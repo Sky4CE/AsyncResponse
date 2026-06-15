@@ -162,7 +162,12 @@ Two more shapes of the same terminal:
   this (from its persisted state), so it's an explicit argument, never auto-detected.
 - `For<T>().WaitAsync(correlationId => …)` — the builder generates the correlation id (also
   placing it in the ambient `AsyncResponseContext`) and hands it to the trigger, so simple flows
-  never touch correlation ids at all.
+  never touch correlation ids at all. This overload is **typed for safety**: `For<T>()` returns
+  an `IAsyncResponseTriggeredBuilder<T>` whose `WaitAsync` *requires* the trigger — a generated
+  correlation id is known to nobody else, so waiting without sending could never complete, and
+  the type system makes that mistake unrepresentable. The explicit-id `For<T>(correlationId)`
+  keeps the trigger optional on purpose: durable flows persist the id first and decide at
+  runtime whether this run sends or re-attaches.
 
 Need the waiter's lifetime under your control? `BuildWaiterAsync()` returns an
 `IAsyncResponseWaiter<T>`; `await waiter.ResponseTask` when ready, dispose to cancel.
