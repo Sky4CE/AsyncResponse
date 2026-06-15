@@ -18,7 +18,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
     <PackageReference Include="Moq" Version="4.20.72" />
-    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.v3.mtp-v2" Version="3.2.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
@@ -28,9 +28,9 @@
          Versions are pinned to the MTP 1.9.x line that xUnit.net v3 3.2.x is built against; the
          explicit Microsoft.Testing.Platform pin keeps the whole MTP graph on one (v1) major so the
          shared host assembly stays compatible. -->
-    <PackageReference Include="Microsoft.Testing.Platform" Version="1.9.1" />
-    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="1.9.1" />
-    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.0.6" />
+    <PackageReference Include="Microsoft.Testing.Platform" Version="2.2.3" />
+    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="2.2.3" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.8.0" />
   </ItemGroup>
 
   <ItemGroup>
