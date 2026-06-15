@@ -1,11 +1,11 @@
 using AsyncResponse;
-using AsyncResponse.Redis;
+using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Microsoft.Extensions.DependencyInjection;
 
 /// <summary>
-/// DI registration for the Redis-backed AsyncResponse channel.
+/// DI registration for the Redis-backed AsyncResponse channel package.
 /// </summary>
 public static class RedisAsyncResponseServiceCollectionExtensions
 {

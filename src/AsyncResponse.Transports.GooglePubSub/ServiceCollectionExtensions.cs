@@ -1,5 +1,5 @@
 using AsyncResponse;
-using AsyncResponse.GooglePubSub;
+using AsyncResponse.Transports.GooglePubSub;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Microsoft.Extensions.DependencyInjection;

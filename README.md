@@ -3,7 +3,7 @@
 **Await responses from message brokers and background workers as if they were local async calls — with optional durable, domain-aware recovery when your process dies mid-wait.**
 
 [![CI](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg)](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml)
-[![NuGet](https://img.shields.io/nuget/v/AsyncResponse.Redis.svg)](https://www.nuget.org/packages/AsyncResponse.Redis)
+[![NuGet](https://img.shields.io/nuget/v/AsyncResponse.Channels.Redis.svg)](https://www.nuget.org/packages/AsyncResponse.Channels.Redis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ```csharp
@@ -38,7 +38,7 @@ add durable recovery when the flow needs it:
    predicates, and race-free triggering. `AsyncResponse.Core` ships a process-local response
    channel for simple apps and tests.
 2. **Recovery** — response channels persist *recovery state* through a pluggable
-   `IRecoveryStateStore`. The default store is in-memory; `AsyncResponse.Redis` adds durable
+   `IRecoveryStateStore`. The default store is in-memory; `AsyncResponse.Channels.Redis` adds durable
    recovery. A response that arrives after the waiter died is **classified by its domain
    outcome** and routed to the right callback: resume the flow, or fail it — never resume a
    failure.
@@ -73,7 +73,7 @@ Three layers, one decision each, made exactly where its deciding fact is knowabl
 | Layer | Knowable fact | Decision |
 |---|---|---|
 | **Ingress** (`IAsyncResponseIngress`) | "Does the message parse?" | Parses → deliver as payload, untyped and uninterpreted. Doesn't parse → report as exception. |
-| **Transport** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
+| **Response channel** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
 | **Lost-subscriber dispatcher** | "What domain state does the payload carry?" | `Succeeded`/`InProgress` → resume callback. `Failed`/`Unknown` → failure callback. |
 
 A failed payload is **still a valid response** for an active waiter (your `Until` predicate and
@@ -86,20 +86,24 @@ make the call.
 | Package | What's inside |
 |---|---|
 | `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
-| `AsyncResponse.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
-| `AsyncResponse.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
+| `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
+| `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
+
+Package naming follows the extension point: `AsyncResponse.Channels.*` packages provide
+response/recovery channels; `AsyncResponse.Transports.*` packages provide broker transports for
+workers and ingress.
 
 ## Installation
 
 ```bash
 dotnet add package AsyncResponse.Core
 
-# Optional durable Redis backend:
-dotnet add package AsyncResponse.Redis
+# Optional durable Redis channel:
+dotnet add package AsyncResponse.Channels.Redis
 
-# Optional Google Pub/Sub adapter:
-dotnet add package AsyncResponse.GooglePubSub
+# Optional Google Pub/Sub transport:
+dotnet add package AsyncResponse.Transports.GooglePubSub
 ```
 
 ## Quick start
@@ -145,7 +149,7 @@ builder.Services.AddHealthChecks()
 fast at host startup, so a misconfiguration can never silently hang every waiter. The recovery
 watchdog is part of the engine and runs by default for whichever channel you choose.
 
-### Google Pub/Sub adapters
+### Google Pub/Sub transport
 
 Pub/Sub is a message transport, not a recovery store. Compose it with Core-only waiting for
 simple apps, or with Redis/Postgres-style recovery when late responses must survive redeploys.

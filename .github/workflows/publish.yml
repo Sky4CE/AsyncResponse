@@ -52,8 +52,8 @@ jobs:
         run: |
           dotnet pack src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/AsyncResponse.Redis/AsyncResponse.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/AsyncResponse.GooglePubSub/AsyncResponse.GooglePubSub.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
 
       - name: Push to nuget.org
         run: >

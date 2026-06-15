@@ -1,4 +1,4 @@
-namespace AsyncResponse.GooglePubSub;
+namespace AsyncResponse.Transports.GooglePubSub;
 
 internal static class GooglePubSubOptionsValidator
 {

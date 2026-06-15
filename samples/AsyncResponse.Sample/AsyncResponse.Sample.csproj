@@ -6,7 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\AsyncResponse.Redis\AsyncResponse.Redis.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
   </ItemGroup>
 
 </Project>

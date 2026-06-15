@@ -26,7 +26,7 @@ internal sealed class AsyncResponseStartupValidator(IEnumerable<AsyncResponseCha
         if (names.Length == 0)
             throw new InvalidOperationException(
                 "AsyncResponse has no response channel registered. After AddAsyncResponse(), call " +
-                ".WithInMemoryChannel() (AsyncResponse.Core) or .WithRedisChannel() (AsyncResponse.Redis). " +
+                ".WithInMemoryChannel() (AsyncResponse.Core) or .WithRedisChannel() (AsyncResponse.Channels.Redis). " +
                 "Without a channel, waiters can never receive a response.");
 
         if (names.Length > 1)

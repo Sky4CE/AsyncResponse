@@ -4,7 +4,7 @@ using StackExchange.Redis;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 
-namespace AsyncResponse.Redis;
+namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
 /// Redis-backed implementation of <see cref="IRecoveryStateStore"/>.

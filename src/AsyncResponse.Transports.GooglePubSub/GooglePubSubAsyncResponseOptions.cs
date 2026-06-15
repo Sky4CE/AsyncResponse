@@ -1,7 +1,7 @@
-namespace AsyncResponse.GooglePubSub;
+namespace AsyncResponse.Transports.GooglePubSub;
 
 /// <summary>
-/// Options for Google Pub/Sub AsyncResponse adapters.
+/// Options for the Google Pub/Sub AsyncResponse transport.
 /// </summary>
 public sealed class GooglePubSubAsyncResponseOptions
 {
@@ -16,7 +16,7 @@ public sealed class GooglePubSubAsyncResponseOptions
 
     /// <summary>
     /// Topic id that async-response messages are published to (by the remote system or worker) and
-    /// that <see cref="ResponseSubscriptionId"/> is attached to. The adapter consumes responses
+    /// that <see cref="ResponseSubscriptionId"/> is attached to. The transport consumes responses
     /// through the subscription; it does not itself publish to this topic.
     /// </summary>
     public string? ResponseTopicId { get; set; }

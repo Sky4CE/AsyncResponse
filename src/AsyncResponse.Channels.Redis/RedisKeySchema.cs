@@ -1,9 +1,9 @@
 using StackExchange.Redis;
 
-namespace AsyncResponse.Redis;
+namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
-/// The single source of truth for Redis key/channel shapes, shared by the transport and the
+/// The single source of truth for Redis key/channel shapes, shared by the channel and the
 /// watchdog. Key shapes are a storage contract: changing them orphans in-flight recovery state.
 /// </summary>
 internal sealed class RedisKeySchema(string _keyPrefix)

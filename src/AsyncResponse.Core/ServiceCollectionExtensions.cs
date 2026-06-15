@@ -13,9 +13,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// Registers the channel-agnostic AsyncResponse engine (fluent waiter builder, transport-neutral
     /// ingress, worker-job executor, and the recovery watchdog) and returns a builder to configure
     /// the rest. It deliberately registers <em>no</em> response channel: chain exactly one
-    /// (<see cref="WithInMemoryChannel"/> or the Redis package's <c>WithRedisChannel</c>) — an app
+    /// (<see cref="WithInMemoryChannel"/> or the Redis channel package's <c>WithRedisChannel</c>) — an app
     /// that starts without a channel fails fast at host startup. Optionally chain a worker transport
-    /// (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub package's
+    /// (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub transport package's
     /// <c>WithGooglePubSubTransport</c>).
     /// </summary>
     public static AsyncResponseRegistrationBuilder AddAsyncResponse(
@@ -80,7 +80,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// Registers the in-memory (in-process) worker transport and its background consumer. Jobs run
     /// in the current process and survive only as long as it does — suitable for development, tests,
     /// and single-node deployments. For distributed, durable execution use a broker-backed transport
-    /// (e.g. the Google Pub/Sub package's <c>WithGooglePubSubTransport</c>) and feed consumed
+    /// (e.g. the Google Pub/Sub transport package's <c>WithGooglePubSubTransport</c>) and feed consumed
     /// messages into <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>.
     /// </summary>
     public static AsyncResponseRegistrationBuilder WithInMemoryTransport(this AsyncResponseRegistrationBuilder builder)

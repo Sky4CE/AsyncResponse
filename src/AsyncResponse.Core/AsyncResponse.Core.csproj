@@ -6,7 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="AsyncResponse.Redis" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />
   </ItemGroup>
 

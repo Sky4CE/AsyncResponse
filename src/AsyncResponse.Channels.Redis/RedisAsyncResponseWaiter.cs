@@ -1,4 +1,4 @@
-namespace AsyncResponse.Redis;
+namespace AsyncResponse.Channels.Redis;
 
 /// <inheritdoc cref="IAsyncResponseWaiter{T}"/>
 internal sealed class RedisAsyncResponseWaiter<T>(

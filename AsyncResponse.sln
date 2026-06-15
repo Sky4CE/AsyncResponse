@@ -9,7 +9,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Abstractions"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Core", "src\AsyncResponse.Core\AsyncResponse.Core.csproj", "{4D02F64C-28C8-42BA-8085-8A6F22602646}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Redis", "src\AsyncResponse.Redis\AsyncResponse.Redis.csproj", "{88884076-C424-41DF-A603-4E8444E44F0D}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.Redis", "src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj", "{88884076-C424-41DF-A603-4E8444E44F0D}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
 EndProject
@@ -19,7 +19,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "samples", "samples", "{5D20
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Sample", "samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj", "{B468B781-2033-4D2C-8A85-E679902F3599}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.GooglePubSub", "src\AsyncResponse.GooglePubSub\AsyncResponse.GooglePubSub.csproj", "{CAC5848E-FE27-46C3-9D25-AEE0A5C173F5}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.GooglePubSub", "src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj", "{CAC5848E-FE27-46C3-9D25-AEE0A5C173F5}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

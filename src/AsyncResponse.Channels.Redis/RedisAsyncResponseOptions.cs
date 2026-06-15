@@ -1,12 +1,12 @@
-namespace AsyncResponse.Redis;
+namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
-/// Options for the Redis async-response transport.
+/// Options for the Redis async-response channel.
 /// </summary>
 public sealed class RedisAsyncResponseOptions
 {
     /// <summary>
-    /// Prefix for every Redis key and pub/sub channel created by the transport:
+    /// Prefix for every Redis key and pub/sub channel created by the channel:
     /// response channels are <c>{KeyPrefix}:response:{correlationId}</c> and recovery state lives
     /// at <c>{KeyPrefix}:recovery:{correlationId}</c>. Change it to isolate multiple
     /// applications or environments sharing one Redis. Treat as a deployment-wide contract:

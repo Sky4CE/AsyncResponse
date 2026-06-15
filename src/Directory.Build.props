@@ -14,7 +14,7 @@
     <PackageProjectUrl>https://github.com/Sky4CE/AsyncResponse</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Sky4CE/AsyncResponse</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>async;response;correlation;correlation-id;redis;pubsub;request-response;messaging;background-worker;recovery;resilience</PackageTags>
+    <PackageTags>async;response;correlation;correlation-id;channel;transport;redis;pubsub;request-response;messaging;background-worker;recovery;resilience</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
 

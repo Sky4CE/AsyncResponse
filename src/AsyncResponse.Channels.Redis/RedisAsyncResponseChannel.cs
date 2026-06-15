@@ -6,7 +6,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 
-namespace AsyncResponse.Redis;
+namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
 /// Redis-backed response channel:

@@ -31,8 +31,8 @@ jobs:
         run: |
           dotnet pack src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Redis/AsyncResponse.Redis.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.GooglePubSub/AsyncResponse.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
 
       - name: Upload packages as build artifacts
         uses: actions/upload-artifact@v4

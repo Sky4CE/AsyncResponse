@@ -3,7 +3,7 @@ using Google.Protobuf;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
 
-namespace AsyncResponse.GooglePubSub;
+namespace AsyncResponse.Transports.GooglePubSub;
 
 /// <summary>
 /// Publishes <see cref="WorkerJobEnvelope"/> messages to a Google Pub/Sub topic.

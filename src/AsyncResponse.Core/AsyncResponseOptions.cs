@@ -4,7 +4,7 @@ namespace AsyncResponse;
 /// Engine-level options for AsyncResponse, configured by <c>AddAsyncResponse()</c>. These apply
 /// regardless of which channel or transport is registered. Channel-specific settings (per-waiter
 /// timeouts, recovery-state expiry, key prefixes) live on the channel's own options — see
-/// <see cref="InMemoryAsyncResponseOptions"/> and the Redis package's <c>RedisAsyncResponseOptions</c>.
+/// <see cref="InMemoryAsyncResponseOptions"/> and the Redis channel package's <c>RedisAsyncResponseOptions</c>.
 /// </summary>
 public sealed class AsyncResponseOptions
 {
