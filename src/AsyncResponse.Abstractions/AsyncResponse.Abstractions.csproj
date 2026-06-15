@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.Abstractions</PackageId>
+    <Description>Contracts for AsyncResponse: correlation-id based request/response over messaging, domain-outcome classification of payloads, lost-subscriber recovery callbacks, and worker dispatch. Reference this package from class libraries; hosts reference AsyncResponse.Redis.</Description>
+  </PropertyGroup>
+
+</Project>

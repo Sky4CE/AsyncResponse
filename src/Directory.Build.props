@@ -1,0 +1,38 @@
+<Project>
+
+  <!-- Inherit the repo-root properties. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <!-- Shared NuGet packaging metadata for all shipped packages. -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <Version>0.1.0</Version>
+    <Authors>Vitalii Tiunisov</Authors>
+    <Company>Vitalii Tiunisov</Company>
+    <Copyright>Copyright (c) Vitalii Tiunisov</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/vitaliy-opti/AsyncResponse</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/vitaliy-opti/AsyncResponse</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>async;response;correlation;correlation-id;redis;pubsub;request-response;messaging;background-worker;recovery;resilience</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- XML-doc warnings on every public member would drown the build; docs are still generated. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- Deterministic builds + SourceLink for debuggable public packages. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="\" Visible="false" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>

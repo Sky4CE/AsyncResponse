@@ -1,0 +1,59 @@
+# Publishes the NuGet packages to nuget.org.
+#
+# Trigger: publish a GitHub Release (or push a tag) named like `v1.2.3`.
+# The version is derived from the tag, overriding the <Version> in Directory.Build.props.
+#
+# Required repository secret: NUGET_API_KEY — create it at
+# https://www.nuget.org/account/apikeys (scope: Push, glob: AsyncResponse.*).
+name: Publish NuGet
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Derive package version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+].*)?$ ]]; then
+            echo "::error::Tag '$TAG' does not look like a semantic version tag (expected e.g. v1.2.3 or v1.2.3-preview.1)."
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "Publishing version ${TAG#v}"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore -p:Version=$PACKAGE_VERSION
+
+      - name: Test
+        run: dotnet test --configuration Release --no-build
+
+      - name: Pack
+        run: dotnet pack --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+
+      - name: Push to nuget.org
+        run: >
+          dotnet nuget push "./artifacts/*.nupkg"
+          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate

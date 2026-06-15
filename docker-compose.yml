@@ -1,0 +1,7 @@
+# Local Redis for running the sample and experimenting with the library:
+#   docker compose up -d
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
