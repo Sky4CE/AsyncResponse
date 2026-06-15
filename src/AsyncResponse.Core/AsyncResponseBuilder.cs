@@ -6,7 +6,8 @@ namespace AsyncResponse;
 internal sealed class AsyncResponseBuilder(
     IAsyncResponseSubscriber _subscriber,
     IWorkerTransport? _workerTransport = null,
-    IAsyncResponseReplyTargetProvider? _replyTargetProvider = null) : IAsyncResponseBuilder
+    IAsyncResponseReplyTargetProvider? _replyTargetProvider = null,
+    AsyncResponseContextPropagation? _propagation = null) : IAsyncResponseBuilder
 {
     /// <inheritdoc />
     public IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
@@ -35,7 +36,8 @@ internal sealed class AsyncResponseBuilder(
         {
             Call = work,
             CorrelationId = AsyncResponseContext.CorrelationId,
-            ReplyTarget = AsyncResponseContext.ReplyTarget
+            ReplyTarget = AsyncResponseContext.ReplyTarget,
+            Context = _propagation?.Capture()
         });
     }
 

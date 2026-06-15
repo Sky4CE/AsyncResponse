@@ -22,7 +22,8 @@ builder.Services.AddAsyncResponse(options =>
     options.KeyPrefix = "sample";
     options.RecoveryStateExpiry = TimeSpan.FromHours(1);
 })
-.WithInMemoryTransport();
+.WithInMemoryTransport()
+.WithContextPropagator<SampleTracePropagator>();   // carry the trace id across serialized hops
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 
 // --- Sample services ------------------------------------------------------------------------
@@ -136,8 +137,9 @@ app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteW
 app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orderId) =>
 {
     AsyncResponseContext.CreateCorrelationId();
+    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
     await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessOrderAsync(orderId));
-    return Results.Accepted(value: new { orderId, note = "Watch the logs for WORKER output." });
+    return Results.Accepted(value: new { orderId, traceId = SampleTraceContext.Current, note = "Watch the logs for WORKER output — the traceId flows in-process via ExecutionContext." });
 });
 
 // 5a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
@@ -145,6 +147,10 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
 // returns immediately; the subscription and the persisted recovery state stay alive.
 app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncResponse) =>
 {
+    // The propagator captures this trace id into the persisted recovery state, so it is restored
+    // before the recovery callback runs after the "crash" — even though the waiter is long gone.
+    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+
     var armed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
     armedWaits.Add(asyncResponse
@@ -168,6 +174,7 @@ app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncRespo
     return Results.Ok(new
     {
         correlationId = armedCorrelationId,
+        traceId = SampleTraceContext.Current,   // this should reappear in the RECOVERY log after the crash
         next = "POST /demo/lost-subscriber/crash, then /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed"
     });
 });

@@ -9,6 +9,7 @@ namespace AsyncResponse;
 internal sealed class AsyncResponseIngress(
     IAsyncResponsePublisher _publisher,
     WorkerJobExecutor _workerJobExecutor,
+    AsyncResponseContextPropagation _propagation,
     ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
 {
     private const string SERVICE_NAME = nameof(AsyncResponseIngress);
@@ -53,7 +54,10 @@ internal sealed class AsyncResponseIngress(
             var job = JsonSafety.SafeDeserialize<WorkerJobEnvelope>(messageJson)
                 ?? throw new InvalidDataException("Worker message deserialized to null.");
 
-            await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
+            // The job crossed a serialization boundary (broker → ingress): restore any ambient
+            // context its propagators captured before executing it.
+            using (_propagation.Restore(job.Context))
+                await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

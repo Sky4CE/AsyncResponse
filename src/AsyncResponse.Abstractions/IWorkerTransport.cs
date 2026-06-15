@@ -21,6 +21,13 @@ public sealed class WorkerJobEnvelope
     /// publish responses to the same generic ingress.
     /// </summary>
     public AsyncResponseReplyTarget? ReplyTarget { get; set; }
+
+    /// <summary>
+    /// Serialized application ambient context captured when the job was enqueued (see
+    /// <see cref="IAsyncResponseContextPropagator"/>), restored before the job executes when it is
+    /// delivered through a broker ingress. <c>null</c> when no context propagators are registered.
+    /// </summary>
+    public Dictionary<string, string>? Context { get; set; }
 }
 
 /// <summary>

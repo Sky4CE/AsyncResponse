@@ -19,18 +19,21 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly InMemoryAsyncResponseOptions _options;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
+    private readonly AsyncResponseContextPropagation _propagation;
     private readonly ILogger<InMemoryAsyncResponseChannel> _logger;
 
     public InMemoryAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         IRecoveryStateStore recoveryStateStore,
         IOptions<InMemoryAsyncResponseOptions> options,
+        AsyncResponseContextPropagation propagation,
         ILogger<InMemoryAsyncResponseChannel> logger)
     {
         _recoveryStateStore = recoveryStateStore;
         _options = options.Value;
+        _propagation = propagation;
         _logger = logger;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, logger);
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
     }
 
     public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
@@ -55,7 +58,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             owner: this,
             correlationId,
             timeout.Value,
-            completionPredicate);
+            completionPredicate,
+            ExecutionContext.Capture());
 
         subscription.ArmTimeout();
 
@@ -75,7 +79,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
                     FailureCallback = failureCallback,
                     CorrelationId = correlationId,
                     PayloadTypeFullName = typeof(T).FullName,
-                    RegisteredAtUtc = DateTime.UtcNow
+                    RegisteredAtUtc = DateTime.UtcNow,
+                    Context = _propagation.Capture()
                 },
                 _options.RecoveryStateExpiry).ConfigureAwait(false);
 
@@ -269,25 +274,41 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
     private sealed class Subscription<T> : SubscriptionBase where T : IAsyncResponsePayload
     {
         private readonly Func<T, ValueTask<bool>> _completionPredicate;
+        private readonly ExecutionContext? _capturedContext;
         private readonly TaskCompletionSource<T> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Subscription(
             InMemoryAsyncResponseChannel owner,
             string correlationId,
             TimeSpan timeout,
-            Func<T, ValueTask<bool>> completionPredicate)
+            Func<T, ValueTask<bool>> completionPredicate,
+            ExecutionContext? capturedContext)
             : base(owner, correlationId, timeout)
         {
             _completionPredicate = completionPredicate;
+            _capturedContext = capturedContext;
         }
 
         public Task<T> ResponseTask => _tcs.Task;
 
-        public override async Task DispatchResponseAsync(object? response)
+        public override Task DispatchResponseAsync(object? response)
         {
             if (CleanupStarted)
-                return;
+                return Task.CompletedTask;
 
+            // Restore the waiter's subscribe-time ambient context (trace, principal, …) so the
+            // completion predicate and any logging run under it, even when the response is delivered
+            // on a foreign thread such as a broker ingress callback.
+            if (_capturedContext is null)
+                return DispatchResponseCoreAsync(response);
+
+            Task? dispatch = null;
+            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchResponseCoreAsync(response), null);
+            return dispatch!;
+        }
+
+        private async Task DispatchResponseCoreAsync(object? response)
+        {
             try
             {
                 var payload = response is T typed

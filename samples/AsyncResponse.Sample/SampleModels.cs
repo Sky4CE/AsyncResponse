@@ -48,8 +48,8 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
 {
     public async Task ProcessOrderAsync(int orderId)
     {
-        _logger.LogInformation("WORKER: processing order {OrderId} (correlationId: {CorrelationId})…",
-            orderId, AsyncResponseContext.CorrelationId);
+        _logger.LogInformation("WORKER: processing order {OrderId} (correlationId: {CorrelationId}, traceId: {TraceId})…",
+            orderId, AsyncResponseContext.CorrelationId, SampleTraceContext.Current);
         await Task.Delay(1_000);
         _logger.LogInformation("WORKER: order {OrderId} processed.", orderId);
     }
@@ -58,8 +58,8 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
     {
         _logger.LogWarning(
             "RECOVERY (resume): flow '{FlowName}' got a {Status} response after its waiter was lost " +
-            "(correlationId: {CorrelationId}, message: {Message}). A real flow would resume or re-register here.",
-            flowName, payload.Status, correlationId, payload.Message);
+            "(correlationId: {CorrelationId}, traceId: {TraceId}, message: {Message}). A real flow would resume or re-register here.",
+            flowName, payload.Status, correlationId, SampleTraceContext.Current, payload.Message);
         return Task.CompletedTask;
     }
 
@@ -68,16 +68,72 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
         if (exception is AsyncResponseDomainFailureException domainFailure)
         {
             _logger.LogError(
-                "RECOVERY (failure): correlationId {CorrelationId} reported domain outcome {Outcome} after its waiter was lost. Payload: {Payload}. A real flow would mark itself failed (retriable) here.",
-                correlationId, domainFailure.Outcome, domainFailure.PayloadJson);
+                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}) reported domain outcome {Outcome} after its waiter was lost. Payload: {Payload}. A real flow would mark itself failed (retriable) here.",
+                correlationId, SampleTraceContext.Current, domainFailure.Outcome, domainFailure.PayloadJson);
         }
         else
         {
             _logger.LogError(exception,
-                "RECOVERY (failure): correlationId {CorrelationId} failed technically after its waiter was lost.",
-                correlationId);
+                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}) failed technically after its waiter was lost.",
+                correlationId, SampleTraceContext.Current);
         }
 
         return Task.CompletedTask;
     }
+}
+
+/// <summary>
+/// A tiny ambient "trace id" the sample sets per request, standing in for a real trace/tenant/
+/// principal. It flows automatically to in-process work (the in-memory worker, the response
+/// handler) via <see cref="System.Threading.ExecutionContext"/>; to survive the serialized hops
+/// (lost-subscriber recovery, broker-backed workers) it needs <see cref="SampleTracePropagator"/>.
+/// </summary>
+public static class SampleTraceContext
+{
+    private static readonly AsyncLocal<string?> _traceId = new();
+
+    public static string? Current => _traceId.Value;
+
+    public static void Set(string traceId) => _traceId.Value = traceId;
+
+    internal static readonly IDisposable NoScope = new NullScope();
+
+    internal static IDisposable Push(string? traceId)
+    {
+        var previous = _traceId.Value;
+        _traceId.Value = traceId;
+        return new Scope(previous);
+    }
+
+    private sealed class Scope(string? _previous) : IDisposable
+    {
+        public void Dispose() => _traceId.Value = _previous;
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// Sample <see cref="IAsyncResponseContextPropagator"/> that carries the ambient trace id across
+/// the serialization boundary into worker jobs and lost-subscriber recovery callbacks. A real one
+/// would also restore an <c>ILogger.BeginScope</c> in <see cref="Restore"/> so emitted logs carry
+/// the trace id — that is what the returned <see cref="IDisposable"/> is for.
+/// </summary>
+public sealed class SampleTracePropagator : IAsyncResponseContextPropagator
+{
+    private const string Key = "sample.traceId";
+
+    public void Capture(IDictionary<string, string> carrier)
+    {
+        if (SampleTraceContext.Current is { } traceId)
+            carrier[Key] = traceId;
+    }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+        => carrier.TryGetValue(Key, out var traceId)
+            ? SampleTraceContext.Push(traceId)
+            : SampleTraceContext.NoScope;
 }

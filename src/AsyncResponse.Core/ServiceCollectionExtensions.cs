@@ -29,12 +29,14 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         }
 
         // Channel-agnostic engine.
+        services.TryAddSingleton<AsyncResponseContextPropagation>();
         services.TryAddSingleton<WorkerJobExecutor>();
         services.TryAddSingleton<IAsyncResponseIngress, AsyncResponseIngress>();
         services.TryAddSingleton<IAsyncResponseBuilder>(provider => new AsyncResponseBuilder(
             provider.GetRequiredService<IAsyncResponseSubscriber>(),
             provider.GetService<IWorkerTransport>(),
-            provider.GetService<IAsyncResponseReplyTargetProvider>()));
+            provider.GetService<IAsyncResponseReplyTargetProvider>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>()));
 
         // The recovery watchdog is part of the engine and runs by default for whatever channel is
         // registered (scanning + liveness go through IRecoveryStateScanner / IActiveSubscriberProbe).
@@ -45,6 +47,21 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.AddHostedService<AsyncResponseStartupValidator>();
 
         return new AsyncResponseRegistrationBuilder(services);
+    }
+
+    /// <summary>
+    /// Registers an application <see cref="IAsyncResponseContextPropagator"/> that carries ambient
+    /// context (trace id, principal, tenant, …) across the serialization boundary into worker jobs
+    /// and lost-subscriber recovery callbacks. In-process hops flow ambient state automatically via
+    /// the captured <see cref="System.Threading.ExecutionContext"/>; propagators are only needed for
+    /// context that must survive serialization (broker-backed workers, recovery after a redeploy).
+    /// Register one per concern (e.g. a trace propagator and a principal propagator).
+    /// </summary>
+    public static AsyncResponseRegistrationBuilder WithContextPropagator<TPropagator>(this AsyncResponseRegistrationBuilder builder)
+        where TPropagator : class, IAsyncResponseContextPropagator
+    {
+        builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<IAsyncResponseContextPropagator, TPropagator>());
+        return builder;
     }
 
     /// <summary>

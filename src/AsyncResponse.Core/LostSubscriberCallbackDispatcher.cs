@@ -34,7 +34,10 @@ internal readonly record struct LostSubscriberDispatchResult(AsyncResponseOutcom
 /// and hands over to this dispatcher.
 /// </para>
 /// </summary>
-internal sealed class LostSubscriberCallbackDispatcher(IServiceScopeFactory _scopeFactory, ILogger _logger)
+internal sealed class LostSubscriberCallbackDispatcher(
+    IServiceScopeFactory _scopeFactory,
+    AsyncResponseContextPropagation _propagation,
+    ILogger _logger)
 {
     private const string SERVICE_NAME = nameof(LostSubscriberCallbackDispatcher);
 
@@ -77,7 +80,7 @@ internal sealed class LostSubscriberCallbackDispatcher(IServiceScopeFactory _sco
         // Deliberately not wrapped in try/catch: a failing resume propagates to the publisher's
         // caller, which can escalate it through SetException to the failure callback
         // (the ingress does exactly that).
-        await InvokeAsync(invocation).ConfigureAwait(false);
+        await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
         _logger.LogInformation("{ServiceName}: {MethodName} Resume callback invoked for channel {Channel}.",
             SERVICE_NAME, MethodName, channel);
@@ -107,7 +110,7 @@ internal sealed class LostSubscriberCallbackDispatcher(IServiceScopeFactory _sco
             correlationId: recoveryState.CorrelationId
         );
 
-        await InvokeAsync(invocation).ConfigureAwait(false);
+        await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
         _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel}.",
             SERVICE_NAME, MethodName, channel);
@@ -161,7 +164,7 @@ internal sealed class LostSubscriberCallbackDispatcher(IServiceScopeFactory _sco
 
         try
         {
-            await InvokeAsync(invocation).ConfigureAwait(false);
+            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
             _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel} (domain outcome {Outcome}).",
                 SERVICE_NAME, MethodName, channel, outcome);
@@ -179,8 +182,11 @@ internal sealed class LostSubscriberCallbackDispatcher(IServiceScopeFactory _sco
         }
     }
 
-    private async Task InvokeAsync(ReflectionInvocationDto invocation)
+    private async Task InvokeAsync(ReflectionInvocationDto invocation, IReadOnlyDictionary<string, string>? context)
     {
+        // The recovery callback may run in a different deployment than the original waiter, so
+        // restore any ambient context captured at registration before resolving and invoking it.
+        using var contextScope = _propagation.Restore(context);
         await using var serviceScope = _scopeFactory.CreateAsyncScope();
         await serviceScope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
     }

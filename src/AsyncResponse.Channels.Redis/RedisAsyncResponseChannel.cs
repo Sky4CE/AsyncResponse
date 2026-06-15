@@ -28,6 +28,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
     private readonly ISubscriber _subscriber;
     private readonly IConnectionMultiplexer _multiplexer;
     private readonly IRecoveryStateStore _recoveryStateStore;
+    private readonly AsyncResponseContextPropagation _propagation;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
     private readonly RedisKeySchema _keys;
     private readonly RedisAsyncResponseOptions _options;
@@ -40,15 +41,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         IConnectionMultiplexer multiplexer,
         IRecoveryStateStore recoveryStateStore,
         IOptions<RedisAsyncResponseOptions> options,
+        AsyncResponseContextPropagation propagation,
         ILogger<RedisAsyncResponseChannel> logger)
     {
         _subscriber = multiplexer.GetSubscriber();
         _multiplexer = multiplexer;
         _recoveryStateStore = recoveryStateStore;
+        _propagation = propagation;
         _options = options.Value;
         _keys = new RedisKeySchema(_options.KeyPrefix);
         _logger = logger;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, logger);
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -77,6 +80,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
 
         var storedCorrelationId = correlationId;
+        // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
+        // scope) flow into the message handler, which runs on a foreign Redis subscriber thread.
+        var capturedContext = ExecutionContext.Capture();
         var channel = _keys.Channel(correlationId);
 
         var activity = ActivitySource.StartActivity("asyncresponse.wait");
@@ -206,12 +212,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         void RedisHandler(RedisChannel messageChannel, RedisValue messageValue)
         {
             _ = GetExecutor(messageChannel.ToString()!)
-                  .Enqueue(async () =>
-                  {
-                      // Restore the ambient correlation id for the message-processing scope.
-                      using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
-                      await ProcessRedisMessageAsync(messageChannel, messageValue, RedisHandler).ConfigureAwait(false);
-                  })
+                  .Enqueue(() => ProcessUnderCapturedContextAsync(messageChannel, messageValue, RedisHandler))
                   .ContinueWith(t =>
                   {
                       if (t.IsFaulted)
@@ -219,6 +220,27 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                       else if (!t.Result)
                           _logger.LogWarning("{ServiceName}: Executor rejected message for {Channel}", SERVICE_NAME, messageChannel.ToString());
                   });
+        }
+
+        // -------------------------------------------------------------------------
+        // Local: ProcessUnderCapturedContextAsync
+        // Restores the waiter's subscribe-time ExecutionContext (app AsyncLocals: trace, principal,
+        // logging scope) plus the correlation id before processing — the Redis subscriber callback
+        // runs on a foreign thread-pool thread that never had them.
+        Task ProcessUnderCapturedContextAsync(RedisChannel messageChannel, RedisValue messageValue, Action<RedisChannel, RedisValue> redisHandler)
+        {
+            async Task ProcessAsync()
+            {
+                using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
+                await ProcessRedisMessageAsync(messageChannel, messageValue, redisHandler).ConfigureAwait(false);
+            }
+
+            if (capturedContext is null)
+                return ProcessAsync();
+
+            Task? task = null;
+            ExecutionContext.Run(capturedContext, _ => task = ProcessAsync(), null);
+            return task!;
         }
 
         timeoutRegistration = cancellationTokenSource.Token.Register(() =>
@@ -241,7 +263,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
                 PayloadTypeFullName = typeof(T).FullName,
-                RegisteredAtUtc = DateTime.UtcNow
+                RegisteredAtUtc = DateTime.UtcNow,
+                Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
             _logger.LogDebug("{ServiceName}: {MethodName} Subscribed to channel {Channel} for correlationId {CorrelationId}.",

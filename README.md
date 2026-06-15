@@ -351,7 +351,46 @@ current process; for distributed execution use `.WithGooglePubSubTransport(...)`
 `IWorkerTransport` against your broker and have the consumer call
 `ingress.HandleWorkerMessageAsync(json)`.
 
-### 6. Timeouts, errors, and cancellation
+### 6. Propagating ambient context (trace, principal, tenant)
+
+Anything your app keeps in `AsyncLocal` — a trace id, the current principal, a tenant, a logging
+scope — is lost when AsyncResponse hands work to a foreign execution context. Two mechanisms carry
+it back, picked automatically per boundary:
+
+- **In-process hops** — the response handlers and the in-memory worker run under the *captured
+  `ExecutionContext`*, so ambient `AsyncLocal` state (`Activity.Current`, principal, logging scopes,
+  …) flows automatically. Nothing to configure.
+- **Serialized hops** — a broker-backed worker on another node, or a lost-subscriber recovery
+  callback after a redeploy, cannot carry `AsyncLocal`s. Register an
+  `IAsyncResponseContextPropagator` to capture your context into a `string`→`string` bag (persisted
+  with the worker job / recovery state) and restore it on the far side:
+
+```csharp
+public sealed class TracePropagator(ILogger<TracePropagator> logger) : IAsyncResponseContextPropagator
+{
+    public void Capture(IDictionary<string, string> carrier)
+    {
+        if (Activity.Current is { } activity) carrier["trace.id"] = activity.TraceId.ToString();
+    }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+        => carrier.TryGetValue("trace.id", out var traceId)
+            ? logger.BeginScope("traceId:{TraceId}", traceId)!   // the IDisposable restores a logging scope
+            : NullScope.Instance;
+}
+
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithContextPropagator<TracePropagator>()      // one per concern (trace, principal, tenant, …)
+    .WithInMemoryTransport();
+```
+
+The carrier is `string`→`string` so it survives JSON serialization; the `Restore` return value is an
+`IDisposable`, so a propagator can re-establish *behavior* like a logging scope, not just data. With
+no propagator registered the feature is a zero-cost no-op and the wire payload is unchanged. (See
+`SampleTracePropagator` in the sample for a runnable end-to-end example.)
+
+### 7. Timeouts, errors, and cancellation
 
 ```csharp
 try
@@ -370,7 +409,7 @@ catch (Exception ex)       { /* SetException from the remote side, with remote s
   operation never started, so nothing is left armed.
 - Disposing a waiter cancels the subscription and deletes its recovery state.
 
-### 7. Operations: watchdog + health check
+### 8. Operations: watchdog + health check
 
 The recovery watchdog is part of the engine: `AddAsyncResponse()` starts it by default, and it
 works for whichever channel you registered (in-memory or Redis). It periodically scans the

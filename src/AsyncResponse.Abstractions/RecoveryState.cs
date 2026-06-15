@@ -43,4 +43,12 @@ public sealed class RecoveryState
     /// state (old entries with no live subscriber and no response in sight).
     /// </summary>
     public DateTime? RegisteredAtUtc { get; set; }
+
+    /// <summary>
+    /// Serialized application ambient context captured at waiter registration (see
+    /// <see cref="IAsyncResponseContextPropagator"/>), restored before a lost-subscriber recovery
+    /// callback runs — which may be in a different deployment. <c>null</c> when no context
+    /// propagators are registered.
+    /// </summary>
+    public Dictionary<string, string>? Context { get; set; }
 }
