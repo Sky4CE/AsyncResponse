@@ -7,10 +7,10 @@ namespace AsyncResponse;
 public interface IAsyncResponseSubscriber
 {
     /// <summary>
-    /// Subscribes to the channel associated with <paramref name="correlationId"/>, persists the
-    /// recovery callbacks, and returns a disposable <see cref="IAsyncResponseWaiter{T}"/> for
-    /// manual lifetime control. Disposing the waiter cancels the subscription and clears the
-    /// persisted recovery state.
+    /// Subscribes to the response channel associated with <paramref name="correlationId"/>,
+    /// stores the recovery callbacks, and returns a disposable
+    /// <see cref="IAsyncResponseWaiter{T}"/> for manual lifetime control. Disposing the waiter
+    /// cancels the subscription and clears the stored recovery state.
     /// </summary>
     /// <typeparam name="T">The expected response payload type.</typeparam>
     /// <param name="correlationId">The unique identifier linking the request to its response channel.</param>
@@ -29,7 +29,7 @@ public interface IAsyncResponseSubscriber
     /// </param>
     /// <param name="timeout">
     /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/>.
-    /// When <c>null</c>, the transport's default timeout applies — waits are never infinite.
+    /// When <c>null</c>, the response channel's default timeout applies — waits are never infinite.
     /// </param>
     Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
         string correlationId,

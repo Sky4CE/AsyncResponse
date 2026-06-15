@@ -1,11 +1,11 @@
 namespace AsyncResponse;
 
 /// <summary>
-/// Durable per-correlation recovery state, persisted by the transport when a waiter registers.
-/// It outlives the in-memory waiter, so a response that arrives after the waiter died (e.g.
-/// a redeploy dropped the process) can still be routed: the lost-subscriber dispatcher
-/// classifies the payload's domain outcome and invokes <see cref="ResumeCallback"/> or
-/// <see cref="FailureCallback"/>.
+/// Per-correlation recovery state, stored by the response channel when a waiter registers.
+/// With a durable store (for example Redis) it outlives the in-memory waiter, so a response that
+/// arrives after the waiter died (e.g. a redeploy dropped the process) can still be routed: the
+/// lost-subscriber dispatcher classifies the payload's domain outcome and invokes
+/// <see cref="ResumeCallback"/> or <see cref="FailureCallback"/>.
 /// <para>
 /// <b>Contract warning:</b> instances are serialized into the backing store (e.g. Redis) and
 /// must remain readable across deployments. Treat property names as a wire contract — additive

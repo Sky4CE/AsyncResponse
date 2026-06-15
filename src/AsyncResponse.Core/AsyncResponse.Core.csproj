@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <PackageId>AsyncResponse.Core</PackageId>
-    <Description>Transport-agnostic core of AsyncResponse: the fluent waiter builder (Until/WithTimeout/TriggeredBy), payload outcome classification, lost-subscriber callback dispatch, expression-based callback registration, and an in-process worker transport for development and single-node deployments.</Description>
+    <Description>Core AsyncResponse implementation: fluent waiter builder, process-local response channel and recovery store, transport-neutral ingress, payload outcome classification, lost-subscriber callback dispatch, expression-based callbacks, and an in-process worker queue for development and single-node deployments.</Description>
   </PropertyGroup>
 
   <ItemGroup>

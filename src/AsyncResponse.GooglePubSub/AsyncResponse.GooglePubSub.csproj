@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.GooglePubSub</PackageId>
+    <Description>Google Pub/Sub adapter for AsyncResponse: publish worker jobs to Pub/Sub, consume worker-job subscriptions, and feed response subscriptions into the transport-neutral AsyncResponse ingress.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Microsoft.SourceLink.GitHub" Version="10.0.300" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Cloud.PubSub.V1" Version="3.35.0" />
+  </ItemGroup>
+
+</Project>

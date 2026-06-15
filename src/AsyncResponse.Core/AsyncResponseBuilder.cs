@@ -25,7 +25,7 @@ internal sealed class AsyncResponseBuilder(
         ArgumentNullException.ThrowIfNull(work);
 
         var transport = _workerTransport ?? throw new InvalidOperationException(
-            "No IWorkerTransport is registered. Add AddInProcessWorkerTransport() for in-process execution, " +
+            "No IWorkerTransport is registered. Add AddInProcessWorkerQueue() for in-process execution, " +
             "or register a broker-backed IWorkerTransport implementation.");
 
         return transport.PublishAsync(new WorkerJobEnvelope

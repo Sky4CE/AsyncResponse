@@ -1,8 +1,8 @@
 # AsyncResponse
 
-**Await responses from message brokers and background workers as if they were local async calls — with durable, domain-aware recovery when your process dies mid-wait.**
+**Await responses from message brokers and background workers as if they were local async calls — with optional durable, domain-aware recovery when your process dies mid-wait.**
 
-[![CI](https://github.com/vitaliy-opti/AsyncResponse/actions/workflows/ci.yml/badge.svg)](https://github.com/vitaliy-opti/AsyncResponse/actions/workflows/ci.yml)
+[![CI](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg)](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml)
 [![NuGet](https://img.shields.io/nuget/v/AsyncResponse.Redis.svg)](https://www.nuget.org/packages/AsyncResponse.Redis)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -31,13 +31,17 @@ gone. The response arrives anyway. Now what?
 - If you blindly resume the flow, you just resumed the **happy path on a failed response** —
   the payload said `"status": "failed"`, but nobody looked.
 
-AsyncResponse solves both halves:
+AsyncResponse solves the core correlation problem without requiring infrastructure, and lets you
+add durable recovery when the flow needs it:
 
-1. **Correlation** — `await` a response by correlation id over Redis pub/sub, with fluent
-   timeouts, progress predicates, and race-free triggering.
-2. **Recovery** — every wait persists durable *recovery state* (7 days by default). A response
-   that arrives after the waiter died is **classified by its domain outcome** and routed to the
-   right callback: resume the flow, or fail it — never resume a failure.
+1. **Correlation** — `await` a response by correlation id, with fluent timeouts, progress
+   predicates, and race-free triggering. `AsyncResponse.Core` ships a process-local response
+   channel for simple apps and tests.
+2. **Recovery** — response channels persist *recovery state* through a pluggable
+   `IRecoveryStateStore`. The default store is in-memory; `AsyncResponse.Redis` adds durable
+   recovery. A response that arrives after the waiter died is **classified by its domain
+   outcome** and routed to the right callback: resume the flow, or fail it — never resume a
+   failure.
 
 ## How it works
 
@@ -45,8 +49,8 @@ AsyncResponse solves both halves:
         you                       AsyncResponse                         remote system
          │                              │                                     │
          │  For<T>().WaitAsync(send)    │                                     │
-         ├─────────────────────────────►│ 1. subscribe cid + persist          │
-         │                              │    RecoveryState (Redis)            │
+         ├─────────────────────────────►│ 1. subscribe cid + save             │
+         │                              │    RecoveryState (store)            │
          │                              │ 2. run trigger ────────────────────►│  (request sent
          │        await response        │                                     │   AFTER subscribe)
          │                              │◄──────── progress message ──────────┤
@@ -81,17 +85,43 @@ make the call.
 
 | Package | What's inside |
 |---|---|
-| `AsyncResponse.Redis` | The Redis transport, recovery watchdog, readiness health check. **Reference this from your host.** |
-| `AsyncResponse.Core` | Transport-agnostic core: fluent builder, outcome classifier, lost-subscriber dispatcher, expression-based callbacks, in-process worker transport. |
+| `AsyncResponse.Core` | Fluent builder, process-local response channel, process-local recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-process worker queue. |
+| `AsyncResponse.Redis` | Optional Redis response channel, Redis recovery-state store, recovery watchdog, readiness health check. |
+| `AsyncResponse.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
 
 ## Installation
 
 ```bash
+dotnet add package AsyncResponse.Core
+
+# Optional durable Redis backend:
 dotnet add package AsyncResponse.Redis
+
+# Optional Google Pub/Sub adapter:
+dotnet add package AsyncResponse.GooglePubSub
 ```
 
 ## Quick start
+
+### Core-only, no Redis
+
+Use this when you want the async-response pattern without durable recovery. Waiters and recovery
+state live in the current process.
+
+```csharp
+using AsyncResponse;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddAsyncResponse();        // in-memory response channel + fluent builder
+builder.Services.AddInProcessWorkerQueue(); // optional: background worker jobs
+```
+
+### Redis-backed response channel and recovery
+
+Use this when waiters may die during redeploys and late responses must resume/fail the owning
+flow durably.
 
 ```csharp
 using AsyncResponse;
@@ -102,11 +132,59 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<IConnectionMultiplexer>(
     _ => ConnectionMultiplexer.Connect("localhost:6379"));
 
-builder.Services.AddRedisAsyncResponse();          // transport + fluent builder
-builder.Services.AddInProcessWorkerTransport();    // optional: background worker jobs
+builder.Services.AddRedisAsyncResponse();          // Redis response channel + Redis recovery store
+builder.Services.AddInProcessWorkerQueue();        // optional: background worker jobs
 builder.Services.AddAsyncResponseWatchdog();       // optional: stale-flow detection
 builder.Services.AddHealthChecks()
     .AddAsyncResponseRecoveryCheck();              // optional: surface it on /readyz
+```
+
+The Redis package also exposes composable registrations:
+
+```csharp
+builder.Services.AddRedisRecoveryStore();   // Redis only for recovery state
+builder.Services.AddRedisResponseChannel(); // Redis pub/sub response channel + builder
+```
+
+### Google Pub/Sub adapters
+
+Pub/Sub is a message transport, not a recovery store. Compose it with Core-only waiting for
+simple apps, or with Redis/Postgres-style recovery when late responses must survive redeploys.
+
+```csharp
+builder.Services.AddAsyncResponse(); // or AddRedisAsyncResponse()
+
+builder.Services.AddGooglePubSubWorkerTransport(options =>
+{
+    options.ProjectId = "my-gcp-project";
+    options.WorkerTopicId = "asyncresponse-workers";
+});
+
+builder.Services.AddGooglePubSubWorkerSubscriber(options =>
+{
+    options.ProjectId = "my-gcp-project";
+    options.WorkerSubscriptionId = "asyncresponse-workers-sub";
+});
+
+builder.Services.AddGooglePubSubResponseIngress(options =>
+{
+    options.ProjectId = "my-gcp-project";
+    options.ResponseSubscriptionId = "asyncresponse-responses-sub";
+    options.CorrelationIdAttribute = "correlationId";
+});
+```
+
+For the Core-only setup, the convenience registration wires the in-memory response channel plus
+all Pub/Sub adapters:
+
+```csharp
+builder.Services.AddGooglePubSubAsyncResponse(options =>
+{
+    options.ProjectId = "my-gcp-project";
+    options.WorkerTopicId = "asyncresponse-workers";
+    options.WorkerSubscriptionId = "asyncresponse-workers-sub";
+    options.ResponseSubscriptionId = "asyncresponse-responses-sub";
+});
 ```
 
 ### 1. Define a payload — and its domain semantics
@@ -238,7 +316,7 @@ await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsy
 ```
 
 The ambient correlation id is captured with the job and restored before execution, so anything
-the job publishes correlates automatically. `AddInProcessWorkerTransport()` executes jobs in the
+the job publishes correlates automatically. `AddInProcessWorkerQueue()` executes jobs in the
 current process; for distributed execution implement `IWorkerTransport` against your broker and
 have the consumer call `ingress.HandleWorkerMessageAsync(json)`.
 

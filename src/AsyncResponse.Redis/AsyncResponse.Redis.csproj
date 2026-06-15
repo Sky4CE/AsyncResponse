@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <PackageId>AsyncResponse.Redis</PackageId>
-    <Description>Redis transport for AsyncResponse: await responses from message brokers and background workers by correlation id over Redis pub/sub, with durable lost-subscriber recovery (survives redeploys), domain-state-aware failure routing, a stale-flow watchdog, and a readiness health check.</Description>
+    <Description>Redis backend for AsyncResponse: Redis pub/sub response channel, Redis recovery-state store for durable lost-subscriber recovery, domain-state-aware failure routing, stale-flow watchdog, and readiness health check.</Description>
   </PropertyGroup>
 
   <ItemGroup>

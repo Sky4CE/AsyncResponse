@@ -11,8 +11,8 @@
     <Company>Vitalii Tiunisov</Company>
     <Copyright>Copyright (c) Vitalii Tiunisov</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/vitaliy-opti/AsyncResponse</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/vitaliy-opti/AsyncResponse</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/Sky4CE/AsyncResponse</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Sky4CE/AsyncResponse</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>async;response;correlation;correlation-id;redis;pubsub;request-response;messaging;background-worker;recovery;resilience</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>

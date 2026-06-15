@@ -15,7 +15,7 @@ builder.Services.AddRedisAsyncResponse(options =>
     options.KeyPrefix = "sample";
     options.RecoveryStateExpiry = TimeSpan.FromHours(1);
 });
-builder.Services.AddInProcessWorkerTransport();
+builder.Services.AddInProcessWorkerQueue();
 builder.Services.AddAsyncResponseWatchdog(options =>
 {
     // Aggressive values so the demo shows results quickly; defaults are 6h/24h/5m.

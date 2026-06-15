@@ -97,9 +97,9 @@ public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayloa
 
     /// <summary>
     /// Specifies how long to wait before the waiter faults with a <see cref="TimeoutException"/>.
-    /// When not specified, the transport's default applies (for the Redis transport: the
-    /// recovery-state expiry) — waits are never infinite, so a response that never arrives fails
-    /// the flow instead of leaving it stuck.
+    /// When not specified, the response channel's default applies (for the built-in channels:
+    /// the recovery-state expiry) — waits are never infinite, so a response that never arrives
+    /// fails the flow instead of leaving it stuck.
     /// </summary>
     IAsyncResponseAttachedBuilder<T> WithTimeout(TimeSpan timeout);
 

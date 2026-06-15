@@ -6,21 +6,15 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 namespace Microsoft.Extensions.DependencyInjection;
 
 /// <summary>
-/// DI registrations for the Redis async-response transport.
+/// DI registrations for Redis-backed AsyncResponse components.
 /// </summary>
 public static class RedisAsyncResponseServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers the Redis transport behind <see cref="IAsyncResponsePublisher"/>,
-    /// <see cref="IAsyncResponseSubscriber"/>, and <see cref="IAsyncResponseIngress"/>, plus the
-    /// fluent <see cref="IAsyncResponseBuilder"/>.
-    /// <para>
-    /// Requires a <c>StackExchange.Redis.IConnectionMultiplexer</c> singleton to be registered by
-    /// the host. All three transport interfaces resolve to one shared instance — per-interface
-    /// instances would split internal per-channel state.
-    /// </para>
+    /// Registers the Redis recovery-state store. Use this when another response channel should
+    /// still persist lost-subscriber callbacks in Redis.
     /// </summary>
-    public static IServiceCollection AddRedisAsyncResponse(
+    public static IServiceCollection AddRedisRecoveryStore(
         this IServiceCollection services,
         Action<RedisAsyncResponseOptions>? configure = null)
     {
@@ -30,14 +24,47 @@ public static class RedisAsyncResponseServiceCollectionExtensions
             services.Configure(configure);
         }
 
+        services.TryAddSingleton<RedisRecoveryStateStore>();
+        services.Replace(ServiceDescriptor.Singleton<IRecoveryStateStore>(provider => provider.GetRequiredService<RedisRecoveryStateStore>()));
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers Redis pub/sub as the response channel behind
+    /// <see cref="IAsyncResponsePublisher"/> and <see cref="IAsyncResponseSubscriber"/>, plus the
+    /// fluent builder and transport-neutral ingress.
+    /// <para>
+    /// Requires a <c>StackExchange.Redis.IConnectionMultiplexer</c> singleton to be registered by
+    /// the host. Publisher/subscriber interfaces resolve to one shared instance — per-interface
+    /// instances would split internal per-channel state. Recovery state is stored through
+    /// <see cref="IRecoveryStateStore"/>; by default this method registers the Redis store too.
+    /// </para>
+    /// </summary>
+    public static IServiceCollection AddRedisResponseChannel(
+        this IServiceCollection services,
+        Action<RedisAsyncResponseOptions>? configure = null)
+    {
+        services.AddRedisRecoveryStore(configure);
+
         services.TryAddSingleton<RedisAsyncResponseTransport>();
-        services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<RedisAsyncResponseTransport>());
-        services.TryAddSingleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<RedisAsyncResponseTransport>());
-        services.TryAddSingleton<IAsyncResponseIngress>(provider => provider.GetRequiredService<RedisAsyncResponseTransport>());
+        services.Replace(ServiceDescriptor.Singleton<IAsyncResponsePublisher>(provider =>
+            provider.GetRequiredService<RedisAsyncResponseTransport>()));
+        services.Replace(ServiceDescriptor.Singleton<IAsyncResponseSubscriber>(provider =>
+            provider.GetRequiredService<RedisAsyncResponseTransport>()));
         services.AddAsyncResponseBuilder();
 
         return services;
     }
+
+    /// <summary>
+    /// Compatibility/simple setup: Redis recovery store + Redis response channel + fluent
+    /// builder + transport-neutral ingress.
+    /// </summary>
+    public static IServiceCollection AddRedisAsyncResponse(
+        this IServiceCollection services,
+        Action<RedisAsyncResponseOptions>? configure = null)
+        => services.AddRedisResponseChannel(configure);
 
     /// <summary>
     /// Registers the report-only watchdog that periodically scans the persisted recovery state

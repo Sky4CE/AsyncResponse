@@ -1,9 +1,10 @@
 namespace AsyncResponse;
 
 /// <summary>
-/// Broadcasts asynchronous responses (payloads or failures) on the channel identified by a
-/// correlation id. Active waiters receive them; when nobody is listening, the lost-subscriber
-/// fallback routes them through the persisted <see cref="RecoveryState"/> callbacks.
+/// Broadcasts asynchronous responses (payloads or failures) on the response channel identified
+/// by a correlation id. Active waiters receive them; when nobody is listening, the
+/// lost-subscriber fallback routes them through the <see cref="RecoveryState"/> callbacks stored
+/// in the configured <see cref="IRecoveryStateStore"/>.
 /// </summary>
 public interface IAsyncResponsePublisher
 {

@@ -10,7 +10,7 @@ using Xunit;
 namespace AsyncResponse.Tests;
 
 /// <summary>
-/// No-subscriber behavior of the Redis transport (the lost-subscriber fallback after a
+/// No-subscriber behavior of the Redis response channel (the lost-subscriber fallback after a
 /// redeploy/restart), exercised through the real implementation resolved from DI with Redis
 /// mocked. Verifies that the domain state of the payload — not the transport envelope — decides
 /// between the resume callback and the failure callback, and that the broker ingress delivers
