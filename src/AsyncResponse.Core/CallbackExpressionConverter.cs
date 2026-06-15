@@ -8,7 +8,7 @@ namespace AsyncResponse;
 /// become runtime placeholders. This gives compile-time safety (rename-refactoring, type checks)
 /// over hand-written reflection descriptors.
 /// </summary>
-public static class CallbackExpressionConverter
+internal static class CallbackExpressionConverter
 {
     public static ReflectionCallDto ToReflectionCall<TService>(Expression<Action<TService>> expression)
         => Build<TService>(expression.Body);

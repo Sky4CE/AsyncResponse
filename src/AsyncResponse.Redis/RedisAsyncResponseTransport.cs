@@ -208,11 +208,13 @@ internal sealed class RedisAsyncResponseTransport : IAsyncResponsePublisher, IAs
         // Receives raw Redis pub/sub messages and enqueues them on the per-channel executor.
         void RedisHandler(RedisChannel messageChannel, RedisValue messageValue)
         {
-            // Restore the ambient correlation id for the handling scope.
-            AsyncResponseContext.SetCorrelationId(storedCorrelationId);
-
             _ = GetExecutor(messageChannel.ToString()!)
-                  .Enqueue(() => ProcessRedisMessageAsync(messageChannel, messageValue, RedisHandler))
+                  .Enqueue(async () =>
+                  {
+                      // Restore the ambient correlation id for the message-processing scope.
+                      using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
+                      await ProcessRedisMessageAsync(messageChannel, messageValue, RedisHandler).ConfigureAwait(false);
+                  })
                   .ContinueWith(t =>
                   {
                       if (t.IsFaulted)

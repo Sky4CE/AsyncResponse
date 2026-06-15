@@ -9,7 +9,7 @@ namespace AsyncResponse;
 /// (<see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>) and the in-process worker
 /// transport, so every transport executes jobs identically.
 /// </summary>
-public sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILogger<WorkerJobExecutor> _logger)
+internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILogger<WorkerJobExecutor> _logger)
 {
     private const string SERVICE_NAME = nameof(WorkerJobExecutor);
 
@@ -24,12 +24,9 @@ public sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILogge
         _logger.LogDebug("{ServiceName}: executing job {Target}.{Method} (correlationId: {CorrelationId}).",
             SERVICE_NAME, job.Call.ServiceInterfaceFullName, job.Call.MethodName, job.CorrelationId);
 
-        // Restore the ambient correlation id so publishes made by the job correlate to the
-        // originating operation.
-        if (!string.IsNullOrWhiteSpace(job.CorrelationId))
-        {
-            AsyncResponseContext.SetCorrelationId(job.CorrelationId!);
-        }
+        // Scope the restored ambient correlation id so one job cannot inherit or leak another
+        // job's correlation context.
+        using var correlationScope = AsyncResponseContext.PushCorrelationId(job.CorrelationId);
 
         var invocation = ReflectionExtensions.ResolveCallback(
             job.Call,

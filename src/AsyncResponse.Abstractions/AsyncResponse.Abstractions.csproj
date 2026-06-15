@@ -6,6 +6,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Core" />
+    <InternalsVisibleTo Include="AsyncResponse.Redis" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Update="Microsoft.SourceLink.GitHub" Version="10.0.300" />
   </ItemGroup>
 

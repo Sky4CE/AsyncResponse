@@ -235,6 +235,36 @@ public class LostSubscriberRoutingTests
         Assert.Equal(CorrelationId, observedCorrelationId);
     }
 
+    [Fact]
+    public async Task Ingress_WorkerMessage_WithoutCorrelationId_ClearsAmbientOnlyForJob()
+    {
+        AsyncResponseContext.SetCorrelationId("outer-correlation-id");
+        try
+        {
+            var job = new WorkerJobEnvelope
+            {
+                CorrelationId = null,
+                Call = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+                    MethodName = nameof(IRecoverySpy.OnWorkerJob),
+                    Params = [CallbackParam.ForValue(42)]
+                }
+            };
+
+            await Ingress.HandleWorkerMessageAsync(JsonSerializer.Serialize(job));
+
+            var (orderId, observedCorrelationId) = Assert.Single(_spy.WorkerJobs);
+            Assert.Equal(42, orderId);
+            Assert.Null(observedCorrelationId);
+            Assert.Equal("outer-correlation-id", AsyncResponseContext.CorrelationId);
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+        }
+    }
+
     // ----- helpers -----
 
     private void ArmRecoveryState(string? payloadTypeFullName = "default", bool includeFailureCallback = true)

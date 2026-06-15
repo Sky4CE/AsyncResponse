@@ -11,7 +11,7 @@ namespace AsyncResponse;
 /// <see cref="IAsyncResponsePayload.ClassifyOutcome"/>.
 /// </para>
 /// </summary>
-public static class PayloadOutcomeClassifier
+internal static class PayloadOutcomeClassifier
 {
     /// <summary>
     /// Attempts to classify the domain outcome of <paramref name="payload"/>.

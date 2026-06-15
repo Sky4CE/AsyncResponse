@@ -48,6 +48,31 @@ public static class AsyncResponseContext
             : throw new ArgumentException("CorrelationId cannot be null or whitespace.", nameof(correlationId));
     }
 
+    /// <summary>
+    /// Temporarily sets the ambient correlation id for the current logical operation and
+    /// restores the previous value when the returned scope is disposed. Passing <c>null</c> or
+    /// whitespace clears the ambient id for the scope.
+    /// </summary>
+    internal static IDisposable PushCorrelationId(string? correlationId)
+    {
+        var previousCorrelationId = _currentCorrelationId.Value;
+        _currentCorrelationId.Value = !string.IsNullOrWhiteSpace(correlationId) ? correlationId : null;
+        return new CorrelationScope(previousCorrelationId);
+    }
+
     /// <summary>Clears the ambient correlation id for the current logical operation.</summary>
     public static void ClearCorrelationId() => _currentCorrelationId.Value = null;
+
+    private sealed class CorrelationScope(string? _previousCorrelationId) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _currentCorrelationId.Value = _previousCorrelationId;
+            }
+        }
+    }
 }

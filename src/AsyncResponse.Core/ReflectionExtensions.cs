@@ -8,7 +8,7 @@ namespace AsyncResponse;
 /// materializing untyped JSON payloads as CLR types, resolving placeholder parameters, and
 /// invoking <see cref="ReflectionInvocationDto"/>s against the DI container.
 /// </summary>
-public static class ReflectionExtensions
+internal static class ReflectionExtensions
 {
     // Loose options for any JSON deserialization here.
     private static readonly JsonSerializerOptions _looseJsonOptions = new()
