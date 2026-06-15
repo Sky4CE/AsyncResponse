@@ -25,7 +25,17 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Test
-        run: dotnet test --configuration Release --no-build --logger trx
+        # Microsoft.Testing.Platform: TRX report + code coverage via the MTP extensions (args after
+        # `--` are forwarded to the test app). An absolute results directory keeps output stable
+        # regardless of the test app's working directory at solution-level `dotnet test`.
+        run: dotnet test --configuration Release --no-build -- --report-trx --coverage --results-directory "${{ github.workspace }}/TestResults"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ github.workspace }}/TestResults
 
       - name: Pack (validation only)
         run: |

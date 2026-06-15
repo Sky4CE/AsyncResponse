@@ -524,6 +524,22 @@ persisted in the recovery state.
 10. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create
    a second connection for AsyncResponse.
 
+## Building and testing
+
+```bash
+dotnet build
+dotnet test            # runs on Microsoft.Testing.Platform (xUnit.net v3)
+```
+
+The test project is a Microsoft.Testing.Platform application, so you can also run it directly and
+use MTP options — test filtering, a TRX report, and code coverage:
+
+```bash
+dotnet run --project tests/AsyncResponse.Tests -f net10.0 -- \
+    --filter-namespace AsyncResponse.Tests \
+    --report-trx --coverage --results-directory ./TestResults
+```
+
 ## License
 
 [MIT](LICENSE) — © Vitalii Tiunisov
