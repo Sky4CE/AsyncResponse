@@ -8,7 +8,7 @@ internal sealed class AsyncResponseBuilder(
     IWorkerTransport? _workerTransport = null) : IAsyncResponseBuilder
 {
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
+    public IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
         => new AsyncResponseBuilder<T>(
             _subscriber,
             !string.IsNullOrWhiteSpace(correlationId)
@@ -48,8 +48,8 @@ internal sealed class AsyncResponseBuilder(
         => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
 }
 
-/// <inheritdoc cref="IAsyncResponseBuilder{T}" />
-internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePayload
+/// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}" />
+internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePayload
 {
     private readonly IAsyncResponseSubscriber _subscriber;
     private readonly string _correlationId;
@@ -65,29 +65,29 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback)
+    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback)
     {
         _resumeCallback = callback ?? throw new ArgumentNullException(nameof(callback));
         return this;
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
+    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
         => OnLostSubscriberResume(CallbackExpressionConverter.ToReflectionCall(callback));
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback)
+    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback)
     {
         _failureCallback = callback ?? throw new ArgumentNullException(nameof(callback));
         return this;
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
+    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
         => OnLostSubscriberFailure(CallbackExpressionConverter.ToReflectionCall(callback));
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> WithTimeout(TimeSpan timeout)
+    public IAsyncResponseAttachedBuilder<T> WithTimeout(TimeSpan timeout)
     {
         if (timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than zero.");
@@ -97,7 +97,7 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> Until(Func<T, bool> predicate)
+    public IAsyncResponseAttachedBuilder<T> Until(Func<T, bool> predicate)
     {
         _completionPredicate = predicate != null
             ? payload => new ValueTask<bool>(predicate(payload))
@@ -106,7 +106,7 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> Until(Func<T, Task<bool>> predicate)
+    public IAsyncResponseAttachedBuilder<T> Until(Func<T, Task<bool>> predicate)
     {
         _completionPredicate = predicate != null
             ? payload => new ValueTask<bool>(predicate(payload))
@@ -114,19 +114,25 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
         return this;
     }
 
-    /// <inheritdoc />
-    public Task<T> WaitAsync(Func<Task>? trigger = null)
-        => WaitCoreAsync(trigger);
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WaitAsync" />
+    public Task<T> WaitAsync()
+        => WaitCoreAsync(trigger: null);
 
-    /// <inheritdoc />
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{Task})" />
+    public Task<T> WaitAsync(Func<Task> trigger)
+    {
+        ArgumentNullException.ThrowIfNull(trigger);
+        return WaitCoreAsync(trigger);
+    }
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{string, Task})" />
     public Task<T> WaitAsync(Func<string, Task> trigger)
     {
         ArgumentNullException.ThrowIfNull(trigger);
         return WaitCoreAsync(() => trigger(_correlationId));
     }
 
-    /// <inheritdoc />
-    public Task<IAsyncResponseWaiter<T>> BuildWaiterAsync()
+    private Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
         => _subscriber.CreateResponseWaiter<T>(
             _correlationId,
             _resumeCallback,
@@ -137,7 +143,7 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
 
     private async Task<T> WaitCoreAsync(Func<Task>? trigger)
     {
-        await using var waiter = await BuildWaiterAsync().ConfigureAwait(false);
+        await using var waiter = await CreateWaiterAsync().ConfigureAwait(false);
 
         // Subscribe-before-send by construction: the trigger runs only once the subscription and
         // the recovery state exist, so the first response can never race the registration. A
@@ -152,8 +158,9 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T>, IAsync
     // -----------------------------------------------------------------------------------------
     // IAsyncResponseTriggeredBuilder<T> — the builder handed out by For<T>() (generated
     // correlation id). Same shared state and behavior; only the static return type differs, so
-    // the trigger-required WaitAsync terminal is preserved through the fluent chain. The shared
-    // WaitAsync/BuildWaiterAsync implementations above satisfy both interfaces.
+    // the trigger-required WaitAsync terminal is preserved through the fluent chain. The public
+    // WaitAsync(Func<Task>) / WaitAsync(Func<string, Task>) overloads above satisfy its
+    // terminals.
 
     IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {

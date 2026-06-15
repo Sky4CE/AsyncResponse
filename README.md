@@ -44,7 +44,7 @@ AsyncResponse solves both halves:
 ```
         you                       AsyncResponse                         remote system
          │                              │                                     │
-         │  For<T>(cid).WaitAsync(send) │                                     │
+         │  For<T>().WaitAsync(send)    │                                     │
          ├─────────────────────────────►│ 1. subscribe cid + persist          │
          │                              │    RecoveryState (Redis)            │
          │                              │ 2. run trigger ────────────────────►│  (request sent
@@ -140,13 +140,11 @@ paths simply returns `Succeeded`.
 ```csharp
 public async Task<OrderResult> PlaceOrderAsync(int orderId)
 {
-    var correlationId = AsyncResponseContext.CreateCorrelationId();
-
     return await _asyncResponse
-        .For<OrderResult>(correlationId)
+        .For<OrderResult>()
         .WithTimeout(TimeSpan.FromMinutes(10))
         .Until(r => r.Status != OrderStatus.Processing)
-        .WaitAsync(() => _remoteSystem.SubmitAsync(orderId, correlationId));
+        .WaitAsync(correlationId => _remoteSystem.SubmitAsync(orderId, correlationId));
 }
 ```
 
@@ -155,22 +153,26 @@ recovery state exist, so the first response can never arrive before anyone is li
 failing trigger tears the registration down (the operation never started). Rule of thumb:
 *never send the request yourself — pass the send as the trigger.*
 
-Two more shapes of the same terminal:
+The two builder shapes are **typed for safety** — each terminal offers exactly the actions
+that make sense for where the correlation id came from:
 
-- `WaitAsync()` with no trigger — the request was already sent: a resumed step re-attaching to
-  its in-flight correlation id, or a different system owning the send. Only your flow can know
-  this (from its persisted state), so it's an explicit argument, never auto-detected.
-- `For<T>().WaitAsync(correlationId => …)` — the builder generates the correlation id (also
-  placing it in the ambient `AsyncResponseContext`) and hands it to the trigger, so simple flows
-  never touch correlation ids at all. This overload is **typed for safety**: `For<T>()` returns
-  an `IAsyncResponseTriggeredBuilder<T>` whose `WaitAsync` *requires* the trigger — a generated
-  correlation id is known to nobody else, so waiting without sending could never complete, and
-  the type system makes that mistake unrepresentable. The explicit-id `For<T>(correlationId)`
-  keeps the trigger optional on purpose: durable flows persist the id first and decide at
-  runtime whether this run sends or re-attaches.
+- `For<T>()` → `IAsyncResponseTriggeredBuilder<T>` — the builder generates the correlation id
+  (also placing it in the ambient `AsyncResponseContext`) and `WaitAsync` *requires* the
+  trigger: a generated id is known to nobody else, so waiting without sending could never
+  complete, and the type system makes that mistake unrepresentable. The
+  `WaitAsync(correlationId => …)` overload hands the id to the trigger — persist it into your
+  flow state there (the subscription already exists), then send.
+- `For<T>(correlationId)` → `IAsyncResponseAttachedBuilder<T>` — *attaches* to an operation
+  already started elsewhere: a resumed step re-attaching to its in-flight correlation id, or a
+  different system owning the send. Its `WaitAsync()` takes *no* trigger — re-sending an
+  in-flight operation would double-fire it, so that mistake is unrepresentable too.
 
-Need the waiter's lifetime under your control? `BuildWaiterAsync()` returns an
-`IAsyncResponseWaiter<T>`; `await waiter.ResponseTask` when ready, dispose to cancel.
+Flows that decide fresh-vs-resume at runtime branch between the two chains on their persisted
+state — only the flow can know which case applies; the transport cannot detect it.
+
+Need to arm recovery without awaiting in place? Start the wait as a background task
+(`_ = builder…WaitAsync(trigger)`): the subscription and the persisted recovery state stay
+alive while your code moves on (see the sample's `/demo/lost-subscriber/arm` endpoint).
 
 ### 3. Deliver responses (your broker → the ingress)
 
@@ -197,13 +199,13 @@ receives the late response — which may be a *different deployment*):
 
 ```csharp
 var result = await _asyncResponse
-    .For<OrderResult>(correlationId)
+    .For<OrderResult>()
     .Until(r => r.Status != OrderStatus.Processing)
     .OnLostSubscriberResume<IOrderFlow>(flow =>
         flow.ResumeAsync(orderId, Placeholder.Payload<OrderResult>(), Placeholder.CorrelationId()))
     .OnLostSubscriberFailure<IOrderFlow>(flow =>
         flow.FailAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-    .WaitAsync(() => _remoteSystem.SubmitAsync(orderId, correlationId));
+    .WaitAsync(correlationId => _remoteSystem.SubmitAsync(orderId, correlationId));
 ```
 
 `Placeholder.Payload<T>()`, `Placeholder.Exception()`, and `Placeholder.CorrelationId()` are

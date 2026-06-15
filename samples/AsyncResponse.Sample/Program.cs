@@ -2,7 +2,6 @@ using AsyncResponse;
 using AsyncResponse.Sample;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using StackExchange.Redis;
-using System.Collections.Concurrent;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -34,7 +33,8 @@ var app = builder.Build();
 
 // Waiters armed for the lost-subscriber demo. Held (not awaited) so they stay alive until
 // "crashed"; a real flow would be awaiting them inside a worker.
-var armedWaiters = new ConcurrentDictionary<string, IAsyncResponseWaiter<OperationResult>>();
+// Background waits armed by /demo/lost-subscriber/arm — kept only so the tasks stay referenced.
+var armedWaits = new List<Task<OperationResult>>();
 
 app.MapGet("/", () => Results.Text(
     """
@@ -50,24 +50,25 @@ app.MapGet("/", () => Results.Text(
       GET  /healthz                                              health report incl. the recovery watchdog
     """));
 
-// 1) Request/response with an active waiter. The WaitAsync trigger guarantees
-//    subscribe-before-send.
+// 1) Request/response with an active waiter. For<T>() generates the correlation id and the
+//    required WaitAsync trigger guarantees subscribe-before-send.
 app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior) =>
 {
-    var correlationId = AsyncResponseContext.CreateCorrelationId();
+    var startedCorrelationId = string.Empty;
 
     var result = await asyncResponse
-        .For<OperationResult>(correlationId)
+        .For<OperationResult>()
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running) // consume progress messages
-        .WaitAsync(() =>
+        .WaitAsync(correlationId =>
         {
+            startedCorrelationId = correlationId;
             remote.Start(correlationId, behavior ?? RemoteBehavior.Succeed);
             return Task.CompletedTask;
         });
 
     return result.Status == OperationStatus.Completed
-        ? Results.Ok(new { correlationId, result.Status, result.Message })
+        ? Results.Ok(new { correlationId = startedCorrelationId, result.Status, result.Message })
         : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
 });
 
@@ -103,25 +104,34 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
     return Results.Accepted(value: new { orderId, note = "Watch the logs for WORKER output." });
 });
 
-// 4a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it alive.
+// 4a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
+// waiting in the background (like a worker awaiting a slow remote operation). The HTTP request
+// returns immediately; the subscription and the persisted recovery state stay alive.
 app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncResponse) =>
 {
-    var correlationId = AsyncResponseContext.CreateCorrelationId();
+    var armed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    var waiter = await asyncResponse
-        .For<OperationResult>(correlationId)
+    armedWaits.Add(asyncResponse
+        .For<OperationResult>()
         .Until(response => response.Status != OperationStatus.Running)
         .OnLostSubscriberResume<ISampleFlowService>(flow =>
             flow.ResumeFlowAsync("sample-flow", Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId()))
         .OnLostSubscriberFailure<ISampleFlowService>(flow =>
             flow.FailFlowAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-        .BuildWaiterAsync();
+        .WaitAsync(correlationId =>
+        {
+            // The trigger runs once the subscription and recovery state exist. The "send" here
+            // is handing the id to the operator: the remote work is delivered manually via
+            // /demo/lost-subscriber/respond.
+            armed.SetResult(correlationId);
+            return Task.CompletedTask;
+        }));
 
-    armedWaiters[correlationId] = waiter;
+    var armedCorrelationId = await armed.Task;
 
     return Results.Ok(new
     {
-        correlationId,
+        correlationId = armedCorrelationId,
         next = "POST /demo/lost-subscriber/crash, then /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed"
     });
 });

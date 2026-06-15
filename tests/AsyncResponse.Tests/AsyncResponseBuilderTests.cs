@@ -32,13 +32,13 @@ public class AsyncResponseBuilderTests
         var callOrder = new List<string>();
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
-                "corr-1", It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
                 It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
             .Callback(() => callOrder.Add("subscribe"))
             .ReturnsAsync(_waiter.Object);
 
         var result = await new AsyncResponseBuilder(_subscriber.Object)
-            .For<OperationResult>("corr-1")
+            .For<OperationResult>()
             .WaitAsync(() =>
             {
                 callOrder.Add("trigger");
@@ -52,7 +52,7 @@ public class AsyncResponseBuilderTests
     [Fact]
     public async Task WaitAsync_WhenTriggerThrows_DisposesWaiterAndPropagates()
     {
-        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>();
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             builder.WaitAsync(() => throw new InvalidOperationException("send failed")));
@@ -62,30 +62,16 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
-    public async Task WaitAsync_WithoutTrigger_OnlyWaits()
+    public async Task AttachedWaitAsync_IsWaitOnly()
     {
+        // For<T>(correlationId) attaches to an operation started elsewhere; its terminal takes
+        // no trigger — a double-send is not expressible.
         var result = await new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>("corr-1")
             .WaitAsync();
 
         Assert.Equal(OperationStatus.Completed, result.Status);
         _waiter.Verify(w => w.DisposeAsync(), Times.Once);
-    }
-
-    [Fact]
-    public async Task WaitAsync_CorrelationIdOverload_PassesTheWaiterCorrelationId()
-    {
-        string? observed = null;
-
-        await new AsyncResponseBuilder(_subscriber.Object)
-            .For<OperationResult>("corr-1")
-            .WaitAsync(correlationId =>
-            {
-                observed = correlationId;
-                return Task.CompletedTask;
-            });
-
-        Assert.Equal("corr-1", observed);
     }
 
     [Fact]
@@ -132,7 +118,7 @@ public class AsyncResponseBuilderTests
             .For<OperationResult>("corr-1")
             .OnLostSubscriberResume<IRecoverySpy>(spy => spy.OnResume(Placeholder.Payload<OperationResult>()))
             .OnLostSubscriberFailure<IRecoverySpy>(spy => spy.OnFailure(Placeholder.Exception()))
-            .BuildWaiterAsync();
+            .WaitAsync();
 
         Assert.NotNull(resume);
         Assert.Equal(nameof(IRecoverySpy.OnResume), resume!.MethodName);
