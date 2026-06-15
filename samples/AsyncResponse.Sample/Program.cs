@@ -10,19 +10,19 @@ var builder = WebApplication.CreateBuilder(args);
 var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
 
-builder.Services.AddRedisAsyncResponse(options =>
+builder.Services.AddAsyncResponse(options =>
+{
+    // Aggressive watchdog values so the demo shows results quickly; defaults are 6h/24h/5m.
+    options.Watchdog.StartupDelay = TimeSpan.FromSeconds(10);
+    options.Watchdog.Interval = TimeSpan.FromSeconds(30);
+    options.Watchdog.StaleAfter = TimeSpan.FromMinutes(2);
+})
+.WithRedisChannel(options =>
 {
     options.KeyPrefix = "sample";
     options.RecoveryStateExpiry = TimeSpan.FromHours(1);
-});
-builder.Services.AddInProcessWorkerQueue();
-builder.Services.AddAsyncResponseWatchdog(options =>
-{
-    // Aggressive values so the demo shows results quickly; defaults are 6h/24h/5m.
-    options.StartupDelay = TimeSpan.FromSeconds(10);
-    options.Interval = TimeSpan.FromSeconds(30);
-    options.StaleAfter = TimeSpan.FromMinutes(2);
-});
+})
+.WithInMemoryTransport();
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 
 // --- Sample services ------------------------------------------------------------------------

@@ -85,8 +85,8 @@ make the call.
 
 | Package | What's inside |
 |---|---|
-| `AsyncResponse.Core` | Fluent builder, process-local response channel, process-local recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-process worker queue. |
-| `AsyncResponse.Redis` | Optional Redis response channel, Redis recovery-state store, recovery watchdog, readiness health check. |
+| `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
+| `AsyncResponse.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
 
@@ -114,8 +114,9 @@ using AsyncResponse;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddAsyncResponse();        // in-memory response channel + fluent builder
-builder.Services.AddInProcessWorkerQueue(); // optional: background worker jobs
+builder.Services.AddAsyncResponse()   // engine: fluent builder, ingress, recovery watchdog
+    .WithInMemoryChannel()            // process-local response channel + recovery store (required)
+    .WithInMemoryTransport();         // optional: in-process background worker jobs
 ```
 
 ### Redis-backed response channel and recovery
@@ -132,19 +133,17 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<IConnectionMultiplexer>(
     _ => ConnectionMultiplexer.Connect("localhost:6379"));
 
-builder.Services.AddRedisAsyncResponse();          // Redis response channel + Redis recovery store
-builder.Services.AddInProcessWorkerQueue();        // optional: background worker jobs
-builder.Services.AddAsyncResponseWatchdog();       // optional: stale-flow detection
+builder.Services.AddAsyncResponse()                // engine + recovery watchdog (on by default)
+    .WithRedisChannel()                            // Redis response channel + Redis recovery store
+    .WithInMemoryTransport();                      // optional: background worker jobs
 builder.Services.AddHealthChecks()
-    .AddAsyncResponseRecoveryCheck();              // optional: surface it on /readyz
+    .AddAsyncResponseRecoveryCheck();              // optional: surface the watchdog on /readyz
 ```
 
-The Redis package also exposes composable registrations:
-
-```csharp
-builder.Services.AddRedisRecoveryStore();   // Redis only for recovery state
-builder.Services.AddRedisResponseChannel(); // Redis pub/sub response channel + builder
-```
+`AddAsyncResponse()` registers the channel-agnostic engine but **no channel** — chain exactly one
+(`.WithInMemoryChannel()` or `.WithRedisChannel()`). An app that starts without a channel fails
+fast at host startup, so a misconfiguration can never silently hang every waiter. The recovery
+watchdog is part of the engine and runs by default for whichever channel you choose.
 
 ### Google Pub/Sub adapters
 
@@ -152,40 +151,23 @@ Pub/Sub is a message transport, not a recovery store. Compose it with Core-only 
 simple apps, or with Redis/Postgres-style recovery when late responses must survive redeploys.
 
 ```csharp
-builder.Services.AddAsyncResponse(); // or AddRedisAsyncResponse()
-
-builder.Services.AddGooglePubSubWorkerTransport(options =>
-{
-    options.ProjectId = "my-gcp-project";
-    options.WorkerTopicId = "asyncresponse-workers";
-});
-
-builder.Services.AddGooglePubSubWorkerSubscriber(options =>
-{
-    options.ProjectId = "my-gcp-project";
-    options.WorkerSubscriptionId = "asyncresponse-workers-sub";
-});
-
-builder.Services.AddGooglePubSubResponseIngress(options =>
-{
-    options.ProjectId = "my-gcp-project";
-    options.ResponseSubscriptionId = "asyncresponse-responses-sub";
-    options.CorrelationIdAttribute = "correlationId";
-});
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()   // or .WithRedisChannel() for durable recovery
+    .WithGooglePubSubTransport(options =>
+    {
+        options.ProjectId = "my-gcp-project";
+        options.WorkerTopicId = "asyncresponse-workers";
+        options.WorkerSubscriptionId = "asyncresponse-workers-sub";
+        options.ResponseTopicId = "asyncresponse-responses";
+        options.ResponseSubscriptionId = "asyncresponse-responses-sub";
+        options.CorrelationIdAttribute = "correlationId";
+    });
 ```
 
-For the Core-only setup, the convenience registration wires the in-memory response channel plus
-all Pub/Sub adapters:
-
-```csharp
-builder.Services.AddGooglePubSubAsyncResponse(options =>
-{
-    options.ProjectId = "my-gcp-project";
-    options.WorkerTopicId = "asyncresponse-workers";
-    options.WorkerSubscriptionId = "asyncresponse-workers-sub";
-    options.ResponseSubscriptionId = "asyncresponse-responses-sub";
-});
-```
+One `.WithGooglePubSubTransport(...)` wires the worker publisher, the worker-job subscriber, and
+the response-ingress subscriber. Pub/Sub is a transport, not a recovery store, so pair it with a
+channel: `.WithInMemoryChannel()` for simple apps, or `.WithRedisChannel()` when late responses
+must survive redeploys.
 
 ### 1. Define a payload — and its domain semantics
 
@@ -316,9 +298,10 @@ await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsy
 ```
 
 The ambient correlation id is captured with the job and restored before execution, so anything
-the job publishes correlates automatically. `AddInProcessWorkerQueue()` executes jobs in the
-current process; for distributed execution implement `IWorkerTransport` against your broker and
-have the consumer call `ingress.HandleWorkerMessageAsync(json)`.
+the job publishes correlates automatically. `.WithInMemoryTransport()` executes jobs in the
+current process; for distributed execution use `.WithGooglePubSubTransport(...)` or implement
+`IWorkerTransport` against your broker and have the consumer call
+`ingress.HandleWorkerMessageAsync(json)`.
 
 ### 6. Timeouts, errors, and cancellation
 
@@ -341,10 +324,15 @@ catch (Exception ex)       { /* SetException from the remote side, with remote s
 
 ### 7. Operations: watchdog + health check
 
-`AddAsyncResponseWatchdog()` (register in **one** host per Redis) periodically scans the
+The recovery watchdog is part of the engine: `AddAsyncResponse()` starts it by default, and it
+works for whichever channel you registered (in-memory or Redis). It periodically scans the
 persisted recovery state and warns about entries that are old and have no live waiter — flows
 that are probably stuck. `AddAsyncResponseRecoveryCheck()` surfaces the cached findings on your
 health endpoint with stats and the offending correlation ids.
+
+Tune or disable it through `AsyncResponseOptions.Watchdog` — e.g. set `Watchdog.Enabled = false`
+in all but one host when several hosts share one Redis, so its scan and warnings aren't
+duplicated.
 
 The check reports at most **`Degraded`** — a stuck *business flow* must never pull a healthy
 *process* out of rotation, so keep `Degraded → 200` on readiness endpoints (the ASP.NET Core
@@ -353,18 +341,18 @@ default).
 ## Configuration
 
 ```csharp
-builder.Services.AddRedisAsyncResponse(options =>
+builder.Services.AddAsyncResponse(options =>
+{
+    options.Watchdog.Interval = TimeSpan.FromHours(6);
+    options.Watchdog.StaleAfter = TimeSpan.FromHours(24);
+    options.Watchdog.StartupDelay = TimeSpan.FromMinutes(5);
+    // options.Watchdog.Enabled = false;                   // e.g. all but one host per Redis
+})
+.WithRedisChannel(options =>
 {
     options.KeyPrefix = "myapp";                            // isolate apps/environments
     options.RecoveryStateExpiry = TimeSpan.FromDays(7);     // how long recovery survives
     options.DefaultTimeout = TimeSpan.FromHours(12);        // default per-waiter timeout
-});
-
-builder.Services.AddAsyncResponseWatchdog(options =>
-{
-    options.Interval = TimeSpan.FromHours(6);
-    options.StaleAfter = TimeSpan.FromHours(24);
-    options.StartupDelay = TimeSpan.FromMinutes(5);
 });
 ```
 

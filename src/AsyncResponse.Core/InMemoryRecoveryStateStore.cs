@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace AsyncResponse;
 
@@ -7,7 +8,7 @@ namespace AsyncResponse;
 /// and single-process apps. It is intentionally not durable: entries disappear when the process
 /// exits.
 /// </summary>
-internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore
+internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
 {
     private sealed record Entry(RecoveryState State, DateTime ExpiresAtUtc);
 
@@ -51,5 +52,18 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_entries.TryRemove(correlationId, out _));
+    }
+
+    public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await Task.CompletedTask.ConfigureAwait(false); // process-local store: no async I/O to await
+
+        var nowUtc = DateTime.UtcNow;
+        foreach (var entry in _entries.Values)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (entry.ExpiresAtUtc > nowUtc)
+                yield return entry.State;
+        }
     }
 }

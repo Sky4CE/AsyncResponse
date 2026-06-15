@@ -1,14 +1,14 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
-namespace AsyncResponse.Redis;
+namespace AsyncResponse;
 
 /// <summary>
 /// Surfaces the async-response watchdog findings on the health endpoints (e.g. <c>/readyz</c>).
 /// <para>
-/// Reads the snapshot cached by <see cref="AsyncResponseWatchdogState"/> — probes never touch
-/// Redis. The check reports at most <see cref="HealthStatus.Degraded"/>: stale recovery state
-/// means business flows are likely stuck and need operator attention, but the process itself is
-/// fully able to serve traffic, so this check should never flip readiness to 503 and pull
+/// Reads the snapshot cached by <see cref="AsyncResponseWatchdogState"/> — probes never touch the
+/// recovery store. The check reports at most <see cref="HealthStatus.Degraded"/>: stale recovery
+/// state means business flows are likely stuck and need operator attention, but the process itself
+/// is fully able to serve traffic, so this check should never flip readiness to 503 and pull
 /// instances out of rotation (map <see cref="HealthStatus.Degraded"/> to HTTP 200 in your
 /// health-endpoint options, which is the ASP.NET Core default).
 /// </para>

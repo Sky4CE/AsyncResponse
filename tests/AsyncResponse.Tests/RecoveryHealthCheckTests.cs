@@ -1,4 +1,3 @@
-using AsyncResponse.Redis;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Xunit;
 
@@ -35,7 +34,7 @@ public class RecoveryHealthCheckTests
     [Fact]
     public async Task StaleEntries_ReportDegradedWithDetails()
     {
-        var stale = new RecoveryStateObservation("key", "corr-stuck-1", DateTime.UtcNow - TimeSpan.FromDays(2), 0, typeof(OperationResult).FullName);
+        var stale = new RecoveryStateObservation("corr-stuck-1", DateTime.UtcNow - TimeSpan.FromDays(2), 0, typeof(OperationResult).FullName);
         var report = new AsyncResponseWatchdogReport(5, 1, [stale], 0);
 
         var result = await CheckAsync(state => state.Publish(Snapshot(report)));
@@ -70,7 +69,7 @@ public class RecoveryHealthCheckTests
     public async Task ManyStaleEntries_AreCappedInPayload()
     {
         var staleEntries = Enumerable.Range(1, 12)
-            .Select(i => new RecoveryStateObservation($"key-{i}", $"corr-{i}", DateTime.UtcNow - TimeSpan.FromDays(2), 0, null))
+            .Select(i => new RecoveryStateObservation($"corr-{i}", DateTime.UtcNow - TimeSpan.FromDays(2), 0, null))
             .ToList();
         var report = new AsyncResponseWatchdogReport(12, 0, staleEntries, 0);
 

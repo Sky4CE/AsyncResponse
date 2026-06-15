@@ -6,25 +6,25 @@ using System.Collections.Concurrent;
 namespace AsyncResponse;
 
 /// <summary>
-/// Process-local response channel used by <c>AddAsyncResponse()</c>. It provides the
-/// async-response programming model without Redis or another broker-backed response channel.
+/// Process-local response channel registered by <c>AddAsyncResponse().WithInMemoryChannel()</c>.
+/// It provides the async-response programming model without Redis or another broker-backed channel.
 /// Waiters, subscriptions, and recovery state are all in memory and disappear when the process
 /// exits.
 /// </summary>
-internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber
+internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
     private const string SERVICE_NAME = nameof(InMemoryAsyncResponseChannel);
 
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, SubscriptionBase>> _subscriptions = new(StringComparer.Ordinal);
     private readonly IRecoveryStateStore _recoveryStateStore;
-    private readonly AsyncResponseOptions _options;
+    private readonly InMemoryAsyncResponseOptions _options;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
     private readonly ILogger<InMemoryAsyncResponseChannel> _logger;
 
     public InMemoryAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         IRecoveryStateStore recoveryStateStore,
-        IOptions<AsyncResponseOptions> options,
+        IOptions<InMemoryAsyncResponseOptions> options,
         ILogger<InMemoryAsyncResponseChannel> logger)
     {
         _recoveryStateStore = recoveryStateStore;
@@ -160,6 +160,16 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
         _logger.LogInformation("{ServiceName}: {MethodName} Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.",
             SERVICE_NAME, MethodName, correlationId, subscribers.Count);
+    }
+
+    /// <inheritdoc />
+    public ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+            return new ValueTask<long>(0L);
+
+        long count = _subscriptions.TryGetValue(correlationId, out var subscribers) ? subscribers.Count : 0L;
+        return new ValueTask<long>(count);
     }
 
     private IReadOnlyList<SubscriptionBase> SnapshotSubscribers(string correlationId)

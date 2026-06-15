@@ -1,4 +1,3 @@
-using AsyncResponse.Redis;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -53,7 +52,7 @@ public class WatchdogReportTests
     [Fact]
     public void EntryWithoutTimestamp_IsCountedAsUnknownAge_NotStale()
     {
-        var entry = new RecoveryStateObservation("asyncresponse:recovery:legacy", "legacy", RegisteredAtUtc: null, ActiveSubscribers: 0, PayloadTypeFullName: null);
+        var entry = new RecoveryStateObservation("legacy", RegisteredAtUtc: null, ActiveSubscribers: 0, PayloadTypeFullName: null);
 
         var report = AsyncResponseWatchdogReport.Evaluate([entry], Now, StaleAfter);
 
@@ -67,7 +66,7 @@ public class WatchdogReportTests
         var stale = Entry(TimeSpan.FromDays(3), activeSubscribers: 0, correlationId: "stale");
         var healthyActive = Entry(TimeSpan.FromDays(3), activeSubscribers: 2, correlationId: "active");
         var armedYoung = Entry(TimeSpan.FromMinutes(10), activeSubscribers: 0, correlationId: "young");
-        var legacy = new RecoveryStateObservation("key", "legacy", null, 0, null);
+        var legacy = new RecoveryStateObservation("legacy", null, 0, null);
 
         var report = AsyncResponseWatchdogReport.Evaluate([stale, healthyActive, armedYoung, legacy], Now, StaleAfter);
 
@@ -79,7 +78,6 @@ public class WatchdogReportTests
 
     private static RecoveryStateObservation Entry(TimeSpan registeredAgo, long activeSubscribers, string correlationId = "corr-1")
         => new(
-            $"asyncresponse:recovery:{correlationId}",
             correlationId,
             Now - registeredAgo,
             activeSubscribers,

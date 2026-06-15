@@ -14,6 +14,13 @@ public sealed class GooglePubSubAsyncResponseOptions
     /// <summary>Subscription id consumed by the worker subscriber hosted service.</summary>
     public string? WorkerSubscriptionId { get; set; }
 
+    /// <summary>
+    /// Topic id that async-response messages are published to (by the remote system or worker) and
+    /// that <see cref="ResponseSubscriptionId"/> is attached to. The adapter consumes responses
+    /// through the subscription; it does not itself publish to this topic.
+    /// </summary>
+    public string? ResponseTopicId { get; set; }
+
     /// <summary>Subscription id consumed by the response-ingress hosted service.</summary>
     public string? ResponseSubscriptionId { get; set; }
 

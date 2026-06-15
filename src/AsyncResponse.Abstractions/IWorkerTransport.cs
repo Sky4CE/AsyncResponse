@@ -20,8 +20,8 @@ public sealed class WorkerJobEnvelope
 /// Publishes worker jobs for background execution. Implement this against your message broker
 /// of choice for distributed execution (any consumer then feeds the message into
 /// <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>), or register the built-in
-/// in-process queue (<c>AddInProcessWorkerQueue()</c>) for development and single-node
-/// deployments.
+/// in-memory queue (<c>AddAsyncResponse().WithInMemoryTransport()</c>) for development and
+/// single-node deployments.
 /// </summary>
 public interface IWorkerTransport
 {

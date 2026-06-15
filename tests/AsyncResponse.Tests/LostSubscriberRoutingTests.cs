@@ -41,7 +41,7 @@ public class LostSubscriberRoutingTests
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton(_multiplexer.Object);
         services.AddSingleton<IRecoverySpy>(_spy);
-        services.AddRedisAsyncResponse();
+        services.AddAsyncResponse().WithRedisChannel();
 
         _provider = services.BuildServiceProvider();
     }

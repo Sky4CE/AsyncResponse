@@ -4,16 +4,21 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 namespace Microsoft.Extensions.DependencyInjection;
 
 /// <summary>
-/// Core registrations for AsyncResponse.
+/// Core registrations for AsyncResponse. Everything is configured through the fluent builder
+/// returned by <see cref="AddAsyncResponse"/>: chain a channel and, optionally, a worker transport.
 /// </summary>
 public static class AsyncResponseCoreServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers AsyncResponse with the default process-local response channel and recovery
-    /// store. This is the simplest setup: no Redis, no durable recovery, but the same
-    /// async/await request-response pattern, predicates, timeouts, and broker ingress.
+    /// Registers the channel-agnostic AsyncResponse engine (fluent waiter builder, transport-neutral
+    /// ingress, worker-job executor, and the recovery watchdog) and returns a builder to configure
+    /// the rest. It deliberately registers <em>no</em> response channel: chain exactly one
+    /// (<see cref="WithInMemoryChannel"/> or the Redis package's <c>WithRedisChannel</c>) — an app
+    /// that starts without a channel fails fast at host startup. Optionally chain a worker transport
+    /// (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub package's
+    /// <c>WithGooglePubSubTransport</c>).
     /// </summary>
-    public static IServiceCollection AddAsyncResponse(
+    public static AsyncResponseRegistrationBuilder AddAsyncResponse(
         this IServiceCollection services,
         Action<AsyncResponseOptions>? configure = null)
     {
@@ -23,53 +28,68 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             services.Configure(configure);
         }
 
-        services.TryAddSingleton<IRecoveryStateStore, InMemoryRecoveryStateStore>();
-        services.TryAddSingleton<InMemoryAsyncResponseChannel>();
-        services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
-        services.TryAddSingleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
-        services.AddAsyncResponseBuilder();
-
-        return services;
-    }
-
-    /// <summary>
-    /// Registers the fluent <see cref="IAsyncResponseBuilder"/>, transport-neutral
-    /// <see cref="IAsyncResponseIngress"/>, and <see cref="WorkerJobExecutor"/>.
-    /// Requires an <see cref="IAsyncResponseSubscriber"/> and <see cref="IAsyncResponsePublisher"/>
-    /// to be registered by <c>AddAsyncResponse()</c> or a backend package. An
-    /// <see cref="IWorkerTransport"/> is optional: without one, <c>EnqueueWorkerAsync</c> throws
-    /// with guidance.
-    /// </summary>
-    public static IServiceCollection AddAsyncResponseBuilder(this IServiceCollection services)
-    {
+        // Channel-agnostic engine.
         services.TryAddSingleton<WorkerJobExecutor>();
         services.TryAddSingleton<IAsyncResponseIngress, AsyncResponseIngress>();
         services.TryAddSingleton<IAsyncResponseBuilder>(provider => new AsyncResponseBuilder(
             provider.GetRequiredService<IAsyncResponseSubscriber>(),
             provider.GetService<IWorkerTransport>()));
-        return services;
+
+        // The recovery watchdog is part of the engine and runs by default for whatever channel is
+        // registered (scanning + liveness go through IRecoveryStateScanner / IActiveSubscriberProbe).
+        services.TryAddSingleton<AsyncResponseWatchdogState>();
+        services.AddHostedService<AsyncResponseWatchdog>();
+
+        // Fail fast at host startup if no channel was chained on.
+        services.AddHostedService<AsyncResponseStartupValidator>();
+
+        return new AsyncResponseRegistrationBuilder(services);
     }
 
     /// <summary>
-    /// Registers the in-process <see cref="IWorkerTransport"/> and its background consumer.
-    /// Jobs are executed within the current process and survive only as long as it does —
-    /// suitable for development, tests, and single-node deployments. For distributed,
-    /// durable execution, implement <see cref="IWorkerTransport"/> against your broker and feed
-    /// consumed messages into <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>.
+    /// Registers the process-local response channel and recovery store. Waiters, subscriptions,
+    /// and recovery state all live in memory and disappear when the process exits — the simplest
+    /// setup, with no durable recovery. Pair with <see cref="WithInMemoryTransport"/> for a fully
+    /// in-memory setup including background worker jobs.
     /// </summary>
-    public static IServiceCollection AddInProcessWorkerQueue(this IServiceCollection services)
+    public static AsyncResponseRegistrationBuilder WithInMemoryChannel(
+        this AsyncResponseRegistrationBuilder builder,
+        Action<InMemoryAsyncResponseOptions>? configure = null)
     {
-        services.TryAddSingleton<WorkerJobExecutor>();
-        services.TryAddSingleton<InProcessWorkerTransport>();
-        services.TryAddSingleton<IWorkerTransport>(provider => provider.GetRequiredService<InProcessWorkerTransport>());
-        services.AddHostedService<InProcessWorkerHost>();
-        return services;
+        var services = builder.Services;
+        services.AddOptions();
+        if (configure is not null)
+        {
+            services.Configure(configure);
+        }
+
+        services.TryAddSingleton<InMemoryRecoveryStateStore>();
+        services.TryAddSingleton<IRecoveryStateStore>(provider => provider.GetRequiredService<InMemoryRecoveryStateStore>());
+        services.TryAddSingleton<IRecoveryStateScanner>(provider => provider.GetRequiredService<InMemoryRecoveryStateStore>());
+
+        services.TryAddSingleton<InMemoryAsyncResponseChannel>();
+        services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+        services.TryAddSingleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+        services.TryAddSingleton<IActiveSubscriberProbe>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+
+        services.AddSingleton(new AsyncResponseChannelMarker("InMemory"));
+        return builder;
     }
 
     /// <summary>
-    /// Registers the in-process <see cref="IWorkerTransport"/>. Kept for compatibility; new code
-    /// can use <see cref="AddInProcessWorkerQueue(IServiceCollection)"/> for clearer terminology.
+    /// Registers the in-memory (in-process) worker transport and its background consumer. Jobs run
+    /// in the current process and survive only as long as it does — suitable for development, tests,
+    /// and single-node deployments. For distributed, durable execution use a broker-backed transport
+    /// (e.g. the Google Pub/Sub package's <c>WithGooglePubSubTransport</c>) and feed consumed
+    /// messages into <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>.
     /// </summary>
-    public static IServiceCollection AddInProcessWorkerTransport(this IServiceCollection services)
-        => services.AddInProcessWorkerQueue();
+    public static AsyncResponseRegistrationBuilder WithInMemoryTransport(this AsyncResponseRegistrationBuilder builder)
+    {
+        var services = builder.Services;
+        services.TryAddSingleton<WorkerJobExecutor>();
+        services.TryAddSingleton<InMemoryWorkerTransport>();
+        services.TryAddSingleton<IWorkerTransport>(provider => provider.GetRequiredService<InMemoryWorkerTransport>());
+        services.AddHostedService<InMemoryWorkerHost>();
+        return builder;
+    }
 }

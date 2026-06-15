@@ -1,20 +1,19 @@
 namespace AsyncResponse;
 
 /// <summary>
-/// Options for the transport-agnostic, in-memory AsyncResponse implementation registered by
-/// <c>AddAsyncResponse()</c>.
+/// Engine-level options for AsyncResponse, configured by <c>AddAsyncResponse()</c>. These apply
+/// regardless of which channel or transport is registered. Channel-specific settings (per-waiter
+/// timeouts, recovery-state expiry, key prefixes) live on the channel's own options — see
+/// <see cref="InMemoryAsyncResponseOptions"/> and the Redis package's <c>RedisAsyncResponseOptions</c>.
 /// </summary>
 public sealed class AsyncResponseOptions
 {
     /// <summary>
-    /// How long process-local recovery state lives. This is not durable persistence: entries are
-    /// lost when the process exits. Default: 30 minutes.
+    /// Settings for the built-in recovery-state watchdog, which runs by default and periodically
+    /// scans the configured recovery store for flows that look stuck (persisted recovery state
+    /// with no live waiter). Set <see cref="AsyncResponseWatchdogOptions.Enabled"/> to
+    /// <c>false</c> to turn it off — for example in all but one host when several hosts share one
+    /// durable store, to avoid duplicate scans and warnings.
     /// </summary>
-    public TimeSpan RecoveryStateExpiry { get; set; } = TimeSpan.FromMinutes(30);
-
-    /// <summary>
-    /// Default timeout applied to waiters that do not specify <c>WithTimeout</c>. When
-    /// <c>null</c> (the default), <see cref="RecoveryStateExpiry"/> is used.
-    /// </summary>
-    public TimeSpan? DefaultTimeout { get; set; }
+    public AsyncResponseWatchdogOptions Watchdog { get; set; } = new();
 }

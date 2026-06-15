@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <PackageId>AsyncResponse.Core</PackageId>
-    <Description>Core AsyncResponse implementation: fluent waiter builder, process-local response channel and recovery store, transport-neutral ingress, payload outcome classification, lost-subscriber callback dispatch, expression-based callbacks, and an in-process worker queue for development and single-node deployments.</Description>
+    <Description>Core AsyncResponse implementation: fluent registration and waiter builder, process-local response channel and recovery store, transport-neutral ingress, payload outcome classification, lost-subscriber callback dispatch, expression-based callbacks, an in-memory worker queue, and the recovery watchdog plus readiness health check.</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.9" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.9" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
     <PackageReference Update="Microsoft.SourceLink.GitHub" Version="10.0.300" />

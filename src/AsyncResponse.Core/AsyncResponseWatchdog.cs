@@ -1,14 +1,19 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using StackExchange.Redis;
-using System.Text.Json;
 
-namespace AsyncResponse.Redis;
+namespace AsyncResponse;
 
-/// <summary>Options for the async-response watchdog.</summary>
+/// <summary>Options for the async-response recovery watchdog.</summary>
 public sealed class AsyncResponseWatchdogOptions
 {
+    /// <summary>
+    /// Whether the watchdog runs. Default: <c>true</c>. Set to <c>false</c> to disable it — for
+    /// example in all but one host when several hosts share one durable recovery store, so the
+    /// scan and its warnings are not duplicated.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
     /// <summary>How often the watchdog scans the persisted recovery state. Default: 6 hours.</summary>
     public TimeSpan Interval { get; set; } = TimeSpan.FromHours(6);
 
@@ -25,8 +30,15 @@ public sealed class AsyncResponseWatchdogOptions
 /// <summary>
 /// Snapshot of one persisted recovery entry as observed by the watchdog.
 /// </summary>
+/// <param name="CorrelationId">The correlation id the entry belongs to.</param>
+/// <param name="RegisteredAtUtc">When the waiter registered, or <c>null</c> if unknown.</param>
+/// <param name="ActiveSubscribers">
+/// Live subscribers awaiting this correlation id's channel: <c>0</c> = no live waiter, a positive
+/// value = at least one, a negative value = liveness could not be probed (no
+/// <see cref="IActiveSubscriberProbe"/>).
+/// </param>
+/// <param name="PayloadTypeFullName">The payload type the waiter subscribed for.</param>
 public sealed record RecoveryStateObservation(
-    string RecoveryKey,
     string? CorrelationId,
     DateTime? RegisteredAtUtc,
     long ActiveSubscribers,
@@ -48,7 +60,7 @@ public sealed record AsyncResponseWatchdogSnapshot(
 
 /// <summary>
 /// Holds the latest watchdog scan result. The watchdog is the single writer; readers (e.g. the
-/// readiness health check) get a cheap, consistent snapshot without touching Redis.
+/// readiness health check) get a cheap, consistent snapshot without touching the recovery store.
 /// </summary>
 public sealed class AsyncResponseWatchdogState
 {
@@ -71,7 +83,9 @@ public sealed record AsyncResponseWatchdogReport(
     /// Pure evaluation: an entry is <em>stale</em> when nobody is subscribed to its channel
     /// (the waiter died) and it has been registered for longer than <paramref name="staleAfter"/>
     /// without any response triggering the lost-subscriber recovery. Entries without a
-    /// registration timestamp are reported separately as unknown-age.
+    /// registration timestamp are reported separately as unknown-age. Entries whose liveness could
+    /// not be probed (negative <see cref="RecoveryStateObservation.ActiveSubscribers"/>) are never
+    /// flagged stale, to avoid false positives.
     /// </summary>
     public static AsyncResponseWatchdogReport Evaluate(
         IReadOnlyCollection<RecoveryStateObservation> entries,
@@ -91,44 +105,60 @@ public sealed record AsyncResponseWatchdogReport(
 }
 
 /// <summary>
-/// Periodic, report-only scanner of the persisted async-response recovery state.
+/// Periodic, report-only scanner of the persisted async-response recovery state. It is part of the
+/// engine and runs by default for whatever channel is registered: it enumerates recovery entries
+/// through <see cref="IRecoveryStateScanner"/> and checks waiter liveness through
+/// <see cref="IActiveSubscriberProbe"/>, so it is independent of any specific store or broker.
 /// <para>
-/// Every recovery entry in Redis represents an outstanding wait registration. A healthy entry
-/// either has a live subscriber (the waiter is awaiting in some process) or is young — armed
-/// recovery state for a response that has not arrived yet. An entry that is <em>old</em> and has
-/// <em>no subscriber</em> means the waiter died and nothing (response, resume, retry) has touched
-/// the flow since: the precursor of an operation stuck "in progress". The watchdog logs a warning
-/// per such entry and publishes a summary snapshot for the health check. It deliberately performs
-/// no remediation — recovery belongs to the lost-subscriber dispatcher and the flows' own retry
-/// paths.
+/// Every recovery entry represents an outstanding wait registration. A healthy entry either has a
+/// live subscriber (the waiter is awaiting in some process) or is young — armed recovery state for
+/// a response that has not arrived yet. An entry that is <em>old</em> and has <em>no subscriber</em>
+/// means the waiter died and nothing (response, resume, retry) has touched the flow since: the
+/// precursor of an operation stuck "in progress". The watchdog logs a warning per such entry and
+/// publishes a summary snapshot for the health check. It deliberately performs no remediation —
+/// recovery belongs to the lost-subscriber dispatcher and the flows' own retry paths.
 /// </para>
 /// </summary>
 internal sealed class AsyncResponseWatchdog : BackgroundService
 {
     private const string SERVICE_NAME = nameof(AsyncResponseWatchdog);
 
-    private readonly IConnectionMultiplexer _multiplexer;
+    private readonly IRecoveryStateScanner? _scanner;
+    private readonly IActiveSubscriberProbe? _subscriberProbe;
     private readonly AsyncResponseWatchdogState _state;
-    private readonly RedisKeySchema _keys;
     private readonly AsyncResponseWatchdogOptions _options;
     private readonly ILogger<AsyncResponseWatchdog> _logger;
 
     public AsyncResponseWatchdog(
-        IConnectionMultiplexer multiplexer,
+        IEnumerable<IRecoveryStateScanner> scanners,
+        IEnumerable<IActiveSubscriberProbe> subscriberProbes,
         AsyncResponseWatchdogState state,
-        IOptions<RedisAsyncResponseOptions> transportOptions,
-        IOptions<AsyncResponseWatchdogOptions> watchdogOptions,
+        IOptions<AsyncResponseOptions> options,
         ILogger<AsyncResponseWatchdog> logger)
     {
-        _multiplexer = multiplexer;
+        _scanner = scanners.FirstOrDefault();
+        _subscriberProbe = subscriberProbes.FirstOrDefault();
         _state = state;
-        _keys = new RedisKeySchema(transportOptions.Value.KeyPrefix);
-        _options = watchdogOptions.Value;
+        _options = options.Value.Watchdog;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (!_options.Enabled)
+        {
+            _logger.LogInformation("{ServiceName}: disabled via options; not scanning.", SERVICE_NAME);
+            return;
+        }
+
+        if (_scanner is null)
+        {
+            _logger.LogInformation(
+                "{ServiceName}: no IRecoveryStateScanner registered; the configured channel does not support scanning, so the watchdog is idle.",
+                SERVICE_NAME);
+            return;
+        }
+
         _logger.LogInformation("{ServiceName}: started. Interval: {Interval}, stale threshold: {StaleAfter}.",
             SERVICE_NAME, _options.Interval, _options.StaleAfter);
 
@@ -140,8 +170,12 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             {
                 try
                 {
-                    var report = await ScanOnceAsync().ConfigureAwait(false);
+                    var report = await ScanOnceAsync(stoppingToken).ConfigureAwait(false);
                     _state.Publish(new AsyncResponseWatchdogSnapshot(DateTime.UtcNow, _options.Interval, report, Error: null));
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
@@ -158,53 +192,22 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         }
     }
 
-    private async Task<AsyncResponseWatchdogReport> ScanOnceAsync()
+    private async Task<AsyncResponseWatchdogReport> ScanOnceAsync(CancellationToken cancellationToken)
     {
-        var connectedServers = _multiplexer.GetEndPoints()
-            .Select(endPoint => _multiplexer.GetServer(endPoint))
-            .Where(server => server.IsConnected)
-            .ToList();
-
         var snapshot = new List<RecoveryStateObservation>();
-        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-        var database = _multiplexer.GetDatabase();
 
-        foreach (var server in connectedServers)
+        await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
         {
-            foreach (var key in server.Keys(pattern: _keys.RecoveryKeyPattern, pageSize: 250))
-            {
-                var recoveryKey = key.ToString();
-                if (!seenKeys.Add(recoveryKey))
-                    continue;
+            if (entry is null)
+                continue;
 
-                var value = await database.StringGetAsync(recoveryKey).ConfigureAwait(false);
-                if (value.IsNullOrEmpty)
-                    continue;
+            var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
 
-                RecoveryState? entry;
-                try
-                {
-                    entry = JsonSerializer.Deserialize<RecoveryState>(value.ToString());
-                }
-                catch (JsonException ex)
-                {
-                    _logger.LogWarning(ex, "{ServiceName}: unreadable recovery state at {RecoveryKey}; skipping.", SERVICE_NAME, recoveryKey);
-                    continue;
-                }
-
-                if (entry is null)
-                    continue;
-
-                var correlationId = entry.CorrelationId ?? _keys.CorrelationIdFromRecoveryKey(recoveryKey);
-                var channel = _keys.Channel(correlationId);
-
-                snapshot.Add(new RecoveryStateObservation(
-                    recoveryKey,
-                    correlationId,
-                    entry.RegisteredAtUtc,
-                    GetSubscriberCount(connectedServers, channel),
-                    entry.PayloadTypeFullName));
-            }
+            snapshot.Add(new RecoveryStateObservation(
+                entry.CorrelationId,
+                entry.RegisteredAtUtc,
+                activeSubscribers,
+                entry.PayloadTypeFullName));
         }
 
         var report = AsyncResponseWatchdogReport.Evaluate(snapshot, DateTime.UtcNow, _options.StaleAfter);
@@ -224,24 +227,22 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
     }
 
     /// <summary>
-    /// Subscriptions live on whichever node the client subscribed through, so the count is the
-    /// maximum across all connected endpoints.
+    /// Liveness for one entry. Returns <c>-1</c> (unknown) when there is no probe or no correlation
+    /// id; the report treats unknown liveness as "not stale" so it never raises a false alarm.
     /// </summary>
-    private long GetSubscriberCount(IReadOnlyList<IServer> servers, RedisChannel channel)
+    private async ValueTask<long> CountActiveSubscribersAsync(string? correlationId, CancellationToken cancellationToken)
     {
-        long subscribers = 0;
-        foreach (var server in servers)
-        {
-            try
-            {
-                subscribers = Math.Max(subscribers, server.SubscriptionSubscriberCount(channel));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "{ServiceName}: failed to read subscriber count for channel {Channel}.", SERVICE_NAME, channel.ToString());
-            }
-        }
+        if (_subscriberProbe is null || string.IsNullOrWhiteSpace(correlationId))
+            return -1;
 
-        return subscribers;
+        try
+        {
+            return await _subscriberProbe.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "{ServiceName}: failed to probe subscribers for correlationId {CorrelationId}.", SERVICE_NAME, correlationId);
+            return -1;
+        }
     }
 }

@@ -84,11 +84,12 @@ public class InMemoryAsyncResponseTests
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
-        services.AddAsyncResponse(options =>
-        {
-            options.DefaultTimeout = TimeSpan.FromSeconds(5);
-            options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
-        });
+        services.AddAsyncResponse()
+            .WithInMemoryChannel(options =>
+            {
+                options.DefaultTimeout = TimeSpan.FromSeconds(5);
+                options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
+            });
         configure?.Invoke(services);
         return services.BuildServiceProvider();
     }

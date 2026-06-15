@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 
 namespace AsyncResponse.Redis;
@@ -8,10 +9,11 @@ namespace AsyncResponse.Redis;
 /// <summary>
 /// Redis-backed implementation of <see cref="IRecoveryStateStore"/>.
 /// </summary>
-internal sealed class RedisRecoveryStateStore : IRecoveryStateStore
+internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
 {
     private const string SERVICE_NAME = nameof(RedisRecoveryStateStore);
 
+    private readonly IConnectionMultiplexer _multiplexer;
     private readonly IDatabase _database;
     private readonly RedisKeySchema _keys;
     private readonly ILogger<RedisRecoveryStateStore> _logger;
@@ -21,6 +23,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore
         IOptions<RedisAsyncResponseOptions> options,
         ILogger<RedisRecoveryStateStore> logger)
     {
+        _multiplexer = multiplexer;
         _database = multiplexer.GetDatabase();
         _keys = new RedisKeySchema(options.Value.KeyPrefix);
         _logger = logger;
@@ -72,5 +75,51 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
         return _database.KeyDeleteAsync(_keys.RecoveryKey(correlationId));
+    }
+
+    public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var connectedServers = _multiplexer.GetEndPoints()
+            .Select(endPoint => _multiplexer.GetServer(endPoint))
+            .Where(server => server.IsConnected)
+            .ToList();
+
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var server in connectedServers)
+        {
+            foreach (var key in server.Keys(pattern: _keys.RecoveryKeyPattern, pageSize: 250))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var recoveryKey = key.ToString();
+                if (!seenKeys.Add(recoveryKey))
+                    continue;
+
+                var value = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
+                if (value.IsNullOrEmpty)
+                    continue;
+
+                RecoveryState? state;
+                try
+                {
+                    state = JsonSerializer.Deserialize<RecoveryState>(value.ToString());
+                }
+                catch (JsonException ex)
+                {
+                    _logger.LogWarning(ex, "{ServiceName}: unreadable recovery state at {RecoveryKey}; skipping.", SERVICE_NAME, recoveryKey);
+                    continue;
+                }
+
+                if (state is null)
+                    continue;
+
+                // Older entries may predate the persisted correlation id; recover it from the key.
+                if (string.IsNullOrWhiteSpace(state.CorrelationId))
+                    state.CorrelationId = _keys.CorrelationIdFromRecoveryKey(recoveryKey);
+
+                yield return state;
+            }
+        }
     }
 }

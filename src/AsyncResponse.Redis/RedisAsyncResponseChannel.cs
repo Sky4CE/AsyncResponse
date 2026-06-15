@@ -18,30 +18,32 @@ namespace AsyncResponse.Redis;
 /// payload's domain outcome and invokes the resume or failure callback.</description></item>
 /// </list>
 /// </summary>
-internal sealed class RedisAsyncResponseTransport : IAsyncResponsePublisher, IAsyncResponseSubscriber
+internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
-    private const string SERVICE_NAME = nameof(RedisAsyncResponseTransport);
+    private const string SERVICE_NAME = nameof(RedisAsyncResponseChannel);
 
     /// <summary>OpenTelemetry-compatible activity source for the AsyncResponse library.</summary>
     internal static readonly ActivitySource ActivitySource = new("AsyncResponse");
 
     private readonly ISubscriber _subscriber;
+    private readonly IConnectionMultiplexer _multiplexer;
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
     private readonly RedisKeySchema _keys;
     private readonly RedisAsyncResponseOptions _options;
-    private readonly ILogger<RedisAsyncResponseTransport> _logger;
+    private readonly ILogger<RedisAsyncResponseChannel> _logger;
 
     private readonly ConcurrentDictionary<string, ChannelSerialExecutor> _executors = new(StringComparer.Ordinal);
 
-    public RedisAsyncResponseTransport(
+    public RedisAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         IConnectionMultiplexer multiplexer,
         IRecoveryStateStore recoveryStateStore,
         IOptions<RedisAsyncResponseOptions> options,
-        ILogger<RedisAsyncResponseTransport> logger)
+        ILogger<RedisAsyncResponseChannel> logger)
     {
         _subscriber = multiplexer.GetSubscriber();
+        _multiplexer = multiplexer;
         _recoveryStateStore = recoveryStateStore;
         _options = options.Value;
         _keys = new RedisKeySchema(_options.KeyPrefix);
@@ -389,6 +391,39 @@ internal sealed class RedisAsyncResponseTransport : IAsyncResponsePublisher, IAs
             activity?.SetTag("error.type", ex.GetType().Name);
             throw;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // IActiveSubscriberProbe
+
+    /// <inheritdoc/>
+    public ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+            return new ValueTask<long>(0L);
+
+        var channel = _keys.Channel(correlationId);
+
+        // Subscriptions live on whichever node the client subscribed through, so the live count is
+        // the maximum reported across all connected endpoints.
+        long subscribers = 0;
+        foreach (var endPoint in _multiplexer.GetEndPoints())
+        {
+            var server = _multiplexer.GetServer(endPoint);
+            if (!server.IsConnected)
+                continue;
+
+            try
+            {
+                subscribers = Math.Max(subscribers, server.SubscriptionSubscriberCount(channel));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "{ServiceName}: failed to read subscriber count for channel {Channel}.", SERVICE_NAME, channel.ToString());
+            }
+        }
+
+        return new ValueTask<long>(subscribers);
     }
 
     private ChannelSerialExecutor GetExecutor(string channel) =>
