@@ -25,15 +25,15 @@ public class InMemoryAsyncResponseTests
             .For<OperationResult>()
             .WithTimeout(TimeSpan.FromSeconds(5))
             .Until(response => response.Status != OperationStatus.Running)
-            .WaitAsync(async (string correlationId) =>
+            .WaitAsync(async context =>
             {
                 await ingress.HandleResponseMessageAsync(
                     JsonSerializer.Serialize(new OperationResult { Status = OperationStatus.Running }),
-                    correlationId);
+                    context.CorrelationId);
 
                 await ingress.HandleResponseMessageAsync(
                     JsonSerializer.Serialize(new OperationResult { Status = OperationStatus.Completed, Message = "done" }),
-                    correlationId);
+                    context.CorrelationId);
             });
 
         Assert.Equal(OperationStatus.Completed, result.Status);

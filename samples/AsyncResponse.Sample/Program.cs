@@ -61,10 +61,10 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
         .For<OperationResult>()
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running) // consume progress messages
-        .WaitAsync((string correlationId) =>
+        .WaitAsync(context =>
         {
-            startedCorrelationId = correlationId;
-            remote.Start(correlationId, behavior ?? RemoteBehavior.Succeed);
+            startedCorrelationId = context.CorrelationId;
+            remote.Start(context.CorrelationId, behavior ?? RemoteBehavior.Succeed);
             return Task.CompletedTask;
         });
 
@@ -90,7 +90,7 @@ app.MapPost("/demo/request-response/reply-target", async (IAsyncResponseBuilder 
         .WithReplyTarget(replyTarget)
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running)
-        .WaitAsync((AsyncResponseRequestContext context) =>
+        .WaitAsync(context =>
         {
             startedContext = context;
             remote.Start(context, behavior ?? RemoteBehavior.Succeed);
@@ -118,9 +118,9 @@ app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteW
             .For<OperationResult>()
             .WithTimeout(TimeSpan.FromSeconds(2))
             .Until(response => response.Status != OperationStatus.Running)
-            .WaitAsync((string correlationId) =>
+            .WaitAsync(context =>
             {
-                remote.Start(correlationId, RemoteBehavior.Slow);
+                remote.Start(context.CorrelationId, RemoteBehavior.Slow);
                 return Task.CompletedTask;
             });
 
@@ -154,12 +154,12 @@ app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncRespo
             flow.ResumeFlowAsync("sample-flow", Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId()))
         .OnLostSubscriberFailure<ISampleFlowService>(flow =>
             flow.FailFlowAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-        .WaitAsync((string correlationId) =>
+        .WaitAsync(context =>
         {
             // The trigger runs once the subscription and recovery state exist. The "send" here
             // is handing the id to the operator: the remote work is delivered manually via
             // /demo/lost-subscriber/respond.
-            armed.SetResult(correlationId);
+            armed.SetResult(context.CorrelationId);
             return Task.CompletedTask;
         }));
 

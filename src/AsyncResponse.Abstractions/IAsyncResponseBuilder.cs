@@ -29,9 +29,9 @@ public interface IAsyncResponseBuilder
     /// Begins configuring an async-response waiter with a freshly generated correlation id,
     /// created through <see cref="AsyncResponseContext.CreateCorrelationId"/> so it is also
     /// available ambiently to the outgoing request. Combine with
-    /// <see cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{string, Task})"/> so simple
-    /// flows never handle the correlation id themselves:
-    /// <c>builder.For&lt;T&gt;().WaitAsync(correlationId =&gt; SendRequest(correlationId))</c>.
+    /// <see cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{AsyncResponseRequestContext, Task})"/>
+    /// so simple flows never handle the correlation id themselves:
+    /// <c>builder.For&lt;T&gt;().WaitAsync(context =&gt; SendRequest(context.CorrelationId))</c>.
     /// <para>
     /// Returns a <see cref="IAsyncResponseTriggeredBuilder{T}"/>, whose <c>WaitAsync</c>
     /// <em>requires</em> the trigger: a generated correlation id is known to nobody else, so a
@@ -191,29 +191,20 @@ public interface IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePaylo
 
     /// <summary>
     /// Subscribes, runs the required trigger (the action that starts the remote operation),
-    /// awaits the terminal response, and unsubscribes automatically. The trigger runs strictly
-    /// <em>after</em> the subscription and recovery state exist, which closes the race where a
-    /// fast first response arrives before anyone is listening. If the trigger throws, the
-    /// registration is torn down and the exception propagates: the operation never started, so
-    /// nothing is left armed. Rule of thumb: never send the request yourself — pass the send
-    /// (and any recovery-breadcrumb persistence) as the trigger.
-    /// </summary>
-    /// <param name="trigger">The action that starts the remote operation. Required.</param>
-    Task<T> WaitAsync(Func<Task> trigger);
-
-    /// <summary>
-    /// Same as <see cref="WaitAsync(Func{Task})"/>, with the generated correlation id passed
-    /// into the trigger: <c>For&lt;T&gt;().WaitAsync(correlationId =&gt; SendRequest(correlationId))</c>.
-    /// Use this overload when the trigger persists the correlation id (e.g. into flow state)
-    /// before sending.
-    /// </summary>
-    /// <param name="trigger">The action that starts the remote operation; receives the correlation id. Required.</param>
-    Task<T> WaitAsync(Func<string, Task> trigger);
-
-    /// <summary>
-    /// Same as <see cref="WaitAsync(Func{string, Task})"/>, with a request context containing the
-    /// generated correlation id and the selected reply target. Use this when the remote request
-    /// needs explicit reply-to metadata.
+    /// awaits the terminal response, and unsubscribes automatically. The trigger receives an
+    /// <see cref="AsyncResponseRequestContext"/> carrying the generated correlation id and the
+    /// selected reply target (if any): read <see cref="AsyncResponseRequestContext.CorrelationId"/>
+    /// to persist a recovery breadcrumb or stamp the outgoing request, read
+    /// <see cref="AsyncResponseRequestContext.ReplyTarget"/> for reply-to metadata, or ignore the
+    /// argument entirely (<c>_ =&gt; Send()</c>) when the ambient <see cref="AsyncResponseContext"/>
+    /// is enough.
+    /// <para>
+    /// The trigger runs strictly <em>after</em> the subscription and recovery state exist, which
+    /// closes the race where a fast first response arrives before anyone is listening. If the
+    /// trigger throws, the registration is torn down and the exception propagates: the operation
+    /// never started, so nothing is left armed. Rule of thumb: never send the request yourself —
+    /// pass the send (and any recovery-breadcrumb persistence) as the trigger.
+    /// </para>
     /// </summary>
     /// <param name="trigger">The action that starts the remote operation; receives the request context. Required.</param>
     Task<T> WaitAsync(Func<AsyncResponseRequestContext, Task> trigger);

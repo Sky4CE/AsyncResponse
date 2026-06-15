@@ -39,7 +39,7 @@ public class AsyncResponseBuilderTests
 
         var result = await new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>()
-            .WaitAsync(() =>
+            .WaitAsync(_ =>
             {
                 callOrder.Add("trigger");
                 return Task.CompletedTask;
@@ -55,7 +55,7 @@ public class AsyncResponseBuilderTests
         var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>();
 
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            builder.WaitAsync(() => throw new InvalidOperationException("send failed")));
+            builder.WaitAsync(_ => throw new InvalidOperationException("send failed")));
 
         // The operation never started: subscription and recovery state must be torn down.
         _waiter.Verify(w => w.DisposeAsync(), Times.Once);
@@ -89,9 +89,9 @@ public class AsyncResponseBuilderTests
         string? triggeredWith = null;
         await new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>()
-            .WaitAsync((string correlationId) =>
+            .WaitAsync(context =>
             {
-                triggeredWith = correlationId;
+                triggeredWith = context.CorrelationId;
                 return Task.CompletedTask;
             });
 
@@ -127,7 +127,7 @@ public class AsyncResponseBuilderTests
         await new AsyncResponseBuilder(_subscriber.Object, null, provider.Object)
             .For<OperationResult>()
             .WithReplyTarget()
-            .WaitAsync((AsyncResponseRequestContext context) =>
+            .WaitAsync(context =>
             {
                 observed = context;
                 ambientInTrigger = AsyncResponseContext.ReplyTarget;
@@ -157,7 +157,7 @@ public class AsyncResponseBuilderTests
         await new AsyncResponseBuilder(_subscriber.Object, null, provider.Object)
             .For<OperationResult>()
             .WithReplyTarget("regional-us")
-            .WaitAsync((AsyncResponseRequestContext context) =>
+            .WaitAsync(context =>
             {
                 observed = context;
                 return Task.CompletedTask;

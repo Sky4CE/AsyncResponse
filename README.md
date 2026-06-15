@@ -11,8 +11,8 @@ OrderResult result = await asyncResponse
     .For<OrderResult>()                                       // correlation id generated for you
     .WithTimeout(TimeSpan.FromMinutes(10))
     .Until(r => r.Status != OrderStatus.Processing)           // consume progress messages
-    .WaitAsync(correlationId =>                               // looks sync, is fully async
-        paymentGateway.StartAsync(orderId, correlationId));   // sent only AFTER subscribing
+    .WaitAsync(context =>                                     // looks sync, is fully async
+        paymentGateway.StartAsync(orderId, context.CorrelationId)); // sent only AFTER subscribing
 ```
 
 ---
@@ -248,7 +248,7 @@ public async Task<OrderResult> PlaceOrderAsync(int orderId)
         .For<OrderResult>()
         .WithTimeout(TimeSpan.FromMinutes(10))
         .Until(r => r.Status != OrderStatus.Processing)
-        .WaitAsync(correlationId => _remoteSystem.SubmitAsync(orderId, correlationId));
+        .WaitAsync(context => _remoteSystem.SubmitAsync(orderId, context.CorrelationId));
 }
 ```
 
@@ -263,9 +263,10 @@ that make sense for where the correlation id came from:
 - `For<T>()` → `IAsyncResponseTriggeredBuilder<T>` — the builder generates the correlation id
   (also placing it in the ambient `AsyncResponseContext`) and `WaitAsync` *requires* the
   trigger: a generated id is known to nobody else, so waiting without sending could never
-  complete, and the type system makes that mistake unrepresentable. The
-  `WaitAsync(correlationId => …)` overload hands the id to the trigger — persist it into your
-  flow state there (the subscription already exists), then send.
+  complete, and the type system makes that mistake unrepresentable. The trigger receives an
+  `AsyncResponseRequestContext` (correlation id + reply target) — persist `context.CorrelationId`
+  into your flow state there (the subscription already exists), then send. Ignore the argument
+  (`_ => …`) when the ambient `AsyncResponseContext` is enough.
 - `For<T>(correlationId)` → `IAsyncResponseAttachedBuilder<T>` — *attaches* to an operation
   already started elsewhere: a resumed step re-attaching to its in-flight correlation id, or a
   different system owning the send. Its `WaitAsync()` takes *no* trigger — re-sending an
@@ -312,7 +313,7 @@ var result = await _asyncResponse
         flow.ResumeAsync(orderId, Placeholder.Payload<OrderResult>(), Placeholder.CorrelationId()))
     .OnLostSubscriberFailure<IOrderFlow>(flow =>
         flow.FailAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-    .WaitAsync(correlationId => _remoteSystem.SubmitAsync(orderId, correlationId));
+    .WaitAsync(context => _remoteSystem.SubmitAsync(orderId, context.CorrelationId));
 ```
 
 `Placeholder.Payload<T>()`, `Placeholder.Exception()`, and `Placeholder.CorrelationId()` are

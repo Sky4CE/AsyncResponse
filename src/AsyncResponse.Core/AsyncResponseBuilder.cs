@@ -162,25 +162,11 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     public Task<T> WaitAsync()
         => WaitCoreAsync((Func<AsyncResponseRequestContext, Task>?)null);
 
-    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{Task})" />
-    public Task<T> WaitAsync(Func<Task> trigger)
-    {
-        ArgumentNullException.ThrowIfNull(trigger);
-        return WaitCoreAsync(trigger);
-    }
-
-    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{string, Task})" />
-    public Task<T> WaitAsync(Func<string, Task> trigger)
-    {
-        ArgumentNullException.ThrowIfNull(trigger);
-        return WaitCoreAsync(() => trigger(_correlationId));
-    }
-
     /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{AsyncResponseRequestContext, Task})" />
     public Task<T> WaitAsync(Func<AsyncResponseRequestContext, Task> trigger)
     {
         ArgumentNullException.ThrowIfNull(trigger);
-        return WaitCoreAsync(context => trigger(context));
+        return WaitCoreAsync(trigger);
     }
 
     private Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
@@ -191,9 +177,6 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
             _completionPredicate,
             _timeout
         );
-
-    private async Task<T> WaitCoreAsync(Func<Task>? trigger)
-        => await WaitCoreAsync(trigger is null ? null : _ => trigger()).ConfigureAwait(false);
 
     private async Task<T> WaitCoreAsync(Func<AsyncResponseRequestContext, Task>? trigger)
     {
@@ -241,8 +224,7 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     // IAsyncResponseTriggeredBuilder<T> — the builder handed out by For<T>() (generated
     // correlation id). Same shared state and behavior; only the static return type differs, so
     // the trigger-required WaitAsync terminal is preserved through the fluent chain. The public
-    // WaitAsync(Func<Task>) / WaitAsync(Func<string, Task>) overloads above satisfy its
-    // terminals.
+    // WaitAsync(Func<AsyncResponseRequestContext, Task>) overload above satisfies its terminal.
 
     IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {
