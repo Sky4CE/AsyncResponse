@@ -7,14 +7,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ```csharp
-var correlationId = AsyncResponseContext.CreateCorrelationId();
-
 OrderResult result = await asyncResponse
-    .For<OrderResult>(correlationId)
+    .For<OrderResult>()                                       // correlation id generated for you
     .WithTimeout(TimeSpan.FromMinutes(10))
-    .Until(r => r.Status != OrderStatus.Processing)          // consume progress messages
-    .TriggeredBy(() => paymentGateway.StartAsync(orderId, correlationId))
-    .BuildAndWaitAsync();                                     // looks sync, is fully async
+    .Until(r => r.Status != OrderStatus.Processing)           // consume progress messages
+    .WaitAsync(correlationId =>                               // looks sync, is fully async
+        paymentGateway.StartAsync(orderId, correlationId));   // sent only AFTER subscribing
 ```
 
 ---
@@ -46,7 +44,7 @@ AsyncResponse solves both halves:
 ```
         you                       AsyncResponse                         remote system
          │                              │                                     │
-         │  For<T>(cid).TriggeredBy(…)  │                                     │
+         │  For<T>(cid).WaitAsync(send) │                                     │
          ├─────────────────────────────►│ 1. subscribe cid + persist          │
          │                              │    RecoveryState (Redis)            │
          │                              │ 2. run trigger ────────────────────►│  (request sent
@@ -148,14 +146,23 @@ public async Task<OrderResult> PlaceOrderAsync(int orderId)
         .For<OrderResult>(correlationId)
         .WithTimeout(TimeSpan.FromMinutes(10))
         .Until(r => r.Status != OrderStatus.Processing)
-        .TriggeredBy(() => _remoteSystem.SubmitAsync(orderId, correlationId))
-        .BuildAndWaitAsync();
+        .WaitAsync(() => _remoteSystem.SubmitAsync(orderId, correlationId));
 }
 ```
 
-`TriggeredBy` is the race-killer: the request is sent **after** the subscription and recovery
-state exist, so the first response can never arrive before anyone is listening. Rule of thumb:
-*never send the request yourself before the waiter exists — make the send the trigger.*
+The `WaitAsync` trigger is the race-killer: the request is sent **after** the subscription and
+recovery state exist, so the first response can never arrive before anyone is listening, and a
+failing trigger tears the registration down (the operation never started). Rule of thumb:
+*never send the request yourself — pass the send as the trigger.*
+
+Two more shapes of the same terminal:
+
+- `WaitAsync()` with no trigger — the request was already sent: a resumed step re-attaching to
+  its in-flight correlation id, or a different system owning the send. Only your flow can know
+  this (from its persisted state), so it's an explicit argument, never auto-detected.
+- `For<T>().WaitAsync(correlationId => …)` — the builder generates the correlation id (also
+  placing it in the ambient `AsyncResponseContext`) and hands it to the trigger, so simple flows
+  never touch correlation ids at all.
 
 Need the waiter's lifetime under your control? `BuildWaiterAsync()` returns an
 `IAsyncResponseWaiter<T>`; `await waiter.ResponseTask` when ready, dispose to cancel.
@@ -184,15 +191,14 @@ serializable method descriptors (persisted in Redis, invoked through DI by the p
 receives the late response — which may be a *different deployment*):
 
 ```csharp
-var waiter = await _asyncResponse
+var result = await _asyncResponse
     .For<OrderResult>(correlationId)
     .Until(r => r.Status != OrderStatus.Processing)
     .OnLostSubscriberResume<IOrderFlow>(flow =>
         flow.ResumeAsync(orderId, Placeholder.Payload<OrderResult>(), Placeholder.CorrelationId()))
     .OnLostSubscriberFailure<IOrderFlow>(flow =>
         flow.FailAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-    .TriggeredBy(() => _remoteSystem.SubmitAsync(orderId, correlationId))
-    .BuildWaiterAsync();
+    .WaitAsync(() => _remoteSystem.SubmitAsync(orderId, correlationId));
 ```
 
 `Placeholder.Payload<T>()`, `Placeholder.Exception()`, and `Placeholder.CorrelationId()` are
@@ -236,7 +242,7 @@ try
 {
     var result = await _asyncResponse.For<OrderResult>(correlationId)
         .WithTimeout(TimeSpan.FromSeconds(30))
-        .BuildAndWaitAsync();
+        .WaitAsync();
 }
 catch (TimeoutException)   { /* no response in time — flow fails visibly, never hangs */ }
 catch (Exception ex)       { /* SetException from the remote side, with remote stack in ex.Data */ }
@@ -308,9 +314,9 @@ curl 'localhost:5000/healthz'                                            # watch
 
 ## Best practices
 
-1. **Always make the send the trigger** (`TriggeredBy`). Sending before subscribing is a race:
-   a fast first response finds nobody listening and, on first registration, no recovery state
-   either.
+1. **Always make the send the trigger** (the `WaitAsync` argument). Sending before subscribing
+   is a race: a fast first response finds nobody listening and, on first registration, no
+   recovery state either.
 2. **Classify honestly.** `ClassifyOutcome()` must mirror your active waiter's `Until`
    semantics. Map unrecognized states to `Unknown` (fails conservatively) unless your active
    path deliberately keeps waiting on them — then map them to `InProgress`.

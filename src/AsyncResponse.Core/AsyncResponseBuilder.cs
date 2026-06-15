@@ -16,6 +16,10 @@ internal sealed class AsyncResponseBuilder(
                 : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace."));
 
     /// <inheritdoc />
+    public IAsyncResponseBuilder<T> For<T>() where T : IAsyncResponsePayload
+        => new AsyncResponseBuilder<T>(_subscriber, AsyncResponseContext.CreateCorrelationId());
+
+    /// <inheritdoc />
     public Task EnqueueWorkerAsync(ReflectionCallDto work)
     {
         ArgumentNullException.ThrowIfNull(work);
@@ -53,7 +57,6 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T> where T
     private ReflectionCallDto? _failureCallback;
     private Func<T, ValueTask<bool>>? _completionPredicate;
     private TimeSpan? _timeout;
-    private Func<Task>? _trigger;
 
     internal AsyncResponseBuilder(IAsyncResponseSubscriber subscriber, string correlationId)
     {
@@ -112,46 +115,37 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseBuilder<T> where T
     }
 
     /// <inheritdoc />
-    public IAsyncResponseBuilder<T> TriggeredBy(Func<Task> trigger)
+    public Task<T> WaitAsync(Func<Task>? trigger = null)
+        => WaitCoreAsync(trigger);
+
+    /// <inheritdoc />
+    public Task<T> WaitAsync(Func<string, Task> trigger)
     {
-        _trigger = trigger ?? throw new ArgumentNullException(nameof(trigger));
-        return this;
+        ArgumentNullException.ThrowIfNull(trigger);
+        return WaitCoreAsync(() => trigger(_correlationId));
     }
 
     /// <inheritdoc />
-    public async Task<IAsyncResponseWaiter<T>> BuildWaiterAsync()
-    {
-        var waiter = await _subscriber.CreateResponseWaiter<T>(
+    public Task<IAsyncResponseWaiter<T>> BuildWaiterAsync()
+        => _subscriber.CreateResponseWaiter<T>(
             _correlationId,
             _resumeCallback,
             _failureCallback,
             _completionPredicate,
             _timeout
-        ).ConfigureAwait(false);
+        );
 
-        if (_trigger is null)
-            return waiter;
-
-        // Subscribe-before-send by construction: the trigger runs only once the subscription and
-        // the recovery state exist, so the first response can never race the registration.
-        try
-        {
-            await _trigger().ConfigureAwait(false);
-        }
-        catch
-        {
-            // The operation never started: tear down the subscription and the recovery state.
-            await waiter.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-
-        return waiter;
-    }
-
-    /// <inheritdoc />
-    public async Task<T> BuildAndWaitAsync()
+    private async Task<T> WaitCoreAsync(Func<Task>? trigger)
     {
         await using var waiter = await BuildWaiterAsync().ConfigureAwait(false);
+
+        // Subscribe-before-send by construction: the trigger runs only once the subscription and
+        // the recovery state exist, so the first response can never race the registration. A
+        // failing trigger means the operation never started — the waiter (and with it the
+        // recovery state) is torn down by the await-using disposal as the exception propagates.
+        if (trigger != null)
+            await trigger().ConfigureAwait(false);
+
         return await waiter.ResponseTask.ConfigureAwait(false);
     }
 }

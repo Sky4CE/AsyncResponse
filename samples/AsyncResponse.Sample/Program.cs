@@ -50,7 +50,8 @@ app.MapGet("/", () => Results.Text(
       GET  /healthz                                              health report incl. the recovery watchdog
     """));
 
-// 1) Request/response with an active waiter. TriggeredBy guarantees subscribe-before-send.
+// 1) Request/response with an active waiter. The WaitAsync trigger guarantees
+//    subscribe-before-send.
 app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior) =>
 {
     var correlationId = AsyncResponseContext.CreateCorrelationId();
@@ -59,35 +60,32 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
         .For<OperationResult>(correlationId)
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running) // consume progress messages
-        .TriggeredBy(() =>
+        .WaitAsync(() =>
         {
             remote.Start(correlationId, behavior ?? RemoteBehavior.Succeed);
             return Task.CompletedTask;
-        })
-        .BuildAndWaitAsync();
+        });
 
     return result.Status == OperationStatus.Completed
         ? Results.Ok(new { correlationId, result.Status, result.Message })
         : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
 });
 
-// 2) Timeout: the remote takes 15s, the waiter allows 2s.
+// 2) Timeout: the remote takes 15s, the waiter allows 2s. Also shows the no-correlation-id
+//    flow: For<T>() generates one and hands it to the trigger.
 app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote) =>
 {
-    var correlationId = AsyncResponseContext.CreateCorrelationId();
-
     try
     {
         await asyncResponse
-            .For<OperationResult>(correlationId)
+            .For<OperationResult>()
             .WithTimeout(TimeSpan.FromSeconds(2))
             .Until(response => response.Status != OperationStatus.Running)
-            .TriggeredBy(() =>
+            .WaitAsync(correlationId =>
             {
                 remote.Start(correlationId, RemoteBehavior.Slow);
                 return Task.CompletedTask;
-            })
-            .BuildAndWaitAsync();
+            });
 
         return Results.Ok("Unexpectedly completed in time.");
     }

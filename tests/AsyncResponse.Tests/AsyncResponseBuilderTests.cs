@@ -27,7 +27,7 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
-    public async Task TriggeredBy_RunsAfterSubscription()
+    public async Task WaitAsync_TriggerRunsAfterSubscription()
     {
         var callOrder = new List<string>();
         _subscriber
@@ -39,28 +39,80 @@ public class AsyncResponseBuilderTests
 
         var result = await new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>("corr-1")
-            .TriggeredBy(() =>
+            .WaitAsync(() =>
             {
                 callOrder.Add("trigger");
                 return Task.CompletedTask;
-            })
-            .BuildAndWaitAsync();
+            });
 
         Assert.Equal(["subscribe", "trigger"], callOrder);
         Assert.Equal(OperationStatus.Completed, result.Status);
     }
 
     [Fact]
-    public async Task TriggeredBy_WhenTriggerThrows_DisposesWaiterAndPropagates()
+    public async Task WaitAsync_WhenTriggerThrows_DisposesWaiterAndPropagates()
     {
-        var builder = new AsyncResponseBuilder(_subscriber.Object)
-            .For<OperationResult>("corr-1")
-            .TriggeredBy(() => throw new InvalidOperationException("send failed"));
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
 
-        await Assert.ThrowsAsync<InvalidOperationException>(builder.BuildWaiterAsync);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            builder.WaitAsync(() => throw new InvalidOperationException("send failed")));
 
         // The operation never started: subscription and recovery state must be torn down.
         _waiter.Verify(w => w.DisposeAsync(), Times.Once);
+    }
+
+    [Fact]
+    public async Task WaitAsync_WithoutTrigger_OnlyWaits()
+    {
+        var result = await new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>("corr-1")
+            .WaitAsync();
+
+        Assert.Equal(OperationStatus.Completed, result.Status);
+        _waiter.Verify(w => w.DisposeAsync(), Times.Once);
+    }
+
+    [Fact]
+    public async Task WaitAsync_CorrelationIdOverload_PassesTheWaiterCorrelationId()
+    {
+        string? observed = null;
+
+        await new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>("corr-1")
+            .WaitAsync(correlationId =>
+            {
+                observed = correlationId;
+                return Task.CompletedTask;
+            });
+
+        Assert.Equal("corr-1", observed);
+    }
+
+    [Fact]
+    public async Task For_WithoutCorrelationId_GeneratesOneAndSharesItWithAmbientContextAndTrigger()
+    {
+        string? subscribedWith = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _, _, _) => subscribedWith = correlationId)
+            .ReturnsAsync(_waiter.Object);
+
+        string? triggeredWith = null;
+        await new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>()
+            .WaitAsync(correlationId =>
+            {
+                triggeredWith = correlationId;
+                return Task.CompletedTask;
+            });
+
+        Assert.False(string.IsNullOrWhiteSpace(subscribedWith));
+        Assert.Equal(subscribedWith, triggeredWith);
+        // The generated id is also ambient, so outgoing requests built from context still correlate.
+        Assert.Equal(subscribedWith, AsyncResponseContext.CorrelationId);
     }
 
     [Fact]
