@@ -354,16 +354,24 @@ current process; for distributed execution use `.WithGooglePubSubTransport(...)`
 ### 6. Propagating ambient context (trace, principal, tenant)
 
 Anything your app keeps in `AsyncLocal` — a trace id, the current principal, a tenant, a logging
-scope — is lost when AsyncResponse hands work to a foreign execution context. Two mechanisms carry
-it back, picked automatically per boundary:
+scope — is lost when AsyncResponse hands work to a foreign execution context. AsyncResponse carries
+it back, choosing the mechanism automatically per boundary:
 
-- **In-process hops** — the response handlers and the in-memory worker run under the *captured
-  `ExecutionContext`*, so ambient `AsyncLocal` state (`Activity.Current`, principal, logging scopes,
-  …) flows automatically. Nothing to configure.
-- **Serialized hops** — a broker-backed worker on another node, or a lost-subscriber recovery
-  callback after a redeploy, cannot carry `AsyncLocal`s. Register an
-  `IAsyncResponseContextPropagator` to capture your context into a `string`→`string` bag (persisted
-  with the worker job / recovery state) and restore it on the far side:
+| Where work resumes | Boundary | How context is carried |
+|---|---|---|
+| Response handler (Redis & in-memory) — your `Until` predicate, progress handling | in-process thread hop | captured `ExecutionContext` (automatic) |
+| In-memory worker job | in-process thread hop | captured `ExecutionContext` (automatic) |
+| Broker-backed worker job (e.g. Google Pub/Sub) | serialized, another process | `IAsyncResponseContextPropagator` baggage |
+| Lost-subscriber recovery callback (after a redeploy) | serialized, maybe another deployment | `IAsyncResponseContextPropagator` baggage |
+
+**In-process hops need no configuration.** The response handler and the in-memory worker run under
+the `ExecutionContext` captured when the wait was armed / the job was enqueued, so ambient
+`AsyncLocal` state — `Activity.Current`, the principal, an open logging scope — flows automatically.
+This is the classic "restore the trace/principal *inside* the broker callback" chore, handled for you.
+
+**Serialized hops can't carry `AsyncLocal`s**, so register an `IAsyncResponseContextPropagator` to
+capture your context into a `string`→`string` bag (persisted with the worker job / recovery state)
+and restore it on the far side:
 
 ```csharp
 public sealed class TracePropagator(ILogger<TracePropagator> logger) : IAsyncResponseContextPropagator
@@ -381,14 +389,17 @@ public sealed class TracePropagator(ILogger<TracePropagator> logger) : IAsyncRes
 
 builder.Services.AddAsyncResponse()
     .WithRedisChannel()
-    .WithContextPropagator<TracePropagator>()      // one per concern (trace, principal, tenant, …)
+    .WithContextPropagator<TracePropagator>()       // register one per concern…
+    .WithContextPropagator<PrincipalPropagator>()   // …they compose (each namespaces its own keys)
     .WithInMemoryTransport();
 ```
 
-The carrier is `string`→`string` so it survives JSON serialization; the `Restore` return value is an
-`IDisposable`, so a propagator can re-establish *behavior* like a logging scope, not just data. With
-no propagator registered the feature is a zero-cost no-op and the wire payload is unchanged. (See
-`SampleTracePropagator` in the sample for a runnable end-to-end example.)
+The carrier is `string`→`string`, so it survives JSON serialization and a redeploy; the `Restore`
+return value is an `IDisposable`, so a propagator can re-establish *behavior* like a logging scope,
+not just data — and the library disposes the scopes (in reverse) once processing finishes. With no
+propagator registered the feature is a zero-cost no-op and the wire payload is unchanged. See
+`SampleTracePropagator`/`SampleTenantPropagator` in the sample for a runnable example spanning all
+four boundaries.
 
 ### 7. Timeouts, errors, and cancellation
 
@@ -476,6 +487,13 @@ curl 'http://localhost:5000/healthz'                                            
 For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in
 one of the `/respond` requests. `Completed` exercises the resume callback; `Failed` exercises
 the failure callback with an `AsyncResponseDomainFailureException`.
+
+The sample also wires two context propagators (`SampleTracePropagator`, `SampleTenantPropagator`) —
+watch the `traceId`/`tenant` fields in the logs: `/demo/request-response` shows them on `HANDLER:`
+lines (flowing into the Redis response handler via `ExecutionContext`), `/demo/worker` shows them on
+the `WORKER:` line (in-memory worker, also `ExecutionContext`), and the `/demo/lost-subscriber` flow
+shows them on the `RECOVERY:` line — there they survived the simulated crash as serialized baggage
+persisted in the recovery state.
 
 ## Best practices
 

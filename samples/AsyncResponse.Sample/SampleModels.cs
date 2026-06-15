@@ -48,8 +48,8 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
 {
     public async Task ProcessOrderAsync(int orderId)
     {
-        _logger.LogInformation("WORKER: processing order {OrderId} (correlationId: {CorrelationId}, traceId: {TraceId})…",
-            orderId, AsyncResponseContext.CorrelationId, SampleTraceContext.Current);
+        _logger.LogInformation("WORKER: processing order {OrderId} (correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant})…",
+            orderId, AsyncResponseContext.CorrelationId, SampleTraceContext.Current, SampleTenantContext.Current);
         await Task.Delay(1_000);
         _logger.LogInformation("WORKER: order {OrderId} processed.", orderId);
     }
@@ -58,8 +58,8 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
     {
         _logger.LogWarning(
             "RECOVERY (resume): flow '{FlowName}' got a {Status} response after its waiter was lost " +
-            "(correlationId: {CorrelationId}, traceId: {TraceId}, message: {Message}). A real flow would resume or re-register here.",
-            flowName, payload.Status, correlationId, SampleTraceContext.Current, payload.Message);
+            "(correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant}, message: {Message}). A real flow would resume or re-register here.",
+            flowName, payload.Status, correlationId, SampleTraceContext.Current, SampleTenantContext.Current, payload.Message);
         return Task.CompletedTask;
     }
 
@@ -68,14 +68,14 @@ public sealed class SampleFlowService(ILogger<SampleFlowService> _logger) : ISam
         if (exception is AsyncResponseDomainFailureException domainFailure)
         {
             _logger.LogError(
-                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}) reported domain outcome {Outcome} after its waiter was lost. Payload: {Payload}. A real flow would mark itself failed (retriable) here.",
-                correlationId, SampleTraceContext.Current, domainFailure.Outcome, domainFailure.PayloadJson);
+                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}, tenant: {Tenant}) reported domain outcome {Outcome} after its waiter was lost. Payload: {Payload}. A real flow would mark itself failed (retriable) here.",
+                correlationId, SampleTraceContext.Current, SampleTenantContext.Current, domainFailure.Outcome, domainFailure.PayloadJson);
         }
         else
         {
             _logger.LogError(exception,
-                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}) failed technically after its waiter was lost.",
-                correlationId, SampleTraceContext.Current);
+                "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}, tenant: {Tenant}) failed technically after its waiter was lost.",
+                correlationId, SampleTraceContext.Current, SampleTenantContext.Current);
         }
 
         return Task.CompletedTask;
@@ -136,4 +136,56 @@ public sealed class SampleTracePropagator : IAsyncResponseContextPropagator
         => carrier.TryGetValue(Key, out var traceId)
             ? SampleTraceContext.Push(traceId)
             : SampleTraceContext.NoScope;
+}
+
+/// <summary>
+/// A second ambient value (tenant) the sample sets per request, demonstrating how multiple
+/// propagators compose — each registered with its own <c>.WithContextPropagator&lt;T&gt;()</c> and
+/// namespacing its own carrier key. Like the trace id, it flows in-process via
+/// <see cref="System.Threading.ExecutionContext"/> and across serialized hops via
+/// <see cref="SampleTenantPropagator"/>.
+/// </summary>
+public static class SampleTenantContext
+{
+    private static readonly AsyncLocal<string?> _tenant = new();
+
+    public static string? Current => _tenant.Value;
+
+    public static void Set(string tenant) => _tenant.Value = tenant;
+
+    internal static readonly IDisposable NoScope = new NullScope();
+
+    internal static IDisposable Push(string? tenant)
+    {
+        var previous = _tenant.Value;
+        _tenant.Value = tenant;
+        return new Scope(previous);
+    }
+
+    private sealed class Scope(string? _previous) : IDisposable
+    {
+        public void Dispose() => _tenant.Value = _previous;
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public void Dispose() { }
+    }
+}
+
+/// <summary>Sample propagator carrying the tenant id; registered alongside <see cref="SampleTracePropagator"/>.</summary>
+public sealed class SampleTenantPropagator : IAsyncResponseContextPropagator
+{
+    private const string Key = "sample.tenant";
+
+    public void Capture(IDictionary<string, string> carrier)
+    {
+        if (SampleTenantContext.Current is { } tenant)
+            carrier[Key] = tenant;
+    }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+        => carrier.TryGetValue(Key, out var tenant)
+            ? SampleTenantContext.Push(tenant)
+            : SampleTenantContext.NoScope;
 }

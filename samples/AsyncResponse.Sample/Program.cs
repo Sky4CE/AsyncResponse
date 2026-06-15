@@ -23,7 +23,8 @@ builder.Services.AddAsyncResponse(options =>
     options.RecoveryStateExpiry = TimeSpan.FromHours(1);
 })
 .WithInMemoryTransport()
-.WithContextPropagator<SampleTracePropagator>();   // carry the trace id across serialized hops
+.WithContextPropagator<SampleTracePropagator>()    // carry the trace id across serialized hops…
+.WithContextPropagator<SampleTenantPropagator>();  // …and the tenant — propagators compose
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 
 // --- Sample services ------------------------------------------------------------------------
@@ -54,14 +55,26 @@ app.MapGet("/", () => Results.Text(
 
 // 1) Request/response with an active waiter. For<T>() generates the correlation id and the
 //    required WaitAsync trigger guarantees subscribe-before-send.
-app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior) =>
+app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior, ILoggerFactory loggerFactory) =>
 {
+    var logger = loggerFactory.CreateLogger("RequestResponse");
+
+    // Per-request ambient context. It flows into the response handler below — which runs on a Redis
+    // subscriber thread — via the captured ExecutionContext, so the HANDLER log lines carry it. This
+    // is exactly the OptimaticV2 "restore context inside the redis worker" case, now automatic.
+    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    SampleTenantContext.Set("tenant-acme");
     var startedCorrelationId = string.Empty;
 
     var result = await asyncResponse
         .For<OperationResult>()
         .WithTimeout(TimeSpan.FromSeconds(30))
-        .Until(response => response.Status != OperationStatus.Running) // consume progress messages
+        .Until(response =>
+        {
+            logger.LogInformation("HANDLER: progress {Status} (traceId: {TraceId}, tenant: {Tenant})",
+                response.Status, SampleTraceContext.Current, SampleTenantContext.Current);
+            return response.Status != OperationStatus.Running; // consume progress messages
+        })
         .WaitAsync(context =>
         {
             startedCorrelationId = context.CorrelationId;
@@ -138,6 +151,7 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
 {
     AsyncResponseContext.CreateCorrelationId();
     SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    SampleTenantContext.Set("tenant-acme");
     await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessOrderAsync(orderId));
     return Results.Accepted(value: new { orderId, traceId = SampleTraceContext.Current, note = "Watch the logs for WORKER output — the traceId flows in-process via ExecutionContext." });
 });
@@ -147,9 +161,11 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
 // returns immediately; the subscription and the persisted recovery state stay alive.
 app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncResponse) =>
 {
-    // The propagator captures this trace id into the persisted recovery state, so it is restored
-    // before the recovery callback runs after the "crash" — even though the waiter is long gone.
+    // The propagators capture this trace id and tenant into the persisted recovery state, so they
+    // are restored before the recovery callback runs after the "crash" — even though the waiter is
+    // long gone (the values must survive serialization, which is what the propagators are for).
     SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    SampleTenantContext.Set("tenant-acme");
 
     var armed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 

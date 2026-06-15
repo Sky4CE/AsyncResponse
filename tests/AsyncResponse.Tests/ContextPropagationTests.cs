@@ -179,6 +179,194 @@ public class ContextPropagationTests
         }
     }
 
+    [Fact]
+    public async Task MultiplePropagators_BothRestoredThroughIngress()
+    {
+        var probe = new BaggageProbe();
+        var provider = BuildProvider(probe, b => b
+            .WithInMemoryChannel()
+            .WithContextPropagator<BaggagePropagator>()
+            .WithContextPropagator<TenantPropagator>());
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = JsonSerializer.Serialize(new WorkerJobEnvelope
+        {
+            Call = Call(nameof(IBaggageProbe.Observe), 7),
+            CorrelationId = "cid",
+            Context = new Dictionary<string, string>
+            {
+                [BaggagePropagator.Key] = "trace-1",
+                [TenantPropagator.Key] = "acme",
+            },
+        });
+
+        BaggagePropagator.Set(null);
+        TenantPropagator.Set(null);
+        await ingress.HandleWorkerMessageAsync(json);
+
+        var trace = await probe.Done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("trace-1", trace);
+        Assert.Equal("acme", probe.Tenant);
+        Assert.Null(BaggagePropagator.Current);   // both scopes disposed after the job
+        Assert.Null(TenantPropagator.Current);
+    }
+
+    [Fact]
+    public async Task InMemoryWorker_FlowsViaExecutionContext_WithoutInvokingPropagatorRestore()
+    {
+        var probe = new BaggageProbe();
+        var provider = BuildProvider(probe, b => b
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithContextPropagator<BaggagePropagator>());
+        var asyncResponse = provider.GetRequiredService<IAsyncResponseBuilder>();
+        var host = provider.GetServices<IHostedService>().OfType<InMemoryWorkerHost>().Single();
+
+        await host.StartAsync(CancellationToken.None);
+        try
+        {
+            BaggagePropagator.Reset("via-ec");
+            await asyncResponse.EnqueueWorkerAsync<IBaggageProbe>(p => p.Observe(7));
+            BaggagePropagator.Set(null);
+
+            var observed = await probe.Done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("via-ec", observed);                 // flowed via the captured ExecutionContext
+            Assert.Equal(0, BaggagePropagator.RestoreCalls);  // baggage Restore is NOT used for the in-process worker
+        }
+        finally
+        {
+            await host.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RecoveryFailureCallback_RestoresBaggage_OnSetException()
+    {
+        var probe = new BaggageProbe();
+        var provider = BuildProvider(probe, b => b.WithInMemoryChannel().WithContextPropagator<BaggagePropagator>());
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+
+        await store.SaveAsync(
+            "cid",
+            new RecoveryState
+            {
+                CorrelationId = "cid",
+                Context = new Dictionary<string, string> { [BaggagePropagator.Key] = "hello" },
+                FailureCallback = Call(nameof(IBaggageProbe.Observe), 7),
+            },
+            TimeSpan.FromMinutes(5));
+
+        BaggagePropagator.Set(null);
+        await publisher.SetException(new InvalidOperationException("boom"), "cid"); // no subscriber → failure callback
+
+        var observed = await probe.Done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("hello", observed);
+    }
+
+    [Fact]
+    public async Task RecoveryFailureCallback_RestoresBaggage_OnFailedDomainOutcome()
+    {
+        var probe = new BaggageProbe();
+        var provider = BuildProvider(probe, b => b.WithInMemoryChannel().WithContextPropagator<BaggagePropagator>());
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+
+        await store.SaveAsync(
+            "cid",
+            new RecoveryState
+            {
+                CorrelationId = "cid",
+                PayloadTypeFullName = typeof(OperationResult).FullName,
+                Context = new Dictionary<string, string> { [BaggagePropagator.Key] = "hello" },
+                FailureCallback = Call(nameof(IBaggageProbe.Observe), 7),
+            },
+            TimeSpan.FromMinutes(5));
+
+        BaggagePropagator.Set(null);
+        // A Failed payload with no subscriber routes to the failure callback via the dispatcher.
+        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Failed }, "cid");
+
+        var observed = await probe.Done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("hello", observed);
+    }
+
+    [Fact]
+    public async Task EnqueueWorker_BaggageRoundTrips_CaptureSerializeRestore()
+    {
+        WorkerJobEnvelope? published = null;
+        var transport = new Mock<IWorkerTransport>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Callback<WorkerJobEnvelope, CancellationToken>((job, _) => published = job)
+            .Returns(Task.CompletedTask);
+
+        var probe = new BaggageProbe();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IBaggageProbe>(probe);
+        services.AddSingleton(transport.Object);
+        services.AddAsyncResponse().WithInMemoryChannel().WithContextPropagator<BaggagePropagator>();
+        var provider = services.BuildServiceProvider();
+        var asyncResponse = provider.GetRequiredService<IAsyncResponseBuilder>();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        BaggagePropagator.Set("hello");
+        await asyncResponse.EnqueueWorkerAsync<IBaggageProbe>(p => p.Observe(7)); // captured into the envelope
+        BaggagePropagator.Set(null);
+
+        // Cross the wire (broker → ingress) and execute on the far side.
+        await ingress.HandleWorkerMessageAsync(JsonSerializer.Serialize(published));
+
+        var observed = await probe.Done.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("hello", observed);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_CapturesAmbientIntoRecoveryState()
+    {
+        var provider = BuildProvider(new BaggageProbe(), b => b.WithInMemoryChannel().WithContextPropagator<BaggagePropagator>());
+        var asyncResponse = provider.GetRequiredService<IAsyncResponseBuilder>();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+
+        BaggagePropagator.Set("hello");
+        string? correlationId = null;
+        var armed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Arm a waiter in the background; the trigger reports the generated id once recovery state exists.
+        _ = asyncResponse.For<OperationResult>().WaitAsync(ctx =>
+        {
+            correlationId = ctx.CorrelationId;
+            armed.SetResult();
+            return Task.CompletedTask;
+        });
+        await armed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var state = await store.GetAsync(correlationId!);
+        Assert.NotNull(state);
+        Assert.Equal("hello", state!.Context?[BaggagePropagator.Key]);
+    }
+
+    [Fact]
+    public async Task PropagatorRegistered_NothingAmbient_EnvelopeContextIsNull()
+    {
+        WorkerJobEnvelope? published = null;
+        var transport = new Mock<IWorkerTransport>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Callback<WorkerJobEnvelope, CancellationToken>((job, _) => published = job)
+            .Returns(Task.CompletedTask);
+
+        var propagation = new AsyncResponseContextPropagation([new BaggagePropagator()]);
+        var builder = new AsyncResponseBuilder(Mock.Of<IAsyncResponseSubscriber>(), transport.Object, null, propagation);
+
+        BaggagePropagator.Set(null); // nothing ambient to capture
+        await builder.EnqueueWorkerAsync<IBaggageProbe>(p => p.Observe(7));
+
+        Assert.NotNull(published);
+        Assert.Null(published!.Context); // empty carrier collapses to null, not an empty dictionary
+    }
+
     // ----- helpers -----
 
     private static ServiceProvider BuildProvider<TProbe>(TProbe probe, Action<AsyncResponseRegistrationBuilder> configure)
@@ -201,10 +389,57 @@ public class ContextPropagationTests
     };
 }
 
-/// <summary>Serializable-baggage propagator backed by an <see cref="AsyncLocal{T}"/>.</summary>
+/// <summary>Serializable-baggage propagator backed by an <see cref="AsyncLocal{T}"/>, with a
+/// restore-call counter so tests can assert which boundary restored it.</summary>
 public sealed class BaggagePropagator : IAsyncResponseContextPropagator
 {
     public const string Key = "test.baggage";
+    private static readonly AsyncLocal<string?> _value = new();
+    private static int _restoreCalls;
+
+    public static string? Current => _value.Value;
+    public static int RestoreCalls => Volatile.Read(ref _restoreCalls);
+
+    public static void Set(string? value) => _value.Value = value;
+
+    public static void Reset(string? value = null)
+    {
+        _value.Value = value;
+        Interlocked.Exchange(ref _restoreCalls, 0);
+    }
+
+    public void Capture(IDictionary<string, string> carrier)
+    {
+        if (_value.Value is { } v) carrier[Key] = v;
+    }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+    {
+        Interlocked.Increment(ref _restoreCalls);
+        if (!carrier.TryGetValue(Key, out var value))
+            return NullScope.Instance;
+
+        var previous = _value.Value;
+        _value.Value = value;
+        return new Restorer(previous);
+    }
+
+    private sealed class Restorer(string? _previous) : IDisposable
+    {
+        public void Dispose() => _value.Value = _previous;
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static readonly NullScope Instance = new();
+        public void Dispose() { }
+    }
+}
+
+/// <summary>A second baggage propagator (different namespaced key) for composition tests.</summary>
+public sealed class TenantPropagator : IAsyncResponseContextPropagator
+{
+    public const string Key = "test.tenant";
     private static readonly AsyncLocal<string?> _value = new();
 
     public static string? Current => _value.Value;
@@ -218,7 +453,7 @@ public sealed class BaggagePropagator : IAsyncResponseContextPropagator
     public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
     {
         if (!carrier.TryGetValue(Key, out var value))
-            return Restorer.NoOp;
+            return NullScope.Instance;
 
         var previous = _value.Value;
         _value.Value = value;
@@ -227,8 +462,13 @@ public sealed class BaggagePropagator : IAsyncResponseContextPropagator
 
     private sealed class Restorer(string? _previous) : IDisposable
     {
-        public static readonly Restorer NoOp = new(null);
         public void Dispose() => _value.Value = _previous;
+    }
+
+    private sealed class NullScope : IDisposable
+    {
+        public static readonly NullScope Instance = new();
+        public void Dispose() { }
     }
 }
 
@@ -241,8 +481,12 @@ public sealed class BaggageProbe : IBaggageProbe
 {
     public readonly TaskCompletionSource<string?> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    /// <summary>The tenant baggage observed during execution (for composition tests).</summary>
+    public string? Tenant;
+
     public Task Observe(int n)
     {
+        Tenant = TenantPropagator.Current;
         Done.TrySetResult(BaggagePropagator.Current);
         return Task.CompletedTask;
     }
