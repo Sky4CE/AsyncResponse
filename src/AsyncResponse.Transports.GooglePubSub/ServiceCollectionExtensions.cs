@@ -33,6 +33,7 @@ public static class GooglePubSubAsyncResponseServiceCollectionExtensions
         services.TryAddSingleton<GooglePubSubWorkerTransport>();
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<GooglePubSubWorkerTransport>()));
+        services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, GooglePubSubReplyTargetProvider>());
 
         services.AddHostedService<GooglePubSubWorkerSubscriber>();
         services.AddHostedService<GooglePubSubResponseIngressSubscriber>();

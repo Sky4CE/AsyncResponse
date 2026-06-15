@@ -83,7 +83,8 @@ internal sealed class GooglePubSubResponseIngressSubscriber(
 
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
     {
-        message.Attributes.TryGetValue(Options.CorrelationIdAttribute, out var correlationId);
-        return ingress.HandleResponseMessageAsync(message.Data.ToStringUtf8(), correlationId);
+        var messageJson = message.Data.ToStringUtf8();
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(message, messageJson, Options);
+        return ingress.HandleResponseMessageAsync(messageJson, correlationId);
     }
 }

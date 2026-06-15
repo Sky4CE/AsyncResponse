@@ -25,7 +25,24 @@ public sealed class RemoteWorkSimulator(IAsyncResponseIngress _ingress, ILogger<
     public void Start(string correlationId, RemoteBehavior behavior)
     {
         _logger.LogInformation("REMOTE: accepted request {CorrelationId} ({Behavior}).", correlationId, behavior);
+        StartWork(correlationId, behavior);
+    }
 
+    public void Start(AsyncResponseRequestContext context, RemoteBehavior behavior)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        _logger.LogInformation(
+            "REMOTE: accepted request {CorrelationId} ({Behavior}) with reply target {ReplyTarget}.",
+            context.CorrelationId,
+            behavior,
+            context.ReplyTarget?.Address);
+
+        StartWork(context.CorrelationId, behavior);
+    }
+
+    private void StartWork(string correlationId, RemoteBehavior behavior)
+    {
         _ = Task.Run(async () =>
         {
             try

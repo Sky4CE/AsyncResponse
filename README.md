@@ -173,6 +173,46 @@ the response-ingress subscriber. Pub/Sub is a transport, not a recovery store, s
 channel: `.WithInMemoryChannel()` for simple apps, or `.WithRedisChannel()` when late responses
 must survive redeploys.
 
+The response topic is also exposed as a transport-neutral reply target. Use this when the
+remote request needs to know where to publish its eventual response:
+
+```csharp
+OrderResult result = await _asyncResponse
+    .For<OrderResult>()
+    .WithReplyTarget() // default: options.ResponseTopicId
+    .WaitAsync(context => _remoteSystem.SubmitAsync(
+        orderId,
+        correlationId: context.CorrelationId,
+        replyProjectId: context.ReplyTarget!.Properties["projectId"],
+        replyTopicId: context.ReplyTarget.Properties["topicId"]));
+```
+
+For multi-region or multi-tenant routing, register named targets and select one per flow:
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithGooglePubSubTransport(options =>
+    {
+        options.ProjectId = "my-gcp-project";
+        options.WorkerTopicId = "asyncresponse-workers";
+        options.WorkerSubscriptionId = "asyncresponse-workers-sub";
+        options.ResponseSubscriptionId = "asyncresponse-responses-sub";
+        options.AddReplyTarget("regional-us", "my-gcp-project-us", "asyncresponse-responses-us");
+    });
+
+var result = await _asyncResponse
+    .For<OrderResult>()
+    .WithReplyTarget("regional-us")
+    .WaitAsync(context => _remoteSystem.SubmitAsync(orderId, context));
+```
+
+The hosted response subscriber feeds Pub/Sub messages into the same transport-neutral
+`IAsyncResponseIngress` you would call from any broker. It resolves the correlation id from the
+configured message attribute first (`correlationId` by default), then falls back to JSON body
+paths such as `CorrelationId`, `CustomParameters`, `CustomParameters.CorrelationId`,
+`PubSubParams.CustomParameters.CorrelationId`, and `DagJsonParameters.CorrelationId`.
+
 ### 1. Define a payload — and its domain semantics
 
 Every payload implements `IAsyncResponsePayload`. The `ClassifyOutcome()` member is
@@ -247,6 +287,9 @@ them into the ingress:
 // e.g. inside your broker consumer:
 await ingress.HandleResponseMessageAsync(messageBodyJson, correlationIdFromHeaders);
 ```
+
+When you use `AsyncResponse.Transports.GooglePubSub`, the hosted response subscriber does this
+for you and can extract the correlation id from Pub/Sub attributes or the configured JSON paths.
 
 In-process publishers can skip the ingress and call `IAsyncResponsePublisher` directly:
 
@@ -376,43 +419,51 @@ dotnet run --project samples/AsyncResponse.Sample
 Then walk the scenarios:
 
 ```bash
-curl -X POST 'localhost:5000/demo/request-response?behavior=Succeed'     # happy path with progress messages
-curl -X POST 'localhost:5000/demo/request-response?behavior=FailDomain'  # domain failure seen by the active waiter
-curl -X POST 'localhost:5000/demo/timeout'                               # 2s timeout vs 15s remote
-curl -X POST 'localhost:5000/demo/worker?orderId=42'                     # background worker job
+curl -X POST 'http://localhost:5000/demo/request-response?behavior=Succeed'              # happy path with progress messages
+curl -X POST 'http://localhost:5000/demo/request-response?behavior=FailDomain'           # domain failure seen by the active waiter
+curl -X POST 'http://localhost:5000/demo/request-response/reply-target?behavior=Succeed' # same flow, passing explicit reply-to metadata
+curl -X POST 'http://localhost:5000/demo/timeout'                                        # 2s timeout vs 15s remote
+curl -X POST 'http://localhost:5000/demo/worker?orderId=42'                              # background worker job
 
 # The headline feature — recovery after a "redeploy":
-curl -X POST 'localhost:5000/demo/lost-subscriber/arm'                   # → returns a correlationId
-curl -X POST 'localhost:5000/demo/lost-subscriber/crash'                 # kills every subscription
-curl -X POST 'localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Completed'  # → resume callback
-curl -X POST 'localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Failed'     # → failure callback
-curl 'localhost:5000/healthz'                                            # watchdog findings
+curl -X POST 'http://localhost:5000/demo/lost-subscriber/arm'                            # returns a correlationId
+curl -X POST 'http://localhost:5000/demo/lost-subscriber/crash'                          # kills every subscription
+curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Completed' # resume callback
+curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Failed'    # failure callback
+curl 'http://localhost:5000/healthz'                                                     # watchdog findings
 ```
+
+For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in
+one of the `/respond` requests. `Completed` exercises the resume callback; `Failed` exercises
+the failure callback with an `AsyncResponseDomainFailureException`.
 
 ## Best practices
 
 1. **Always make the send the trigger** (the `WaitAsync` argument). Sending before subscribing
    is a race: a fast first response finds nobody listening and, on first registration, no
    recovery state either.
-2. **Classify honestly.** `ClassifyOutcome()` must mirror your active waiter's `Until`
+2. **Use reply targets for generic response topics.** If the remote system needs reply-to
+   metadata, call `.WithReplyTarget()` and pass the `AsyncResponseRequestContext` into the
+   trigger. Transport packages own how native destinations become reply targets.
+3. **Classify honestly.** `ClassifyOutcome()` must mirror your active waiter's `Until`
    semantics. Map unrecognized states to `Unknown` (fails conservatively) unless your active
    path deliberately keeps waiting on them — then map them to `InProgress`.
-3. **Register both recovery callbacks** for any flow that must survive redeploys. A failed
+4. **Register both recovery callbacks** for any flow that must survive redeploys. A failed
    payload with no failure callback is logged and dropped — never resumed — but dropped is
    still a stuck flow.
-4. **Make resume callbacks re-entrant.** A resume may re-trigger a flow whose step is still
+5. **Make resume callbacks re-entrant.** A resume may re-trigger a flow whose step is still
    running remotely; resume should *re-attach* (subscribe to the same correlation id) rather
    than re-execute side effects. Persist enough state to tell the difference.
-5. **Treat callback method names and the `KeyPrefix` as deployment contracts.** They are
+6. **Treat callback method names and the `KeyPrefix` as deployment contracts.** They are
    persisted; rename with a migration window.
-6. **Set timeouts per flow.** The 7-day default is a backstop, not a recommendation; a payment
+7. **Set timeouts per flow.** The 7-day default is a backstop, not a recommendation; a payment
    flow should fail in minutes.
-7. **Run the watchdog in exactly one host per Redis** and alert on its warnings or the
+8. **Run the watchdog in exactly one host per Redis** and alert on its warnings or the
    `Degraded` health status — stale recovery state is your earliest signal of stuck flows.
-8. **Mind Redis pub/sub semantics.** Delivery is at-most-once to live subscribers; the recovery
+9. **Mind Redis pub/sub semantics.** Delivery is at-most-once to live subscribers; the recovery
    state is what makes the system safe across gaps. Don't disable it (`RecoveryStateExpiry`)
    below your longest flow duration.
-9. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create
+10. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create
    a second connection for AsyncResponse.
 
 ## License

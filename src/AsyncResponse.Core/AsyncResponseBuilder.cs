@@ -5,19 +5,21 @@ namespace AsyncResponse;
 /// <inheritdoc cref="IAsyncResponseBuilder"/>
 internal sealed class AsyncResponseBuilder(
     IAsyncResponseSubscriber _subscriber,
-    IWorkerTransport? _workerTransport = null) : IAsyncResponseBuilder
+    IWorkerTransport? _workerTransport = null,
+    IAsyncResponseReplyTargetProvider? _replyTargetProvider = null) : IAsyncResponseBuilder
 {
     /// <inheritdoc />
     public IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
         => new AsyncResponseBuilder<T>(
             _subscriber,
+            _replyTargetProvider,
             !string.IsNullOrWhiteSpace(correlationId)
                 ? correlationId
                 : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace."));
 
     /// <inheritdoc />
     public IAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
-        => new AsyncResponseBuilder<T>(_subscriber, AsyncResponseContext.CreateCorrelationId());
+        => new AsyncResponseBuilder<T>(_subscriber, _replyTargetProvider, AsyncResponseContext.CreateCorrelationId());
 
     /// <inheritdoc />
     public Task EnqueueWorkerAsync(ReflectionCallDto work)
@@ -32,7 +34,8 @@ internal sealed class AsyncResponseBuilder(
         return transport.PublishAsync(new WorkerJobEnvelope
         {
             Call = work,
-            CorrelationId = AsyncResponseContext.CorrelationId
+            CorrelationId = AsyncResponseContext.CorrelationId,
+            ReplyTarget = AsyncResponseContext.ReplyTarget
         });
     }
 
@@ -53,15 +56,23 @@ internal sealed class AsyncResponseBuilder(
 internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePayload
 {
     private readonly IAsyncResponseSubscriber _subscriber;
+    private readonly IAsyncResponseReplyTargetProvider? _replyTargetProvider;
     private readonly string _correlationId;
     private ReflectionCallDto? _resumeCallback;
     private ReflectionCallDto? _failureCallback;
     private Func<T, ValueTask<bool>>? _completionPredicate;
     private TimeSpan? _timeout;
+    private bool _useReplyTarget;
+    private string? _replyTargetName;
+    private AsyncResponseReplyTarget? _replyTarget;
 
-    internal AsyncResponseBuilder(IAsyncResponseSubscriber subscriber, string correlationId)
+    internal AsyncResponseBuilder(
+        IAsyncResponseSubscriber subscriber,
+        IAsyncResponseReplyTargetProvider? replyTargetProvider,
+        string correlationId)
     {
         _subscriber = subscriber;
+        _replyTargetProvider = replyTargetProvider;
         _correlationId = correlationId;
     }
 
@@ -98,6 +109,38 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     }
 
     /// <inheritdoc />
+    public IAsyncResponseAttachedBuilder<T> WithReplyTarget()
+    {
+        _useReplyTarget = true;
+        _replyTargetName = null;
+        _replyTarget = null;
+        return this;
+    }
+
+    /// <inheritdoc />
+    public IAsyncResponseAttachedBuilder<T> WithReplyTarget(string name)
+    {
+        _useReplyTarget = true;
+        _replyTargetName = !string.IsNullOrWhiteSpace(name)
+            ? name
+            : throw new ArgumentException("Reply target name cannot be null or whitespace.", nameof(name));
+        _replyTarget = null;
+        return this;
+    }
+
+    /// <inheritdoc />
+    public IAsyncResponseAttachedBuilder<T> WithReplyTarget(AsyncResponseReplyTarget replyTarget)
+    {
+        ArgumentNullException.ThrowIfNull(replyTarget);
+        ValidateReplyTarget(replyTarget);
+
+        _useReplyTarget = true;
+        _replyTargetName = null;
+        _replyTarget = replyTarget;
+        return this;
+    }
+
+    /// <inheritdoc />
     public IAsyncResponseAttachedBuilder<T> Until(Func<T, bool> predicate)
     {
         _completionPredicate = predicate != null
@@ -117,7 +160,7 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
 
     /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WaitAsync" />
     public Task<T> WaitAsync()
-        => WaitCoreAsync(trigger: null);
+        => WaitCoreAsync((Func<AsyncResponseRequestContext, Task>?)null);
 
     /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{Task})" />
     public Task<T> WaitAsync(Func<Task> trigger)
@@ -133,6 +176,13 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
         return WaitCoreAsync(() => trigger(_correlationId));
     }
 
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WaitAsync(Func{AsyncResponseRequestContext, Task})" />
+    public Task<T> WaitAsync(Func<AsyncResponseRequestContext, Task> trigger)
+    {
+        ArgumentNullException.ThrowIfNull(trigger);
+        return WaitCoreAsync(context => trigger(context));
+    }
+
     private Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
         => _subscriber.CreateResponseWaiter<T>(
             _correlationId,
@@ -143,17 +193,48 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
         );
 
     private async Task<T> WaitCoreAsync(Func<Task>? trigger)
+        => await WaitCoreAsync(trigger is null ? null : _ => trigger()).ConfigureAwait(false);
+
+    private async Task<T> WaitCoreAsync(Func<AsyncResponseRequestContext, Task>? trigger)
     {
         await using var waiter = await CreateWaiterAsync().ConfigureAwait(false);
+        var replyTarget = ResolveReplyTarget();
+        var requestContext = new AsyncResponseRequestContext(_correlationId, replyTarget);
 
         // Subscribe-before-send by construction: the trigger runs only once the subscription and
         // the recovery state exist, so the first response can never race the registration. A
         // failing trigger means the operation never started — the waiter (and with it the
         // recovery state) is torn down by the await-using disposal as the exception propagates.
         if (trigger != null)
-            await trigger().ConfigureAwait(false);
+        {
+            using var contextScope = AsyncResponseContext.PushContext(_correlationId, replyTarget);
+            await trigger(requestContext).ConfigureAwait(false);
+        }
 
         return await waiter.ResponseTask.ConfigureAwait(false);
+    }
+
+    private AsyncResponseReplyTarget? ResolveReplyTarget()
+    {
+        if (!_useReplyTarget)
+            return null;
+
+        var replyTarget = _replyTarget
+            ?? (_replyTargetProvider ?? throw new InvalidOperationException(
+                "No async-response reply target provider is registered. Register a transport package " +
+                "that provides reply targets, such as .WithGooglePubSubTransport(...), or pass an " +
+                "explicit AsyncResponseReplyTarget to .WithReplyTarget(...)."))
+            .GetReplyTarget(_replyTargetName);
+
+        ValidateReplyTarget(replyTarget);
+        return replyTarget;
+    }
+
+    private static void ValidateReplyTarget(AsyncResponseReplyTarget replyTarget)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(replyTarget.Name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(replyTarget.Transport);
+        ArgumentException.ThrowIfNullOrWhiteSpace(replyTarget.Address);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -190,6 +271,24 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.WithTimeout(TimeSpan timeout)
     {
         WithTimeout(timeout);
+        return this;
+    }
+
+    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.WithReplyTarget()
+    {
+        WithReplyTarget();
+        return this;
+    }
+
+    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.WithReplyTarget(string name)
+    {
+        WithReplyTarget(name);
+        return this;
+    }
+
+    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.WithReplyTarget(AsyncResponseReplyTarget replyTarget)
+    {
+        WithReplyTarget(replyTarget);
         return this;
     }
 

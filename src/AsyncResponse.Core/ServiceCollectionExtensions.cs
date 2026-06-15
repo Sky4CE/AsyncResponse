@@ -33,7 +33,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.TryAddSingleton<IAsyncResponseIngress, AsyncResponseIngress>();
         services.TryAddSingleton<IAsyncResponseBuilder>(provider => new AsyncResponseBuilder(
             provider.GetRequiredService<IAsyncResponseSubscriber>(),
-            provider.GetService<IWorkerTransport>()));
+            provider.GetService<IWorkerTransport>(),
+            provider.GetService<IAsyncResponseReplyTargetProvider>()));
 
         // The recovery watchdog is part of the engine and runs by default for whatever channel is
         // registered (scanning + liveness go through IRecoveryStateScanner / IActiveSubscriberProbe).

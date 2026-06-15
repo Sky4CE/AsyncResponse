@@ -14,6 +14,13 @@ public sealed class WorkerJobEnvelope
     /// <see cref="AsyncResponseContext"/> before execution so downstream publishes correlate.
     /// </summary>
     public string? CorrelationId { get; set; }
+
+    /// <summary>
+    /// The reply target captured when the job was enqueued; restored into
+    /// <see cref="AsyncResponseContext"/> before execution so downstream remote requests can
+    /// publish responses to the same generic ingress.
+    /// </summary>
+    public AsyncResponseReplyTarget? ReplyTarget { get; set; }
 }
 
 /// <summary>

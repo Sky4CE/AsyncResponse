@@ -41,6 +41,7 @@ app.MapGet("/", () => Results.Text(
     AsyncResponse sample. Endpoints:
 
       POST /demo/request-response?behavior=Succeed|FailDomain   happy path / domain failure with an active waiter
+      POST /demo/request-response/reply-target                  same flow with explicit reply-to metadata
       POST /demo/timeout                                         2s timeout against a 15s remote operation
       POST /demo/worker?orderId=42                               fire-and-forget background worker job
       POST /demo/lost-subscriber/arm                             register a waiter with recovery callbacks
@@ -60,7 +61,7 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
         .For<OperationResult>()
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running) // consume progress messages
-        .WaitAsync(correlationId =>
+        .WaitAsync((string correlationId) =>
         {
             startedCorrelationId = correlationId;
             remote.Start(correlationId, behavior ?? RemoteBehavior.Succeed);
@@ -72,7 +73,42 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
         : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
 });
 
-// 2) Timeout: the remote takes 15s, the waiter allows 2s. Also shows the no-correlation-id
+// 2) Request/response with explicit reply-to metadata. Transport packages usually provide this
+//    via WithReplyTarget(); this sample uses an explicit target so it stays infrastructure-free.
+app.MapPost("/demo/request-response/reply-target", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior) =>
+{
+    AsyncResponseRequestContext? startedContext = null;
+    var replyTarget = new AsyncResponseReplyTarget
+    {
+        Name = "sample",
+        Transport = "sample",
+        Address = "sample://remote-work-simulator"
+    };
+
+    var result = await asyncResponse
+        .For<OperationResult>()
+        .WithReplyTarget(replyTarget)
+        .WithTimeout(TimeSpan.FromSeconds(30))
+        .Until(response => response.Status != OperationStatus.Running)
+        .WaitAsync((AsyncResponseRequestContext context) =>
+        {
+            startedContext = context;
+            remote.Start(context, behavior ?? RemoteBehavior.Succeed);
+            return Task.CompletedTask;
+        });
+
+    return result.Status == OperationStatus.Completed
+        ? Results.Ok(new
+        {
+            correlationId = startedContext?.CorrelationId,
+            replyTarget = startedContext?.ReplyTarget,
+            result.Status,
+            result.Message
+        })
+        : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
+});
+
+// 3) Timeout: the remote takes 15s, the waiter allows 2s. Also shows the no-correlation-id
 //    flow: For<T>() generates one and hands it to the trigger.
 app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote) =>
 {
@@ -82,7 +118,7 @@ app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteW
             .For<OperationResult>()
             .WithTimeout(TimeSpan.FromSeconds(2))
             .Until(response => response.Status != OperationStatus.Running)
-            .WaitAsync(correlationId =>
+            .WaitAsync((string correlationId) =>
             {
                 remote.Start(correlationId, RemoteBehavior.Slow);
                 return Task.CompletedTask;
@@ -96,7 +132,7 @@ app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteW
     }
 });
 
-// 3) Fire-and-forget worker job via the in-process worker transport.
+// 4) Fire-and-forget worker job via the in-process worker transport.
 app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orderId) =>
 {
     AsyncResponseContext.CreateCorrelationId();
@@ -104,7 +140,7 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
     return Results.Accepted(value: new { orderId, note = "Watch the logs for WORKER output." });
 });
 
-// 4a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
+// 5a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
 // waiting in the background (like a worker awaiting a slow remote operation). The HTTP request
 // returns immediately; the subscription and the persisted recovery state stay alive.
 app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncResponse) =>
@@ -118,7 +154,7 @@ app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncRespo
             flow.ResumeFlowAsync("sample-flow", Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId()))
         .OnLostSubscriberFailure<ISampleFlowService>(flow =>
             flow.FailFlowAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-        .WaitAsync(correlationId =>
+        .WaitAsync((string correlationId) =>
         {
             // The trigger runs once the subscription and recovery state exist. The "send" here
             // is handing the id to the operator: the remote work is delivered manually via
@@ -136,7 +172,7 @@ app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncRespo
     });
 });
 
-// 4b) Lost-subscriber demo — crash: drop every Redis subscription, like a redeploy would.
+// 5b) Lost-subscriber demo — crash: drop every Redis subscription, like a redeploy would.
 // The recovery state stays in Redis; only the in-memory waiters die.
 app.MapPost("/demo/lost-subscriber/crash", (IConnectionMultiplexer multiplexer) =>
 {
@@ -144,7 +180,7 @@ app.MapPost("/demo/lost-subscriber/crash", (IConnectionMultiplexer multiplexer) 
     return Results.Ok("All subscriptions dropped (simulated redeploy). The armed waiters are now lost.");
 });
 
-// 4c) Lost-subscriber demo — respond: deliver the late terminal response. With no subscriber
+// 5c) Lost-subscriber demo — respond: deliver the late terminal response. With no subscriber
 // alive, the lost-subscriber dispatcher classifies the payload: Completed → ResumeFlowAsync,
 // Failed → FailFlowAsync (as AsyncResponseDomainFailureException). Watch the RECOVERY logs.
 app.MapPost("/demo/lost-subscriber/respond", async (RemoteWorkSimulator remote, string correlationId, OperationStatus status) =>

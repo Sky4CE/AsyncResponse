@@ -5,7 +5,7 @@ namespace AsyncResponse.Tests;
 
 /// <summary>
 /// The fluent builder's safety guarantees: subscribe-before-trigger ordering, waiter teardown on
-/// a failing trigger, and worker enqueueing with the ambient correlation id.
+/// a failing trigger, and worker enqueueing with the ambient async-response context.
 /// </summary>
 public class AsyncResponseBuilderTests
 {
@@ -89,7 +89,7 @@ public class AsyncResponseBuilderTests
         string? triggeredWith = null;
         await new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>()
-            .WaitAsync(correlationId =>
+            .WaitAsync((string correlationId) =>
             {
                 triggeredWith = correlationId;
                 return Task.CompletedTask;
@@ -99,6 +99,71 @@ public class AsyncResponseBuilderTests
         Assert.Equal(subscribedWith, triggeredWith);
         // The generated id is also ambient, so outgoing requests built from context still correlate.
         Assert.Equal(subscribedWith, AsyncResponseContext.CorrelationId);
+    }
+
+    [Fact]
+    public async Task WaitAsync_WithReplyTarget_PassesRequestContextAndScopesAmbientValues()
+    {
+        var replyTarget = new AsyncResponseReplyTarget
+        {
+            Name = "default",
+            Transport = "test",
+            Address = "test://reply"
+        };
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        provider.Setup(p => p.GetReplyTarget(null)).Returns(replyTarget);
+
+        string? subscribedWith = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _, _, _) => subscribedWith = correlationId)
+            .ReturnsAsync(_waiter.Object);
+
+        AsyncResponseRequestContext? observed = null;
+        AsyncResponseReplyTarget? ambientInTrigger = null;
+        await new AsyncResponseBuilder(_subscriber.Object, null, provider.Object)
+            .For<OperationResult>()
+            .WithReplyTarget()
+            .WaitAsync((AsyncResponseRequestContext context) =>
+            {
+                observed = context;
+                ambientInTrigger = AsyncResponseContext.ReplyTarget;
+                return Task.CompletedTask;
+            });
+
+        Assert.NotNull(observed);
+        Assert.Equal(subscribedWith, observed!.CorrelationId);
+        Assert.Same(replyTarget, observed.ReplyTarget);
+        Assert.Same(replyTarget, ambientInTrigger);
+        Assert.Null(AsyncResponseContext.ReplyTarget);
+    }
+
+    [Fact]
+    public async Task WaitAsync_WithNamedReplyTarget_ResolvesNamedProviderTarget()
+    {
+        var replyTarget = new AsyncResponseReplyTarget
+        {
+            Name = "regional-us",
+            Transport = "test",
+            Address = "test://regional-us"
+        };
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        provider.Setup(p => p.GetReplyTarget("regional-us")).Returns(replyTarget);
+
+        AsyncResponseRequestContext? observed = null;
+        await new AsyncResponseBuilder(_subscriber.Object, null, provider.Object)
+            .For<OperationResult>()
+            .WithReplyTarget("regional-us")
+            .WaitAsync((AsyncResponseRequestContext context) =>
+            {
+                observed = context;
+                return Task.CompletedTask;
+            });
+
+        Assert.Same(replyTarget, observed!.ReplyTarget);
     }
 
     [Fact]
@@ -140,7 +205,7 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
-    public async Task EnqueueWorker_CapturesAmbientCorrelationId()
+    public async Task EnqueueWorker_CapturesAmbientContext()
     {
         var transport = new Mock<IWorkerTransport>();
         WorkerJobEnvelope? published = null;
@@ -149,12 +214,29 @@ public class AsyncResponseBuilderTests
             .Callback<WorkerJobEnvelope, CancellationToken>((job, _) => published = job)
             .Returns(Task.CompletedTask);
 
+        var replyTarget = new AsyncResponseReplyTarget
+        {
+            Name = "default",
+            Transport = "test",
+            Address = "test://reply"
+        };
+
         AsyncResponseContext.SetCorrelationId("corr-worker");
-        await new AsyncResponseBuilder(_subscriber.Object, transport.Object)
-            .EnqueueWorkerAsync<IRecoverySpy>(spy => spy.OnWorkerJob(7));
+        AsyncResponseContext.SetReplyTarget(replyTarget);
+        try
+        {
+            await new AsyncResponseBuilder(_subscriber.Object, transport.Object)
+                .EnqueueWorkerAsync<IRecoverySpy>(spy => spy.OnWorkerJob(7));
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+            AsyncResponseContext.ClearReplyTarget();
+        }
 
         Assert.NotNull(published);
         Assert.Equal("corr-worker", published!.CorrelationId);
+        Assert.Same(replyTarget, published.ReplyTarget);
         Assert.Equal(nameof(IRecoverySpy.OnWorkerJob), published.Call.MethodName);
         Assert.Equal(7, Assert.Single(published.Call.Params).Value);
     }

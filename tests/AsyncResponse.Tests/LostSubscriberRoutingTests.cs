@@ -220,6 +220,12 @@ public class LostSubscriberRoutingTests
         var job = new WorkerJobEnvelope
         {
             CorrelationId = CorrelationId,
+            ReplyTarget = new AsyncResponseReplyTarget
+            {
+                Name = "default",
+                Transport = "test",
+                Address = "test://reply"
+            },
             Call = new ReflectionCallDto
             {
                 ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
@@ -230,15 +236,22 @@ public class LostSubscriberRoutingTests
 
         await Ingress.HandleWorkerMessageAsync(JsonSerializer.Serialize(job));
 
-        var (orderId, observedCorrelationId) = Assert.Single(_spy.WorkerJobs);
+        var (orderId, observedCorrelationId, observedReplyTarget) = Assert.Single(_spy.WorkerJobs);
         Assert.Equal(42, orderId);
         Assert.Equal(CorrelationId, observedCorrelationId);
+        Assert.Equal("default", observedReplyTarget);
     }
 
     [Fact]
-    public async Task Ingress_WorkerMessage_WithoutCorrelationId_ClearsAmbientOnlyForJob()
+    public async Task Ingress_WorkerMessage_WithoutContext_ClearsAmbientOnlyForJob()
     {
         AsyncResponseContext.SetCorrelationId("outer-correlation-id");
+        AsyncResponseContext.SetReplyTarget(new AsyncResponseReplyTarget
+        {
+            Name = "outer",
+            Transport = "test",
+            Address = "test://outer"
+        });
         try
         {
             var job = new WorkerJobEnvelope
@@ -254,14 +267,17 @@ public class LostSubscriberRoutingTests
 
             await Ingress.HandleWorkerMessageAsync(JsonSerializer.Serialize(job));
 
-            var (orderId, observedCorrelationId) = Assert.Single(_spy.WorkerJobs);
+            var (orderId, observedCorrelationId, observedReplyTarget) = Assert.Single(_spy.WorkerJobs);
             Assert.Equal(42, orderId);
             Assert.Null(observedCorrelationId);
+            Assert.Null(observedReplyTarget);
             Assert.Equal("outer-correlation-id", AsyncResponseContext.CorrelationId);
+            Assert.Equal("outer", AsyncResponseContext.ReplyTarget?.Name);
         }
         finally
         {
             AsyncResponseContext.ClearCorrelationId();
+            AsyncResponseContext.ClearReplyTarget();
         }
     }
 
@@ -311,7 +327,7 @@ public sealed class RecoverySpy : IRecoverySpy
 {
     public List<object> ResumedPayloads { get; } = [];
     public List<Exception> Failures { get; } = [];
-    public List<(int OrderId, string? CorrelationId)> WorkerJobs { get; } = [];
+    public List<(int OrderId, string? CorrelationId, string? ReplyTarget)> WorkerJobs { get; } = [];
     public Exception? FailureCallbackError { get; set; }
 
     public Task OnResume(object payload)
@@ -328,7 +344,7 @@ public sealed class RecoverySpy : IRecoverySpy
 
     public Task OnWorkerJob(int orderId)
     {
-        WorkerJobs.Add((orderId, AsyncResponseContext.CorrelationId));
+        WorkerJobs.Add((orderId, AsyncResponseContext.CorrelationId, AsyncResponseContext.ReplyTarget?.Name));
         return Task.CompletedTask;
     }
 }

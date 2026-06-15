@@ -104,6 +104,24 @@ public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayloa
     IAsyncResponseAttachedBuilder<T> WithTimeout(TimeSpan timeout);
 
     /// <summary>
+    /// Marks this wait as using the default async-response reply target registered by a transport
+    /// package. The target is exposed through <see cref="AsyncResponseRequestContext"/> and
+    /// <see cref="AsyncResponseContext.ReplyTarget"/> while the trigger executes.
+    /// </summary>
+    IAsyncResponseAttachedBuilder<T> WithReplyTarget();
+
+    /// <summary>
+    /// Marks this wait as using a named async-response reply target registered by a transport
+    /// package.
+    /// </summary>
+    IAsyncResponseAttachedBuilder<T> WithReplyTarget(string name);
+
+    /// <summary>
+    /// Marks this wait as using an explicitly supplied async-response reply target.
+    /// </summary>
+    IAsyncResponseAttachedBuilder<T> WithReplyTarget(AsyncResponseReplyTarget replyTarget);
+
+    /// <summary>
     /// Configures a completion predicate. The waiter keeps receiving payloads until the
     /// predicate returns <c>true</c> — use it to consume intermediate progress messages and
     /// decide which payload is terminal.
@@ -156,6 +174,15 @@ public interface IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePaylo
     /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithTimeout(TimeSpan)"/>
     IAsyncResponseTriggeredBuilder<T> WithTimeout(TimeSpan timeout);
 
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget()"/>
+    IAsyncResponseTriggeredBuilder<T> WithReplyTarget();
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget(string)"/>
+    IAsyncResponseTriggeredBuilder<T> WithReplyTarget(string name);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget(AsyncResponseReplyTarget)"/>
+    IAsyncResponseTriggeredBuilder<T> WithReplyTarget(AsyncResponseReplyTarget replyTarget);
+
     /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.Until(Func{T, bool})"/>
     IAsyncResponseTriggeredBuilder<T> Until(Func<T, bool> predicate);
 
@@ -182,4 +209,12 @@ public interface IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePaylo
     /// </summary>
     /// <param name="trigger">The action that starts the remote operation; receives the correlation id. Required.</param>
     Task<T> WaitAsync(Func<string, Task> trigger);
+
+    /// <summary>
+    /// Same as <see cref="WaitAsync(Func{string, Task})"/>, with a request context containing the
+    /// generated correlation id and the selected reply target. Use this when the remote request
+    /// needs explicit reply-to metadata.
+    /// </summary>
+    /// <param name="trigger">The action that starts the remote operation; receives the request context. Required.</param>
+    Task<T> WaitAsync(Func<AsyncResponseRequestContext, Task> trigger);
 }

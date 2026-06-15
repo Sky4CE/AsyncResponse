@@ -21,12 +21,17 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        _logger.LogDebug("{ServiceName}: executing job {Target}.{Method} (correlationId: {CorrelationId}).",
-            SERVICE_NAME, job.Call.ServiceInterfaceFullName, job.Call.MethodName, job.CorrelationId);
+        _logger.LogDebug(
+            "{ServiceName}: executing job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).",
+            SERVICE_NAME,
+            job.Call.ServiceInterfaceFullName,
+            job.Call.MethodName,
+            job.CorrelationId,
+            job.ReplyTarget?.Name);
 
-        // Scope the restored ambient correlation id so one job cannot inherit or leak another
-        // job's correlation context.
-        using var correlationScope = AsyncResponseContext.PushCorrelationId(job.CorrelationId);
+        // Scope the restored ambient context so one job cannot inherit or leak another job's
+        // correlation id or reply target.
+        using var asyncResponseScope = AsyncResponseContext.PushContext(job.CorrelationId, job.ReplyTarget);
 
         var invocation = ReflectionExtensions.ResolveCallback(
             job.Call,
