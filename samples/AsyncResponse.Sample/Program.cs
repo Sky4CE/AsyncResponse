@@ -5,6 +5,8 @@ using StackExchange.Redis;
 using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.AddServiceDefaults();
+builder.Services.AddOpenApi();
 
 // --- AsyncResponse wiring -------------------------------------------------------------------
 var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
@@ -32,6 +34,11 @@ builder.Services.AddSingleton<ISampleFlowService, SampleFlowService>();
 builder.Services.AddSingleton<RemoteWorkSimulator>();
 
 var app = builder.Build();
+app.MapOpenApi();
+app.UseSwaggerUI(options =>
+{
+    options.SwaggerEndpoint("/openapi/v1.json", "AsyncResponse sample v1");
+});
 
 // Waiters armed for the lost-subscriber demo. Held (not awaited) so they stay alive until
 // "crashed"; a real flow would be awaiting them inside a worker.
@@ -42,6 +49,7 @@ app.MapGet("/", () => Results.Text(
     """
     AsyncResponse sample. Endpoints:
 
+      GET  /swagger                                             interactive request playground
       POST /demo/request-response?behavior=Succeed|FailDomain   happy path / domain failure with an active waiter
       POST /demo/request-response/reply-target                  same flow with explicit reply-to metadata
       POST /demo/timeout                                         2s timeout against a 15s remote operation
@@ -51,7 +59,10 @@ app.MapGet("/", () => Results.Text(
       POST /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed
                                                                  deliver the late response → watch recovery in logs
       GET  /healthz                                              health report incl. the recovery watchdog
-    """));
+      GET  /health                                               Aspire/service-defaults readiness check
+      GET  /alive                                                Aspire/service-defaults liveness check
+    """))
+    .ExcludeFromDescription();
 
 // 1) Request/response with an active waiter. For<T>() generates the correlation id and the
 //    required WaitAsync trigger guarantees subscribe-before-send.
@@ -85,7 +96,10 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
     return result.Status == OperationStatus.Completed
         ? Results.Ok(new { correlationId = startedCorrelationId, result.Status, result.Message })
         : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
-});
+})
+.WithTags("Request/response")
+.WithSummary("Run a correlated request/response flow")
+.WithDescription("Starts simulated remote work, waits for a terminal OperationResult, and logs progress messages with propagated trace/tenant context.");
 
 // 2) Request/response with explicit reply-to metadata. Transport packages usually provide this
 //    via WithReplyTarget(); this sample uses an explicit target so it stays infrastructure-free.
@@ -120,7 +134,10 @@ app.MapPost("/demo/request-response/reply-target", async (IAsyncResponseBuilder 
             result.Message
         })
         : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
-});
+})
+.WithTags("Request/response")
+.WithSummary("Run request/response with explicit reply target")
+.WithDescription("Demonstrates passing reply-to metadata into the async request context.");
 
 // 3) Timeout: the remote takes 15s, the waiter allows 2s. Also shows the no-correlation-id
 //    flow: For<T>() generates one and hands it to the trigger.
@@ -144,7 +161,10 @@ app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteW
     {
         return Results.Problem(title: "Timed out as expected", detail: timeout.Message, statusCode: 504);
     }
-});
+})
+.WithTags("Timeouts")
+.WithSummary("Trigger a timeout")
+.WithDescription("Runs slow simulated remote work with a two-second waiter timeout.");
 
 // 4) Fire-and-forget worker job via the in-process worker transport.
 app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orderId) =>
@@ -154,7 +174,10 @@ app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orde
     SampleTenantContext.Set("tenant-acme");
     await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessOrderAsync(orderId));
     return Results.Accepted(value: new { orderId, traceId = SampleTraceContext.Current, note = "Watch the logs for WORKER output — the traceId flows in-process via ExecutionContext." });
-});
+})
+.WithTags("Workers")
+.WithSummary("Queue a background worker job")
+.WithDescription("Enqueues a fire-and-forget in-memory worker operation and propagates trace/tenant context.");
 
 // 5a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
 // waiting in the background (like a worker awaiting a slow remote operation). The HTTP request
@@ -193,7 +216,10 @@ app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncRespo
         traceId = SampleTraceContext.Current,   // this should reappear in the RECOVERY log after the crash
         next = "POST /demo/lost-subscriber/crash, then /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed"
     });
-});
+})
+.WithTags("Recovery")
+.WithSummary("Arm lost-subscriber recovery")
+.WithDescription("Registers a waiter with recovery callbacks and returns a correlationId to use in the crash/respond flow.");
 
 // 5b) Lost-subscriber demo — crash: drop every Redis subscription, like a redeploy would.
 // The recovery state stays in Redis; only the in-memory waiters die.
@@ -201,7 +227,10 @@ app.MapPost("/demo/lost-subscriber/crash", (IConnectionMultiplexer multiplexer) 
 {
     multiplexer.GetSubscriber().UnsubscribeAll();
     return Results.Ok("All subscriptions dropped (simulated redeploy). The armed waiters are now lost.");
-});
+})
+.WithTags("Recovery")
+.WithSummary("Simulate a redeploy")
+.WithDescription("Drops all Redis subscriptions while preserving recovery state.");
 
 // 5c) Lost-subscriber demo — respond: deliver the late terminal response. With no subscriber
 // alive, the lost-subscriber dispatcher classifies the payload: Completed → ResumeFlowAsync,
@@ -215,7 +244,10 @@ app.MapPost("/demo/lost-subscriber/respond", async (RemoteWorkSimulator remote, 
     });
 
     return Results.Ok("Delivered. Watch the application logs for the RECOVERY route taken.");
-});
+})
+.WithTags("Recovery")
+.WithSummary("Deliver a late response after subscriber loss")
+.WithDescription("Publishes a terminal response for the correlationId returned by /demo/lost-subscriber/arm.");
 
 // Health endpoint with full JSON details, including the recovery check's data payload.
 app.MapHealthChecks("/healthz", new HealthCheckOptions
@@ -235,6 +267,10 @@ app.MapHealthChecks("/healthz", new HealthCheckOptions
             })
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
-});
+})
+.WithTags("Health")
+.WithSummary("Show watchdog health details")
+.WithDescription("Returns JSON health details, including AsyncResponse recovery watchdog data.");
 
+app.MapDefaultEndpoints();
 app.Run();

@@ -462,6 +462,28 @@ OpenTelemetry with `.AddSource("AsyncResponse")`.
 
 A complete testbed lives in [`samples/AsyncResponse.Sample`](samples/AsyncResponse.Sample):
 
+Run it as an Aspire playground when you want the dashboard, managed Redis, logs, traces, metrics,
+resource environment, and health checks in one place:
+
+```bash
+dotnet run --project samples/AsyncResponse.AppHost
+```
+
+In Rider, use the shared run configuration `AsyncResponse.Playground`. It is a small launcher
+project that starts the Aspire AppHost without relying on Rider's Aspire/launch-profile project
+pickers.
+
+The Aspire AppHost starts a Redis container and the sample API, then opens the Aspire dashboard.
+Use the dashboard's `playground` resource to open the API endpoint and inspect `AsyncResponse`
+logs/traces. The local playground pins the dashboard to `http://localhost:18888` and uses HTTP
+resource/OTLP endpoints to avoid local HTTPS certificate issues. The sample also exposes Aspire
+service-default endpoints at `/health` and `/alive`.
+
+Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
+such as Docker or Podman for the Redis resource.
+
+If you want to run the sample without Aspire, start Redis yourself:
+
 ```bash
 docker compose up -d          # local Redis
 dotnet run --project samples/AsyncResponse.Sample
@@ -482,6 +504,8 @@ curl -X POST 'http://localhost:5000/demo/lost-subscriber/crash'                 
 curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Completed' # resume callback
 curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Failed'    # failure callback
 curl 'http://localhost:5000/healthz'                                                     # watchdog findings
+curl 'http://localhost:5000/health'                                                      # Aspire readiness check
+curl 'http://localhost:5000/alive'                                                       # Aspire liveness check
 ```
 
 For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in
