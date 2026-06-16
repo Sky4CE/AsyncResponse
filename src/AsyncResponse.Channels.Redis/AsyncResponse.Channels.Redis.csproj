@@ -15,4 +15,9 @@
     <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Lets the test project white-box the internal key schema without widening the public API. -->
+    <InternalsVisibleTo Include="AsyncResponse.Tests" />
+  </ItemGroup>
+
 </Project>

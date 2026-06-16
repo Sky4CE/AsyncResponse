@@ -4,18 +4,18 @@ using Google.Cloud.PubSub.V1;
 using Grpc.Core;
 using Microsoft.Extensions.Options;
 
-namespace AsyncResponse.IntegrationTests.App;
+namespace AsyncResponse.Sample;
 
 /// <summary>
-/// Creates the worker/response topics + subscriptions in the Google Pub/Sub <em>emulator</em> before the
-/// transport's subscribers start. The emulator boots empty, whereas the library assumes the
-/// topics/subscriptions already exist. This runs <b>only</b> when <c>PUBSUB_EMULATOR_HOST</c> is set, so
-/// it is a no-op against real Google Cloud (where they are provisioned out of band).
+/// Creates the worker/response topics + subscriptions in the Google Pub/Sub <em>emulator</em> before
+/// the transport's subscribers start. The emulator boots empty, whereas the library assumes the
+/// topics/subscriptions already exist. This runs <b>only</b> when <c>PUBSUB_EMULATOR_HOST</c> is set,
+/// so it is a no-op against real Google Cloud (where they are provisioned out of band).
 /// </summary>
 /// <remarks>
-/// Registered before <c>AddAsyncResponse()</c> so it is the first hosted service: hosted services start
-/// in registration order, and its <see cref="StartAsync"/> completes (awaiting provisioning) before the
-/// transport's subscribers begin attaching to the subscriptions.
+/// Registered before <c>AddAsyncResponse()</c> so it is the first hosted service: hosted services
+/// start in registration order, and its <see cref="StartAsync"/> completes (awaiting provisioning)
+/// before the transport's subscribers begin attaching to the subscriptions.
 /// </remarks>
 internal sealed class PubSubEmulatorProvisioner(
     IOptions<GooglePubSubAsyncResponseOptions> options,

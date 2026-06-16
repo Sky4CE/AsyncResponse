@@ -1,4 +1,4 @@
-using AsyncResponse.IntegrationTests.App;
+using AsyncResponse.Sample;
 using System.Net.Http.Json;
 using Xunit;
 
@@ -37,7 +37,7 @@ public sealed class PubSubTransportTests(IntegrationFixture fixture) : Integrati
 
         var call = await WaitForCallAsync($"waiter:{correlationId}");
         Assert.Equal("waiter", call.Kind);
-        Assert.Equal(ItestStatus.Completed, call.Status);
+        Assert.Equal(OperationStatus.Completed, call.Status);
     }
 
     [Fact]
@@ -51,7 +51,7 @@ public sealed class PubSubTransportTests(IntegrationFixture fixture) : Integrati
 
         var call = await WaitForCallAsync($"waiter:{correlationId}");
         Assert.Equal("waiter", call.Kind);
-        Assert.Equal(ItestStatus.Completed, call.Status);
+        Assert.Equal(OperationStatus.Completed, call.Status);
     }
 
     private sealed record WorkerResponse(string CorrelationId);

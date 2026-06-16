@@ -1,4 +1,4 @@
-using AsyncResponse.IntegrationTests.App;
+using AsyncResponse.Sample;
 using System.Net;
 using System.Net.Http.Json;
 using Xunit;
@@ -16,7 +16,7 @@ public sealed class RedisChannelTests(IntegrationFixture fixture) : IntegrationT
 
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<RequestResponseResult>();
-        Assert.Equal(ItestStatus.Completed, result!.Status);
+        Assert.Equal(OperationStatus.Completed, result!.Status);
         Assert.Equal("done", result.Message);
     }
 
@@ -28,7 +28,7 @@ public sealed class RedisChannelTests(IntegrationFixture fixture) : IntegrationT
 
         response.EnsureSuccessStatusCode();
         var result = await response.Content.ReadFromJsonAsync<RequestResponseResult>();
-        Assert.Equal(ItestStatus.Failed, result!.Status);
+        Assert.Equal(OperationStatus.Failed, result!.Status);
         Assert.Equal("remote failed", result.Message);
     }
 

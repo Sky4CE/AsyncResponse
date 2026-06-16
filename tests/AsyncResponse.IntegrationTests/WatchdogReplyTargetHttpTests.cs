@@ -1,4 +1,4 @@
-using AsyncResponse.IntegrationTests.App;
+using AsyncResponse.Sample;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Xunit;
@@ -51,7 +51,7 @@ public sealed class WatchdogReplyTargetHttpTests(IntegrationFixture fixture) : I
         response.EnsureSuccessStatusCode();
 
         var result = await response.Content.ReadFromJsonAsync<RequestResponseResult>();
-        Assert.Equal(ItestStatus.Completed, result!.Status);
+        Assert.Equal(OperationStatus.Completed, result!.Status);
     }
 
     [Fact]

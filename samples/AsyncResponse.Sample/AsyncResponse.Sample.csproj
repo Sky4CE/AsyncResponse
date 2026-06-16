@@ -7,7 +7,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AsyncResponse.ServiceDefaults\AsyncResponse.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
   </ItemGroup>
 
   <ItemGroup>

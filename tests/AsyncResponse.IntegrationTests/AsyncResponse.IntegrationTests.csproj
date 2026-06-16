@@ -23,13 +23,16 @@
 
     <!-- Boots the Aspire AppHost (real Redis + Pub/Sub emulator containers + the SUT) in-process. -->
     <PackageReference Include="Aspire.Hosting.Testing" Version="13.4.4" />
+    <!-- In-process WebApplicationFactory hosting for the no-Docker in-memory end-to-end tests. -->
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.9" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The AppHost provides the orchestration (Projects.AsyncResponse_IntegrationTests_AppHost); the App provides the
-         shared DTO types (ItestPayload / ItestStatus / ItestCall) used to deserialize HTTP responses. -->
+    <!-- The AppHost orchestrates the SUT (Projects.AsyncResponse_IntegrationTests_AppHost). The sample app *is* the
+         SUT: it provides the shared DTO types (OperationResult / OperationStatus / FlowCall) and its Program entry
+         point for the in-process WebApplicationFactory tests. -->
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
-    <ProjectReference Include="..\AsyncResponse.IntegrationTests.App\AsyncResponse.IntegrationTests.App.csproj" />
+    <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
   </ItemGroup>
 
 </Project>

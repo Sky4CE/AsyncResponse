@@ -1,4 +1,4 @@
-using AsyncResponse.IntegrationTests.App;
+using AsyncResponse.Sample;
 using System.Net.Http.Json;
 
 namespace AsyncResponse.IntegrationTests;
@@ -29,12 +29,12 @@ public abstract class IntegrationTestBase(IntegrationFixture fixture)
     /// Long-polls the SUT for a recorded flow call (e.g. <c>worker:{token}</c>, <c>resume:{cid}</c>,
     /// <c>fail:{cid}</c>, <c>waiter:{cid}</c>). Throws if the call does not arrive within the timeout.
     /// </summary>
-    protected async Task<ItestCall> WaitForCallAsync(string key, TimeSpan? timeout = null)
+    protected async Task<FlowCall> WaitForCallAsync(string key, TimeSpan? timeout = null)
     {
         var ms = (int)(timeout ?? DefaultTimeout).TotalMilliseconds;
         var response = await Client.GetAsync($"/calls?key={Uri.EscapeDataString(key)}&timeoutMs={ms}");
         response.EnsureSuccessStatusCode();
-        return (await response.Content.ReadFromJsonAsync<ItestCall>())!;
+        return (await response.Content.ReadFromJsonAsync<FlowCall>())!;
     }
 
     /// <summary>Polls until <paramref name="done"/> is satisfied or the timeout elapses, returning the last value.</summary>
@@ -51,5 +51,5 @@ public abstract class IntegrationTestBase(IntegrationFixture fixture)
     }
 
     protected sealed record ArmResponse(string CorrelationId);
-    protected sealed record RequestResponseResult(ItestStatus Status, string? Message);
+    protected sealed record RequestResponseResult(OperationStatus Status, string? Message);
 }

@@ -1,4 +1,4 @@
-using AsyncResponse.IntegrationTests.App;
+using AsyncResponse.Sample;
 using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
@@ -22,7 +22,7 @@ public sealed class LostSubscriberRecoveryTests(IntegrationFixture fixture) : In
 
         var call = await WaitForCallAsync($"resume:{correlationId}");
         Assert.Equal("resume", call.Kind);
-        Assert.Equal(ItestStatus.Completed, call.Status);
+        Assert.Equal(OperationStatus.Completed, call.Status);
         Assert.Equal(trace, call.Trace); // baggage restored from the persisted recovery state
     }
 

@@ -60,7 +60,7 @@ public sealed class RemoteWorkSimulator(IAsyncResponseIngress _ingress, ILogger<
                 await DeliverAsync(correlationId, new OperationResult
                 {
                     Status = behavior == RemoteBehavior.FailDomain ? OperationStatus.Failed : OperationStatus.Completed,
-                    Message = behavior == RemoteBehavior.FailDomain ? "remote validation failed" : "remote operation completed"
+                    Message = behavior == RemoteBehavior.FailDomain ? "remote failed" : "done"
                 });
             }
             catch (Exception ex)

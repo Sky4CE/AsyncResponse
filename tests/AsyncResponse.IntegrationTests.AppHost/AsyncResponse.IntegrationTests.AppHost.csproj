@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\AsyncResponse.IntegrationTests.App\AsyncResponse.IntegrationTests.App.csproj" />
+    <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
   </ItemGroup>
 
 </Project>

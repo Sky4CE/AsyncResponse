@@ -279,9 +279,18 @@ that make sense for where the correlation id came from:
 Flows that decide fresh-vs-resume at runtime branch between the two chains on their persisted
 state — only the flow can know which case applies; the transport cannot detect it.
 
+```csharp
+// A resumed step re-attaching to its in-flight correlation id — no trigger, nothing to re-send:
+OrderResult result = await _asyncResponse
+    .For<OrderResult>(persistedCorrelationId)     // attach mode (IAsyncResponseAttachedBuilder<T>)
+    .WithTimeout(TimeSpan.FromMinutes(10))
+    .Until(r => r.Status != OrderStatus.Processing)
+    .WaitAsync();                                  // wait-only terminal
+```
+
 Need to arm recovery without awaiting in place? Start the wait as a background task
 (`_ = builder…WaitAsync(trigger)`): the subscription and the persisted recovery state stay
-alive while your code moves on (see the sample's `/demo/lost-subscriber/arm` endpoint).
+alive while your code moves on (see the sample's `/arm` endpoint).
 
 ### 3. Deliver responses (your broker → the ingress)
 
@@ -354,6 +363,26 @@ the job publishes correlates automatically. `.WithInMemoryTransport()` executes 
 current process; for distributed execution use `.WithGooglePubSubTransport(...)` or implement
 `IWorkerTransport` against your broker and have the consumer call
 `ingress.HandleWorkerMessageAsync(json)`.
+
+A custom transport is a thin publish-side adapter; any consumer then feeds the message back into
+the ingress, which restores the captured context and executes the job:
+
+```csharp
+public sealed class RabbitMqWorkerTransport(IModel channel) : IWorkerTransport
+{
+    public Task PublishAsync(WorkerJobEnvelope job, CancellationToken ct = default)
+    {
+        channel.BasicPublish("", "asyncresponse-workers", body: JsonSerializer.SerializeToUtf8Bytes(job));
+        return Task.CompletedTask;
+    }
+}
+
+builder.Services.AddAsyncResponse().WithRedisChannel();
+builder.Services.AddSingleton<IWorkerTransport, RabbitMqWorkerTransport>();   // instead of .WithInMemoryTransport()
+
+// in your RabbitMQ consumer:
+await ingress.HandleWorkerMessageAsync(Encoding.UTF8.GetString(body));
+```
 
 ### 6. Propagating ambient context (trace, principal, tenant)
 
@@ -482,41 +511,50 @@ service-default endpoints at `/health` and `/alive`.
 Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
 such as Docker or Podman for the Redis resource.
 
-If you want to run the sample without Aspire, start Redis yourself:
+The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis`) and
+`AsyncResponse:Transport` (`None` | `InMemory` | `GooglePubSub`) select the providers, defaulting to
+fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
-docker compose up -d          # local Redis
-dotnet run --project samples/AsyncResponse.Sample
+dotnet run --project samples/AsyncResponse.Sample      # in-memory channel + in-memory worker transport
 ```
 
-Then walk the scenarios:
+The durable lost-subscriber recovery flow needs a real channel — point the sample at Redis for it:
 
 ```bash
-curl -X POST 'http://localhost:5000/demo/request-response?behavior=Succeed'              # happy path with progress messages
-curl -X POST 'http://localhost:5000/demo/request-response?behavior=FailDomain'           # domain failure seen by the active waiter
-curl -X POST 'http://localhost:5000/demo/request-response/reply-target?behavior=Succeed' # same flow, passing explicit reply-to metadata
-curl -X POST 'http://localhost:5000/demo/timeout'                                        # 2s timeout vs 15s remote
-curl -X POST 'http://localhost:5000/demo/worker?orderId=42'                              # background worker job
-
-# The headline feature — recovery after a "redeploy":
-curl -X POST 'http://localhost:5000/demo/lost-subscriber/arm'                            # returns a correlationId
-curl -X POST 'http://localhost:5000/demo/lost-subscriber/crash'                          # kills every subscription
-curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Completed' # resume callback
-curl -X POST 'http://localhost:5000/demo/lost-subscriber/respond?correlationId=<id>&status=Failed'    # failure callback
-curl 'http://localhost:5000/healthz'                                                     # watchdog findings
-curl 'http://localhost:5000/health'                                                      # Aspire readiness check
-curl 'http://localhost:5000/alive'                                                       # Aspire liveness check
+docker compose up -d                                                  # local Redis
+AsyncResponse__Channel=Redis dotnet run --project samples/AsyncResponse.Sample
 ```
 
-For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in
-one of the `/respond` requests. `Completed` exercises the resume callback; `Failed` exercises
-the failure callback with an `AsyncResponseDomainFailureException`.
+Then walk the scenarios (the same HTTP endpoints the integration tests drive):
+
+```bash
+curl -X POST 'http://localhost:5000/request-response?behavior=Succeed'      # happy path with progress messages
+curl -X POST 'http://localhost:5000/request-response?behavior=FailDomain'   # domain failure seen by the active waiter
+curl -X POST 'http://localhost:5000/request-response?behavior=Fail'         # technical failure (SetException)
+curl -X POST 'http://localhost:5000/request-response?behavior=Timeout'      # 2s timeout vs a slow remote
+curl -X POST 'http://localhost:5000/attach'                                 # attach to an in-flight op by correlation id
+curl -X POST 'http://localhost:5000/worker?token=order-42'                  # fire-and-forget background worker job
+curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
+curl      'http://localhost:5000/alive'                                     # liveness check
+
+# The headline feature — recovery after a "redeploy" (needs the Redis channel):
+curl -X POST 'http://localhost:5000/arm'                                          # returns a correlationId
+curl -X POST 'http://localhost:5000/crash'                                        # drops every subscription
+curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Completed'  # → resume callback
+curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Failed'     # → failure callback
+```
+
+For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in a
+`/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
+callback with an `AsyncResponseDomainFailureException`. (`/arm`, `/crash`, and `/publish` require
+the Redis channel — run with `AsyncResponse__Channel=Redis`.)
 
 The sample also wires two context propagators (`SampleTracePropagator`, `SampleTenantPropagator`) —
-watch the `traceId`/`tenant` fields in the logs: `/demo/request-response` shows them on `HANDLER:`
-lines (flowing into the Redis response handler via `ExecutionContext`), `/demo/worker` shows them on
-the `WORKER:` line (in-memory worker, also `ExecutionContext`), and the `/demo/lost-subscriber` flow
-shows them on the `RECOVERY:` line — there they survived the simulated crash as serialized baggage
+watch the `traceId`/`tenant` fields in the logs: `/request-response` shows them on `HANDLER:` lines
+(flowing into the response handler via `ExecutionContext`), `/worker` shows them on the `WORKER:`
+line (the in-memory worker, also `ExecutionContext`), and the `/arm`→`/crash`→`/publish` flow shows
+them on the `RECOVERY:` line — there they survived the simulated crash as serialized baggage
 persisted in the recovery state.
 
 ## Best practices
@@ -565,12 +603,16 @@ dotnet run --project tests/AsyncResponse.Tests -f net10.0 -- \
 ```
 
 The integration tests in [`tests/AsyncResponse.IntegrationTests`](tests/AsyncResponse.IntegrationTests)
-exercise the library end-to-end against **real infrastructure**, orchestrated by **.NET Aspire**. By
-default the test project boots an internal integration AppHost via `Aspire.Hosting.Testing`; that
-AppHost starts real Redis, a Google Pub/Sub emulator container, and the system-under-test app
-(`itest-app`). The tests then drive every scenario over HTTP. They need a running Docker daemon
-(and pull a Pub/Sub emulator image on first run), so CI runs them in a separate Docker-backed
-`integration-tests` job:
+exercise the library end-to-end, driving the **sample app itself** as the system under test (one app —
+no separate fixture app to keep in sync). They run at two levels:
+
+- **In-process, no Docker** — `WebApplicationFactory` boots the sample on the fully in-memory channel
+  and transport, covering the core request/response, attach, worker, and concurrency paths. They need
+  no containers, so they stay fast and reliable even where Docker is unavailable.
+- **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
+  a Google Pub/Sub emulator container, and the sample app, then drives the Redis-channel and Pub/Sub
+  scenarios over HTTP. They need a running Docker daemon (and pull a Pub/Sub emulator image on first
+  run), so CI runs them in a separate Docker-backed `integration-tests` job:
 
 ```bash
 dotnet run --project tests/AsyncResponse.IntegrationTests

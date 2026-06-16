@@ -19,7 +19,10 @@ var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
 var emulatorHost = ReferenceExpression.Create(
     $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
 
-var itestApp = builder.AddProject<Projects.AsyncResponse_IntegrationTests_App>("itest-app")
+// The integration SUT is the sample app itself (one app, no duplication), booted here with the
+// Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
+// profile so the AppHost owns the endpoint (WithHttpEndpoint), matching how it provisions ports.
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app", launchProfileName: null)
     .WithReference(redis)
     .WaitFor(redis)
     .WaitFor(pubsub)
@@ -30,6 +33,8 @@ var itestApp = builder.AddProject<Projects.AsyncResponse_IntegrationTests_App>("
     .WithEnvironment("PubSub:ResponseTopicId", ResponseTopic)
     .WithEnvironment("PubSub:ResponseSubscriptionId", ResponseSubscription)
     .WithEnvironment("AsyncResponse:KeyPrefix", TestRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

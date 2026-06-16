@@ -1,6 +1,11 @@
 using AsyncResponse;
 using AsyncResponse.Sample;
+using AsyncResponse.Transports.GooglePubSub;
+using Google.Api.Gax;
+using Google.Cloud.PubSub.V1;
+using Google.Protobuf;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using System.Text.Json;
 
@@ -8,245 +13,363 @@ var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
 builder.Services.AddOpenApi();
 
-// --- AsyncResponse wiring -------------------------------------------------------------------
-var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
-builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
+// --- Provider selection (configuration-driven) ----------------------------------------------
+// Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (optional).
+// Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHost
+// overrides them to Redis + Google Pub/Sub to exercise the durable, broker-backed stack.
+var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // None | InMemory | GooglePubSub
+var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
+var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 
-builder.Services.AddAsyncResponse(options =>
+if (useRedis)
 {
-    // Aggressive watchdog values so the demo shows results quickly; defaults are 6h/24h/5m.
-    options.Watchdog.StartupDelay = TimeSpan.FromSeconds(10);
-    options.Watchdog.Interval = TimeSpan.FromSeconds(30);
-    options.Watchdog.StaleAfter = TimeSpan.FromMinutes(2);
-})
-.WithRedisChannel(options =>
+    var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
+    builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
+}
+
+// Provision the emulator's topics/subscriptions before the transport's subscribers start
+// (emulator-only; no-op against real GCP). Registered first so its StartAsync completes first.
+if (useGooglePubSub)
 {
-    options.KeyPrefix = "sample";
-    options.RecoveryStateExpiry = TimeSpan.FromHours(1);
-})
-.WithInMemoryTransport()
-.WithContextPropagator<SampleTracePropagator>()    // carry the trace id across serialized hops…
-.WithContextPropagator<SampleTenantPropagator>();  // …and the tenant — propagators compose
+    builder.Services.AddHostedService<PubSubEmulatorProvisioner>();
+}
+
+var asyncResponse = builder.Services.AddAsyncResponse(options =>
+{
+    // Aggressive watchdog so the stale-recovery demo/health scenario resolves quickly; defaults 6h/24h/5m.
+    options.Watchdog.StartupDelay = TimeSpan.FromSeconds(1);
+    options.Watchdog.Interval = TimeSpan.FromSeconds(1);
+    options.Watchdog.StaleAfter = TimeSpan.FromSeconds(2);
+});
+
+// Exactly one channel (enforced at host startup).
+if (useRedis)
+{
+    asyncResponse.WithRedisChannel(options =>
+    {
+        options.KeyPrefix = builder.Configuration["AsyncResponse:KeyPrefix"] ?? "sample";
+        options.DefaultTimeout = TimeSpan.FromSeconds(30);
+    });
+}
+else
+{
+    asyncResponse.WithInMemoryChannel();
+}
+
+// Optional worker transport.
+if (useGooglePubSub)
+{
+    asyncResponse.WithGooglePubSubTransport(options =>
+    {
+        options.ProjectId = builder.Configuration["PubSub:ProjectId"];
+        options.WorkerTopicId = builder.Configuration["PubSub:WorkerTopicId"];
+        options.WorkerSubscriptionId = builder.Configuration["PubSub:WorkerSubscriptionId"];
+        options.ResponseTopicId = builder.Configuration["PubSub:ResponseTopicId"];
+        options.ResponseSubscriptionId = builder.Configuration["PubSub:ResponseSubscriptionId"];
+    });
+}
+else if (!string.Equals(transport, "None", StringComparison.OrdinalIgnoreCase))
+{
+    asyncResponse.WithInMemoryTransport();
+}
+
+// Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
+asyncResponse
+    .WithContextPropagator<SampleTracePropagator>()
+    .WithContextPropagator<SampleTenantPropagator>();
+
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 
-// --- Sample services ------------------------------------------------------------------------
+builder.Services.AddSingleton<FlowRecorder>();
 builder.Services.AddSingleton<ISampleFlowService, SampleFlowService>();
 builder.Services.AddSingleton<RemoteWorkSimulator>();
 
 var app = builder.Build();
+app.Logger.LogInformation("AsyncResponse sample started: channel={Channel}, transport={Transport}.", channel, transport);
 app.MapOpenApi();
-app.UseSwaggerUI(options =>
-{
-    options.SwaggerEndpoint("/openapi/v1.json", "AsyncResponse sample v1");
-});
-
-// Waiters armed for the lost-subscriber demo. Held (not awaited) so they stay alive until
-// "crashed"; a real flow would be awaiting them inside a worker.
-// Background waits armed by /demo/lost-subscriber/arm — kept only so the tasks stay referenced.
-var armedWaits = new List<Task<OperationResult>>();
+app.UseSwaggerUI(options => options.SwaggerEndpoint("/openapi/v1.json", "AsyncResponse sample v1"));
 
 app.MapGet("/", () => Results.Text(
-    """
-    AsyncResponse sample. Endpoints:
+    $"""
+    AsyncResponse sample — channel: {channel}, transport: {transport}.
 
-      GET  /swagger                                             interactive request playground
-      POST /demo/request-response?behavior=Succeed|FailDomain   happy path / domain failure with an active waiter
-      POST /demo/request-response/reply-target                  same flow with explicit reply-to metadata
-      POST /demo/timeout                                         2s timeout against a 15s remote operation
-      POST /demo/worker?orderId=42                               fire-and-forget background worker job
-      POST /demo/lost-subscriber/arm                             register a waiter with recovery callbacks
-      POST /demo/lost-subscriber/crash                           simulate a redeploy (kill all Redis subscriptions)
-      POST /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed
-                                                                 deliver the late response → watch recovery in logs
+      GET  /swagger                                              interactive request playground
+      POST /request-response?behavior=Succeed|FailDomain|Fail|Timeout   active-waiter round-trip
+      POST /attach                                               wait by a known correlation id (no trigger)
+      POST /worker?token=42                                      fire-and-forget background worker job
+      POST /arm  + POST /crash + POST /publish                   lost-subscriber recovery flow (Redis)
+      GET  /reply-target                                         provider-resolved reply target (Pub/Sub)
       GET  /healthz                                              health report incl. the recovery watchdog
-      GET  /health                                               Aspire/service-defaults readiness check
-      GET  /alive                                                Aspire/service-defaults liveness check
-    """))
-    .ExcludeFromDescription();
+    """)).ExcludeFromDescription();
 
-// 1) Request/response with an active waiter. For<T>() generates the correlation id and the
-//    required WaitAsync trigger guarantees subscribe-before-send.
-app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior, ILoggerFactory loggerFactory) =>
+// Liveness probe (used by the AppHost health check) — always 200 while the process is up,
+// independent of the recovery health check (which may go Degraded in the watchdog scenario).
+app.MapGet("/alive", () => Results.Ok("alive")).ExcludeFromDescription();
+
+// Reports the providers this instance resolved from configuration. The in-process tests assert
+// InMemory/InMemory and the Aspire SUT asserts Redis/GooglePubSub, so each variation is provably
+// exercised even though only one is ever booted per process.
+app.MapGet("/config", () => Results.Ok(new { channel, transport })).WithTags("Observability");
+
+// 1) Request/response with an active waiter and a selectable terminal behavior. For<T>() generates
+//    the correlation id; the required WaitAsync trigger guarantees subscribe-before-send.
+app.MapPost("/request-response", async (
+    IAsyncResponseBuilder asyncResponse, IAsyncResponsePublisher publisher, RemoteWorkSimulator remote,
+    string? behavior, string? trace, ILoggerFactory loggerFactory) =>
 {
     var logger = loggerFactory.CreateLogger("RequestResponse");
+    var kind = (behavior ?? "Succeed").ToLowerInvariant();
 
-    // Per-request ambient context. It flows into the response handler below — which runs on a Redis
-    // subscriber thread — via the captured ExecutionContext, so the HANDLER log lines carry it.
-    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    // Per-request ambient context flows into the response handler (a subscriber-thread callback) via
+    // the captured ExecutionContext, so the HANDLER log lines carry it.
+    SampleTraceContext.Set(trace ?? $"trace-{Guid.NewGuid().ToString("N")[..8]}");
     SampleTenantContext.Set("tenant-acme");
-    var startedCorrelationId = string.Empty;
 
-    var result = await asyncResponse
-        .For<OperationResult>()
-        .WithTimeout(TimeSpan.FromSeconds(30))
-        .Until(response =>
-        {
-            logger.LogInformation("HANDLER: progress {Status} (traceId: {TraceId}, tenant: {Tenant})",
-                response.Status, SampleTraceContext.Current, SampleTenantContext.Current);
-            return response.Status != OperationStatus.Running; // consume progress messages
-        })
-        .WaitAsync(context =>
-        {
-            startedCorrelationId = context.CorrelationId;
-            remote.Start(context.CorrelationId, behavior ?? RemoteBehavior.Succeed);
-            return Task.CompletedTask;
-        });
-
-    return result.Status == OperationStatus.Completed
-        ? Results.Ok(new { correlationId = startedCorrelationId, result.Status, result.Message })
-        : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
-})
-.WithTags("Request/response")
-.WithSummary("Run a correlated request/response flow")
-.WithDescription("Starts simulated remote work, waits for a terminal OperationResult, and logs progress messages with propagated trace/tenant context.");
-
-// 2) Request/response with explicit reply-to metadata. Transport packages usually provide this
-//    via WithReplyTarget(); this sample uses an explicit target so it stays infrastructure-free.
-app.MapPost("/demo/request-response/reply-target", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote, RemoteBehavior? behavior) =>
-{
-    AsyncResponseRequestContext? startedContext = null;
-    var replyTarget = new AsyncResponseReplyTarget
+    try
     {
-        Name = "sample",
-        Transport = "sample",
-        Address = "sample://remote-work-simulator"
-    };
+        var result = await asyncResponse
+            .For<OperationResult>()
+            .WithTimeout(kind == "timeout" ? TimeSpan.FromSeconds(2) : TimeSpan.FromSeconds(30))
+            .Until(response =>
+            {
+                logger.LogInformation("HANDLER: progress {Status} (traceId: {TraceId}, tenant: {Tenant})",
+                    response.Status, SampleTraceContext.Current, SampleTenantContext.Current);
+                return response.Status != OperationStatus.Running; // consume progress messages
+            })
+            .WaitAsync(async context =>
+            {
+                switch (kind)
+                {
+                    case "faildomain":
+                        remote.Start(context.CorrelationId, RemoteBehavior.FailDomain);
+                        break;
+                    case "fail":
+                        await publisher.SetException(new InvalidOperationException("remote technical error"), context.CorrelationId);
+                        break;
+                    case "timeout":
+                        remote.Start(context.CorrelationId, RemoteBehavior.Slow); // never terminal in time
+                        break;
+                    default:
+                        remote.Start(context.CorrelationId, RemoteBehavior.Succeed);
+                        break;
+                }
+            });
+
+        return Results.Ok(new { result.Status, result.Message });
+    }
+    catch (TimeoutException)
+    {
+        return Results.StatusCode(StatusCodes.Status504GatewayTimeout);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(detail: ex.Message, statusCode: StatusCodes.Status500InternalServerError);
+    }
+})
+.WithTags("Request/response");
+
+// 2) Attach to an in-flight operation by a known correlation id. For<T>(correlationId) is wait-only
+//    (no trigger): the operation was started elsewhere; here we just await its response.
+app.MapPost("/attach", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote) =>
+{
+    var correlationId = AsyncResponseContext.GenerateCorrelationId();
+    remote.Start(correlationId, RemoteBehavior.Succeed); // a 400ms head start before the first delivery
 
     var result = await asyncResponse
-        .For<OperationResult>()
-        .WithReplyTarget(replyTarget)
+        .For<OperationResult>(correlationId)
         .WithTimeout(TimeSpan.FromSeconds(30))
         .Until(response => response.Status != OperationStatus.Running)
-        .WaitAsync(context =>
-        {
-            startedContext = context;
-            remote.Start(context, behavior ?? RemoteBehavior.Succeed);
-            return Task.CompletedTask;
-        });
+        .WaitAsync();
 
-    return result.Status == OperationStatus.Completed
-        ? Results.Ok(new
-        {
-            correlationId = startedContext?.CorrelationId,
-            replyTarget = startedContext?.ReplyTarget,
-            result.Status,
-            result.Message
-        })
-        : Results.Problem(title: "Remote operation failed", detail: result.Message, statusCode: 502);
+    return Results.Ok(new { correlationId, result.Status, result.Message });
 })
-.WithTags("Request/response")
-.WithSummary("Run request/response with explicit reply target")
-.WithDescription("Demonstrates passing reply-to metadata into the async request context.");
+.WithTags("Request/response");
 
-// 3) Timeout: the remote takes 15s, the waiter allows 2s. Also shows the no-correlation-id
-//    flow: For<T>() generates one and hands it to the trigger.
-app.MapPost("/demo/timeout", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSimulator remote) =>
+// 3) Reply target resolved by the registered transport's provider (Pub/Sub). Returns the target the
+//    trigger observed; falls back to a clear 409 when no provider is registered (e.g. in-memory).
+app.MapGet("/reply-target", async (IAsyncResponseBuilder asyncResponse, IAsyncResponsePublisher publisher) =>
 {
+    AsyncResponseReplyTarget? observed = null;
     try
     {
         await asyncResponse
             .For<OperationResult>()
-            .WithTimeout(TimeSpan.FromSeconds(2))
-            .Until(response => response.Status != OperationStatus.Running)
-            .WaitAsync(context =>
+            .WithReplyTarget()
+            .WithTimeout(TimeSpan.FromSeconds(20))
+            .Until(r => r.Status != OperationStatus.Running)
+            .WaitAsync(async ctx =>
             {
-                remote.Start(context.CorrelationId, RemoteBehavior.Slow);
-                return Task.CompletedTask;
+                observed = ctx.ReplyTarget;
+                await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, ctx.CorrelationId);
             });
-
-        return Results.Ok("Unexpectedly completed in time.");
     }
-    catch (TimeoutException timeout)
+    catch (InvalidOperationException ex)
     {
-        return Results.Problem(title: "Timed out as expected", detail: timeout.Message, statusCode: 504);
+        return Results.Conflict(ex.Message); // no reply-target provider registered for this transport
     }
+
+    return Results.Ok(new { observed?.Transport, observed?.Address });
 })
-.WithTags("Timeouts")
-.WithSummary("Trigger a timeout")
-.WithDescription("Runs slow simulated remote work with a two-second waiter timeout.");
+.WithTags("Request/response");
 
-// 4) Fire-and-forget worker job via the in-process worker transport.
-app.MapPost("/demo/worker", async (IAsyncResponseBuilder asyncResponse, int orderId) =>
+// 4) Fire-and-forget worker job over the configured transport. Returns the correlation id it set so a
+//    round-trip test can assert it is restored on the consuming side.
+app.MapPost("/worker", async (IAsyncResponseBuilder asyncResponse, string token, string? trace) =>
 {
-    AsyncResponseContext.CreateCorrelationId();
-    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    var correlationId = AsyncResponseContext.CreateCorrelationId();
+    SampleTraceContext.Set(trace);
     SampleTenantContext.Set("tenant-acme");
-    await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessOrderAsync(orderId));
-    return Results.Accepted(value: new { orderId, traceId = SampleTraceContext.Current, note = "Watch the logs for WORKER output — the traceId flows in-process via ExecutionContext." });
+    await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessWorkAsync(token));
+    return Results.Ok(new { correlationId });
 })
-.WithTags("Workers")
-.WithSummary("Queue a background worker job")
-.WithDescription("Enqueues a fire-and-forget in-memory worker operation and propagates trace/tenant context.");
+.WithTags("Workers");
 
-// 5a) Lost-subscriber demo — arm: register a waiter with recovery callbacks and keep it
-// waiting in the background (like a worker awaiting a slow remote operation). The HTTP request
-// returns immediately; the subscription and the persisted recovery state stay alive.
-app.MapPost("/demo/lost-subscriber/arm", async (IAsyncResponseBuilder asyncResponse) =>
+// 5a) Lost-subscriber recovery — arm: register a waiter with recovery callbacks and keep it waiting
+//     in the background. The HTTP request returns immediately; the subscription and persisted
+//     recovery state stay alive. The propagators capture the trace/tenant into the recovery state.
+app.MapPost("/arm", async (IAsyncResponseBuilder asyncResponse, FlowRecorder recorder, string? trace) =>
 {
-    // The propagators capture this trace id and tenant into the persisted recovery state, so they
-    // are restored before the recovery callback runs after the "crash" — even though the waiter is
-    // long gone (the values must survive serialization, which is what the propagators are for).
-    SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
+    SampleTraceContext.Set(trace);
     SampleTenantContext.Set("tenant-acme");
-
     var armed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    armedWaits.Add(asyncResponse
+    var waitTask = asyncResponse
         .For<OperationResult>()
-        .Until(response => response.Status != OperationStatus.Running)
+        .WithTimeout(TimeSpan.FromMinutes(2))
+        .Until(r => r.Status != OperationStatus.Running)
         .OnLostSubscriberResume<ISampleFlowService>(flow =>
             flow.ResumeFlowAsync("sample-flow", Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId()))
         .OnLostSubscriberFailure<ISampleFlowService>(flow =>
             flow.FailFlowAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
         .WaitAsync(context =>
         {
-            // The trigger runs once the subscription and recovery state exist. The "send" here
-            // is handing the id to the operator: the remote work is delivered manually via
-            // /demo/lost-subscriber/respond.
             armed.SetResult(context.CorrelationId);
             return Task.CompletedTask;
-        }));
+        });
 
-    var armedCorrelationId = await armed.Task;
-
-    return Results.Ok(new
-    {
-        correlationId = armedCorrelationId,
-        traceId = SampleTraceContext.Current,   // this should reappear in the RECOVERY log after the crash
-        next = "POST /demo/lost-subscriber/crash, then /demo/lost-subscriber/respond?correlationId=…&status=Completed|Failed"
-    });
+    var correlationId = await armed.Task;
+    _ = waitTask.ContinueWith(t => recorder.RecordWaiterResult(correlationId, t), TaskScheduler.Default);
+    return Results.Ok(new { correlationId });
 })
-.WithTags("Recovery")
-.WithSummary("Arm lost-subscriber recovery")
-.WithDescription("Registers a waiter with recovery callbacks and returns a correlationId to use in the crash/respond flow.");
+.WithTags("Recovery");
 
-// 5b) Lost-subscriber demo — crash: drop every Redis subscription, like a redeploy would.
-// The recovery state stays in Redis; only the in-memory waiters die.
-app.MapPost("/demo/lost-subscriber/crash", (IConnectionMultiplexer multiplexer) =>
+// 5b) Lost-subscriber recovery — crash: drop every Redis subscription, like a redeploy would. The
+//     recovery state stays in Redis; only the in-memory waiters die. (Redis channel only.)
+app.MapPost("/crash", (IServiceProvider services) =>
 {
+    var multiplexer = services.GetService<IConnectionMultiplexer>();
+    if (multiplexer is null)
+        return Results.Conflict("Crash simulation requires the Redis channel (the in-memory channel has no durable recovery to survive it).");
+
     multiplexer.GetSubscriber().UnsubscribeAll();
-    return Results.Ok("All subscriptions dropped (simulated redeploy). The armed waiters are now lost.");
+    return Results.Ok();
 })
-.WithTags("Recovery")
-.WithSummary("Simulate a redeploy")
-.WithDescription("Drops all Redis subscriptions while preserving recovery state.");
+.WithTags("Recovery");
 
-// 5c) Lost-subscriber demo — respond: deliver the late terminal response. With no subscriber
-// alive, the lost-subscriber dispatcher classifies the payload: Completed → ResumeFlowAsync,
-// Failed → FailFlowAsync (as AsyncResponseDomainFailureException). Watch the RECOVERY logs.
-app.MapPost("/demo/lost-subscriber/respond", async (RemoteWorkSimulator remote, string correlationId, OperationStatus status) =>
+// 5c) Deliver a late response/exception for a correlation id through the configured channel (used by
+//     the lost-subscriber recovery scenarios after /crash, and by the active-waiter scenarios).
+app.MapPost("/publish", async (IAsyncResponsePublisher publisher, string correlationId, string? status, string? message, string? exception) =>
 {
-    await remote.DeliverAsync(correlationId, new OperationResult
+    if (exception is not null)
     {
-        Status = status,
-        Message = $"late response delivered after crash ({status})"
-    });
+        await publisher.SetException(new InvalidOperationException(exception), correlationId);
+    }
+    else
+    {
+        var parsedStatus = Enum.TryParse<OperationStatus>(status, ignoreCase: true, out var s) ? s : OperationStatus.Completed;
+        await publisher.SetResponse(new OperationResult { Status = parsedStatus, Message = message }, correlationId);
+    }
 
-    return Results.Ok("Delivered. Watch the application logs for the RECOVERY route taken.");
+    return Results.Accepted();
 })
-.WithTags("Recovery")
-.WithSummary("Deliver a late response after subscriber loss")
-.WithDescription("Publishes a terminal response for the correlationId returned by /demo/lost-subscriber/arm.");
+.WithTags("Recovery");
+
+// 6) Publish a raw response to the Pub/Sub response topic, acting as the remote system. With
+//    useAttribute the correlation id rides a message attribute; otherwise it goes in the JSON body so
+//    the extractor's JSON-path fallback is exercised. (Google Pub/Sub transport only.)
+app.MapPost("/emit-response", async (
+    IServiceProvider services, string correlationId, string? status, bool useAttribute, string? message) =>
+{
+    var options = services.GetService<IOptions<GooglePubSubAsyncResponseOptions>>();
+    if (options is null)
+        return Results.Conflict("Pub/Sub response ingress requires the Google Pub/Sub transport.");
+
+    var o = options.Value;
+    var parsedStatus = Enum.TryParse<OperationStatus>(status, ignoreCase: true, out var s) ? s : OperationStatus.Completed;
+
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = parsedStatus, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)parsedStatus, Message = message });
+
+    var pubsubMessage = new PubsubMessage { Data = ByteString.CopyFromUtf8(json) };
+    if (useAttribute)
+        pubsubMessage.Attributes[o.CorrelationIdAttribute] = correlationId;
+
+    var publisher = await new PublisherServiceApiClientBuilder
+    {
+        EmulatorDetection = EmulatorDetection.EmulatorOrProduction
+    }.BuildAsync();
+    await publisher.PublishAsync(TopicName.FromProjectTopic(o.ProjectId!, o.ResponseTopicId!), [pubsubMessage]);
+
+    return Results.Accepted();
+})
+.WithTags("Workers");
+
+// --- Observability / test affordances --------------------------------------------------------
+
+// Long-poll the flow recorder for a recorded call (e.g. worker:{token}, resume:{cid}, waiter:{cid}).
+app.MapGet("/calls", async (FlowRecorder recorder, string key, int? timeoutMs) =>
+{
+    try
+    {
+        var call = await recorder.WaitForAsync(key).WaitAsync(TimeSpan.FromMilliseconds(timeoutMs ?? 15000));
+        return Results.Ok(call);
+    }
+    catch (TimeoutException)
+    {
+        return Results.StatusCode(StatusCodes.Status408RequestTimeout);
+    }
+})
+.WithTags("Observability");
+
+// Seed a stale recovery entry (no live subscriber) so the watchdog surfaces it as Degraded health.
+app.MapPost("/seed-recovery", async (IRecoveryStateStore store, string correlationId, int? ageMinutes) =>
+{
+    await store.SaveAsync(correlationId, new RecoveryState
+    {
+        CorrelationId = correlationId,
+        PayloadTypeFullName = typeof(OperationResult).FullName,
+        RegisteredAtUtc = DateTime.UtcNow.AddMinutes(-(ageMinutes ?? 5))
+    }, TimeSpan.FromMinutes(10));
+
+    return Results.Accepted();
+})
+.WithTags("Observability");
+
+app.MapDelete("/test/recovery/{correlationId}", async (IRecoveryStateStore store, string correlationId) =>
+{
+    var deleted = await store.TryDeleteAsync(correlationId);
+    return Results.Ok(new { deleted });
+})
+.WithTags("Observability");
+
+app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateStore store, FlowRecorder recorder, CancellationToken cancellationToken) =>
+{
+    var deleted = 0;
+    await foreach (var state in scanner.ScanAsync(cancellationToken))
+    {
+        if (!string.IsNullOrWhiteSpace(state.CorrelationId)
+            && await store.TryDeleteAsync(state.CorrelationId, cancellationToken))
+        {
+            deleted++;
+        }
+    }
+
+    recorder.Clear();
+    return Results.Ok(new { deleted });
+})
+.WithTags("Observability");
 
 // Health endpoint with full JSON details, including the recovery check's data payload.
 app.MapHealthChecks("/healthz", new HealthCheckOptions
@@ -266,10 +389,10 @@ app.MapHealthChecks("/healthz", new HealthCheckOptions
             })
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
-})
-.WithTags("Health")
-.WithSummary("Show watchdog health details")
-.WithDescription("Returns JSON health details, including AsyncResponse recovery watchdog data.");
+}).WithTags("Health");
 
 app.MapDefaultEndpoints();
 app.Run();
+
+/// <summary>Exposed so in-process integration tests can boot the app with WebApplicationFactory.</summary>
+public partial class Program;
