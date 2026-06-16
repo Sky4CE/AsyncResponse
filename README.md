@@ -657,7 +657,7 @@ same invariants are gated on every CI run, at smaller scale, by
 the in-memory channel and transport in-process.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
-drives the sample app's HTTP endpoints with [NBomber](https://nbomber.com) over the **real** stack —
+drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 Redis channel + Google Pub/Sub transport — reporting throughput, latency percentiles, and failures per
 scenario (request/response, worker, attach). By default it boots Redis + a Pub/Sub emulator + the SUT
 via Aspire (Docker required); pass `--url` to load an already-running instance instead:
@@ -671,9 +671,6 @@ It writes an HTML/CSV/Markdown report to `nbomber-report/`. The
 [load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact.
-
-> NBomber is free for personal and open-source use; **organizations require a paid license** (it
-> prints a reminder at startup). See [NBomber licensing](https://nbomber.com).
 
 **Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
 ([`benchmarks.yml`](.github/workflows/benchmarks.yml)) and publishes them with
