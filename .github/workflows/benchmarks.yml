@@ -1,0 +1,112 @@
+name: Benchmarks
+
+# Tracks performance over time. Runs the BenchmarkDotNet micro-benchmarks and the in-process load
+# stress harness, then publishes both to the `gh-pages` branch via github-action-benchmark, which
+# renders charts at https://<owner>.github.io/<repo>/dev/bench/ and alerts on regressions.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmarks.yml'
+  workflow_dispatch:
+
+# github-action-benchmark commits the results history to gh-pages.
+permissions:
+  contents: write
+
+# Serialize runs so concurrent pushes to main don't race on the gh-pages history.
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # A "short" job keeps CI fast; trends (not absolute numbers) are what matter on shared runners.
+      - name: Run BenchmarkDotNet
+        run: |
+          dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*' --job short
+
+      # BenchmarkSwitcher writes one report per benchmark class; merge their Benchmarks arrays into the
+      # single file github-action-benchmark expects.
+      - name: Merge BenchmarkDotNet reports
+        run: |
+          reports=$(find . -path '*BenchmarkDotNet.Artifacts/results/*-report-full-compressed.json')
+          echo "Merging reports:"; echo "$reports"
+          jq -s '{ Benchmarks: (map(.Benchmarks) | add) }' $reports > "${{ github.workspace }}/benchmark-report.json"
+          echo "Total benchmarks: $(jq '.Benchmarks | length' "${{ github.workspace }}/benchmark-report.json")"
+
+      - name: Publish BenchmarkDotNet results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AsyncResponse Microbenchmarks
+          tool: benchmarkdotnet
+          output-file-path: benchmark-report.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      # Asserts correctness under load (process exits non-zero on a violation, failing the job) and
+      # writes throughput/latency/allocation series for charting.
+      - name: Run stress harness
+        run: |
+          dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
+            stress --concurrency 256 --count 50000 --progress 5 --json "${{ github.workspace }}/stress"
+
+      - name: Publish stress throughput (bigger is better)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AsyncResponse Stress - throughput
+          tool: customBiggerIsBetter
+          output-file-path: stress.bigger.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Publish stress latency & allocations (smaller is better)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AsyncResponse Stress - latency & allocations
+          tool: customSmallerIsBetter
+          output-file-path: stress.smaller.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-report.json
+            stress.bigger.json
+            stress.smaller.json
+            **/BenchmarkDotNet.Artifacts/results/*

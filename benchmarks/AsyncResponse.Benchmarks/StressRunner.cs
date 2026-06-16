@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -17,14 +18,22 @@ public interface ICountingWorker
 /// library's own seams at high concurrency, <b>asserts correctness</b> (no lost/crossed responses,
 /// no duplicate worker executions, no hangs), and reports throughput, latency percentiles,
 /// allocations, GC counts and working set. Correctness violations make the process exit non-zero.
+/// <para>
+/// With <c>--json &lt;prefix&gt;</c> it also writes <c>&lt;prefix&gt;.bigger.json</c> (throughput) and
+/// <c>&lt;prefix&gt;.smaller.json</c> (latency + allocations) in github-action-benchmark's custom
+/// format so the CI workflow can chart them over time.
+/// </para>
 /// </summary>
 internal static class StressRunner
 {
+    private static readonly List<GhMetric> Series = [];
+
     public static async Task<int> RunAsync(string[] args)
     {
         var concurrency = GetInt(args, "--concurrency", 256);
         var count = GetInt(args, "--count", 50_000);
         var progress = GetInt(args, "--progress", 5);
+        var jsonPrefix = GetString(args, "--json");
 
         Console.WriteLine($"AsyncResponse stress — concurrency={concurrency:N0}, count={count:N0}, progressPerFlow={progress}");
         Console.WriteLine($"runtime={Environment.Version}, cores={Environment.ProcessorCount}, serverGC={System.Runtime.GCSettings.IsServerGC}");
@@ -35,6 +44,9 @@ internal static class StressRunner
         failures += await ProgressStorm(concurrency, Math.Max(1, count / 10), progress);
         failures += await WorkerStorm(concurrency, count);
         failures += await RaceBurst(concurrency, count);
+
+        if (jsonPrefix is not null)
+            WriteGitHubBenchmarkJson(jsonPrefix);
 
         Console.WriteLine(new string('=', 78));
         if (failures == 0)
@@ -74,6 +86,7 @@ internal static class StressRunner
         });
 
         metrics.Print();
+        metrics.Emit("waiter-storm");
         return Check("waiter-storm", ("crosstalk", crosstalk), ("faults", faults));
     }
 
@@ -109,6 +122,7 @@ internal static class StressRunner
         });
 
         metrics.Print();
+        metrics.Emit("progress-storm");
         return Check("progress-storm", ("wrongTerminal", wrongTerminal), ("faults", faults));
     }
 
@@ -139,6 +153,9 @@ internal static class StressRunner
             Console.WriteLine("  worker-storm (fire-and-forget, exactly-once)");
             Console.WriteLine($"    jobs={count:N0}  elapsed={sw.Elapsed.TotalMilliseconds:N0}ms  throughput={count / sw.Elapsed.TotalSeconds:N0} jobs/s");
             Console.WriteLine($"    executed={counter.Executed:N0}  duplicates={counter.Duplicates}  drained={drained}  alloc={alloc / 1024.0 / 1024.0:N1}MB ({alloc / (double)count:N0} B/job)");
+
+            Series.Add(new GhMetric("worker-storm throughput", "jobs/s", count / sw.Elapsed.TotalSeconds, BiggerIsBetter: true));
+            Series.Add(new GhMetric("worker-storm allocations", "B/op", alloc / (double)count, BiggerIsBetter: false));
 
             return Check("worker-storm", ("notDrained", drained ? 0 : 1), ("missing", count - counter.Executed), ("duplicates", counter.Duplicates));
         }
@@ -173,6 +190,7 @@ internal static class StressRunner
         });
 
         metrics.Print();
+        metrics.Emit("race-burst");
         return Check("race-burst", ("timeouts/faults", faults));
     }
 
@@ -244,6 +262,17 @@ internal static class StressRunner
         await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
+    private static void WriteGitHubBenchmarkJson(string prefix)
+    {
+        var options = new JsonSerializerOptions { WriteIndented = true };
+        var bigger = Series.Where(m => m.BiggerIsBetter).Select(m => new { name = m.Name, unit = m.Unit, value = m.Value }).ToArray();
+        var smaller = Series.Where(m => !m.BiggerIsBetter).Select(m => new { name = m.Name, unit = m.Unit, value = m.Value }).ToArray();
+
+        File.WriteAllText($"{prefix}.bigger.json", JsonSerializer.Serialize(bigger, options));
+        File.WriteAllText($"{prefix}.smaller.json", JsonSerializer.Serialize(smaller, options));
+        Console.WriteLine($"Wrote {prefix}.bigger.json ({bigger.Length} throughput metrics) and {prefix}.smaller.json ({smaller.Length} latency/alloc metrics).");
+    }
+
     private static int Check(string scenario, params (string Label, long Value)[] violations)
     {
         var bad = violations.Where(v => v.Value != 0).ToArray();
@@ -263,6 +292,15 @@ internal static class StressRunner
         return index >= 0 && index + 1 < args.Length && int.TryParse(args[index + 1], out var value) ? value : fallback;
     }
 
+    private static string? GetString(string[] args, string name)
+    {
+        var index = Array.IndexOf(args, name);
+        return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+    }
+
+    /// <summary>One metric in github-action-benchmark's custom format, tagged with its better-direction.</summary>
+    private sealed record GhMetric(string Name, string Unit, double Value, bool BiggerIsBetter);
+
     private sealed class Metrics
     {
         public string Name = "";
@@ -275,10 +313,24 @@ internal static class StressRunner
         public int Gen2;
         public long WorkingSetBytes;
 
+        public double Throughput => Count / Elapsed.TotalSeconds;
+        public double AllocatedPerOp => AllocatedBytes / (double)Count;
+
+        public double P99
+        {
+            get
+            {
+                if (Latencies.Length == 0) return 0;
+                var sorted = (double[])Latencies.Clone();
+                Array.Sort(sorted);
+                return Percentile(sorted, 99);
+            }
+        }
+
         public void Print()
         {
             Console.WriteLine($"  {Name}");
-            Console.WriteLine($"    ops={Count:N0}  elapsed={Elapsed.TotalMilliseconds:N0}ms  throughput={Count / Elapsed.TotalSeconds:N0} ops/s");
+            Console.WriteLine($"    ops={Count:N0}  elapsed={Elapsed.TotalMilliseconds:N0}ms  throughput={Throughput:N0} ops/s");
             if (Latencies.Length > 0)
             {
                 var sorted = (double[])Latencies.Clone();
@@ -286,7 +338,15 @@ internal static class StressRunner
                 Console.WriteLine($"    latency ms: p50={Percentile(sorted, 50):F3}  p95={Percentile(sorted, 95):F3}  p99={Percentile(sorted, 99):F3}  max={sorted[^1]:F3}");
             }
 
-            Console.WriteLine($"    alloc={AllocatedBytes / 1024.0 / 1024.0:N1}MB ({AllocatedBytes / (double)Count:N0} B/op)  GC g0/g1/g2={Gen0}/{Gen1}/{Gen2}  workingSet={WorkingSetBytes / 1024.0 / 1024.0:N0}MB");
+            Console.WriteLine($"    alloc={AllocatedBytes / 1024.0 / 1024.0:N1}MB ({AllocatedPerOp:N0} B/op)  GC g0/g1/g2={Gen0}/{Gen1}/{Gen2}  workingSet={WorkingSetBytes / 1024.0 / 1024.0:N0}MB");
+        }
+
+        // Appends this scenario's headline series to the github-action-benchmark output set.
+        public void Emit(string scenario)
+        {
+            Series.Add(new GhMetric($"{scenario} throughput", "ops/s", Throughput, BiggerIsBetter: true));
+            Series.Add(new GhMetric($"{scenario} p99 latency", "ms", P99, BiggerIsBetter: false));
+            Series.Add(new GhMetric($"{scenario} allocations", "B/op", AllocatedPerOp, BiggerIsBetter: false));
         }
 
         private static double Percentile(double[] sorted, double p)

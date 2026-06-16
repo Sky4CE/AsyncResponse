@@ -1,4 +1,6 @@
 using AsyncResponse.Benchmarks;
+using BenchmarkDotNet.Configs;
+using BenchmarkDotNet.Exporters.Json;
 using BenchmarkDotNet.Running;
 
 // AsyncResponse benchmarks + load/stress harness.
@@ -17,5 +19,8 @@ if (args is [var command, ..] && string.Equals(command, "stress", StringComparis
     return await StressRunner.RunAsync(args[1..]);
 }
 
-BenchmarkSwitcher.FromAssembly(typeof(StressRunner).Assembly).Run(args);
+// Always emit the full-compressed JSON report that github-action-benchmark consumes, on top of the
+// default (markdown/HTML) exporters.
+var config = ManualConfig.Create(DefaultConfig.Instance).AddExporter(JsonExporter.FullCompressed);
+BenchmarkSwitcher.FromAssembly(typeof(StressRunner).Assembly).Run(args, config);
 return 0;

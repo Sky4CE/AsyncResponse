@@ -648,13 +648,31 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress --concurrency 512 --count 200000 --progress 5
 ```
 
-Scenarios: **waiter-storm** (N concurrent waiters, each must receive exactly its own response),
-**progress-storm** (many progress messages + a terminal per flow), **worker-storm** (N fire-and-forget
-jobs, each executed exactly once), and **race-burst** (subscribe-before-send under contention with a
-short timeout). The same invariants are gated on every CI run, at smaller scale, by
-[`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. For sustained
-end-to-end HTTP load against the real Redis/Pub-Sub stack, an [NBomber](https://nbomber.com) scenario
-driving the sample app is a natural addition.
+The stress harness checks four scenarios under load: **waiter-storm** (N concurrent waiters, each must
+receive exactly its own response — no cross-correlation leakage), **progress-storm** (a burst of
+progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
+exactly once), and **race-burst** (subscribe-before-send under contention with a short timeout). The
+same invariants are gated on every CI run, at smaller scale, by
+[`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. Both tiers run
+the in-memory channel and transport in-process; end-to-end load against Redis/Pub-Sub is out of scope
+for this harness — reach for a tool such as [NBomber](https://nbomber.com) if you need it.
+
+**Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
+([`benchmarks.yml`](.github/workflows/benchmarks.yml)) and publishes them with
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as three
+interactive, per-commit charts — micro-benchmark time & allocations, stress throughput, and stress
+latency & allocations:
+
+**📈 [Benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/)**
+
+A change that moves a number stands out immediately; a regression beyond the alert threshold is posted
+as a comment on the offending commit, and every run prints a results table to its
+[workflow summary](https://github.com/Sky4CE/AsyncResponse/actions/workflows/benchmarks.yml). The
+numbers come from shared CI runners, so read them as **trends** rather than absolute hardware figures —
+run the benchmarks locally (above) for stable measurements.
+
+> The dashboard goes live after the workflow's first run on `main`, once GitHub Pages is enabled for
+> the `gh-pages` branch (Settings → Pages → Branch: `gh-pages`).
 
 ## License
 
