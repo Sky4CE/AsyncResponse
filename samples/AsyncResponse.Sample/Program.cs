@@ -71,8 +71,7 @@ app.MapPost("/demo/request-response", async (IAsyncResponseBuilder asyncResponse
     var logger = loggerFactory.CreateLogger("RequestResponse");
 
     // Per-request ambient context. It flows into the response handler below — which runs on a Redis
-    // subscriber thread — via the captured ExecutionContext, so the HANDLER log lines carry it. This
-    // is exactly the OptimaticV2 "restore context inside the redis worker" case, now automatic.
+    // subscriber thread — via the captured ExecutionContext, so the HANDLER log lines carry it.
     SampleTraceContext.Set($"trace-{Guid.NewGuid().ToString("N")[..8]}");
     SampleTenantContext.Set("tenant-acme");
     var startedCorrelationId = string.Empty;
