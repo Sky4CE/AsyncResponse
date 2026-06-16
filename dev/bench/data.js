@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781652976692,
+  "lastUpdate": 1781652977853,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -570,6 +570,62 @@ window.BENCHMARK_DATA = {
             "name": "attach_redis throughput",
             "value": 50,
             "unit": "req/s"
+          }
+        ]
+      }
+    ],
+    "AsyncResponse Load test - latency": [
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ffbb46cb8b4713afec451b9a02dc3de9585069dd",
+          "message": "added NBomber load test",
+          "timestamp": "2026-06-17T01:31:48+02:00",
+          "tree_id": "ccb860d192b362baf5d11235c1ce3db34a0d2c39",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ffbb46cb8b4713afec451b9a02dc3de9585069dd"
+        },
+        "date": 1781652977664,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis p95 latency",
+            "value": 1004.03,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_redis p99 latency",
+            "value": 1006.59,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p95 latency",
+            "value": 12.54,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p99 latency",
+            "value": 14.42,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1003.01,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1005.06,
+            "unit": "ms"
           }
         ]
       }
