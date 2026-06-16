@@ -654,14 +654,32 @@ progress messages then a terminal per flow), **worker-storm** (N fire-and-forget
 exactly once), and **race-burst** (subscribe-before-send under contention with a short timeout). The
 same invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. Both tiers run
-the in-memory channel and transport in-process; end-to-end load against Redis/Pub-Sub is out of scope
-for this harness — reach for a tool such as [NBomber](https://nbomber.com) if you need it.
+the in-memory channel and transport in-process.
+
+**End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
+drives the sample app's HTTP endpoints with [NBomber](https://nbomber.com) over the **real** stack —
+Redis channel + Google Pub/Sub transport — reporting throughput, latency percentiles, and failures per
+scenario (request/response, worker, attach). By default it boots Redis + a Pub/Sub emulator + the SUT
+via Aspire (Docker required); pass `--url` to load an already-running instance instead:
+
+```bash
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rate 200 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
+```
+
+It writes an HTML/CSV/Markdown report to `nbomber-report/`. The
+[load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
+publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
+uploading the full report as an artifact.
+
+> NBomber is free for personal and open-source use; **organizations require a paid license** (it
+> prints a reminder at startup). See [NBomber licensing](https://nbomber.com).
 
 **Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
 ([`benchmarks.yml`](.github/workflows/benchmarks.yml)) and publishes them with
-[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as three
-interactive, per-commit charts — micro-benchmark time & allocations, stress throughput, and stress
-latency & allocations:
+[github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as
+interactive, per-commit charts: micro-benchmark timings & allocations, the in-process stress suites,
+and — from the load-test workflow — end-to-end throughput & latency over the real Redis/Pub-Sub stack:
 
 **📈 [Benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/)**
 

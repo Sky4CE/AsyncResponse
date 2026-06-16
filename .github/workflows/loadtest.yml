@@ -1,0 +1,95 @@
+name: Load test
+
+# End-to-end HTTP load test (NBomber) against the real Redis + Google Pub/Sub stack. Runs on every
+# push to main and publishes throughput/latency to the same gh-pages dashboard as the benchmarks
+# workflow; can also be triggered manually with custom rate/duration. It is Docker-backed, so it
+# shares a concurrency group with the benchmarks workflow to avoid racing on the gh-pages history.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'samples/**'
+      - 'benchmarks/**'
+      - 'tests/AsyncResponse.IntegrationTests.AppHost/**'
+      - '.github/workflows/loadtest.yml'
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: 'Requests per second, per scenario'
+        default: '50'
+      duration:
+        description: 'Load duration in seconds'
+        default: '30'
+
+# github-action-benchmark commits the results history to gh-pages.
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmark-publish
+  cancel-in-progress: false
+
+jobs:
+  loadtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Verify Docker
+        run: docker version
+
+      # Boots Redis + a Pub/Sub emulator + the sample SUT via Aspire, drives them with NBomber, and
+      # emits github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
+      - name: Run NBomber load test
+        run: |
+          dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- \
+            --rate ${{ github.event.inputs.rate || '50' }} \
+            --duration ${{ github.event.inputs.duration || '30' }} \
+            --warmup 10 \
+            --gh-json "${{ github.workspace }}/loadtest"
+
+      - name: Publish load-test throughput (bigger is better)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AsyncResponse Load test - throughput
+          tool: customBiggerIsBetter
+          output-file-path: loadtest.bigger.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          alert-threshold: '200%'
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Publish load-test latency (smaller is better)
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: AsyncResponse Load test - latency
+          tool: customSmallerIsBetter
+          output-file-path: loadtest.smaller.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          alert-threshold: '200%'
+          comment-on-alert: true
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Upload NBomber report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nbomber-report
+          path: nbomber-report/**

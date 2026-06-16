@@ -16,9 +16,10 @@ on:
 permissions:
   contents: write
 
-# Serialize runs so concurrent pushes to main don't race on the gh-pages history.
+# Shared with the load-test workflow so the two never race on the gh-pages history (both publish to
+# the same dev/bench dashboard).
 concurrency:
-  group: benchmarks
+  group: benchmark-publish
   cancel-in-progress: false
 
 jobs:

@@ -59,6 +59,8 @@ dlldata.c
 
 # Benchmark Results
 BenchmarkDotNet.Artifacts/
+nbomber-report/
+reports/
 
 # .NET
 project.lock.json
