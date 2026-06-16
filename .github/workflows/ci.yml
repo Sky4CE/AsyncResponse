@@ -25,9 +25,6 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Test (unit)
-        # Unit tests only. The integration tests (tests/AsyncResponse.IntegrationTests) need Docker
-        # — the integration Aspire AppHost spins up real Redis + a Google Pub/Sub emulator + the SUT —
-        # so they run locally / on demand rather than in this default job.
         # .NET 10 Native MTP mode: parameters pass directly to Microsoft.Testing.Platform.
         # An absolute results directory keeps output stable regardless of the test app's working directory.
         run: |
@@ -56,3 +53,41 @@ jobs:
         with:
           name: nuget-packages
           path: ./artifacts/*.nupkg
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Verify Docker
+        run: docker version
+
+      - name: Restore
+        run: dotnet restore tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj
+
+      - name: Build
+        run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
+
+      - name: Test (integration)
+        # The integration fixture boots the Aspire AppHost, which starts Redis, the Google Pub/Sub
+        # emulator, and the system-under-test app in Docker-backed resources.
+        run: |
+          dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
+            --configuration Release --no-build \
+            --report-trx \
+            --results-directory "${{ github.workspace }}/TestResults/Integration"
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: ${{ github.workspace }}/TestResults/Integration

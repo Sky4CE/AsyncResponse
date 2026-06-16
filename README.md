@@ -565,7 +565,8 @@ exercise the library end-to-end against **real infrastructure**, orchestrated by
 default the test project boots an internal integration AppHost via `Aspire.Hosting.Testing`; that
 AppHost starts real Redis, a Google Pub/Sub emulator container, and the system-under-test app
 (`itest-app`). The tests then drive every scenario over HTTP. They need a running Docker daemon
-(and pull a Pub/Sub emulator image on first run), so they run locally / on demand rather than in CI:
+(and pull a Pub/Sub emulator image on first run), so CI runs them in a separate Docker-backed
+`integration-tests` job:
 
 ```bash
 dotnet run --project tests/AsyncResponse.IntegrationTests
