@@ -1,3 +1,4 @@
+using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.Options;
@@ -19,7 +20,13 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         var projectId = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
         var topicId = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
         var topicName = TopicName.FromProjectTopic(projectId, topicId);
-        _publisher = new Lazy<Task<PublisherClient>>(() => PublisherClient.CreateAsync(topicName));
+        // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
+        // real Google Cloud otherwise — no behavior change in production.
+        _publisher = new Lazy<Task<PublisherClient>>(() => new PublisherClientBuilder
+        {
+            TopicName = topicName,
+            EmulatorDetection = EmulatorDetection.EmulatorOrProduction
+        }.BuildAsync());
     }
 
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)

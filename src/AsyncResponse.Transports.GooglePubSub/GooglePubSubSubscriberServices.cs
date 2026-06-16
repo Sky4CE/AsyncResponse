@@ -1,3 +1,4 @@
+using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -20,7 +21,13 @@ internal abstract class GooglePubSubSubscriberService(
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, SubscriptionId);
-        var subscriber = await SubscriberClient.CreateAsync(subscriptionName).ConfigureAwait(false);
+        // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
+        // real Google Cloud otherwise — no behavior change in production.
+        var subscriber = await new SubscriberClientBuilder
+        {
+            SubscriptionName = subscriptionName,
+            EmulatorDetection = EmulatorDetection.EmulatorOrProduction
+        }.BuildAsync().ConfigureAwait(false);
 
         Logger.LogInformation("{ServiceName}: started. Subscription: {Subscription}.",
             ServiceName, subscriptionName.ToString());

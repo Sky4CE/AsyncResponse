@@ -564,6 +564,24 @@ dotnet run --project tests/AsyncResponse.Tests -f net10.0 -- \
     --report-trx --coverage --results-directory ./TestResults
 ```
 
+The integration tests in [`tests/AsyncResponse.IntegrationTests`](tests/AsyncResponse.IntegrationTests)
+exercise the library end-to-end against **real infrastructure**, orchestrated by **.NET Aspire**: the
+test boots the [AppHost](samples/AsyncResponse.AppHost) via `Aspire.Hosting.Testing`, which starts real
+Redis and a Google Pub/Sub emulator (containers) plus the system-under-test app (`itest-app`), then
+drives every scenario over HTTP. They need a running Docker daemon (and pull a Pub/Sub emulator image
+on first run), so they run locally / on demand rather than in CI:
+
+```bash
+dotnet run --project tests/AsyncResponse.IntegrationTests
+```
+
+The same AppHost doubles as a dashboard playground — `aspire run` (or the command below) shows `redis`,
+`pubsub` and `itest-app` with their live logs and traces, so you can poke the SUT's endpoints by hand:
+
+```bash
+dotnet run --project samples/AsyncResponse.AppHost
+```
+
 ## License
 
 [MIT](LICENSE) — © Vitalii Tiunisov

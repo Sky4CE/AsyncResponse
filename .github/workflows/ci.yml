@@ -24,11 +24,15 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
-      - name: Test
+      - name: Test (unit)
+        # Unit tests only. The integration tests (tests/AsyncResponse.IntegrationTests) need Docker
+        # — the Aspire AppHost spins up real Redis + a Google Pub/Sub emulator (containers) + the SUT —
+        # so they run locally / on demand rather than in this default job.
         # .NET 10 Native MTP mode: parameters pass directly to Microsoft.Testing.Platform.
         # An absolute results directory keeps output stable regardless of the test app's working directory.
         run: |
-          dotnet test --configuration Release --no-build \
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
+            --configuration Release --no-build \
             --report-trx \
             --coverage \
             --results-directory "${{ github.workspace }}/TestResults"
