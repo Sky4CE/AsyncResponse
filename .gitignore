@@ -425,6 +425,9 @@ test-results/
 # Mac bundle stuff
 *.dmg
 *.app
+!tests/AsyncResponse.IntegrationTests.App/
+!tests/AsyncResponse.IntegrationTests.App/*.cs
+!tests/AsyncResponse.IntegrationTests.App/*.csproj
 
 # content below from: https://github.com/github/gitignore/blob/main/Global/macOS.gitignore
 # General
