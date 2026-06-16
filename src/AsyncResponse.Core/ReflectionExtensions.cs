@@ -37,7 +37,7 @@ internal static class ReflectionExtensions
         // Handle JSON payloads
         if (o is JsonElement je)
         {
-            return JsonSerializer.Deserialize(je.GetRawText(), targetType, _looseJsonOptions);
+            return JsonSerializer.Deserialize(je, targetType, _looseJsonOptions);
         }
         // JSON in a string
         if (o is string s && targetType != typeof(string))

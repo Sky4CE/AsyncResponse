@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -13,6 +14,8 @@ namespace AsyncResponse;
 /// </summary>
 internal static class PayloadOutcomeClassifier
 {
+    private static readonly ConcurrentDictionary<string, Type> PayloadTypes = new(StringComparer.Ordinal);
+
     /// <summary>
     /// Attempts to classify the domain outcome of <paramref name="payload"/>.
     /// </summary>
@@ -65,9 +68,19 @@ internal static class PayloadOutcomeClassifier
         }
     }
 
-    private static Type? ResolvePayloadType(string payloadTypeFullName) =>
-        AppDomain.CurrentDomain
+    private static Type? ResolvePayloadType(string payloadTypeFullName)
+    {
+        if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached))
+            return cached;
+
+        var resolved = AppDomain.CurrentDomain
             .GetAssemblies()
             .Select(a => a.GetType(payloadTypeFullName, throwOnError: false))
             .FirstOrDefault(t => t != null);
+
+        if (resolved is not null)
+            PayloadTypes.TryAdd(payloadTypeFullName, resolved);
+
+        return resolved;
+    }
 }

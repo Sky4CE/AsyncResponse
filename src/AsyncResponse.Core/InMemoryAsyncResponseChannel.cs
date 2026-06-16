@@ -87,8 +87,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             if (subscription.CleanupStarted)
                 await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
 
-            _logger.LogInformation("{ServiceName}: {MethodName} Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.",
-                SERVICE_NAME, MethodName, correlationId, timeout.Value);
+            if (_logger.IsEnabled(LogLevel.Information))
+            {
+                _logger.LogInformation("{ServiceName}: {MethodName} Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.",
+                    SERVICE_NAME, MethodName, correlationId, timeout.Value);
+            }
         }
         catch (Exception ex)
         {
@@ -114,7 +117,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         }
 
         var subscribers = SnapshotSubscribers(correlationId);
-        if (subscribers.Count == 0)
+        if (subscribers.Length == 0)
         {
             var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
             var result = await _lostSubscriberDispatcher
@@ -127,10 +130,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             return;
         }
 
-        await Task.WhenAll(subscribers.Select(s => s.DispatchResponseAsync(response))).ConfigureAwait(false);
+        await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-        _logger.LogInformation("{ServiceName}: {MethodName} Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.",
-            SERVICE_NAME, MethodName, correlationId, typeof(T), subscribers.Count);
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("{ServiceName}: {MethodName} Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.",
+                SERVICE_NAME, MethodName, correlationId, typeof(T), subscribers.Length);
+        }
     }
 
     public async Task SetException(Exception exception, string? correlationId = null)
@@ -148,7 +154,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         }
 
         var subscribers = SnapshotSubscribers(correlationId);
-        if (subscribers.Count == 0)
+        if (subscribers.Length == 0)
         {
             var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
             var invoked = await _lostSubscriberDispatcher
@@ -161,10 +167,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             return;
         }
 
-        await Task.WhenAll(subscribers.Select(s => s.DispatchExceptionAsync(exception))).ConfigureAwait(false);
+        await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
 
-        _logger.LogInformation("{ServiceName}: {MethodName} Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.",
-            SERVICE_NAME, MethodName, correlationId, subscribers.Count);
+        if (_logger.IsEnabled(LogLevel.Information))
+        {
+            _logger.LogInformation("{ServiceName}: {MethodName} Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.",
+                SERVICE_NAME, MethodName, correlationId, subscribers.Length);
+        }
     }
 
     /// <inheritdoc />
@@ -177,10 +186,34 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         return new ValueTask<long>(count);
     }
 
-    private IReadOnlyList<SubscriptionBase> SnapshotSubscribers(string correlationId)
+    private SubscriptionBase[] SnapshotSubscribers(string correlationId)
         => _subscriptions.TryGetValue(correlationId, out var subscribers)
             ? subscribers.Values.ToArray()
             : [];
+
+    private static Task DispatchResponsesAsync(SubscriptionBase[] subscribers, object? response)
+    {
+        if (subscribers.Length == 1)
+            return subscribers[0].DispatchResponseAsync(response);
+
+        var tasks = new Task[subscribers.Length];
+        for (var i = 0; i < subscribers.Length; i++)
+            tasks[i] = subscribers[i].DispatchResponseAsync(response);
+
+        return Task.WhenAll(tasks);
+    }
+
+    private static Task DispatchExceptionsAsync(SubscriptionBase[] subscribers, Exception exception)
+    {
+        if (subscribers.Length == 1)
+            return subscribers[0].DispatchExceptionAsync(exception);
+
+        var tasks = new Task[subscribers.Length];
+        for (var i = 0; i < subscribers.Length; i++)
+            tasks[i] = subscribers[i].DispatchExceptionAsync(exception);
+
+        return Task.WhenAll(tasks);
+    }
 
     private void RemoveSubscription(string correlationId, Guid subscriptionId)
     {
@@ -225,13 +258,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
         public abstract Task DispatchResponseAsync(object? response);
 
-        public async Task DispatchExceptionAsync(Exception exception)
+        public Task DispatchExceptionAsync(Exception exception)
         {
             if (!TryBeginTerminal())
-                return;
+                return Task.CompletedTask;
 
             TrySetException(exception);
-            await CleanupOnceAsync().ConfigureAwait(false);
+            return CleanupOnceAsTask();
         }
 
         public async ValueTask CleanupOnceAsync()
@@ -258,16 +291,22 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
         public abstract void TrySetException(Exception exception);
 
-        private async Task TimeoutAsync()
+        protected Task CleanupOnceAsTask()
+        {
+            var cleanup = CleanupOnceAsync();
+            return cleanup.IsCompletedSuccessfully ? Task.CompletedTask : cleanup.AsTask();
+        }
+
+        private Task TimeoutAsync()
         {
             if (!TryBeginTerminal())
-                return;
+                return Task.CompletedTask;
 
             _owner._logger.LogWarning("{ServiceName}: {MethodName} Timed out waiting for response for correlationId {CorrelationId}.",
                 SERVICE_NAME, nameof(CreateResponseWaiter), CorrelationId);
 
             SetTimeoutException(new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}."));
-            await CleanupOnceAsync().ConfigureAwait(false);
+            return CleanupOnceAsTask();
         }
     }
 
@@ -307,7 +346,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             return dispatch!;
         }
 
-        private async Task DispatchResponseCoreAsync(object? response)
+        private Task DispatchResponseCoreAsync(object? response)
         {
             try
             {
@@ -315,7 +354,32 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
                     ? typed
                     : response.As<T>();
 
-                var finished = await _completionPredicate(payload).ConfigureAwait(false);
+                var completion = _completionPredicate(payload);
+                if (!completion.IsCompletedSuccessfully)
+                    return AwaitCompletionPredicateAsync(completion, payload);
+
+                var finished = completion.Result;
+                if (!finished || !TryBeginTerminal())
+                    return Task.CompletedTask;
+
+                _tcs.TrySetResult(payload);
+                return CleanupOnceAsTask();
+            }
+            catch (Exception ex)
+            {
+                if (!TryBeginTerminal())
+                    return Task.CompletedTask;
+
+                _tcs.TrySetException(ex);
+                return CleanupOnceAsTask();
+            }
+        }
+
+        private async Task AwaitCompletionPredicateAsync(ValueTask<bool> completion, T payload)
+        {
+            try
+            {
+                var finished = await completion.ConfigureAwait(false);
                 if (!finished || !TryBeginTerminal())
                     return;
 
