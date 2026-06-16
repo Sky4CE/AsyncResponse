@@ -14,20 +14,23 @@ public sealed class WatchdogReplyTargetHttpTests(IntegrationFixture fixture) : I
     {
         var correlationId = NewId("stale");
 
-        // A recovery entry with no live subscriber, registered well before the (2s) stale threshold.
-        (await Client.PostAsync($"/seed-recovery?correlationId={correlationId}&ageMinutes=5", content: null))
-            .EnsureSuccessStatusCode();
+        try
+        {
+            // A recovery entry with no live subscriber, registered well before the (2s) stale threshold.
+            (await Client.PostAsync($"/seed-recovery?correlationId={correlationId}&ageMinutes=5", content: null))
+                .EnsureSuccessStatusCode();
 
-        var status = await PollAsync(
-            async () =>
-            {
-                using var document = JsonDocument.Parse(await Client.GetStringAsync("/healthz"));
-                return document.RootElement.GetProperty("status").GetString();
-            },
-            s => s == "Degraded",
-            TimeSpan.FromSeconds(20));
+            var status = await PollAsync(
+                GetHealthStatusAsync,
+                s => s == "Degraded",
+                TimeSpan.FromSeconds(20));
 
-        Assert.Equal("Degraded", status);
+            Assert.Equal("Degraded", status);
+        }
+        finally
+        {
+            await CleanupRecoveryStateAsync(correlationId);
+        }
     }
 
     [Fact]
@@ -66,4 +69,28 @@ public sealed class WatchdogReplyTargetHttpTests(IntegrationFixture fixture) : I
     }
 
     private sealed record ReplyTargetResult(string Transport, string Address);
+
+    private async Task<string?> GetHealthStatusAsync()
+    {
+        using var document = JsonDocument.Parse(await Client.GetStringAsync("/healthz"));
+        return document.RootElement.GetProperty("status").GetString();
+    }
+
+    private async Task CleanupRecoveryStateAsync(string correlationId)
+    {
+        try
+        {
+            using var response = await Client.DeleteAsync($"/test/recovery/{correlationId}");
+            response.EnsureSuccessStatusCode();
+
+            await PollAsync(
+                GetHealthStatusAsync,
+                s => s == "Healthy",
+                TimeSpan.FromSeconds(5));
+        }
+        catch
+        {
+            // Cleanup is best-effort; the assertion above should remain the failure signal.
+        }
+    }
 }

@@ -7,7 +7,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <IsAspireHost>true</IsAspireHost>
-    <UserSecretsId>asyncresponse-apphost-7253e3ff-66ad-4f3c-95f1-a44f0327ddda</UserSecretsId>
+    <UserSecretsId>asyncresponse-integrationtests-apphost-5ff760b0-7ffb-4cd9-8fe5-6464f1286486</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
+    <ProjectReference Include="..\AsyncResponse.IntegrationTests.App\AsyncResponse.IntegrationTests.App.csproj" />
   </ItemGroup>
 
 </Project>

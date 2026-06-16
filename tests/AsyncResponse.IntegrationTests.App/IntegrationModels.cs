@@ -125,6 +125,15 @@ public sealed class ItestFlowService : IItestFlowService
     public Task<ItestCall> WaitForAsync(string key)
         => _waiters.GetOrAdd(key, _ => NewSource()).Task;
 
+    public void Clear()
+    {
+        while (_calls.TryDequeue(out _))
+        {
+        }
+
+        _waiters.Clear();
+    }
+
     private void Record(string key, ItestCall call)
     {
         _calls.Enqueue(call);

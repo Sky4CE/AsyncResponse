@@ -202,6 +202,28 @@ app.MapPost("/seed-recovery", async (IRecoveryStateStore store, string correlati
     return Results.Accepted();
 });
 
+app.MapDelete("/test/recovery/{correlationId}", async (IRecoveryStateStore store, string correlationId) =>
+{
+    var deleted = await store.TryDeleteAsync(correlationId);
+    return Results.Ok(new { deleted });
+});
+
+app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateStore store, ItestFlowService flow, CancellationToken cancellationToken) =>
+{
+    var deleted = 0;
+    await foreach (var state in scanner.ScanAsync(cancellationToken))
+    {
+        if (!string.IsNullOrWhiteSpace(state.CorrelationId)
+            && await store.TryDeleteAsync(state.CorrelationId, cancellationToken))
+        {
+            deleted++;
+        }
+    }
+
+    flow.Clear();
+    return Results.Ok(new { deleted });
+});
+
 // Runs a WithReplyTarget round-trip and returns the reply target observed by the trigger.
 app.MapGet("/reply-target", async (IAsyncResponseBuilder asyncResponse, IAsyncResponsePublisher publisher) =>
 {

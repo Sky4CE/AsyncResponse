@@ -26,9 +26,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The AppHost provides the orchestration (Projects.AsyncResponse_AppHost); the App provides the
+    <!-- The AppHost provides the orchestration (Projects.AsyncResponse_IntegrationTests_AppHost); the App provides the
          shared DTO types (ItestPayload / ItestStatus / ItestCall) used to deserialize HTTP responses. -->
-    <ProjectReference Include="..\..\samples\AsyncResponse.AppHost\AsyncResponse.AppHost.csproj" />
+    <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.App\AsyncResponse.IntegrationTests.App.csproj" />
   </ItemGroup>
 

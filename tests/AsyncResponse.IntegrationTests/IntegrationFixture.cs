@@ -6,8 +6,8 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>
 /// Boots the Aspire AppHost once for the whole collection — real Redis + a Google Pub/Sub emulator
-/// (containers) and the system-under-test app (<c>itest-app</c>), all orchestrated by Aspire: the same
-/// model you get from <c>aspire run</c>. Tests drive the SUT entirely over HTTP via <see cref="Client"/>.
+/// (containers) and the system-under-test app (<c>itest-app</c>), all orchestrated by the dedicated
+/// integration AppHost. Tests drive the SUT entirely over HTTP via <see cref="Client"/>.
 /// </summary>
 public sealed class IntegrationFixture : IAsyncLifetime
 {
@@ -22,7 +22,7 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
-        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_AppHost>();
+        var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_IntegrationTests_AppHost>();
         _app = await appHost.BuildAsync().WaitAsync(StartupTimeout);
         await _app.StartAsync().WaitAsync(StartupTimeout);
 
@@ -33,6 +33,7 @@ public sealed class IntegrationFixture : IAsyncLifetime
             .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
+        await ResetTestStateAsync().WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -40,5 +41,11 @@ public sealed class IntegrationFixture : IAsyncLifetime
         Client?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
+    }
+
+    private async Task ResetTestStateAsync()
+    {
+        var response = await Client.PostAsync("/test/reset", content: null);
+        response.EnsureSuccessStatusCode();
     }
 }

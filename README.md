@@ -469,11 +469,7 @@ resource environment, and health checks in one place:
 dotnet run --project samples/AsyncResponse.AppHost
 ```
 
-In Rider, use the shared run configuration `AsyncResponse.Playground`. It is a small launcher
-project that starts the Aspire AppHost without relying on Rider's Aspire/launch-profile project
-pickers.
-
-The Aspire AppHost starts a Redis container and the sample API, then opens the Aspire dashboard.
+The sample AppHost starts a Redis container and the sample API, then opens the Aspire dashboard.
 Use the dashboard's `playground` resource to open the API endpoint and inspect `AsyncResponse`
 logs/traces. The local playground pins the dashboard to `http://localhost:18888` and uses HTTP
 resource/OTLP endpoints to avoid local HTTPS certificate issues. The sample also exposes Aspire
@@ -565,22 +561,19 @@ dotnet run --project tests/AsyncResponse.Tests -f net10.0 -- \
 ```
 
 The integration tests in [`tests/AsyncResponse.IntegrationTests`](tests/AsyncResponse.IntegrationTests)
-exercise the library end-to-end against **real infrastructure**, orchestrated by **.NET Aspire**: the
-test boots the [AppHost](samples/AsyncResponse.AppHost) via `Aspire.Hosting.Testing`, which starts real
-Redis and a Google Pub/Sub emulator (containers) plus the system-under-test app (`itest-app`), then
-drives every scenario over HTTP. They need a running Docker daemon (and pull a Pub/Sub emulator image
-on first run), so they run locally / on demand rather than in CI:
+exercise the library end-to-end against **real infrastructure**, orchestrated by **.NET Aspire**. By
+default the test project boots an internal integration AppHost via `Aspire.Hosting.Testing`; that
+AppHost starts real Redis, a Google Pub/Sub emulator container, and the system-under-test app
+(`itest-app`). The tests then drive every scenario over HTTP. They need a running Docker daemon
+(and pull a Pub/Sub emulator image on first run), so they run locally / on demand rather than in CI:
 
 ```bash
 dotnet run --project tests/AsyncResponse.IntegrationTests
 ```
 
-The same AppHost doubles as a dashboard playground — `aspire run` (or the command below) shows `redis`,
-`pubsub` and `itest-app` with their live logs and traces, so you can poke the SUT's endpoints by hand:
-
-```bash
-dotnet run --project samples/AsyncResponse.AppHost
-```
+In Rider, use the Unit Tests window or gutter icons to run/debug individual unit or integration
+tests. Aspire is not a test explorer here; it is only the infrastructure harness that the integration
+fixture starts for you.
 
 ## License
 
