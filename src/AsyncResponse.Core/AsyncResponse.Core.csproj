@@ -8,6 +8,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />
+    <InternalsVisibleTo Include="AsyncResponse.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>

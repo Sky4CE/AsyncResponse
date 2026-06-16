@@ -622,6 +622,40 @@ In Rider, use the Unit Tests window or gutter icons to run/debug individual unit
 tests. Aspire is not a test explorer here; it is only the infrastructure harness that the integration
 fixture starts for you.
 
+## Benchmarking and load testing
+
+[`benchmarks/AsyncResponse.Benchmarks`](benchmarks/AsyncResponse.Benchmarks) is a console app with two
+modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harness. Run both from a
+**Release** build.
+
+**Benchmarks** — per-operation latency, allocations, and GC for the hot paths (in-memory
+request/response round-trip, envelope (de)serialization, payload classification, expression→callback
+conversion, reflection invoke). `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections
+per op alongside mean/median/percentile timings:
+
+```bash
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks                 # all benchmarks
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter *Channel*
+```
+
+**Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
+lost/crossed responses, no duplicate worker executions, no hangs) and report throughput, latency
+percentiles, allocations, GC counts, and working set. The process exits non-zero if any correctness
+check fails, so it doubles as a soak gate:
+
+```bash
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress --concurrency 512 --count 200000 --progress 5
+```
+
+Scenarios: **waiter-storm** (N concurrent waiters, each must receive exactly its own response),
+**progress-storm** (many progress messages + a terminal per flow), **worker-storm** (N fire-and-forget
+jobs, each executed exactly once), and **race-burst** (subscribe-before-send under contention with a
+short timeout). The same invariants are gated on every CI run, at smaller scale, by
+[`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. For sustained
+end-to-end HTTP load against the real Redis/Pub-Sub stack, an [NBomber](https://nbomber.com) scenario
+driving the sample app is a natural addition.
+
 ## License
 
 [MIT](LICENSE) — © Vitalii Tiunisov
