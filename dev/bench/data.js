@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781652824843,
+  "lastUpdate": 1781652833262,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -305,6 +305,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "race-burst throughput",
             "value": 136898.68621068817,
+            "unit": "ops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ffbb46cb8b4713afec451b9a02dc3de9585069dd",
+          "message": "added NBomber load test",
+          "timestamp": "2026-06-17T01:31:48+02:00",
+          "tree_id": "ccb860d192b362baf5d11235c1ce3db34a0d2c39",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ffbb46cb8b4713afec451b9a02dc3de9585069dd"
+        },
+        "date": 1781652833000,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 87305.5617833523,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 53666.72534228637,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 43544.85041211717,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 124979.19096470438,
             "unit": "ops/s"
           }
         ]
