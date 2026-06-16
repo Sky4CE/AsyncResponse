@@ -1,5 +1,9 @@
 # AsyncResponse
 
+<p align="center">
+  <img src="icon.png" alt="AsyncResponse Icon" width="128" />
+</p>
+
 **Await responses from message brokers and background workers as if they were local async calls — with optional durable, domain-aware recovery when your process dies mid-wait.**
 
 [![CI](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg)](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml)
