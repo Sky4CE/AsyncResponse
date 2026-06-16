@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781641092587,
+  "lastUpdate": 1781641103405,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -72,6 +72,52 @@ window.BENCHMARK_DATA = {
             "value": 4486.481313069661,
             "unit": "ns",
             "range": "± 35.14350859525638"
+          }
+        ]
+      }
+    ],
+    "AsyncResponse Stress - throughput": [
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "336277848e28b1e7d6850920480786681c7f088c",
+          "message": "added workflow yml to track performance",
+          "timestamp": "2026-06-16T22:03:55+02:00",
+          "tree_id": "e47c587b1108eb0a00844a032f8a52d7d22e63c2",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/336277848e28b1e7d6850920480786681c7f088c"
+        },
+        "date": 1781641102893,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 66875.6038867031,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 34577.500973356655,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 32262.995550739335,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 69911.7462080568,
+            "unit": "ops/s"
           }
         ]
       }
