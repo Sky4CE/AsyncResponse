@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781708382119,
+  "lastUpdate": 1781708558404,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -729,6 +729,45 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/ffbb46cb8b4713afec451b9a02dc3de9585069dd"
         },
         "date": 1781652976425,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "153850349b435011c16eebed4de044bcc0ddaa7e",
+          "message": "Refactored ClassifyOutcome in favor of ShouldResumeOnRecovery",
+          "timestamp": "2026-06-17T16:57:01+02:00",
+          "tree_id": "071b5f9af921a0da084c38210926e4a7e5b3f2b1",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/153850349b435011c16eebed4de044bcc0ddaa7e"
+        },
+        "date": 1781708557004,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
