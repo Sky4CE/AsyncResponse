@@ -13,8 +13,8 @@ public interface IAsyncResponsePublisher
     /// Any active subscriber awaiting this channel receives the payload — including payloads
     /// that describe a failed business state, which the waiter's <c>Until</c> predicate and flow
     /// code interpret. With no subscribers, the payload's
-    /// <see cref="IAsyncResponsePayload.ClassifyOutcome"/> decides between the persisted resume
-    /// and failure callbacks.
+    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides between the persisted
+    /// resume and failure callbacks.
     /// </summary>
     /// <typeparam name="T">The payload type.</typeparam>
     /// <param name="response">The payload to publish.</param>

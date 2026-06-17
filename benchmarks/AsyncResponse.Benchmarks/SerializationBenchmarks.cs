@@ -5,7 +5,7 @@ namespace AsyncResponse.Benchmarks;
 
 /// <summary>
 /// The wire/classification hot paths exercised on every delivered response: envelope (de)serialize
-/// and payload outcome classification (typed vs. broker-delivered raw JSON).
+/// and payload recovery-routing classification (typed vs. broker-delivered raw JSON).
 /// </summary>
 [MemoryDiagnoser]
 public class SerializationBenchmarks
@@ -38,10 +38,10 @@ public class SerializationBenchmarks
             _envelopeJson, AsyncResponseEnvelopeOptions<BenchPayload>.Instance)!.Payload!.Status;
 
     [Benchmark]
-    public AsyncResponseOutcome? Classify_TypedPayload()
-        => PayloadOutcomeClassifier.TryClassify(Payload, _payloadTypeName);
+    public bool? Classify_TypedPayload()
+        => PayloadRecoveryClassifier.ShouldResume(Payload, _payloadTypeName);
 
     [Benchmark]
-    public AsyncResponseOutcome? Classify_RawJson()
-        => PayloadOutcomeClassifier.TryClassify(_rawJson, _payloadTypeName);
+    public bool? Classify_RawJson()
+        => PayloadRecoveryClassifier.ShouldResume(_rawJson, _payloadTypeName);
 }

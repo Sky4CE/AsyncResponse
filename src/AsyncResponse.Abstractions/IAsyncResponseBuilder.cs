@@ -66,10 +66,10 @@ public interface IAsyncResponseBuilder
 public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayload
 {
     /// <summary>
-    /// Registers the lost-subscriber <em>resume</em> callback: invoked when a response whose
-    /// domain outcome is <see cref="AsyncResponseOutcome.Succeeded"/> or
-    /// <see cref="AsyncResponseOutcome.InProgress"/> arrives while no waiter is listening
-    /// (typically after a redeploy). The callback usually resumes or re-registers the flow.
+    /// Registers the lost-subscriber <em>resume</em> callback: invoked when a response payload whose
+    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returns <c>true</c> arrives while
+    /// no waiter is listening (typically after a redeploy). The callback usually resumes or
+    /// re-registers the flow.
     /// </summary>
     IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback);
 
@@ -83,8 +83,8 @@ public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayloa
 
     /// <summary>
     /// Registers the lost-subscriber <em>failure</em> callback: invoked when an exception
-    /// envelope — or a payload whose domain outcome is <see cref="AsyncResponseOutcome.Failed"/>
-    /// or <see cref="AsyncResponseOutcome.Unknown"/> — arrives while no waiter is listening.
+    /// envelope — or a payload whose <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
+    /// returns <c>false</c> (or that cannot be classified) — arrives while no waiter is listening.
     /// Domain failures are delivered as <see cref="AsyncResponseDomainFailureException"/>.
     /// </summary>
     IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback);

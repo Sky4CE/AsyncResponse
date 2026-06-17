@@ -37,7 +37,7 @@ public sealed class LostSubscriberRecoveryTests(IntegrationFixture fixture) : In
 
         var call = await WaitForCallAsync($"fail:{correlationId}");
         Assert.Equal("fail", call.Kind);
-        Assert.Equal("domain:Failed", call.Detail); // delivered as AsyncResponseDomainFailureException
+        Assert.Equal("domain-failure", call.Detail); // delivered as AsyncResponseDomainFailureException
     }
 
     [Fact]

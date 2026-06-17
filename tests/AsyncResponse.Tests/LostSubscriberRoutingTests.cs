@@ -61,7 +61,6 @@ public class LostSubscriberRoutingTests
 
         Assert.Empty(_spy.ResumedPayloads);
         var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
-        Assert.Equal(AsyncResponseOutcome.Failed, failure.Outcome);
         Assert.Equal(CorrelationId, failure.CorrelationId);
         Assert.Equal(typeof(OperationResult).FullName, failure.PayloadTypeFullName);
         Assert.Contains("remote step failed", failure.PayloadJson);
@@ -79,8 +78,7 @@ public class LostSubscriberRoutingTests
         await Publisher.SetResponse(payload, CorrelationId);
 
         Assert.Empty(_spy.ResumedPayloads);
-        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
-        Assert.Equal(AsyncResponseOutcome.Failed, failure.Outcome);
+        Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
     }
 
     [Fact]
@@ -115,19 +113,21 @@ public class LostSubscriberRoutingTests
         await Publisher.SetResponse(new OperationResult { Status = OperationStatus.Unknown }, CorrelationId);
 
         Assert.Empty(_spy.ResumedPayloads);
-        Assert.Equal(AsyncResponseOutcome.Unknown, Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures)).Outcome);
+        Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
     }
 
     [Fact]
-    public async Task SetResponse_UnclassifiableRawJsonWithoutStoredType_KeepsResumeRouting()
+    public async Task SetResponse_UnclassifiableRawJsonWithoutStoredType_FailsConservatively()
     {
+        // No stored payload type → the payload cannot be asked whether to resume, so it takes the
+        // failure path rather than resume something the recovery process cannot understand.
         ArmRecoveryState(payloadTypeFullName: null);
-        var payload = JsonSerializer.Deserialize<object>("""{"Status":3,"Message":"would be a failure if classifiable"}""");
+        var payload = JsonSerializer.Deserialize<object>("""{"Status":3,"Message":"unclassifiable without a stored type"}""");
 
         await Publisher.SetResponse(payload, CorrelationId);
 
-        Assert.Single(_spy.ResumedPayloads);
-        Assert.Empty(_spy.Failures);
+        Assert.Empty(_spy.ResumedPayloads);
+        Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
     }
 
     [Fact]
@@ -198,8 +198,7 @@ public class LostSubscriberRoutingTests
         await Ingress.HandleResponseMessageAsync("""{"Status":3,"Message":"remote step failed"}""", CorrelationId);
 
         Assert.Empty(_spy.ResumedPayloads);
-        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
-        Assert.Equal(AsyncResponseOutcome.Failed, failure.Outcome);
+        Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
     }
 
     [Fact]

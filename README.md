@@ -67,9 +67,9 @@ add durable recovery when the flow needs it:
 
          │                              │◄──────── terminal message ──────────┤
          │                              │ nobody is listening →               │
-         │                              │ classify payload.ClassifyOutcome()  │
-         │   ResumeCallback(payload)  ◄─┤   Succeeded / InProgress            │
-         │   FailureCallback(exception)◄┤   Failed / Unknown                  │
+         │                              │ payload.ShouldResumeOnRecovery()    │
+         │   ResumeCallback(payload)  ◄─┤   true → resume                     │
+         │   FailureCallback(exception)◄┤   false → fail                      │
 ```
 
 Three layers, one decision each, made exactly where its deciding fact is knowable:
@@ -78,12 +78,12 @@ Three layers, one decision each, made exactly where its deciding fact is knowabl
 |---|---|---|
 | **Ingress** (`IAsyncResponseIngress`) | "Does the message parse?" | Parses → deliver as payload, untyped and uninterpreted. Doesn't parse → report as exception. |
 | **Response channel** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
-| **Lost-subscriber dispatcher** | "What domain state does the payload carry?" | `Succeeded`/`InProgress` → resume callback. `Failed`/`Unknown` → failure callback. |
+| **Lost-subscriber dispatcher** | "Should this late response resume the flow?" | `ShouldResumeOnRecovery()` true → resume callback. false (or unclassifiable) → failure callback. |
 
 A failed payload is **still a valid response** for an active waiter (your `Until` predicate and
 flow code want to see it — persist details, decide to retry, throw a rich domain error).
-Classification applies only when nobody is listening — which is exactly when somebody has to
-make the call.
+`ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
+somebody has to make the call.
 
 ## Packages
 
@@ -217,12 +217,23 @@ configured message attribute first (`correlationId` by default), then falls back
 paths such as `CorrelationId`, `CustomParameters`, `CustomParameters.CorrelationId`,
 `PubSubParams.CustomParameters.CorrelationId`, and `DagJsonParameters.CorrelationId`.
 
-### 1. Define a payload — and its domain semantics
+### 1. Define a payload
 
-Every payload implements `IAsyncResponsePayload`. The `ClassifyOutcome()` member is
-**deliberately required**: the "what does a failed response mean" decision must be made
-explicitly by every payload author, so it can never be forgotten — that omission is precisely
-the bug class this library exists to prevent.
+Every payload implements `IAsyncResponsePayload` — a marker that also keeps scalars (`string`,
+`int`, …) out of `For<T>()`. Most payloads need nothing more:
+
+```csharp
+public sealed class OrderResult : IAsyncResponsePayload
+{
+    public OrderStatus Status { get; set; }
+    public string? Message { get; set; }
+}
+```
+
+Override `ShouldResumeOnRecovery()` only when a payload can carry a *domain failure* and you use
+lost-subscriber recovery. It answers one question — *should a late response of this type resume
+the flow, or fail it?* — and is consulted **only** on the recovery path, never for live
+completion (which your `Until` predicate owns):
 
 ```csharp
 public sealed class OrderResult : IAsyncResponsePayload
@@ -230,18 +241,14 @@ public sealed class OrderResult : IAsyncResponsePayload
     public OrderStatus Status { get; set; }
     public string? Message { get; set; }
 
-    public AsyncResponseOutcome ClassifyOutcome() => Status switch
-    {
-        OrderStatus.Completed  => AsyncResponseOutcome.Succeeded,
-        OrderStatus.Processing => AsyncResponseOutcome.InProgress,
-        OrderStatus.Failed     => AsyncResponseOutcome.Failed,
-        _                      => AsyncResponseOutcome.Unknown   // fail conservatively
-    };
+    // recovery routing only: fail on a failed result, resume otherwise.
+    public bool ShouldResumeOnRecovery() => Status != OrderStatus.Failed;
 }
 ```
 
-Mirror the semantics your `Until` predicate applies. A payload only ever published on success
-paths simply returns `Succeeded`.
+The default returns `false` (don't resume), so a failed response can never resume the happy path
+by omission. Durable channels (Redis) require this override when you register recovery callbacks —
+they fail fast if it's missing; the in-memory channel, which can't survive a redeploy, doesn't.
 
 ### 2. Request/response correlation
 
@@ -565,9 +572,10 @@ persisted in the recovery state.
 2. **Use reply targets for generic response topics.** If the remote system needs reply-to
    metadata, call `.WithReplyTarget()` and pass the `AsyncResponseRequestContext` into the
    trigger. Transport packages own how native destinations become reply targets.
-3. **Classify honestly.** `ClassifyOutcome()` must mirror your active waiter's `Until`
-   semantics. Map unrecognized states to `Unknown` (fails conservatively) unless your active
-   path deliberately keeps waiting on them — then map them to `InProgress`.
+3. **Decide recovery routing honestly.** Override `ShouldResumeOnRecovery()` for any payload that
+   can carry a domain failure on a durable channel, returning `false` for the states that must not
+   resume. It's independent of your `Until` predicate (which owns live completion) — they answer
+   different questions: "is it a failure?" versus "is the operation done?".
 4. **Register both recovery callbacks** for any flow that must survive redeploys. A failed
    payload with no failure callback is logged and dropped — never resumed — but dropped is
    still a stuck flow.

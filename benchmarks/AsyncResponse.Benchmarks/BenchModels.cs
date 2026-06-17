@@ -14,13 +14,7 @@ public sealed class BenchPayload : IAsyncResponsePayload
     public BenchStatus Status { get; set; }
     public string? Message { get; set; }
 
-    public AsyncResponseOutcome ClassifyOutcome() => Status switch
-    {
-        BenchStatus.Completed => AsyncResponseOutcome.Succeeded,
-        BenchStatus.Running => AsyncResponseOutcome.InProgress,
-        BenchStatus.Failed => AsyncResponseOutcome.Failed,
-        _ => AsyncResponseOutcome.Unknown
-    };
+    public bool ShouldResumeOnRecovery() => Status is BenchStatus.Completed or BenchStatus.Running;
 }
 
 /// <summary>A no-op worker target for the callback/reflection benchmarks.</summary>

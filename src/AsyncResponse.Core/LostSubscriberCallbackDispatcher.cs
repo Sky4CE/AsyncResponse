@@ -7,31 +7,32 @@ namespace AsyncResponse;
 /// <summary>
 /// Result of a lost-subscriber dispatch attempt.
 /// </summary>
-/// <param name="Outcome">
-/// The classified domain outcome of the payload, or <c>null</c> when it could not be classified
-/// (no recovery state, missing payload type, null payload, conversion failure).
+/// <param name="ShouldResume">
+/// The recovery route the payload reported (<see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>):
+/// <c>true</c> resume, <c>false</c> fail, or <c>null</c> when it could not be classified (no recovery
+/// state, missing payload type, null payload, conversion failure) — treated as "do not resume".
 /// </param>
 /// <param name="CallbackInvoked">
 /// <c>true</c> when a callback was invoked successfully — the recovery state is consumed and the
 /// caller should delete it.
 /// </param>
-internal readonly record struct LostSubscriberDispatchResult(AsyncResponseOutcome? Outcome, bool CallbackInvoked);
+internal readonly record struct LostSubscriberDispatchResult(bool? ShouldResume, bool CallbackInvoked);
 
 /// <summary>
 /// The single decision point of the lost-subscriber fallback: when an async response is published
 /// and no subscriber is listening (the original waiter died, e.g. with a redeploy/restart), this
 /// dispatcher chooses and invokes the callback persisted in the <see cref="RecoveryState"/>.
 /// <para>
-/// For payload envelopes (<c>SetResponse</c>) the domain outcome of the payload decides the route:
-/// <see cref="AsyncResponseOutcome.Succeeded"/>/<see cref="AsyncResponseOutcome.InProgress"/> go to
-/// the resume callback; <see cref="AsyncResponseOutcome.Failed"/>/<see cref="AsyncResponseOutcome.Unknown"/>
-/// go to the failure callback wrapped in an <see cref="AsyncResponseDomainFailureException"/>;
-/// unclassifiable payloads keep the resume routing. For exception envelopes
-/// (<c>SetException</c>) the failure callback is always used.
+/// For payload envelopes (<c>SetResponse</c>) the payload's
+/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides the route: <c>true</c> goes to
+/// the resume callback; <c>false</c> (and any unclassifiable payload, conservatively) goes to the
+/// failure callback wrapped in an <see cref="AsyncResponseDomainFailureException"/>. For exception
+/// envelopes (<c>SetException</c>) the failure callback is always used.
 /// </para>
 /// <para>
-/// The publisher stays a plain transport: it only reports "published, but nobody was listening"
-/// and hands over to this dispatcher.
+/// The publisher stays a plain transport: it only reports "published, but nobody was listening" and
+/// hands over to this dispatcher. This decision is independent of the live waiter's <c>Until</c>
+/// predicate, which no longer exists once the waiter is lost.
 /// </para>
 /// </summary>
 internal sealed class LostSubscriberCallbackDispatcher(
@@ -46,29 +47,37 @@ internal sealed class LostSubscriberCallbackDispatcher(
     {
         const string MethodName = nameof(DispatchLostResponse);
 
-        // A payload delivered through SetResponse is only a transport-level success: it may still
-        // describe a failed business state (Status = Error, Success = false, ...). Classify it
-        // as the payload type the original waiter registered for, so the flow is resumed only for
-        // successful or in-progress responses while failed ones take the failure callback.
-        var outcome = recoveryState is null
-            ? null
-            : PayloadOutcomeClassifier.TryClassify(response, recoveryState.PayloadTypeFullName);
+        // The recovering process has no live Until predicate — the payload itself decides whether
+        // this late response resumes the flow or fails it. A null (unclassifiable) verdict is
+        // treated conservatively as "do not resume", so a payload that cannot be understood never
+        // takes the happy path.
+        var shouldResume = recoveryState is null
+            ? (bool?)null
+            : PayloadRecoveryClassifier.ShouldResume(response, recoveryState.PayloadTypeFullName);
 
-        if (outcome is AsyncResponseOutcome.Failed or AsyncResponseOutcome.Unknown)
+        if (shouldResume != true)
         {
-            var invoked = await DispatchFailedDomainState(recoveryState!, response, outcome.Value, channel).ConfigureAwait(false);
-            return new LostSubscriberDispatchResult(outcome, invoked);
+            if (recoveryState is null)
+            {
+                _logger.LogWarning("{ServiceName}: {MethodName} No subscribers and no recovery state for channel {Channel}.",
+                    SERVICE_NAME, MethodName, channel);
+                return new LostSubscriberDispatchResult(shouldResume, false);
+            }
+
+            var invoked = await DispatchFailedDomainState(recoveryState, response, channel).ConfigureAwait(false);
+            return new LostSubscriberDispatchResult(shouldResume, invoked);
         }
 
-        if (recoveryState?.ResumeCallback == null)
+        // shouldResume == true implies recoveryState is non-null (the verdict is null otherwise).
+        if (recoveryState!.ResumeCallback == null)
         {
             _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. No resume callback available.",
                 SERVICE_NAME, MethodName, channel);
-            return new LostSubscriberDispatchResult(outcome, false);
+            return new LostSubscriberDispatchResult(shouldResume, false);
         }
 
-        _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Invoking resume callback (domain outcome: {Outcome}).",
-            SERVICE_NAME, MethodName, channel, outcome?.ToString() ?? "Unclassified");
+        _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Invoking resume callback.",
+            SERVICE_NAME, MethodName, channel);
 
         var invocation = ReflectionExtensions.ResolveCallback(
             recoveryState.ResumeCallback,
@@ -85,7 +94,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         _logger.LogInformation("{ServiceName}: {MethodName} Resume callback invoked for channel {Channel}.",
             SERVICE_NAME, MethodName, channel);
 
-        return new LostSubscriberDispatchResult(outcome, true);
+        return new LostSubscriberDispatchResult(shouldResume, true);
     }
 
     /// <summary>Dispatches an exception envelope that no subscriber received.</summary>
@@ -119,11 +128,12 @@ internal sealed class LostSubscriberCallbackDispatcher(
     }
 
     /// <summary>
-    /// Routes a payload that reported a failed (or unrecognized) domain state to the failure
-    /// callback, wrapped in an <see cref="AsyncResponseDomainFailureException"/> — so the failure
-    /// takes the same path as a technical <c>SetException</c>.
+    /// Routes a payload that declined to resume (<see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
+    /// returned <c>false</c>, or it could not be classified) to the failure callback, wrapped in an
+    /// <see cref="AsyncResponseDomainFailureException"/> — so it takes the same path as a technical
+    /// <c>SetException</c>.
     /// </summary>
-    private async Task<bool> DispatchFailedDomainState<T>(RecoveryState recoveryState, T response, AsyncResponseOutcome outcome, string channel)
+    private async Task<bool> DispatchFailedDomainState<T>(RecoveryState recoveryState, T response, string channel)
     {
         const string MethodName = nameof(DispatchFailedDomainState);
 
@@ -140,18 +150,17 @@ internal sealed class LostSubscriberCallbackDispatcher(
         if (recoveryState.FailureCallback == null)
         {
             _logger.LogError(
-                "{ServiceName}: {MethodName} No subscribers found for channel {Channel} and the response reported domain outcome {Outcome}, but no failure callback is available. The response is NOT routed to the resume callback. Payload: {Payload}",
-                SERVICE_NAME, MethodName, channel, outcome, payloadJson);
+                "{ServiceName}: {MethodName} No subscribers found for channel {Channel} and the response declined to resume, but no failure callback is available. The response is NOT routed to the resume callback. Payload: {Payload}",
+                SERVICE_NAME, MethodName, channel, payloadJson);
             return false;
         }
 
         _logger.LogWarning(
-            "{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Response reported domain outcome {Outcome}; invoking failure callback. Payload: {Payload}",
-            SERVICE_NAME, MethodName, channel, outcome, payloadJson);
+            "{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Response declined to resume; invoking failure callback. Payload: {Payload}",
+            SERVICE_NAME, MethodName, channel, payloadJson);
 
         var domainFailure = new AsyncResponseDomainFailureException(
             recoveryState.CorrelationId,
-            outcome,
             recoveryState.PayloadTypeFullName,
             payloadJson);
 
@@ -166,18 +175,18 @@ internal sealed class LostSubscriberCallbackDispatcher(
         {
             await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
-            _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel} (domain outcome {Outcome}).",
-                SERVICE_NAME, MethodName, channel, outcome);
+            _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel}.",
+                SERVICE_NAME, MethodName, channel);
 
             return true;
         }
         catch (Exception ex)
         {
-            // Deliberately not rethrown: an exception would bubble up to the broker ingress,
-            // which reacts with SetException — and that would invoke this same failure callback
-            // a second time. The domain failure has already been dispatched.
-            _logger.LogError(ex, "{ServiceName}: {MethodName} Failure callback failed for channel {Channel} (domain outcome {Outcome}).",
-                SERVICE_NAME, MethodName, channel, outcome);
+            // Deliberately not rethrown: an exception would bubble up to the broker ingress, which
+            // reacts with SetException — and that would invoke this same failure callback a second
+            // time. The domain failure has already been dispatched.
+            _logger.LogError(ex, "{ServiceName}: {MethodName} Failure callback failed for channel {Channel}.",
+                SERVICE_NAME, MethodName, channel);
             return false;
         }
     }

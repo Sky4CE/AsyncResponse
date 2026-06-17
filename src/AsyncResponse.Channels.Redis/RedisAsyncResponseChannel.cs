@@ -70,6 +70,21 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         if (string.IsNullOrWhiteSpace(correlationId))
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
+        // Recovery callbacks only make sense if the payload can say whether a late response should
+        // resume or fail the flow. On this durable channel that decision is real (it survives a
+        // redeploy), so require the override rather than letting the conservative default silently
+        // route every recovered response to the failure callback. The in-memory channel, which
+        // cannot recover across a process restart, is deliberately not subject to this check.
+        if ((resumeCallback is not null || failureCallback is not null)
+            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+        {
+            throw new InvalidOperationException(
+                $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the Redis channel " +
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
+                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
+                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+        }
+
         // default: first envelope completes the wait
         completionPredicate ??= _ => new ValueTask<bool>(true);
 
@@ -330,12 +345,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
             if (numSubscribers == 0)
             {
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response
-                // over to the lost-subscriber dispatcher, which classifies the payload's domain
-                // state and decides between the resume and failure callbacks.
+                // over to the lost-subscriber dispatcher, which asks the payload whether to resume
+                // the flow or fail it, and invokes the matching callback.
                 var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.lost_subscriber_outcome", dispatchResult.Outcome?.ToString() ?? "Unclassified");
+                activity?.SetTag("asyncresponse.lost_subscriber_route", dispatchResult.ShouldResume switch
+                {
+                    true => "Resume",
+                    false => "Fail",
+                    _ => "Unclassified"
+                });
 
                 if (dispatchResult.CallbackInvoked)
                     await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);

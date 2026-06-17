@@ -4,20 +4,21 @@ using System.Text.Json;
 namespace AsyncResponse;
 
 /// <summary>
-/// Classifies the domain outcome of an async-response payload for the lost-subscriber fallback.
+/// Resolves the lost-subscriber recovery route for a response payload by asking it
+/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>.
 /// <para>
-/// Payloads arriving through a broker ingress are untyped (a raw <see cref="JsonElement"/>), so
-/// the payload type the original waiter registered for (persisted in the recovery state) is used
-/// to materialize the payload before asking it for its
-/// <see cref="IAsyncResponsePayload.ClassifyOutcome"/>.
+/// Payloads arriving through a broker ingress are untyped (a raw <see cref="JsonElement"/> / JSON
+/// string), so the payload type the original waiter registered for (persisted in the recovery
+/// state) is used to materialize the payload before asking it.
 /// </para>
 /// </summary>
-internal static class PayloadOutcomeClassifier
+internal static class PayloadRecoveryClassifier
 {
     private static readonly ConcurrentDictionary<string, Type> PayloadTypes = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Attempts to classify the domain outcome of <paramref name="payload"/>.
+    /// Attempts to decide whether <paramref name="payload"/> should resume the flow on the
+    /// lost-subscriber path.
     /// </summary>
     /// <param name="payload">
     /// The payload as received by <c>SetResponse</c>: either an already-typed
@@ -28,20 +29,19 @@ internal static class PayloadOutcomeClassifier
     /// Full name of the payload type the waiter subscribed for, from the recovery state.
     /// </param>
     /// <returns>
-    /// The classified outcome, or <c>null</c> when the payload cannot be classified — a
-    /// <c>null</c> payload, missing/unresolvable type information, or a conversion failure.
-    /// Callers must treat <c>null</c> as "no domain knowledge" and keep the resume routing;
-    /// note this is distinct from <see cref="AsyncResponseOutcome.Unknown"/>, which is an
-    /// explicit verdict by the payload's own classifier and routes to the failure callback.
+    /// <c>true</c> to resume, <c>false</c> to fail, or <c>null</c> when the payload cannot be
+    /// classified — a <c>null</c> payload, missing/unresolvable type information, or a conversion
+    /// failure. Callers must treat <c>null</c> conservatively as "do not resume", so a payload that
+    /// cannot be understood never takes the happy path.
     /// </returns>
-    public static AsyncResponseOutcome? TryClassify(object? payload, string? payloadTypeFullName)
+    public static bool? ShouldResume(object? payload, string? payloadTypeFullName)
     {
         try
         {
-            // Typed payloads (published directly by in-process services) classify themselves.
+            // Typed payloads (published directly by in-process services) answer for themselves.
             if (payload is IAsyncResponsePayload typedPayload)
             {
-                return typedPayload.ClassifyOutcome();
+                return typedPayload.ShouldResumeOnRecovery();
             }
 
             if (payload is null || string.IsNullOrWhiteSpace(payloadTypeFullName))
@@ -56,13 +56,13 @@ internal static class PayloadOutcomeClassifier
             }
 
             return payload.ConvertTo(payloadType) is IAsyncResponsePayload materialized
-                ? materialized.ClassifyOutcome()
+                ? materialized.ShouldResumeOnRecovery()
                 : null;
         }
         catch
         {
-            // A payload that cannot be materialized as the registered type carries no usable
-            // domain state; fall back to the resume routing. The callback invocation itself
+            // A payload that cannot be materialized as the registered type carries no usable domain
+            // state; treat it conservatively as "do not resume". The failure callback invocation
             // performs the same conversion and surfaces the error through the existing path.
             return null;
         }

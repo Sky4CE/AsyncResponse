@@ -11,22 +11,17 @@ public enum OperationStatus
 }
 
 /// <summary>
-/// The response payload the simulated remote system sends back. The classifier mirrors the
-/// semantics the active waiter applies: Completed succeeds, Running keeps waiting, Failed fails,
-/// anything else is conservatively unknown.
+/// The response payload the simulated remote system sends back. <see cref="ShouldResumeOnRecovery"/>
+/// is consulted only on the lost-subscriber recovery path (live completion is owned by the waiter's
+/// <c>Until</c> predicate): resume on the successful/in-flight states, fail on Failed and anything
+/// unrecognized.
 /// </summary>
 public sealed class OperationResult : IAsyncResponsePayload
 {
     public OperationStatus Status { get; set; }
     public string? Message { get; set; }
 
-    public AsyncResponseOutcome ClassifyOutcome() => Status switch
-    {
-        OperationStatus.Completed => AsyncResponseOutcome.Succeeded,
-        OperationStatus.Running => AsyncResponseOutcome.InProgress,
-        OperationStatus.Failed => AsyncResponseOutcome.Failed,
-        _ => AsyncResponseOutcome.Unknown
-    };
+    public bool ShouldResumeOnRecovery() => Status is OperationStatus.Completed or OperationStatus.Running;
 }
 
 /// <summary>One invocation observed by <see cref="SampleFlowService"/> — a worker job, a recovery
@@ -119,8 +114,8 @@ public sealed class SampleFlowService(FlowRecorder _recorder, ILogger<SampleFlow
 
     public Task FailFlowAsync(Exception exception, string correlationId)
     {
-        var detail = exception is AsyncResponseDomainFailureException domainFailure
-            ? $"domain:{domainFailure.Outcome}"
+        var detail = exception is AsyncResponseDomainFailureException
+            ? "domain-failure"
             : exception.GetType().Name;
 
         _logger.LogError(exception,
