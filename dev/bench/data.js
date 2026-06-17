@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781737527221,
+  "lastUpdate": 1781737669093,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1157,6 +1157,45 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/2f952d5b7b7f9263e434757c1b0da1d42fedca63"
         },
         "date": 1781710040711,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ebc07896c052d7f805ef223c02dfa22989cccdcd",
+          "message": "Implemented Source-generated logging and extension",
+          "timestamp": "2026-06-18T01:03:17+02:00",
+          "tree_id": "c4d501288f636132f27750f885d5bea3642ddf68",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ebc07896c052d7f805ef223c02dfa22989cccdcd"
+        },
+        "date": 1781737668812,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
