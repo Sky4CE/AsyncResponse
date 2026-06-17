@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781710042142,
+  "lastUpdate": 1781710044789,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1107,6 +1107,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "attach_redis p99 latency",
             "value": 1026.05,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "2f952d5b7b7f9263e434757c1b0da1d42fedca63",
+          "message": "chore: cleanup/reanming",
+          "timestamp": "2026-06-17T17:21:49+02:00",
+          "tree_id": "2b738c83dddae1dd408f3e58fb597329bf65ea65",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/2f952d5b7b7f9263e434757c1b0da1d42fedca63"
+        },
+        "date": 1781710043678,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis p95 latency",
+            "value": 1013.25,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_redis p99 latency",
+            "value": 1029.63,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p95 latency",
+            "value": 20.3,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p99 latency",
+            "value": 39.2,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1008.64,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1020.42,
             "unit": "ms"
           }
         ]
