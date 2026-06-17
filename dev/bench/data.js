@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781739918171,
+  "lastUpdate": 1781740066951,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1371,6 +1371,45 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/ebc07896c052d7f805ef223c02dfa22989cccdcd"
         },
         "date": 1781737668812,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "c4f5bf04253150fa84ede2b59904e7c1c0f842d6",
+          "message": "Optimized reflection invocation",
+          "timestamp": "2026-06-18T01:43:17+02:00",
+          "tree_id": "13edc6b568bd797ef2ecbbe5b0c2d47caf7159fc",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/c4f5bf04253150fa84ede2b59904e7c1c0f842d6"
+        },
+        "date": 1781740066111,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
