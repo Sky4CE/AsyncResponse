@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781737525184,
+  "lastUpdate": 1781737527221,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -994,6 +994,65 @@ window.BENCHMARK_DATA = {
           {
             "name": "race-burst allocations",
             "value": 2388.21408,
+            "unit": "B/op"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ebc07896c052d7f805ef223c02dfa22989cccdcd",
+          "message": "Implemented Source-generated logging and extension",
+          "timestamp": "2026-06-18T01:03:17+02:00",
+          "tree_id": "c4d501288f636132f27750f885d5bea3642ddf68",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ebc07896c052d7f805ef223c02dfa22989cccdcd"
+        },
+        "date": 1781737526585,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.04,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 2590.00976,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 0.0722,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3823.8128,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4473.25856,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0388,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 2455.50992,
             "unit": "B/op"
           }
         ]
