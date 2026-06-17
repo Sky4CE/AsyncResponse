@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json;
 
@@ -10,15 +12,21 @@ namespace AsyncResponse;
 /// </summary>
 internal static class ReflectionExtensions
 {
+    private delegate ValueTask AsyncMethodInvoker(object service, object?[] args);
+
     // Loose options for any JSON deserialization here.
     private static readonly JsonSerializerOptions _looseJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    // Cached MethodInfo for invoking As<T> at runtime.
-    private static readonly MethodInfo _asMethod = typeof(ReflectionExtensions)
-        .GetMethod(nameof(As), BindingFlags.Public | BindingFlags.Static)!;
+    private static readonly ConcurrentDictionary<string, Type> ServiceTypes = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
+    private static readonly ConcurrentDictionary<InvocationPlanKey, InvocationPlan> InvocationPlans = new();
+    private static readonly MethodInfo ToValueTaskMethod = typeof(ReflectionExtensions)
+        .GetMethod(nameof(ToValueTask), BindingFlags.NonPublic | BindingFlags.Static)!;
+    private static readonly MethodInfo AwaitGenericValueTaskMethod = typeof(ReflectionExtensions)
+        .GetMethod(nameof(AwaitGenericValueTask), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     /// <summary>
     /// If <paramref name="o"/> is a <see cref="JsonElement"/> (or a JSON string), deserializes it
@@ -33,96 +41,157 @@ internal static class ReflectionExtensions
     /// at runtime (e.g. classifying a payload against the type stored in the recovery state).
     /// </summary>
     public static object? ConvertTo(this object? o, Type targetType)
-    {
-        // Handle JSON payloads
-        if (o is JsonElement je)
-        {
-            return JsonSerializer.Deserialize(je, targetType, _looseJsonOptions);
-        }
-        // JSON in a string
-        if (o is string s && targetType != typeof(string))
-        {
-            return JsonSerializer.Deserialize(s, targetType, _looseJsonOptions);
-        }
-        // Already the correct CLR type (a boxed value also satisfies its nullable counterpart)
-        var underlyingType = Nullable.GetUnderlyingType(targetType);
-        if (targetType.IsInstanceOfType(o) || (underlyingType?.IsInstanceOfType(o) ?? false))
-        {
-            return o;
-        }
-        // Null handling
-        if (o is null)
-        {
-            // The target being a non-nullable value type cannot represent null.
-            if (targetType.IsValueType && underlyingType == null)
-            {
-                throw new InvalidCastException($"Cannot convert null to non-nullable type {targetType}.");
-            }
-            return null;
-        }
-        // Fallback for primitives
-        return Convert.ChangeType(o, underlyingType ?? targetType);
-    }
+        => GetConversionPlan(targetType).Convert(o);
 
     /// <summary>
     /// Resolves the requested service from the provider and invokes the described method,
-    /// converting each parameter to the method's parameter type via <see cref="As{T}"/>.
+    /// converting each parameter to the method's parameter type via <see cref="ConvertTo"/>.
     /// </summary>
-    public static async Task InvokeAsync(this IServiceProvider provider, ReflectionInvocationDto dto)
+    public static Task InvokeAsync(this IServiceProvider provider, ReflectionInvocationDto dto)
     {
-        // 1) Load the service type by full name
-        var serviceType = AppDomain.CurrentDomain
-            .GetAssemblies()
-            .Select(a => a.GetType(dto.ServiceInterfaceFullName, throwOnError: false))
-            .FirstOrDefault(t => t != null);
+        try
+        {
+            // 1) Load the service type by full name
+            var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
 
-        if (serviceType == null)
+            if (serviceType == null)
+                throw new InvalidOperationException(
+                    $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
+
+            // 2) Resolve the service instance
+            var service = provider.GetService(serviceType)
+                       ?? throw new InvalidOperationException(
+                            $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
+
+            // 3) Resolve and cache method metadata + compiled invocation delegate.
+            var plan = InvocationPlans.GetOrAdd(
+                new InvocationPlanKey(serviceType, dto.MethodName, dto.Params.Length),
+                static key => CreateInvocationPlan(key));
+
+            // 4) Convert only the arguments that need conversion, keeping already-typed arrays hot.
+            var invocationArgs = plan.ConvertArguments(dto.Params);
+
+            // 5) Invoke through the compiled delegate and await Task/ValueTask results.
+            var pending = plan.Invoke(service, invocationArgs);
+            return pending.IsCompletedSuccessfully ? Task.CompletedTask : AwaitSlow(pending);
+        }
+        catch (Exception ex)
+        {
+            // Match async-method exception behavior without paying for a state machine on the hot path.
+            return Task.FromException(ex);
+        }
+    }
+
+    private static async Task AwaitSlow(ValueTask pending)
+        => await pending.ConfigureAwait(false);
+
+    private static Type? ResolveServiceType(string serviceInterfaceFullName)
+    {
+        if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
+        {
+            return cached;
+        }
+
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var resolved = assembly.GetType(serviceInterfaceFullName, throwOnError: false);
+            if (resolved is not null)
+            {
+                ServiceTypes.TryAdd(serviceInterfaceFullName, resolved);
+                return resolved;
+            }
+        }
+
+        return null;
+    }
+
+    private static InvocationPlan CreateInvocationPlan(InvocationPlanKey key)
+    {
+        // Pick the overload by name + parameter count once, then reuse the compiled plan.
+        var candidates = key.ServiceType.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+            .Where(m => m.Name == key.MethodName
+                     && m.GetParameters().Length == key.ParameterCount)
+            .ToArray();
+
+        if (candidates.Length == 0)
             throw new InvalidOperationException(
-                $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
+                $"No method '{key.MethodName}' with {key.ParameterCount} parameter(s) on '{key.ServiceType.Name}'.");
 
-        // 2) Resolve the service instance
-        var service = provider.GetService(serviceType)
-                   ?? throw new InvalidOperationException(
-                        $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
-
-        // 3) Pick the overload by name + parameter count
-        var candidates = serviceType.GetMethods()
-            .Where(m => m.Name == dto.MethodName
-                     && m.GetParameters().Length == dto.Params.Length)
-            .ToList();
-
-        if (candidates.Count == 0)
+        if (candidates.Length > 1)
             throw new InvalidOperationException(
-                $"No method '{dto.MethodName}' with {dto.Params.Length} parameter(s) on '{serviceType.Name}'.");
-
-        if (candidates.Count > 1)
-            throw new InvalidOperationException(
-                $"Method '{dto.MethodName}' on '{serviceType.Name}' has {candidates.Count} overloads with " +
-                $"{dto.Params.Length} parameter(s); persisted callbacks cannot disambiguate overloads. " +
+                $"Method '{key.MethodName}' on '{key.ServiceType.Name}' has {candidates.Length} overloads with " +
+                $"{key.ParameterCount} parameter(s); persisted callbacks cannot disambiguate overloads. " +
                 "Give the callback target a unique name/arity.");
 
         var method = candidates[0];
         var parameters = method.GetParameters();
-
-        // 4) Build invocation args via the As<T> helper
-        var invocationArgs = new object?[parameters.Length];
-        for (int i = 0; i < parameters.Length; i++)
+        var converters = new ConversionPlan[parameters.Length];
+        for (var i = 0; i < parameters.Length; i++)
         {
-            var raw = dto.Params[i];
-            var targetType = parameters[i].ParameterType;
-            // call the generic As<T> at runtime:
-            var asMethod = _asMethod.MakeGenericMethod(targetType);
-            invocationArgs[i] = asMethod.Invoke(null, [raw]);
+            var parameterType = parameters[i].ParameterType;
+            if (parameterType.IsByRef)
+            {
+                throw new NotSupportedException(
+                    $"Callback method '{method.Name}' on '{key.ServiceType.Name}' uses by-ref parameter '{parameters[i].Name}', which is not supported.");
+            }
+
+            converters[i] = GetConversionPlan(parameterType);
         }
 
-        // 5) Invoke
-        var result = method.Invoke(service, invocationArgs);
-
-        // 6) If it's Task or Task<T>, await & unwrap
-        if (result is Task task)
+        if (method.ContainsGenericParameters)
         {
-            await task.ConfigureAwait(false);
+            throw new NotSupportedException(
+                $"Callback method '{method.Name}' on '{key.ServiceType.Name}' has unbound generic parameters, which are not supported.");
         }
+
+        return new InvocationPlan(converters, CreateInvoker(method, parameters));
+    }
+
+    private static AsyncMethodInvoker CreateInvoker(MethodInfo method, ParameterInfo[] parameters)
+    {
+        var service = Expression.Parameter(typeof(object), "service");
+        var args = Expression.Parameter(typeof(object?[]), "args");
+        var instance = Expression.Convert(service, method.DeclaringType!);
+        var callArgs = new Expression[parameters.Length];
+
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            var arg = Expression.ArrayIndex(args, Expression.Constant(i));
+            callArgs[i] = Expression.Convert(arg, parameters[i].ParameterType);
+        }
+
+        var call = Expression.Call(instance, method, callArgs);
+        var body = ToValueTaskExpression(call, method.ReturnType);
+        return Expression.Lambda<AsyncMethodInvoker>(body, service, args).Compile();
+    }
+
+    private static Expression ToValueTaskExpression(MethodCallExpression call, Type returnType)
+    {
+        if (returnType == typeof(void))
+            return Expression.Block(call, Expression.Default(typeof(ValueTask)));
+
+        if (typeof(Task).IsAssignableFrom(returnType))
+            return Expression.Call(ToValueTaskMethod, Expression.Convert(call, typeof(Task)));
+
+        if (returnType == typeof(ValueTask))
+            return call;
+
+        if (returnType.IsGenericType && returnType.GetGenericTypeDefinition() == typeof(ValueTask<>))
+            return Expression.Call(AwaitGenericValueTaskMethod.MakeGenericMethod(returnType.GetGenericArguments()[0]), call);
+
+        return Expression.Block(call, Expression.Default(typeof(ValueTask)));
+    }
+
+    private static ValueTask ToValueTask(Task? task)
+        => task is null ? default : new ValueTask(task);
+
+    private static async ValueTask AwaitGenericValueTask<T>(ValueTask<T> task)
+        => await task.ConfigureAwait(false);
+
+    private static ConversionPlan GetConversionPlan(Type targetType)
+    {
+        ArgumentNullException.ThrowIfNull(targetType);
+        return ConversionPlans.GetOrAdd(targetType, static type => new ConversionPlan(type));
     }
 
     /// <summary>
@@ -152,5 +221,86 @@ internal static class ReflectionExtensions
             MethodName = template.MethodName,
             Params = args
         };
+    }
+
+    private readonly record struct InvocationPlanKey(Type ServiceType, string MethodName, int ParameterCount);
+
+    private sealed class InvocationPlan(ConversionPlan[] converters, AsyncMethodInvoker invoker)
+    {
+        public object?[] ConvertArguments(object?[] args)
+        {
+            object?[]? converted = null;
+
+            for (var i = 0; i < converters.Length; i++)
+            {
+                var raw = args[i];
+                var value = converters[i].Convert(raw);
+                if (!ReferenceEquals(value, raw))
+                {
+                    converted ??= CopyPrefix(args, i);
+                    converted[i] = value;
+                }
+                else if (converted is not null)
+                {
+                    converted[i] = raw;
+                }
+            }
+
+            return converted ?? args;
+        }
+
+        public ValueTask Invoke(object service, object?[] args)
+            => invoker(service, args);
+
+        private static object?[] CopyPrefix(object?[] args, int length)
+        {
+            var copy = new object?[args.Length];
+            Array.Copy(args, copy, length);
+            return copy;
+        }
+    }
+
+    private sealed class ConversionPlan(Type targetType)
+    {
+        private readonly Type? _underlyingType = Nullable.GetUnderlyingType(targetType);
+        private readonly Type _conversionType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+        private readonly bool _isNonNullableValueType = targetType.IsValueType && Nullable.GetUnderlyingType(targetType) is null;
+        private readonly bool _isString = targetType == typeof(string);
+
+        public object? Convert(object? value)
+        {
+            // Handle JSON payloads
+            if (value is JsonElement je)
+            {
+                return JsonSerializer.Deserialize(je, targetType, _looseJsonOptions);
+            }
+
+            // JSON in a string
+            if (value is string s && !_isString)
+            {
+                return JsonSerializer.Deserialize(s, targetType, _looseJsonOptions);
+            }
+
+            // Already the correct CLR type (a boxed value also satisfies its nullable counterpart)
+            if (targetType.IsInstanceOfType(value) || (_underlyingType?.IsInstanceOfType(value) ?? false))
+            {
+                return value;
+            }
+
+            // Null handling
+            if (value is null)
+            {
+                // The target being a non-nullable value type cannot represent null.
+                if (_isNonNullableValueType)
+                {
+                    throw new InvalidCastException($"Cannot convert null to non-nullable type {targetType}.");
+                }
+
+                return null;
+            }
+
+            // Fallback for primitives
+            return System.Convert.ChangeType(value, _conversionType);
+        }
     }
 }

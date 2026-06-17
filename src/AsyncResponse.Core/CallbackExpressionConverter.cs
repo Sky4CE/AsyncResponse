@@ -70,10 +70,18 @@ internal static class CallbackExpressionConverter
         if (ReferencesParameter(expression, svcParam))
             throw new NotSupportedException("Argument must not reference the service parameter (e.g., svc => svc.M(svc.Prop)).");
 
-        // Use the interpreter to avoid JIT'ing lots of tiny dynamic methods.
-        var lambda = Expression.Lambda(expression);
-        var del = lambda.Compile(preferInterpretation: true);
-        return del.DynamicInvoke();
+        if (expression is ConstantExpression constant)
+        {
+            return constant.Value;
+        }
+
+        // Use the interpreter to avoid JIT'ing lots of tiny dynamic methods, but keep the delegate
+        // typed so argument capture does not pay DynamicInvoke's reflection dispatch cost.
+        var boxed = expression.Type == typeof(object)
+            ? expression
+            : Expression.Convert(expression, typeof(object));
+        var lambda = Expression.Lambda<Func<object?>>(boxed);
+        return lambda.Compile(preferInterpretation: true)();
     }
 
     private static bool ContainsMethodCall(Expression expression)

@@ -7,6 +7,8 @@ namespace AsyncResponse.Tests;
 public interface IInvokeTarget
 {
     Task RecordAsync(string value);
+    ValueTask RecordValueTaskAsync(string value);
+    ValueTask<int> RecordGenericValueTaskAsync(string value);
 
     // Two overloads with the same arity — persisted callbacks cannot disambiguate these.
     Task TwinAsync(string value);
@@ -21,6 +23,19 @@ public sealed class InvokeTarget : IInvokeTarget
     {
         Recorded.Add(value);
         return Task.CompletedTask;
+    }
+
+    public async ValueTask RecordValueTaskAsync(string value)
+    {
+        await Task.Yield();
+        Recorded.Add(value);
+    }
+
+    public async ValueTask<int> RecordGenericValueTaskAsync(string value)
+    {
+        await Task.Yield();
+        Recorded.Add(value);
+        return Recorded.Count;
     }
 
     public Task TwinAsync(string value) => Task.CompletedTask;
@@ -49,6 +64,38 @@ public class ReflectionInvokeAsyncTests
         });
 
         Assert.Equal("hello", Assert.Single(target.Recorded));
+    }
+
+    [Fact]
+    public async Task InvokesValueTaskMethod_AndAwaitsCompletion()
+    {
+        var target = new InvokeTarget();
+        var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(target).BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
+            MethodName = nameof(IInvokeTarget.RecordValueTaskAsync),
+            Params = ["value-task"]
+        });
+
+        Assert.Equal("value-task", Assert.Single(target.Recorded));
+    }
+
+    [Fact]
+    public async Task InvokesGenericValueTaskMethod_AndAwaitsCompletion()
+    {
+        var target = new InvokeTarget();
+        var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(target).BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
+            MethodName = nameof(IInvokeTarget.RecordGenericValueTaskAsync),
+            Params = ["generic-value-task"]
+        });
+
+        Assert.Equal("generic-value-task", Assert.Single(target.Recorded));
     }
 
     [Fact]

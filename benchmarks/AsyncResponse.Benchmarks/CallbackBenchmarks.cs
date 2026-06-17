@@ -22,6 +22,7 @@ public class CallbackBenchmarks
         _provider = new ServiceCollection().AddSingleton<IBenchWorker, BenchWorker>().BuildServiceProvider();
         var dto = CallbackExpressionConverter.ToReflectionCall(Expression);
         _invocation = ReflectionExtensions.ResolveCallback(dto, payload: null, exception: null, correlationId: "c1");
+        _provider.InvokeAsync(_invocation).GetAwaiter().GetResult();
     }
 
     [GlobalCleanup]
