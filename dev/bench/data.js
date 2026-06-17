@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781708365503,
+  "lastUpdate": 1781708378412,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -421,6 +421,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "race-burst throughput",
             "value": 124979.19096470438,
+            "unit": "ops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "153850349b435011c16eebed4de044bcc0ddaa7e",
+          "message": "Refactored ClassifyOutcome in favor of ShouldResumeOnRecovery",
+          "timestamp": "2026-06-17T16:57:01+02:00",
+          "tree_id": "071b5f9af921a0da084c38210926e4a7e5b3f2b1",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/153850349b435011c16eebed4de044bcc0ddaa7e"
+        },
+        "date": 1781708377140,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 56801.59317108527,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 26372.47641773159,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 26895.89427718844,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 85021.08692998037,
             "unit": "ops/s"
           }
         ]
