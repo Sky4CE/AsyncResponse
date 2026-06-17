@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781708558404,
+  "lastUpdate": 1781708560843,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -839,6 +839,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "attach_redis p99 latency",
             "value": 1005.06,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "153850349b435011c16eebed4de044bcc0ddaa7e",
+          "message": "Refactored ClassifyOutcome in favor of ShouldResumeOnRecovery",
+          "timestamp": "2026-06-17T16:57:01+02:00",
+          "tree_id": "071b5f9af921a0da084c38210926e4a7e5b3f2b1",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/153850349b435011c16eebed4de044bcc0ddaa7e"
+        },
+        "date": 1781708559848,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis p95 latency",
+            "value": 1017.34,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_redis p99 latency",
+            "value": 1049.6,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p95 latency",
+            "value": 21.39,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p99 latency",
+            "value": 73.47,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1011.71,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1026.05,
             "unit": "ms"
           }
         ]
