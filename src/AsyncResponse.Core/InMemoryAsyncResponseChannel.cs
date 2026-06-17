@@ -13,8 +13,6 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
-    private const string SERVICE_NAME = nameof(InMemoryAsyncResponseChannel);
-
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, SubscriptionBase>> _subscriptions = new(StringComparer.Ordinal);
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly InMemoryAsyncResponseOptions _options;
@@ -43,8 +41,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         Func<T, ValueTask<bool>>? completionPredicate = null,
         TimeSpan? timeout = null) where T : IAsyncResponsePayload
     {
-        const string MethodName = nameof(CreateResponseWaiter);
-
         if (string.IsNullOrWhiteSpace(correlationId))
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
@@ -87,16 +83,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             if (subscription.CleanupStarted)
                 await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Information))
-            {
-                _logger.LogInformation("{ServiceName}: {MethodName} Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.",
-                    SERVICE_NAME, MethodName, correlationId, timeout.Value);
-            }
+            _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "{ServiceName}: {MethodName} Failed to create in-memory waiter for correlationId {CorrelationId}.",
-                SERVICE_NAME, MethodName, correlationId);
+            _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
             subscription.TrySetException(ex);
             await subscription.CleanupOnceAsync().ConfigureAwait(false);
         }
@@ -106,13 +97,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
     public async Task SetResponse<T>(T response, string? correlationId = null)
     {
-        const string MethodName = nameof(SetResponse);
-
         correlationId ??= AsyncResponseContext.CorrelationId;
         if (string.IsNullOrWhiteSpace(correlationId))
         {
-            _logger.LogWarning("{ServiceName}: {MethodName} CorrelationId is null. Cannot publish the response.",
-                SERVICE_NAME, MethodName);
+            _logger.LogWarning("CorrelationId is null; cannot publish the response.");
             return;
         }
 
@@ -132,24 +120,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
         await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-        if (_logger.IsEnabled(LogLevel.Information))
-        {
-            _logger.LogInformation("{ServiceName}: {MethodName} Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.",
-                SERVICE_NAME, MethodName, correlationId, typeof(T), subscribers.Length);
-        }
+        _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Length);
     }
 
     public async Task SetException(Exception exception, string? correlationId = null)
     {
-        const string MethodName = nameof(SetException);
-
         ArgumentNullException.ThrowIfNull(exception);
 
         correlationId ??= AsyncResponseContext.CorrelationId;
         if (string.IsNullOrWhiteSpace(correlationId))
         {
-            _logger.LogWarning("{ServiceName}: {MethodName} CorrelationId is null. Cannot publish the exception. Exception: {ExceptionMessage}",
-                SERVICE_NAME, MethodName, exception.Message);
+            _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
             return;
         }
 
@@ -169,11 +150,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
         await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
 
-        if (_logger.IsEnabled(LogLevel.Information))
-        {
-            _logger.LogInformation("{ServiceName}: {MethodName} Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.",
-                SERVICE_NAME, MethodName, correlationId, subscribers.Length);
-        }
+        _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Length);
     }
 
     /// <inheritdoc />
@@ -302,8 +279,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             if (!TryBeginTerminal())
                 return Task.CompletedTask;
 
-            _owner._logger.LogWarning("{ServiceName}: {MethodName} Timed out waiting for response for correlationId {CorrelationId}.",
-                SERVICE_NAME, nameof(CreateResponseWaiter), CorrelationId);
+            _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
 
             SetTimeoutException(new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}."));
             return CleanupOnceAsTask();

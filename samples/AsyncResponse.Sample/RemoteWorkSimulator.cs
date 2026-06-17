@@ -32,11 +32,7 @@ public sealed class RemoteWorkSimulator(IAsyncResponseIngress _ingress, ILogger<
     {
         ArgumentNullException.ThrowIfNull(context);
 
-        _logger.LogInformation(
-            "REMOTE: accepted request {CorrelationId} ({Behavior}) with reply target {ReplyTarget}.",
-            context.CorrelationId,
-            behavior,
-            context.ReplyTarget?.Address);
+        _logger.LogInformation("REMOTE: accepted request {CorrelationId} ({Behavior}) with reply target {ReplyTarget}.", context.CorrelationId, behavior, context.ReplyTarget?.Address);
 
         StartWork(context.CorrelationId, behavior);
     }

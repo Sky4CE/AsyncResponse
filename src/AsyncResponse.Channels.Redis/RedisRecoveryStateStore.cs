@@ -11,8 +11,6 @@ namespace AsyncResponse.Channels.Redis;
 /// </summary>
 internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
 {
-    private const string SERVICE_NAME = nameof(RedisRecoveryStateStore);
-
     private readonly IConnectionMultiplexer _multiplexer;
     private readonly IDatabase _database;
     private readonly RedisKeySchema _keys;
@@ -64,8 +62,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         }
         catch (JsonException ex)
         {
-            _logger.LogError(ex, "{ServiceName}: Failed to deserialize recovery state at {RecoveryKey}.",
-                SERVICE_NAME, recoveryKey);
+            _logger.LogError(ex, "Failed to deserialize recovery state at {RecoveryKey}.", recoveryKey.ToString());
             return null;
         }
     }
@@ -107,7 +104,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogWarning(ex, "{ServiceName}: unreadable recovery state at {RecoveryKey}; skipping.", SERVICE_NAME, recoveryKey);
+                    _logger.LogWarning(ex, "Unreadable recovery state at {RecoveryKey}; skipping.", recoveryKey);
                     continue;
                 }
 
@@ -122,4 +119,5 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             }
         }
     }
+
 }

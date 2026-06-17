@@ -40,13 +40,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
     AsyncResponseContextPropagation _propagation,
     ILogger _logger)
 {
-    private const string SERVICE_NAME = nameof(LostSubscriberCallbackDispatcher);
-
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>
     public async Task<LostSubscriberDispatchResult> DispatchLostResponse<T>(RecoveryState? recoveryState, T response, string channel)
     {
-        const string MethodName = nameof(DispatchLostResponse);
-
         // The recovering process has no live Until predicate — the payload itself decides whether
         // this late response resumes the flow or fails it. A null (unclassifiable) verdict is
         // treated conservatively as "do not resume", so a payload that cannot be understood never
@@ -59,8 +55,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         {
             if (recoveryState is null)
             {
-                _logger.LogWarning("{ServiceName}: {MethodName} No subscribers and no recovery state for channel {Channel}.",
-                    SERVICE_NAME, MethodName, channel);
+                _logger.LogWarning("No subscribers and no recovery state for channel {Channel}.", channel);
                 return new LostSubscriberDispatchResult(shouldResume, false);
             }
 
@@ -71,13 +66,11 @@ internal sealed class LostSubscriberCallbackDispatcher(
         // shouldResume == true implies recoveryState is non-null (the verdict is null otherwise).
         if (recoveryState!.ResumeCallback == null)
         {
-            _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. No resume callback available.",
-                SERVICE_NAME, MethodName, channel);
+            _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
             return new LostSubscriberDispatchResult(shouldResume, false);
         }
 
-        _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Invoking resume callback.",
-            SERVICE_NAME, MethodName, channel);
+        _logger.LogWarning("No subscribers for channel {Channel}; invoking resume callback.", channel);
 
         var invocation = ReflectionExtensions.ResolveCallback(
             recoveryState.ResumeCallback,
@@ -91,8 +84,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         // (the ingress does exactly that).
         await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
-        _logger.LogInformation("{ServiceName}: {MethodName} Resume callback invoked for channel {Channel}.",
-            SERVICE_NAME, MethodName, channel);
+        _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);
 
         return new LostSubscriberDispatchResult(shouldResume, true);
     }
@@ -100,17 +92,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <summary>Dispatches an exception envelope that no subscriber received.</summary>
     public async Task<bool> DispatchLostException(RecoveryState? recoveryState, Exception exception, string channel)
     {
-        const string MethodName = nameof(DispatchLostException);
-
         if (recoveryState?.FailureCallback == null)
         {
-            _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. No failure callback available.",
-                SERVICE_NAME, MethodName, channel);
+            _logger.LogWarning("No subscribers for channel {Channel}; no failure callback available.", channel);
             return false;
         }
 
-        _logger.LogWarning("{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Invoking failure callback.",
-            SERVICE_NAME, MethodName, channel);
+        _logger.LogWarning("No subscribers for channel {Channel}; invoking failure callback.", channel);
 
         var invocation = ReflectionExtensions.ResolveCallback(
             recoveryState.FailureCallback,
@@ -121,8 +109,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
-        _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel}.",
-            SERVICE_NAME, MethodName, channel);
+        _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
 
         return true;
     }
@@ -135,8 +122,6 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// </summary>
     private async Task<bool> DispatchToFailureCallback<T>(RecoveryState recoveryState, T response, string channel)
     {
-        const string MethodName = nameof(DispatchToFailureCallback);
-
         string? payloadJson = null;
         try
         {
@@ -149,15 +134,11 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         if (recoveryState.FailureCallback == null)
         {
-            _logger.LogError(
-                "{ServiceName}: {MethodName} No subscribers found for channel {Channel} and the response declined to resume, but no failure callback is available. The response is NOT routed to the resume callback. Payload: {Payload}",
-                SERVICE_NAME, MethodName, channel, payloadJson);
+            _logger.LogError("No subscribers for channel {Channel} and the response declined to resume, but no failure callback is available; the response is NOT routed to resume. Payload: {Payload}", channel, payloadJson);
             return false;
         }
 
-        _logger.LogWarning(
-            "{ServiceName}: {MethodName} No subscribers found for channel {Channel}. Response declined to resume; invoking failure callback. Payload: {Payload}",
-            SERVICE_NAME, MethodName, channel, payloadJson);
+        _logger.LogWarning("No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {Payload}", channel, payloadJson);
 
         var domainFailure = new AsyncResponseDomainFailureException(
             recoveryState.CorrelationId,
@@ -175,8 +156,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         {
             await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
 
-            _logger.LogInformation("{ServiceName}: {MethodName} Failure callback invoked for channel {Channel}.",
-                SERVICE_NAME, MethodName, channel);
+            _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
 
             return true;
         }
@@ -185,8 +165,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // Deliberately not rethrown: an exception would bubble up to the broker ingress, which
             // reacts with SetException — and that would invoke this same failure callback a second
             // time. The domain failure has already been dispatched.
-            _logger.LogError(ex, "{ServiceName}: {MethodName} Failure callback failed for channel {Channel}.",
-                SERVICE_NAME, MethodName, channel);
+            _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
             return false;
         }
     }
@@ -199,4 +178,5 @@ internal sealed class LostSubscriberCallbackDispatcher(
         await using var serviceScope = _scopeFactory.CreateAsyncScope();
         await serviceScope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
     }
+
 }

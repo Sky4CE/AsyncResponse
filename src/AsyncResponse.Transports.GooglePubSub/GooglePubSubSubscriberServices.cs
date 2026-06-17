@@ -14,7 +14,6 @@ internal abstract class GooglePubSubSubscriberService(
     protected ILogger Logger { get; } = logger;
 
     protected abstract string SubscriptionId { get; }
-    protected abstract string ServiceName { get; }
     protected abstract Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -29,8 +28,7 @@ internal abstract class GooglePubSubSubscriberService(
             EmulatorDetection = EmulatorDetection.EmulatorOrProduction
         }.BuildAsync().ConfigureAwait(false);
 
-        Logger.LogInformation("{ServiceName}: started. Subscription: {Subscription}.",
-            ServiceName, subscriptionName.ToString());
+        Logger.LogInformation("Pub/Sub subscriber started. Subscription: {Subscription}.", subscriptionName.ToString());
 
         var runTask = subscriber.StartAsync(async (message, cancellationToken) =>
         {
@@ -41,8 +39,7 @@ internal abstract class GooglePubSubSubscriberService(
             }
             catch (Exception ex)
             {
-                Logger.LogError(ex, "{ServiceName}: message handling failed; NACKing message {MessageId}.",
-                    ServiceName, message.MessageId);
+                Logger.LogError(ex, "Pub/Sub message handling failed; NACKing message {MessageId}.", message.MessageId);
                 return SubscriberClient.Reply.Nack;
             }
         });
@@ -62,6 +59,7 @@ internal abstract class GooglePubSubSubscriberService(
             await runTask.ConfigureAwait(false);
         }
     }
+
 }
 
 internal sealed class GooglePubSubWorkerSubscriber(
@@ -71,8 +69,6 @@ internal sealed class GooglePubSubWorkerSubscriber(
 {
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.WorkerSubscriptionId, nameof(Options.WorkerSubscriptionId));
-
-    protected override string ServiceName => nameof(GooglePubSubWorkerSubscriber);
 
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
         => ingress.HandleWorkerMessageAsync(message.Data.ToStringUtf8());
@@ -85,8 +81,6 @@ internal sealed class GooglePubSubResponseIngressSubscriber(
 {
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.ResponseSubscriptionId, nameof(Options.ResponseSubscriptionId));
-
-    protected override string ServiceName => nameof(GooglePubSubResponseIngressSubscriber);
 
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
     {

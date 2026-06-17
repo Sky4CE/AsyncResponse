@@ -11,8 +11,6 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILogger<WorkerJobExecutor> _logger)
 {
-    private const string SERVICE_NAME = nameof(WorkerJobExecutor);
-
     /// <summary>
     /// Executes the job. Exceptions propagate to the caller — transports decide whether to log,
     /// retry, or dead-letter.
@@ -21,13 +19,7 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        _logger.LogDebug(
-            "{ServiceName}: executing job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).",
-            SERVICE_NAME,
-            job.Call.ServiceInterfaceFullName,
-            job.Call.MethodName,
-            job.CorrelationId,
-            job.ReplyTarget?.Name);
+        _logger.LogDebug("Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).", job.Call.ServiceInterfaceFullName, job.Call.MethodName, job.CorrelationId, job.ReplyTarget?.Name);
 
         // Scope the restored ambient context so one job cannot inherit or leak another job's
         // correlation id or reply target.
@@ -42,7 +34,6 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
         await using var scope = _scopeFactory.CreateAsyncScope();
         await scope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
 
-        _logger.LogInformation("{ServiceName}: executed job {Target}.{Method} successfully.",
-            SERVICE_NAME, job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+        _logger.LogInformation("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
     }
 }

@@ -345,12 +345,15 @@ The failure callback receives an `AsyncResponseDomainFailureException` for domai
 technical ones — pattern-match to tell them apart:
 
 ```csharp
-public Task FailAsync(Exception ex, string correlationId)
+public sealed class OrderFlow(ILogger<OrderFlow> _logger, IOrderStore _orders) : IOrderFlow
 {
-    if (ex is AsyncResponseDomainFailureException domain)
-        _logger.LogError("Order flow {Cid} failed remotely: {Payload}", correlationId, domain.PayloadJson);
+    public Task FailAsync(Exception ex, string correlationId)
+    {
+        if (ex is AsyncResponseDomainFailureException domain)
+            _logger.LogError("Order flow {CorrelationId} failed remotely: {Payload}", correlationId, domain.PayloadJson);
 
-    return _orders.MarkFailedRetriableAsync(correlationId, ex.Message);
+        return _orders.MarkFailedRetriableAsync(correlationId, ex.Message);
+    }
 }
 ```
 

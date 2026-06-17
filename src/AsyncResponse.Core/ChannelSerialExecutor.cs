@@ -10,8 +10,6 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class ChannelSerialExecutor : IAsyncDisposable
 {
-    private const string SERVICE_NAME = nameof(ChannelSerialExecutor);
-
     private readonly ActionBlock<Func<Task>> _block;
     private readonly ILogger _logger;
     private readonly string _channel;
@@ -27,22 +25,19 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
         _block = new ActionBlock<Func<Task>>(
             async work =>
             {
-                logger.LogDebug("{ServiceName}: starting work for {Channel}; PendingCount={PendingCount}",
-                    SERVICE_NAME, channel, PendingCount);
+                _logger.LogDebug("Channel executor starting work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
                 try
                 {
                     await work().ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "{ServiceName}: Error in channel executor for {Channel}; PendingCount={PendingCount}",
-                        SERVICE_NAME, channel, PendingCount);
+                    _logger.LogError(ex, "Channel executor error for {Channel} (pending {PendingCount}).", _channel, PendingCount);
                     // swallow, so the block stays alive
                 }
                 finally
                 {
-                    logger.LogDebug("{ServiceName}: completed work for {Channel}; PendingCount={PendingCount}",
-                        SERVICE_NAME, channel, PendingCount);
+                    _logger.LogDebug("Channel executor completed work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
                 }
             },
             new ExecutionDataflowBlockOptions
@@ -53,9 +48,7 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
                 CancellationToken = default
             });
 
-        _block.Completion.ContinueWith(t =>
-            logger.LogDebug("{ServiceName}: Channel {Channel} executor completed (IsFaulted={Faulted}); PendingCount={PendingCount}",
-                SERVICE_NAME, channel, t.IsFaulted, PendingCount));
+        _block.Completion.ContinueWith(t => _logger.LogDebug("Channel {Channel} executor completed (faulted {Faulted}, pending {PendingCount}).", _channel, t.IsFaulted, PendingCount));
     }
 
     /// <summary>
@@ -66,15 +59,9 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     {
         var accepted = await _block.SendAsync(work, cancellationToken).ConfigureAwait(false);
         if (accepted)
-        {
-            _logger.LogDebug("{ServiceName}: enqueued work for {Channel}; now PendingCount={PendingCount}",
-                SERVICE_NAME, _channel, PendingCount);
-        }
+            _logger.LogDebug("Channel executor enqueued work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
         else
-        {
-            _logger.LogWarning("{ServiceName}: failed to enqueue work for {Channel} (block completed); PendingCount={PendingCount}",
-                SERVICE_NAME, _channel, PendingCount);
-        }
+            _logger.LogWarning("Channel executor failed to enqueue work for {Channel}; block already completed (pending {PendingCount}).", _channel, PendingCount);
         return accepted;
     }
 
@@ -83,13 +70,11 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        _logger.LogDebug("{ServiceName}: disposing channel executor for {Channel}; PendingCount={PendingCount}",
-            SERVICE_NAME, _channel, PendingCount);
+        _logger.LogDebug("Disposing channel executor for {Channel} (pending {PendingCount}).", _channel, PendingCount);
 
         _block.Complete();
         await _block.Completion.ConfigureAwait(false);
 
-        _logger.LogDebug("{ServiceName}: disposed channel executor for {Channel}; PendingCount={PendingCount}",
-            SERVICE_NAME, _channel, PendingCount);
+        _logger.LogDebug("Disposed channel executor for {Channel} (pending {PendingCount}).", _channel, PendingCount);
     }
 }

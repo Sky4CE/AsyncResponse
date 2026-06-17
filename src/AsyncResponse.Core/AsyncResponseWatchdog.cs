@@ -121,8 +121,6 @@ public sealed record AsyncResponseWatchdogReport(
 /// </summary>
 internal sealed class AsyncResponseWatchdog : BackgroundService
 {
-    private const string SERVICE_NAME = nameof(AsyncResponseWatchdog);
-
     private readonly IRecoveryStateScanner? _scanner;
     private readonly IActiveSubscriberProbe? _subscriberProbe;
     private readonly AsyncResponseWatchdogState _state;
@@ -147,20 +145,17 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
     {
         if (!_options.Enabled)
         {
-            _logger.LogInformation("{ServiceName}: disabled via options; not scanning.", SERVICE_NAME);
+            _logger.LogInformation("Recovery watchdog disabled via options; not scanning.");
             return;
         }
 
         if (_scanner is null)
         {
-            _logger.LogInformation(
-                "{ServiceName}: no IRecoveryStateScanner registered; the configured channel does not support scanning, so the watchdog is idle.",
-                SERVICE_NAME);
+            _logger.LogInformation("Recovery watchdog idle: no IRecoveryStateScanner registered (the configured channel does not support scanning).");
             return;
         }
 
-        _logger.LogInformation("{ServiceName}: started. Interval: {Interval}, stale threshold: {StaleAfter}.",
-            SERVICE_NAME, _options.Interval, _options.StaleAfter);
+        _logger.LogInformation("Recovery watchdog started. Interval: {Interval}, stale threshold: {StaleAfter}.", _options.Interval, _options.StaleAfter);
 
         try
         {
@@ -179,7 +174,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "{ServiceName}: scan failed; next attempt in {Interval}.", SERVICE_NAME, _options.Interval);
+                    _logger.LogError(ex, "Recovery watchdog scan failed; next attempt in {Interval}.", _options.Interval);
                     _state.Publish(new AsyncResponseWatchdogSnapshot(DateTime.UtcNow, _options.Interval, Report: null, Error: ex.Message));
                 }
 
@@ -212,15 +207,11 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
         var report = AsyncResponseWatchdogReport.Evaluate(snapshot, DateTime.UtcNow, _options.StaleAfter);
 
-        _logger.LogInformation(
-            "{ServiceName}: scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}.",
-            SERVICE_NAME, report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries);
+        _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries);
 
         foreach (var stale in report.StaleEntries)
         {
-            _logger.LogWarning(
-                "{ServiceName}: stale async-response recovery state detected — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc:u}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.",
-                SERVICE_NAME, stale.CorrelationId, stale.PayloadTypeFullName, stale.RegisteredAtUtc);
+            _logger.LogWarning("Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.", stale.CorrelationId, stale.PayloadTypeFullName, stale.RegisteredAtUtc);
         }
 
         return report;
@@ -241,7 +232,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "{ServiceName}: failed to probe subscribers for correlationId {CorrelationId}.", SERVICE_NAME, correlationId);
+            _logger.LogDebug(ex, "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.", correlationId);
             return -1;
         }
     }

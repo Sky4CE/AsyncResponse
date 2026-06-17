@@ -93,9 +93,7 @@ public sealed class SampleFlowService(FlowRecorder _recorder, ILogger<SampleFlow
 {
     public Task ProcessWorkAsync(string token)
     {
-        _logger.LogInformation(
-            "WORKER: processing {Token} (correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant})…",
-            token, AsyncResponseContext.CorrelationId, SampleTraceContext.Current, SampleTenantContext.Current);
+        _logger.LogInformation("WORKER: processing {Token} (correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant})…", token, AsyncResponseContext.CorrelationId, SampleTraceContext.Current, SampleTenantContext.Current);
         _recorder.Record($"worker:{token}", new FlowCall(
             "worker", AsyncResponseContext.CorrelationId, SampleTraceContext.Current, SampleTenantContext.Current, null, token));
         return Task.CompletedTask;
@@ -103,10 +101,7 @@ public sealed class SampleFlowService(FlowRecorder _recorder, ILogger<SampleFlow
 
     public Task ResumeFlowAsync(string flowName, OperationResult payload, string correlationId)
     {
-        _logger.LogWarning(
-            "RECOVERY (resume): flow '{FlowName}' got a {Status} response after its waiter was lost " +
-            "(correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant}, message: {Message}).",
-            flowName, payload.Status, correlationId, SampleTraceContext.Current, SampleTenantContext.Current, payload.Message);
+        _logger.LogWarning("RECOVERY (resume): flow '{FlowName}' got a {Status} response after its waiter was lost (correlationId: {CorrelationId}, traceId: {TraceId}, tenant: {Tenant}, message: {Message}).", flowName, payload.Status, correlationId, SampleTraceContext.Current, SampleTenantContext.Current, payload.Message);
         _recorder.Record($"resume:{correlationId}", new FlowCall(
             "resume", correlationId, SampleTraceContext.Current, SampleTenantContext.Current, payload.Status, payload.Message));
         return Task.CompletedTask;
@@ -118,9 +113,7 @@ public sealed class SampleFlowService(FlowRecorder _recorder, ILogger<SampleFlow
             ? "domain-failure"
             : exception.GetType().Name;
 
-        _logger.LogError(exception,
-            "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}, tenant: {Tenant}) failed after its waiter was lost — {Detail}.",
-            correlationId, SampleTraceContext.Current, SampleTenantContext.Current, detail);
+        _logger.LogError(exception, "RECOVERY (failure): correlationId {CorrelationId} (traceId: {TraceId}, tenant: {Tenant}) failed after its waiter was lost — {Detail}.", correlationId, SampleTraceContext.Current, SampleTenantContext.Current, detail);
         _recorder.Record($"fail:{correlationId}", new FlowCall(
             "fail", correlationId, SampleTraceContext.Current, SampleTenantContext.Current, null, detail));
         return Task.CompletedTask;

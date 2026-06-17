@@ -45,8 +45,6 @@ internal sealed class InMemoryWorkerHost(
     WorkerJobExecutor _executor,
     ILogger<InMemoryWorkerHost> _logger) : BackgroundService
 {
-    private const string SERVICE_NAME = nameof(InMemoryWorkerHost);
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
@@ -59,8 +57,7 @@ internal sealed class InMemoryWorkerHost(
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "{ServiceName}: worker job {Target}.{Method} failed.",
-                        SERVICE_NAME, queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+                    _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
                 }
             }
         }
@@ -81,4 +78,5 @@ internal sealed class InMemoryWorkerHost(
         ExecutionContext.Run(queued.Context, _ => task = _executor.ExecuteAsync(queued.Job), null);
         return task!;
     }
+
 }
