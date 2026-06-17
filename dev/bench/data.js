@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781708378412,
+  "lastUpdate": 1781708382119,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -644,6 +644,65 @@ window.BENCHMARK_DATA = {
           {
             "name": "race-burst allocations",
             "value": 2450.09856,
+            "unit": "B/op"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "153850349b435011c16eebed4de044bcc0ddaa7e",
+          "message": "Refactored ClassifyOutcome in favor of ShouldResumeOnRecovery",
+          "timestamp": "2026-06-17T16:57:01+02:00",
+          "tree_id": "071b5f9af921a0da084c38210926e4a7e5b3f2b1",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/153850349b435011c16eebed4de044bcc0ddaa7e"
+        },
+        "date": 1781708380897,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0425,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 2523.58416,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 2.0584,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3879.0576,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4600.80448,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0294,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 2387.73632,
             "unit": "B/op"
           }
         ]
