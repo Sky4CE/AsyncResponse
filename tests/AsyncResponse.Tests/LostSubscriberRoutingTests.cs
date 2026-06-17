@@ -12,7 +12,7 @@ namespace AsyncResponse.Tests;
 /// <summary>
 /// No-subscriber behavior of the Redis response channel (the lost-subscriber fallback after a
 /// redeploy/restart), exercised through the real implementation resolved from DI with Redis
-/// mocked. Verifies that the domain state of the payload — not the transport envelope — decides
+/// mocked. Verifies that the payload's ShouldResumeOnRecovery — not the transport envelope — decides
 /// between the resume callback and the failure callback, and that the broker ingress delivers
 /// failed-but-valid payloads through <c>SetResponse</c> instead of converting them at ingress.
 /// </summary>
@@ -52,7 +52,7 @@ public class LostSubscriberRoutingTests
     // ----- Domain-state-aware routing through SetResponse -----
 
     [Fact]
-    public async Task SetResponse_FailedDomainState_InvokesFailureCallbackInsteadOfResume()
+    public async Task SetResponse_FailedPayload_InvokesFailureCallbackInsteadOfResume()
     {
         ArmRecoveryState();
         var payload = new OperationResult { Status = OperationStatus.Failed, Message = "remote step failed" };
@@ -68,7 +68,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_FailedDomainState_AsRawJson_InvokesFailureCallback()
+    public async Task SetResponse_FailedPayload_AsRawJson_InvokesFailureCallback()
     {
         // The realistic redeploy scenario: the broker ingress delivers the response as an
         // untyped JsonElement; the payload type is only known from the recovery state.
@@ -82,7 +82,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_SucceededDomainState_AsRawJson_InvokesResumeCallback()
+    public async Task SetResponse_CompletedPayload_AsRawJson_InvokesResumeCallback()
     {
         ArmRecoveryState();
         var payload = JsonSerializer.Deserialize<object>("""{"Status":2,"Message":"done"}""");
@@ -95,7 +95,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_InProgressDomainState_InvokesResumeCallback()
+    public async Task SetResponse_RunningPayload_InvokesResumeCallback()
     {
         ArmRecoveryState();
 
@@ -106,7 +106,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_UnknownDomainState_InvokesFailureCallbackConservatively()
+    public async Task SetResponse_UnknownPayload_InvokesFailureCallbackConservatively()
     {
         ArmRecoveryState();
 
@@ -131,7 +131,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_FailedOutcome_WithoutFailureCallback_DoesNotInvokeResume()
+    public async Task SetResponse_FailedPayload_WithoutFailureCallback_DoesNotInvokeResume()
     {
         ArmRecoveryState(includeFailureCallback: false);
 
@@ -188,11 +188,11 @@ public class LostSubscriberRoutingTests
     // ----- Broker ingress -----
 
     [Fact]
-    public async Task Ingress_FailedDomainState_IsDeliveredThroughSetResponseAndClassified_NotConvertedAtIngress()
+    public async Task Ingress_FailedPayload_IsDeliveredThroughSetResponse_NotConvertedAtIngress()
     {
         // Pins the ingress contract: a failed-state response is valid JSON, so the untyped
         // ingress deserialization cannot fail on it — it flows through SetResponse and only the
-        // lost-subscriber dispatcher classifies its domain state.
+        // lost-subscriber dispatcher decides whether it resumes.
         ArmRecoveryState();
 
         await Ingress.HandleResponseMessageAsync("""{"Status":3,"Message":"remote step failed"}""", CorrelationId);

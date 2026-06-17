@@ -265,7 +265,7 @@ public class ContextPropagationTests
     }
 
     [Fact]
-    public async Task RecoveryFailureCallback_RestoresBaggage_OnFailedDomainOutcome()
+    public async Task RecoveryFailureCallback_RestoresBaggage_OnDomainFailure()
     {
         var probe = new BaggageProbe();
         var provider = BuildProvider(probe, b => b.WithInMemoryChannel().WithContextPropagator<BaggagePropagator>());

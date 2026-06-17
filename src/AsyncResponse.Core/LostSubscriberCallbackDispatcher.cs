@@ -64,7 +64,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 return new LostSubscriberDispatchResult(shouldResume, false);
             }
 
-            var invoked = await DispatchFailedDomainState(recoveryState, response, channel).ConfigureAwait(false);
+            var invoked = await DispatchToFailureCallback(recoveryState, response, channel).ConfigureAwait(false);
             return new LostSubscriberDispatchResult(shouldResume, invoked);
         }
 
@@ -133,9 +133,9 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <see cref="AsyncResponseDomainFailureException"/> — so it takes the same path as a technical
     /// <c>SetException</c>.
     /// </summary>
-    private async Task<bool> DispatchFailedDomainState<T>(RecoveryState recoveryState, T response, string channel)
+    private async Task<bool> DispatchToFailureCallback<T>(RecoveryState recoveryState, T response, string channel)
     {
-        const string MethodName = nameof(DispatchFailedDomainState);
+        const string MethodName = nameof(DispatchToFailureCallback);
 
         string? payloadJson = null;
         try

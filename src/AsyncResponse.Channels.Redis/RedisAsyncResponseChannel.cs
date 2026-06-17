@@ -14,8 +14,8 @@ namespace AsyncResponse.Channels.Redis;
 /// <item><description>Publishes responses to Redis pub/sub channels keyed by correlation id.</description></item>
 /// <item><description>Subscribes waiters to those channels with per-channel serialized handling.</description></item>
 /// <item><description>Persists <see cref="RecoveryState"/> so responses arriving after the waiter
-/// died (e.g. a redeploy) are routed through the lost-subscriber dispatcher, which classifies the
-/// payload's domain outcome and invokes the resume or failure callback.</description></item>
+/// died (e.g. a redeploy) are routed through the lost-subscriber dispatcher, which asks the payload's
+/// ShouldResumeOnRecovery and invokes the resume or failure callback.</description></item>
 /// </list>
 /// </summary>
 internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
