@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace AsyncResponse;
 
@@ -19,21 +20,36 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
     {
         ArgumentNullException.ThrowIfNull(job);
 
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.worker.execute",
+            ActivityKind.Consumer,
+            job.CorrelationId);
+        AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
+        AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+
         _logger.LogDebug("Executing worker job {Target}.{Method} (correlationId: {CorrelationId}, replyTarget: {ReplyTarget}).", job.Call.ServiceInterfaceFullName, job.Call.MethodName, job.CorrelationId, job.ReplyTarget?.Name);
 
-        // Scope the restored ambient context so one job cannot inherit or leak another job's
-        // correlation id or reply target.
-        using var asyncResponseScope = AsyncResponseContext.PushContext(job.CorrelationId, job.ReplyTarget);
+        try
+        {
+            // Scope the restored ambient context so one job cannot inherit or leak another job's
+            // correlation id or reply target.
+            using var asyncResponseScope = AsyncResponseContext.PushContext(job.CorrelationId, job.ReplyTarget);
 
-        var invocation = ReflectionExtensions.ResolveCallback(
-            job.Call,
-            payload: null,
-            exception: null,
-            correlationId: job.CorrelationId);
+            var invocation = ReflectionExtensions.ResolveCallback(
+                job.Call,
+                payload: null,
+                exception: null,
+                correlationId: job.CorrelationId);
 
-        await using var scope = _scopeFactory.CreateAsyncScope();
-        await scope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            await scope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
 
-        _logger.LogInformation("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+            _logger.LogInformation("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 }

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 
 namespace AsyncResponse;
 
@@ -189,32 +190,46 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
     private async Task<AsyncResponseWatchdogReport> ScanOnceAsync(CancellationToken cancellationToken)
     {
-        var snapshot = new List<RecoveryStateObservation>();
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.watchdog.scan");
 
-        await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
+        try
         {
-            if (entry is null)
-                continue;
+            var snapshot = new List<RecoveryStateObservation>();
 
-            var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
+            await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (entry is null)
+                    continue;
 
-            snapshot.Add(new RecoveryStateObservation(
-                entry.CorrelationId,
-                entry.RegisteredAtUtc,
-                activeSubscribers,
-                entry.PayloadTypeFullName));
+                var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
+
+                snapshot.Add(new RecoveryStateObservation(
+                    entry.CorrelationId,
+                    entry.RegisteredAtUtc,
+                    activeSubscribers,
+                    entry.PayloadTypeFullName));
+            }
+
+            var report = AsyncResponseWatchdogReport.Evaluate(snapshot, DateTime.UtcNow, _options.StaleAfter);
+            activity?.SetTag("asyncresponse.watchdog.total_entries", report.TotalEntries);
+            activity?.SetTag("asyncresponse.watchdog.active_waiters", report.EntriesWithActiveWaiter);
+            activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);
+            activity?.SetTag("asyncresponse.watchdog.unknown_age_entries", report.UnknownAgeEntries);
+
+            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries);
+
+            foreach (var stale in report.StaleEntries)
+            {
+                _logger.LogWarning("Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.", stale.CorrelationId, stale.PayloadTypeFullName, stale.RegisteredAtUtc);
+            }
+
+            return report;
         }
-
-        var report = AsyncResponseWatchdogReport.Evaluate(snapshot, DateTime.UtcNow, _options.StaleAfter);
-
-        _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries);
-
-        foreach (var stale in report.StaleEntries)
+        catch (Exception ex)
         {
-            _logger.LogWarning("Stale async-response recovery state — correlationId {CorrelationId}, payload type {PayloadType}, registered {RegisteredAtUtc}, no live subscriber. The owning flow is likely stuck; investigate and resume or fail it.", stale.CorrelationId, stale.PayloadTypeFullName, stale.RegisteredAtUtc);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
         }
-
-        return report;
     }
 
     /// <summary>

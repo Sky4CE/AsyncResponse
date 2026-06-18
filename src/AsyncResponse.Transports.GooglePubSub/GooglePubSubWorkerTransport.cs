@@ -2,6 +2,7 @@ using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace AsyncResponse.Transports.GooglePubSub;
@@ -33,16 +34,35 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        var message = new PubsubMessage
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.worker.publish",
+            ActivityKind.Producer,
+            job.CorrelationId);
+        activity?.SetTag("asyncresponse.transport", "google_pubsub");
+        activity?.SetTag("messaging.system", "gcp_pubsub");
+        activity?.SetTag("messaging.destination.name", _options.WorkerTopicId);
+        AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
+        AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+
+        try
         {
-            Data = ByteString.CopyFromUtf8(JsonSerializer.Serialize(job))
-        };
+            var message = new PubsubMessage
+            {
+                Data = ByteString.CopyFromUtf8(JsonSerializer.Serialize(job))
+            };
 
-        if (!string.IsNullOrWhiteSpace(job.CorrelationId))
-            message.Attributes[_options.CorrelationIdAttribute] = job.CorrelationId;
+            if (!string.IsNullOrWhiteSpace(job.CorrelationId))
+                message.Attributes[_options.CorrelationIdAttribute] = job.CorrelationId;
 
-        var publisher = await _publisher.Value.ConfigureAwait(false);
-        await publisher.PublishAsync(message).WaitAsync(cancellationToken).ConfigureAwait(false);
+            var publisher = await _publisher.Value.ConfigureAwait(false);
+            var messageId = await publisher.PublishAsync(message).WaitAsync(cancellationToken).ConfigureAwait(false);
+            activity?.SetTag("messaging.message.id", messageId);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     public async ValueTask DisposeAsync()

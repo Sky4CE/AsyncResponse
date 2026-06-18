@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 
 namespace AsyncResponse;
 
@@ -50,11 +51,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         if (timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than zero.");
 
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.wait", correlationId: correlationId);
+        activity?.SetTag("asyncresponse.channel", "inmemory");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
+        activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
+
         var subscription = new Subscription<T>(
             owner: this,
             correlationId,
             timeout.Value,
             completionPredicate,
+            activity,
             ExecutionContext.Capture());
 
         subscription.ArmTimeout();
@@ -88,6 +95,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
+            AsyncResponseDiagnostics.SetError(activity, ex);
             subscription.TrySetException(ex);
             await subscription.CleanupOnceAsync().ConfigureAwait(false);
         }
@@ -97,60 +105,95 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
     public async Task SetResponse<T>(T response, string? correlationId = null)
     {
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "inmemory");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
+
         correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
         if (string.IsNullOrWhiteSpace(correlationId))
         {
             _logger.LogWarning("CorrelationId is null; cannot publish the response.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the response.");
             return;
         }
 
-        var subscribers = SnapshotSubscribers(correlationId);
-        if (subscribers.Length == 0)
+        try
         {
-            var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
-            var result = await _lostSubscriberDispatcher
-                .DispatchLostResponse(recoveryState, response, ChannelName(correlationId))
-                .ConfigureAwait(false);
+            var subscribers = SnapshotSubscribers(correlationId);
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Length);
+            if (subscribers.Length == 0)
+            {
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var result = await _lostSubscriberDispatcher
+                    .DispatchLostResponse(recoveryState, response, ChannelName(correlationId))
+                    .ConfigureAwait(false);
 
-            if (result.CallbackInvoked)
-                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
-            return;
+                if (result.CallbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+
+                return;
+            }
+
+            await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
+
+            _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Length);
         }
-
-        await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
-
-        _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Length);
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     public async Task SetException(Exception exception, string? correlationId = null)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "inmemory");
+        activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
+
         correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
         if (string.IsNullOrWhiteSpace(correlationId))
         {
             _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the exception.");
             return;
         }
 
-        var subscribers = SnapshotSubscribers(correlationId);
-        if (subscribers.Length == 0)
+        try
         {
-            var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
-            var invoked = await _lostSubscriberDispatcher
-                .DispatchLostException(recoveryState, exception, ChannelName(correlationId))
-                .ConfigureAwait(false);
+            var subscribers = SnapshotSubscribers(correlationId);
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Length);
+            if (subscribers.Length == 0)
+            {
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var invoked = await _lostSubscriberDispatcher
+                    .DispatchLostException(recoveryState, exception, ChannelName(correlationId))
+                    .ConfigureAwait(false);
 
-            if (invoked)
-                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
 
-            return;
+                if (invoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+
+                return;
+            }
+
+            await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
+
+            _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Length);
         }
-
-        await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
-
-        _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Length);
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     /// <inheritdoc />
@@ -208,20 +251,23 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
     {
         private readonly InMemoryAsyncResponseChannel _owner;
         private readonly CancellationTokenSource _timeoutCts;
+        private readonly Activity? _activity;
         private CancellationTokenRegistration _timeoutRegistration;
         private int _terminal;
         private int _cleanupStarted;
 
-        protected SubscriptionBase(InMemoryAsyncResponseChannel owner, string correlationId, TimeSpan timeout)
+        protected SubscriptionBase(InMemoryAsyncResponseChannel owner, string correlationId, TimeSpan timeout, Activity? activity)
         {
             _owner = owner;
             CorrelationId = correlationId;
             Timeout = timeout;
+            _activity = activity;
             _timeoutCts = new CancellationTokenSource(timeout);
         }
 
         public Guid Id { get; } = Guid.NewGuid();
         protected string CorrelationId { get; }
+        protected Activity? WaitActivity => _activity;
         private TimeSpan Timeout { get; }
         public bool CleanupStarted => Volatile.Read(ref _cleanupStarted) != 0;
 
@@ -240,6 +286,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             if (!TryBeginTerminal())
                 return Task.CompletedTask;
 
+            AsyncResponseDiagnostics.SetError(_activity, exception);
             TrySetException(exception);
             return CleanupOnceAsTask();
         }
@@ -258,6 +305,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             {
                 await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 _timeoutCts.Dispose();
+                _activity?.Dispose();
             }
         }
 
@@ -281,7 +329,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
 
             _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
 
-            SetTimeoutException(new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}."));
+            var exception = new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}.");
+            AsyncResponseDiagnostics.SetError(_activity, "timeout", exception.Message);
+            SetTimeoutException(exception);
             return CleanupOnceAsTask();
         }
     }
@@ -297,8 +347,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
             string correlationId,
             TimeSpan timeout,
             Func<T, ValueTask<bool>> completionPredicate,
+            Activity? activity,
             ExecutionContext? capturedContext)
-            : base(owner, correlationId, timeout)
+            : base(owner, correlationId, timeout, activity)
         {
             _completionPredicate = completionPredicate;
             _capturedContext = capturedContext;
@@ -346,6 +397,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
                 if (!TryBeginTerminal())
                     return Task.CompletedTask;
 
+                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
                 _tcs.TrySetException(ex);
                 return CleanupOnceAsTask();
             }
@@ -367,6 +419,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
                 if (!TryBeginTerminal())
                     return;
 
+                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
                 _tcs.TrySetException(ex);
                 await CleanupOnceAsync().ConfigureAwait(false);
             }

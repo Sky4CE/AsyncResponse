@@ -1,4 +1,5 @@
 using System.Linq.Expressions;
+using System.Diagnostics;
 
 namespace AsyncResponse;
 
@@ -23,22 +24,37 @@ internal sealed class AsyncResponseBuilder(
         => new AsyncResponseBuilder<T>(_subscriber, _replyTargetProvider, AsyncResponseContext.CreateCorrelationId());
 
     /// <inheritdoc />
-    public Task EnqueueWorkerAsync(ReflectionCallDto work)
+    public async Task EnqueueWorkerAsync(ReflectionCallDto work)
     {
         ArgumentNullException.ThrowIfNull(work);
 
-        var transport = _workerTransport ?? throw new InvalidOperationException(
-            "No IWorkerTransport is registered. Call .WithInMemoryTransport() for in-process execution, " +
-            ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
-            "or register a broker-backed IWorkerTransport implementation.");
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.enqueue_worker",
+            ActivityKind.Producer,
+            AsyncResponseContext.CorrelationId);
+        AsyncResponseDiagnostics.SetWorker(activity, work);
+        AsyncResponseDiagnostics.SetReplyTarget(activity, AsyncResponseContext.ReplyTarget);
 
-        return transport.PublishAsync(new WorkerJobEnvelope
+        try
         {
-            Call = work,
-            CorrelationId = AsyncResponseContext.CorrelationId,
-            ReplyTarget = AsyncResponseContext.ReplyTarget,
-            Context = _propagation?.Capture()
-        });
+            var transport = _workerTransport ?? throw new InvalidOperationException(
+                "No IWorkerTransport is registered. Call .WithInMemoryTransport() for in-process execution, " +
+                ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
+                "or register a broker-backed IWorkerTransport implementation.");
+
+            await transport.PublishAsync(new WorkerJobEnvelope
+            {
+                Call = work,
+                CorrelationId = AsyncResponseContext.CorrelationId,
+                ReplyTarget = AsyncResponseContext.ReplyTarget,
+                Context = _propagation?.Capture()
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     /// <inheritdoc />

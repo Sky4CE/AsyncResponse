@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace AsyncResponse;
@@ -27,7 +28,24 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);
-        await _queue.Writer.WriteAsync(new QueuedJob(job, ExecutionContext.Capture()), cancellationToken).ConfigureAwait(false);
+
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.worker.publish",
+            ActivityKind.Producer,
+            job.CorrelationId);
+        activity?.SetTag("asyncresponse.transport", "inmemory");
+        AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
+        AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+
+        try
+        {
+            await _queue.Writer.WriteAsync(new QueuedJob(job, ExecutionContext.Capture()), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     /// <summary>A queued job paired with the ambient execution context captured when it was enqueued.</summary>

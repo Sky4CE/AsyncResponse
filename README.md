@@ -497,9 +497,37 @@ builder.Services.AddAsyncResponse(options =>
 });
 ```
 
-Tracing: all operations emit `System.Diagnostics.Activity` spans from the `"AsyncResponse"`
-`ActivitySource` (`asyncresponse.wait`, `asyncresponse.set_response`, …) — subscribe to it from
-OpenTelemetry with `.AddSource("AsyncResponse")`.
+Tracing: AsyncResponse emits `System.Diagnostics.Activity` spans from one source,
+`AsyncResponseDiagnostics.ActivitySourceName` (`"AsyncResponse"`). The library does not take an
+OpenTelemetry dependency; your host connects that source to OpenTelemetry, Datadog, or any other
+`ActivitySource` listener:
+
+```csharp
+using AsyncResponse;
+using OpenTelemetry.Trace;
+
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource(AsyncResponseDiagnostics.ActivitySourceName)
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation());
+```
+
+Spans cover the whole library path, not only Redis:
+
+| Span | What it represents |
+|---|---|
+| `asyncresponse.wait` | active waiter lifetime, including timeout/fault status |
+| `asyncresponse.set_response`, `asyncresponse.set_exception` | publishing a response or exception through the configured channel |
+| `asyncresponse.ingress.response`, `asyncresponse.ingress.worker` | transport-neutral response and worker message ingress |
+| `asyncresponse.enqueue_worker`, `asyncresponse.worker.publish`, `asyncresponse.worker.execute` | worker enqueue, transport publish, and execution |
+| `asyncresponse.pubsub.receive` | Google Pub/Sub subscriber message handling |
+| `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
+| `asyncresponse.watchdog.scan` | recovery watchdog scans |
+
+Common tags include `asyncresponse.correlation_id`, `asyncresponse.channel`,
+`asyncresponse.transport`, `asyncresponse.payload_type`, `asyncresponse.subscribers`,
+`asyncresponse.lost_subscriber_route`, and worker/reply-target details.
 
 ## The sample app
 

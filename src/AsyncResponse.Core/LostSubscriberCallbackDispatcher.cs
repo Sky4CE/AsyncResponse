@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -43,75 +44,114 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>
     public async Task<LostSubscriberDispatchResult> DispatchLostResponse<T>(RecoveryState? recoveryState, T response, string channel)
     {
-        // The recovering process has no live Until predicate — the payload itself decides whether
-        // this late response resumes the flow or fails it. A null (unclassifiable) verdict is
-        // treated conservatively as "do not resume", so a payload that cannot be understood never
-        // takes the happy path.
-        var shouldResume = recoveryState is null
-            ? (bool?)null
-            : PayloadRecoveryClassifier.ShouldResume(response, recoveryState.PayloadTypeFullName);
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.lost_subscriber.dispatch",
+            correlationId: recoveryState?.CorrelationId);
+        activity?.SetTag("asyncresponse.lost_subscriber.kind", "response");
+        activity?.SetTag("asyncresponse.channel_name", channel);
+        if (response is not null)
+            AsyncResponseDiagnostics.SetPayloadType(activity, response.GetType());
 
-        if (shouldResume != true)
+        try
         {
-            if (recoveryState is null)
+            // The recovering process has no live Until predicate — the payload itself decides whether
+            // this late response resumes the flow or fails it. A null (unclassifiable) verdict is
+            // treated conservatively as "do not resume", so a payload that cannot be understood never
+            // takes the happy path.
+            var shouldResume = recoveryState is null
+                ? (bool?)null
+                : PayloadRecoveryClassifier.ShouldResume(response, recoveryState.PayloadTypeFullName);
+            AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, shouldResume);
+
+            if (shouldResume != true)
             {
-                _logger.LogWarning("No subscribers and no recovery state for channel {Channel}.", channel);
+                if (recoveryState is null)
+                {
+                    _logger.LogWarning("No subscribers and no recovery state for channel {Channel}.", channel);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
+                    return new LostSubscriberDispatchResult(shouldResume, false);
+                }
+
+                var invoked = await DispatchToFailureCallback(recoveryState, response, channel, activity).ConfigureAwait(false);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
+                return new LostSubscriberDispatchResult(shouldResume, invoked);
+            }
+
+            // shouldResume == true implies recoveryState is non-null (the verdict is null otherwise).
+            if (recoveryState!.ResumeCallback == null)
+            {
+                _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                 return new LostSubscriberDispatchResult(shouldResume, false);
             }
 
-            var invoked = await DispatchToFailureCallback(recoveryState, response, channel).ConfigureAwait(false);
-            return new LostSubscriberDispatchResult(shouldResume, invoked);
-        }
+            _logger.LogWarning("No subscribers for channel {Channel}; invoking resume callback.", channel);
 
-        // shouldResume == true implies recoveryState is non-null (the verdict is null otherwise).
-        if (recoveryState!.ResumeCallback == null)
+            var invocation = ReflectionExtensions.ResolveCallback(
+                recoveryState.ResumeCallback,
+                payload: response,
+                exception: null,
+                correlationId: recoveryState.CorrelationId
+            );
+
+            // Deliberately not swallowed: a failing resume propagates to the publisher's caller,
+            // which can escalate it through SetException to the failure callback (the ingress does
+            // exactly that). The catch below only marks the activity before rethrowing.
+            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+
+            _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);
+            activity?.SetTag("asyncresponse.recovery.callback_invoked", true);
+
+            return new LostSubscriberDispatchResult(shouldResume, true);
+        }
+        catch (Exception ex)
         {
-            _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
-            return new LostSubscriberDispatchResult(shouldResume, false);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
         }
-
-        _logger.LogWarning("No subscribers for channel {Channel}; invoking resume callback.", channel);
-
-        var invocation = ReflectionExtensions.ResolveCallback(
-            recoveryState.ResumeCallback,
-            payload: response,
-            exception: null,
-            correlationId: recoveryState.CorrelationId
-        );
-
-        // Deliberately not wrapped in try/catch: a failing resume propagates to the publisher's
-        // caller, which can escalate it through SetException to the failure callback
-        // (the ingress does exactly that).
-        await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
-
-        _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);
-
-        return new LostSubscriberDispatchResult(shouldResume, true);
     }
 
     /// <summary>Dispatches an exception envelope that no subscriber received.</summary>
     public async Task<bool> DispatchLostException(RecoveryState? recoveryState, Exception exception, string channel)
     {
-        if (recoveryState?.FailureCallback == null)
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.lost_subscriber.dispatch",
+            correlationId: recoveryState?.CorrelationId);
+        activity?.SetTag("asyncresponse.lost_subscriber.kind", "exception");
+        activity?.SetTag("asyncresponse.channel_name", channel);
+        activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, false);
+
+        try
         {
-            _logger.LogWarning("No subscribers for channel {Channel}; no failure callback available.", channel);
-            return false;
+            if (recoveryState?.FailureCallback == null)
+            {
+                _logger.LogWarning("No subscribers for channel {Channel}; no failure callback available.", channel);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
+                return false;
+            }
+
+            _logger.LogWarning("No subscribers for channel {Channel}; invoking failure callback.", channel);
+
+            var invocation = ReflectionExtensions.ResolveCallback(
+                recoveryState.FailureCallback,
+                payload: null,
+                exception: exception,
+                correlationId: recoveryState.CorrelationId
+            );
+
+            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+
+            _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
+            activity?.SetTag("asyncresponse.recovery.callback_invoked", true);
+
+            return true;
         }
-
-        _logger.LogWarning("No subscribers for channel {Channel}; invoking failure callback.", channel);
-
-        var invocation = ReflectionExtensions.ResolveCallback(
-            recoveryState.FailureCallback,
-            payload: null,
-            exception: exception,
-            correlationId: recoveryState.CorrelationId
-        );
-
-        await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
-
-        _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
-
-        return true;
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
     }
 
     /// <summary>
@@ -120,7 +160,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// <see cref="AsyncResponseDomainFailureException"/> — so it takes the same path as a technical
     /// <c>SetException</c>.
     /// </summary>
-    private async Task<bool> DispatchToFailureCallback<T>(RecoveryState recoveryState, T response, string channel)
+    private async Task<bool> DispatchToFailureCallback<T>(RecoveryState recoveryState, T response, string channel, Activity? activity)
     {
         string? payloadJson = null;
         try
@@ -165,6 +205,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // Deliberately not rethrown: an exception would bubble up to the broker ingress, which
             // reacts with SetException — and that would invoke this same failure callback a second
             // time. The domain failure has already been dispatched.
+            AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
             return false;
         }

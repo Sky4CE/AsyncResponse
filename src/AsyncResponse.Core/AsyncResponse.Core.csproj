@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
+    <InternalsVisibleTo Include="AsyncResponse.Transports.GooglePubSub" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />
     <InternalsVisibleTo Include="AsyncResponse.Benchmarks" />
   </ItemGroup>

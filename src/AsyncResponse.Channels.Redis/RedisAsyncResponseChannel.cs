@@ -20,8 +20,6 @@ namespace AsyncResponse.Channels.Redis;
 /// </summary>
 internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
-    /// <summary>OpenTelemetry-compatible activity source for the AsyncResponse library.</summary>
-    internal static readonly ActivitySource ActivitySource = new("AsyncResponse");
 
     private readonly ISubscriber _subscriber;
     private readonly IConnectionMultiplexer _multiplexer;
@@ -96,8 +94,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         var capturedContext = ExecutionContext.Capture();
         var channel = _keys.Channel(correlationId);
 
-        var activity = ActivitySource.StartActivity("asyncresponse.wait");
-        activity?.SetTag("asyncresponse.correlation_id", correlationId);
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.wait", correlationId: correlationId);
+        activity?.SetTag("asyncresponse.channel", "redis");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
 
         _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
@@ -160,8 +159,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                     _logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", correlationId);
 
                     finished = true;
-                    activity?.SetTag("error.type", "deserialize_failure");
                     var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {correlationId}.");
+                    AsyncResponseDiagnostics.SetError(activity, "deserialize_failure", deserializationError.Message);
                     if (!tcs.TrySetException(deserializationError))
                         _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 }
@@ -175,7 +174,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                     }
 
                     _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
-                    activity?.SetTag("error.type", "remote_failure");
+                    AsyncResponseDiagnostics.SetError(activity, "remote_failure", remoteFailure.Message);
                     if (!tcs.TrySetException(remoteFailure))
                         _logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 }
@@ -194,6 +193,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                 _logger.LogError(ex, "Error processing message on channel {Channel} for correlationId {CorrelationId}.", messageChannel.ToString()!, correlationId);
 
                 finished = true;
+                AsyncResponseDiagnostics.SetError(activity, ex);
                 if (!tcs.TrySetException(ex))
                     _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
             }
@@ -248,6 +248,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
             _ = Task.Run(async () =>
             {
                 _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
+                AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
                 await CleanupOnceAsync(RedisHandler).ConfigureAwait(false);
             });
@@ -271,7 +272,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
-            activity?.SetTag("error.type", "subscribe_failure");
+            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
             tcs.TrySetException(ex);
             await CleanupOnceAsync(RedisHandler).ConfigureAwait(false);
             // Return an already-faulted waiter.
@@ -297,16 +298,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
     /// <inheritdoc/>
     public async Task SetResponse<T>(T response, string? correlationId = null)
     {
-        using var activity = ActivitySource.StartActivity("asyncresponse.set_response");
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "redis");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
         // When no correlation id is provided, fall back to the ambient context.
         correlationId ??= AsyncResponseContext.CorrelationId;
-        activity?.SetTag("asyncresponse.correlation_id", correlationId);
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
         {
             _logger.LogWarning("CorrelationId is null; cannot publish the response.");
-            activity?.SetTag("error.type", "correlation_id_null");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the response.");
             return;
         }
 
@@ -330,12 +333,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                 var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.lost_subscriber_route", dispatchResult.ShouldResume switch
-                {
-                    true => "Resume",
-                    false => "Fail",
-                    _ => "Unclassified"
-                });
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 if (dispatchResult.CallbackInvoked)
                     await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
@@ -350,7 +349,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
-            activity?.SetTag("error.type", ex.GetType().Name);
+            AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
     }
@@ -358,15 +357,19 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
     /// <inheritdoc/>
     public async Task SetException(Exception exception, string? correlationId = null)
     {
-        using var activity = ActivitySource.StartActivity("asyncresponse.set_exception");
+        ArgumentNullException.ThrowIfNull(exception);
+
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "redis");
+        activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 
         correlationId ??= AsyncResponseContext.CorrelationId;
-        activity?.SetTag("asyncresponse.correlation_id", correlationId);
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
         {
             _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
-            activity?.SetTag("error.type", "correlation_id_null");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the exception.");
             return;
         }
 
@@ -390,6 +393,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
                 var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
 
                 var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, channel.ToString()!).ConfigureAwait(false);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
 
                 if (callbackInvoked)
                     await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
@@ -404,7 +408,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish exception response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
-            activity?.SetTag("error.type", ex.GetType().Name);
+            AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
     }

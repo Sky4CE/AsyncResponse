@@ -3,6 +3,7 @@ using Google.Cloud.PubSub.V1;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using System.Diagnostics;
 
 namespace AsyncResponse.Transports.GooglePubSub;
 
@@ -19,7 +20,8 @@ internal abstract class GooglePubSubSubscriberService(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
-        var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, SubscriptionId);
+        var subscriptionId = SubscriptionId;
+        var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
         // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
         // real Google Cloud otherwise — no behavior change in production.
         var subscriber = await new SubscriberClientBuilder
@@ -32,6 +34,17 @@ internal abstract class GooglePubSubSubscriberService(
 
         var runTask = subscriber.StartAsync(async (message, cancellationToken) =>
         {
+            using var activity = AsyncResponseDiagnostics.StartActivity(
+                "asyncresponse.pubsub.receive",
+                ActivityKind.Consumer);
+            activity?.SetTag("asyncresponse.transport", "google_pubsub");
+            activity?.SetTag("messaging.system", "gcp_pubsub");
+            activity?.SetTag("messaging.destination.name", subscriptionId);
+            activity?.SetTag("messaging.message.id", message.MessageId);
+
+            if (message.Attributes.TryGetValue(Options.CorrelationIdAttribute, out var correlationId))
+                AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
             try
             {
                 await HandleMessageAsync(message, cancellationToken).ConfigureAwait(false);
@@ -40,6 +53,7 @@ internal abstract class GooglePubSubSubscriberService(
             catch (Exception ex)
             {
                 Logger.LogError(ex, "Pub/Sub message handling failed; NACKing message {MessageId}.", message.MessageId);
+                AsyncResponseDiagnostics.SetError(activity, ex);
                 return SubscriberClient.Reply.Nack;
             }
         });
