@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781767011093,
+  "lastUpdate": 1781769987638,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1663,6 +1663,45 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/bfc3f5edbb30e7bab9c88d15df588817189ae9f5"
         },
         "date": 1781767008881,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "d5b3851d0d74c8482c267762e70caf7f58f4f293",
+          "message": "IAsyncResponsePublisher.SetResponse<T> is now constrained to where T : IAsyncResponsePayload",
+          "timestamp": "2026-06-18T10:03:56+02:00",
+          "tree_id": "50180d8491650ae9fa26b68bcc8b5adf95ebbeab",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/d5b3851d0d74c8482c267762e70caf7f58f4f293"
+        },
+        "date": 1781769986923,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
