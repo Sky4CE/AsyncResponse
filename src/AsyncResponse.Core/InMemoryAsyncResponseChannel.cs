@@ -319,12 +319,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 continue;
             }
 
-            if (pending is null)
-            {
-                pending = new List<Task>(subscribers.Length) { firstPending };
-            }
-
-            pending.Add(task);
+            (pending ??= [firstPending]).Add(task);
         }
 
         return pending is not null
@@ -635,11 +630,25 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     ? typed
                     : response.As<T>();
 
-                return DispatchPayloadAsync(payload);
+                var completion = _completionPredicate(payload);
+                if (!completion.IsCompletedSuccessfully)
+                    return AwaitCompletionPredicateAsync(completion, payload);
+
+                var finished = completion.Result;
+                if (!finished || !TryBeginTerminal())
+                    return Task.CompletedTask;
+
+                _tcs.TrySetResult(payload);
+                return CleanupOnceAsTask();
             }
             catch (Exception ex)
             {
-                return FaultAsync(ex);
+                if (!TryBeginTerminal())
+                    return Task.CompletedTask;
+
+                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
+                _tcs.TrySetException(ex);
+                return CleanupOnceAsTask();
             }
         }
 
@@ -655,6 +664,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        // Raw ingress has to materialize JSON before it can run the same completion semantics as
+        // the typed path. Keep this separate so typed publishers stay on the shorter inline path.
         private Task DispatchPayloadAsync(T payload)
         {
             try
@@ -699,7 +710,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
             catch (Exception ex)
             {
-                await FaultAsync(ex).ConfigureAwait(false);
+                if (!TryBeginTerminal())
+                    return;
+
+                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
+                _tcs.TrySetException(ex);
+                await CleanupOnceAsync().ConfigureAwait(false);
             }
         }
 

@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <ParentProps>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))</ParentProps>
+  </PropertyGroup>
+  <Import Project="$(ParentProps)" Condition="Exists('$(ParentProps)')" />
+  
+  <PropertyGroup>
+    <ExcludeFromCodeCoverage>true</ExcludeFromCodeCoverage>
+  </PropertyGroup>
+</Project>
