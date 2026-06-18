@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781740068849,
+  "lastUpdate": 1781742320436,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -504,6 +504,78 @@ window.BENCHMARK_DATA = {
             "value": 246.29924154281616,
             "unit": "ns",
             "range": "± 0.8077590359305069"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "1076187437db7250b4004ade902f9a29f3be0a3a",
+          "message": "Implemented AsyncResponseDiagnostics",
+          "timestamp": "2026-06-18T02:23:19+02:00",
+          "tree_id": "74343527b6844a6ec95393f0eaf58e8f09e84d2e",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/1076187437db7250b4004ade902f9a29f3be0a3a"
+        },
+        "date": 1781742320143,
+        "tool": "benchmarkdotnet",
+        "benches": [
+          {
+            "name": "AsyncResponse.Benchmarks.ChannelBenchmarks.RoundTrip_ViaBuilder",
+            "value": 3199.222873687744,
+            "unit": "ns",
+            "range": "± 26.474365179559275"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.ChannelBenchmarks.RoundTrip_ViaSubscriber",
+            "value": 2930.852308909098,
+            "unit": "ns",
+            "range": "± 1.1798707323453486"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.CallbackBenchmarks.ExpressionToReflectionCall",
+            "value": 84.1066624323527,
+            "unit": "ns",
+            "range": "± 0.7914142165996724"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.CallbackBenchmarks.ReflectionInvoke",
+            "value": 60.16807589928309,
+            "unit": "ns",
+            "range": "± 0.37496946788305036"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Envelope_Serialize",
+            "value": 342.9159887631734,
+            "unit": "ns",
+            "range": "± 0.7282787300856164"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Envelope_Deserialize",
+            "value": 604.057624499003,
+            "unit": "ns",
+            "range": "± 4.348812637591549"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Classify_TypedPayload",
+            "value": 1.6777138424416382,
+            "unit": "ns",
+            "range": "± 0.0024599171226677165"
+          },
+          {
+            "name": "AsyncResponse.Benchmarks.SerializationBenchmarks.Classify_RawJson",
+            "value": 235.92462619145712,
+            "unit": "ns",
+            "range": "± 1.0363731514540488"
           }
         ]
       }
