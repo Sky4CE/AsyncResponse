@@ -1,4 +1,5 @@
 using AsyncResponse;
+using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.GooglePubSub;
 using Google.Api.Gax;
@@ -33,6 +34,10 @@ if (useRedis)
 if (useGooglePubSub)
 {
     builder.Services.AddHostedService<PubSubEmulatorProvisioner>();
+    builder.Services.AddSingleton(_ => new Lazy<Task<PublisherServiceApiClient>>(() => new PublisherServiceApiClientBuilder
+    {
+        EmulatorDetection = EmulatorDetection.EmulatorOrProduction
+    }.BuildAsync()));
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -472,6 +477,7 @@ app.MapPost("/lost-subscriber-flow", async (
     IAsyncResponsePublisher publisher,
     FlowRecorder recorder,
     IServiceProvider services,
+    IOptions<RedisAsyncResponseOptions> redisOptions,
     string? outcome,
     string? trace) =>
 {
@@ -500,7 +506,10 @@ app.MapPost("/lost-subscriber-flow", async (
     var correlationId = await armed.Task.WaitAsync(TimeSpan.FromSeconds(10));
     _ = waitTask.ContinueWith(t => recorder.RecordWaiterResult(correlationId, t), TaskScheduler.Default);
 
-    multiplexer.GetSubscriber().UnsubscribeAll();
+    var responseChannel = new RedisChannel(
+        $"{redisOptions.Value.KeyPrefix}:response:{correlationId}",
+        RedisChannel.PatternMode.Literal);
+    await multiplexer.GetSubscriber().UnsubscribeAsync(responseChannel);
     await Task.Delay(100);
 
     var normalized = (outcome ?? "Completed").Trim().ToLowerInvariant();
@@ -539,6 +548,9 @@ app.MapPost("/emit-response", async (
     var options = services.GetService<IOptions<GooglePubSubAsyncResponseOptions>>();
     if (options is null)
         return Results.Conflict("Pub/Sub response ingress requires the Google Pub/Sub transport.");
+    var publisherFactory = services.GetService<Lazy<Task<PublisherServiceApiClient>>>();
+    if (publisherFactory is null)
+        return Results.Conflict("Pub/Sub publisher client is not registered.");
 
     var o = options.Value;
     var parsedStatus = Enum.TryParse<OperationStatus>(status, ignoreCase: true, out var s) ? s : OperationStatus.Completed;
@@ -551,10 +563,7 @@ app.MapPost("/emit-response", async (
     if (useAttribute)
         pubsubMessage.Attributes[o.CorrelationIdAttribute] = correlationId;
 
-    var publisher = await new PublisherServiceApiClientBuilder
-    {
-        EmulatorDetection = EmulatorDetection.EmulatorOrProduction
-    }.BuildAsync();
+    var publisher = await publisherFactory.Value.ConfigureAwait(false);
     await publisher.PublishAsync(TopicName.FromProjectTopic(o.ProjectId!, o.ResponseTopicId!), [pubsubMessage]);
 
     return Results.Accepted();

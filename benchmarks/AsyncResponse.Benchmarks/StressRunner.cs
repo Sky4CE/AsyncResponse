@@ -529,20 +529,48 @@ internal static class StressRunner
             var allocBefore = GC.GetTotalAllocatedBytes();
             var sw = Stopwatch.StartNew();
 
-            var observations = new List<RecoveryStateObservation>(entries);
+            var totalEntries = 0;
+            var entriesWithActiveWaiter = 0;
+            var unknownAgeEntries = 0;
+            List<RecoveryStateObservation>? staleEntries = null;
+            var utcNow = DateTime.UtcNow;
             await foreach (var state in scanner.ScanAsync().ConfigureAwait(false))
             {
                 var active = string.IsNullOrWhiteSpace(state.CorrelationId)
                     ? -1
                     : await probe.CountActiveSubscribersAsync(state.CorrelationId).ConfigureAwait(false);
-                observations.Add(new RecoveryStateObservation(
+
+                totalEntries++;
+                if (active > 0)
+                {
+                    entriesWithActiveWaiter++;
+                    continue;
+                }
+
+                if (active != 0)
+                    continue;
+
+                if (state.RegisteredAtUtc is null)
+                {
+                    unknownAgeEntries++;
+                    continue;
+                }
+
+                if (utcNow - state.RegisteredAtUtc.Value < TimeSpan.FromMinutes(30))
+                    continue;
+
+                (staleEntries ??= []).Add(new RecoveryStateObservation(
                     state.CorrelationId,
                     state.RegisteredAtUtc,
                     active,
                     state.PayloadTypeFullName));
             }
 
-            var report = AsyncResponseWatchdogReport.Evaluate(observations, DateTime.UtcNow, TimeSpan.FromMinutes(30));
+            var report = new AsyncResponseWatchdogReport(
+                totalEntries,
+                entriesWithActiveWaiter,
+                staleEntries ?? [],
+                unknownAgeEntries);
             sw.Stop();
             var allocated = GC.GetTotalAllocatedBytes() - allocBefore;
 

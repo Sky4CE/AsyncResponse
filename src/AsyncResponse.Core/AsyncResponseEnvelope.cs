@@ -57,27 +57,32 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
             if (reader.TokenType == JsonTokenType.PropertyName)
             {
-                string propertyName = reader.GetString()!;
+                var isSuccess = reader.ValueTextEquals("Success"u8);
+                var isPayload = reader.ValueTextEquals("Payload"u8);
+                var isExceptionMessage = reader.ValueTextEquals("ExceptionMessage"u8);
+                var isExceptionStackTrace = reader.ValueTextEquals("ExceptionStackTrace"u8);
                 reader.Read();
 
-                switch (propertyName)
+                if (isSuccess)
                 {
-                    case "Success":
-                        success = reader.GetBoolean();
-                        break;
-                    case "Payload":
-                        // Instead of throwing, assign default(T)
-                        payload = reader.TokenType == JsonTokenType.Null ? default : JsonSerializer.Deserialize<T>(ref reader, options);
-                        break;
-                    case "ExceptionMessage":
-                        exceptionMessage = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
-                        break;
-                    case "ExceptionStackTrace":
-                        exceptionStackTrace = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
-                        break;
-                    default:
-                        reader.Skip();
-                        break;
+                    success = reader.GetBoolean();
+                }
+                else if (isPayload)
+                {
+                    // Instead of throwing, assign default(T)
+                    payload = reader.TokenType == JsonTokenType.Null ? default : JsonSerializer.Deserialize<T>(ref reader, options);
+                }
+                else if (isExceptionMessage)
+                {
+                    exceptionMessage = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
+                }
+                else if (isExceptionStackTrace)
+                {
+                    exceptionStackTrace = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
+                }
+                else
+                {
+                    reader.Skip();
                 }
             }
         }

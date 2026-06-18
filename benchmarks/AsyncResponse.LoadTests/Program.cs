@@ -14,6 +14,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
@@ -22,6 +23,7 @@ var rate = GetInt("--rate", 20);
 var duration = TimeSpan.FromSeconds(GetInt("--duration", 30));
 var warmup = TimeSpan.FromSeconds(GetInt("--warmup", 5));
 var profile = (GetString("--profile") ?? "broad").Trim().ToLowerInvariant();
+var scenarioFilter = GetString("--scenario");
 var existingUrl = GetString("--url");
 var ghJsonPrefix = GetString("--gh-json");
 
@@ -58,7 +60,7 @@ try
 
     await TryResetAsync(httpClient);
 
-    var definitions = SelectScenarios(profile);
+    var definitions = FilterScenarios(SelectScenarios(profile), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
@@ -150,6 +152,28 @@ static ScenarioDefinition[] SelectScenarios(string profile)
         _ => throw new ArgumentException(
             $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, recovery.")
     };
+}
+
+static ScenarioDefinition[] FilterScenarios(ScenarioDefinition[] definitions, string? filter)
+{
+    if (string.IsNullOrWhiteSpace(filter))
+        return definitions;
+
+    var names = filter
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var filtered = definitions
+        .Where(definition => names.Contains(definition.Name))
+        .ToArray();
+
+    if (filtered.Length == 0)
+    {
+        throw new ArgumentException(
+            $"No scenarios matched --scenario '{filter}'. Available: {string.Join(", ", definitions.Select(d => d.Name))}");
+    }
+
+    return filtered;
 }
 
 static Task RequestResponseSuccessAsync(HttpClient http)

@@ -22,7 +22,7 @@ internal sealed class AsyncResponseContextPropagation
         if (_propagators.Count == 0)
             return null;
 
-        var carrier = new Dictionary<string, string>(StringComparer.Ordinal);
+        var carrier = new Dictionary<string, string>(_propagators.Count, StringComparer.Ordinal);
         foreach (var propagator in _propagators)
             propagator.Capture(carrier);
 
@@ -38,15 +38,26 @@ internal sealed class AsyncResponseContextPropagation
         if (_propagators.Count == 0 || carrier is null || carrier.Count == 0)
             return NullScope.Instance;
 
+        IDisposable? firstScope = null;
         List<IDisposable>? scopes = null;
         foreach (var propagator in _propagators)
         {
             var scope = propagator.Restore(carrier);
-            if (scope is not null && !ReferenceEquals(scope, NullScope.Instance))
-                (scopes ??= []).Add(scope);
+            if (scope is null || ReferenceEquals(scope, NullScope.Instance))
+                continue;
+
+            if (firstScope is null)
+            {
+                firstScope = scope;
+                continue;
+            }
+
+            (scopes ??= [firstScope]).Add(scope);
         }
 
-        return scopes is null ? NullScope.Instance : new CompositeScope(scopes);
+        return scopes is not null
+            ? new CompositeScope(scopes)
+            : firstScope ?? NullScope.Instance;
     }
 
     private sealed class NullScope : IDisposable

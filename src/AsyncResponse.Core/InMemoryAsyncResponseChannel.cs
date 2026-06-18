@@ -14,7 +14,7 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, SubscriptionBase>> _subscriptions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SubscriptionGroup> _subscriptions = new(StringComparer.Ordinal);
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly InMemoryAsyncResponseOptions _options;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
@@ -64,11 +64,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity,
             ExecutionContext.Capture());
 
-        var subscribers = _subscriptions.GetOrAdd(
-            correlationId,
-            _ => new ConcurrentDictionary<Guid, SubscriptionBase>());
-
-        subscribers[subscription.Id] = subscription;
+        AddSubscription(correlationId, subscription);
 
         try
         {
@@ -127,8 +123,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         try
         {
             var subscribers = SnapshotSubscribers(correlationId);
-            activity?.SetTag("asyncresponse.subscribers", subscribers.Length);
-            if (subscribers.Length == 0)
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+            if (subscribers.Count == 0)
             {
                 var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
                 var result = await _lostSubscriberDispatcher
@@ -146,7 +142,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-            _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Length);
+            _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -175,8 +171,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         try
         {
             var subscribers = SnapshotSubscribers(correlationId);
-            activity?.SetTag("asyncresponse.subscribers", subscribers.Length);
-            if (subscribers.Length == 0)
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+            if (subscribers.Count == 0)
             {
                 var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
                 var invoked = await _lostSubscriberDispatcher
@@ -193,7 +189,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
 
-            _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Length);
+            _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -212,33 +208,67 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         return new ValueTask<long>(count);
     }
 
-    private SubscriptionBase[] SnapshotSubscribers(string correlationId)
-        => _subscriptions.TryGetValue(correlationId, out var subscribers)
-            ? subscribers.Values.ToArray()
-            : [];
-
-    private static Task DispatchResponsesAsync(SubscriptionBase[] subscribers, object? response)
+    private void AddSubscription(string correlationId, SubscriptionBase subscription)
     {
-        if (subscribers.Length == 1)
-            return subscribers[0].DispatchResponseAsync(response);
+        while (true)
+        {
+            var group = _subscriptions.GetOrAdd(correlationId, static _ => new SubscriptionGroup());
+            if (group.TryAdd(subscription))
+                return;
 
-        var tasks = new Task[subscribers.Length];
-        for (var i = 0; i < subscribers.Length; i++)
-            tasks[i] = subscribers[i].DispatchResponseAsync(response);
-
-        return Task.WhenAll(tasks);
+            _subscriptions.TryRemove(new KeyValuePair<string, SubscriptionGroup>(correlationId, group));
+        }
     }
 
-    private static Task DispatchExceptionsAsync(SubscriptionBase[] subscribers, Exception exception)
+    private SubscriptionSnapshot SnapshotSubscribers(string correlationId)
+        => _subscriptions.TryGetValue(correlationId, out var subscribers)
+            ? subscribers.Snapshot()
+            : default;
+
+    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response)
     {
-        if (subscribers.Length == 1)
-            return subscribers[0].DispatchExceptionAsync(exception);
+        if (subscribers.Single is { } single)
+            return single.DispatchResponseAsync(response);
 
-        var tasks = new Task[subscribers.Length];
+        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchResponseAsync(state), response);
+    }
+
+    private static Task DispatchExceptionsAsync(SubscriptionSnapshot subscribers, Exception exception)
+    {
+        if (subscribers.Single is { } single)
+            return single.DispatchExceptionAsync(exception);
+
+        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchExceptionAsync(state), exception);
+    }
+
+    private static Task DispatchManyAsync<TState>(
+        SubscriptionBase[]? subscribers,
+        Func<SubscriptionBase, TState, Task> dispatch,
+        TState state)
+    {
+        if (subscribers is null || subscribers.Length == 0)
+            return Task.CompletedTask;
+
+        Task? firstPending = null;
+        List<Task>? pending = null;
         for (var i = 0; i < subscribers.Length; i++)
-            tasks[i] = subscribers[i].DispatchExceptionAsync(exception);
+        {
+            var task = dispatch(subscribers[i], state);
+            if (task.IsCompletedSuccessfully)
+                continue;
 
-        return Task.WhenAll(tasks);
+            if (firstPending is null)
+            {
+                firstPending = task;
+                continue;
+            }
+
+            (pending ??= [firstPending]).Add(task);
+        }
+
+        return pending is not null
+            ? Task.WhenAll(pending)
+            : firstPending ?? Task.CompletedTask;
     }
 
     private void RemoveSubscription(string correlationId, Guid subscriptionId)
@@ -246,12 +276,123 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         if (!_subscriptions.TryGetValue(correlationId, out var subscribers))
             return;
 
-        subscribers.TryRemove(subscriptionId, out _);
-        if (subscribers.IsEmpty)
-            _subscriptions.TryRemove(correlationId, out _);
+        if (subscribers.Remove(subscriptionId))
+            _subscriptions.TryRemove(new KeyValuePair<string, SubscriptionGroup>(correlationId, subscribers));
     }
 
     private static string ChannelName(string correlationId) => $"inmemory:response:{correlationId}";
+
+    private sealed class SubscriptionGroup
+    {
+        private readonly object _gate = new();
+        private SubscriptionBase? _single;
+        private List<SubscriptionBase>? _many;
+        private bool _closed;
+
+        public int Count
+        {
+            get
+            {
+                lock (_gate)
+                    return _single is not null ? 1 : _many?.Count ?? 0;
+            }
+        }
+
+        public bool TryAdd(SubscriptionBase subscription)
+        {
+            lock (_gate)
+            {
+                if (_closed)
+                    return false;
+
+                if (_single is null && _many is null)
+                {
+                    _single = subscription;
+                    return true;
+                }
+
+                if (_many is null)
+                {
+                    _many = [_single!, subscription];
+                    _single = null;
+                    return true;
+                }
+
+                _many.Add(subscription);
+                return true;
+            }
+        }
+
+        public bool Remove(Guid subscriptionId)
+        {
+            lock (_gate)
+            {
+                if (_single?.Id == subscriptionId)
+                {
+                    _single = null;
+                    _closed = true;
+                    return true;
+                }
+
+                if (_many is null)
+                    return false;
+
+                for (var i = 0; i < _many.Count; i++)
+                {
+                    if (_many[i].Id != subscriptionId)
+                        continue;
+
+                    _many.RemoveAt(i);
+                    if (_many.Count == 1)
+                    {
+                        _single = _many[0];
+                        _many = null;
+                    }
+                    else if (_many.Count == 0)
+                    {
+                        _many = null;
+                        _closed = true;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                return false;
+            }
+        }
+
+        public SubscriptionSnapshot Snapshot()
+        {
+            lock (_gate)
+            {
+                if (_single is not null)
+                    return SubscriptionSnapshot.ForSingle(_single);
+
+                if (_many is { Count: > 0 })
+                    return SubscriptionSnapshot.ForMany(_many.ToArray());
+
+                return default;
+            }
+        }
+    }
+
+    private readonly struct SubscriptionSnapshot
+    {
+        private SubscriptionSnapshot(SubscriptionBase? single, SubscriptionBase[]? many)
+        {
+            Single = single;
+            Many = many;
+        }
+
+        public SubscriptionBase? Single { get; }
+        public SubscriptionBase[]? Many { get; }
+        public int Count => Single is not null ? 1 : Many?.Length ?? 0;
+
+        public static SubscriptionSnapshot ForSingle(SubscriptionBase single) => new(single, null);
+
+        public static SubscriptionSnapshot ForMany(SubscriptionBase[] many) => new(null, many);
+    }
 
     private abstract class SubscriptionBase
     {

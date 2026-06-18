@@ -590,9 +590,9 @@ curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Failed'   
 curl -X POST 'http://localhost:5000/publish?correlationId=<id>&exception=boom'    # → failure callback via SetException
 
 # Same recovery flow, composed into one endpoint:
-curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Completed'        # arm + crash + late success → resume
-curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Failed'           # arm + crash + late failed payload → fail
-curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Exception'        # arm + crash + late SetException → fail
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Completed'        # arm + drop this channel + late success → resume
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Failed'           # arm + drop this channel + late failed payload → fail
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Exception'        # arm + drop this channel + late SetException → fail
 ```
 
 For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in a
@@ -600,6 +600,9 @@ For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and re
 callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical
 failure path through `IAsyncResponsePublisher.SetException`. (`/arm`, `/crash`, `/publish`, and
 `/lost-subscriber-flow` require the Redis channel — run with `AsyncResponse__Channel=Redis`.)
+`/crash` is intentionally a blunt manual demo that drops all Redis subscriptions, while
+`/lost-subscriber-flow` drops only the correlation id it just armed so load tests can run many
+recovery flows concurrently without disturbing each other.
 
 `/shared-correlation-exception` demonstrates fan-out: two waiters attach to the same correlation
 id, then one `SetException` faults both. This works with the in-memory and Redis channels; Redis may
@@ -642,6 +645,10 @@ persisted in the recovery state.
    below your longest flow duration.
 10. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create
    a second connection for AsyncResponse.
+11. **Measure hot paths in isolation before comparing profiles.** The sample's remote simulator
+    deliberately waits before progress and terminal messages, so broad HTTP load-test latency mostly
+    reflects sample workflow timing. Use the micro-benchmarks, stress harness, and NBomber
+    `--scenario` filter to separate library overhead from demo behavior.
 
 ## Building and testing
 
@@ -735,11 +742,15 @@ recovery profile separately because it intentionally simulates subscriber loss:
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 ```
 
-It writes an HTML/CSV/Markdown report to `nbomber-report/`. The
-[load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
+Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;
+the mixed profiles are better at finding interference between flows. The sample Pub/Sub emit endpoint
+reuses its publisher client, so the `pubsub` profile measures response ingress and emulator scheduling
+rather than per-request client construction. It writes an HTML/CSV/Markdown report to `nbomber-report/`.
+The [load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
 `duration`; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and

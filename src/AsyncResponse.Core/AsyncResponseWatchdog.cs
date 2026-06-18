@@ -93,15 +93,53 @@ public sealed record AsyncResponseWatchdogReport(
         DateTime utcNow,
         TimeSpan staleAfter)
     {
-        var entriesWithActiveWaiter = entries.Count(e => e.ActiveSubscribers > 0);
-        var unknownAgeEntries = entries.Count(e => e.ActiveSubscribers == 0 && e.RegisteredAtUtc is null);
-        var staleEntries = entries
-            .Where(e => e.ActiveSubscribers == 0
-                && e.RegisteredAtUtc is not null
-                && utcNow - e.RegisteredAtUtc.Value >= staleAfter)
-            .ToList();
+        var entriesWithActiveWaiter = 0;
+        var unknownAgeEntries = 0;
+        var staleEntryCount = 0;
 
-        return new AsyncResponseWatchdogReport(entries.Count, entriesWithActiveWaiter, staleEntries, unknownAgeEntries);
+        foreach (var entry in entries)
+        {
+            if (entry.ActiveSubscribers > 0)
+            {
+                entriesWithActiveWaiter++;
+                continue;
+            }
+
+            if (entry.ActiveSubscribers != 0)
+                continue;
+
+            if (entry.RegisteredAtUtc is null)
+            {
+                unknownAgeEntries++;
+                continue;
+            }
+
+            if (utcNow - entry.RegisteredAtUtc.Value >= staleAfter)
+                staleEntryCount++;
+        }
+
+        IReadOnlyList<RecoveryStateObservation> staleEntries = [];
+        if (staleEntryCount > 0)
+        {
+            var staleList = new List<RecoveryStateObservation>(staleEntryCount);
+            foreach (var entry in entries)
+            {
+                if (entry.ActiveSubscribers == 0
+                    && entry.RegisteredAtUtc is not null
+                    && utcNow - entry.RegisteredAtUtc.Value >= staleAfter)
+                {
+                    staleList.Add(entry);
+                }
+            }
+
+            staleEntries = staleList;
+        }
+
+        return new AsyncResponseWatchdogReport(
+            entries.Count,
+            entriesWithActiveWaiter,
+            staleEntries,
+            unknownAgeEntries);
     }
 }
 
@@ -194,7 +232,11 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
         try
         {
-            var snapshot = new List<RecoveryStateObservation>();
+            var totalEntries = 0;
+            var entriesWithActiveWaiter = 0;
+            var unknownAgeEntries = 0;
+            List<RecoveryStateObservation>? staleEntries = null;
+            var utcNow = DateTime.UtcNow;
 
             await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -202,15 +244,38 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                     continue;
 
                 var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
+                totalEntries++;
 
-                snapshot.Add(new RecoveryStateObservation(
+                if (activeSubscribers > 0)
+                {
+                    entriesWithActiveWaiter++;
+                    continue;
+                }
+
+                if (activeSubscribers != 0)
+                    continue;
+
+                if (entry.RegisteredAtUtc is null)
+                {
+                    unknownAgeEntries++;
+                    continue;
+                }
+
+                if (utcNow - entry.RegisteredAtUtc.Value < _options.StaleAfter)
+                    continue;
+
+                (staleEntries ??= []).Add(new RecoveryStateObservation(
                     entry.CorrelationId,
                     entry.RegisteredAtUtc,
                     activeSubscribers,
                     entry.PayloadTypeFullName));
             }
 
-            var report = AsyncResponseWatchdogReport.Evaluate(snapshot, DateTime.UtcNow, _options.StaleAfter);
+            var report = new AsyncResponseWatchdogReport(
+                totalEntries,
+                entriesWithActiveWaiter,
+                staleEntries ?? [],
+                unknownAgeEntries);
             activity?.SetTag("asyncresponse.watchdog.total_entries", report.TotalEntries);
             activity?.SetTag("asyncresponse.watchdog.active_waiters", report.EntriesWithActiveWaiter);
             activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);

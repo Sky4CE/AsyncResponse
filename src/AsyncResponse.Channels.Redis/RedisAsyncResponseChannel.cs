@@ -327,7 +327,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 Success = true,
                 Payload = response
             };
-            var json = JsonSerializer.Serialize(envelope);
+            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
             long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", numSubscribers);
 
@@ -389,7 +389,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 ExceptionStackTrace = exception.StackTrace,
                 Payload = null
             };
-            var json = JsonSerializer.Serialize(envelope);
+            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
             long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", numSubscribers);
 
