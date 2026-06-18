@@ -1,3 +1,5 @@
+using System.Collections;
+
 namespace AsyncResponse;
 
 /// <summary>
@@ -19,14 +21,23 @@ internal sealed class AsyncResponseContextPropagation
     /// </summary>
     public Dictionary<string, string>? Capture()
     {
-        if (_propagators.Count == 0)
+        var propagators = _propagators;
+        var count = propagators.Count;
+        if (count == 0)
             return null;
 
-        var carrier = new Dictionary<string, string>(_propagators.Count, StringComparer.Ordinal);
-        foreach (var propagator in _propagators)
-            propagator.Capture(carrier);
+        // Hand each propagator a lazy carrier instead of a fully-formed Dictionary. The backing
+        // dictionary is allocated only when a propagator actually writes a value, so the very
+        // common "nothing to capture" path (no ambient trace/tenant/etc. set) allocates nothing.
+        // The carrier wrapper itself is pooled per thread and never escapes this synchronous call,
+        // so even when a propagator does write, the only surviving allocation is the dictionary
+        // that gets returned — no wrapper and no enumerator. Indexing the list avoids the
+        // IEnumerator<T> boxing that a foreach over an interface-typed list would incur.
+        var carrier = LazyCapturingCarrier.Rent(count);
+        for (var i = 0; i < count; i++)
+            propagators[i].Capture(carrier);
 
-        return carrier.Count == 0 ? null : carrier;
+        return carrier.Detach();
     }
 
     /// <summary>
@@ -35,35 +46,70 @@ internal sealed class AsyncResponseContextPropagation
     /// </summary>
     public IDisposable Restore(IReadOnlyDictionary<string, string>? carrier)
     {
-        if (_propagators.Count == 0 || carrier is null || carrier.Count == 0)
+        var propagators = _propagators;
+        var count = propagators.Count;
+        if (count == 0 || carrier is null || carrier.Count == 0)
             return NullScope.Instance;
 
-        IDisposable? firstScope = null;
-        List<IDisposable>? scopes = null;
-        foreach (var propagator in _propagators)
+        // Collect the real scopes without allocating until we genuinely need a composite. The 0/1/2
+        // active-scope cases — by far the most common — return either the shared no-op, the single
+        // scope directly, or a fixed two-field CompositeScope2. Only 3+ active propagators fall back
+        // to the List-backed CompositeScope. Indexing the list avoids the foreach enumerator alloc.
+        IDisposable? first = null;
+        IDisposable? second = null;
+        List<IDisposable>? more = null;
+
+        for (var i = 0; i < count; i++)
         {
-            var scope = propagator.Restore(carrier);
+            var scope = propagators[i].Restore(carrier);
             if (scope is null || ReferenceEquals(scope, NullScope.Instance))
                 continue;
 
-            if (firstScope is null)
-            {
-                firstScope = scope;
-                continue;
-            }
-
-            (scopes ??= [firstScope]).Add(scope);
+            if (more is not null)
+                more.Add(scope);
+            else if (first is null)
+                first = scope;
+            else if (second is null)
+                second = scope;
+            else
+                more = [first, second, scope];
         }
 
-        return scopes is not null
-            ? new CompositeScope(scopes)
-            : firstScope ?? NullScope.Instance;
+        if (more is not null)
+            return new CompositeScope(more);
+
+        if (second is not null)
+            return new CompositeScope2(first!, second);
+
+        return first ?? NullScope.Instance;
     }
 
     private sealed class NullScope : IDisposable
     {
         public static readonly NullScope Instance = new();
         public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Disposes exactly two scopes in reverse order, mirroring nested <c>using</c> semantics without
+    /// the <see cref="List{T}"/> + general <see cref="CompositeScope"/> allocation that the 1–2
+    /// propagator case (the overwhelmingly common one) would otherwise pay.
+    /// </summary>
+    private sealed class CompositeScope2(IDisposable _first, IDisposable _second) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            try { _second.Dispose(); }
+            catch { /* a misbehaving propagator scope must not mask the other */ }
+
+            try { _first.Dispose(); }
+            catch { /* swallow: best-effort restore of the remaining scope */ }
+        }
     }
 
     private sealed class CompositeScope(List<IDisposable> _scopes) : IDisposable
@@ -82,5 +128,103 @@ internal sealed class AsyncResponseContextPropagation
                 catch { /* a misbehaving propagator scope must not mask the others */ }
             }
         }
+    }
+
+    /// <summary>
+    /// An <see cref="IDictionary{TKey,TValue}"/> facade that defers creating its backing
+    /// <see cref="Dictionary{TKey,TValue}"/> until the first mutation. Reads before any write see an
+    /// empty map; the first write allocates a right-sized dictionary. A single instance is reused per
+    /// thread (the carrier never escapes the synchronous <see cref="Capture"/> call), so capturing
+    /// context adds no wrapper allocation on the hot path — only the backing dictionary, and only
+    /// when a propagator writes.
+    /// </summary>
+    private sealed class LazyCapturingCarrier : IDictionary<string, string>
+    {
+        [ThreadStatic] private static LazyCapturingCarrier? _cached;
+
+        // Shared, never-mutated empty map backing every read taken before the first write.
+        private static readonly Dictionary<string, string> EmptyView = new(0, StringComparer.Ordinal);
+
+        private Dictionary<string, string>? _inner;
+        private int _capacity;
+
+        private LazyCapturingCarrier(int capacity) => _capacity = capacity;
+
+        /// <summary>
+        /// Borrows the thread's pooled carrier (or allocates one on first use / under re-entrancy).
+        /// The slot is cleared while borrowed so a re-entrant capture gets its own instance rather
+        /// than corrupting the borrowed one.
+        /// </summary>
+        public static LazyCapturingCarrier Rent(int capacity)
+        {
+            var carrier = _cached;
+            if (carrier is null)
+                return new LazyCapturingCarrier(capacity);
+
+            _cached = null;
+            carrier._capacity = capacity;
+            return carrier;
+        }
+
+        /// <summary>
+        /// Returns the captured dictionary (or <c>null</c> when nothing was written), resets the
+        /// carrier, and returns it to the thread pool for the next capture.
+        /// </summary>
+        public Dictionary<string, string>? Detach()
+        {
+            var inner = _inner;
+            _inner = null;
+            _cached = this;
+            return inner is { Count: > 0 } ? inner : null;
+        }
+
+        private Dictionary<string, string> EnsureWritable()
+            => _inner ??= new Dictionary<string, string>(_capacity, StringComparer.Ordinal);
+
+        private Dictionary<string, string> ReadView => _inner ?? EmptyView;
+
+        public string this[string key]
+        {
+            get => ReadView[key];
+            set => EnsureWritable()[key] = value;
+        }
+
+        public ICollection<string> Keys => ReadView.Keys;
+        public ICollection<string> Values => ReadView.Values;
+        public int Count => _inner?.Count ?? 0;
+        public bool IsReadOnly => false;
+
+        public void Add(string key, string value) => EnsureWritable().Add(key, value);
+
+        public void Add(KeyValuePair<string, string> item)
+            => ((ICollection<KeyValuePair<string, string>>)EnsureWritable()).Add(item);
+
+        public bool ContainsKey(string key) => _inner?.ContainsKey(key) ?? false;
+
+        public bool Contains(KeyValuePair<string, string> item)
+            => _inner is { } inner && ((ICollection<KeyValuePair<string, string>>)inner).Contains(item);
+
+        public bool TryGetValue(string key, out string value)
+        {
+            if (_inner is { } inner)
+                return inner.TryGetValue(key, out value!);
+
+            value = null!;
+            return false;
+        }
+
+        public bool Remove(string key) => _inner?.Remove(key) ?? false;
+
+        public bool Remove(KeyValuePair<string, string> item)
+            => _inner is { } inner && ((ICollection<KeyValuePair<string, string>>)inner).Remove(item);
+
+        public void Clear() => _inner?.Clear();
+
+        public void CopyTo(KeyValuePair<string, string>[] array, int arrayIndex)
+            => ((ICollection<KeyValuePair<string, string>>)ReadView).CopyTo(array, arrayIndex);
+
+        public IEnumerator<KeyValuePair<string, string>> GetEnumerator() => ReadView.GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

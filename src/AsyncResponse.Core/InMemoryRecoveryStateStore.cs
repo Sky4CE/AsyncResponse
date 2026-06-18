@@ -59,7 +59,15 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         await Task.CompletedTask.ConfigureAwait(false); // process-local store: no async I/O to await
 
         var nowUtc = DateTime.UtcNow;
-        foreach (var entry in _entries.Values)
+
+        // Enumerate the dictionary directly rather than materializing ConcurrentDictionary.Values.
+        // The Values property builds a fresh List/ReadOnlyCollection holding a copy of every value,
+        // acquiring all of the dictionary's bucket locks to do so — an O(N) heap allocation and a
+        // latency spike that grow with the store on every scan. The dictionary's own enumerator is
+        // allocation-light and lock-free: it walks the buckets in place and hands back
+        // KeyValuePair<,> structs without snapshotting, so a scan over N entries adds no per-scan
+        // heap traffic beyond the states it actually yields.
+        foreach (var (_, entry) in _entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (entry.ExpiresAtUtc > nowUtc)

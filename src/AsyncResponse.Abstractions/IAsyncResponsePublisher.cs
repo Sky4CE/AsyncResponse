@@ -25,14 +25,58 @@ public interface IAsyncResponsePublisher
     Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload;
 
     /// <summary>
-    /// Publishes a technical failure on the channel associated with the specified correlation id.
-    /// Active subscribers fault with the exception; with no subscribers, the persisted failure
-    /// callback is invoked.
+    /// Publishes a <em>technical</em> failure on the channel associated with the specified
+    /// correlation id. Every active subscriber's wait faults with <paramref name="exception"/>; with
+    /// no subscribers, the persisted failure callback is invoked.
+    /// <para>
+    /// <b>Reserve this for genuinely exceptional, unexpected conditions</b> (a dependency is down, a
+    /// message could not be deserialized, an invariant was violated) — not for expected business
+    /// outcomes. For an <em>expected</em> negative result — a validation failure, a declined or
+    /// rejected request, a "not found", a partial success — publish a payload via
+    /// <see cref="SetResponse{T}"/> that <em>encodes</em> the outcome (a result-pattern payload such
+    /// as <c>Result&lt;T, Error&gt;</c> or a domain-specific discriminated payload) and let the
+    /// waiter's <c>Until</c> predicate and flow code branch on it. See the remarks for why this
+    /// matters.
+    /// </para>
     /// </summary>
     /// <param name="exception">The exception to publish as the error response.</param>
     /// <param name="correlationId">
     /// Optional correlation id; when <c>null</c>, the ambient
     /// <see cref="AsyncResponseContext.CorrelationId"/> is used.
     /// </param>
+    /// <remarks>
+    /// <para>
+    /// <b>Cost.</b> Faulting a wait is expensive, and the cost scales with the number of waiters on
+    /// the correlation id. When this exception fans out to <c>N</c> active subscribers, each of the
+    /// <c>N</c> awaiting flows resumes by <em>re-throwing</em> the exception, and the .NET runtime
+    /// pays the full price of a real <see langword="throw"/>/<see langword="catch"/> every time:
+    /// restoring the captured stack trace (via <see cref="System.Runtime.ExceptionServices.ExceptionDispatchInfo"/>),
+    /// walking the stack, running first-chance/handler search, and unwinding. That work happens
+    /// independently per awaiter and cannot be batched, shared, or amortized — it is inherent to how
+    /// the CLR propagates exceptions through faulted <see cref="System.Threading.Tasks.Task"/>s, so
+    /// the channel cannot optimize it away. A shared-correlation exception fan-out can therefore cost
+    /// one to two orders of magnitude more than the equivalent successful payload fan-out, and it
+    /// allocates per awaiter (an exception-dispatch holder for each faulted task). High-frequency or
+    /// wide-fan-out failure paths driven by <c>SetException</c> will dominate your latency and GC
+    /// profile.
+    /// </para>
+    /// <para>
+    /// <b>Recommended pattern.</b> Model expected failures as <em>data</em>, not exceptions. Define a
+    /// payload that carries the outcome — for example a result type that is either a success value or
+    /// an error, or a status enum plus an error detail — publish it with <see cref="SetResponse{T}"/>,
+    /// and have the waiter inspect it. This keeps the fan-out on the cheap value path (no
+    /// <see langword="throw"/>, no stack capture, minimal allocation), makes the failure a
+    /// first-class part of your contract that survives serialization across brokers and process
+    /// restarts, and lets <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> drive
+    /// recovery routing for it. Keep <c>SetException</c> for the failures you would genuinely want a
+    /// stack trace and an <see langword="catch"/> block for.
+    /// </para>
+    /// <para>
+    /// When a result-pattern payload that declines to resume reaches the lost-subscriber fallback, it
+    /// is surfaced to the failure callback as an <see cref="AsyncResponseDomainFailureException"/>,
+    /// so a domain failure and a technical <c>SetException</c> can share one failure-handling path
+    /// while remaining distinguishable by type.
+    /// </para>
+    /// </remarks>
     Task SetException(Exception exception, string? correlationId = null);
 }

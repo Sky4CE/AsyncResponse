@@ -95,50 +95,41 @@ public sealed record AsyncResponseWatchdogReport(
     {
         var entriesWithActiveWaiter = 0;
         var unknownAgeEntries = 0;
-        var staleEntryCount = 0;
+
+        // Single pass: classify each entry once and collect the stale ones inline. The previous
+        // implementation walked the collection twice (once to count, once to materialize the list)
+        // and recomputed the staleness subtraction on every visited entry both times. Here the
+        // timestamp arithmetic runs at most once per entry and the result list is allocated lazily,
+        // so the common healthy snapshot — no stale entries — allocates nothing at all.
+        List<RecoveryStateObservation>? staleEntries = null;
 
         foreach (var entry in entries)
         {
-            if (entry.ActiveSubscribers > 0)
+            var activeSubscribers = entry.ActiveSubscribers;
+            if (activeSubscribers > 0)
             {
                 entriesWithActiveWaiter++;
                 continue;
             }
 
-            if (entry.ActiveSubscribers != 0)
+            // Negative liveness means it could not be probed; never flag those as stale.
+            if (activeSubscribers != 0)
                 continue;
 
-            if (entry.RegisteredAtUtc is null)
+            if (entry.RegisteredAtUtc is not { } registeredAtUtc)
             {
                 unknownAgeEntries++;
                 continue;
             }
 
-            if (utcNow - entry.RegisteredAtUtc.Value >= staleAfter)
-                staleEntryCount++;
-        }
-
-        IReadOnlyList<RecoveryStateObservation> staleEntries = [];
-        if (staleEntryCount > 0)
-        {
-            var staleList = new List<RecoveryStateObservation>(staleEntryCount);
-            foreach (var entry in entries)
-            {
-                if (entry.ActiveSubscribers == 0
-                    && entry.RegisteredAtUtc is not null
-                    && utcNow - entry.RegisteredAtUtc.Value >= staleAfter)
-                {
-                    staleList.Add(entry);
-                }
-            }
-
-            staleEntries = staleList;
+            if (utcNow - registeredAtUtc >= staleAfter)
+                (staleEntries ??= []).Add(entry);
         }
 
         return new AsyncResponseWatchdogReport(
             entries.Count,
             entriesWithActiveWaiter,
-            staleEntries,
+            staleEntries ?? [],
             unknownAgeEntries);
     }
 }
