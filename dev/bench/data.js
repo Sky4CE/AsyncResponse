@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781742484095,
+  "lastUpdate": 1781767009508,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1624,6 +1624,45 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/1076187437db7250b4004ade902f9a29f3be0a3a"
         },
         "date": 1781742481212,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub throughput",
+            "value": 50,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 50,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "bfc3f5edbb30e7bab9c88d15df588817189ae9f5",
+          "message": "Tests coverage expansion",
+          "timestamp": "2026-06-18T09:14:16+02:00",
+          "tree_id": "a8647fcaa34acd2d751d8394d5fd03c12fc4fb77",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/bfc3f5edbb30e7bab9c88d15df588817189ae9f5"
+        },
+        "date": 1781767008881,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
