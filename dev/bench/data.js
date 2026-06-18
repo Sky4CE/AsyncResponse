@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781767009508,
+  "lastUpdate": 1781767011093,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -2004,6 +2004,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "attach_redis p99 latency",
             "value": 1004.54,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "bfc3f5edbb30e7bab9c88d15df588817189ae9f5",
+          "message": "Tests coverage expansion",
+          "timestamp": "2026-06-18T09:14:16+02:00",
+          "tree_id": "a8647fcaa34acd2d751d8394d5fd03c12fc4fb77",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/bfc3f5edbb30e7bab9c88d15df588817189ae9f5"
+        },
+        "date": 1781767010626,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis p95 latency",
+            "value": 1009.66,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_redis p99 latency",
+            "value": 1022.46,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p95 latency",
+            "value": 17.3,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p99 latency",
+            "value": 34.34,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1007.1,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1018.88,
             "unit": "ms"
           }
         ]
