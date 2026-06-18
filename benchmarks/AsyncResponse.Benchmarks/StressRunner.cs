@@ -532,7 +532,7 @@ internal static class StressRunner
             var totalEntries = 0;
             var entriesWithActiveWaiter = 0;
             var unknownAgeEntries = 0;
-            List<RecoveryStateObservation>? staleEntries = null;
+            var staleEntries = new List<RecoveryStateObservation>(expectedStale);
             var utcNow = DateTime.UtcNow;
             await foreach (var state in scanner.ScanAsync().ConfigureAwait(false))
             {
@@ -559,7 +559,7 @@ internal static class StressRunner
                 if (utcNow - state.RegisteredAtUtc.Value < TimeSpan.FromMinutes(30))
                     continue;
 
-                (staleEntries ??= []).Add(new RecoveryStateObservation(
+                staleEntries.Add(new RecoveryStateObservation(
                     state.CorrelationId,
                     state.RegisteredAtUtc,
                     active,
@@ -569,7 +569,7 @@ internal static class StressRunner
             var report = new AsyncResponseWatchdogReport(
                 totalEntries,
                 entriesWithActiveWaiter,
-                staleEntries ?? [],
+                staleEntries,
                 unknownAgeEntries);
             sw.Stop();
             var allocated = GC.GetTotalAllocatedBytes() - allocBefore;
@@ -651,22 +651,31 @@ internal static class StressRunner
     }
 
     // Runs `operation` for indices [0, count) with at most `concurrency` in flight at once.
+    // Keep the harness overhead bounded: one worker task per lane instead of one Task per operation.
     private static async Task ForEachAsync(int count, int concurrency, Func<int, Task> operation)
     {
-        using var throttle = new SemaphoreSlim(concurrency);
-        var tasks = new Task[count];
-        for (var i = 0; i < count; i++)
-        {
-            await throttle.WaitAsync().ConfigureAwait(false);
-            var index = i;
-            tasks[index] = Task.Run(async () =>
-            {
-                try { await operation(index).ConfigureAwait(false); }
-                finally { throttle.Release(); }
-            });
-        }
+        if (count <= 0)
+            return;
+
+        var workerCount = Math.Min(Math.Max(1, concurrency), count);
+        var next = -1;
+        var tasks = new Task[workerCount];
+        for (var worker = 0; worker < tasks.Length; worker++)
+            tasks[worker] = Task.Run(WorkerAsync);
 
         await Task.WhenAll(tasks).ConfigureAwait(false);
+
+        async Task WorkerAsync()
+        {
+            while (true)
+            {
+                var index = Interlocked.Increment(ref next);
+                if (index >= count)
+                    return;
+
+                await operation(index).ConfigureAwait(false);
+            }
+        }
     }
 
     private static async Task<string> CaptureFailureNameAsync(Task<BenchPayload> task)
