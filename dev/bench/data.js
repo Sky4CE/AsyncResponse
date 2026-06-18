@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781776841188,
+  "lastUpdate": 1781776851309,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -1802,6 +1802,85 @@ window.BENCHMARK_DATA = {
             "name": "race-burst throughput",
             "value": 55130.0556604068,
             "unit": "ops/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "6dcb3a4bccf01a3f9a3777c6b7fe74dbacbb1f0e",
+          "message": "fixed in-memory waiter timer could race cleanup",
+          "timestamp": "2026-06-18T11:55:14+02:00",
+          "tree_id": "b367b0e04256a6f5a8564598ae67835b375bc3d6",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/6dcb3a4bccf01a3f9a3777c6b7fe74dbacbb1f0e"
+        },
+        "date": 1781776850889,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 98360.95243303684,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 69036.74411668867,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 80189.11801592876,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 189350.0446108705,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 63271.9494188851,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 53466.32904462086,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 19656.46784280487,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 9271.767560495966,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 125440.29543698381,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 54979.8553809884,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 804712.3957897448,
+            "unit": "entries/s"
           }
         ]
       }
