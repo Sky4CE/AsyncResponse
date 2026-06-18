@@ -64,8 +64,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity,
             ExecutionContext.Capture());
 
-        subscription.ArmTimeout();
-
         var subscribers = _subscriptions.GetOrAdd(
             correlationId,
             _ => new ConcurrentDictionary<Guid, SubscriptionBase>());
@@ -89,6 +87,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             if (subscription.CleanupStarted)
                 await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+            else
+                subscription.ArmTimeout();
 
             _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
         }
@@ -258,7 +258,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         private readonly InMemoryAsyncResponseChannel _owner;
         private readonly CancellationTokenSource _timeoutCts;
         private readonly Activity? _activity;
+        private readonly object _cleanupSync = new();
         private CancellationTokenRegistration _timeoutRegistration;
+        private Task? _cleanupTask;
         private int _terminal;
         private int _cleanupStarted;
 
@@ -268,7 +270,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             CorrelationId = correlationId;
             Timeout = timeout;
             _activity = activity;
-            _timeoutCts = new CancellationTokenSource(timeout);
+            _timeoutCts = new CancellationTokenSource();
         }
 
         public Guid Id { get; } = Guid.NewGuid();
@@ -279,10 +281,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         public void ArmTimeout()
         {
-            _timeoutRegistration = _timeoutCts.Token.Register(static state =>
+            if (CleanupStarted)
+                return;
+
+            try
             {
-                _ = ((SubscriptionBase)state!).TimeoutAsync();
-            }, this);
+                _timeoutRegistration = _timeoutCts.Token.Register(static state =>
+                {
+                    _ = ((SubscriptionBase)state!).TimeoutAsync();
+                }, this);
+
+                if (CleanupStarted)
+                {
+                    _timeoutRegistration.Dispose();
+                    return;
+                }
+
+                _timeoutCts.CancelAfter(Timeout);
+            }
+            catch (ObjectDisposedException)
+            {
+                // A response or explicit disposal can clean up between the guard and timer arming.
+            }
         }
 
         public abstract Task DispatchResponseAsync(object? response);
@@ -297,11 +317,22 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return CleanupOnceAsTask();
         }
 
-        public async ValueTask CleanupOnceAsync()
+        public ValueTask CleanupOnceAsync()
         {
-            if (Interlocked.Exchange(ref _cleanupStarted, 1) != 0)
-                return;
+            Task cleanupTask;
+            lock (_cleanupSync)
+            {
+                cleanupTask = _cleanupTask ??= StartCleanupAsync();
+            }
 
+            return cleanupTask.IsCompletedSuccessfully
+                ? ValueTask.CompletedTask
+                : new ValueTask(cleanupTask);
+        }
+
+        private async Task StartCleanupAsync()
+        {
+            Volatile.Write(ref _cleanupStarted, 1);
             try
             {
                 _owner.RemoveSubscription(CorrelationId, Id);

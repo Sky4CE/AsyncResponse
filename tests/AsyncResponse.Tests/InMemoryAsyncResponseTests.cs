@@ -80,6 +80,32 @@ public class InMemoryAsyncResponseTests
         Assert.Null(await store.GetAsync(CorrelationId));
     }
 
+    [Fact]
+    public async Task CreateResponseWaiter_TinyTimeout_DoesNotLeakCleanedSubscription()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var correlationId = $"{CorrelationId}-tiny-timeout";
+
+        var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromTicks(1));
+
+        try
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask);
+        }
+        finally
+        {
+            await waiter.DisposeAsync();
+        }
+
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+        Assert.Null(await store.GetAsync(correlationId));
+    }
+
     private static ServiceProvider CreateProvider(Action<IServiceCollection>? configure = null)
     {
         var services = new ServiceCollection();
