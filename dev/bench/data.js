@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781769987638,
+  "lastUpdate": 1781769989243,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -2097,6 +2097,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "attach_redis p99 latency",
             "value": 1018.88,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "d5b3851d0d74c8482c267762e70caf7f58f4f293",
+          "message": "IAsyncResponsePublisher.SetResponse<T> is now constrained to where T : IAsyncResponsePayload",
+          "timestamp": "2026-06-18T10:03:56+02:00",
+          "tree_id": "50180d8491650ae9fa26b68bcc8b5adf95ebbeab",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/d5b3851d0d74c8482c267762e70caf7f58f4f293"
+        },
+        "date": 1781769988784,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_redis p95 latency",
+            "value": 1008.13,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_redis p99 latency",
+            "value": 1018.37,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p95 latency",
+            "value": 16.38,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub p99 latency",
+            "value": 24.88,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1006.59,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1016.83,
             "unit": "ms"
           }
         ]
