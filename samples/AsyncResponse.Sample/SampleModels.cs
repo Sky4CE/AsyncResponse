@@ -29,6 +29,25 @@ public sealed class OperationResult : IAsyncResponsePayload
 /// assert it over HTTP (see the <c>/calls</c> endpoint).</summary>
 public sealed record FlowCall(string Kind, string? CorrelationId, string? Trace, string? Tenant, OperationStatus? Status, string? Detail);
 
+/// <summary>One step in a multi-step sample flow, including success payloads and technical faults.</summary>
+public sealed record StepOutcome(
+    string Name,
+    string CorrelationId,
+    bool Succeeded,
+    OperationStatus? Status,
+    string? Message,
+    string? ExceptionType,
+    string? Detail);
+
+/// <summary>Result returned by the sample's sequential multi-step endpoint.</summary>
+public sealed record MultiStepFlowResult(bool Completed, string? FailedAt, IReadOnlyList<StepOutcome> Steps);
+
+/// <summary>Result returned when one published exception fans out to multiple waiters.</summary>
+public sealed record SharedExceptionResult(string CorrelationId, IReadOnlyList<string> Failures);
+
+/// <summary>Result returned by the high-level lost-subscriber recovery flow endpoint.</summary>
+public sealed record LostSubscriberFlowResult(string CorrelationId, string Outcome, FlowCall Callback);
+
 /// <summary>
 /// Records flow invocations (worker jobs, recovery callbacks, waiter results) and lets a caller
 /// long-poll for one by key. This is the observability seam that lets the integration tests assert

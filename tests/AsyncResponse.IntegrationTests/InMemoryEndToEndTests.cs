@@ -86,6 +86,75 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
     }
 
     [Fact]
+    public async Task MultiStep_SucceedThenSucceed_CompletesBothStepsInOrder()
+    {
+        var response = await _client.PostAsync("/multi-step?first=Succeed&second=Succeed", content: null);
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<MultiStepFlowResult>();
+        Assert.True(result!.Completed);
+        Assert.Null(result.FailedAt);
+        Assert.Collection(
+            result.Steps,
+            first =>
+            {
+                Assert.Equal("first", first.Name);
+                Assert.True(first.Succeeded);
+                Assert.Equal(OperationStatus.Completed, first.Status);
+            },
+            second =>
+            {
+                Assert.Equal("second", second.Name);
+                Assert.True(second.Succeeded);
+                Assert.Equal(OperationStatus.Completed, second.Status);
+            });
+        Assert.NotEqual(result.Steps[0].CorrelationId, result.Steps[1].CorrelationId);
+    }
+
+    [Fact]
+    public async Task MultiStep_FirstTechnicalFailure_StopsBeforeSecondStep()
+    {
+        var response = await _client.PostAsync("/multi-step?first=Fail&second=Succeed", content: null);
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<MultiStepFlowResult>();
+        Assert.False(result!.Completed);
+        Assert.Equal("first", result.FailedAt);
+        var step = Assert.Single(result.Steps);
+        Assert.Equal("first", step.Name);
+        Assert.False(step.Succeeded);
+        Assert.Equal(nameof(InvalidOperationException), step.ExceptionType);
+        Assert.Contains("first technical error", step.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AmbientException_UsesPublisherAmbientCorrelationFallback()
+    {
+        var response = await _client.PostAsync("/ambient-exception?message=ambient%20boom", content: null);
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<AmbientExceptionResult>();
+        Assert.True(result!.Faulted);
+        Assert.Equal(nameof(InvalidOperationException), result.ExceptionType);
+        Assert.Equal("ambient boom", result.Detail);
+    }
+
+    [Fact]
+    public async Task SharedCorrelationException_FaultsBothAttachedWaiters()
+    {
+        var response = await _client.PostAsync("/shared-correlation-exception?message=fanout%20boom", content: null);
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<SharedExceptionResult>();
+        Assert.Equal(2, result!.Failures.Count);
+        Assert.All(result.Failures, failure =>
+        {
+            Assert.Contains(nameof(InvalidOperationException), failure, StringComparison.Ordinal);
+            Assert.Contains("fanout boom", failure, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task Worker_RunsInProcess_AndFlowsTraceAndTenantViaExecutionContext()
     {
         var token = $"order-{Guid.NewGuid():N}";
@@ -155,6 +224,7 @@ public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.
 
     private sealed record Result(OperationStatus Status, string? Message);
     private sealed record ProviderConfig(string Channel, string Transport);
+    private sealed record AmbientExceptionResult(bool Faulted, string ExceptionType, string Detail);
 
     /// <summary>
     /// Boots the sample app in-process with the fully in-memory provider configuration. The type

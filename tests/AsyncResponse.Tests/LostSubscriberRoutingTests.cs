@@ -185,6 +185,89 @@ public class LostSubscriberRoutingTests
         Assert.Equal("technical error", failure.Message);
     }
 
+    [Fact]
+    public async Task SetException_WithActiveSubscribers_PublishesFailureEnvelopeAndDoesNotReadRecoveryState()
+    {
+        RedisChannel publishedChannel = default;
+        RedisValue publishedValue = default;
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .Callback<RedisChannel, RedisValue, CommandFlags>((channel, value, _) =>
+            {
+                publishedChannel = channel;
+                publishedValue = value;
+            })
+            .ReturnsAsync(2);
+
+        await Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId);
+
+        Assert.Equal($"asyncresponse:response:{CorrelationId}", publishedChannel.ToString());
+        using var document = JsonDocument.Parse(publishedValue.ToString());
+        var root = document.RootElement;
+        Assert.False(root.GetProperty("Success").GetBoolean());
+        Assert.Equal("technical error", root.GetProperty("ExceptionMessage").GetString());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("Payload").ValueKind);
+        _database.Verify(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+        _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SetException_WithoutExplicitCorrelation_UsesAmbientCorrelationId()
+    {
+        RedisChannel publishedChannel = default;
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .Callback<RedisChannel, RedisValue, CommandFlags>((channel, _, _) => publishedChannel = channel)
+            .ReturnsAsync(1);
+
+        AsyncResponseContext.SetCorrelationId(CorrelationId);
+        try
+        {
+            await Publisher.SetException(new InvalidOperationException("ambient technical error"));
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+        }
+
+        Assert.Equal($"asyncresponse:response:{CorrelationId}", publishedChannel.ToString());
+    }
+
+    [Fact]
+    public async Task SetException_NoSubscriberWithoutFailureCallback_DoesNotDeleteRecoveryState()
+    {
+        ArmRecoveryState(includeFailureCallback: false);
+
+        await Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId);
+
+        Assert.Empty(_spy.Failures);
+        _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SetException_FailureCallbackThrows_PropagatesAndKeepsRecoveryState()
+    {
+        ArmRecoveryState();
+        _spy.FailureCallbackError = new InvalidOperationException("handler exploded");
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId));
+
+        Assert.Equal("handler exploded", thrown.Message);
+        Assert.Single(_spy.Failures);
+        _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SetException_NullException_ThrowsBeforePublishing()
+    {
+        await Assert.ThrowsAsync<ArgumentNullException>(() => Publisher.SetException(null!, CorrelationId));
+
+        _subscriber.Verify(
+            s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
+            Times.Never);
+    }
+
     // ----- Broker ingress -----
 
     [Fact]

@@ -572,21 +572,37 @@ curl -X POST 'http://localhost:5000/request-response?behavior=FailDomain'   # do
 curl -X POST 'http://localhost:5000/request-response?behavior=Fail'         # technical failure (SetException)
 curl -X POST 'http://localhost:5000/request-response?behavior=Timeout'      # 2s timeout vs a slow remote
 curl -X POST 'http://localhost:5000/attach'                                 # attach to an in-flight op by correlation id
+curl -X POST 'http://localhost:5000/multi-step?first=Succeed&second=Succeed' # sequential two-step flow
+curl -X POST 'http://localhost:5000/multi-step?first=Succeed&second=Fail'    # step 2 fails through SetException
+curl -X POST 'http://localhost:5000/ambient-exception?message=boom'          # SetException uses ambient correlation id
+curl -X POST 'http://localhost:5000/shared-correlation-exception?message=boom' # one exception faults two waiters
 curl -X POST 'http://localhost:5000/worker?token=order-42'                  # fire-and-forget background worker job
 curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
 curl      'http://localhost:5000/alive'                                     # liveness check
 
-# The headline feature — recovery after a "redeploy" (needs the Redis channel):
+# Recovery after a "redeploy" (needs the Redis channel):
 curl -X POST 'http://localhost:5000/arm'                                          # returns a correlationId
 curl -X POST 'http://localhost:5000/crash'                                        # drops every subscription
 curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Completed'  # → resume callback
 curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Failed'     # → failure callback
+curl -X POST 'http://localhost:5000/publish?correlationId=<id>&exception=boom'    # → failure callback via SetException
+
+# Same recovery flow, composed into one endpoint:
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Completed'        # arm + crash + late success → resume
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Failed'           # arm + crash + late failed payload → fail
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Exception'        # arm + crash + late SetException → fail
 ```
 
 For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and replace `<id>` in a
 `/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
-callback with an `AsyncResponseDomainFailureException`. (`/arm`, `/crash`, and `/publish` require
-the Redis channel — run with `AsyncResponse__Channel=Redis`.)
+callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical
+failure path through `IAsyncResponsePublisher.SetException`. (`/arm`, `/crash`, `/publish`, and
+`/lost-subscriber-flow` require the Redis channel — run with `AsyncResponse__Channel=Redis`.)
+
+`/shared-correlation-exception` demonstrates fan-out: two waiters attach to the same correlation
+id, then one `SetException` faults both. This works with the in-memory and Redis channels; Redis may
+multiplex local handlers through one server-side subscription, so the sample waits for both waiter
+registrations directly rather than relying on Redis subscriber counts.
 
 The sample also wires two context propagators (`SampleTracePropagator`, `SampleTenantPropagator`) —
 watch the `traceId`/`tenant` fields in the logs: `/request-response` shows them on `HANDLER:` lines
