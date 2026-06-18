@@ -686,48 +686,65 @@ modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harne
 **Release** build.
 
 **Benchmarks** — per-operation latency, allocations, and GC for the hot paths (in-memory
-request/response round-trip, envelope (de)serialization, payload classification, expression→callback
-conversion, reflection invoke). `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections
-per op alongside mean/median/percentile timings:
+request/response round-trip, raw broker ingress, shared-correlation fanout, exception fanout,
+recovery-state save/scan, watchdog/health evaluation, context propagation, envelope
+(de)serialization, payload classification, expression→callback conversion, reflection invoke).
+`[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections per op alongside
+mean/median/percentile timings:
 
 ```bash
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks                 # all benchmarks
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter *Channel*
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter *Ingress*
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
-lost/crossed responses, no duplicate worker executions, no hangs) and report throughput, latency
-percentiles, allocations, GC counts, and working set. The process exits non-zero if any correctness
-check fails, so it doubles as a soak gate:
+lost/crossed responses, no duplicate worker executions, no cleanup leaks, no context bleed, no hangs)
+and report throughput, latency percentiles, allocations, GC counts, and working set. The process exits
+non-zero if any correctness check fails, so it doubles as a soak gate:
 
 ```bash
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress --concurrency 512 --count 200000 --progress 5
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress --fanout 8 --timeout-count 5000 --timeout-ms 50
 ```
 
-The stress harness checks four scenarios under load: **waiter-storm** (N concurrent waiters, each must
-receive exactly its own response — no cross-correlation leakage), **progress-storm** (a burst of
-progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
-exactly once), and **race-burst** (subscribe-before-send under contention with a short timeout). The
-same invariants are gated on every CI run, at smaller scale, by
+The stress harness now checks the system from multiple angles: **waiter-storm** (N concurrent waiters,
+each must receive exactly its own response — no cross-correlation leakage), **progress-storm** (a burst
+of progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
+exactly once), **race-burst** (subscribe-before-send under contention), **raw-ingress-storm** (broker
+JSON into typed waiters), **shared-response-fanout** and **exception-fanout** (many waiters on one
+correlation id), **timeout-storm** and **dispose-cleanup-storm** (subscription/recovery cleanup),
+**context-isolation-storm** (captured `ExecutionContext` under foreign publishers), and
+**watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The same invariants are
+gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. Both tiers run
 the in-memory channel and transport in-process.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 Redis channel + Google Pub/Sub transport — reporting throughput, latency percentiles, and failures per
-scenario (request/response, worker, attach). By default it boots Redis + a Pub/Sub emulator + the SUT
-via Aspire (Docker required); pass `--url` to load an already-running instance instead:
+scenario. By default it boots Redis + a Pub/Sub emulator + the SUT via Aspire (Docker required); pass
+`--url` to load an already-running instance instead. Profiles let you choose the scenario set:
+`broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
+exception, shared exception, reply target), `pubsub` (response-topic ingress with attribute/body
+correlation ids), or `recovery` (lost-subscriber resume/failure/exception and stale health). Run the
+recovery profile separately because it intentionally simulates subscriber loss:
 
 ```bash
-dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rate 200 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 ```
 
 It writes an HTML/CSV/Markdown report to `nbomber-report/`. The
 [load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
-uploading the full report as an artifact.
+uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
+`duration`; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
+`customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
+`gh-pages`.
 
 **Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
 ([`benchmarks.yml`](.github/workflows/benchmarks.yml)) and publishes them with

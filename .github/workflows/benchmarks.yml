@@ -69,7 +69,7 @@ jobs:
       - name: Run stress harness
         run: |
           dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
-            stress --concurrency 256 --count 50000 --progress 5 --json "${{ github.workspace }}/stress"
+            stress --concurrency 256 --count 25000 --progress 5 --fanout 4 --timeout-count 2000 --json "${{ github.workspace }}/stress"
 
       - name: Publish stress throughput (bigger is better)
         uses: benchmark-action/github-action-benchmark@v1

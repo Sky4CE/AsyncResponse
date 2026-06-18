@@ -1,9 +1,10 @@
 name: Load test
 
-# End-to-end HTTP load test (NBomber) against the real Redis + Google Pub/Sub stack. Runs on every
-# push to main and publishes throughput/latency to the same gh-pages dashboard as the benchmarks
-# workflow; can also be triggered manually with custom rate/duration. It is Docker-backed, so it
-# shares a concurrency group with the benchmarks workflow to avoid racing on the gh-pages history.
+# End-to-end HTTP load test (NBomber) against the real Redis + Google Pub/Sub stack. Runs the broad
+# non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
+# dashboard as the benchmarks workflow; manual runs can select pubsub/recovery/all profiles. It is
+# Docker-backed, so it shares a concurrency group with the benchmarks workflow to avoid racing on the
+# gh-pages history.
 on:
   push:
     branches: [main]
@@ -15,9 +16,12 @@ on:
       - '.github/workflows/loadtest.yml'
   workflow_dispatch:
     inputs:
+      profile:
+        description: 'Scenario profile: broad, pubsub, recovery'
+        default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
-        default: '50'
+        default: '20'
       duration:
         description: 'Load duration in seconds'
         default: '30'
@@ -52,7 +56,8 @@ jobs:
       - name: Run NBomber load test
         run: |
           dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- \
-            --rate ${{ github.event.inputs.rate || '50' }} \
+            --profile ${{ github.event.inputs.profile || 'broad' }} \
+            --rate ${{ github.event.inputs.rate || '20' }} \
             --duration ${{ github.event.inputs.duration || '30' }} \
             --warmup 10 \
             --gh-json "${{ github.workspace }}/loadtest"

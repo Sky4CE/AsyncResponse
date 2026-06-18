@@ -9,11 +9,13 @@ using BenchmarkDotNet.Running;
 //   dotnet run -c Release -- --filter *Channel*                      → run a subset (BDN filter)
 //   dotnet run -c Release -- stress                                  → run the concurrency/load scenarios
 //   dotnet run -c Release -- stress --concurrency 512 --count 100000 --progress 5
+//   dotnet run -c Release -- stress --fanout 8 --timeout-count 5000 --timeout-ms 50
 //
 // Benchmarks measure per-operation latency + allocations + GC (BenchmarkDotNet, [MemoryDiagnoser]).
 // The stress runner hammers the library at high concurrency, asserts correctness (no lost/crossed
-// responses, no duplicate work, no hangs), and reports throughput, latency percentiles, allocations,
-// GC counts and working set. Its process exit code is non-zero if any correctness check fails.
+// responses, no duplicate work, no cleanup leaks, no context bleed, no hangs), and reports
+// throughput, latency percentiles, allocations, GC counts and working set. Its process exit code is
+// non-zero if any correctness check fails.
 if (args is [var command, ..] && string.Equals(command, "stress", StringComparison.OrdinalIgnoreCase))
 {
     return await StressRunner.RunAsync(args[1..]);
