@@ -205,7 +205,7 @@ internal static class StressRunner
     }
 
     // 5) Raw JSON ingress storm. This exercises the transport-facing broker/webhook path:
-    //    raw JSON -> untyped payload -> typed waiter conversion -> completion predicate.
+    //    raw JSON -> typed waiter materialization -> completion predicate.
     private static async Task<int> RawIngressStorm(int concurrency, int count)
     {
         using var provider = BuildProvider();

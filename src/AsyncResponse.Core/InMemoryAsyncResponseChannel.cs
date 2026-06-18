@@ -105,6 +105,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
         => SetResponseCore(response, correlationId);
 
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
+        => SetRawResponseJsonCore(new RawJsonResponse(responseJson), correlationId);
+
     private async Task SetResponseCore<T>(T response, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
@@ -143,6 +146,51 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
             _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private async Task SetRawResponseJsonCore(RawJsonResponse response, string? correlationId)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "inmemory");
+
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
+            return;
+        }
+
+        try
+        {
+            var subscribers = SnapshotSubscribers(correlationId);
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+            if (subscribers.Count == 0)
+            {
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var result = await _lostSubscriberDispatcher
+                    .DispatchLostResponse(recoveryState, response.DeserializeUntyped(), ChannelName(correlationId))
+                    .ConfigureAwait(false);
+
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
+
+                if (result.CallbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+
+                return;
+            }
+
+            await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
+
+            _logger.LogInformation("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -233,6 +281,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchResponseAsync(state), response);
     }
 
+    private static Task DispatchRawJsonResponsesAsync(SubscriptionSnapshot subscribers, RawJsonResponse response)
+    {
+        if (subscribers.Single is { } single)
+            return single.DispatchRawJsonResponseAsync(response);
+
+        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchRawJsonResponseAsync(state), response);
+    }
+
     private static Task DispatchExceptionsAsync(SubscriptionSnapshot subscribers, Exception exception)
     {
         if (subscribers.Single is { } single)
@@ -263,7 +319,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 continue;
             }
 
-            (pending ??= [firstPending]).Add(task);
+            if (pending is null)
+            {
+                pending = new List<Task>(subscribers.Length) { firstPending };
+            }
+
+            pending.Add(task);
         }
 
         return pending is not null
@@ -448,6 +509,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         public abstract Task DispatchResponseAsync(object? response);
 
+        public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response);
+
         public Task DispatchExceptionAsync(Exception exception)
         {
             if (!TryBeginTerminal())
@@ -551,6 +614,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return dispatch!;
         }
 
+        public override Task DispatchRawJsonResponseAsync(RawJsonResponse response)
+        {
+            if (CleanupStarted)
+                return Task.CompletedTask;
+
+            if (_capturedContext is null)
+                return DispatchRawJsonResponseCoreAsync(response);
+
+            Task? dispatch = null;
+            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchRawJsonResponseCoreAsync(response), null);
+            return dispatch!;
+        }
+
         private Task DispatchResponseCoreAsync(object? response)
         {
             try
@@ -559,6 +635,30 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                     ? typed
                     : response.As<T>();
 
+                return DispatchPayloadAsync(payload);
+            }
+            catch (Exception ex)
+            {
+                return FaultAsync(ex);
+            }
+        }
+
+        private Task DispatchRawJsonResponseCoreAsync(RawJsonResponse response)
+        {
+            try
+            {
+                return DispatchPayloadAsync(response.Deserialize<T>()!);
+            }
+            catch (Exception ex)
+            {
+                return FaultAsync(ex);
+            }
+        }
+
+        private Task DispatchPayloadAsync(T payload)
+        {
+            try
+            {
                 var completion = _completionPredicate(payload);
                 if (!completion.IsCompletedSuccessfully)
                     return AwaitCompletionPredicateAsync(completion, payload);
@@ -572,13 +672,18 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
             catch (Exception ex)
             {
-                if (!TryBeginTerminal())
-                    return Task.CompletedTask;
-
-                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
-                _tcs.TrySetException(ex);
-                return CleanupOnceAsTask();
+                return FaultAsync(ex);
             }
+        }
+
+        private Task FaultAsync(Exception exception)
+        {
+            if (!TryBeginTerminal())
+                return Task.CompletedTask;
+
+            AsyncResponseDiagnostics.SetError(WaitActivity, exception);
+            _tcs.TrySetException(exception);
+            return CleanupOnceAsTask();
         }
 
         private async Task AwaitCompletionPredicateAsync(ValueTask<bool> completion, T payload)
@@ -594,12 +699,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
             catch (Exception ex)
             {
-                if (!TryBeginTerminal())
-                    return;
-
-                AsyncResponseDiagnostics.SetError(WaitActivity, ex);
-                _tcs.TrySetException(ex);
-                await CleanupOnceAsync().ConfigureAwait(false);
+                await FaultAsync(ex).ConfigureAwait(false);
             }
         }
 

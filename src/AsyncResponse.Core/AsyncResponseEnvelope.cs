@@ -38,6 +38,11 @@ internal static class AsyncResponseEnvelopeOptions<T>
 /// </summary>
 internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncResponseEnvelope<T>>
 {
+    private static readonly JsonEncodedText SuccessName = JsonEncodedText.Encode("Success");
+    private static readonly JsonEncodedText PayloadName = JsonEncodedText.Encode("Payload");
+    private static readonly JsonEncodedText ExceptionMessageName = JsonEncodedText.Encode("ExceptionMessage");
+    private static readonly JsonEncodedText ExceptionStackTraceName = JsonEncodedText.Encode("ExceptionStackTrace");
+
     public override AsyncResponseEnvelope<T>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType != JsonTokenType.StartObject)
@@ -57,26 +62,23 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
             if (reader.TokenType == JsonTokenType.PropertyName)
             {
-                var isSuccess = reader.ValueTextEquals("Success"u8);
-                var isPayload = reader.ValueTextEquals("Payload"u8);
-                var isExceptionMessage = reader.ValueTextEquals("ExceptionMessage"u8);
-                var isExceptionStackTrace = reader.ValueTextEquals("ExceptionStackTrace"u8);
+                var property = GetProperty(ref reader);
                 reader.Read();
 
-                if (isSuccess)
+                if (property == EnvelopeProperty.Success)
                 {
                     success = reader.GetBoolean();
                 }
-                else if (isPayload)
+                else if (property == EnvelopeProperty.Payload)
                 {
                     // Instead of throwing, assign default(T)
                     payload = reader.TokenType == JsonTokenType.Null ? default : JsonSerializer.Deserialize<T>(ref reader, options);
                 }
-                else if (isExceptionMessage)
+                else if (property == EnvelopeProperty.ExceptionMessage)
                 {
                     exceptionMessage = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
-                else if (isExceptionStackTrace)
+                else if (property == EnvelopeProperty.ExceptionStackTrace)
                 {
                     exceptionStackTrace = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
@@ -99,11 +101,50 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
     public override void Write(Utf8JsonWriter writer, AsyncResponseEnvelope<T> value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
-        writer.WriteBoolean("Success", value.Success);
-        writer.WritePropertyName("Payload");
+        writer.WriteBoolean(SuccessName, value.Success);
+        writer.WritePropertyName(PayloadName);
         JsonSerializer.Serialize(writer, value.Payload, options);
-        writer.WriteString("ExceptionMessage", value.ExceptionMessage);
-        writer.WriteString("ExceptionStackTrace", value.ExceptionStackTrace);
+        writer.WriteString(ExceptionMessageName, value.ExceptionMessage);
+        writer.WriteString(ExceptionStackTraceName, value.ExceptionStackTrace);
         writer.WriteEndObject();
+    }
+
+    private static EnvelopeProperty GetProperty(ref Utf8JsonReader reader)
+    {
+        if (!reader.HasValueSequence)
+        {
+            var name = reader.ValueSpan;
+            switch (name.Length)
+            {
+                case 7 when name[0] == (byte)'S' && reader.ValueTextEquals("Success"u8):
+                    return EnvelopeProperty.Success;
+                case 7 when name[0] == (byte)'P' && reader.ValueTextEquals("Payload"u8):
+                    return EnvelopeProperty.Payload;
+                case 16 when name[0] == (byte)'E' && reader.ValueTextEquals("ExceptionMessage"u8):
+                    return EnvelopeProperty.ExceptionMessage;
+                case 19 when name[0] == (byte)'E' && reader.ValueTextEquals("ExceptionStackTrace"u8):
+                    return EnvelopeProperty.ExceptionStackTrace;
+            }
+        }
+
+        if (reader.ValueTextEquals("Success"u8))
+            return EnvelopeProperty.Success;
+        if (reader.ValueTextEquals("Payload"u8))
+            return EnvelopeProperty.Payload;
+        if (reader.ValueTextEquals("ExceptionMessage"u8))
+            return EnvelopeProperty.ExceptionMessage;
+        if (reader.ValueTextEquals("ExceptionStackTrace"u8))
+            return EnvelopeProperty.ExceptionStackTrace;
+
+        return EnvelopeProperty.Unknown;
+    }
+
+    private enum EnvelopeProperty
+    {
+        Unknown,
+        Success,
+        Payload,
+        ExceptionMessage,
+        ExceptionStackTrace
     }
 }

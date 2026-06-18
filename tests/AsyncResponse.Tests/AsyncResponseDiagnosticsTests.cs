@@ -58,8 +58,9 @@ public class AsyncResponseDiagnosticsTests
         Assert.Equal(ActivityKind.Consumer, ingressActivity.Kind);
         Assert.Equal("corr-ingress", Tag(ingressActivity, "asyncresponse.correlation_id"));
 
-        var publish = collector.Single("asyncresponse.set_response", "asyncresponse.correlation_id", "corr-ingress");
+        var publish = collector.Single("asyncresponse.ingress.raw_response", "asyncresponse.correlation_id", "corr-ingress");
         Assert.Equal("corr-ingress", Tag(publish, "asyncresponse.correlation_id"));
+        Assert.Equal("inmemory", Tag(publish, "asyncresponse.channel"));
         Assert.Equal(0, Convert.ToInt32(Tag(publish, "asyncresponse.subscribers")));
 
         var dispatch = collector.Single("asyncresponse.lost_subscriber.dispatch", "asyncresponse.channel_name", "inmemory:response:corr-ingress");

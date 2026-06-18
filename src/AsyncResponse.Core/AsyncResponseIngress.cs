@@ -25,8 +25,7 @@ internal sealed class AsyncResponseIngress(
         {
             _logger.LogDebug("Ingress received inbound response message: {Message}", messageJson);
 
-            var response = JsonSafety.SafeDeserialize<object?>(messageJson);
-            await _rawPublisher.SetRawResponse(response, correlationId).ConfigureAwait(false);
+            await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

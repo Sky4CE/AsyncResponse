@@ -2,8 +2,10 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 
 namespace AsyncResponse.Channels.Redis;
@@ -302,6 +304,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
         => SetResponseCore(response, correlationId);
 
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
+        => SetRawResponseJsonCore(responseJson, correlationId);
+
     private async Task SetResponseCore<T>(T response, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
@@ -355,6 +360,55 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private async Task SetRawResponseJsonCore(string responseJson, string? correlationId)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "redis");
+
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
+            return;
+        }
+
+        var channel = _keys.Channel(correlationId);
+        try
+        {
+            var json = SerializeRawSuccessEnvelope(responseJson);
+            long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.subscribers", numSubscribers);
+
+            if (numSubscribers == 0)
+            {
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var response = new RawJsonResponse(responseJson).DeserializeUntyped();
+
+                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+
+                if (dispatchResult.CallbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+
+                await RemoveExecutorAsync(channel.ToString()!).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogInformation("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish raw response for correlationId {CorrelationId} on channel {Channel}.", correlationId, channel.ToString()!);
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -454,6 +508,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     private ChannelSerialExecutor GetExecutor(string channel) =>
         _executors.GetOrAdd(channel, ch => new ChannelSerialExecutor(_logger, ch));
+
+    private static string SerializeRawSuccessEnvelope(string payloadJson)
+    {
+        JsonSafety.ThrowIfClearlyNotJson(payloadJson);
+
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writer.WriteBoolean("Success", true);
+            writer.WritePropertyName("Payload");
+            writer.WriteRawValue(payloadJson);
+            writer.WriteNull("ExceptionMessage");
+            writer.WriteNull("ExceptionStackTrace");
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
 
     private async ValueTask RemoveExecutorAsync(string channel)
     {

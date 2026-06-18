@@ -7,4 +7,6 @@ namespace AsyncResponse;
 internal interface IRawAsyncResponsePublisher
 {
     Task SetRawResponse(object? response, string? correlationId = null);
+
+    Task SetRawResponseJson(string responseJson, string? correlationId = null);
 }

@@ -19,13 +19,7 @@ internal static class JsonSafety
     /// </summary>
     public static T? SafeDeserialize<T>(string json, JsonSerializerOptions? options = null)
     {
-        var trimmed = json.AsSpan().TrimStart();
-        if (trimmed.Length == 0)
-            throw new InvalidDataException("Empty message body when JSON was expected.");
-
-        // Guard against HTML error pages.
-        if (trimmed[0] == '<')
-            throw new InvalidDataException($"Received HTML when JSON was expected: {json[..Math.Min(200, json.Length)]}…");
+        ThrowIfClearlyNotJson(json);
 
         try
         {
@@ -36,5 +30,32 @@ internal static class JsonSafety
             // Re-throw with the payload prefix in the message so the failure is diagnosable.
             throw new InvalidDataException($"Failed to parse JSON payload: {json[..Math.Min(200, json.Length)]}…", jsonException);
         }
+    }
+
+    public static object? SafeDeserialize(string json, Type returnType, JsonSerializerOptions? options = null)
+    {
+        ThrowIfClearlyNotJson(json);
+
+        try
+        {
+            return JsonSerializer.Deserialize(json, returnType, options ?? _defaultOptions);
+        }
+        catch (JsonException jsonException)
+        {
+            // Re-throw with the payload prefix in the message so the failure is diagnosable.
+            throw new InvalidDataException($"Failed to parse JSON payload: {json[..Math.Min(200, json.Length)]}…", jsonException);
+        }
+    }
+
+    public static void ThrowIfClearlyNotJson(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            throw new InvalidDataException("Empty message body when JSON was expected.");
+
+        var trimmed = json.AsSpan().TrimStart();
+
+        // Guard against HTML error pages.
+        if (trimmed[0] == '<')
+            throw new InvalidDataException($"Received HTML when JSON was expected: {json[..Math.Min(200, json.Length)]}…");
     }
 }
