@@ -87,6 +87,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
 
         services.TryAddSingleton<InMemoryAsyncResponseChannel>();
         services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+        services.TryAddSingleton<IRawAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
         services.TryAddSingleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
         services.TryAddSingleton<IActiveSubscriberProbe>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
 

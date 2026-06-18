@@ -42,6 +42,7 @@ public static class RedisAsyncResponseServiceCollectionExtensions
         // all one shared instance.
         services.TryAddSingleton<RedisAsyncResponseChannel>();
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
+        services.Replace(ServiceDescriptor.Singleton<IRawAsyncResponsePublisher>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
         services.Replace(ServiceDescriptor.Singleton<IActiveSubscriberProbe>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
 

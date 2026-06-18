@@ -18,7 +18,7 @@ namespace AsyncResponse.Channels.Redis;
 /// ShouldResumeOnRecovery and invokes the resume or failure callback.</description></item>
 /// </list>
 /// </summary>
-internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
+internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
 
     private readonly ISubscriber _subscriber;
@@ -296,7 +296,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IAsyn
     // IAsyncResponsePublisher
 
     /// <inheritdoc/>
-    public async Task SetResponse<T>(T response, string? correlationId = null)
+    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId);
+
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
+        => SetResponseCore(response, correlationId);
+
+    private async Task SetResponseCore<T>(T response, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "redis");

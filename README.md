@@ -312,7 +312,9 @@ await ingress.HandleResponseMessageAsync(messageBodyJson, correlationIdFromHeade
 When you use `AsyncResponse.Transports.GooglePubSub`, the hosted response subscriber does this
 for you and can extract the correlation id from Pub/Sub attributes or the configured JSON paths.
 
-In-process publishers can skip the ingress and call `IAsyncResponsePublisher` directly:
+In-process publishers can skip the ingress and call `IAsyncResponsePublisher` directly with
+payload types that implement `IAsyncResponsePayload`. Raw broker/webhook JSON should stay on
+`IAsyncResponseIngress`, which keeps it untyped until the channel can route it:
 
 ```csharp
 await publisher.SetResponse(new OrderResult { Status = OrderStatus.Completed }, correlationId);

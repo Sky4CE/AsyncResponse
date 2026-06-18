@@ -14,7 +14,7 @@ namespace AsyncResponse.Tests;
 /// redeploy/restart), exercised through the real implementation resolved from DI with Redis
 /// mocked. Verifies that the payload's ShouldResumeOnRecovery — not the transport envelope — decides
 /// between the resume callback and the failure callback, and that the broker ingress delivers
-/// failed-but-valid payloads through <c>SetResponse</c> instead of converting them at ingress.
+/// failed-but-valid payloads through the raw response path instead of converting them at ingress.
 /// </summary>
 public class LostSubscriberRoutingTests
 {
@@ -68,26 +68,24 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_FailedPayload_AsRawJson_InvokesFailureCallback()
+    public async Task Ingress_FailedPayload_AsRawJson_InvokesFailureCallback()
     {
         // The realistic redeploy scenario: the broker ingress delivers the response as an
         // untyped JsonElement; the payload type is only known from the recovery state.
         ArmRecoveryState();
-        var payload = JsonSerializer.Deserialize<object>("""{"Status":3,"Message":"remote step failed"}""");
 
-        await Publisher.SetResponse(payload, CorrelationId);
+        await Ingress.HandleResponseMessageAsync("""{"Status":3,"Message":"remote step failed"}""", CorrelationId);
 
         Assert.Empty(_spy.ResumedPayloads);
         Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
     }
 
     [Fact]
-    public async Task SetResponse_CompletedPayload_AsRawJson_InvokesResumeCallback()
+    public async Task Ingress_CompletedPayload_AsRawJson_InvokesResumeCallback()
     {
         ArmRecoveryState();
-        var payload = JsonSerializer.Deserialize<object>("""{"Status":2,"Message":"done"}""");
 
-        await Publisher.SetResponse(payload, CorrelationId);
+        await Ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"done"}""", CorrelationId);
 
         Assert.Single(_spy.ResumedPayloads);
         Assert.Empty(_spy.Failures);
@@ -117,14 +115,13 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_UnclassifiableRawJsonWithoutStoredType_FailsConservatively()
+    public async Task Ingress_UnclassifiableRawJsonWithoutStoredType_FailsConservatively()
     {
         // No stored payload type → the payload cannot be asked whether to resume, so it takes the
         // failure path rather than resume something the recovery process cannot understand.
         ArmRecoveryState(payloadTypeFullName: null);
-        var payload = JsonSerializer.Deserialize<object>("""{"Status":3,"Message":"unclassifiable without a stored type"}""");
 
-        await Publisher.SetResponse(payload, CorrelationId);
+        await Ingress.HandleResponseMessageAsync("""{"Status":3,"Message":"unclassifiable without a stored type"}""", CorrelationId);
 
         Assert.Empty(_spy.ResumedPayloads);
         Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));

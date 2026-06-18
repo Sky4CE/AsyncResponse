@@ -5,13 +5,12 @@ namespace AsyncResponse;
 /// Kafka, an HTTP webhook, …) to these methods to feed inbound messages into AsyncResponse.
 /// <para>
 /// The ingress deliberately makes only a <em>transport-level</em> decision: a message that
-/// parses as JSON is a response payload and is delivered through
-/// <see cref="IAsyncResponsePublisher.SetResponse{T}"/> untyped and uninterpreted — a payload
-/// whose domain state is failed is still a valid response that active waiters consume through
-/// their <c>Until</c> predicates. A message that does not parse carries no payload and is
-/// reported through <see cref="IAsyncResponsePublisher.SetException"/>. Domain-state
-/// classification happens only in the lost-subscriber fallback, because "nobody is listening"
-/// is only knowable after publishing.
+/// parses as JSON is a response payload and is delivered through the channel's raw ingress path
+/// untyped and uninterpreted — a payload whose domain state is failed is still a valid response
+/// that active waiters consume through their <c>Until</c> predicates. A message that does not
+/// parse carries no payload and is reported through <see cref="IAsyncResponsePublisher.SetException"/>.
+/// Domain-state classification happens only in the lost-subscriber fallback, because "nobody is
+/// listening" is only knowable after publishing.
 /// </para>
 /// </summary>
 public interface IAsyncResponseIngress

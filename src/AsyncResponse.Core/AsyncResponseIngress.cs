@@ -8,6 +8,7 @@ namespace AsyncResponse;
 /// and worker-job envelopes into this service without depending on a specific response channel.
 /// </summary>
 internal sealed class AsyncResponseIngress(
+    IRawAsyncResponsePublisher _rawPublisher,
     IAsyncResponsePublisher _publisher,
     WorkerJobExecutor _workerJobExecutor,
     AsyncResponseContextPropagation _propagation,
@@ -25,7 +26,7 @@ internal sealed class AsyncResponseIngress(
             _logger.LogDebug("Ingress received inbound response message: {Message}", messageJson);
 
             var response = JsonSafety.SafeDeserialize<object?>(messageJson);
-            await _publisher.SetResponse(response, correlationId).ConfigureAwait(false);
+            await _rawPublisher.SetRawResponse(response, correlationId).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

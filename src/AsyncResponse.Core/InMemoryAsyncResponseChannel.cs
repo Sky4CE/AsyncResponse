@@ -12,7 +12,7 @@ namespace AsyncResponse;
 /// Waiters, subscriptions, and recovery state are all in memory and disappear when the process
 /// exits.
 /// </summary>
-internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
+internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
 {
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, SubscriptionBase>> _subscriptions = new(StringComparer.Ordinal);
     private readonly IRecoveryStateStore _recoveryStateStore;
@@ -103,7 +103,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IA
         return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.CleanupOnceAsync);
     }
 
-    public async Task SetResponse<T>(T response, string? correlationId = null)
+    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId);
+
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
+        => SetResponseCore(response, correlationId);
+
+    private async Task SetResponseCore<T>(T response, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "inmemory");

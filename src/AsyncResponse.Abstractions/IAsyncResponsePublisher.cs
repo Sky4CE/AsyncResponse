@@ -22,7 +22,7 @@ public interface IAsyncResponsePublisher
     /// Optional correlation id; when <c>null</c>, the ambient
     /// <see cref="AsyncResponseContext.CorrelationId"/> is used.
     /// </param>
-    Task SetResponse<T>(T response, string? correlationId = null);
+    Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload;
 
     /// <summary>
     /// Publishes a technical failure on the channel associated with the specified correlation id.
