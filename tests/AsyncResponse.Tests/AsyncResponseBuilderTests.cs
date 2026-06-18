@@ -240,4 +240,188 @@ public class AsyncResponseBuilderTests
         Assert.Equal(nameof(IRecoverySpy.OnWorkerJob), published.Call.MethodName);
         Assert.Equal(7, Assert.Single(published.Call.Params).Value);
     }
+
+    [Fact]
+    public void WithTimeout_RejectsNonPositiveTimeout()
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithTimeout(TimeSpan.Zero));
+        Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithTimeout(TimeSpan.FromTicks(-1)));
+    }
+
+    [Fact]
+    public async Task WithReplyTarget_WithoutProvider_ThrowsWithGuidance()
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>()
+            .WithReplyTarget();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            builder.WaitAsync(_ => Task.CompletedTask));
+
+        Assert.Contains("reply target provider", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(null, "transport", "test://reply")]
+    [InlineData("default", null, "test://reply")]
+    [InlineData("default", "transport", null)]
+    public void WithReplyTarget_ValidatesExplicitTarget(string? name, string? transport, string? address)
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
+
+        Assert.ThrowsAny<ArgumentException>(() => builder.WithReplyTarget(new AsyncResponseReplyTarget
+        {
+            Name = name!,
+            Transport = transport!,
+            Address = address!
+        }));
+    }
+
+    [Fact]
+    public async Task TriggeredBuilder_InterfaceFluentMethodsPassConfiguredOptions()
+    {
+        ReflectionCallDto? resume = null;
+        ReflectionCallDto? failure = null;
+        TimeSpan? timeout = null;
+        Func<OperationResult, ValueTask<bool>>? predicate = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, r, f, p, t) => { resume = r; failure = f; predicate = p; timeout = t; })
+            .ReturnsAsync(_waiter.Object);
+        var resumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnResume),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
+        };
+        var failureCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnFailure),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+        };
+
+        IAsyncResponseTriggeredBuilder<OperationResult> builder = new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>();
+
+        await builder
+            .OnLostSubscriberResume(resumeCallback)
+            .OnLostSubscriberFailure(failureCallback)
+            .WithTimeout(TimeSpan.FromSeconds(3))
+            .Until(payload => payload.Status == OperationStatus.Completed)
+            .WaitAsync(_ => Task.CompletedTask);
+
+        Assert.Same(resumeCallback, resume);
+        Assert.Same(failureCallback, failure);
+        Assert.Equal(TimeSpan.FromSeconds(3), timeout);
+        Assert.NotNull(predicate);
+        Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
+        Assert.False(await predicate(new OperationResult { Status = OperationStatus.Running }));
+    }
+
+    [Fact]
+    public async Task TriggeredBuilder_ExpressionCallbacksAndTaskPredicate_PassConfiguredOptions()
+    {
+        ReflectionCallDto? resume = null;
+        ReflectionCallDto? failure = null;
+        Func<OperationResult, ValueTask<bool>>? predicate = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, r, f, p, _) => { resume = r; failure = f; predicate = p; })
+            .ReturnsAsync(_waiter.Object);
+
+        IAsyncResponseTriggeredBuilder<OperationResult> builder = new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>();
+
+        await builder
+            .OnLostSubscriberResume<IRecoverySpy>(spy => spy.OnResume(Placeholder.Payload<OperationResult>()))
+            .OnLostSubscriberFailure<IRecoverySpy>(spy => spy.OnFailure(Placeholder.Exception()))
+            .Until(payload => Task.FromResult(payload.Status == OperationStatus.Completed))
+            .WaitAsync(_ => Task.CompletedTask);
+
+        Assert.Equal(nameof(IRecoverySpy.OnResume), resume!.MethodName);
+        Assert.Equal(nameof(IRecoverySpy.OnFailure), failure!.MethodName);
+        Assert.NotNull(predicate);
+        Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
+    }
+
+    [Fact]
+    public async Task AttachedBuilder_ExplicitReplyTargetAndTaskPredicate_ArePassedToSubscriber()
+    {
+        AsyncResponseReplyTarget? observedReplyTarget = null;
+        Func<OperationResult, ValueTask<bool>>? predicate = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                "corr-1", It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, _, _, p, _) => predicate = p)
+            .ReturnsAsync(_waiter.Object);
+        var replyTarget = new AsyncResponseReplyTarget
+        {
+            Name = "explicit",
+            Transport = "test",
+            Address = "test://explicit"
+        };
+
+        await new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>("corr-1")
+            .WithReplyTarget(replyTarget)
+            .Until(payload => Task.FromResult(payload.Status == OperationStatus.Completed))
+            .WaitAsync();
+
+        Assert.NotNull(predicate);
+        Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
+        Assert.False(await predicate(new OperationResult { Status = OperationStatus.Running }));
+        _waiter.Verify(w => w.DisposeAsync(), Times.Once);
+
+        await new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>()
+            .WithReplyTarget(replyTarget)
+            .WaitAsync(context =>
+            {
+                observedReplyTarget = context.ReplyTarget;
+                return Task.CompletedTask;
+            });
+
+        Assert.Same(replyTarget, observedReplyTarget);
+    }
+
+    [Fact]
+    public async Task EnqueueWorker_ExpressionOverloadsSupportActionAndValueTask()
+    {
+        var transport = new Mock<IWorkerTransport>();
+        var calls = new List<ReflectionCallDto>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Callback<WorkerJobEnvelope, CancellationToken>((job, _) => calls.Add(job.Call))
+            .Returns(Task.CompletedTask);
+        var builder = new AsyncResponseBuilder(_subscriber.Object, transport.Object);
+
+        await builder.EnqueueWorkerAsync<IExpressionWorker>(worker => worker.Run(42));
+        await builder.EnqueueWorkerAsync<IExpressionWorker>(worker => worker.RunAsync());
+
+        Assert.Collection(
+            calls,
+            call =>
+            {
+                Assert.Equal(nameof(IExpressionWorker.Run), call.MethodName);
+                Assert.Equal(42, Assert.Single(call.Params).Value);
+            },
+            call => Assert.Equal(nameof(IExpressionWorker.RunAsync), call.MethodName));
+    }
+}
+
+public interface IExpressionWorker
+{
+    void Run(int value);
+    ValueTask RunAsync();
 }

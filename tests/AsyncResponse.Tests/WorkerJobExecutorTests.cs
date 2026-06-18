@@ -69,4 +69,116 @@ public class WorkerJobExecutorTests
 
         await Assert.ThrowsAsync<ArgumentNullException>(() => executor.ExecuteAsync(null!));
     }
+
+    [Fact]
+    public async Task MissingService_FaultsThroughExecutorErrorPath()
+    {
+        var provider = new ServiceCollection().BuildServiceProvider();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IWorkerProbe).FullName!,
+                MethodName = nameof(IWorkerProbe.RunAsync),
+                Params = []
+            },
+            CorrelationId = "cid-missing"
+        }));
+
+        Assert.Contains(nameof(IWorkerProbe), ex.Message);
+    }
+
+    [Fact]
+    public async Task InMemoryWorkerTransport_CanceledPublish_FaultsThroughProducerErrorPath()
+    {
+        var transport = new InMemoryWorkerTransport();
+        using var canceled = new CancellationTokenSource();
+        await canceled.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transport.PublishAsync(new WorkerJobEnvelope
+        {
+            CorrelationId = "cid-canceled",
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IWorkerProbe).FullName!,
+                MethodName = nameof(IWorkerProbe.RunAsync),
+                Params = []
+            }
+        }, canceled.Token));
+    }
+
+    [Fact]
+    public async Task InMemoryWorkerHost_ContinuesAfterFailedJobAndRunsWithoutCapturedExecutionContext()
+    {
+        var probe = new WorkerProbe();
+        var provider = new ServiceCollection().AddSingleton<IWorkerProbe>(probe).BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(
+            transport,
+            executor,
+            NullLogger<InMemoryWorkerHost>.Instance);
+
+        var flow = ExecutionContext.SuppressFlow();
+        try
+        {
+            await transport.PublishAsync(new WorkerJobEnvelope
+            {
+                CorrelationId = "cid-missing-service",
+                Call = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = "AsyncResponse.Tests.IMissingWorker",
+                    MethodName = nameof(IWorkerProbe.RunAsync),
+                    Params = []
+                }
+            });
+
+            await transport.PublishAsync(new WorkerJobEnvelope
+            {
+                CorrelationId = "cid-direct",
+                Call = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = typeof(IWorkerProbe).FullName!,
+                    MethodName = nameof(IWorkerProbe.RunAsync),
+                    Params = []
+                }
+            });
+        }
+        finally
+        {
+            flow.Undo();
+        }
+
+        await host.StartAsync(CancellationToken.None);
+        try
+        {
+            await WaitUntilAsync(() => probe.SeenCorrelationId == "cid-direct");
+        }
+        finally
+        {
+            await host.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Equal("cid-direct", probe.SeenCorrelationId);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+                return;
+
+            await Task.Delay(20);
+        }
+
+        throw new TimeoutException("Condition was not met in time.");
+    }
 }

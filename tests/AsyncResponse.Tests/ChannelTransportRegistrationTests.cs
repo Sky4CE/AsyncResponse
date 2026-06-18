@@ -1,8 +1,12 @@
+using AsyncResponse.Channels.Redis;
 using AsyncResponse.Transports.GooglePubSub;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Moq;
+using StackExchange.Redis;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -66,6 +70,51 @@ public class ChannelTransportRegistrationTests
         await validator.StopAsync(CancellationToken.None);
 
         Assert.Equal("Redis", provider.GetRequiredService<AsyncResponseChannelMarker>().Name);
+    }
+
+    [Fact]
+    public void RedisChannel_AppliesConfigureOptions()
+    {
+        var provider = Build(builder => builder.WithRedisChannel(options =>
+        {
+            options.KeyPrefix = "orders";
+            options.DefaultTimeout = TimeSpan.FromSeconds(11);
+        }));
+
+        var options = provider.GetRequiredService<IOptions<RedisAsyncResponseOptions>>().Value;
+        Assert.Equal("orders", options.KeyPrefix);
+        Assert.Equal(TimeSpan.FromSeconds(11), options.DefaultTimeout);
+    }
+
+    [Fact]
+    public void RedisChannel_ResolvedInterfacesShareStoreAndChannelInstances()
+    {
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer
+            .Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object?>()))
+            .Returns(Mock.Of<IDatabase>());
+        multiplexer
+            .Setup(m => m.GetSubscriber(It.IsAny<object?>()))
+            .Returns(Mock.Of<ISubscriber>());
+        var provider = Build(builder =>
+        {
+            builder.Services.AddSingleton(multiplexer.Object);
+            builder.WithRedisChannel();
+        });
+
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var scanner = provider.GetRequiredService<IRecoveryStateScanner>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+
+        Assert.Same(store, scanner);
+        Assert.IsType<RedisRecoveryStateStore>(store);
+        Assert.Same(publisher, rawPublisher);
+        Assert.Same(publisher, subscriber);
+        Assert.Same(publisher, probe);
+        Assert.IsType<RedisAsyncResponseChannel>(publisher);
     }
 
     [Fact]

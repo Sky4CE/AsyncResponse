@@ -13,21 +13,37 @@ namespace AsyncResponse.Transports.GooglePubSub;
 public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDisposable
 {
     private readonly GooglePubSubAsyncResponseOptions _options;
-    private readonly Lazy<Task<PublisherClient>> _publisher;
+    private readonly Lazy<Task<IGooglePubSubPublisherClient>> _publisher;
 
     public GooglePubSubWorkerTransport(IOptions<GooglePubSubAsyncResponseOptions> options)
+        : this(options, () => CreatePublisherAsync(options.Value))
+    {
+    }
+
+    internal GooglePubSubWorkerTransport(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        Func<Task<IGooglePubSubPublisherClient>> publisherFactory)
     {
         _options = options.Value;
-        var projectId = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
-        var topicId = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
+        _ = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
+        _ = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
+        _publisher = new Lazy<Task<IGooglePubSubPublisherClient>>(publisherFactory);
+    }
+
+    private static async Task<IGooglePubSubPublisherClient> CreatePublisherAsync(
+        GooglePubSubAsyncResponseOptions options)
+    {
+        var projectId = GooglePubSubOptionsValidator.Required(options.ProjectId, nameof(options.ProjectId));
+        var topicId = GooglePubSubOptionsValidator.Required(options.WorkerTopicId, nameof(options.WorkerTopicId));
         var topicName = TopicName.FromProjectTopic(projectId, topicId);
         // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
         // real Google Cloud otherwise — no behavior change in production.
-        _publisher = new Lazy<Task<PublisherClient>>(() => new PublisherClientBuilder
+        var publisher = await new PublisherClientBuilder
         {
             TopicName = topicName,
             EmulatorDetection = EmulatorDetection.EmulatorOrProduction
-        }.BuildAsync());
+        }.BuildAsync().ConfigureAwait(false);
+        return new GooglePubSubPublisherClientAdapter(publisher);
     }
 
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)

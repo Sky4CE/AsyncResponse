@@ -50,7 +50,12 @@ public class CallbackExpressionConverterTests
     public void ArgumentsReferencingTheServiceParameter_AreRejected()
         => Assert.Throws<NotSupportedException>(() =>
             CallbackExpressionConverter.ToReflectionCall<IFlowCallbacks>(flow => flow.ResumeAsync(
-                flow.ToString()!, Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId())));
+                flow.FlowName, Placeholder.Payload<OperationResult>(), Placeholder.CorrelationId())));
+
+    [Fact]
+    public void StaticMethodCallBodies_AreRejected()
+        => Assert.Throws<NotSupportedException>(() =>
+            CallbackExpressionConverter.ToReflectionCall<IFlowCallbacks>(_ => StaticResumeAsync()));
 
     [Fact]
     public void NonMethodCallBodies_AreRejected()
@@ -63,6 +68,9 @@ public class CallbackExpressionConverterTests
 
     public interface IFlowCallbacks
     {
+        string FlowName { get; }
         Task ResumeAsync(string flowName, OperationResult payload, string correlationId);
     }
+
+    private static Task StaticResumeAsync() => Task.CompletedTask;
 }

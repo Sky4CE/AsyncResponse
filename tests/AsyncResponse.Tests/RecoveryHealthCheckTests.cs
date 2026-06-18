@@ -1,4 +1,7 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -79,6 +82,28 @@ public class RecoveryHealthCheckTests
         var listed = Assert.IsAssignableFrom<System.Collections.IEnumerable>(result.Data["staleEntries"]);
         Assert.Equal(10, listed.Cast<object>().Count());
         Assert.Equal(2, result.Data["staleEntriesTruncated"]);
+    }
+
+    [Fact]
+    public async Task AddAsyncResponseRecoveryCheck_RegistersNamedHealthCheckAndState()
+    {
+        var services = new ServiceCollection();
+
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddHealthChecks().AddAsyncResponseRecoveryCheck("async-response-custom", ["ready"]);
+        await using var provider = services.BuildServiceProvider();
+
+        var state = provider.GetRequiredService<AsyncResponseWatchdogState>();
+        Assert.Same(state, provider.GetRequiredService<AsyncResponseWatchdogState>());
+
+        var health = await provider
+            .GetRequiredService<HealthCheckService>()
+            .CheckHealthAsync(_ => true);
+
+        Assert.Equal(HealthStatus.Healthy, health.Status);
+        var entry = Assert.Single(health.Entries);
+        Assert.Equal("async-response-custom", entry.Key);
+        Assert.Equal(HealthStatus.Healthy, entry.Value.Status);
     }
 
     private static async Task<HealthCheckResult> CheckAsync(Action<AsyncResponseWatchdogState> arrange)

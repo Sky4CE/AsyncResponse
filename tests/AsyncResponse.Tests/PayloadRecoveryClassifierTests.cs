@@ -71,4 +71,8 @@ public class PayloadRecoveryClassifierTests
         Assert.Null(PayloadRecoveryClassifier.ShouldResume(json, "Does.Not.Exist.Type"));
         Assert.Null(PayloadRecoveryClassifier.ShouldResume(json, typeof(string).FullName));
     }
+
+    [Fact]
+    public void RawJsonThatCannotMaterializeAsRegisteredType_ReturnsNull()
+        => Assert.Null(PayloadRecoveryClassifier.ShouldResume("not-json", typeof(OperationResult).FullName));
 }

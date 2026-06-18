@@ -1,4 +1,5 @@
 using Xunit;
+using System.Reflection;
 
 namespace AsyncResponse.Tests;
 
@@ -88,4 +89,79 @@ public class AsyncResponseContextTests
         Assert.Null(AsyncResponseContext.CorrelationId);
         Assert.Null(AsyncResponseContext.ReplyTarget);
     }
+
+    [Fact]
+    public void PushCorrelationId_RestoresPreviousValueAndIsIdempotent()
+    {
+        AsyncResponseContext.SetCorrelationId("outer");
+        try
+        {
+            var scope = PushCorrelationId("inner");
+
+            Assert.Equal("inner", AsyncResponseContext.CorrelationId);
+
+            scope.Dispose();
+            scope.Dispose();
+
+            Assert.Equal("outer", AsyncResponseContext.CorrelationId);
+
+            using (PushCorrelationId(" "))
+            {
+                Assert.Null(AsyncResponseContext.CorrelationId);
+            }
+
+            Assert.Equal("outer", AsyncResponseContext.CorrelationId);
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+        }
+    }
+
+    [Fact]
+    public void PushContext_RestoresCorrelationAndReplyTargetAndIsIdempotent()
+    {
+        var outer = new AsyncResponseReplyTarget
+        {
+            Name = "outer",
+            Transport = "test",
+            Address = "test://outer"
+        };
+        var inner = new AsyncResponseReplyTarget
+        {
+            Name = "inner",
+            Transport = "test",
+            Address = "test://inner"
+        };
+        AsyncResponseContext.SetCorrelationId("outer-corr");
+        AsyncResponseContext.SetReplyTarget(outer);
+        try
+        {
+            var scope = PushContext("inner-corr", inner);
+
+            Assert.Equal("inner-corr", AsyncResponseContext.CorrelationId);
+            Assert.Same(inner, AsyncResponseContext.ReplyTarget);
+
+            scope.Dispose();
+            scope.Dispose();
+
+            Assert.Equal("outer-corr", AsyncResponseContext.CorrelationId);
+            Assert.Same(outer, AsyncResponseContext.ReplyTarget);
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+            AsyncResponseContext.ClearReplyTarget();
+        }
+    }
+
+    private static IDisposable PushCorrelationId(string? correlationId)
+        => (IDisposable)typeof(AsyncResponseContext)
+            .GetMethod("PushCorrelationId", BindingFlags.Static | BindingFlags.NonPublic)!
+            .Invoke(null, [correlationId])!;
+
+    private static IDisposable PushContext(string? correlationId, AsyncResponseReplyTarget? replyTarget)
+        => (IDisposable)typeof(AsyncResponseContext)
+            .GetMethod("PushContext", BindingFlags.Static | BindingFlags.NonPublic)!
+            .Invoke(null, [correlationId, replyTarget])!;
 }

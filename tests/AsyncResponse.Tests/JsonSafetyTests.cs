@@ -40,6 +40,16 @@ public class JsonSafetyTests
     }
 
     [Fact]
+    public void MalformedJson_NonGenericDeserialize_ThrowsInvalidDataWrappingTheJsonException()
+    {
+        var ex = Assert.Throws<InvalidDataException>(
+            () => JsonSafety.SafeDeserialize("""{"Status": }""", typeof(OperationResult)));
+
+        Assert.Contains("Failed to parse JSON payload", ex.Message, StringComparison.Ordinal);
+        Assert.IsType<JsonException>(ex.InnerException);
+    }
+
+    [Fact]
     public void ValidJson_DeserializesCaseInsensitivelyByDefault()
     {
         // Default options are case-insensitive, mirroring how brokers may emit camelCase.
@@ -60,5 +70,15 @@ public class JsonSafetyTests
 
         Assert.NotNull(result);
         Assert.Equal(OperationStatus.Unknown, result!.Status); // unbound → enum default
+    }
+
+    [Fact]
+    public void NonGenericDeserialize_UsesDefaultCaseInsensitiveOptions()
+    {
+        var result = Assert.IsType<OperationResult>(
+            JsonSafety.SafeDeserialize("""{"status":2,"message":"done"}""", typeof(OperationResult)));
+
+        Assert.Equal(OperationStatus.Completed, result.Status);
+        Assert.Equal("done", result.Message);
     }
 }

@@ -2,12 +2,145 @@ using AsyncResponse.Transports.GooglePubSub;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.Options;
+using Moq;
+using System.Text.Json;
 using Xunit;
 
 namespace AsyncResponse.Tests;
 
 public class GooglePubSubTransportTests
 {
+    [Fact]
+    public void WorkerTransport_RequiresProjectAndTopic()
+    {
+        Assert.Throws<InvalidOperationException>(() => new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions { WorkerTopicId = "jobs" })));
+        Assert.Throws<InvalidOperationException>(() => new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions { ProjectId = "project-a" })));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_DisposeBeforePublish_DoesNotBuildPublisher()
+    {
+        var transport = new GooglePubSubWorkerTransport(Options.Create(new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerTopicId = "jobs"
+        }));
+
+        await transport.DisposeAsync();
+        await Assert.ThrowsAsync<ArgumentNullException>(() => transport.PublishAsync(null!));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishesSerializedJobAndShutsDownPublisher()
+    {
+        var publisher = new FakePublisherClient { MessageId = "message-1" };
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerTopicId = "jobs",
+            CorrelationIdAttribute = "async-correlation",
+            ShutdownTimeout = TimeSpan.FromSeconds(3)
+        };
+        var factoryCalls = 0;
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(options),
+            () =>
+            {
+                factoryCalls++;
+                return Task.FromResult<IGooglePubSubPublisherClient>(publisher);
+            });
+        var job = WorkerJob("corr-123");
+
+        await transport.PublishAsync(job);
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, factoryCalls);
+        var message = Assert.Single(publisher.Messages);
+        Assert.Equal("corr-123", message.Attributes["async-correlation"]);
+        var roundTripped = JsonSerializer.Deserialize<WorkerJobEnvelope>(message.Data.ToStringUtf8());
+        Assert.NotNull(roundTripped);
+        Assert.Equal("corr-123", roundTripped.CorrelationId);
+        Assert.Equal("DoWork", roundTripped.Call.MethodName);
+        Assert.Equal(1, publisher.ShutdownCalls);
+        Assert.Equal(options.ShutdownTimeout, publisher.LastShutdownTimeout);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_WhenCorrelationIdIsBlank_DoesNotAddAttribute()
+    {
+        var publisher = new FakePublisherClient();
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        await transport.PublishAsync(WorkerJob("  "));
+
+        var message = Assert.Single(publisher.Messages);
+        Assert.False(message.Attributes.ContainsKey("correlationId"));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_WhenPublisherFails_PropagatesException()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        var publisher = new FakePublisherClient { PublishException = failure };
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-1")));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_WhenPublishIsCanceled_PropagatesCancellation()
+    {
+        var publisher = new FakePublisherClient
+        {
+            PublishCompletion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => transport.PublishAsync(WorkerJob("corr-1"), cts.Token));
+    }
+
+    [Fact]
+    public async Task PublisherClientAdapter_DelegatesPublishAndShutdown()
+    {
+        var message = new PubsubMessage { Data = ByteString.CopyFromUtf8("{}") };
+        var timeout = TimeSpan.FromSeconds(2);
+        var publisher = new Mock<PublisherClient>();
+        publisher.Setup(p => p.PublishAsync(message)).ReturnsAsync("message-id");
+        publisher.Setup(p => p.ShutdownAsync(timeout)).Returns(Task.CompletedTask);
+        var adapter = new GooglePubSubPublisherClientAdapter(publisher.Object);
+
+        var messageId = await adapter.PublishAsync(message);
+        await adapter.ShutdownAsync(timeout);
+
+        Assert.Equal("message-id", messageId);
+        publisher.Verify(p => p.PublishAsync(message), Times.Once);
+        publisher.Verify(p => p.ShutdownAsync(timeout), Times.Once);
+    }
+
     [Fact]
     public void ReplyTargetProvider_UsesResponseTopicAsDefaultTarget()
     {
@@ -111,5 +244,126 @@ public class GooglePubSubTransportTests
             new GooglePubSubAsyncResponseOptions { CorrelationIdJsonPaths = null! });
 
         Assert.Null(correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_WhenJsonIsInvalid_ReturnsNull()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"CorrelationId": }""",
+            new GooglePubSubAsyncResponseOptions());
+
+        Assert.Null(correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_WhenJsonRootIsNull_ReturnsNull()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            "null",
+            new GooglePubSubAsyncResponseOptions());
+
+        Assert.Null(correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_IgnoresBlankPathsAndReadsCaseInsensitiveProperty()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"correlationid":"case-insensitive"}""",
+            new GooglePubSubAsyncResponseOptions
+            {
+                CorrelationIdJsonPaths = [" ", "CorrelationId"]
+            });
+
+        Assert.Equal("case-insensitive", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_ReturnsNumericJsonValueAsString()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"CorrelationId":12345}""",
+            new GooglePubSubAsyncResponseOptions());
+
+        Assert.Equal("12345", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_WhenPathCannotTraverseObject_ReturnsNull()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"CorrelationId":"corr-1"}""",
+            new GooglePubSubAsyncResponseOptions
+            {
+                CorrelationIdJsonPaths = ["CorrelationId.Value"]
+            });
+
+        Assert.Null(correlationId);
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_WhenNestedJsonStringIsInvalid_FallsBackToNull()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"CustomParameters":"{\"CorrelationId\":"}""",
+            new GooglePubSubAsyncResponseOptions
+            {
+                CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+            });
+
+        Assert.Null(correlationId);
+    }
+
+    private static WorkerJobEnvelope WorkerJob(string? correlationId)
+        => new()
+        {
+            CorrelationId = correlationId,
+            ReplyTarget = new AsyncResponseReplyTarget
+            {
+                Name = "reply",
+                Transport = GooglePubSubAsyncResponseOptions.TransportName,
+                Address = "projects/project-a/topics/responses",
+                Properties = new Dictionary<string, string> { ["topicId"] = "responses" }
+            },
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "AsyncResponse.Tests.IWorker",
+                MethodName = "DoWork",
+                Params = [CallbackParam.ForValue(42)]
+            }
+        };
+
+    private sealed class FakePublisherClient : IGooglePubSubPublisherClient
+    {
+        public List<PubsubMessage> Messages { get; } = [];
+        public string MessageId { get; init; } = "message-id";
+        public Exception? PublishException { get; init; }
+        public TaskCompletionSource<string>? PublishCompletion { get; init; }
+        public int ShutdownCalls { get; private set; }
+        public TimeSpan? LastShutdownTimeout { get; private set; }
+
+        public Task<string> PublishAsync(PubsubMessage message)
+        {
+            Messages.Add(message);
+
+            if (PublishException is not null)
+                return Task.FromException<string>(PublishException);
+
+            return PublishCompletion?.Task ?? Task.FromResult(MessageId);
+        }
+
+        public Task ShutdownAsync(TimeSpan timeout)
+        {
+            ShutdownCalls++;
+            LastShutdownTimeout = timeout;
+            return Task.CompletedTask;
+        }
     }
 }

@@ -7,21 +7,36 @@ using System.Diagnostics;
 
 namespace AsyncResponse.Transports.GooglePubSub;
 
-internal abstract class GooglePubSubSubscriberService(
-    IOptions<GooglePubSubAsyncResponseOptions> options,
-    ILogger logger) : BackgroundService
+internal abstract class GooglePubSubSubscriberService : BackgroundService
 {
-    protected GooglePubSubAsyncResponseOptions Options { get; } = options.Value;
-    protected ILogger Logger { get; } = logger;
+    private readonly Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
+
+    protected GooglePubSubSubscriberService(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        ILogger logger)
+        : this(options, logger, CreateSubscriberAsync)
+    {
+    }
+
+    protected GooglePubSubSubscriberService(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        ILogger logger,
+        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+    {
+        Options = options.Value;
+        Logger = logger;
+        _subscriberFactory = subscriberFactory;
+    }
+
+    protected GooglePubSubAsyncResponseOptions Options { get; }
+    protected ILogger Logger { get; }
 
     protected abstract string SubscriptionId { get; }
     protected abstract Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken);
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
+        SubscriptionName subscriptionName)
     {
-        var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
-        var subscriptionId = SubscriptionId;
-        var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
         // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
         // real Google Cloud otherwise — no behavior change in production.
         var subscriber = await new SubscriberClientBuilder
@@ -29,6 +44,15 @@ internal abstract class GooglePubSubSubscriberService(
             SubscriptionName = subscriptionName,
             EmulatorDetection = EmulatorDetection.EmulatorOrProduction
         }.BuildAsync().ConfigureAwait(false);
+        return new GooglePubSubSubscriberClientAdapter(subscriber);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
+        var subscriptionId = SubscriptionId;
+        var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
+        var subscriber = await _subscriberFactory(subscriptionName).ConfigureAwait(false);
 
         Logger.LogInformation("Pub/Sub subscriber started. Subscription: {Subscription}.", subscriptionName.ToString());
 
@@ -76,23 +100,59 @@ internal abstract class GooglePubSubSubscriberService(
 
 }
 
-internal sealed class GooglePubSubWorkerSubscriber(
-    IOptions<GooglePubSubAsyncResponseOptions> options,
-    IAsyncResponseIngress ingress,
-    ILogger<GooglePubSubWorkerSubscriber> logger) : GooglePubSubSubscriberService(options, logger)
+internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberService
 {
+    private readonly IAsyncResponseIngress _ingress;
+
+    public GooglePubSubWorkerSubscriber(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        IAsyncResponseIngress ingress,
+        ILogger<GooglePubSubWorkerSubscriber> logger)
+        : base(options, logger)
+    {
+        _ingress = ingress;
+    }
+
+    internal GooglePubSubWorkerSubscriber(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        IAsyncResponseIngress ingress,
+        ILogger<GooglePubSubWorkerSubscriber> logger,
+        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        : base(options, logger, subscriberFactory)
+    {
+        _ingress = ingress;
+    }
+
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.WorkerSubscriptionId, nameof(Options.WorkerSubscriptionId));
 
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
-        => ingress.HandleWorkerMessageAsync(message.Data.ToStringUtf8());
+        => _ingress.HandleWorkerMessageAsync(message.Data.ToStringUtf8());
 }
 
-internal sealed class GooglePubSubResponseIngressSubscriber(
-    IOptions<GooglePubSubAsyncResponseOptions> options,
-    IAsyncResponseIngress ingress,
-    ILogger<GooglePubSubResponseIngressSubscriber> logger) : GooglePubSubSubscriberService(options, logger)
+internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscriberService
 {
+    private readonly IAsyncResponseIngress _ingress;
+
+    public GooglePubSubResponseIngressSubscriber(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        IAsyncResponseIngress ingress,
+        ILogger<GooglePubSubResponseIngressSubscriber> logger)
+        : base(options, logger)
+    {
+        _ingress = ingress;
+    }
+
+    internal GooglePubSubResponseIngressSubscriber(
+        IOptions<GooglePubSubAsyncResponseOptions> options,
+        IAsyncResponseIngress ingress,
+        ILogger<GooglePubSubResponseIngressSubscriber> logger,
+        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        : base(options, logger, subscriberFactory)
+    {
+        _ingress = ingress;
+    }
+
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.ResponseSubscriptionId, nameof(Options.ResponseSubscriptionId));
 
@@ -100,6 +160,6 @@ internal sealed class GooglePubSubResponseIngressSubscriber(
     {
         var messageJson = message.Data.ToStringUtf8();
         var correlationId = GooglePubSubCorrelationIdExtractor.Extract(message, messageJson, Options);
-        return ingress.HandleResponseMessageAsync(messageJson, correlationId);
+        return _ingress.HandleResponseMessageAsync(messageJson, correlationId);
     }
 }
