@@ -195,7 +195,10 @@ internal static class StressRunner
                     allProcessed.TrySetResult();
                 return Task.CompletedTask;
             },
-            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubAsyncResponseOptions
+            {
+                HostShutdownTimeout = TimeSpan.FromSeconds(90)
+            },
             new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: workerCount,
                 backgroundQueueCapacity: Math.Max(count, concurrency),

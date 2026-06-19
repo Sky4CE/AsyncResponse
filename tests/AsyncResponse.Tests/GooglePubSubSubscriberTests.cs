@@ -2,9 +2,11 @@ using AsyncResponse.Transports.GooglePubSub;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Google.Api.Gax.ResourceNames;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
+using System.Diagnostics;
 using System.Reflection;
 using Xunit;
 
@@ -179,6 +181,7 @@ public class GooglePubSubSubscriberTests
     {
         var client = new FakeSubscriberClient();
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failureReported = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var ingress = new Mock<IAsyncResponseIngress>();
         ingress
             .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
@@ -196,6 +199,11 @@ public class GooglePubSubSubscriberTests
             backgroundWorkerCount: 1,
             backgroundQueueCapacity: 8,
             backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
         var subscriber = new GooglePubSubWorkerSubscriber(
             Options.Create(options),
             ingress.Object,
@@ -213,6 +221,11 @@ public class GooglePubSubSubscriberTests
 
         Assert.Equal(SubscriberClient.Reply.Ack, reply);
         await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var failure = await failureReported.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("workers", failure.SubscriptionId);
+        Assert.Equal("Worker", failure.SubscriberRole);
+        Assert.Equal("message-background-failure", failure.MessageId);
+        Assert.IsType<InvalidOperationException>(failure.Exception);
         await subscriber.StopAsync(CancellationToken.None);
     }
 
@@ -384,6 +397,88 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_BackgroundFailureLogsOnceAndInvokesHook()
+    {
+        var logger = new ListLogger();
+        var failureReported = new TaskCompletionSource<GooglePubSubBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriberOptions = new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        subscriberOptions.OnBackgroundFailure = context =>
+        {
+            failureReported.TrySetResult(context);
+            return ValueTask.CompletedTask;
+        };
+
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => Task.FromException(new InvalidOperationException("queued-handler-failure")),
+            new GooglePubSubAsyncResponseOptions(),
+            subscriberOptions,
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        var reply = await dispatcher.HandleAsync(Message("message-logged-once"), CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        await failureReported.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var handlerFailureLogs = logger.Entries
+            .Where(entry => entry.Level == LogLevel.Error)
+            .Where(entry => entry.Exception is InvalidOperationException)
+            .ToList();
+        Assert.Single(handlerFailureLogs);
+        Assert.Contains("already-ACKed message", handlerFailureLogs[0].Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_CancelsRunningHandlerAfterDrainTimeout()
+    {
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = GooglePubSubMessageDispatcher.Create(
+            async (_, cancellationToken) =>
+            {
+                handlerStarted.TrySetResult();
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    cancellationObserved.TrySetResult();
+                    throw;
+                }
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: 1,
+                backgroundQueueCapacity: 8,
+                backgroundDrainTimeout: TimeSpan.FromMilliseconds(50)),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        try
+        {
+            Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-cancelled"), CancellationToken.None));
+            await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var elapsed = Stopwatch.StartNew();
+            await dispatcher.DisposeAsync();
+            elapsed.Stop();
+
+            await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(elapsed.Elapsed >= TimeSpan.FromMilliseconds(40));
+            Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task SubscriberClientAdapter_DelegatesStartAndStop()
     {
         Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler =
@@ -447,6 +542,38 @@ public class GooglePubSubSubscriberTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
 
         Assert.Contains(nameof(GooglePubSubSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
+        Assert.False(factoryCalled);
+    }
+
+    [Fact]
+    public async Task SubscriberService_AckAfterEnqueueDrainBudgetExceedsHostShutdownBudget_FailsBeforeCreatingClient()
+    {
+        var factoryCalled = false;
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromSeconds(20),
+            HostShutdownTimeout = TimeSpan.FromSeconds(25)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(10));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ =>
+            {
+                factoryCalled = true;
+                return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
+            });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
+
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout), ex.Message, StringComparison.Ordinal);
         Assert.False(factoryCalled);
     }
 
@@ -590,6 +717,36 @@ public class GooglePubSubSubscriberTests
             LastShutdownOptions = options;
             _run.TrySetResult();
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class ListLogger : ILogger
+    {
+        public List<LogEntry> Entries { get; } = [];
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+    }
+
+    private sealed record LogEntry(LogLevel Level, string Message, Exception? Exception);
+
+    private sealed class NullScope : IDisposable
+    {
+        public static readonly NullScope Instance = new();
+
+        public void Dispose()
+        {
         }
     }
 }

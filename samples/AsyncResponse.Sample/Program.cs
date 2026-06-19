@@ -33,6 +33,7 @@ if (useRedis)
 // (emulator-only; no-op against real GCP). Registered first so its StartAsync completes first.
 if (useGooglePubSub)
 {
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services);
     builder.Services.AddHostedService<PubSubEmulatorProvisioner>();
     builder.Services.AddSingleton(_ => new Lazy<Task<PublisherServiceApiClient>>(() => new PublisherServiceApiClientBuilder
     {
@@ -72,6 +73,7 @@ if (useGooglePubSub)
         options.WorkerSubscriptionId = builder.Configuration["PubSub:WorkerSubscriptionId"];
         options.ResponseTopicId = builder.Configuration["PubSub:ResponseTopicId"];
         options.ResponseSubscriptionId = builder.Configuration["PubSub:ResponseSubscriptionId"];
+        ConfigurePubSubShutdownBudget(builder.Configuration, options);
         ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Worker", options.WorkerSubscriber);
         ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
     });
@@ -153,6 +155,36 @@ static string NormalizeBehavior(string? behavior)
         "timeout" => "timeout",
         _ => "succeed"
     };
+
+static void ConfigurePubSubShutdownBudget(
+    IConfiguration configuration,
+    GooglePubSubAsyncResponseOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "PubSub:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
+static void ConfigureHostShutdownBudget(
+    IConfiguration configuration,
+    IServiceCollection services)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "PubSub:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        services.Configure<HostOptions>(options => options.ShutdownTimeout = timeout.Value);
+}
+
+static TimeSpan? ReadOptionalPositiveTimeout(IConfiguration configuration, string key)
+{
+    var rawValue = configuration[key];
+    if (string.IsNullOrWhiteSpace(rawValue))
+        return null;
+
+    if (!int.TryParse(rawValue, out var seconds) || seconds <= 0)
+        throw new InvalidOperationException($"{key} must be a positive integer when set.");
+
+    return TimeSpan.FromSeconds(seconds);
+}
 
 static void ConfigureSubscriberAckMode(
     IConfiguration configuration,

@@ -72,6 +72,14 @@ public sealed class GooglePubSubAsyncResponseOptions
     /// <summary>How long hosted subscribers/publishers are allowed to shut down gracefully.</summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// The hosting shutdown budget that must contain Pub/Sub client shutdown plus
+    /// <see cref="GooglePubSubSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
+    /// <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
+    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// </summary>
+    public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Adds or replaces a named Google Pub/Sub reply target.</summary>
     public GooglePubSubAsyncResponseOptions AddReplyTarget(string name, string projectId, string topicId)
     {

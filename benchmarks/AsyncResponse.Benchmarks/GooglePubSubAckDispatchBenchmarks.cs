@@ -28,7 +28,10 @@ public class GooglePubSubAckDispatchBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var transportOptions = new GooglePubSubAsyncResponseOptions();
+        var transportOptions = new GooglePubSubAsyncResponseOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(60)
+        };
         _awaiting = GooglePubSubMessageDispatcher.Create(
             (_, _) => Task.CompletedTask,
             transportOptions,

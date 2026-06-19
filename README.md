@@ -182,6 +182,11 @@ redelivery when the handler throws. For worker jobs that can run longer than the
 you can explicitly opt the worker subscription into ACK-after-enqueue behavior:
 
 ```csharp
+builder.Services.Configure<HostOptions>(host =>
+{
+    host.ShutdownTimeout = TimeSpan.FromMinutes(3);
+});
+
 builder.Services.AddAsyncResponse()
     .WithRedisChannel()
     .WithGooglePubSubTransport(options =>
@@ -192,16 +197,29 @@ builder.Services.AddAsyncResponse()
         options.ResponseTopicId = "asyncresponse-responses";
         options.ResponseSubscriptionId = "asyncresponse-responses-sub";
 
+        options.HostShutdownTimeout = TimeSpan.FromMinutes(3);
         options.WorkerSubscriber.UseAckAfterEnqueue(
             backgroundWorkerCount: 64,
             backgroundQueueCapacity: 10_000,
             backgroundDrainTimeout: TimeSpan.FromMinutes(2));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            // Alert, increment a metric, or publish context.Message to a durable failure path.
+            return ValueTask.CompletedTask;
+        };
     });
 ```
 
 This is intentionally opt-in. With `AckAfterEnqueue`, Pub/Sub is ACKed once the message is accepted
 into a bounded in-process queue; if the process dies after that point, Pub/Sub will not redeliver
 that message. If the queue is full or draining, the subscriber returns NACK so Pub/Sub can retry.
+If a background handler fails after ACK, the failure is logged and reported through
+`OnBackgroundFailure`; use that hook for operator-visible metrics, alerting, or a durable
+dead-letter path. The transport validates that `ShutdownTimeout + BackgroundDrainTimeout` fits
+inside `HostShutdownTimeout` (30 seconds by default, matching the Generic Host default), so mirror
+any custom `HostOptions.ShutdownTimeout` value in the transport options. With more than one
+background worker, handling is concurrent and message ordering is not preserved; use one worker for
+order-sensitive subscriptions or Pub/Sub ordering-key workflows.
 Keep response ingress on the default `AckAfterHandlerCompletes` unless response processing is also
 durable enough to tolerate early ACK.
 

@@ -57,6 +57,7 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-early-ack", launchP
     .WithEnvironment("PubSub:Worker:BackgroundWorkerCount", "4")
     .WithEnvironment("PubSub:Worker:BackgroundQueueCapacity", "256")
     .WithEnvironment("PubSub:Worker:BackgroundDrainTimeoutSeconds", "10")
+    .WithEnvironment("PubSub:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", EarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")

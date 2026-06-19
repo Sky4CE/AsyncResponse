@@ -45,7 +45,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         string subscriptionId,
         GooglePubSubSubscriberRole role)
     {
-        ValidateOptions(subscriberOptions, role);
+        ValidateOptions(transportOptions, subscriberOptions, role);
 
         return subscriberOptions.AckMode switch
         {
@@ -68,7 +68,10 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         };
     }
 
-    public static void ValidateOptions(GooglePubSubSubscriberOptions subscriberOptions, GooglePubSubSubscriberRole role)
+    public static void ValidateOptions(
+        GooglePubSubAsyncResponseOptions transportOptions,
+        GooglePubSubSubscriberOptions subscriberOptions,
+        GooglePubSubSubscriberRole role)
     {
         var optionPath = role is GooglePubSubSubscriberRole.Worker
             ? $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriber)}"
@@ -100,6 +103,34 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
                         $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
                 }
 
+                if (transportOptions.ShutdownTimeout <= TimeSpan.Zero)
+                {
+                    throw new InvalidOperationException(
+                        $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)} must be positive.");
+                }
+
+                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
+                {
+                    if (hostShutdownTimeout <= TimeSpan.Zero)
+                    {
+                        throw new InvalidOperationException(
+                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)} must be positive when set.");
+                    }
+
+                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
+                    if (requiredShutdownBudget > hostShutdownTimeout)
+                    {
+                        throw new InvalidOperationException(
+                            $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)} plus " +
+                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)} " +
+                            $"requires {requiredShutdownBudget}, which exceeds " +
+                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)} " +
+                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
+                            $"and mirror that value in {nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)}, " +
+                            "or reduce the Pub/Sub shutdown/drain timeouts.");
+                    }
+                }
+
                 return;
 
             default:
@@ -114,7 +145,10 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
 
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
-    protected async Task ExecuteHandlerAsync(PubsubMessage message, CancellationToken cancellationToken)
+    protected async Task ExecuteHandlerAsync(
+        PubsubMessage message,
+        CancellationToken cancellationToken,
+        bool logFailures = true)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.pubsub.receive",
@@ -135,9 +169,38 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            Logger.LogError(ex, "Pub/Sub message handling failed for message {MessageId}.", message.MessageId);
+            if (logFailures)
+                Logger.LogError(ex, "Pub/Sub message handling failed for message {MessageId}.", message.MessageId);
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
+        }
+    }
+
+    protected async ValueTask NotifyBackgroundFailureAsync(
+        PubsubMessage message,
+        Exception exception,
+        string subscriptionId,
+        GooglePubSubSubscriberRole role)
+    {
+        var callback = _subscriberOptions.OnBackgroundFailure;
+        if (callback is null)
+            return;
+
+        try
+        {
+            await callback(new GooglePubSubBackgroundFailureContext(
+                subscriptionId,
+                role.ToString(),
+                message,
+                exception)).ConfigureAwait(false);
+        }
+        catch (Exception callbackException)
+        {
+            Logger.LogError(
+                callbackException,
+                "Pub/Sub background failure callback failed for already-ACKed message {MessageId} on {SubscriptionId}.",
+                message.MessageId,
+                subscriptionId);
         }
     }
 }
@@ -171,8 +234,10 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
 {
     private readonly Channel<PubsubMessage> _queue;
     private readonly Task[] _workers;
+    private readonly CancellationTokenSource _drainCancellation = new();
     private readonly TimeSpan _drainTimeout;
     private readonly string _subscriptionId;
+    private readonly GooglePubSubSubscriberRole _role;
     private int _pendingCount;
     private int _runningCount;
     private int _disposeStarted;
@@ -188,9 +253,12 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
         _subscriptionId = subscriptionId;
+        _role = role;
         _queue = Channel.CreateBounded<PubsubMessage>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
         {
             AllowSynchronousContinuations = false,
+            // TryWrite never waits; NACK-on-full comes from TryWrite returning false. Keep Wait so
+            // any future WriteAsync usage would apply backpressure instead of dropping messages.
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
             SingleWriter = false
@@ -261,6 +329,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         try
         {
             await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            _drainCancellation.Dispose();
             Logger.LogInformation(
                 "Drained Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}.",
                 _subscriptionId,
@@ -269,6 +338,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         }
         catch (TimeoutException ex)
         {
+            _drainCancellation.Cancel();
             Logger.LogWarning(
                 ex,
                 "Timed out while draining Pub/Sub ACK-after-enqueue dispatcher for {SubscriptionId}. Pending={PendingCount}, Running={RunningCount}. Already ACKed work may be interrupted by host shutdown.",
@@ -294,7 +364,10 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                     _subscriptionId,
                     PendingCount,
                     RunningCount);
-                await ExecuteHandlerAsync(message, CancellationToken.None).ConfigureAwait(false);
+                await ExecuteHandlerAsync(
+                    message,
+                    _drainCancellation.Token,
+                    logFailures: false).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -303,6 +376,11 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                     "Pub/Sub background handler failed for already-ACKed message {MessageId} on {SubscriptionId}.",
                     message.MessageId,
                     _subscriptionId);
+                await NotifyBackgroundFailureAsync(
+                    message,
+                    ex,
+                    _subscriptionId,
+                    _role).ConfigureAwait(false);
             }
             finally
             {

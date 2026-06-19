@@ -52,7 +52,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionId = SubscriptionId;
-        GooglePubSubMessageDispatcher.ValidateOptions(SubscriberOptions, SubscriberRole);
+        GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
         var subscriber = await _subscriberFactory(subscriptionName).ConfigureAwait(false);
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(

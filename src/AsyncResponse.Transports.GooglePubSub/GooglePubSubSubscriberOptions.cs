@@ -1,3 +1,5 @@
+using Google.Cloud.PubSub.V1;
+
 namespace AsyncResponse.Transports.GooglePubSub;
 
 /// <summary>
@@ -13,9 +15,45 @@ public enum GooglePubSubAckMode
 
     /// <summary>
     /// ACK immediately after the message is accepted into a bounded in-process background queue.
-    /// Handler failures are logged because Pub/Sub has already been ACKed.
+    /// Handler failures are logged and reported through
+    /// <see cref="GooglePubSubSubscriberOptions.OnBackgroundFailure"/> because Pub/Sub has already
+    /// been ACKed.
     /// </summary>
     AckAfterEnqueue = 1
+}
+
+/// <summary>
+/// Describes a handler failure that happened after a Google Pub/Sub message was already ACKed by
+/// <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>.
+/// </summary>
+public sealed class GooglePubSubBackgroundFailureContext
+{
+    internal GooglePubSubBackgroundFailureContext(
+        string subscriptionId,
+        string subscriberRole,
+        PubsubMessage message,
+        Exception exception)
+    {
+        SubscriptionId = subscriptionId;
+        SubscriberRole = subscriberRole;
+        Message = message;
+        Exception = exception;
+    }
+
+    /// <summary>The subscription whose background worker was handling the message.</summary>
+    public string SubscriptionId { get; }
+
+    /// <summary>The logical subscriber role, such as <c>Worker</c> or <c>ResponseIngress</c>.</summary>
+    public string SubscriberRole { get; }
+
+    /// <summary>The Pub/Sub message that failed after being ACKed.</summary>
+    public PubsubMessage Message { get; }
+
+    /// <summary>The Pub/Sub message id, when provided by Google Pub/Sub.</summary>
+    public string MessageId => Message.MessageId;
+
+    /// <summary>The exception thrown by the background handler.</summary>
+    public Exception Exception { get; }
 }
 
 /// <summary>
@@ -32,6 +70,8 @@ public sealed class GooglePubSubSubscriberOptions
     /// <summary>
     /// Number of background workers used by <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>.
     /// Must be explicitly set to a positive value for early ACK mode.
+    /// Values greater than one allow concurrent handling and therefore do not preserve message
+    /// ordering.
     /// </summary>
     public int BackgroundWorkerCount { get; set; }
 
@@ -46,6 +86,13 @@ public sealed class GooglePubSubSubscriberOptions
     /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops.
     /// </summary>
     public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Optional callback invoked when a background handler fails after the message was already ACKed.
+    /// Use it to publish to a dead-letter path, increment operator-visible metrics, or alert on
+    /// already-ACKed work that Pub/Sub cannot redeliver.
+    /// </summary>
+    public Func<GooglePubSubBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 
     /// <summary>
     /// Explicitly opts this subscriber into ACK-after-enqueue behavior.
