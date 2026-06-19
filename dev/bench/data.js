@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781870477008,
+  "lastUpdate": 1781870478581,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -7013,6 +7013,135 @@ window.BENCHMARK_DATA = {
           {
             "name": "watchdog-scan-storm allocations",
             "value": 63.556,
+            "unit": "B/entry"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "b5b9a73f55bc399e5ec9114ed56d830f24d4d855",
+          "message": "InMemoryAsyncResponseChannel perf optimization",
+          "timestamp": "2026-06-19T13:53:24+02:00",
+          "tree_id": "430c87e41f483954b7a059e3043d430bf4efa341",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/b5b9a73f55bc399e5ec9114ed56d830f24d4d855"
+        },
+        "date": 1781870478188,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0251,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1610.10336,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 0.0288,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 2496.88,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 2863.31904,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0136,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1474.99904,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.029,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1851.95488,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 0.9547,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4379.4624,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 3.0957,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8502.77632,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 28.0592,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 2742.156,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0217,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1155.984,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.0505,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2725.6672,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 8.3685,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 62.7376,
             "unit": "B/entry"
           }
         ]
