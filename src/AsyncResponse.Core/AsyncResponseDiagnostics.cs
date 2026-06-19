@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace AsyncResponse;
 
@@ -23,21 +24,32 @@ public static class AsyncResponseDiagnostics
         ActivityKind kind = ActivityKind.Internal,
         string? correlationId = null)
     {
+        if (!ActivitySource.HasListeners())
+            return null;
+
         var activity = ActivitySource.StartActivity(name, kind);
-        SetCorrelationId(activity, correlationId);
+        if (correlationId is not null)
+            SetCorrelationId(activity, correlationId);
+
         return activity;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetCorrelationId(Activity? activity, string? correlationId)
     {
-        if (!string.IsNullOrWhiteSpace(correlationId))
-            activity?.SetTag("asyncresponse.correlation_id", correlationId);
+        if (activity is null || string.IsNullOrWhiteSpace(correlationId))
+            return;
+
+        activity.SetTag("asyncresponse.correlation_id", correlationId);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetPayloadType(Activity? activity, Type? payloadType)
     {
-        if (payloadType is not null)
-            activity?.SetTag("asyncresponse.payload_type", payloadType.FullName ?? payloadType.Name);
+        if (activity is null || payloadType is null)
+            return;
+
+        activity.SetTag("asyncresponse.payload_type", payloadType.FullName ?? payloadType.Name);
     }
 
     internal static void SetReplyTarget(Activity? activity, AsyncResponseReplyTarget? replyTarget)
