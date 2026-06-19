@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781867084907,
+  "lastUpdate": 1781870138040,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -7710,6 +7710,75 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/Sky4CE/AsyncResponse/commit/a95672f4df5a479d9f48b963078061da6aa84509"
         },
         "date": 1781866753629,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "request_response_domain_failure_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "attach_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "worker_pubsub_observed throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_success_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "multi_step_domain_failure_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "ambient_exception_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "shared_exception_fanout_redis throughput",
+            "value": 20,
+            "unit": "req/s"
+          },
+          {
+            "name": "reply_target_pubsub throughput",
+            "value": 20,
+            "unit": "req/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "b5b9a73f55bc399e5ec9114ed56d830f24d4d855",
+          "message": "InMemoryAsyncResponseChannel perf optimization",
+          "timestamp": "2026-06-19T13:53:24+02:00",
+          "tree_id": "430c87e41f483954b7a059e3043d430bf4efa341",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/b5b9a73f55bc399e5ec9114ed56d830f24d4d855"
+        },
+        "date": 1781870137451,
         "tool": "customBiggerIsBetter",
         "benches": [
           {
