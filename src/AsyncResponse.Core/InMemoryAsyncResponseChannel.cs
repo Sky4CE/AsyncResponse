@@ -46,7 +46,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         if (string.IsNullOrWhiteSpace(correlationId))
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
-        completionPredicate ??= _ => new ValueTask<bool>(true);
+        var hasCustomPredicate = completionPredicate is not null;
+        completionPredicate ??= static _ => new ValueTask<bool>(true);
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
 
         if (timeout <= TimeSpan.Zero)
@@ -63,7 +64,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             timeout.Value,
             completionPredicate,
             activity,
-            ExecutionContext.Capture());
+            // Only restore the subscribe-time ambient context during dispatch when there is a user
+            // completion predicate to run under it. With the default (always-complete) predicate,
+            // nothing on the dispatch path observes ambient context, so capturing it would only buy
+            // a per-dispatch ExecutionContext.Run plus its capturing closure. The waiter's own
+            // continuation flows its own context regardless (RunContinuationsAsynchronously).
+            hasCustomPredicate ? ExecutionContext.Capture() : null);
 
         AddSubscription(correlationId, subscription);
 
