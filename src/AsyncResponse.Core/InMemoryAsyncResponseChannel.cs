@@ -108,68 +108,27 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
         => SetRawResponseJsonCore(new RawJsonResponse(responseJson), correlationId);
 
-    private Task SetResponseCore<T>(T response, string? correlationId)
-        => PublishResponseCore(
-            response,
-            correlationId,
-            ResponsePublishKind.Typed,
-            typeof(T),
-            static response => response,
-            static (subscribers, response) => DispatchResponsesAsync(subscribers, response));
-
-    private Task SetRawResponseJsonCore(RawJsonResponse response, string? correlationId)
-        => PublishResponseCore(
-            response,
-            correlationId,
-            ResponsePublishKind.RawJson,
-            payloadType: null,
-            static response => response.DeserializeUntyped(),
-            static (subscribers, response) => DispatchRawJsonResponsesAsync(subscribers, response));
-
-    private async Task PublishResponseCore<TResponse>(
-        TResponse response,
-        string? correlationId,
-        ResponsePublishKind kind,
-        Type? payloadType,
-        Func<TResponse, object?> lostResponseFactory,
-        Func<SubscriptionSnapshot, TResponse, Task> dispatchResponsesAsync)
+    private async Task SetResponseCore<T>(T response, string? correlationId)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(GetPublishActivityName(kind), ActivityKind.Producer);
-        activity?.SetTag("asyncresponse.channel", "inmemory");
-        if (payloadType is not null)
-            AsyncResponseDiagnostics.SetPayloadType(activity, payloadType);
+        using var activity = StartPublishActivity(ResponsePublishKind.Typed, typeof(T));
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
-        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            LogMissingPublishCorrelationId(kind, activity);
+        if (!TryResolvePublishCorrelationId(ref correlationId, ResponsePublishKind.Typed, activity))
             return;
-        }
+        var resolvedCorrelationId = correlationId!;
 
         try
         {
-            var subscribers = SnapshotSubscribers(correlationId);
+            var subscribers = SnapshotSubscribers(resolvedCorrelationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
-                var result = await _lostSubscriberDispatcher
-                    .DispatchLostResponse(recoveryState, lostResponseFactory(response), ChannelName(correlationId))
-                    .ConfigureAwait(false);
-
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
-
-                if (result.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
-
+                await DispatchLostResponseAsync(resolvedCorrelationId, response, activity).ConfigureAwait(false);
                 return;
             }
 
-            await dispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
+            await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-            LogPublishedResponse(kind, correlationId, payloadType, subscribers.Count);
+            _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", resolvedCorrelationId, typeof(T), subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -178,10 +137,72 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         }
     }
 
-    private static string GetPublishActivityName(ResponsePublishKind kind)
-        => kind is ResponsePublishKind.Typed
+    private async Task SetRawResponseJsonCore(RawJsonResponse response, string? correlationId)
+    {
+        using var activity = StartPublishActivity(ResponsePublishKind.RawJson, payloadType: null);
+
+        if (!TryResolvePublishCorrelationId(ref correlationId, ResponsePublishKind.RawJson, activity))
+            return;
+        var resolvedCorrelationId = correlationId!;
+
+        try
+        {
+            var subscribers = SnapshotSubscribers(resolvedCorrelationId);
+            activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+            if (subscribers.Count == 0)
+            {
+                await DispatchLostResponseAsync(resolvedCorrelationId, response.DeserializeUntyped(), activity).ConfigureAwait(false);
+                return;
+            }
+
+            await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
+
+            _logger.LogInformation("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", resolvedCorrelationId, subscribers.Count);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private static Activity? StartPublishActivity(ResponsePublishKind kind, Type? payloadType)
+    {
+        var activityName = kind is ResponsePublishKind.Typed
             ? "asyncresponse.set_response"
             : "asyncresponse.ingress.raw_response";
+        var activity = AsyncResponseDiagnostics.StartActivity(activityName, ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "inmemory");
+        if (payloadType is not null)
+            AsyncResponseDiagnostics.SetPayloadType(activity, payloadType);
+
+        return activity;
+    }
+
+    private bool TryResolvePublishCorrelationId(ref string? correlationId, ResponsePublishKind kind, Activity? activity)
+    {
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+        if (!string.IsNullOrWhiteSpace(correlationId))
+            return true;
+
+        LogMissingPublishCorrelationId(kind, activity);
+        return false;
+    }
+
+    private async Task DispatchLostResponseAsync(string correlationId, object? response, Activity? activity)
+    {
+        var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+        var result = await _lostSubscriberDispatcher
+            .DispatchLostResponse(recoveryState, response, ChannelName(correlationId))
+            .ConfigureAwait(false);
+
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+        activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
+
+        if (result.CallbackInvoked)
+            await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+    }
 
     private void LogMissingPublishCorrelationId(ResponsePublishKind kind, Activity? activity)
     {
@@ -194,17 +215,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
         AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
-    }
-
-    private void LogPublishedResponse(ResponsePublishKind kind, string correlationId, Type? payloadType, int subscriberCount)
-    {
-        if (kind is ResponsePublishKind.Typed)
-        {
-            _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, payloadType, subscriberCount);
-            return;
-        }
-
-        _logger.LogInformation("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscriberCount);
     }
 
     public async Task SetException(Exception exception, string? correlationId = null)

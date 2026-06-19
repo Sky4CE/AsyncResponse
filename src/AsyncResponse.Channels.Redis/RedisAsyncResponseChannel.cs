@@ -307,88 +307,114 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
         => SetRawResponseJsonCore(responseJson, correlationId);
 
-    private Task SetResponseCore<T>(T response, string? correlationId)
-        => PublishResponseCore(
-            response,
-            correlationId,
-            ResponsePublishKind.Typed,
-            typeof(T),
-            static response => SerializeSuccessEnvelope(response),
-            static response => response);
-
-    private Task SetRawResponseJsonCore(string responseJson, string? correlationId)
-        => PublishResponseCore(
-            responseJson,
-            correlationId,
-            ResponsePublishKind.RawJson,
-            payloadType: null,
-            static responseJson => SerializeRawSuccessEnvelope(responseJson),
-            static responseJson => new RawJsonResponse(responseJson).DeserializeUntyped());
-
-    private async Task PublishResponseCore<TResponse>(
-        TResponse response,
-        string? correlationId,
-        ResponsePublishKind kind,
-        Type? payloadType,
-        Func<TResponse, string> serializeEnvelope,
-        Func<TResponse, object?> lostResponseFactory)
+    private async Task SetResponseCore<T>(T response, string? correlationId)
     {
-        using var activity = AsyncResponseDiagnostics.StartActivity(GetPublishActivityName(kind), ActivityKind.Producer);
-        activity?.SetTag("asyncresponse.channel", "redis");
-        if (payloadType is not null)
-            AsyncResponseDiagnostics.SetPayloadType(activity, payloadType);
+        using var activity = StartPublishActivity(ResponsePublishKind.Typed, typeof(T));
 
-        // When no correlation id is provided, fall back to the ambient context.
-        correlationId ??= AsyncResponseContext.CorrelationId;
-        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            LogMissingPublishCorrelationId(kind, activity);
+        if (!TryResolvePublishCorrelationId(ref correlationId, ResponsePublishKind.Typed, activity))
             return;
-        }
+        var resolvedCorrelationId = correlationId!;
 
-        var channel = _keys.Channel(correlationId);
+        var channel = _keys.Channel(resolvedCorrelationId);
         var channelName = channel.ToString()!;
         try
         {
-            var json = serializeEnvelope(response);
+            var json = SerializeSuccessEnvelope(response);
             long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", numSubscribers);
 
             if (numSubscribers == 0)
             {
-                // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response
-                // over to the lost-subscriber dispatcher, which asks the payload whether to resume
-                // the flow or fail it, and invokes the matching callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
-
-                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, lostResponseFactory(response), channelName).ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-
-                if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
-
-                await RemoveExecutorAsync(channelName).ConfigureAwait(false);
+                await DispatchLostResponseAsync(resolvedCorrelationId, response, channelName, activity).ConfigureAwait(false);
             }
             else
             {
-                LogPublishedResponse(kind, correlationId, channelName, payloadType, numSubscribers);
+                _logger.LogInformation("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", resolvedCorrelationId, channelName, typeof(T), numSubscribers);
             }
         }
         catch (Exception ex)
         {
-            LogPublishFailure(kind, ex, correlationId, channelName);
+            LogPublishFailure(ResponsePublishKind.Typed, ex, resolvedCorrelationId, channelName);
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
     }
 
-    private static string GetPublishActivityName(ResponsePublishKind kind)
-        => kind is ResponsePublishKind.Typed
+    private async Task SetRawResponseJsonCore(string responseJson, string? correlationId)
+    {
+        using var activity = StartPublishActivity(ResponsePublishKind.RawJson, payloadType: null);
+
+        if (!TryResolvePublishCorrelationId(ref correlationId, ResponsePublishKind.RawJson, activity))
+            return;
+        var resolvedCorrelationId = correlationId!;
+
+        var channel = _keys.Channel(resolvedCorrelationId);
+        var channelName = channel.ToString()!;
+        try
+        {
+            var json = SerializeRawSuccessEnvelope(responseJson);
+            long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.subscribers", numSubscribers);
+
+            if (numSubscribers == 0)
+            {
+                var response = new RawJsonResponse(responseJson).DeserializeUntyped();
+                await DispatchLostResponseAsync(resolvedCorrelationId, response, channelName, activity).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogInformation("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", resolvedCorrelationId, channelName, numSubscribers);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogPublishFailure(ResponsePublishKind.RawJson, ex, resolvedCorrelationId, channelName);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private static Activity? StartPublishActivity(ResponsePublishKind kind, Type? payloadType)
+    {
+        var activityName = kind is ResponsePublishKind.Typed
             ? "asyncresponse.set_response"
             : "asyncresponse.ingress.raw_response";
+        var activity = AsyncResponseDiagnostics.StartActivity(activityName, ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "redis");
+        if (payloadType is not null)
+            AsyncResponseDiagnostics.SetPayloadType(activity, payloadType);
+
+        return activity;
+    }
+
+    private bool TryResolvePublishCorrelationId(ref string? correlationId, ResponsePublishKind kind, Activity? activity)
+    {
+        // When no correlation id is provided, fall back to the ambient context.
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+        if (!string.IsNullOrWhiteSpace(correlationId))
+            return true;
+
+        LogMissingPublishCorrelationId(kind, activity);
+        return false;
+    }
+
+    private async Task DispatchLostResponseAsync(string correlationId, object? response, string channelName, Activity? activity)
+    {
+        // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response
+        // over to the lost-subscriber dispatcher, which asks the payload whether to resume
+        // the flow or fail it, and invokes the matching callback.
+        var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+
+        var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channelName).ConfigureAwait(false);
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+        activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+
+        if (dispatchResult.CallbackInvoked)
+            await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+
+        await RemoveExecutorAsync(channelName).ConfigureAwait(false);
+    }
 
     private void LogMissingPublishCorrelationId(ResponsePublishKind kind, Activity? activity)
     {
@@ -401,17 +427,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
         AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
-    }
-
-    private void LogPublishedResponse(ResponsePublishKind kind, string correlationId, string channel, Type? payloadType, long subscriberCount)
-    {
-        if (kind is ResponsePublishKind.Typed)
-        {
-            _logger.LogInformation("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel, payloadType, subscriberCount);
-            return;
-        }
-
-        _logger.LogInformation("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel, subscriberCount);
     }
 
     private void LogPublishFailure(ResponsePublishKind kind, Exception exception, string correlationId, string channel)
