@@ -3,7 +3,6 @@ using Google.Cloud.PubSub.V1;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Diagnostics;
 
 namespace AsyncResponse.Transports.GooglePubSub;
 
@@ -32,6 +31,8 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     protected ILogger Logger { get; }
 
     protected abstract string SubscriptionId { get; }
+    protected abstract GooglePubSubSubscriberOptions SubscriberOptions { get; }
+    protected abstract GooglePubSubSubscriberRole SubscriberRole { get; }
     protected abstract Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken);
 
     private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
@@ -51,36 +52,24 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionId = SubscriptionId;
+        GooglePubSubMessageDispatcher.ValidateOptions(SubscriberOptions, SubscriberRole);
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
         var subscriber = await _subscriberFactory(subscriptionName).ConfigureAwait(false);
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            HandleMessageAsync,
+            Options,
+            SubscriberOptions,
+            Logger,
+            subscriptionId,
+            SubscriberRole);
 
-        Logger.LogInformation("Pub/Sub subscriber started. Subscription: {Subscription}.", subscriptionName.ToString());
+        Logger.LogInformation(
+            "Pub/Sub subscriber started. Subscription: {Subscription}. Role: {Role}. AckMode: {AckMode}.",
+            subscriptionName.ToString(),
+            SubscriberRole,
+            SubscriberOptions.AckMode);
 
-        var runTask = subscriber.StartAsync(async (message, cancellationToken) =>
-        {
-            using var activity = AsyncResponseDiagnostics.StartActivity(
-                "asyncresponse.pubsub.receive",
-                ActivityKind.Consumer);
-            activity?.SetTag("asyncresponse.transport", "google_pubsub");
-            activity?.SetTag("messaging.system", "gcp_pubsub");
-            activity?.SetTag("messaging.destination.name", subscriptionId);
-            activity?.SetTag("messaging.message.id", message.MessageId);
-
-            if (message.Attributes.TryGetValue(Options.CorrelationIdAttribute, out var correlationId))
-                AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-
-            try
-            {
-                await HandleMessageAsync(message, cancellationToken).ConfigureAwait(false);
-                return SubscriberClient.Reply.Ack;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError(ex, "Pub/Sub message handling failed; NACKing message {MessageId}.", message.MessageId);
-                AsyncResponseDiagnostics.SetError(activity, ex);
-                return SubscriberClient.Reply.Nack;
-            }
-        });
+        var runTask = subscriber.StartAsync(dispatcher.HandleAsync);
 
         try
         {
@@ -126,6 +115,9 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.WorkerSubscriptionId, nameof(Options.WorkerSubscriptionId));
 
+    protected override GooglePubSubSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
+    protected override GooglePubSubSubscriberRole SubscriberRole => GooglePubSubSubscriberRole.Worker;
+
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
         => _ingress.HandleWorkerMessageAsync(message.Data.ToStringUtf8());
 }
@@ -155,6 +147,9 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
 
     protected override string SubscriptionId
         => GooglePubSubOptionsValidator.Required(Options.ResponseSubscriptionId, nameof(Options.ResponseSubscriptionId));
+
+    protected override GooglePubSubSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
+    protected override GooglePubSubSubscriberRole SubscriberRole => GooglePubSubSubscriberRole.ResponseIngress;
 
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
     {

@@ -9,11 +9,30 @@ namespace AsyncResponse.IntegrationTests;
 /// and responses ingested from a Pub/Sub topic into active waiters.
 /// </summary>
 [Collection(IntegrationCollection.Name)]
-public sealed class PubSubTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
-{
-    [Fact]
-    public async Task WorkerJob_RoundTripsThroughPubSub_WithRestoredCorrelationAndTrace()
+    public sealed class PubSubTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
     {
+        [Fact]
+        public async Task Config_ReportsDefaultAndEarlyAckPubSubModes()
+        {
+            var defaultConfig = (await Client.GetFromJsonAsync<ConfigResponse>("/config"))!;
+            var earlyAckConfig = (await Fixture.EarlyAckClient.GetFromJsonAsync<ConfigResponse>("/config"))!;
+
+            Assert.Equal("Redis", defaultConfig.Channel);
+            Assert.Equal("GooglePubSub", defaultConfig.Transport);
+            Assert.Equal("AckAfterHandlerCompletes", defaultConfig.Pubsub!.WorkerAckMode);
+            Assert.Equal("AckAfterHandlerCompletes", defaultConfig.Pubsub.ResponseAckMode);
+
+            Assert.Equal("Redis", earlyAckConfig.Channel);
+            Assert.Equal("GooglePubSub", earlyAckConfig.Transport);
+            Assert.Equal("AckAfterEnqueue", earlyAckConfig.Pubsub!.WorkerAckMode);
+            Assert.Equal(4, earlyAckConfig.Pubsub.WorkerBackgroundWorkerCount);
+            Assert.Equal(256, earlyAckConfig.Pubsub.WorkerBackgroundQueueCapacity);
+            Assert.Equal("AckAfterHandlerCompletes", earlyAckConfig.Pubsub.ResponseAckMode);
+        }
+
+        [Fact]
+        public async Task WorkerJob_RoundTripsThroughPubSub_WithRestoredCorrelationAndTrace()
+        {
         var token = NewId("token");
         var trace = NewId("trace");
 
@@ -23,9 +42,25 @@ public sealed class PubSubTransportTests(IntegrationFixture fixture) : Integrati
 
         var call = await WaitForCallAsync($"worker:{token}");
         Assert.Equal("worker", call.Kind);
-        Assert.Equal(correlationId, call.CorrelationId); // correlation id restored across the Pub/Sub hop
-        Assert.Equal(trace, call.Trace);                 // trace baggage restored across the Pub/Sub hop
-    }
+            Assert.Equal(correlationId, call.CorrelationId); // correlation id restored across the Pub/Sub hop
+            Assert.Equal(trace, call.Trace);                 // trace baggage restored across the Pub/Sub hop
+        }
+
+        [Fact]
+        public async Task WorkerJob_RoundTripsThroughPubSub_WithAckAfterEnqueueWorkerSubscriber()
+        {
+            var token = NewId("early-token");
+            var trace = NewId("early-trace");
+
+            var response = await Fixture.EarlyAckClient.PostAsync($"/worker?token={token}&trace={trace}", content: null);
+            response.EnsureSuccessStatusCode();
+            var correlationId = (await response.Content.ReadFromJsonAsync<WorkerResponse>())!.CorrelationId;
+
+            var call = await WaitForCallAsync(Fixture.EarlyAckClient, $"worker:{token}");
+            Assert.Equal("worker", call.Kind);
+            Assert.Equal(correlationId, call.CorrelationId);
+            Assert.Equal(trace, call.Trace);
+        }
 
     [Fact]
     public async Task ResponseIngress_CorrelationViaAttribute_CompletesActiveWaiter()
@@ -55,4 +90,10 @@ public sealed class PubSubTransportTests(IntegrationFixture fixture) : Integrati
     }
 
     private sealed record WorkerResponse(string CorrelationId);
+    private sealed record ConfigResponse(string Channel, string Transport, PubSubConfig? Pubsub);
+    private sealed record PubSubConfig(
+        string WorkerAckMode,
+        int WorkerBackgroundWorkerCount,
+        int WorkerBackgroundQueueCapacity,
+        string ResponseAckMode);
 }

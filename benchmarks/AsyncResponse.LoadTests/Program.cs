@@ -16,6 +16,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
 // The process exits non-zero if any scenario records failed requests.
@@ -25,15 +26,22 @@ var warmup = TimeSpan.FromSeconds(GetInt("--warmup", 5));
 var profile = (GetString("--profile") ?? "broad").Trim().ToLowerInvariant();
 var scenarioFilter = GetString("--scenario");
 var existingUrl = GetString("--url");
+var existingEarlyAckUrl = GetString("--early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
 Uri baseAddress;
+Uri? earlyAckBaseAddress = null;
 
 if (existingUrl is not null)
 {
     baseAddress = new Uri(existingUrl);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
+    if (existingEarlyAckUrl is not null)
+    {
+        earlyAckBaseAddress = new Uri(existingEarlyAckUrl);
+        Console.WriteLine($"Load testing existing ACK-after-enqueue instance at {earlyAckBaseAddress}.");
+    }
 }
 else
 {
@@ -45,8 +53,11 @@ else
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-early-ack"))
+        earlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
+    Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -57,16 +68,23 @@ try
         BaseAddress = baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var earlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = earlyAckBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
+    if (earlyAckBaseAddress is not null)
+        await TryResetAsync(earlyAckHttpClient);
 
-    var definitions = FilterScenarios(SelectScenarios(profile), scenarioFilter);
+    var definitions = FilterScenarios(SelectScenarios(profile, includeEarlyAckTarget: earlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
 
     var scenarios = definitions
-        .Select(definition => BuildScenario(definition, httpClient, rate, duration, warmup))
+        .Select(definition => BuildScenario(definition, httpClient, earlyAckHttpClient, rate, duration, warmup))
         .ToArray();
 
     var nodeStats = NBomberRunner
@@ -108,14 +126,15 @@ return hadFailures ? 1 : 0;
 static ScenarioProps BuildScenario(
     ScenarioDefinition definition,
     HttpClient httpClient,
+    HttpClient earlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
-    => Scenario.Create(definition.Name, _ => RunWorkflowAsync(() => definition.RunAsync(httpClient)))
+    => Scenario.Create(definition.Name, _ => RunWorkflowAsync(() => definition.RunAsync(httpClient, earlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
-static ScenarioDefinition[] SelectScenarios(string profile)
+static ScenarioDefinition[] SelectScenarios(string profile, bool includeEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -132,9 +151,18 @@ static ScenarioDefinition[] SelectScenarios(string profile)
 
     var pubsub = new[]
     {
+        new ScenarioDefinition("pubsub_worker_default_ack_observed", WorkerObservedAsync),
         new ScenarioDefinition("pubsub_response_ingress_attribute", http => PubSubResponseIngressAsync(http, useAttribute: true)),
         new ScenarioDefinition("pubsub_response_ingress_body", http => PubSubResponseIngressAsync(http, useAttribute: false))
     };
+    if (includeEarlyAckTarget)
+    {
+        pubsub =
+        [
+            .. pubsub,
+            new ScenarioDefinition("pubsub_worker_ack_after_enqueue_observed", (_, earlyAckHttp) => WorkerObservedAsync(earlyAckHttp))
+        ];
+    }
 
     var recovery = new[]
     {
@@ -314,4 +342,10 @@ static string? GetString(string name)
 
 static string Trace() => $"trace-{Guid.NewGuid():N}";
 
-internal sealed record ScenarioDefinition(string Name, Func<HttpClient, Task> RunAsync);
+internal sealed record ScenarioDefinition(string Name, Func<HttpClient, HttpClient, Task> RunAsync)
+{
+    public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
+        : this(name, (http, _) => runAsync(http))
+    {
+    }
+}

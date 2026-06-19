@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
   </ItemGroup>
 
 </Project>

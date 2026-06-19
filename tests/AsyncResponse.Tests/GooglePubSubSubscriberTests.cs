@@ -13,6 +13,46 @@ namespace AsyncResponse.Tests;
 public class GooglePubSubSubscriberTests
 {
     [Fact]
+    public async Task WorkerSubscriberService_DefaultAckMode_WaitsForHandlerBeforeAck()
+    {
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+            });
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers"
+            }),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        var replyTask = handler(new PubsubMessage
+        {
+            MessageId = "message-await",
+            Data = ByteString.CopyFromUtf8("{}")
+        }, CancellationToken.None);
+
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(replyTask.IsCompleted);
+
+        releaseHandler.TrySetResult();
+        Assert.Equal(SubscriberClient.Reply.Ack, await replyTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task WorkerSubscriberService_AcksHandledMessagesAndStopsSubscriber()
     {
         var client = new FakeSubscriberClient();
@@ -85,6 +125,98 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_AcksBeforeHandlerCompletes()
+    {
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+                handlerCompleted.TrySetResult();
+            });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+
+        var reply = await handler(new PubsubMessage
+        {
+            MessageId = "message-early-ack",
+            Data = ByteString.CopyFromUtf8("{}")
+        }, CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.False(handlerCompleted.Task.IsCompleted);
+
+        releaseHandler.TrySetResult();
+        await handlerCompleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_BackgroundFailureKeepsAck()
+    {
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(() =>
+            {
+                handlerStarted.TrySetResult();
+                return Task.FromException(new InvalidOperationException("background-failure"));
+            });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers"
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+
+        var reply = await handler(new PubsubMessage
+        {
+            MessageId = "message-background-failure",
+            Data = ByteString.CopyFromUtf8("{}")
+        }, CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task ResponseSubscriberService_ForwardsExtractedCorrelation()
     {
         var client = new FakeSubscriberClient();
@@ -111,6 +243,144 @@ public class GooglePubSubSubscriberTests
 
         Assert.Equal(SubscriberClient.Reply.Ack, reply);
         ingress.Verify(i => i.HandleResponseMessageAsync(message.Data.ToStringUtf8(), "from-json"), Times.Once);
+    }
+
+    [Fact]
+    public async Task ResponseSubscriberService_AckAfterEnqueue_AcksBeforeIngressCompletes()
+    {
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleResponseMessageAsync(It.IsAny<string>(), It.IsAny<string?>()))
+            .Returns(async () =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+            });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            ResponseSubscriptionId = "responses"
+        };
+        options.ResponseSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubResponseIngressSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
+            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+        var message = new PubsubMessage
+        {
+            MessageId = "message-response-early-ack",
+            Data = ByteString.CopyFromUtf8("""{"CorrelationId":"from-json","Status":2}""")
+        };
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+
+        var reply = await handler(message, CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        ingress.Verify(i => i.HandleResponseMessageAsync(message.Data.ToStringUtf8(), "from-json"), Times.Once);
+
+        releaseHandler.TrySetResult();
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_StopWaitsForQueuedWorkToDrain()
+    {
+        var client = new FakeSubscriberClient();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress
+            .Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+            });
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers",
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            ingress.Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        var handler = await WaitForHandlerAsync(client);
+        var reply = await handler(new PubsubMessage
+        {
+            MessageId = "message-drain",
+            Data = ByteString.CopyFromUtf8("{}")
+        }, CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var stopTask = subscriber.StopAsync(CancellationToken.None);
+        await Task.Delay(50);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        Assert.False(stopTask.IsCompleted);
+
+        releaseHandler.TrySetResult();
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_NacksWhenBackgroundQueueIsFull()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                var call = Interlocked.Increment(ref calls);
+                if (call == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+                else if (call == 2)
+                {
+                    secondStarted.TrySetResult();
+                }
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: 1,
+                backgroundQueueCapacity: 1,
+                backgroundDrainTimeout: TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-1"), CancellationToken.None));
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-2"), CancellationToken.None));
+        Assert.Equal(SubscriberClient.Reply.Nack, await dispatcher.HandleAsync(Message("message-3"), CancellationToken.None));
+        Assert.Equal(1, Volatile.Read(ref calls));
+
+        releaseFirst.TrySetResult();
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(2, Volatile.Read(ref calls));
     }
 
     [Fact]
@@ -152,6 +422,48 @@ public class GooglePubSubSubscriberTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
 
         Assert.False(factoryCalled);
+    }
+
+    [Fact]
+    public async Task SubscriberService_AckAfterEnqueueWithoutExplicitBackgroundSettings_FailsBeforeCreatingClient()
+    {
+        var factoryCalled = false;
+        var options = new GooglePubSubAsyncResponseOptions
+        {
+            ProjectId = "project-a",
+            WorkerSubscriptionId = "workers"
+        };
+        options.WorkerSubscriber.AckMode = GooglePubSubAckMode.AckAfterEnqueue;
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(options),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ =>
+            {
+                factoryCalled = true;
+                return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
+            });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
+
+        Assert.Contains(nameof(GooglePubSubSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
+        Assert.False(factoryCalled);
+    }
+
+    [Fact]
+    public void SubscriberOptions_UseAckAfterEnqueue_RequiresExplicitPositiveSettings()
+    {
+        var options = new GooglePubSubSubscriberOptions();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.UseAckAfterEnqueue(0, 10));
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.UseAckAfterEnqueue(1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.UseAckAfterEnqueue(1, 10, TimeSpan.Zero));
+
+        options.UseAckAfterEnqueue(2, 32, TimeSpan.FromSeconds(3));
+        Assert.Equal(GooglePubSubAckMode.AckAfterEnqueue, options.AckMode);
+        Assert.Equal(2, options.BackgroundWorkerCount);
+        Assert.Equal(32, options.BackgroundQueueCapacity);
+        Assert.Equal(TimeSpan.FromSeconds(3), options.BackgroundDrainTimeout);
     }
 
     [Fact]
@@ -237,6 +549,13 @@ public class GooglePubSubSubscriberTests
             BindingFlags.Instance | BindingFlags.NonPublic)!;
         return (string)property.GetValue(subscriber)!;
     }
+
+    private static PubsubMessage Message(string messageId)
+        => new()
+        {
+            MessageId = messageId,
+            Data = ByteString.CopyFromUtf8("{}")
+        };
 
     private static async Task<Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>>> WaitForHandlerAsync(
         FakeSubscriberClient client)

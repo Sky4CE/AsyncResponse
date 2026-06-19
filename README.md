@@ -177,6 +177,34 @@ the response-ingress subscriber. Pub/Sub is a transport, not a recovery store, s
 channel: `.WithInMemoryChannel()` for simple apps, or `.WithRedisChannel()` when late responses
 must survive redeploys.
 
+By default, both hosted subscribers ACK only after their handler completes. That preserves Pub/Sub
+redelivery when the handler throws. For worker jobs that can run longer than the Pub/Sub ack window,
+you can explicitly opt the worker subscription into ACK-after-enqueue behavior:
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithGooglePubSubTransport(options =>
+    {
+        options.ProjectId = "my-gcp-project";
+        options.WorkerTopicId = "asyncresponse-workers";
+        options.WorkerSubscriptionId = "asyncresponse-workers-sub";
+        options.ResponseTopicId = "asyncresponse-responses";
+        options.ResponseSubscriptionId = "asyncresponse-responses-sub";
+
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 64,
+            backgroundQueueCapacity: 10_000,
+            backgroundDrainTimeout: TimeSpan.FromMinutes(2));
+    });
+```
+
+This is intentionally opt-in. With `AckAfterEnqueue`, Pub/Sub is ACKed once the message is accepted
+into a bounded in-process queue; if the process dies after that point, Pub/Sub will not redeliver
+that message. If the queue is full or draining, the subscriber returns NACK so Pub/Sub can retry.
+Keep response ingress on the default `AckAfterHandlerCompletes` unless response processing is also
+durable enough to tolerate early ACK.
+
 The response topic is also exposed as a transport-neutral reply target. Use this when the
 remote request needs to know where to publish its eventual response:
 
@@ -674,9 +702,11 @@ no separate fixture app to keep in sync). They run at two levels:
   and transport, covering the core request/response, attach, worker, and concurrency paths. They need
   no containers, so they stay fast and reliable even where Docker is unavailable.
 - **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
-  a Google Pub/Sub emulator container, and the sample app, then drives the Redis-channel and Pub/Sub
-  scenarios over HTTP. They need a running Docker daemon (and pull a Pub/Sub emulator image on first
-  run), so CI runs them in a separate Docker-backed `integration-tests` job:
+  a Google Pub/Sub emulator container, and two sample-app SUTs: one with default
+  `AckAfterHandlerCompletes` worker subscribers, and one with explicit worker `AckAfterEnqueue`.
+  Tests drive the Redis-channel and Pub/Sub scenarios over HTTP. They need a running Docker daemon
+  (and pull a Pub/Sub emulator image on first run), so CI runs them in a separate Docker-backed
+  `integration-tests` job:
 
 ```bash
 dotnet run --project tests/AsyncResponse.IntegrationTests
@@ -695,14 +725,16 @@ modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harne
 **Benchmarks** — per-operation latency, allocations, and GC for the hot paths (in-memory
 request/response round-trip, raw broker ingress, shared-correlation fanout, exception fanout,
 recovery-state save/scan, watchdog/health evaluation, context propagation, envelope
-(de)serialization, payload classification, expression→callback conversion, reflection invoke).
+(de)serialization, payload classification, expression→callback conversion, reflection invoke, and
+Google Pub/Sub subscriber ACK dispatch modes).
 `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections per op alongside
 mean/median/percentile timings:
 
 ```bash
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks                 # all benchmarks
-dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter *Channel*
-dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter *Ingress*
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Channel*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Ingress*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
@@ -719,10 +751,12 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- stress --
 The stress harness now checks the system from multiple angles: **waiter-storm** (N concurrent waiters,
 each must receive exactly its own response — no cross-correlation leakage), **progress-storm** (a burst
 of progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
-exactly once), **race-burst** (subscribe-before-send under contention), **raw-ingress-storm** (broker
-JSON into typed waiters), **shared-response-fanout** and **exception-fanout** (many waiters on one
-correlation id), **timeout-storm** and **dispose-cleanup-storm** (subscription/recovery cleanup),
-**context-isolation-storm** (captured `ExecutionContext` under foreign publishers), and
+exactly once), **google-pubsub-ack-after-enqueue-dispatch-storm** (bounded early-ACK dispatcher:
+every ACKed message must be processed once), **race-burst** (subscribe-before-send under contention),
+**raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
+**exception-fanout** (many waiters on one correlation id), **timeout-storm** and
+**dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
+`ExecutionContext` under foreign publishers), and
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The same invariants are
 gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. Both tiers run
@@ -731,11 +765,14 @@ the in-memory channel and transport in-process.
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 Redis channel + Google Pub/Sub transport — reporting throughput, latency percentiles, and failures per
-scenario. By default it boots Redis + a Pub/Sub emulator + the SUT via Aspire (Docker required); pass
-`--url` to load an already-running instance instead. Profiles let you choose the scenario set:
+scenario. By default it boots Redis + a Pub/Sub emulator + two SUTs via Aspire (Docker required):
+the default Pub/Sub app and an explicit worker `AckAfterEnqueue` app. Pass `--url` to load an
+already-running default instance, and `--early-ack-url` as well when you want the `pubsub` profile
+to exercise a separate early-ACK instance. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
-exception, shared exception, reply target), `pubsub` (response-topic ingress with attribute/body
-correlation ids), or `recovery` (lost-subscriber resume/failure/exception and stale health). Run the
+exception, shared exception, reply target), `pubsub` (default worker dispatch, response-topic ingress
+with attribute/body correlation ids, and early-ACK worker dispatch when an early target is available),
+or `recovery` (lost-subscriber resume/failure/exception and stale health). Run the
 recovery profile separately because it intentionally simulates subscriber loss:
 
 ```bash
@@ -744,6 +781,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile 
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 ```
 
 Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;

@@ -1,5 +1,8 @@
 using System.Diagnostics;
 using System.Text.Json;
+using AsyncResponse.Transports.GooglePubSub;
+using Google.Cloud.PubSub.V1;
+using Google.Protobuf;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -46,6 +49,7 @@ internal static class StressRunner
         failures += await WaiterStorm(concurrency, count);
         failures += await ProgressStorm(concurrency, Math.Max(1, count / 10), progress);
         failures += await WorkerStorm(concurrency, count);
+        failures += await GooglePubSubAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -174,6 +178,61 @@ internal static class StressRunner
             foreach (var hostedService in hosted)
                 await hostedService.StopAsync(CancellationToken.None);
         }
+    }
+
+    // 3b) Google Pub/Sub ACK-after-enqueue dispatch storm. This bypasses the emulator and hammers the
+    //     subscriber callback dispatcher directly: every ACKed message must be processed exactly once.
+    private static async Task<int> GooglePubSubAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var processed = 0;
+        var nacks = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) =>
+            {
+                if (Interlocked.Increment(ref processed) == count)
+                    allProcessed.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-sub",
+            GooglePubSubSubscriberRole.Worker);
+
+        var metrics = await Measure("google-pubsub-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            var reply = await dispatcher.HandleAsync(new PubsubMessage
+            {
+                MessageId = $"stress-{i}",
+                Data = ByteString.CopyFromUtf8("{}")
+            }, CancellationToken.None).ConfigureAwait(false);
+
+            if (reply is not SubscriberClient.Reply.Ack)
+                Interlocked.Increment(ref nacks);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("google-pubsub-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "google-pubsub-ack-after-enqueue-dispatch-storm",
+            ("nacks", nacks),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
     }
 
     // 4) Subscribe-before-send race. A short timeout means a response lost before its subscription

@@ -17,6 +17,13 @@ public sealed class GooglePubSubAsyncResponseOptions
     public string? WorkerSubscriptionId { get; set; }
 
     /// <summary>
+    /// Worker subscription handling options. The default acknowledgement mode waits until the worker
+    /// handler completes before ACKing; call <see cref="GooglePubSubSubscriberOptions.UseAckAfterEnqueue"/>
+    /// explicitly to opt into early ACK after bounded background enqueue.
+    /// </summary>
+    public GooglePubSubSubscriberOptions WorkerSubscriber { get; } = new();
+
+    /// <summary>
     /// Topic id that async-response messages are published to (by the remote system or worker) and
     /// that <see cref="ResponseSubscriptionId"/> is attached to. The transport consumes responses
     /// through the subscription; it does not itself publish to this topic.
@@ -25,6 +32,12 @@ public sealed class GooglePubSubAsyncResponseOptions
 
     /// <summary>Subscription id consumed by the response-ingress hosted service.</summary>
     public string? ResponseSubscriptionId { get; set; }
+
+    /// <summary>
+    /// Response subscription handling options. Keep the default unless response ingress is known to be
+    /// durable enough to tolerate ACKing before processing completes.
+    /// </summary>
+    public GooglePubSubSubscriberOptions ResponseSubscriber { get; } = new();
 
     /// <summary>The logical reply target name used by <c>WithReplyTarget()</c>. Default: <c>default</c>.</summary>
     public string DefaultReplyTargetName { get; set; } = "default";

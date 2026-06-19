@@ -72,6 +72,8 @@ if (useGooglePubSub)
         options.WorkerSubscriptionId = builder.Configuration["PubSub:WorkerSubscriptionId"];
         options.ResponseTopicId = builder.Configuration["PubSub:ResponseTopicId"];
         options.ResponseSubscriptionId = builder.Configuration["PubSub:ResponseSubscriptionId"];
+        ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Worker", options.WorkerSubscriber);
+        ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
     });
 }
 else if (!string.Equals(transport, "None", StringComparison.OrdinalIgnoreCase))
@@ -109,6 +111,7 @@ app.MapGet("/", () => Results.Text(
       POST /arm  + POST /crash + POST /publish                   lost-subscriber recovery flow (Redis)
       POST /lost-subscriber-flow?outcome=Completed|Failed|Exception  composed recovery flow (Redis)
       GET  /reply-target                                         provider-resolved reply target (Pub/Sub)
+      GET  /config                                               resolved channel/transport/ACK mode
       GET  /healthz                                              health report incl. the recovery watchdog
     """)).ExcludeFromDescription();
 
@@ -119,7 +122,25 @@ app.MapGet("/alive", () => Results.Ok("alive")).ExcludeFromDescription();
 // Reports the providers this instance resolved from configuration. The in-process tests assert
 // InMemory/InMemory and the Aspire SUT asserts Redis/GooglePubSub, so each variation is provably
 // exercised even though only one is ever booted per process.
-app.MapGet("/config", () => Results.Ok(new { channel, transport })).WithTags("Observability");
+app.MapGet("/config", (IServiceProvider services) =>
+{
+    object? pubsub = null;
+    if (useGooglePubSub)
+    {
+        var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
+        pubsub = new
+        {
+            workerAckMode = googleOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = googleOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = googleOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            responseAckMode = googleOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = googleOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = googleOptions.ResponseSubscriber.BackgroundQueueCapacity
+        };
+    }
+
+    return Results.Ok(new { channel, transport, pubsub });
+}).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
     => (behavior ?? "Succeed").Trim().ToLowerInvariant() switch
@@ -132,6 +153,51 @@ static string NormalizeBehavior(string? behavior)
         "timeout" => "timeout",
         _ => "succeed"
     };
+
+static void ConfigureSubscriberAckMode(
+    IConfiguration configuration,
+    string prefix,
+    GooglePubSubSubscriberOptions subscriberOptions)
+{
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<GooglePubSubAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<GooglePubSubAckMode>())}.");
+
+    if (mode is GooglePubSubAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = GooglePubSubAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not GooglePubSubAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
+static int ReadRequiredPositiveInt(IConfiguration configuration, string key)
+{
+    var rawValue = configuration[key];
+    if (!int.TryParse(rawValue, out var value) || value <= 0)
+        throw new InvalidOperationException($"{key} must be explicitly set to a positive integer.");
+
+    return value;
+}
 
 static async Task<StepOutcome> RunStepAsync(
     IAsyncResponseBuilder asyncResponse,

@@ -19,6 +19,7 @@ public sealed class IntegrationFixture : IAsyncLifetime
     private DistributedApplication? _app;
 
     public HttpClient Client { get; private set; } = null!;
+    public HttpClient EarlyAckClient { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -33,19 +34,22 @@ public sealed class IntegrationFixture : IAsyncLifetime
             .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
-        await ResetTestStateAsync().WaitAsync(StartupTimeout);
+        EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
+        await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
     {
         Client?.Dispose();
+        EarlyAckClient?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }
 
-    private async Task ResetTestStateAsync()
+    private static async Task ResetTestStateAsync(HttpClient client)
     {
-        var response = await Client.PostAsync("/test/reset", content: null);
+        var response = await client.PostAsync("/test/reset", content: null);
         response.EnsureSuccessStatusCode();
     }
 }

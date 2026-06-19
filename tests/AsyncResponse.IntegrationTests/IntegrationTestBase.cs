@@ -30,9 +30,12 @@ public abstract class IntegrationTestBase(IntegrationFixture fixture)
     /// <c>fail:{cid}</c>, <c>waiter:{cid}</c>). Throws if the call does not arrive within the timeout.
     /// </summary>
     protected async Task<FlowCall> WaitForCallAsync(string key, TimeSpan? timeout = null)
+        => await WaitForCallAsync(Client, key, timeout).ConfigureAwait(false);
+
+    protected static async Task<FlowCall> WaitForCallAsync(HttpClient client, string key, TimeSpan? timeout = null)
     {
         var ms = (int)(timeout ?? DefaultTimeout).TotalMilliseconds;
-        var response = await Client.GetAsync($"/calls?key={Uri.EscapeDataString(key)}&timeoutMs={ms}");
+        var response = await client.GetAsync($"/calls?key={Uri.EscapeDataString(key)}&timeoutMs={ms}");
         response.EnsureSuccessStatusCode();
         return (await response.Content.ReadFromJsonAsync<FlowCall>())!;
     }

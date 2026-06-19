@@ -5,7 +5,12 @@ const string WorkerTopic = "worker-topic";
 const string WorkerSubscription = "worker-sub";
 const string ResponseTopic = "response-topic";
 const string ResponseSubscription = "response-sub";
+const string EarlyAckWorkerTopic = "worker-topic-early-ack";
+const string EarlyAckWorkerSubscription = "worker-sub-early-ack";
+const string EarlyAckResponseTopic = "response-topic-early-ack";
+const string EarlyAckResponseSubscription = "response-sub-early-ack";
 const string TestRedisKeyPrefix = "itest";
+const string EarlyAckRedisKeyPrefix = "itest-early-ack";
 
 var builder = DistributedApplication.CreateBuilder(args);
 
@@ -33,6 +38,26 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app", launchProfileName
     .WithEnvironment("PubSub:ResponseTopicId", ResponseTopic)
     .WithEnvironment("PubSub:ResponseSubscriptionId", ResponseSubscription)
     .WithEnvironment("AsyncResponse:KeyPrefix", TestRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-early-ack", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WaitFor(pubsub)
+    .WithEnvironment("PUBSUB_EMULATOR_HOST", emulatorHost)
+    .WithEnvironment("PubSub:ProjectId", ProjectId)
+    .WithEnvironment("PubSub:WorkerTopicId", EarlyAckWorkerTopic)
+    .WithEnvironment("PubSub:WorkerSubscriptionId", EarlyAckWorkerSubscription)
+    .WithEnvironment("PubSub:ResponseTopicId", EarlyAckResponseTopic)
+    .WithEnvironment("PubSub:ResponseSubscriptionId", EarlyAckResponseSubscription)
+    .WithEnvironment("PubSub:Worker:AckMode", "AckAfterEnqueue")
+    .WithEnvironment("PubSub:Worker:BackgroundWorkerCount", "4")
+    .WithEnvironment("PubSub:Worker:BackgroundQueueCapacity", "256")
+    .WithEnvironment("PubSub:Worker:BackgroundDrainTimeoutSeconds", "10")
+    .WithEnvironment("AsyncResponse:KeyPrefix", EarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")
     .WithHttpEndpoint()
