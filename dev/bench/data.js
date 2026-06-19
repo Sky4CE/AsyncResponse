@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781861731111,
+  "lastUpdate": 1781861733373,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -7583,6 +7583,120 @@ window.BENCHMARK_DATA = {
           {
             "name": "reply_target_pubsub p99 latency",
             "value": 5.3,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ba59b12ce2698fbd413df7e07a67c7581f23b3fd",
+          "message": "Fixed SetResponseCore/SetRawResponseJsonCore code duplication",
+          "timestamp": "2026-06-19T11:33:23+02:00",
+          "tree_id": "a38526b7b76cd516a7f2fd80dd5f06f0b5380b1a",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ba59b12ce2698fbd413df7e07a67c7581f23b3fd"
+        },
+        "date": 1781861733050,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis p95 latency",
+            "value": 1004.03,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_success_redis p99 latency",
+            "value": 1006.59,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p95 latency",
+            "value": 1004.03,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p99 latency",
+            "value": 1005.06,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1003.01,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1004.54,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p95 latency",
+            "value": 49.44,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p99 latency",
+            "value": 56.22,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p95 latency",
+            "value": 2007.04,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p99 latency",
+            "value": 2009.09,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p95 latency",
+            "value": 2007.04,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p99 latency",
+            "value": 2010.11,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p95 latency",
+            "value": 2.3,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p99 latency",
+            "value": 4.22,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p95 latency",
+            "value": 3.42,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p99 latency",
+            "value": 5.91,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p95 latency",
+            "value": 2.56,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p99 latency",
+            "value": 4.58,
             "unit": "ms"
           }
         ]
