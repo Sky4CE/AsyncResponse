@@ -235,6 +235,112 @@ public class RabbitMqDispatcherTests
         Assert.True(nack.Requeue);
     }
 
+    [Fact]
+    public async Task Awaiting_BelowMaxDeliveryAttempts_RequeuesForRetry()
+    {
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 1), channel, CancellationToken.None);
+
+        Assert.True(Assert.Single(channel.Nacks).Requeue); // attempt 1 < 3
+    }
+
+    [Fact]
+    public async Task Awaiting_AtMaxDeliveryAttempts_RejectsWithoutRequeue()
+    {
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 1), channel, CancellationToken.None);
+
+        Assert.False(Assert.Single(channel.Nacks).Requeue); // attempt 1 >= 1 -> dead-letter
+    }
+
+    [Fact]
+    public async Task Awaiting_RedeliveredAtMaxDeliveryAttempts_RejectsWithoutRequeue()
+    {
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 1, redelivered: true), channel, CancellationToken.None);
+
+        Assert.False(Assert.Single(channel.Nacks).Requeue); // attempt 2 >= 2 -> dead-letter
+    }
+
+    [Fact]
+    public void ResolveDeliveryAttempt_FreshDelivery_IsOne()
+        => Assert.Equal(1, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}")));
+
+    [Fact]
+    public void ResolveDeliveryAttempt_Redelivered_IsTwo()
+        => Assert.Equal(2, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}", redelivered: true)));
+
+    [Fact]
+    public void ResolveDeliveryAttempt_UsesXDeathCount()
+    {
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object>
+                {
+                    new Dictionary<string, object?> { ["count"] = 4L }
+                }
+            }
+        };
+
+        Assert.Equal(5, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}", properties, redelivered: true)));
+    }
+
+    [Fact]
+    public void ResolveDeliveryAttempt_IgnoresNonDictionaryXDeathEntries()
+    {
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?> { ["x-death"] = new List<object> { "not-a-dictionary" } }
+        };
+
+        // No usable count: falls back to the redelivered flag (attempt 2).
+        Assert.Equal(2, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}", properties, redelivered: true)));
+    }
+
+    [Fact]
+    public void ResolveDeliveryAttempt_IgnoresMalformedXDeathCount()
+    {
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object>
+                {
+                    new Dictionary<string, object?> { ["count"] = "not-a-number" }
+                }
+            }
+        };
+
+        // Unparseable count is ignored; a fresh, non-redelivered message stays at attempt 1.
+        Assert.Equal(1, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}", properties)));
+    }
+
     // ---------- QueuedRabbitMqMessageDispatcher (AckAfterEnqueue) ----------
 
     [Fact]
@@ -517,8 +623,11 @@ public class RabbitMqDispatcherTests
         await dispatcher.DisposeAsync();
         elapsed.Stop();
 
-        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(5));
+        // The drain cancellation must reach the still-running handler; generous budget so the assertion is
+        // not flaky under coverage-instrumented or CI parallel load (it only waits this long on real failure).
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // Dispose returned via the drain timeout instead of waiting for the 30s handler to finish.
+        Assert.True(elapsed.Elapsed < TimeSpan.FromSeconds(25));
         Assert.Contains(
             logger.Entries,
             entry => entry.Level == LogLevel.Warning && entry.Message.Contains("Timed out", StringComparison.Ordinal));
@@ -573,11 +682,12 @@ public class RabbitMqDispatcherTests
         BasicProperties? properties = null,
         string exchange = "exchange",
         string routingKey = "route",
-        ulong deliveryTag = 1)
+        ulong deliveryTag = 1,
+        bool redelivered = false)
         => new(
             "consumer",
             deliveryTag,
-            Redelivered: false,
+            redelivered,
             exchange,
             routingKey,
             properties ?? new BasicProperties(),
@@ -610,7 +720,7 @@ public class RabbitMqDispatcherTests
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
-        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default)
+        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
         public Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default)

@@ -70,6 +70,28 @@ public sealed class RabbitMqAsyncResponseOptions
     /// <summary>Response queue handling options.</summary>
     public RabbitMqSubscriberOptions ResponseSubscriber { get; } = new();
 
+    /// <summary>
+    /// Optional dead-letter exchange. When set (and <see cref="DeclareTopology"/> is enabled), the worker and
+    /// response queues are declared with <c>x-dead-letter-exchange</c> so messages rejected without requeue
+    /// (see <see cref="RabbitMqSubscriberOptions.MaxDeliveryAttempts"/>) are routed here instead of dropped.
+    /// Changing this on a queue that already exists requires recreating the queue (RabbitMQ rejects a redeclare
+    /// with different arguments).
+    /// </summary>
+    public string? DeadLetterExchange { get; set; }
+
+    /// <summary>
+    /// Optional dead-letter queue declared and bound to <see cref="DeadLetterExchange"/>. Leave null to manage
+    /// the dead-letter queue externally.
+    /// </summary>
+    public string? DeadLetterQueue { get; set; }
+
+    /// <summary>
+    /// Routing key used both for the <c>x-dead-letter-routing-key</c> argument and for binding
+    /// <see cref="DeadLetterQueue"/>. When null, dead-lettered messages keep their original routing key and the
+    /// dead-letter queue is bound with the source queue's routing key.
+    /// </summary>
+    public string? DeadLetterRoutingKey { get; set; }
+
     /// <summary>The logical reply target name used by <c>WithReplyTarget()</c>. Default: <c>default</c>.</summary>
     public string DefaultReplyTargetName { get; set; } = "default";
 

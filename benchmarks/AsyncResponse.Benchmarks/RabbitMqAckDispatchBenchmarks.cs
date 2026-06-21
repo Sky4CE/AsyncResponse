@@ -84,7 +84,7 @@ public class RabbitMqAckDispatchBenchmarks
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
-        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default)
+        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
         public Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default)

@@ -70,7 +70,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
     {
         await using var connection = await _connectionFactory.CreateConnectionAsync(stoppingToken).ConfigureAwait(false);
-        await using var channel = await connection.CreateChannelAsync(stoppingToken).ConfigureAwait(false);
+        await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken).ConfigureAwait(false);
         await EnsureTopologyAsync(channel, stoppingToken).ConfigureAwait(false);
         await channel.BasicQosAsync(SubscriberOptions.PrefetchCount, stoppingToken).ConfigureAwait(false);
 

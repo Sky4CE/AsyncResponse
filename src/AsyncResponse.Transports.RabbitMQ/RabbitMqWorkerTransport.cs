@@ -8,11 +8,22 @@ namespace AsyncResponse.Transports.RabbitMQ;
 /// <summary>
 /// Publishes <see cref="WorkerJobEnvelope"/> messages to a RabbitMQ exchange.
 /// </summary>
+/// <remarks>
+/// The publish channel is created lazily and re-created on demand: a transient broker outage when the
+/// first job is published no longer permanently breaks the transport (a faulted connect attempt is not
+/// cached). The channel is opened with publisher confirmations so <see cref="PublishAsync"/> only completes
+/// once the broker has accepted the message. A single channel is shared across concurrent publishers;
+/// RabbitMQ.Client v7 tracks each in-flight confirmation independently, so concurrent publishing is safe.
+/// </remarks>
 public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 {
     private readonly RabbitMqAsyncResponseOptions _options;
-    private readonly Lazy<Task<IRabbitMqConnection>> _connection;
-    private readonly Lazy<Task<IRabbitMqChannel>> _channel;
+    private readonly IRabbitMqConnectionFactory _connectionFactory;
+    private readonly SemaphoreSlim _connectionGate = new(1, 1);
+    private IRabbitMqConnection? _connection;
+    private IRabbitMqChannel? _channel;
+    private int _disposeGate;
+    private bool _disposed;
 
     public RabbitMqWorkerTransport(IOptions<RabbitMqAsyncResponseOptions> options)
         : this(options, new RabbitMqConnectionFactoryAdapter(options.Value))
@@ -25,8 +36,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
     {
         _options = options.Value;
         ValidatePublishOptions(_options);
-        _connection = new Lazy<Task<IRabbitMqConnection>>(() => connectionFactory.CreateConnectionAsync());
-        _channel = new Lazy<Task<IRabbitMqChannel>>(CreateChannelAsync);
+        _connectionFactory = connectionFactory;
     }
 
     private static void ValidatePublishOptions(RabbitMqAsyncResponseOptions options)
@@ -37,12 +47,34 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         RabbitMqOptionsValidator.Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
     }
 
-    private async Task<IRabbitMqChannel> CreateChannelAsync()
+    private async Task<IRabbitMqChannel> GetChannelAsync(CancellationToken cancellationToken)
     {
-        var connection = await _connection.Value.ConfigureAwait(false);
-        var channel = await connection.CreateChannelAsync().ConfigureAwait(false);
-        await RabbitMqTopology.EnsureWorkerAsync(channel, _options).ConfigureAwait(false);
-        return channel;
+        var channel = Volatile.Read(ref _channel);
+        if (channel is not null)
+            return channel;
+
+        await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_channel is not null)
+                return _channel;
+
+            // ??= only assigns when the await succeeds, so a failed connect leaves _connection null and
+            // the next publish retries. A successful connection is reused even if channel/topology setup fails.
+            _connection ??= await _connectionFactory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
+            var created = await _connection.CreateChannelAsync(publisherConfirmations: true, cancellationToken).ConfigureAwait(false);
+            await RabbitMqTopology.EnsureWorkerAsync(created, _options, cancellationToken).ConfigureAwait(false);
+
+            // Publish the channel only once it is fully initialized; if anything above threw, _channel stays
+            // null so a later publish recreates it instead of awaiting a permanently faulted task.
+            _channel = created;
+            return created;
+        }
+        finally
+        {
+            _connectionGate.Release();
+        }
     }
 
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
@@ -64,7 +96,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         {
             var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(job));
             var properties = RabbitMqTopology.CreatePersistentJsonProperties(job.CorrelationId, _options.CorrelationIdHeader);
-            var channel = await _channel.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var channel = await GetChannelAsync(cancellationToken).ConfigureAwait(false);
             await channel.BasicPublishAsync(
                 _options.WorkerExchange,
                 _options.WorkerRoutingKey,
@@ -82,20 +114,48 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_channel.IsValueCreated)
-        {
-            var channel = await _channel.Value.ConfigureAwait(false);
-            using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
-            await channel.CloseAsync(cts.Token).ConfigureAwait(false);
-            await channel.DisposeAsync().ConfigureAwait(false);
-        }
+        if (Interlocked.Exchange(ref _disposeGate, 1) != 0)
+            return;
 
-        if (_connection.IsValueCreated)
+        await _connectionGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            var connection = await _connection.Value.ConfigureAwait(false);
-            using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
-            await connection.CloseAsync(_options.ShutdownTimeout, cts.Token).ConfigureAwait(false);
-            await connection.DisposeAsync().ConfigureAwait(false);
+            _disposed = true;
+
+            if (_channel is not null)
+            {
+                using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
+                try
+                {
+                    await _channel.CloseAsync(cts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best effort: the channel may already be closed by broker-side shutdown.
+                }
+
+                await _channel.DisposeAsync().ConfigureAwait(false);
+            }
+
+            if (_connection is not null)
+            {
+                using var cts = new CancellationTokenSource(_options.ShutdownTimeout);
+                try
+                {
+                    await _connection.CloseAsync(_options.ShutdownTimeout, cts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best effort.
+                }
+
+                await _connection.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _connectionGate.Release();
+            _connectionGate.Dispose();
         }
     }
 }

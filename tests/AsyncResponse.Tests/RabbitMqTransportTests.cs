@@ -292,6 +292,84 @@ public class RabbitMqTransportTests
         Assert.Equal(0, factory.Connection.DisposeCalls);
     }
 
+    [Fact]
+    public async Task WorkerTransport_EnablesPublisherConfirmationsOnPublishChannel()
+    {
+        var factory = new FakeConnectionFactory(new FakeRabbitMqChannel());
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("corr", 1));
+
+        Assert.True(factory.Connection.PublisherConfirmationsRequested);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_RecreatesChannelAfterTransientConnectFailure()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FlakyConnectionFactory(new FakeRabbitMqConnection(channel), failuresBeforeSuccess: 1);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        // First publish hits the transient connect failure...
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-1", 1)));
+        Assert.Empty(channel.Published);
+
+        // ...and the transport recovers on the next publish instead of caching the fault forever.
+        await transport.PublishAsync(WorkerJob("corr-2", 2));
+
+        var publish = Assert.Single(channel.Published);
+        Assert.Equal("corr-2", publish.Properties.CorrelationId);
+        Assert.Equal(2, factory.Attempts);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_DisposeAsync_IsIdempotent()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("corr", 1));
+        await transport.DisposeAsync();
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, channel.CloseCalls);
+        Assert.Equal(1, factory.Connection.CloseCalls);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_ReusesChannelAcrossPublishes()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("c1", 1));
+        await transport.PublishAsync(WorkerJob("c2", 2));
+
+        Assert.Equal(2, channel.Published.Count);
+        Assert.Equal(1, factory.Connection.CreateChannelCalls); // the channel is created once and reused.
+    }
+
+    [Fact]
+    public async Task WorkerTransport_DisposeAsync_SwallowsCloseFailures()
+    {
+        var channel = new FakeRabbitMqChannel { ThrowOnClose = new InvalidOperationException("channel close boom") };
+        var factory = new FakeConnectionFactory(channel);
+        factory.Connection.ThrowOnClose = new InvalidOperationException("connection close boom");
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("corr", 1));
+
+        // Close failures during shutdown are best-effort: dispose still completes and disposes resources.
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, channel.CloseCalls);
+        Assert.Equal(1, channel.DisposeCalls);
+        Assert.Equal(1, factory.Connection.CloseCalls);
+        Assert.Equal(1, factory.Connection.DisposeCalls);
+    }
+
     // ---------- Reply target provider: unconfigured targets and queue metadata ----------
 
     [Fact]
@@ -535,6 +613,68 @@ public class RabbitMqTransportTests
         Assert.Null(properties.Headers);
     }
 
+    [Fact]
+    public async Task Topology_WhenDeadLetterConfigured_DeclaresDlxAndTagsQueue()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "w.ex",
+            WorkerQueue = "w.q",
+            WorkerRoutingKey = "w.rk",
+            DeadLetterExchange = "dlx",
+            DeadLetterQueue = "dlq",
+            DeadLetterRoutingKey = "dead"
+        };
+
+        await RabbitMqTopology.EnsureWorkerAsync(channel, options);
+
+        Assert.Contains(channel.ExchangeDeclares, e => e.Exchange == "dlx");
+        Assert.Contains(channel.QueueBinds, b => b is { Queue: "dlq", Exchange: "dlx", RoutingKey: "dead" });
+
+        var workerQueue = Assert.Single(channel.QueueDeclares, q => q.Queue == "w.q");
+        Assert.NotNull(workerQueue.Arguments);
+        Assert.Equal("dlx", workerQueue.Arguments!["x-dead-letter-exchange"]);
+        Assert.Equal("dead", workerQueue.Arguments["x-dead-letter-routing-key"]);
+    }
+
+    [Fact]
+    public async Task Topology_DeadLetterWithoutRoutingKey_BindsWithSourceRoutingKey()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            ResponseExchange = "r.ex",
+            ResponseQueue = "r.q",
+            ResponseRoutingKey = "r.rk",
+            DeadLetterExchange = "dlx",
+            DeadLetterQueue = "dlq"
+        };
+
+        await RabbitMqTopology.EnsureResponseAsync(channel, options);
+
+        Assert.Contains(channel.QueueBinds, b => b is { Queue: "dlq", Exchange: "dlx", RoutingKey: "r.rk" });
+        var responseQueue = Assert.Single(channel.QueueDeclares, q => q.Queue == "r.q");
+        Assert.Equal("dlx", responseQueue.Arguments!["x-dead-letter-exchange"]);
+        Assert.False(responseQueue.Arguments.ContainsKey("x-dead-letter-routing-key"));
+    }
+
+    [Fact]
+    public async Task Topology_WithoutDeadLetter_LeavesQueueArgumentsNull()
+    {
+        var channel = new FakeRabbitMqChannel();
+
+        await RabbitMqTopology.EnsureWorkerAsync(channel, new RabbitMqAsyncResponseOptions
+        {
+            WorkerExchange = "w.ex",
+            WorkerQueue = "w.q",
+            WorkerRoutingKey = "w.rk"
+        });
+
+        var workerQueue = Assert.Single(channel.QueueDeclares);
+        Assert.Null(workerQueue.Arguments);
+    }
+
     // ---------- Subscriber hosted-service: queue validation + startup retry loop ----------
 
     [Fact]
@@ -705,13 +845,22 @@ public class RabbitMqTransportTests
     {
         public int CloseCalls { get; private set; }
         public int DisposeCalls { get; private set; }
+        public int CreateChannelCalls { get; private set; }
+        public bool? PublisherConfirmationsRequested { get; private set; }
+        public Exception? ThrowOnClose { get; set; }
 
-        public Task<IRabbitMqChannel> CreateChannelAsync(CancellationToken cancellationToken = default)
-            => Task.FromResult(channel);
+        public Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default)
+        {
+            CreateChannelCalls++;
+            PublisherConfirmationsRequested = publisherConfirmations;
+            return Task.FromResult(channel);
+        }
 
         public Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
         {
             CloseCalls++;
+            if (ThrowOnClose is not null)
+                throw ThrowOnClose;
             return Task.CompletedTask;
         }
 
@@ -728,7 +877,7 @@ public class RabbitMqTransportTests
         private Func<RabbitMqDelivery, Task>? _handler;
 
         public List<(string Exchange, string Type, bool Durable, bool AutoDelete)> ExchangeDeclares { get; } = [];
-        public List<(string Queue, bool Durable, bool Exclusive, bool AutoDelete)> QueueDeclares { get; } = [];
+        public List<(string Queue, bool Durable, bool Exclusive, bool AutoDelete, IDictionary<string, object?>? Arguments)> QueueDeclares { get; } = [];
         public List<(string Queue, string Exchange, string RoutingKey)> QueueBinds { get; } = [];
         public List<(string Exchange, string RoutingKey, BasicProperties Properties, ReadOnlyMemory<byte> Body)> Published { get; } = [];
         public List<ulong> Acks { get; } = [];
@@ -737,6 +886,7 @@ public class RabbitMqTransportTests
         public int CloseCalls { get; private set; }
         public int DisposeCalls { get; private set; }
         public Exception? ThrowOnPublish { get; init; }
+        public Exception? ThrowOnClose { get; init; }
 
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         {
@@ -744,9 +894,9 @@ public class RabbitMqTransportTests
             return Task.CompletedTask;
         }
 
-        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default)
+        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default)
         {
-            QueueDeclares.Add((queue, durable, exclusive, autoDelete));
+            QueueDeclares.Add((queue, durable, exclusive, autoDelete, arguments));
             return Task.CompletedTask;
         }
 
@@ -801,6 +951,8 @@ public class RabbitMqTransportTests
         public Task CloseAsync(CancellationToken cancellationToken = default)
         {
             CloseCalls++;
+            if (ThrowOnClose is not null)
+                throw ThrowOnClose;
             return Task.CompletedTask;
         }
 
@@ -828,6 +980,21 @@ public class RabbitMqTransportTests
             }
 
             throw new InvalidOperationException("broker unreachable");
+        }
+    }
+
+    private sealed class FlakyConnectionFactory(IRabbitMqConnection connection, int failuresBeforeSuccess) : IRabbitMqConnectionFactory
+    {
+        private int _attempts;
+
+        public int Attempts => Volatile.Read(ref _attempts);
+
+        public Task<IRabbitMqConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _attempts) <= failuresBeforeSuccess)
+                throw new InvalidOperationException("transient connect failure");
+
+            return Task.FromResult(connection);
         }
     }
 

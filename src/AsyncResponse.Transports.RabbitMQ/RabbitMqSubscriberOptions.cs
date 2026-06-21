@@ -77,6 +77,18 @@ public sealed class RabbitMqSubscriberOptions
     public ushort PrefetchCount { get; set; } = 16;
 
     /// <summary>
+    /// Maximum number of times a delivery may be attempted in <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/>
+    /// mode before a failing handler rejects it without requeue (dead-lettering it via
+    /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterExchange"/> when configured, otherwise dropping it).
+    /// Default: <c>0</c>, meaning unlimited — a failing handler requeues forever, which can hot-loop on a poison
+    /// message. Set a positive cap (with a dead-letter exchange) to bound retries. The attempt count is read from
+    /// the broker's <c>x-death</c> header and the <c>redelivered</c> flag; counts above 2 require a dead-letter
+    /// path that re-delivers (classic-queue requeues are not counted by the broker). Ignored for
+    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling and never redelivers.
+    /// </summary>
+    public int MaxDeliveryAttempts { get; set; }
+
+    /// <summary>
     /// Number of background workers used by <see cref="RabbitMqAckMode.AckAfterEnqueue"/>.
     /// Must be explicitly set to a positive value for early ACK mode.
     /// </summary>

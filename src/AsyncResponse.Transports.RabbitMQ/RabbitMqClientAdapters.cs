@@ -47,15 +47,21 @@ internal sealed class RabbitMqConnectionFactoryAdapter(
 
 internal interface IRabbitMqConnection : IAsyncDisposable
 {
-    Task<IRabbitMqChannel> CreateChannelAsync(CancellationToken cancellationToken = default);
+    Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default);
     Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
 }
 
 internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqConnection
 {
-    public async Task<IRabbitMqChannel> CreateChannelAsync(CancellationToken cancellationToken = default)
+    public async Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default)
     {
-        var channel = await inner.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+        // Enabling publisher confirmations with tracking makes BasicPublishAsync await the broker
+        // acknowledgement and throw on a nack or an unroutable (mandatory) return, so a worker job is
+        // never silently lost. Consumer channels pass false and keep the lighter default behavior.
+        var options = publisherConfirmations
+            ? new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true)
+            : null;
+        var channel = await inner.CreateChannelAsync(options, cancellationToken).ConfigureAwait(false);
         return new RabbitMqChannelAdapter(channel);
     }
 
@@ -68,7 +74,7 @@ internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqCo
 internal interface IRabbitMqChannel : IAsyncDisposable
 {
     Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default);
-    Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default);
+    Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default);
     Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default);
     Task BasicQosAsync(ushort prefetchCount, CancellationToken cancellationToken = default);
     ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default);
@@ -84,8 +90,8 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
     public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         => inner.ExchangeDeclareAsync(exchange, type, durable, autoDelete, cancellationToken: cancellationToken);
 
-    public async Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default)
-        => await inner.QueueDeclareAsync(queue, durable, exclusive, autoDelete, cancellationToken: cancellationToken).ConfigureAwait(false);
+    public async Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default)
+        => await inner.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
 
     public Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default)
         => inner.QueueBindAsync(queue, exchange, routingKey, cancellationToken: cancellationToken);

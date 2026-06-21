@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Logging;
+using RabbitMQ.Client;
+using System.Collections;
 using System.Diagnostics;
 using System.Threading.Channels;
 
@@ -35,6 +37,51 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
 
     protected RabbitMqAsyncResponseOptions TransportOptions { get; }
     protected ILogger Logger { get; }
+
+    /// <summary>
+    /// Maximum delivery attempts before a failing <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/> handler
+    /// rejects without requeue. <c>0</c> means unlimited (requeue forever).
+    /// </summary>
+    protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
+
+    /// <summary>
+    /// Resolves the 1-based delivery attempt for a message from the broker's <c>x-death</c> count and the
+    /// <c>redelivered</c> flag. A message seen for the first time is attempt 1.
+    /// </summary>
+    internal static int ResolveDeliveryAttempt(RabbitMqDelivery delivery)
+    {
+        var priorAttempts = Math.Max(ReadDeathCount(delivery.BasicProperties), delivery.Redelivered ? 1L : 0L);
+        var attempt = priorAttempts + 1;
+        return attempt > int.MaxValue ? int.MaxValue : (int)attempt;
+    }
+
+    private static long ReadDeathCount(IReadOnlyBasicProperties properties)
+    {
+        if (properties.Headers is null
+            || !properties.Headers.TryGetValue("x-death", out var raw)
+            || raw is not IEnumerable entries)
+        {
+            return 0;
+        }
+
+        long max = 0;
+        foreach (var entry in entries)
+        {
+            if (entry is not IDictionary fields || !fields.Contains("count") || fields["count"] is not { } countValue)
+                continue;
+
+            try
+            {
+                max = Math.Max(max, Convert.ToInt64(countValue));
+            }
+            catch (Exception ex) when (ex is FormatException or InvalidCastException or OverflowException)
+            {
+                // Ignore malformed x-death entries; fall back to the redelivered flag.
+            }
+        }
+
+        return max;
+    }
 
     public static RabbitMqMessageDispatcher Create(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
@@ -225,7 +272,11 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         }
         catch
         {
-            await channel.BasicNackAsync(delivery.DeliveryTag, requeue: true, CancellationToken.None).ConfigureAwait(false);
+            // Requeue for redelivery, unless a delivery cap is configured and this delivery has reached it —
+            // then reject without requeue so the broker dead-letters (or drops) it instead of hot-looping.
+            var requeue = MaxDeliveryAttempts <= 0
+                || ResolveDeliveryAttempt(delivery) < MaxDeliveryAttempts;
+            await channel.BasicNackAsync(delivery.DeliveryTag, requeue, CancellationToken.None).ConfigureAwait(false);
         }
     }
 }
@@ -334,6 +385,15 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                 _queueName,
                 PendingCount,
                 RunningCount);
+
+            // The workers are still running and read _drainCancellation.Token each loop, so disposing it now
+            // would throw ObjectDisposedException inside them. Dispose once they actually finish, off the
+            // shutdown path, so the source is not leaked either.
+            _ = Task.WhenAll(_workers).ContinueWith(
+                _ => _drainCancellation.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
     }
 

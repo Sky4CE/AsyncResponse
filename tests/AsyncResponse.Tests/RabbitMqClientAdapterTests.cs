@@ -46,19 +46,40 @@ public class RabbitMqClientAdapterTests
     // ---------- RabbitMqConnectionAdapter ----------
 
     [Fact]
-    public async Task ConnectionAdapter_CreateChannel_WrapsInnerChannel()
+    public async Task ConnectionAdapter_CreateChannel_WrapsInnerChannelWithDefaultOptions()
     {
+        CreateChannelOptions? capturedOptions = null;
         var innerChannel = new Mock<IChannel>();
         var connection = new Mock<IConnection>();
         connection
             .Setup(c => c.CreateChannelAsync(It.IsAny<CreateChannelOptions?>(), It.IsAny<CancellationToken>()))
+            .Callback((CreateChannelOptions? options, CancellationToken _) => capturedOptions = options)
             .ReturnsAsync(innerChannel.Object);
         var adapter = new RabbitMqConnectionAdapter(connection.Object);
 
         var channel = await adapter.CreateChannelAsync();
 
         Assert.IsType<RabbitMqChannelAdapter>(channel);
-        connection.Verify(c => c.CreateChannelAsync(It.IsAny<CreateChannelOptions?>(), It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Null(capturedOptions); // consumer channels keep the default (no publisher confirmations).
+    }
+
+    [Fact]
+    public async Task ConnectionAdapter_CreateChannel_WithPublisherConfirmations_EnablesConfirmTracking()
+    {
+        CreateChannelOptions? capturedOptions = null;
+        var innerChannel = new Mock<IChannel>();
+        var connection = new Mock<IConnection>();
+        connection
+            .Setup(c => c.CreateChannelAsync(It.IsAny<CreateChannelOptions?>(), It.IsAny<CancellationToken>()))
+            .Callback((CreateChannelOptions? options, CancellationToken _) => capturedOptions = options)
+            .ReturnsAsync(innerChannel.Object);
+        var adapter = new RabbitMqConnectionAdapter(connection.Object);
+
+        await adapter.CreateChannelAsync(publisherConfirmations: true);
+
+        Assert.NotNull(capturedOptions);
+        Assert.True(capturedOptions!.PublisherConfirmationsEnabled);
+        Assert.True(capturedOptions.PublisherConfirmationTrackingEnabled);
     }
 
     [Fact]
@@ -111,15 +132,16 @@ public class RabbitMqClientAdapterTests
     {
         using var cts = new CancellationTokenSource();
         var channel = new Mock<IChannel>();
+        var arguments = new Dictionary<string, object?> { ["x-dead-letter-exchange"] = "dlx" };
         channel
-            .Setup(c => c.QueueDeclareAsync("q", true, false, false, null, false, false, It.IsAny<CancellationToken>()))
+            .Setup(c => c.QueueDeclareAsync("q", true, false, false, arguments, false, false, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new QueueDeclareOk("q", 0, 0));
         var adapter = new RabbitMqChannelAdapter(channel.Object);
 
-        await adapter.QueueDeclareAsync("q", durable: true, exclusive: false, autoDelete: false, cts.Token);
+        await adapter.QueueDeclareAsync("q", durable: true, exclusive: false, autoDelete: false, arguments, cts.Token);
 
         channel.Verify(
-            c => c.QueueDeclareAsync("q", true, false, false, null, false, false, cts.Token),
+            c => c.QueueDeclareAsync("q", true, false, false, arguments, false, false, cts.Token),
             Times.Once);
     }
 
