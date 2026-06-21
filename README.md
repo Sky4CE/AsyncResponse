@@ -871,15 +871,17 @@ The stress harness now checks the system from multiple angles: **waiter-storm** 
 each must receive exactly its own response — no cross-correlation leakage), **progress-storm** (a burst
 of progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
 exactly once), **google-pubsub-ack-after-enqueue-dispatch-storm** (bounded early-ACK dispatcher:
-every ACKed message must be processed once), **race-burst** (subscribe-before-send under contention),
+every ACKed message must be processed once), **rabbitmq-ack-after-enqueue-dispatch-storm** (the same
+bounded early-ACK invariant for RabbitMQ deliveries), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
 `ExecutionContext` under foreign publishers), and
-**watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The same invariants are
-gated on every CI run, at smaller scale, by
-[`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. Both tiers run
-the in-memory channel and transport in-process.
+**watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The core concurrency
+invariants are gated on every CI run, at smaller scale, by
+[`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
+dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ brokers while exercising
+the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
@@ -889,7 +891,8 @@ required): default/early-ACK Pub/Sub apps and default/early-ACK RabbitMQ apps. P
 already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK target, and
 `--rabbitmq-url` / `--rabbitmq-early-ack-url` for RabbitMQ targets. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
-exception, shared exception, reply target), `pubsub` (default worker dispatch, response-topic ingress
+exception, shared exception, reply target, plus RabbitMQ worker/response/reply-target throughput when
+a RabbitMQ target is available), `pubsub` (default worker dispatch, response-topic ingress
 with attribute/body correlation ids, and early-ACK worker dispatch when an early target is available),
 `rabbitmq` (default worker dispatch, response-queue ingress with header/body correlation ids, reply
 target, and early-ACK worker dispatch when an early target is available), or `recovery`
@@ -902,6 +905,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile 
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq

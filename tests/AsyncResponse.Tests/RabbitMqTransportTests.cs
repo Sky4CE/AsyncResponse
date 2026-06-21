@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using RabbitMQ.Client;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Xunit;
@@ -203,6 +204,439 @@ public class RabbitMqTransportTests
         Assert.Contains(9UL, channel.Acks);
     }
 
+    // ---------- Worker transport: validation, null job, publish failure, disposal ----------
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void WorkerTransport_RequiresWorkerQueue(string value)
+    {
+        var options = Options.Create(new RabbitMqAsyncResponseOptions { WorkerQueue = value });
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new RabbitMqWorkerTransport(options, new FakeConnectionFactory()));
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.WorkerQueue), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void WorkerTransport_RequiresWorkerRoutingKey(string value)
+    {
+        var options = Options.Create(new RabbitMqAsyncResponseOptions { WorkerRoutingKey = value });
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new RabbitMqWorkerTransport(options, new FakeConnectionFactory()));
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.WorkerRoutingKey), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WorkerTransport_RequiresPositiveShutdownTimeout()
+    {
+        var options = Options.Create(new RabbitMqAsyncResponseOptions { ShutdownTimeout = TimeSpan.Zero });
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new RabbitMqWorkerTransport(options, new FakeConnectionFactory()));
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishNullJob_Throws()
+    {
+        var transport = new RabbitMqWorkerTransport(
+            Options.Create(new RabbitMqAsyncResponseOptions()),
+            new FakeConnectionFactory());
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() => transport.PublishAsync(null!));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_WhenPublishFails_Rethrows()
+    {
+        var channel = new FakeRabbitMqChannel { ThrowOnPublish = new InvalidOperationException("publish boom") };
+        var transport = new RabbitMqWorkerTransport(
+            Options.Create(new RabbitMqAsyncResponseOptions()),
+            new FakeConnectionFactory(channel));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr", 1)));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_DisposeAsync_ClosesChannelAndConnection()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("corr", 1));
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, channel.CloseCalls);
+        Assert.Equal(1, channel.DisposeCalls);
+        Assert.Equal(1, factory.Connection.CloseCalls);
+        Assert.Equal(1, factory.Connection.DisposeCalls);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_DisposeAsync_WhenNeverPublished_ClosesNothing()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.DisposeAsync();
+
+        Assert.Equal(0, channel.CloseCalls);
+        Assert.Equal(0, channel.DisposeCalls);
+        Assert.Equal(0, factory.Connection.CloseCalls);
+        Assert.Equal(0, factory.Connection.DisposeCalls);
+    }
+
+    // ---------- Reply target provider: unconfigured targets and queue metadata ----------
+
+    [Fact]
+    public void ReplyTargetProvider_WhenDefaultTargetNotConfigured_Throws()
+    {
+        var provider = new RabbitMqReplyTargetProvider(Options.Create(new RabbitMqAsyncResponseOptions
+        {
+            ResponseExchange = "",
+            ResponseRoutingKey = ""
+        }));
+
+        Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget());
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_WhenNamedTargetMissing_Throws()
+    {
+        var provider = new RabbitMqReplyTargetProvider(Options.Create(new RabbitMqAsyncResponseOptions()));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("does-not-exist"));
+        Assert.Contains("does-not-exist", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_FallsBackToResponseQueueWhenTargetQueueMissing()
+    {
+        var options = new RabbitMqAsyncResponseOptions { ResponseQueue = "shared.response.q" };
+        options.AddReplyTarget("regional", "regional.exchange", "regional.route");
+
+        var target = new RabbitMqReplyTargetProvider(Options.Create(options)).GetReplyTarget("regional");
+
+        Assert.Equal("shared.response.q", target.Properties["queue"]);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_OmitsQueueWhenNoneConfigured()
+    {
+        var options = new RabbitMqAsyncResponseOptions { ResponseQueue = "" };
+        options.AddReplyTarget("regional", "regional.exchange", "regional.route");
+
+        var target = new RabbitMqReplyTargetProvider(Options.Create(options)).GetReplyTarget("regional");
+
+        Assert.False(target.Properties.ContainsKey("queue"));
+    }
+
+    // ---------- Correlation extractor: null/blank/invalid bodies and header conversions ----------
+
+    [Fact]
+    public void CorrelationExtractor_NoJsonPaths_ReturnsNull()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdJsonPaths = [] };
+
+        Assert.Null(RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("""{"CorrelationId":"x"}"""),
+            """{"CorrelationId":"x"}""",
+            options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_WhitespaceBody_ReturnsNull()
+        => Assert.Null(RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("   "),
+            "   ",
+            new RabbitMqAsyncResponseOptions()));
+
+    [Fact]
+    public void CorrelationExtractor_InvalidJson_ReturnsNull()
+        => Assert.Null(RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("{not-json"),
+            "{not-json",
+            new RabbitMqAsyncResponseOptions()));
+
+    [Fact]
+    public void CorrelationExtractor_NullJsonRoot_ReturnsNull()
+        => Assert.Null(RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("null"),
+            "null",
+            new RabbitMqAsyncResponseOptions()));
+
+    [Fact]
+    public void CorrelationExtractor_NoMatchingPath_ReturnsNull()
+        => Assert.Null(RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("""{"Unrelated":"value"}"""),
+            """{"Unrelated":"value"}""",
+            new RabbitMqAsyncResponseOptions()));
+
+    [Fact]
+    public void CorrelationExtractor_NullHeaderValue_FallsThroughToJson()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdHeader = "cid" };
+        var delivery = Delivery(
+            """{"CorrelationId":"from-json"}""",
+            new BasicProperties { Headers = new Dictionary<string, object?> { ["cid"] = null } });
+
+        Assert.Equal("from-json", RabbitMqCorrelationIdExtractor.Extract(
+            delivery,
+            """{"CorrelationId":"from-json"}""",
+            options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReadOnlyMemoryHeader_IsDecoded()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdHeader = "cid" };
+        var delivery = Delivery(
+            "{}",
+            new BasicProperties
+            {
+                Headers = new Dictionary<string, object?> { ["cid"] = new ReadOnlyMemory<byte>("from-memory"u8.ToArray()) }
+            });
+
+        Assert.Equal("from-memory", RabbitMqCorrelationIdExtractor.Extract(delivery, "{}", options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_NonStringHeader_UsesToString()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdHeader = "cid" };
+        var delivery = Delivery(
+            "{}",
+            new BasicProperties { Headers = new Dictionary<string, object?> { ["cid"] = 12345 } });
+
+        Assert.Equal("12345", RabbitMqCorrelationIdExtractor.Extract(delivery, "{}", options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_CaseInsensitivePropertyMatch()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+
+        Assert.Equal("ci", RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("""{"correlationid":"ci"}"""),
+            """{"correlationid":"ci"}""",
+            options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_UnwrapsNestedJsonStringValue()
+    {
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+        };
+        const string json = """{"CustomParameters":"{\"CorrelationId\":\"nested\"}"}""";
+
+        Assert.Equal("nested", RabbitMqCorrelationIdExtractor.Extract(Delivery(json), json, options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_InvalidNestedJsonStringMidPath_ReturnsNull()
+    {
+        var options = new RabbitMqAsyncResponseOptions
+        {
+            CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+        };
+        const string json = """{"CustomParameters":"{ not json"}""";
+
+        Assert.Null(RabbitMqCorrelationIdExtractor.Extract(Delivery(json), json, options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_NonStringJsonValue_ReturnsStringForm()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+
+        Assert.Equal("12345", RabbitMqCorrelationIdExtractor.Extract(
+            Delivery("""{"CorrelationId":12345}"""),
+            """{"CorrelationId":12345}""",
+            options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_WhitespacePathSegment_ReturnsNull()
+    {
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdJsonPaths = [" "] };
+
+        Assert.Null(RabbitMqCorrelationIdExtractor.Extract(Delivery("{}"), "{}", options));
+    }
+
+    // ---------- Topology declaration + message properties ----------
+
+    [Fact]
+    public async Task Topology_WhenDeclareTopologyDisabled_SkipsWorkerDeclares()
+    {
+        var channel = new FakeRabbitMqChannel();
+
+        await RabbitMqTopology.EnsureWorkerAsync(channel, new RabbitMqAsyncResponseOptions { DeclareTopology = false });
+
+        Assert.Empty(channel.ExchangeDeclares);
+        Assert.Empty(channel.QueueDeclares);
+        Assert.Empty(channel.QueueBinds);
+    }
+
+    [Fact]
+    public async Task Topology_WhenDeclareTopologyDisabled_SkipsResponseDeclares()
+    {
+        var channel = new FakeRabbitMqChannel();
+
+        await RabbitMqTopology.EnsureResponseAsync(channel, new RabbitMqAsyncResponseOptions { DeclareTopology = false });
+
+        Assert.Empty(channel.ExchangeDeclares);
+        Assert.Empty(channel.QueueDeclares);
+        Assert.Empty(channel.QueueBinds);
+    }
+
+    [Fact]
+    public async Task Topology_EnsureResponse_DeclaresExchangeQueueAndBinding()
+    {
+        var channel = new FakeRabbitMqChannel();
+
+        await RabbitMqTopology.EnsureResponseAsync(channel, new RabbitMqAsyncResponseOptions
+        {
+            ResponseExchange = "resp.ex",
+            ResponseQueue = "resp.q",
+            ResponseRoutingKey = "resp.rk"
+        });
+
+        Assert.Contains(channel.ExchangeDeclares, item => item.Exchange == "resp.ex" && item.Durable);
+        Assert.Contains(channel.QueueDeclares, item => item.Queue == "resp.q" && item.Durable);
+        Assert.Contains(channel.QueueBinds, item => item is { Queue: "resp.q", Exchange: "resp.ex", RoutingKey: "resp.rk" });
+    }
+
+    [Fact]
+    public void CreatePersistentJsonProperties_NullCorrelation_OmitsCorrelationAndHeaders()
+    {
+        var properties = RabbitMqTopology.CreatePersistentJsonProperties(correlationId: null, correlationHeader: "cid");
+
+        Assert.Equal("application/json", properties.ContentType);
+        Assert.True(properties.Persistent);
+        Assert.False(string.IsNullOrWhiteSpace(properties.MessageId));
+        Assert.Null(properties.CorrelationId);
+        Assert.Null(properties.Headers);
+    }
+
+    [Fact]
+    public void CreatePersistentJsonProperties_BlankHeaderName_SetsCorrelationWithoutHeaders()
+    {
+        var properties = RabbitMqTopology.CreatePersistentJsonProperties(correlationId: "corr-1", correlationHeader: "");
+
+        Assert.Equal("corr-1", properties.CorrelationId);
+        Assert.Null(properties.Headers);
+    }
+
+    // ---------- Subscriber hosted-service: queue validation + startup retry loop ----------
+
+    [Fact]
+    public async Task WorkerSubscriber_QueueNameRequiresConfiguredWorkerQueue()
+    {
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions { WorkerQueue = "" }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            new FakeConnectionFactory());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber));
+    }
+
+    [Fact]
+    public async Task ResponseSubscriber_QueueNameRequiresConfiguredResponseQueue()
+    {
+        var subscriber = new RabbitMqResponseIngressSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions { ResponseQueue = "" }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RabbitMqResponseIngressSubscriber>.Instance,
+            new FakeConnectionFactory());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber));
+    }
+
+    [Fact]
+    public async Task Subscriber_WhenStartupFails_RetriesThenStopsOnCancellation()
+    {
+        var logger = new CapturingLogger<RabbitMqWorkerSubscriber>();
+        var factory = new ThrowingConnectionFactory();
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions
+            {
+                NetworkRecoveryInterval = TimeSpan.FromMilliseconds(20)
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            factory);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        // Two attempts proves the retry delay elapsed and the loop re-entered after a failure.
+        await WaitUntilAsync(() => factory.Attempts >= 2);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(logger.Snapshot(), entry => entry.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task Subscriber_UsesFallbackRetryDelay_WhenIntervalNonPositive()
+    {
+        var logger = new CapturingLogger<RabbitMqWorkerSubscriber>();
+        var factory = new ThrowingConnectionFactory();
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions
+            {
+                NetworkRecoveryInterval = TimeSpan.Zero
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            factory);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => logger.Snapshot().Any(entry => entry.Level == LogLevel.Warning));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.True(factory.Attempts >= 1);
+    }
+
+    [Fact]
+    public async Task Subscriber_WhenCancelledDuringConnect_StopsGracefully()
+    {
+        using var cts = new CancellationTokenSource();
+        var factory = new ThrowingConnectionFactory(cts);
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions()),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            factory);
+
+        // The connect attempt cancels the stopping token and throws; ExecuteAsync must observe the
+        // cancellation and return instead of surfacing the OperationCanceledException.
+        await InvokeExecuteAsync(subscriber, cts.Token);
+
+        Assert.Equal(1, factory.Attempts);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+            await Task.Delay(10, deadline.Token);
+    }
+
+    private static Task InvokeExecuteAsync(RabbitMqSubscriberService subscriber, CancellationToken cancellationToken = default)
+    {
+        var method = typeof(RabbitMqSubscriberService).GetMethod(
+            "ExecuteAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic)!;
+        return (Task)method.Invoke(subscriber, [cancellationToken])!;
+    }
+
     private static WorkerJobEnvelope WorkerJob(string correlationId, int orderId)
         => new()
         {
@@ -269,13 +703,23 @@ public class RabbitMqTransportTests
 
     private sealed class FakeRabbitMqConnection(IRabbitMqChannel channel) : IRabbitMqConnection
     {
+        public int CloseCalls { get; private set; }
+        public int DisposeCalls { get; private set; }
+
         public Task<IRabbitMqChannel> CreateChannelAsync(CancellationToken cancellationToken = default)
             => Task.FromResult(channel);
 
         public Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+        {
+            CloseCalls++;
+            return Task.CompletedTask;
+        }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalls++;
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FakeRabbitMqChannel : IRabbitMqChannel
@@ -290,6 +734,9 @@ public class RabbitMqTransportTests
         public List<ulong> Acks { get; } = [];
         public List<(ulong DeliveryTag, bool Requeue)> Nacks { get; } = [];
         public ushort PrefetchCount { get; private set; }
+        public int CloseCalls { get; private set; }
+        public int DisposeCalls { get; private set; }
+        public Exception? ThrowOnPublish { get; init; }
 
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         {
@@ -317,6 +764,9 @@ public class RabbitMqTransportTests
 
         public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
         {
+            if (ThrowOnPublish is not null)
+                throw ThrowOnPublish;
+
             Published.Add((exchange, routingKey, properties, body));
             return ValueTask.CompletedTask;
         }
@@ -349,8 +799,75 @@ public class RabbitMqTransportTests
         }
 
         public Task CloseAsync(CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+        {
+            CloseCalls++;
+            return Task.CompletedTask;
+        }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalls++;
+            return ValueTask.CompletedTask;
+        }
     }
+
+    private sealed class ThrowingConnectionFactory(CancellationTokenSource? cancelOnConnect = null) : IRabbitMqConnectionFactory
+    {
+        private int _attempts;
+
+        public int Attempts => Volatile.Read(ref _attempts);
+
+        public Task<IRabbitMqConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _attempts);
+
+            if (cancelOnConnect is not null)
+            {
+                cancelOnConnect.Cancel();
+                throw new OperationCanceledException(cancelOnConnect.Token);
+            }
+
+            throw new InvalidOperationException("broker unreachable");
+        }
+    }
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        private readonly object _gate = new();
+        private readonly List<RecordedLog> _entries = [];
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_gate)
+                _entries.Add(new RecordedLog(logLevel, formatter(state, exception), exception));
+        }
+
+        public IReadOnlyList<RecordedLog> Snapshot()
+        {
+            lock (_gate)
+                return _entries.ToArray();
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
+    private sealed record RecordedLog(LogLevel Level, string Message, Exception? Exception);
 }

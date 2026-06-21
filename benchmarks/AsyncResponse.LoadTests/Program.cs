@@ -16,6 +16,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
@@ -118,6 +119,7 @@ try
     var definitions = FilterScenarios(SelectScenarios(
         profile,
         includeEarlyAckTarget: earlyAckBaseAddress is not null,
+        includeRabbitMqTarget: app is not null || existingRabbitMqUrl is not null,
         includeRabbitMqEarlyAckTarget: rabbitMqEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
@@ -183,6 +185,7 @@ static ScenarioProps BuildScenario(
 static ScenarioDefinition[] SelectScenarios(
     string profile,
     bool includeEarlyAckTarget,
+    bool includeRabbitMqTarget,
     bool includeRabbitMqEarlyAckTarget)
 {
     var broad = new[]
@@ -197,6 +200,26 @@ static ScenarioDefinition[] SelectScenarios(
         new ScenarioDefinition("shared_exception_fanout_redis", SharedExceptionFanoutAsync),
         new ScenarioDefinition("reply_target_pubsub", ReplyTargetAsync)
     };
+    if (includeRabbitMqTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("rabbitmq_worker_default_ack_observed", (_, _, rabbitHttp, _) => WorkerObservedAsync(rabbitHttp)),
+            new ScenarioDefinition("rabbitmq_response_ingress_header", (_, _, rabbitHttp, _) => ResponseIngressAsync(rabbitHttp, useAttribute: true)),
+            new ScenarioDefinition("rabbitmq_response_ingress_body", (_, _, rabbitHttp, _) => ResponseIngressAsync(rabbitHttp, useAttribute: false)),
+            new ScenarioDefinition("rabbitmq_reply_target", (_, _, rabbitHttp, _) => ReplyTargetAsync(rabbitHttp))
+        ];
+
+        if (includeRabbitMqEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("rabbitmq_worker_ack_after_enqueue_observed", (_, _, _, rabbitEarlyAckHttp) => WorkerObservedAsync(rabbitEarlyAckHttp))
+            ];
+        }
+    }
 
     var pubsub = new[]
     {

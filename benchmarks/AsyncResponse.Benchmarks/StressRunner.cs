@@ -1,12 +1,14 @@
 using System.Diagnostics;
 using System.Text.Json;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.RabbitMQ;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using RabbitMQ.Client;
 
 namespace AsyncResponse.Benchmarks;
 
@@ -50,6 +52,7 @@ internal static class StressRunner
         failures += await ProgressStorm(concurrency, Math.Max(1, count / 10), progress);
         failures += await WorkerStorm(concurrency, count);
         failures += await GooglePubSubAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await RabbitMqAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -234,6 +237,89 @@ internal static class StressRunner
         return Check(
             "google-pubsub-ack-after-enqueue-dispatch-storm",
             ("nacks", nacks),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3c) RabbitMQ ACK-after-enqueue dispatch storm. This bypasses the broker and hammers the
+    //     subscriber callback dispatcher directly: every ACKed delivery must be processed exactly once.
+    private static async Task<int> RabbitMqAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var channel = new StressRabbitMqChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                var index = (long)delivery.DeliveryTag - 1;
+                if ((ulong)index >= (ulong)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[(int)index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions
+            {
+                HostShutdownTimeout = TimeSpan.FromSeconds(90)
+            },
+            new RabbitMqSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-queue",
+            RabbitMqSubscriberRole.Worker);
+
+        var metrics = await Measure("rabbitmq-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            var delivery = new RabbitMqDelivery(
+                ConsumerTag: "stress-consumer",
+                DeliveryTag: (ulong)i + 1,
+                Redelivered: false,
+                Exchange: "stress-exchange",
+                RoutingKey: "stress-worker-route",
+                BasicProperties: new BasicProperties
+                {
+                    MessageId = $"stress-{i}",
+                    ContentType = "application/json"
+                },
+                Body: System.Text.Encoding.UTF8.GetBytes("{}"),
+                CancellationToken: CancellationToken.None);
+
+            await dispatcher.HandleAsync(delivery, channel, CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("rabbitmq-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "rabbitmq-ack-after-enqueue-dispatch-storm",
+            ("nacks", channel.Nacks),
+            ("ackMismatch", Math.Abs(count - channel.Acks)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
             ("notDrained", drained ? 0 : 1),
             ("missing", count - Volatile.Read(ref processed)));
     }
@@ -859,6 +945,54 @@ internal static class StressRunner
             var rank = (int)Math.Ceiling(p / 100.0 * sorted.Length) - 1;
             return sorted[Math.Clamp(rank, 0, sorted.Length - 1)];
         }
+    }
+
+    private sealed class StressRabbitMqChannel : IRabbitMqChannel
+    {
+        private int _acks;
+        private int _nacks;
+
+        public int Acks => Volatile.Read(ref _acks);
+        public int Nacks => Volatile.Read(ref _nacks);
+
+        public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task BasicQosAsync(ushort prefetchCount, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
+            => ValueTask.CompletedTask;
+
+        public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
+            => Task.FromResult("stress-consumer");
+
+        public Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _acks);
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask BasicNackAsync(ulong deliveryTag, bool requeue, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _nacks);
+            return ValueTask.CompletedTask;
+        }
+
+        public Task CloseAsync(CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public ValueTask DisposeAsync()
+            => ValueTask.CompletedTask;
     }
 
     private sealed class CountingWorker(StressCounter counter) : ICountingWorker

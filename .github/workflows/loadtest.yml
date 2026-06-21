@@ -1,8 +1,8 @@
 name: Load test
 
-# End-to-end HTTP load test (NBomber) against the real Redis + Google Pub/Sub stack. Runs the broad
+# End-to-end HTTP load test (NBomber) against the real Redis + broker transport stack. Runs the broad
 # non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
-# dashboard as the benchmarks workflow; manual runs can select pubsub/recovery/all profiles. It is
+# dashboard as the benchmarks workflow; manual runs can select focused pubsub/rabbitmq/recovery profiles. It is
 # Docker-backed, so it shares a concurrency group with the benchmarks workflow to avoid racing on the
 # gh-pages history.
 on:
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, pubsub, recovery'
+        description: 'Scenario profile: broad, pubsub, rabbitmq, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -51,7 +51,7 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      # Boots Redis + a Pub/Sub emulator + the sample SUT via Aspire, drives them with NBomber, and
+      # Boots Redis + a Pub/Sub emulator + RabbitMQ + sample SUTs via Aspire, drives them with NBomber, and
       # emits github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
       - name: Run NBomber load test
         run: |
