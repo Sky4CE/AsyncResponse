@@ -2,15 +2,15 @@ namespace Microsoft.Extensions.DependencyInjection;
 
 /// <summary>
 /// Fluent registration builder returned by <c>AddAsyncResponse()</c>. Chain a <em>channel</em>
-/// (the response/recovery substrate) and, optionally, a worker <em>transport</em> (background-job
-/// dispatch):
+/// (the response/recovery substrate) and a worker <em>transport</em> (background-job dispatch):
 /// <code>
 /// services.AddAsyncResponse()
 ///         .WithInMemoryChannel()      // or .WithRedisChannel(...)
 ///         .WithInMemoryTransport();   // or .WithGooglePubSubTransport(...)
 /// </code>
-/// Exactly one channel is required — <c>AddAsyncResponse()</c> alone registers no channel, and an
-/// app that starts without one fails fast at host startup. Worker transports are optional.
+/// Exactly one channel and exactly one worker transport are required — <c>AddAsyncResponse()</c>
+/// alone registers neither, and an app that starts without either one fails fast at host startup.
+/// Background dispatch must be an explicit host-level choice.
 /// </summary>
 public sealed class AsyncResponseRegistrationBuilder
 {

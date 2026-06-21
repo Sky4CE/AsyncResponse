@@ -15,12 +15,14 @@ builder.AddServiceDefaults();
 builder.Services.AddOpenApi();
 
 // --- Provider selection (configuration-driven) ----------------------------------------------
-// Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (optional).
+// Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHost
 // overrides them to Redis + Google Pub/Sub to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // None | InMemory | GooglePubSub
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub
+var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
+var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis)
@@ -58,12 +60,17 @@ if (useRedis)
         options.DefaultTimeout = TimeSpan.FromSeconds(30);
     });
 }
-else
+else if (useInMemoryChannel)
 {
     asyncResponse.WithInMemoryChannel();
 }
+else
+{
+    throw new InvalidOperationException(
+        "Unsupported AsyncResponse:Channel value. Use 'InMemory' or 'Redis'.");
+}
 
-// Optional worker transport.
+// Exactly one worker transport (enforced at host startup).
 if (useGooglePubSub)
 {
     asyncResponse.WithGooglePubSubTransport(options =>
@@ -78,9 +85,14 @@ if (useGooglePubSub)
         ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
     });
 }
-else if (!string.Equals(transport, "None", StringComparison.OrdinalIgnoreCase))
+else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
+}
+else
+{
+    throw new InvalidOperationException(
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory' or 'GooglePubSub'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.

@@ -7,9 +7,9 @@ using Xunit;
 namespace AsyncResponse.Tests;
 
 /// <summary>
-/// The fluent registration surface: a channel is mandatory and enforced at host startup, and the
-/// in-memory channel/store satisfy the engine's recovery-state scanner and active-subscriber probe
-/// that the (channel-agnostic) watchdog runs on.
+/// The fluent registration surface: a channel and transport are mandatory and enforced at host
+/// startup, and the in-memory channel/store satisfy the engine's recovery-state scanner and
+/// active-subscriber probe that the (channel-agnostic) watchdog runs on.
 /// </summary>
 public class FluentRegistrationTests
 {
@@ -24,9 +24,19 @@ public class FluentRegistrationTests
     }
 
     [Fact]
-    public async Task StartupValidator_WithChannel_Succeeds()
+    public async Task StartupValidator_NoTransport_ThrowsWithGuidance()
     {
         var provider = Build(builder => builder.WithInMemoryChannel());
+        var validator = StartupValidator(provider);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains("WithInMemoryTransport", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StartupValidator_WithChannelAndTransport_Succeeds()
+    {
+        var provider = Build(builder => builder.WithInMemoryChannel().WithInMemoryTransport());
         var validator = StartupValidator(provider);
 
         await validator.StartAsync(CancellationToken.None); // must not throw

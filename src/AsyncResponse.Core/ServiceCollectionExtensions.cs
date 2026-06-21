@@ -5,7 +5,8 @@ namespace Microsoft.Extensions.DependencyInjection;
 
 /// <summary>
 /// Core registrations for AsyncResponse. Everything is configured through the fluent builder
-/// returned by <see cref="AddAsyncResponse"/>: chain a channel and, optionally, a worker transport.
+/// returned by <see cref="AddAsyncResponse"/>: chain exactly one channel and exactly one worker
+/// transport.
 /// </summary>
 public static class AsyncResponseCoreServiceCollectionExtensions
 {
@@ -13,10 +14,10 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// Registers the channel-agnostic AsyncResponse engine (fluent waiter builder, transport-neutral
     /// ingress, worker-job executor, and the recovery watchdog) and returns a builder to configure
     /// the rest. It deliberately registers <em>no</em> response channel: chain exactly one
-    /// (<see cref="WithInMemoryChannel"/> or the Redis channel package's <c>WithRedisChannel</c>) — an app
-    /// that starts without a channel fails fast at host startup. Optionally chain a worker transport
-    /// (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub transport package's
-    /// <c>WithGooglePubSubTransport</c>).
+    /// (<see cref="WithInMemoryChannel"/> or the Redis channel package's <c>WithRedisChannel</c>) and
+    /// exactly one worker transport (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub
+    /// transport package's <c>WithGooglePubSubTransport</c>). An app that starts without either one
+    /// fails fast at host startup.
     /// </summary>
     public static AsyncResponseRegistrationBuilder AddAsyncResponse(
         this IServiceCollection services,
@@ -38,13 +39,14 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>()));
 
+        // Fail fast before background services do any real work if the required channel/transport
+        // choices were not made explicitly.
+        services.AddHostedService<AsyncResponseStartupValidator>();
+
         // The recovery watchdog is part of the engine and runs by default for whatever channel is
         // registered (scanning + liveness go through IRecoveryStateScanner / IActiveSubscriberProbe).
         services.TryAddSingleton<AsyncResponseWatchdogState>();
         services.AddHostedService<AsyncResponseWatchdog>();
-
-        // Fail fast at host startup if no channel was chained on.
-        services.AddHostedService<AsyncResponseStartupValidator>();
 
         return new AsyncResponseRegistrationBuilder(services);
     }
@@ -98,9 +100,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// <summary>
     /// Registers the in-memory (in-process) worker transport and its background consumer. Jobs run
     /// in the current process and survive only as long as it does — suitable for development, tests,
-    /// and single-node deployments. For distributed, durable execution use a broker-backed transport
-    /// (e.g. the Google Pub/Sub transport package's <c>WithGooglePubSubTransport</c>) and feed consumed
-    /// messages into <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>.
+    /// and single-node deployments. Chain exactly one transport after <see cref="AddAsyncResponse"/>;
+    /// for distributed, durable execution use a full broker-backed transport package such as
+    /// <c>WithGooglePubSubTransport</c>.
     /// </summary>
     public static AsyncResponseRegistrationBuilder WithInMemoryTransport(this AsyncResponseRegistrationBuilder builder)
     {
@@ -109,6 +111,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.TryAddSingleton<InMemoryWorkerTransport>();
         services.TryAddSingleton<IWorkerTransport>(provider => provider.GetRequiredService<InMemoryWorkerTransport>());
         services.AddHostedService<InMemoryWorkerHost>();
+        services.AddSingleton(new AsyncResponseTransportMarker("InMemory"));
         return builder;
     }
 }

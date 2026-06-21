@@ -128,7 +128,8 @@ public class AsyncResponseDiagnosticsTests
             {
                 options.DefaultTimeout = TimeSpan.FromSeconds(5);
                 options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
-            });
+            })
+            .WithInMemoryTransport();
         return services.BuildServiceProvider();
     }
 
@@ -152,9 +153,16 @@ public class AsyncResponseDiagnosticsTests
         private readonly object _gate = new();
         private readonly List<Activity> _activities = [];
         private readonly ActivityListener _listener;
+        private readonly Activity? _previousActivity;
+        private readonly Activity _scope;
+        private readonly ActivityTraceId _traceId;
 
         public ActivityCollector()
         {
+            _previousActivity = Activity.Current;
+            Activity.Current = null;
+            _scope = new Activity("AsyncResponseDiagnosticsTest").Start();
+            _traceId = _scope.TraceId;
             _listener = new ActivityListener
             {
                 ShouldListenTo = source => source.Name == AsyncResponseDiagnostics.ActivitySourceName,
@@ -162,6 +170,9 @@ public class AsyncResponseDiagnosticsTests
                 SampleUsingParentId = (ref ActivityCreationOptions<string> _) => ActivitySamplingResult.AllDataAndRecorded,
                 ActivityStopped = activity =>
                 {
+                    if (activity.TraceId != _traceId)
+                        return;
+
                     lock (_gate)
                     {
                         _activities.Add(activity);
@@ -182,6 +193,10 @@ public class AsyncResponseDiagnosticsTests
         }
 
         public void Dispose()
-            => _listener.Dispose();
+        {
+            _listener.Dispose();
+            _scope.Stop();
+            Activity.Current = _previousActivity;
+        }
     }
 }

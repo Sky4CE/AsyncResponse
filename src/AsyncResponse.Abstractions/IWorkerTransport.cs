@@ -35,7 +35,8 @@ public sealed class WorkerJobEnvelope
 /// of choice for distributed execution (any consumer then feeds the message into
 /// <see cref="IAsyncResponseIngress.HandleWorkerMessageAsync"/>), or register the built-in
 /// in-memory queue (<c>AddAsyncResponse().WithInMemoryTransport()</c>) for development and
-/// single-node deployments.
+/// single-node deployments. Application hosts should select a full transport package rather than
+/// raw-registering this interface directly.
 /// </summary>
 public interface IWorkerTransport
 {

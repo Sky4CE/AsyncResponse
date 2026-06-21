@@ -40,7 +40,7 @@ internal sealed class AsyncResponseBuilder(
             var transport = _workerTransport ?? throw new InvalidOperationException(
                 "No IWorkerTransport is registered. Call .WithInMemoryTransport() for in-process execution, " +
                 ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
-                "or register a broker-backed IWorkerTransport implementation.");
+                "or install another full AsyncResponse transport package.");
 
             await transport.PublishAsync(new WorkerJobEnvelope
             {

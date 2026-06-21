@@ -14,8 +14,9 @@ namespace AsyncResponse.Tests;
 /// <summary>
 /// What each channel/transport registration wires into DI: the in-memory channel shares one
 /// instance across publisher/subscriber/probe and one store across store/scanner; the channel
-/// marker drives the single-channel startup rule (multiple channels fail fast); and the Google
-/// Pub/Sub transport replaces the worker transport and reply-target provider.
+/// marker drives the single-channel startup rule (multiple channels fail fast); transport markers
+/// drive the same single-transport rule; and the Google Pub/Sub transport replaces the worker
+/// transport and reply-target provider.
 /// </summary>
 public class ChannelTransportRegistrationTests
 {
@@ -45,6 +46,7 @@ public class ChannelTransportRegistrationTests
         var provider = Build(builder => builder.WithInMemoryChannel().WithInMemoryTransport());
 
         Assert.IsType<InMemoryWorkerTransport>(provider.GetRequiredService<IWorkerTransport>());
+        Assert.Equal("InMemory", provider.GetRequiredService<AsyncResponseTransportMarker>().Name);
         Assert.Contains(provider.GetServices<IHostedService>(), service => service is InMemoryWorkerHost);
     }
 
@@ -54,7 +56,9 @@ public class ChannelTransportRegistrationTests
         // Build the validator directly from the markers so we don't construct the (Redis-dependent)
         // watchdog, which would need an IConnectionMultiplexer that this test deliberately omits.
         var provider = Build(builder => builder.WithInMemoryChannel().WithRedisChannel());
-        var validator = new AsyncResponseStartupValidator(provider.GetServices<AsyncResponseChannelMarker>());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -63,8 +67,10 @@ public class ChannelTransportRegistrationTests
     [Fact]
     public async Task RedisChannel_RegistersExactlyOneChannelMarker()
     {
-        var provider = Build(builder => builder.WithRedisChannel());
-        var validator = new AsyncResponseStartupValidator(provider.GetServices<AsyncResponseChannelMarker>());
+        var provider = Build(builder => builder.WithRedisChannel().WithInMemoryTransport());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>());
 
         await validator.StartAsync(CancellationToken.None); // single "Redis" channel → must not throw
         await validator.StopAsync(CancellationToken.None);
@@ -135,6 +141,27 @@ public class ChannelTransportRegistrationTests
 
         Assert.IsType<GooglePubSubWorkerTransport>(provider.GetRequiredService<IWorkerTransport>());
         Assert.IsType<GooglePubSubReplyTargetProvider>(provider.GetRequiredService<IAsyncResponseReplyTargetProvider>());
+        Assert.Equal("GooglePubSub", provider.GetRequiredService<AsyncResponseTransportMarker>().Name);
+    }
+
+    [Fact]
+    public async Task MultipleTransports_FailFastAtStartup()
+    {
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithGooglePubSubTransport(options =>
+            {
+                options.ProjectId = "proj";
+                options.WorkerTopicId = "worker-topic";
+            }));
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("transport", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)

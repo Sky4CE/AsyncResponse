@@ -124,7 +124,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddAsyncResponse()   // engine: fluent builder, ingress, recovery watchdog
     .WithInMemoryChannel()            // process-local response channel + recovery store (required)
-    .WithInMemoryTransport();         // optional: in-process background worker jobs
+    .WithInMemoryTransport();         // in-process worker transport (required)
 ```
 
 ### Redis-backed response channel and recovery
@@ -143,15 +143,17 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(
 
 builder.Services.AddAsyncResponse()                // engine + recovery watchdog (on by default)
     .WithRedisChannel()                            // Redis response channel + Redis recovery store
-    .WithInMemoryTransport();                      // optional: background worker jobs
+    .WithInMemoryTransport();                      // in-process worker transport
 builder.Services.AddHealthChecks()
     .AddAsyncResponseRecoveryCheck();              // optional: surface the watchdog on /readyz
 ```
 
-`AddAsyncResponse()` registers the channel-agnostic engine but **no channel** — chain exactly one
-(`.WithInMemoryChannel()` or `.WithRedisChannel()`). An app that starts without a channel fails
-fast at host startup, so a misconfiguration can never silently hang every waiter. The recovery
-watchdog is part of the engine and runs by default for whichever channel you choose.
+`AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
+exactly one channel (`.WithInMemoryChannel()` or `.WithRedisChannel()`) and exactly one transport
+(`.WithInMemoryTransport()`, `.WithGooglePubSubTransport(...)`, or another full AsyncResponse
+transport package). An app that starts without either one fails fast at host startup with setup
+guidance, so a misconfiguration can never silently hang every waiter or drop worker dispatch. The
+recovery watchdog is part of the engine and runs by default for whichever channel you choose.
 
 ### Google Pub/Sub transport
 
@@ -417,29 +419,25 @@ await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsy
 ```
 
 The ambient correlation id is captured with the job and restored before execution, so anything
-the job publishes correlates automatically. `.WithInMemoryTransport()` executes jobs in the
-current process; for distributed execution use `.WithGooglePubSubTransport(...)` or implement
-`IWorkerTransport` against your broker and have the consumer call
-`ingress.HandleWorkerMessageAsync(json)`.
+the job publishes correlates automatically. Transport is an explicit host-level choice:
+`.WithInMemoryTransport()` executes jobs in the current process; for distributed execution use
+`.WithGooglePubSubTransport(...)` or another full AsyncResponse transport package.
 
-A custom transport is a thin publish-side adapter; any consumer then feeds the message back into
-the ingress, which restores the captured context and executes the job:
+A transport package is more than a publish-side adapter: it owns the worker publisher, any hosted
+subscribers, response ingress, reply-target support, options validation, and shutdown behavior that
+the broker needs. New transports should expose a complete fluent extension such as
+`.WithRabbitMqTransport(...)` rather than asking application hosts to raw-register
+`IWorkerTransport`.
 
 ```csharp
-public sealed class RabbitMqWorkerTransport(IModel channel) : IWorkerTransport
-{
-    public Task PublishAsync(WorkerJobEnvelope job, CancellationToken ct = default)
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(options =>
     {
-        channel.BasicPublish("", "asyncresponse-workers", body: JsonSerializer.SerializeToUtf8Bytes(job));
-        return Task.CompletedTask;
-    }
-}
-
-builder.Services.AddAsyncResponse().WithRedisChannel();
-builder.Services.AddSingleton<IWorkerTransport, RabbitMqWorkerTransport>();   // instead of .WithInMemoryTransport()
-
-// in your RabbitMQ consumer:
-await ingress.HandleWorkerMessageAsync(Encoding.UTF8.GetString(body));
+        options.ConnectionString = "...";
+        options.WorkerQueue = "asyncresponse-workers";
+        options.ResponseQueue = "asyncresponse-responses";
+    });
 ```
 
 ### 6. Propagating ambient context (trace, principal, tenant)
@@ -542,7 +540,8 @@ builder.Services.AddAsyncResponse(options =>
     options.KeyPrefix = "myapp";                            // isolate apps/environments
     options.RecoveryStateExpiry = TimeSpan.FromDays(7);     // how long recovery survives
     options.DefaultTimeout = TimeSpan.FromHours(12);        // default per-waiter timeout
-});
+})
+.WithInMemoryTransport();                                   // or .WithGooglePubSubTransport(...)
 ```
 
 Tracing: AsyncResponse emits `System.Diagnostics.Activity` spans from one source,
@@ -598,7 +597,7 @@ Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported contai
 such as Docker or Podman for the Redis resource.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis`) and
-`AsyncResponse:Transport` (`None` | `InMemory` | `GooglePubSub`) select the providers, defaulting to
+`AsyncResponse:Transport` (`InMemory` | `GooglePubSub`) select the providers, defaulting to
 fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
