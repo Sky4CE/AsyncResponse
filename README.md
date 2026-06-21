@@ -92,6 +92,7 @@ somebody has to make the call.
 | `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
 | `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
+| `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
 
 Package naming follows the extension point: `AsyncResponse.Channels.*` packages provide
@@ -108,6 +109,9 @@ dotnet add package AsyncResponse.Channels.Redis
 
 # Optional Google Pub/Sub transport:
 dotnet add package AsyncResponse.Transports.GooglePubSub
+
+# Optional RabbitMQ transport:
+dotnet add package AsyncResponse.Transports.RabbitMQ
 ```
 
 ## Quick start
@@ -150,7 +154,7 @@ builder.Services.AddHealthChecks()
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
 exactly one channel (`.WithInMemoryChannel()` or `.WithRedisChannel()`) and exactly one transport
-(`.WithInMemoryTransport()`, `.WithGooglePubSubTransport(...)`, or another full AsyncResponse
+(`.WithInMemoryTransport()`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, or another full AsyncResponse
 transport package). An app that starts without either one fails fast at host startup with setup
 guidance, so a misconfiguration can never silently hang every waiter or drop worker dispatch. The
 recovery watchdog is part of the engine and runs by default for whichever channel you choose.
@@ -265,6 +269,87 @@ configured message attribute first (`correlationId` by default), then falls back
 paths such as `CorrelationId`, `CustomParameters`, `CustomParameters.CorrelationId`,
 `PubSubParams.CustomParameters.CorrelationId`, and `DagJsonParameters.CorrelationId`.
 
+### RabbitMQ transport
+
+RabbitMQ is also a message transport, not a recovery store. Compose it with Core-only waiting for
+simple apps, or with Redis/Postgres-style recovery when late responses must survive redeploys.
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(options =>
+    {
+        options.ConnectionString = "amqp://guest:guest@localhost:5672/";
+        options.WorkerExchange = "asyncresponse.worker";
+        options.WorkerQueue = "asyncresponse.worker";
+        options.WorkerRoutingKey = "asyncresponse.worker";
+        options.ResponseExchange = "asyncresponse.response";
+        options.ResponseQueue = "asyncresponse.response";
+        options.ResponseRoutingKey = "asyncresponse.response";
+        options.CorrelationIdHeader = "correlationId";
+    });
+```
+
+One `.WithRabbitMqTransport(...)` wires the worker publisher, the worker-job subscriber, the
+response-ingress subscriber, RabbitMQ topology declaration, reply-target support, and shutdown
+validation. By default it declares durable direct exchanges, durable queues, and bindings for the
+configured worker and response paths before publishing or consuming. Set
+`DeclareTopology = false` if your infrastructure team owns topology creation.
+
+RabbitMQ ACK behavior mirrors the Pub/Sub transport. The default is
+`AckAfterHandlerCompletes`, which ACKs only after AsyncResponse handling succeeds and NACKs with
+requeue if the handler throws. For worker jobs that must be accepted quickly into the process, opt
+in explicitly:
+
+```csharp
+builder.Services.Configure<HostOptions>(host =>
+{
+    host.ShutdownTimeout = TimeSpan.FromMinutes(3);
+});
+
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(options =>
+    {
+        options.ConnectionString = "amqp://guest:guest@localhost:5672/";
+        options.HostShutdownTimeout = TimeSpan.FromMinutes(3);
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 64,
+            backgroundQueueCapacity: 10_000,
+            backgroundDrainTimeout: TimeSpan.FromMinutes(2));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            // Alert, increment a metric, or publish to a durable failure path.
+            return ValueTask.CompletedTask;
+        };
+    });
+```
+
+With `AckAfterEnqueue`, RabbitMQ is ACKed once the delivery is accepted into a bounded in-process
+queue. If the process dies after that point, RabbitMQ will not redeliver that message. If the
+queue is full, the subscriber NACKs with requeue. If a background handler fails after ACK, the
+failure is logged and reported through `OnBackgroundFailure`. The transport validates that
+`ShutdownTimeout + BackgroundDrainTimeout` fits inside `HostShutdownTimeout`, so mirror any custom
+`HostOptions.ShutdownTimeout` value in the transport options. Keep response ingress on the default
+`AckAfterHandlerCompletes` unless response processing is durable enough to tolerate early ACK.
+
+The RabbitMQ response exchange/routing key are exposed as a transport-neutral reply target:
+
+```csharp
+OrderResult result = await _asyncResponse
+    .For<OrderResult>()
+    .WithReplyTarget()
+    .WaitAsync(context => _remoteSystem.SubmitAsync(
+        orderId,
+        correlationId: context.CorrelationId,
+        replyExchange: context.ReplyTarget!.Properties["exchange"],
+        replyRoutingKey: context.ReplyTarget.Properties["routingKey"]));
+```
+
+The hosted response subscriber feeds RabbitMQ deliveries into `IAsyncResponseIngress`. It resolves
+the correlation id from AMQP `CorrelationId` first, then from the configured message header
+(`correlationId` by default), then from the same JSON body paths used by the Pub/Sub transport.
+
 ### 1. Define a payload
 
 Every payload implements `IAsyncResponsePayload` — a marker that also keeps scalars (`string`,
@@ -357,8 +442,9 @@ them into the ingress:
 await ingress.HandleResponseMessageAsync(messageBodyJson, correlationIdFromHeaders);
 ```
 
-When you use `AsyncResponse.Transports.GooglePubSub`, the hosted response subscriber does this
-for you and can extract the correlation id from Pub/Sub attributes or the configured JSON paths.
+When you use `AsyncResponse.Transports.GooglePubSub` or `AsyncResponse.Transports.RabbitMQ`, the
+hosted response subscriber does this for you and can extract the correlation id from broker
+metadata or the configured JSON paths.
 
 In-process publishers can skip the ingress and call `IAsyncResponsePublisher` directly with
 payload types that implement `IAsyncResponsePayload`. Raw broker/webhook JSON should stay on
@@ -421,7 +507,8 @@ await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsy
 The ambient correlation id is captured with the job and restored before execution, so anything
 the job publishes correlates automatically. Transport is an explicit host-level choice:
 `.WithInMemoryTransport()` executes jobs in the current process; for distributed execution use
-`.WithGooglePubSubTransport(...)` or another full AsyncResponse transport package.
+`.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, or another full AsyncResponse
+transport package.
 
 A transport package is more than a publish-side adapter: it owns the worker publisher, any hosted
 subscribers, response ingress, reply-target support, options validation, and shutdown behavior that
@@ -450,7 +537,7 @@ it back, choosing the mechanism automatically per boundary:
 |---|---|---|
 | Response handler (Redis & in-memory) — your `Until` predicate, progress handling | in-process thread hop | captured `ExecutionContext` (automatic) |
 | In-memory worker job | in-process thread hop | captured `ExecutionContext` (automatic) |
-| Broker-backed worker job (e.g. Google Pub/Sub) | serialized, another process | `IAsyncResponseContextPropagator` baggage |
+| Broker-backed worker job (e.g. Google Pub/Sub or RabbitMQ) | serialized, another process | `IAsyncResponseContextPropagator` baggage |
 | Lost-subscriber recovery callback (after a redeploy) | serialized, maybe another deployment | `IAsyncResponseContextPropagator` baggage |
 
 **In-process hops need no configuration.** The response handler and the in-memory worker run under
@@ -541,7 +628,7 @@ builder.Services.AddAsyncResponse(options =>
     options.RecoveryStateExpiry = TimeSpan.FromDays(7);     // how long recovery survives
     options.DefaultTimeout = TimeSpan.FromHours(12);        // default per-waiter timeout
 })
-.WithInMemoryTransport();                                   // or .WithGooglePubSubTransport(...)
+.WithInMemoryTransport();                                   // or .WithGooglePubSubTransport(...) / .WithRabbitMqTransport(...)
 ```
 
 Tracing: AsyncResponse emits `System.Diagnostics.Activity` spans from one source,
@@ -569,6 +656,7 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.ingress.response`, `asyncresponse.ingress.worker` | transport-neutral response and worker message ingress |
 | `asyncresponse.enqueue_worker`, `asyncresponse.worker.publish`, `asyncresponse.worker.execute` | worker enqueue, transport publish, and execution |
 | `asyncresponse.pubsub.receive` | Google Pub/Sub subscriber message handling |
+| `asyncresponse.rabbitmq.receive` | RabbitMQ subscriber message handling |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
 | `asyncresponse.watchdog.scan` | recovery watchdog scans |
 
@@ -587,18 +675,18 @@ resource environment, and health checks in one place:
 dotnet run --project samples/AsyncResponse.AppHost
 ```
 
-The sample AppHost starts a Redis container and the sample API, then opens the Aspire dashboard.
+The sample AppHost starts Redis and RabbitMQ containers plus the sample API, then opens the Aspire dashboard.
 Use the dashboard's `playground` resource to open the API endpoint and inspect `AsyncResponse`
 logs/traces. The local playground pins the dashboard to `http://localhost:18888` and uses HTTP
 resource/OTLP endpoints to avoid local HTTPS certificate issues. The sample also exposes Aspire
 service-default endpoints at `/health` and `/alive`.
 
 Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
-such as Docker or Podman for the Redis resource.
+such as Docker or Podman for the Redis and RabbitMQ resources.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis`) and
-`AsyncResponse:Transport` (`InMemory` | `GooglePubSub`) select the providers, defaulting to
-fully in-memory — so it runs standalone with **no external dependencies**:
+`AsyncResponse:Transport` (`InMemory` | `GooglePubSub` | `RabbitMQ`) select the providers,
+defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
 dotnet run --project samples/AsyncResponse.Sample      # in-memory channel + in-memory worker transport
@@ -609,6 +697,18 @@ The durable lost-subscriber recovery flow needs a real channel — point the sam
 ```bash
 docker compose up -d                                                  # local Redis
 AsyncResponse__Channel=Redis dotnet run --project samples/AsyncResponse.Sample
+```
+
+To run the standalone sample against a local RabbitMQ broker, point the transport at an AMQP
+connection string:
+
+```bash
+docker compose up -d                                                  # local Redis
+docker run -d --rm --name asyncresponse-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3.13-management
+AsyncResponse__Channel=Redis \
+AsyncResponse__Transport=RabbitMQ \
+RabbitMQ__ConnectionString=amqp://guest:guest@localhost:5672/ \
+dotnet run --project samples/AsyncResponse.Sample
 ```
 
 Then walk the scenarios (the same HTTP endpoints the integration tests drive):
@@ -624,6 +724,7 @@ curl -X POST 'http://localhost:5000/multi-step?first=Succeed&second=Fail'    # s
 curl -X POST 'http://localhost:5000/ambient-exception?message=boom'          # SetException uses ambient correlation id
 curl -X POST 'http://localhost:5000/shared-correlation-exception?message=boom' # one exception faults two waiters
 curl -X POST 'http://localhost:5000/worker?token=order-42'                  # fire-and-forget background worker job
+curl -X POST 'http://localhost:5000/emit-response?correlationId=<id>&status=Completed&useAttribute=true' # broker response ingress
 curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
 curl      'http://localhost:5000/alive'                                     # liveness check
 
@@ -719,10 +820,10 @@ no separate fixture app to keep in sync). They run at two levels:
   and transport, covering the core request/response, attach, worker, and concurrency paths. They need
   no containers, so they stay fast and reliable even where Docker is unavailable.
 - **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
-  a Google Pub/Sub emulator container, and two sample-app SUTs: one with default
-  `AckAfterHandlerCompletes` worker subscribers, and one with explicit worker `AckAfterEnqueue`.
-  Tests drive the Redis-channel and Pub/Sub scenarios over HTTP. They need a running Docker daemon
-  (and pull a Pub/Sub emulator image on first run), so CI runs them in a separate Docker-backed
+  a Google Pub/Sub emulator container, RabbitMQ, and four sample-app SUTs: Pub/Sub default ACK,
+  Pub/Sub worker `AckAfterEnqueue`, RabbitMQ default ACK, and RabbitMQ worker `AckAfterEnqueue`.
+  Tests drive the Redis-channel, Pub/Sub, and RabbitMQ scenarios over HTTP. They need a running
+  Docker daemon (and pull broker images on first run), so CI runs them in a separate Docker-backed
   `integration-tests` job:
 
 ```bash
@@ -743,7 +844,7 @@ modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harne
 request/response round-trip, raw broker ingress, shared-correlation fanout, exception fanout,
 recovery-state save/scan, watchdog/health evaluation, context propagation, envelope
 (de)serialization, payload classification, expression→callback conversion, reflection invoke, and
-Google Pub/Sub subscriber ACK dispatch modes).
+Google Pub/Sub/RabbitMQ subscriber ACK dispatch modes).
 `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections per op alongside
 mean/median/percentile timings:
 
@@ -752,6 +853,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks             
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Channel*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Ingress*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RabbitMqAckDispatch*'
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
@@ -781,30 +883,34 @@ the in-memory channel and transport in-process.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
-Redis channel + Google Pub/Sub transport — reporting throughput, latency percentiles, and failures per
-scenario. By default it boots Redis + a Pub/Sub emulator + two SUTs via Aspire (Docker required):
-the default Pub/Sub app and an explicit worker `AckAfterEnqueue` app. Pass `--url` to load an
-already-running default instance, and `--early-ack-url` as well when you want the `pubsub` profile
-to exercise a separate early-ACK instance. Profiles let you choose the scenario set:
+Redis channel + broker transports — reporting throughput, latency percentiles, and failures per
+scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + four SUTs via Aspire (Docker
+required): default/early-ACK Pub/Sub apps and default/early-ACK RabbitMQ apps. Pass `--url` to load an
+already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK target, and
+`--rabbitmq-url` / `--rabbitmq-early-ack-url` for RabbitMQ targets. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
 exception, shared exception, reply target), `pubsub` (default worker dispatch, response-topic ingress
 with attribute/body correlation ids, and early-ACK worker dispatch when an early target is available),
-or `recovery` (lost-subscriber resume/failure/exception and stale health). Run the
+`rabbitmq` (default worker dispatch, response-queue ingress with header/body correlation ids, reply
+target, and early-ACK worker dispatch when an early target is available), or `recovery`
+(lost-subscriber resume/failure/exception and stale health). Run the
 recovery profile separately because it intentionally simulates subscriber loss:
 
 ```bash
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
 ```
 
 Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;
 the mixed profiles are better at finding interference between flows. The sample Pub/Sub emit endpoint
-reuses its publisher client, so the `pubsub` profile measures response ingress and emulator scheduling
-rather than per-request client construction. It writes an HTML/CSV/Markdown report to `nbomber-report/`.
+reuses its publisher client, while RabbitMQ response emits open a short-lived AMQP channel per request
+to model an external producer. It writes an HTML/CSV/Markdown report to `nbomber-report/`.
 The [load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
@@ -816,7 +922,7 @@ uploading the full report as an artifact. Manual workflow runs can switch `profi
 ([`benchmarks.yml`](.github/workflows/benchmarks.yml)) and publishes them with
 [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as
 interactive, per-commit charts: micro-benchmark timings & allocations, the in-process stress suites,
-and — from the load-test workflow — end-to-end throughput & latency over the real Redis/Pub-Sub stack:
+and — from the load-test workflow — end-to-end throughput & latency over the real Redis/broker stack:
 
 **📈 [Benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/)**
 

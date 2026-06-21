@@ -10,6 +10,7 @@
     <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
   </ItemGroup>
 
   <ItemGroup>

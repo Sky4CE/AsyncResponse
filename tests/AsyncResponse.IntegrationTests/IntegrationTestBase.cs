@@ -18,8 +18,11 @@ public abstract class IntegrationTestBase(IntegrationFixture fixture)
 
     /// <summary>Arms a recoverable waiter via the SUT endpoint and returns its generated correlation id.</summary>
     protected async Task<string> ArmAsync(string trace)
+        => await ArmAsync(Client, trace).ConfigureAwait(false);
+
+    protected static async Task<string> ArmAsync(HttpClient client, string trace)
     {
-        var response = await Client.PostAsync($"/arm?trace={Uri.EscapeDataString(trace)}", content: null);
+        var response = await client.PostAsync($"/arm?trace={Uri.EscapeDataString(trace)}", content: null);
         response.EnsureSuccessStatusCode();
         var arm = await response.Content.ReadFromJsonAsync<ArmResponse>();
         return arm!.CorrelationId;

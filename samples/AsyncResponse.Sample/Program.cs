@@ -2,11 +2,14 @@ using AsyncResponse;
 using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.RabbitMQ;
 using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
+using RabbitMQ.Client;
+using System.Text;
 using StackExchange.Redis;
 using System.Text.Json;
 
@@ -16,14 +19,15 @@ builder.Services.AddOpenApi();
 
 // --- Provider selection (configuration-driven) ----------------------------------------------
 // Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
-// Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHost
-// overrides them to Redis + Google Pub/Sub to exercise the durable, broker-backed stack.
+// Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
+// override them to Redis + broker transports to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
+var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis)
 {
@@ -41,6 +45,10 @@ if (useGooglePubSub)
     {
         EmulatorDetection = EmulatorDetection.EmulatorOrProduction
     }.BuildAsync()));
+}
+else if (useRabbitMq)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "RabbitMQ");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -81,8 +89,35 @@ if (useGooglePubSub)
         options.ResponseTopicId = builder.Configuration["PubSub:ResponseTopicId"];
         options.ResponseSubscriptionId = builder.Configuration["PubSub:ResponseSubscriptionId"];
         ConfigurePubSubShutdownBudget(builder.Configuration, options);
-        ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Worker", options.WorkerSubscriber);
-        ConfigureSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
+        ConfigurePubSubSubscriberAckMode(builder.Configuration, "PubSub:Worker", options.WorkerSubscriber);
+        ConfigurePubSubSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
+    });
+}
+else if (useRabbitMq)
+{
+    asyncResponse.WithRabbitMqTransport(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("RabbitMQ")
+            ?? builder.Configuration["RabbitMQ:ConnectionString"];
+        options.HostName = builder.Configuration["RabbitMQ:HostName"] ?? options.HostName;
+        options.VirtualHost = builder.Configuration["RabbitMQ:VirtualHost"] ?? options.VirtualHost;
+        options.UserName = builder.Configuration["RabbitMQ:UserName"] ?? options.UserName;
+        options.Password = builder.Configuration["RabbitMQ:Password"] ?? options.Password;
+        options.ClientProvidedName = builder.Configuration["RabbitMQ:ClientProvidedName"] ?? options.ClientProvidedName;
+        options.WorkerExchange = builder.Configuration["RabbitMQ:WorkerExchange"] ?? options.WorkerExchange;
+        options.WorkerQueue = builder.Configuration["RabbitMQ:WorkerQueue"] ?? options.WorkerQueue;
+        options.WorkerRoutingKey = builder.Configuration["RabbitMQ:WorkerRoutingKey"] ?? options.WorkerRoutingKey;
+        options.ResponseExchange = builder.Configuration["RabbitMQ:ResponseExchange"] ?? options.ResponseExchange;
+        options.ResponseQueue = builder.Configuration["RabbitMQ:ResponseQueue"] ?? options.ResponseQueue;
+        options.ResponseRoutingKey = builder.Configuration["RabbitMQ:ResponseRoutingKey"] ?? options.ResponseRoutingKey;
+        options.CorrelationIdHeader = builder.Configuration["RabbitMQ:CorrelationIdHeader"] ?? options.CorrelationIdHeader;
+
+        if (int.TryParse(builder.Configuration["RabbitMQ:Port"], out var port))
+            options.Port = port;
+
+        ConfigureRabbitMqShutdownBudget(builder.Configuration, options);
+        ConfigureRabbitMqSubscriberAckMode(builder.Configuration, "RabbitMQ:Worker", options.WorkerSubscriber);
+        ConfigureRabbitMqSubscriberAckMode(builder.Configuration, "RabbitMQ:Response", options.ResponseSubscriber);
     });
 }
 else if (useInMemoryTransport)
@@ -92,7 +127,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory' or 'GooglePubSub'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', or 'RabbitMQ'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -124,7 +159,7 @@ app.MapGet("/", () => Results.Text(
       POST /worker?token=42                                      fire-and-forget background worker job
       POST /arm  + POST /crash + POST /publish                   lost-subscriber recovery flow (Redis)
       POST /lost-subscriber-flow?outcome=Completed|Failed|Exception  composed recovery flow (Redis)
-      GET  /reply-target                                         provider-resolved reply target (Pub/Sub)
+      GET  /reply-target                                         provider-resolved reply target (broker transports)
       GET  /config                                               resolved channel/transport/ACK mode
       GET  /healthz                                              health report incl. the recovery watchdog
     """)).ExcludeFromDescription();
@@ -134,11 +169,12 @@ app.MapGet("/", () => Results.Text(
 app.MapGet("/alive", () => Results.Ok("alive")).ExcludeFromDescription();
 
 // Reports the providers this instance resolved from configuration. The in-process tests assert
-// InMemory/InMemory and the Aspire SUT asserts Redis/GooglePubSub, so each variation is provably
-// exercised even though only one is ever booted per process.
+// InMemory/InMemory, and the Aspire SUTs assert Redis plus each broker transport variation, so the
+// selectable providers stay exercised even though one app process boots only one pair.
 app.MapGet("/config", (IServiceProvider services) =>
 {
     object? pubsub = null;
+    object? rabbitmq = null;
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
@@ -153,7 +189,27 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, pubsub });
+    if (useRabbitMq)
+    {
+        var rabbitOptions = services.GetRequiredService<IOptions<RabbitMqAsyncResponseOptions>>().Value;
+        rabbitmq = new
+        {
+            workerExchange = rabbitOptions.WorkerExchange,
+            workerQueue = rabbitOptions.WorkerQueue,
+            workerRoutingKey = rabbitOptions.WorkerRoutingKey,
+            responseExchange = rabbitOptions.ResponseExchange,
+            responseQueue = rabbitOptions.ResponseQueue,
+            responseRoutingKey = rabbitOptions.ResponseRoutingKey,
+            workerAckMode = rabbitOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = rabbitOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = rabbitOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            responseAckMode = rabbitOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = rabbitOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = rabbitOptions.ResponseSubscriber.BackgroundQueueCapacity
+        };
+    }
+
+    return Results.Ok(new { channel, transport, pubsub, rabbitmq });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -177,11 +233,21 @@ static void ConfigurePubSubShutdownBudget(
         options.HostShutdownTimeout = timeout.Value;
 }
 
+static void ConfigureRabbitMqShutdownBudget(
+    IConfiguration configuration,
+    RabbitMqAsyncResponseOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "RabbitMQ:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
 static void ConfigureHostShutdownBudget(
     IConfiguration configuration,
-    IServiceCollection services)
+    IServiceCollection services,
+    string prefix = "PubSub")
 {
-    var timeout = ReadOptionalPositiveTimeout(configuration, "PubSub:HostShutdownTimeoutSeconds");
+    var timeout = ReadOptionalPositiveTimeout(configuration, $"{prefix}:HostShutdownTimeoutSeconds");
     if (timeout is not null)
         services.Configure<HostOptions>(options => options.ShutdownTimeout = timeout.Value);
 }
@@ -198,7 +264,7 @@ static TimeSpan? ReadOptionalPositiveTimeout(IConfiguration configuration, strin
     return TimeSpan.FromSeconds(seconds);
 }
 
-static void ConfigureSubscriberAckMode(
+static void ConfigurePubSubSubscriberAckMode(
     IConfiguration configuration,
     string prefix,
     GooglePubSubSubscriberOptions subscriberOptions)
@@ -217,6 +283,42 @@ static void ConfigureSubscriberAckMode(
     }
 
     if (mode is not GooglePubSubAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigureRabbitMqSubscriberAckMode(
+    IConfiguration configuration,
+    string prefix,
+    RabbitMqSubscriberOptions subscriberOptions)
+{
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<RabbitMqAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<RabbitMqAckMode>())}.");
+
+    if (mode is RabbitMqAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = RabbitMqAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not RabbitMqAckMode.AckAfterEnqueue)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -480,8 +582,8 @@ app.MapPost("/shared-correlation-exception", async (
 })
 .WithTags("Request/response");
 
-// 3) Reply target resolved by the registered transport's provider (Pub/Sub). Returns the target the
-//    trigger observed; falls back to a clear 409 when no provider is registered (e.g. in-memory).
+// 3) Reply target resolved by the registered transport's provider. Returns the target the trigger
+//    observed; falls back to a clear 409 when no provider is registered (e.g. in-memory).
 app.MapGet("/reply-target", async (IAsyncResponseBuilder asyncResponse, IAsyncResponsePublisher publisher) =>
 {
     AsyncResponseReplyTarget? observed = null;
@@ -649,11 +751,35 @@ app.MapPost("/lost-subscriber-flow", async (
 })
 .WithTags("Recovery");
 
-// 6) Publish a raw response to the Pub/Sub response topic, acting as the remote system. With
-//    useAttribute the correlation id rides a message attribute; otherwise it goes in the JSON body so
-//    the extractor's JSON-path fallback is exercised. (Google Pub/Sub transport only.)
+// 6) Publish a raw response to the configured broker response destination, acting as the remote
+//    system. With useAttribute the correlation id rides broker metadata; otherwise it goes in the
+//    JSON body so the extractor's JSON-path fallback is exercised. (broker transports only.)
 app.MapPost("/emit-response", async (
-    IServiceProvider services, string correlationId, string? status, bool useAttribute, string? message) =>
+    IServiceProvider services,
+    string correlationId,
+    string? status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken) =>
+{
+    var parsedStatus = Enum.TryParse<OperationStatus>(status, ignoreCase: true, out var s) ? s : OperationStatus.Completed;
+
+    if (useGooglePubSub)
+        return await EmitPubSubResponseAsync(services, correlationId, parsedStatus, useAttribute, message).ConfigureAwait(false);
+
+    if (useRabbitMq)
+        return await EmitRabbitMqResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a broker transport such as GooglePubSub or RabbitMQ.");
+})
+.WithTags("Workers");
+
+static async Task<IResult> EmitPubSubResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message)
 {
     var options = services.GetService<IOptions<GooglePubSubAsyncResponseOptions>>();
     if (options is null)
@@ -663,11 +789,9 @@ app.MapPost("/emit-response", async (
         return Results.Conflict("Pub/Sub publisher client is not registered.");
 
     var o = options.Value;
-    var parsedStatus = Enum.TryParse<OperationStatus>(status, ignoreCase: true, out var s) ? s : OperationStatus.Completed;
-
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = parsedStatus, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)parsedStatus, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
 
     var pubsubMessage = new PubsubMessage { Data = ByteString.CopyFromUtf8(json) };
     if (useAttribute)
@@ -677,8 +801,86 @@ app.MapPost("/emit-response", async (
     await publisher.PublishAsync(TopicName.FromProjectTopic(o.ProjectId!, o.ResponseTopicId!), [pubsubMessage]);
 
     return Results.Accepted();
-})
-.WithTags("Workers");
+}
+
+static async Task<IResult> EmitRabbitMqResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<RabbitMqAsyncResponseOptions>>();
+    if (options is null)
+        return Results.Conflict("RabbitMQ response ingress requires the RabbitMQ transport.");
+
+    var o = options.Value;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+
+    var factory = CreateRabbitMqConnectionFactory(o);
+    await using var connection = await factory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
+    await using var channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+
+    if (o.DeclareTopology)
+    {
+        await channel.ExchangeDeclareAsync(o.ResponseExchange, "direct", durable: true, autoDelete: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await channel.QueueDeclareAsync(o.ResponseQueue, durable: true, exclusive: false, autoDelete: false, cancellationToken: cancellationToken).ConfigureAwait(false);
+        await channel.QueueBindAsync(o.ResponseQueue, o.ResponseExchange, o.ResponseRoutingKey, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    var properties = new BasicProperties
+    {
+        ContentType = "application/json",
+        DeliveryMode = DeliveryModes.Persistent,
+        Persistent = true,
+        MessageId = Guid.NewGuid().ToString("N"),
+        Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+    };
+
+    if (useAttribute)
+    {
+        properties.CorrelationId = correlationId;
+        properties.Headers = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            [o.CorrelationIdHeader] = correlationId
+        };
+    }
+
+    await channel.BasicPublishAsync(
+        o.ResponseExchange,
+        o.ResponseRoutingKey,
+        mandatory: true,
+        properties,
+        System.Text.Encoding.UTF8.GetBytes(json),
+        cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted();
+}
+
+static ConnectionFactory CreateRabbitMqConnectionFactory(RabbitMqAsyncResponseOptions options)
+{
+    var factory = new ConnectionFactory
+    {
+        AutomaticRecoveryEnabled = options.AutomaticRecoveryEnabled,
+        TopologyRecoveryEnabled = options.TopologyRecoveryEnabled,
+        NetworkRecoveryInterval = options.NetworkRecoveryInterval,
+        RequestedHeartbeat = options.RequestedHeartbeat,
+        ClientProvidedName = options.ClientProvidedName,
+        HostName = options.HostName,
+        Port = options.Port,
+        VirtualHost = options.VirtualHost,
+        UserName = options.UserName,
+        Password = options.Password
+    };
+
+    if (!string.IsNullOrWhiteSpace(options.ConnectionString))
+        factory.Uri = new Uri(options.ConnectionString);
+
+    return factory;
+}
 
 // --- Observability / test affordances --------------------------------------------------------
 

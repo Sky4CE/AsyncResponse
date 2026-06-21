@@ -15,9 +15,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// ingress, worker-job executor, and the recovery watchdog) and returns a builder to configure
     /// the rest. It deliberately registers <em>no</em> response channel: chain exactly one
     /// (<see cref="WithInMemoryChannel"/> or the Redis channel package's <c>WithRedisChannel</c>) and
-    /// exactly one worker transport (<see cref="WithInMemoryTransport"/> or the Google Pub/Sub
-    /// transport package's <c>WithGooglePubSubTransport</c>). An app that starts without either one
-    /// fails fast at host startup.
+    /// exactly one worker transport (<see cref="WithInMemoryTransport"/> or a broker transport
+    /// package such as <c>WithGooglePubSubTransport</c> / <c>WithRabbitMqTransport</c>). An app
+    /// that starts without either one fails fast at host startup.
     /// </summary>
     public static AsyncResponseRegistrationBuilder AddAsyncResponse(
         this IServiceCollection services,
@@ -102,7 +102,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// in the current process and survive only as long as it does — suitable for development, tests,
     /// and single-node deployments. Chain exactly one transport after <see cref="AddAsyncResponse"/>;
     /// for distributed, durable execution use a full broker-backed transport package such as
-    /// <c>WithGooglePubSubTransport</c>.
+    /// <c>WithGooglePubSubTransport</c> or <c>WithRabbitMqTransport</c>.
     /// </summary>
     public static AsyncResponseRegistrationBuilder WithInMemoryTransport(this AsyncResponseRegistrationBuilder builder)
     {
