@@ -14,12 +14,14 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
 // The process exits non-zero if any scenario records failed requests.
@@ -32,6 +34,8 @@ var existingUrl = GetString("--url");
 var existingEarlyAckUrl = GetString("--early-ack-url");
 var existingRabbitMqUrl = GetString("--rabbitmq-url");
 var existingRabbitMqEarlyAckUrl = GetString("--rabbitmq-early-ack-url");
+var existingRedisUrl = GetString("--redis-url");
+var existingRedisEarlyAckUrl = GetString("--redis-early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
@@ -39,10 +43,12 @@ Uri baseAddress;
 Uri? earlyAckBaseAddress = null;
 Uri? rabbitMqBaseAddress = null;
 Uri? rabbitMqEarlyAckBaseAddress = null;
+Uri? redisBaseAddress = null;
+Uri? redisEarlyAckBaseAddress = null;
 
-if (existingUrl is not null || existingRabbitMqUrl is not null)
+if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null)
 {
-    baseAddress = new Uri(existingUrl ?? existingRabbitMqUrl!);
+    baseAddress = new Uri(existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl!);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
     if (existingEarlyAckUrl is not null)
     {
@@ -57,6 +63,14 @@ if (existingUrl is not null || existingRabbitMqUrl is not null)
         rabbitMqEarlyAckBaseAddress = new Uri(existingRabbitMqEarlyAckUrl);
         Console.WriteLine($"Load testing existing RabbitMQ ACK-after-enqueue instance at {rabbitMqEarlyAckBaseAddress}.");
     }
+
+    redisBaseAddress = new Uri(existingRedisUrl ?? existingUrl ?? existingRabbitMqUrl!);
+    Console.WriteLine($"Load testing existing Redis transport instance at {redisBaseAddress}.");
+    if (existingRedisEarlyAckUrl is not null)
+    {
+        redisEarlyAckBaseAddress = new Uri(existingRedisEarlyAckUrl);
+        Console.WriteLine($"Load testing existing Redis transport ACK-after-enqueue instance at {redisEarlyAckBaseAddress}.");
+    }
 }
 else
 {
@@ -68,6 +82,8 @@ else
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-rabbitmq").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-rabbitmq-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-redis").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-redis-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
@@ -77,11 +93,17 @@ else
         rabbitMqBaseAddress = probe.BaseAddress!;
     using (var probe = app.CreateHttpClient("itest-app-rabbitmq-early-ack"))
         rabbitMqEarlyAckBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-redis"))
+        redisBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-redis-early-ack"))
+        redisEarlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
     Console.WriteLine($"RabbitMQ SUT at {rabbitMqBaseAddress}.");
     Console.WriteLine($"RabbitMQ ACK-after-enqueue SUT at {rabbitMqEarlyAckBaseAddress}.");
+    Console.WriteLine($"Redis transport SUT at {redisBaseAddress}.");
+    Console.WriteLine($"Redis transport ACK-after-enqueue SUT at {redisEarlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -107,6 +129,16 @@ try
         BaseAddress = rabbitMqEarlyAckBaseAddress ?? rabbitMqBaseAddress ?? baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var redisHttpClient = new HttpClient
+    {
+        BaseAddress = redisBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+    using var redisEarlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = redisEarlyAckBaseAddress ?? redisBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
     if (earlyAckBaseAddress is not null)
@@ -115,18 +147,34 @@ try
         await TryResetAsync(rabbitMqHttpClient);
     if (rabbitMqEarlyAckBaseAddress is not null)
         await TryResetAsync(rabbitMqEarlyAckHttpClient);
+    if (redisBaseAddress is not null)
+        await TryResetAsync(redisHttpClient);
+    if (redisEarlyAckBaseAddress is not null)
+        await TryResetAsync(redisEarlyAckHttpClient);
 
     var definitions = FilterScenarios(SelectScenarios(
         profile,
         includeEarlyAckTarget: earlyAckBaseAddress is not null,
         includeRabbitMqTarget: app is not null || existingRabbitMqUrl is not null,
-        includeRabbitMqEarlyAckTarget: rabbitMqEarlyAckBaseAddress is not null), scenarioFilter);
+        includeRabbitMqEarlyAckTarget: rabbitMqEarlyAckBaseAddress is not null,
+        includeRedisTarget: app is not null || existingRedisUrl is not null,
+        includeRedisEarlyAckTarget: redisEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
 
     var scenarios = definitions
-        .Select(definition => BuildScenario(definition, httpClient, earlyAckHttpClient, rabbitMqHttpClient, rabbitMqEarlyAckHttpClient, rate, duration, warmup))
+        .Select(definition => BuildScenario(
+            definition,
+            httpClient,
+            earlyAckHttpClient,
+            rabbitMqHttpClient,
+            rabbitMqEarlyAckHttpClient,
+            redisHttpClient,
+            redisEarlyAckHttpClient,
+            rate,
+            duration,
+            warmup))
         .ToArray();
 
     var nodeStats = NBomberRunner
@@ -171,6 +219,8 @@ static ScenarioProps BuildScenario(
     HttpClient earlyAckHttpClient,
     HttpClient rabbitMqHttpClient,
     HttpClient rabbitMqEarlyAckHttpClient,
+    HttpClient redisHttpClient,
+    HttpClient redisEarlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
@@ -178,7 +228,9 @@ static ScenarioProps BuildScenario(
         httpClient,
         earlyAckHttpClient,
         rabbitMqHttpClient,
-        rabbitMqEarlyAckHttpClient)))
+        rabbitMqEarlyAckHttpClient,
+        redisHttpClient,
+        redisEarlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
@@ -186,7 +238,9 @@ static ScenarioDefinition[] SelectScenarios(
     string profile,
     bool includeEarlyAckTarget,
     bool includeRabbitMqTarget,
-    bool includeRabbitMqEarlyAckTarget)
+    bool includeRabbitMqEarlyAckTarget,
+    bool includeRedisTarget,
+    bool includeRedisEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -217,6 +271,27 @@ static ScenarioDefinition[] SelectScenarios(
             [
                 .. broad,
                 new ScenarioDefinition("rabbitmq_worker_ack_after_enqueue_observed", (_, _, _, rabbitEarlyAckHttp) => WorkerObservedAsync(rabbitEarlyAckHttp))
+            ];
+        }
+    }
+
+    if (includeRedisTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("redis_worker_default_ack_observed", (_, _, _, _, redisHttp, _) => WorkerObservedAsync(redisHttp)),
+            new ScenarioDefinition("redis_response_ingress_field", (_, _, _, _, redisHttp, _) => ResponseIngressAsync(redisHttp, useAttribute: true)),
+            new ScenarioDefinition("redis_response_ingress_body", (_, _, _, _, redisHttp, _) => ResponseIngressAsync(redisHttp, useAttribute: false)),
+            new ScenarioDefinition("redis_reply_target", (_, _, _, _, redisHttp, _) => ReplyTargetAsync(redisHttp))
+        ];
+
+        if (includeRedisEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("redis_worker_ack_after_enqueue_observed", (_, _, _, _, _, redisEarlyAckHttp) => WorkerObservedAsync(redisEarlyAckHttp))
             ];
         }
     }
@@ -252,6 +327,22 @@ static ScenarioDefinition[] SelectScenarios(
         ];
     }
 
+    var redis = new[]
+    {
+        new ScenarioDefinition("redis_worker_default_ack_observed", (_, _, _, _, redisHttp, _) => WorkerObservedAsync(redisHttp)),
+        new ScenarioDefinition("redis_response_ingress_field", (_, _, _, _, redisHttp, _) => ResponseIngressAsync(redisHttp, useAttribute: true)),
+        new ScenarioDefinition("redis_response_ingress_body", (_, _, _, _, redisHttp, _) => ResponseIngressAsync(redisHttp, useAttribute: false)),
+        new ScenarioDefinition("redis_reply_target", (_, _, _, _, redisHttp, _) => ReplyTargetAsync(redisHttp))
+    };
+    if (includeRedisEarlyAckTarget)
+    {
+        redis =
+        [
+            .. redis,
+            new ScenarioDefinition("redis_worker_ack_after_enqueue_observed", (_, _, _, _, _, redisEarlyAckHttp) => WorkerObservedAsync(redisEarlyAckHttp))
+        ];
+    }
+
     var recovery = new[]
     {
         new ScenarioDefinition("lost_subscriber_resume_redis", http => LostSubscriberFlowAsync(http, "Completed")),
@@ -265,9 +356,10 @@ static ScenarioDefinition[] SelectScenarios(
         "core" or "broad" => broad,
         "pubsub" => pubsub,
         "rabbitmq" => rabbitmq,
+        "redis" => redis,
         "recovery" => recovery,
         _ => throw new ArgumentException(
-            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, recovery.")
+            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, redis, recovery.")
     };
 }
 
@@ -433,15 +525,21 @@ static string Trace() => $"trace-{Guid.NewGuid():N}";
 
 internal sealed record ScenarioDefinition(
     string Name,
-    Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
+    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
 {
     public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
-        : this(name, (http, _, _, _) => runAsync(http))
+        : this(name, (http, _, _, _, _, _) => runAsync(http))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _) => runAsync(http, earlyAckHttp))
+        : this(name, (http, earlyAckHttp, _, _, _, _) => runAsync(http, earlyAckHttp))
+    {
+    }
+
+    public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _) =>
+            runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp))
     {
     }
 }

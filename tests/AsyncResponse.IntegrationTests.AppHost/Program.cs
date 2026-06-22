@@ -25,6 +25,11 @@ const string RabbitMqEarlyAckWorkerRoutingKey = "asyncresponse.itest.worker.earl
 const string RabbitMqEarlyAckResponseExchange = "asyncresponse.itest.response.earlyack";
 const string RabbitMqEarlyAckResponseQueue = "asyncresponse.itest.response.earlyack";
 const string RabbitMqEarlyAckResponseRoutingKey = "asyncresponse.itest.response.earlyack";
+const string RedisTransportKeyPrefix = "itest-redistransport";
+const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
+
+static string Env(string name, string fallback)
+    => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
 
 var builder = DistributedApplication.CreateBuilder(args);
 
@@ -120,6 +125,47 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq-early-ack"
     .WithEnvironment("AsyncResponse:KeyPrefix", RabbitMqEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "RabbitMQ")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "Redis")
+    .WithEnvironment("Redis:KeyPrefix", RedisTransportKeyPrefix)
+    .WithEnvironment("Redis:WorkerConsumerGroup", "asyncresponse-itest-redis-workers")
+    .WithEnvironment("Redis:ResponseConsumerGroup", "asyncresponse-itest-redis-responses")
+    .WithEnvironment("Redis:StreamMaxLength", Env("ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH", "100000"))
+    .WithEnvironment("Redis:PublishMaxAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS", "3"))
+    .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
+    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis-early-ack", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportEarlyAckKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "Redis")
+    .WithEnvironment("Redis:KeyPrefix", RedisTransportEarlyAckKeyPrefix)
+    .WithEnvironment("Redis:WorkerConsumerGroup", "asyncresponse-itest-redis-workers-earlyack")
+    .WithEnvironment("Redis:ResponseConsumerGroup", "asyncresponse-itest-redis-responses-earlyack")
+    .WithEnvironment("Redis:StreamMaxLength", Env("ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH", "100000"))
+    .WithEnvironment("Redis:PublishMaxAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS", "3"))
+    .WithEnvironment("Redis:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE", "AckAfterEnqueue"))
+    .WithEnvironment("Redis:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("Redis:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("Redis:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
+    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
+    .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

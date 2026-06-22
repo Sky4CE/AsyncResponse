@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.RabbitMQ;
+using AsyncResponse.Transports.Redis;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.DependencyInjection;
@@ -9,6 +10,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using RabbitMQ.Client;
+using StackExchange.Redis;
 
 namespace AsyncResponse.Benchmarks;
 
@@ -53,6 +55,7 @@ internal static class StressRunner
         failures += await WorkerStorm(concurrency, count);
         failures += await GooglePubSubAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RabbitMqAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -318,6 +321,90 @@ internal static class StressRunner
             "rabbitmq-ack-after-enqueue-dispatch-storm",
             ("nacks", channel.Nacks),
             ("ackMismatch", Math.Abs(count - channel.Acks)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3d) Redis Streams ACK-after-enqueue dispatch storm. This bypasses a live Redis server and
+    //     hammers the subscriber callback dispatcher directly: every ACKed stream entry must be
+    //     processed exactly once.
+    private static async Task<int> RedisAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var database = new BenchmarkRedisStreamDatabase();
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                var text = delivery.MessageId.ToString();
+                var separator = text.IndexOf('-', StringComparison.Ordinal);
+                var index = separator > 0 && int.TryParse(text[..separator], out var parsed)
+                    ? parsed - 1
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            database,
+            new RedisAsyncResponseTransportOptions
+            {
+                HostShutdownTimeout = TimeSpan.FromSeconds(90)
+            },
+            new RedisSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-stream",
+            "stress-worker-group",
+            RedisSubscriberRole.Worker);
+
+        var metrics = await Measure("redis-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            var id = $"{i + 1}-0";
+            await dispatcher.HandleAsync(new RedisStreamDelivery(
+                "stress-worker-stream",
+                "stress-worker-group",
+                id,
+                "{}",
+                $"stress-{i}",
+                Attempt: 1,
+                new StreamEntry(id, [new NameValueEntry("payload", "{}"), new NameValueEntry("correlationId", $"stress-{i}")])),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("redis-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "redis-ack-after-enqueue-dispatch-storm",
+            ("ackMismatch", Math.Abs(count - database.Acks)),
             ("duplicates", duplicates),
             ("outOfRange", outOfRange),
             ("notDrained", drained ? 0 : 1),

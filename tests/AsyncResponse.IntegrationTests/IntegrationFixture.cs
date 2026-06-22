@@ -24,6 +24,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient EarlyAckClient { get; private set; } = null!;
     public HttpClient RabbitMqClient { get; private set; } = null!;
     public HttpClient RabbitMqEarlyAckClient { get; private set; } = null!;
+    public HttpClient RedisTransportClient { get; private set; } = null!;
+    public HttpClient RedisTransportEarlyAckClient { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -45,15 +47,25 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-rabbitmq-early-ack")
             .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-redis")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-redis-early-ack")
+            .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
         RabbitMqClient = _app.CreateHttpClient("itest-app-rabbitmq");
         RabbitMqEarlyAckClient = _app.CreateHttpClient("itest-app-rabbitmq-early-ack");
+        RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
+        RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -62,6 +74,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         EarlyAckClient?.Dispose();
         RabbitMqClient?.Dispose();
         RabbitMqEarlyAckClient?.Dispose();
+        RedisTransportClient?.Dispose();
+        RedisTransportEarlyAckClient?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }

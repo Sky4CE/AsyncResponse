@@ -91,6 +91,7 @@ somebody has to make the call.
 |---|---|
 | `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
 | `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
+| `AsyncResponse.Transports.Redis` | Optional Redis Streams worker transport and hosted subscribers for worker jobs and response ingress, with consumer-group ACKs, pending-entry retry, and dead-lettering. |
 | `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
@@ -106,6 +107,9 @@ dotnet add package AsyncResponse.Core
 
 # Optional durable Redis channel:
 dotnet add package AsyncResponse.Channels.Redis
+
+# Optional Redis Streams transport:
+dotnet add package AsyncResponse.Transports.Redis
 
 # Optional Google Pub/Sub transport:
 dotnet add package AsyncResponse.Transports.GooglePubSub
@@ -160,10 +164,75 @@ part of the ordinary builder interfaces.
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
 exactly one channel (`.WithInMemoryChannel()` or `.WithRedisChannel()`) and exactly one transport
-(`.WithInMemoryTransport()`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, or another full AsyncResponse
+(`.WithInMemoryTransport()`, `.WithRedisTransport(...)`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, or another full AsyncResponse
 transport package). An app that starts without either one fails fast at host startup with setup
 guidance, so a misconfiguration can never silently hang every waiter or drop worker dispatch. The
 recovery watchdog is part of the engine and runs by default for whichever channel you choose.
+
+### Redis Streams transport
+
+Redis appears twice in AsyncResponse because it can play two different roles:
+
+- `AsyncResponse.Channels.Redis` is the waiter/recovery channel: active waiters listen on Redis
+  pub/sub channels and recovery state is stored in Redis keys.
+- `AsyncResponse.Transports.Redis` is the worker/ingress transport: worker jobs and raw responses
+  move through Redis Streams consumer groups.
+
+Most distributed Redis deployments use both packages and share one `IConnectionMultiplexer`:
+
+```csharp
+using AsyncResponse;
+using AsyncResponse.Channels.Redis;
+using AsyncResponse.Transports.Redis;
+using StackExchange.Redis;
+
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    _ => ConnectionMultiplexer.Connect("localhost:6379"));
+
+builder.Services.Configure<HostOptions>(host =>
+{
+    host.ShutdownTimeout = TimeSpan.FromSeconds(45);
+});
+
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel(channel =>
+    {
+        channel.KeyPrefix = "orders";
+        channel.DefaultTimeout = TimeSpan.FromMinutes(10);
+    })
+    .WithRedisTransport(transport =>
+    {
+        transport.KeyPrefix = "orders";
+        transport.StreamMaxLength = 100_000;
+        transport.PublishMaxAttempts = 3;
+
+        // Default mode: XACK after the handler completes. Handler failures stay pending and are
+        // reclaimed after PendingMessageMinIdleTime, up to MaxDeliveryAttempts, then dead-lettered.
+        transport.WorkerSubscriber.PendingMessageMinIdleTime = TimeSpan.FromSeconds(30);
+        transport.WorkerSubscriber.MaxDeliveryAttempts = 5;
+
+        // Optional early-ACK mode for long-running workers where Redis redelivery is less important
+        // than quickly releasing the stream entry from the pending list.
+        transport.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 16,
+            backgroundQueueCapacity: 10_000,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(30));
+        transport.HostShutdownTimeout = TimeSpan.FromSeconds(45);
+    });
+```
+
+The transport creates two consumer groups by default:
+
+| Stream | Default key | Consumer group | Purpose |
+|---|---|---|---|
+| Worker | `{KeyPrefix}:transport:worker` | `asyncresponse-workers` | `EnqueueWorkerAsync(...)` jobs. |
+| Response | `{KeyPrefix}:transport:response` | `asyncresponse-responses` | Raw remote responses forwarded to `IAsyncResponseIngress`. |
+| Dead letter | `{KeyPrefix}:transport:deadletter` | none | Poison messages and already-ACKed background failures. |
+
+Response producers publish JSON to the response stream using the configured payload field
+(`payload` by default). Put the correlation id in the `correlationId` field when possible; if it is
+omitted, the response subscriber falls back to JSON paths such as `CorrelationId` and
+`CustomParameters.CorrelationId`.
 
 ### Google Pub/Sub transport
 
@@ -675,6 +744,7 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.set_response`, `asyncresponse.set_exception` | publishing a response or exception through the configured channel |
 | `asyncresponse.ingress.response`, `asyncresponse.ingress.worker` | transport-neutral response and worker message ingress |
 | `asyncresponse.enqueue_worker`, `asyncresponse.worker.publish`, `asyncresponse.worker.execute` | worker enqueue, transport publish, and execution |
+| `asyncresponse.redis.receive` | Redis Streams subscriber message handling |
 | `asyncresponse.pubsub.receive` | Google Pub/Sub subscriber message handling |
 | `asyncresponse.rabbitmq.receive` | RabbitMQ subscriber message handling |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
@@ -695,14 +765,14 @@ resource environment, and health checks in one place:
 dotnet run --project samples/AsyncResponse.AppHost
 ```
 
-The sample AppHost starts Redis and RabbitMQ containers plus the sample API, then opens the Aspire dashboard.
+The sample AppHost starts Redis plus the sample API, then opens the Aspire dashboard.
 Use the dashboard's `playground` resource to open the API endpoint and inspect `AsyncResponse`
 logs/traces. The local playground pins the dashboard to `http://localhost:18888` and uses HTTP
 resource/OTLP endpoints to avoid local HTTPS certificate issues. The sample also exposes Aspire
 service-default endpoints at `/health` and `/alive`.
 
 Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
-such as Docker or Podman for the Redis and RabbitMQ resources.
+such as Docker or Podman for the Redis resource.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis`) and
 `AsyncResponse:Transport` (`InMemory` | `GooglePubSub` | `RabbitMQ`) select the providers,
@@ -717,6 +787,17 @@ The durable lost-subscriber recovery flow needs a real channel — point the sam
 ```bash
 docker compose up -d                                                  # local Redis
 AsyncResponse__Channel=Redis dotnet run --project samples/AsyncResponse.Sample
+```
+
+To run the standalone sample on Redis for both the response channel and the worker/ingress
+transport:
+
+```bash
+docker compose up -d                                                  # local Redis
+AsyncResponse__Channel=Redis \
+AsyncResponse__Transport=Redis \
+Redis__KeyPrefix=sample \
+dotnet run --project samples/AsyncResponse.Sample
 ```
 
 To run the standalone sample against a local RabbitMQ broker, point the transport at an AMQP
@@ -872,6 +953,7 @@ mean/median/percentile timings:
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks                 # all benchmarks
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Channel*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Ingress*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RedisAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RabbitMqAckDispatch*'
 ```
@@ -892,7 +974,8 @@ each must receive exactly its own response — no cross-correlation leakage), **
 of progress messages then a terminal per flow), **worker-storm** (N fire-and-forget jobs, each executed
 exactly once), **google-pubsub-ack-after-enqueue-dispatch-storm** (bounded early-ACK dispatcher:
 every ACKed message must be processed once), **rabbitmq-ack-after-enqueue-dispatch-storm** (the same
-bounded early-ACK invariant for RabbitMQ deliveries), **race-burst** (subscribe-before-send under contention),
+bounded early-ACK invariant for RabbitMQ deliveries), **redis-ack-after-enqueue-dispatch-storm** (the
+same bounded early-ACK invariant for Redis stream entries), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
@@ -900,22 +983,26 @@ bounded early-ACK invariant for RabbitMQ deliveries), **race-burst** (subscribe-
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
-dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ brokers while exercising
+dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ/Redis brokers while exercising
 the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 Redis channel + broker transports — reporting throughput, latency percentiles, and failures per
-scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + four SUTs via Aspire (Docker
-required): default/early-ACK Pub/Sub apps and default/early-ACK RabbitMQ apps. Pass `--url` to load an
+scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + six SUTs via Aspire (Docker
+required): default/early-ACK Pub/Sub apps, default/early-ACK RabbitMQ apps, and default/early-ACK
+Redis Streams transport apps. Pass `--url` to load an
 already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK target, and
-`--rabbitmq-url` / `--rabbitmq-early-ack-url` for RabbitMQ targets. Profiles let you choose the scenario set:
+`--rabbitmq-url` / `--rabbitmq-early-ack-url` for RabbitMQ targets, or `--redis-url` /
+`--redis-early-ack-url` for Redis transport targets. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
 exception, shared exception, reply target, plus RabbitMQ worker/response/reply-target throughput when
 a RabbitMQ target is available), `pubsub` (default worker dispatch, response-topic ingress
 with attribute/body correlation ids, and early-ACK worker dispatch when an early target is available),
 `rabbitmq` (default worker dispatch, response-queue ingress with header/body correlation ids, reply
-target, and early-ACK worker dispatch when an early target is available), or `recovery`
+target, and early-ACK worker dispatch when an early target is available), `redis` (default worker
+dispatch, response-stream ingress with field/body correlation ids, reply target, and early-ACK worker
+dispatch when an early target is available), or `recovery`
 (lost-subscriber resume/failure/exception and stale health). Run the
 recovery profile separately because it intentionally simulates subscriber loss:
 
@@ -923,12 +1010,14 @@ recovery profile separately because it intentionally simulates subscriber loss:
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
 ```
 
 Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;
@@ -938,7 +1027,8 @@ to model an external producer. It writes an HTML/CSV/Markdown report to `nbomber
 The [load-test workflow](.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
-`duration`; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
+`duration`, plus Redis transport URLs and Redis stream/retry knobs such as pending idle time, max
+delivery attempts, publish attempts, stream max length, and early-ACK queue sizing; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
 `customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
 `gh-pages`.
 

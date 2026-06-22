@@ -15,6 +15,28 @@ on:
       - 'global.json'
       - '.github/workflows/benchmarks.yml'
   workflow_dispatch:
+    inputs:
+      benchmark_filter:
+        description: 'BenchmarkDotNet filter, e.g. *RedisAckDispatch*'
+        default: '*'
+      benchmark_job:
+        description: 'BenchmarkDotNet job, e.g. short'
+        default: 'short'
+      stress_concurrency:
+        description: 'Stress harness concurrency'
+        default: '256'
+      stress_count:
+        description: 'Stress harness operation count'
+        default: '25000'
+      stress_fanout:
+        description: 'Shared-correlation fanout'
+        default: '4'
+      stress_timeout_count:
+        description: 'Short-timeout waiter count'
+        default: '2000'
+      stress_timeout_ms:
+        description: 'Short-timeout duration in milliseconds'
+        default: '50'
 
 # github-action-benchmark commits the results history to gh-pages.
 permissions:
@@ -42,7 +64,9 @@ jobs:
       # A "short" job keeps CI fast; trends (not absolute numbers) are what matter on shared runners.
       - name: Run BenchmarkDotNet
         run: |
-          dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*' --job short
+          dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
+            --filter "${{ github.event.inputs.benchmark_filter || '*' }}" \
+            --job "${{ github.event.inputs.benchmark_job || 'short' }}"
 
       # BenchmarkSwitcher writes one report per benchmark class; merge their Benchmarks arrays into the
       # single file github-action-benchmark expects.
@@ -73,7 +97,14 @@ jobs:
       - name: Run stress harness
         run: |
           dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
-            stress --concurrency 256 --count 25000 --progress 5 --fanout 4 --timeout-count 2000 --json "${{ github.workspace }}/stress"
+            stress \
+            --concurrency "${{ github.event.inputs.stress_concurrency || '256' }}" \
+            --count "${{ github.event.inputs.stress_count || '25000' }}" \
+            --progress 5 \
+            --fanout "${{ github.event.inputs.stress_fanout || '4' }}" \
+            --timeout-count "${{ github.event.inputs.stress_timeout_count || '2000' }}" \
+            --timeout-ms "${{ github.event.inputs.stress_timeout_ms || '50' }}" \
+            --json "${{ github.workspace }}/stress"
 
       - name: Publish stress throughput (bigger is better)
         uses: benchmark-action/github-action-benchmark@v1

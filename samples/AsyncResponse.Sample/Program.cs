@@ -3,6 +3,7 @@ using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.RabbitMQ;
+using AsyncResponse.Transports.Redis;
 using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
@@ -28,8 +29,9 @@ var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCas
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
+var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
 
-if (useRedis)
+if (useRedis || useRedisTransport)
 {
     var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
     builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
@@ -49,6 +51,10 @@ if (useGooglePubSub)
 else if (useRabbitMq)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "RabbitMQ");
+}
+else if (useRedisTransport)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "Redis");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -120,6 +126,46 @@ else if (useRabbitMq)
         ConfigureRabbitMqSubscriberAckMode(builder.Configuration, "RabbitMQ:Response", options.ResponseSubscriber);
     });
 }
+else if (useRedisTransport)
+{
+    asyncResponse.WithRedisTransport(options =>
+    {
+        options.KeyPrefix = builder.Configuration["Redis:KeyPrefix"]
+            ?? builder.Configuration["AsyncResponse:KeyPrefix"]
+            ?? "sample";
+        options.WorkerStream = builder.Configuration["Redis:WorkerStream"] ?? options.WorkerStream;
+        options.WorkerConsumerGroup = builder.Configuration["Redis:WorkerConsumerGroup"] ?? options.WorkerConsumerGroup;
+        options.ResponseStream = builder.Configuration["Redis:ResponseStream"] ?? options.ResponseStream;
+        options.ResponseConsumerGroup = builder.Configuration["Redis:ResponseConsumerGroup"] ?? options.ResponseConsumerGroup;
+        options.DeadLetterStream = builder.Configuration["Redis:DeadLetterStream"] ?? options.DeadLetterStream;
+        options.ConsumerName = builder.Configuration["Redis:ConsumerName"] ?? options.ConsumerName;
+        options.CorrelationIdField = builder.Configuration["Redis:CorrelationIdField"] ?? options.CorrelationIdField;
+        options.PayloadField = builder.Configuration["Redis:PayloadField"] ?? options.PayloadField;
+
+        if (bool.TryParse(builder.Configuration["Redis:CreateConsumerGroups"], out var createConsumerGroups))
+            options.CreateConsumerGroups = createConsumerGroups;
+        if (bool.TryParse(builder.Configuration["Redis:DeadLetterEnabled"], out var deadLetterEnabled))
+            options.DeadLetterEnabled = deadLetterEnabled;
+        if (bool.TryParse(builder.Configuration["Redis:UseApproximateStreamTrimming"], out var approximateTrim))
+            options.UseApproximateStreamTrimming = approximateTrim;
+        if (long.TryParse(builder.Configuration["Redis:StreamMaxLength"], out var streamMaxLength))
+            options.StreamMaxLength = streamMaxLength;
+        if (long.TryParse(builder.Configuration["Redis:DeadLetterStreamMaxLength"], out var deadLetterStreamMaxLength))
+            options.DeadLetterStreamMaxLength = deadLetterStreamMaxLength;
+        if (int.TryParse(builder.Configuration["Redis:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "Redis:OperationTimeoutSeconds", value => options.OperationTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Redis:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Redis:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Redis:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Redis:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+
+        ConfigureRedisShutdownBudget(builder.Configuration, options);
+        ConfigureRedisSubscriber(builder.Configuration, "Redis:Worker", options.WorkerSubscriber);
+        ConfigureRedisSubscriber(builder.Configuration, "Redis:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -127,7 +173,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', or 'RabbitMQ'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', or 'Redis'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -175,6 +221,7 @@ app.MapGet("/config", (IServiceProvider services) =>
 {
     object? pubsub = null;
     object? rabbitmq = null;
+    object? redis = null;
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
@@ -209,7 +256,31 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, pubsub, rabbitmq });
+    if (useRedisTransport)
+    {
+        var redisOptions = services.GetRequiredService<IOptions<RedisAsyncResponseTransportOptions>>().Value;
+        var workerStream = ResolveRedisStream(redisOptions.WorkerStream, redisOptions.KeyPrefix, "worker");
+        var responseStream = ResolveRedisStream(redisOptions.ResponseStream, redisOptions.KeyPrefix, "response");
+        var deadLetterStream = ResolveRedisStream(redisOptions.DeadLetterStream, redisOptions.KeyPrefix, "deadletter");
+        redis = new
+        {
+            workerStream,
+            workerConsumerGroup = redisOptions.WorkerConsumerGroup,
+            responseStream,
+            responseConsumerGroup = redisOptions.ResponseConsumerGroup,
+            deadLetterStream = redisOptions.DeadLetterEnabled ? deadLetterStream : null,
+            workerAckMode = redisOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = redisOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = redisOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            workerMaxDeliveryAttempts = redisOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            responseAckMode = redisOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = redisOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = redisOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            responseMaxDeliveryAttempts = redisOptions.ResponseSubscriber.MaxDeliveryAttempts
+        };
+    }
+
+    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -242,6 +313,15 @@ static void ConfigureRabbitMqShutdownBudget(
         options.HostShutdownTimeout = timeout.Value;
 }
 
+static void ConfigureRedisShutdownBudget(
+    IConfiguration configuration,
+    RedisAsyncResponseTransportOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "Redis:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
 static void ConfigureHostShutdownBudget(
     IConfiguration configuration,
     IServiceCollection services,
@@ -262,6 +342,25 @@ static TimeSpan? ReadOptionalPositiveTimeout(IConfiguration configuration, strin
         throw new InvalidOperationException($"{key} must be a positive integer when set.");
 
     return TimeSpan.FromSeconds(seconds);
+}
+
+static void ApplyOptionalTimeout(IConfiguration configuration, string key, Action<TimeSpan> apply)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, key);
+    if (timeout is not null)
+        apply(timeout.Value);
+}
+
+static void ApplyOptionalMilliseconds(IConfiguration configuration, string key, Action<TimeSpan> apply)
+{
+    var rawValue = configuration[key];
+    if (string.IsNullOrWhiteSpace(rawValue))
+        return;
+
+    if (!int.TryParse(rawValue, out var milliseconds) || milliseconds <= 0)
+        throw new InvalidOperationException($"{key} must be a positive integer when set.");
+
+    apply(TimeSpan.FromMilliseconds(milliseconds));
 }
 
 static void ConfigurePubSubSubscriberAckMode(
@@ -335,6 +434,58 @@ static void ConfigureRabbitMqSubscriberAckMode(
 
     subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
+
+static void ConfigureRedisSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    RedisSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:BatchSize"], out var batchSize))
+        subscriberOptions.BatchSize = batchSize;
+    if (int.TryParse(configuration[$"{prefix}:PendingClaimBatchSize"], out var pendingBatchSize))
+        subscriberOptions.PendingClaimBatchSize = pendingBatchSize;
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:EmptyPollDelayMs", value => subscriberOptions.EmptyPollDelay = value);
+    ApplyOptionalTimeout(configuration, $"{prefix}:PendingMessageMinIdleTimeSeconds", value => subscriberOptions.PendingMessageMinIdleTime = value);
+    ApplyOptionalTimeout(configuration, $"{prefix}:PendingClaimIntervalSeconds", value => subscriberOptions.PendingClaimInterval = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<RedisAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<RedisAckMode>())}.");
+
+    if (mode is RedisAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = RedisAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not RedisAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
+static string ResolveRedisStream(string? configured, string keyPrefix, string role)
+    => !string.IsNullOrWhiteSpace(configured)
+        ? configured
+        : $"{keyPrefix}:transport:{role}";
 
 static int ReadRequiredPositiveInt(IConfiguration configuration, string key)
 {
@@ -774,7 +925,10 @@ app.MapPost("/emit-response", async (
     if (useRabbitMq)
         return await EmitRabbitMqResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a broker transport such as GooglePubSub or RabbitMQ.");
+    if (useRedisTransport)
+        return await EmitRedisResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, or Redis.");
 })
 .WithTags("Workers");
 
@@ -860,6 +1014,49 @@ static async Task<IResult> EmitRabbitMqResponseAsync(
         properties,
         System.Text.Encoding.UTF8.GetBytes(json),
         cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitRedisResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<RedisAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("Redis response ingress requires the Redis transport.");
+    var multiplexer = services.GetService<IConnectionMultiplexer>();
+    if (multiplexer is null)
+        return Results.Conflict("Redis response ingress requires an IConnectionMultiplexer.");
+
+    var o = options.Value;
+    var responseStream = ResolveRedisStream(o.ResponseStream, o.KeyPrefix, "response");
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+
+    var fields = useAttribute
+        ?
+        [
+            new NameValueEntry(o.PayloadField, json),
+            new NameValueEntry(o.CorrelationIdField, correlationId)
+        ]
+        : new[] { new NameValueEntry(o.PayloadField, json) };
+
+    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    timeout.CancelAfter(o.OperationTimeout);
+    await multiplexer.GetDatabase().StreamAddAsync(
+        responseStream,
+        fields,
+        messageId: null,
+        maxLength: o.StreamMaxLength,
+        useApproximateMaxLength: o.UseApproximateStreamTrimming,
+        limit: null,
+        trimMode: StreamTrimMode.KeepReferences).WaitAsync(timeout.Token).ConfigureAwait(false);
 
     return Results.Accepted();
 }

@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, pubsub, rabbitmq, recovery'
+        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -27,6 +27,33 @@ on:
       duration:
         description: 'Load duration in seconds'
         default: '30'
+      redis_url:
+        description: 'Optional existing Redis transport SUT URL for --redis-url'
+        default: ''
+      redis_early_ack_url:
+        description: 'Optional existing Redis transport early-ACK SUT URL for --redis-early-ack-url'
+        default: ''
+      redis_worker_ack_mode:
+        description: 'Redis worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterEnqueue'
+        default: 'AckAfterEnqueue'
+      redis_worker_background_workers:
+        description: 'Redis early-ACK background worker count'
+        default: '4'
+      redis_worker_queue_capacity:
+        description: 'Redis early-ACK background queue capacity'
+        default: '256'
+      redis_pending_idle_seconds:
+        description: 'Redis pending-entry idle seconds before retry/claim'
+        default: '1'
+      redis_max_delivery_attempts:
+        description: 'Redis max delivery attempts before dead-lettering'
+        default: '5'
+      redis_publish_max_attempts:
+        description: 'Redis XADD publish retry attempts'
+        default: '3'
+      redis_stream_max_length:
+        description: 'Redis worker/response stream MAXLEN setting'
+        default: '100000'
 
 # github-action-benchmark commits the results history to gh-pages.
 permissions:
@@ -56,13 +83,31 @@ jobs:
       # Boots Redis + a Pub/Sub emulator + RabbitMQ + sample SUTs via Aspire, drives them with NBomber, and
       # emits github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
       - name: Run NBomber load test
+        env:
+          REDIS_URL: ${{ github.event.inputs.redis_url || '' }}
+          REDIS_EARLY_ACK_URL: ${{ github.event.inputs.redis_early_ack_url || '' }}
+          ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE: ${{ github.event.inputs.redis_worker_ack_mode || 'AckAfterEnqueue' }}
+          ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.redis_worker_background_workers || '4' }}
+          ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.redis_worker_queue_capacity || '256' }}
+          ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS: ${{ github.event.inputs.redis_pending_idle_seconds || '1' }}
+          ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS: ${{ github.event.inputs.redis_max_delivery_attempts || '5' }}
+          ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS: ${{ github.event.inputs.redis_publish_max_attempts || '3' }}
+          ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH: ${{ github.event.inputs.redis_stream_max_length || '100000' }}
         run: |
-          dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- \
-            --profile ${{ github.event.inputs.profile || 'broad' }} \
-            --rate ${{ github.event.inputs.rate || '20' }} \
-            --duration ${{ github.event.inputs.duration || '30' }} \
-            --warmup 10 \
+          args=(
+            --profile "${{ github.event.inputs.profile || 'broad' }}"
+            --rate "${{ github.event.inputs.rate || '20' }}"
+            --duration "${{ github.event.inputs.duration || '30' }}"
+            --warmup 10
             --gh-json "${{ github.workspace }}/loadtest"
+          )
+          if [ -n "$REDIS_URL" ]; then
+            args+=(--redis-url "$REDIS_URL")
+          fi
+          if [ -n "$REDIS_EARLY_ACK_URL" ]; then
+            args+=(--redis-early-ack-url "$REDIS_EARLY_ACK_URL")
+          fi
+          dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- "${args[@]}"
 
       - name: Publish load-test throughput (bigger is better)
         uses: benchmark-action/github-action-benchmark@v1
