@@ -198,6 +198,166 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
+    public async Task RecoverableBuilder_OrdinaryInterfaceDispatchStillUsesRecoverableWaiter()
+    {
+        var correlationIds = new List<string>();
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                null,
+                null,
+                null,
+                null))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _, _, _) => correlationIds.Add(correlationId))
+            .ReturnsAsync(_waiter.Object);
+
+        IAsyncResponseBuilder builder = new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object);
+
+        await builder.For<OperationResult>("corr-attached").WaitAsync();
+        await builder.For<OperationResult>().WaitAsync(_ => Task.CompletedTask);
+
+        Assert.Collection(
+            correlationIds,
+            correlationId => Assert.Equal("corr-attached", correlationId),
+            correlationId => Assert.False(string.IsNullOrWhiteSpace(correlationId)));
+    }
+
+    [Fact]
+    public async Task RecoverableAttachedBuilder_InterfaceFluentMethodsPassConfiguredOptions()
+    {
+        ReflectionCallDto? resume = null;
+        ReflectionCallDto? failure = null;
+        TimeSpan? timeout = null;
+        Func<OperationResult, ValueTask<bool>>? predicate = null;
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                "corr-1",
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, r, f, p, t) => { resume = r; failure = f; predicate = p; timeout = t; })
+            .ReturnsAsync(_waiter.Object);
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        var replyTarget = ReplyTarget("default");
+        provider.Setup(p => p.GetReplyTarget(null)).Returns(replyTarget);
+        var resumeCallback = RecoveryCallback(nameof(IRecoverySpy.OnResume), PlaceholderType.Payload);
+        var failureCallback = RecoveryCallback(nameof(IRecoverySpy.OnFailure), PlaceholderType.Exception);
+
+        IRecoverableAsyncResponseAttachedBuilder<OperationResult> builder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object, null, provider.Object)
+                .For<OperationResult>("corr-1");
+
+        await builder
+            .OnLostSubscriberResume(resumeCallback)
+            .OnLostSubscriberFailure(failureCallback)
+            .WithTimeout(TimeSpan.FromSeconds(3))
+            .WithReplyTarget()
+            .Until(payload => payload.Status == OperationStatus.Completed)
+            .WaitAsync();
+
+        Assert.Same(resumeCallback, resume);
+        Assert.Same(failureCallback, failure);
+        Assert.Equal(TimeSpan.FromSeconds(3), timeout);
+        Assert.NotNull(predicate);
+        Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
+        Assert.False(await predicate(new OperationResult { Status = OperationStatus.Running }));
+        provider.Verify(p => p.GetReplyTarget(null), Times.Once);
+    }
+
+    [Fact]
+    public async Task RecoverableAttachedBuilder_InterfaceReplyTargetVariantsResolve()
+    {
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .ReturnsAsync(_waiter.Object);
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        var namedTarget = ReplyTarget("regional");
+        provider.Setup(p => p.GetReplyTarget("regional")).Returns(namedTarget);
+
+        IRecoverableAsyncResponseAttachedBuilder<OperationResult> namedBuilder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object, null, provider.Object)
+                .For<OperationResult>("corr-named");
+
+        await namedBuilder
+            .WithReplyTarget("regional")
+            .Until(payload => Task.FromResult(payload.Status == OperationStatus.Completed))
+            .WaitAsync();
+
+        IRecoverableAsyncResponseAttachedBuilder<OperationResult> explicitBuilder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object)
+                .For<OperationResult>("corr-explicit");
+
+        await explicitBuilder
+            .WithReplyTarget(ReplyTarget("explicit"))
+            .WaitAsync();
+
+        provider.Verify(p => p.GetReplyTarget("regional"), Times.Once);
+    }
+
+    [Fact]
+    public async Task RecoverableTriggeredBuilder_InterfaceReplyTargetVariantsPassRequestContext()
+    {
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<ReflectionCallDto?>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .ReturnsAsync(_waiter.Object);
+        var provider = new Mock<IAsyncResponseReplyTargetProvider>();
+        var defaultTarget = ReplyTarget("default");
+        var namedTarget = ReplyTarget("regional");
+        provider.Setup(p => p.GetReplyTarget(null)).Returns(defaultTarget);
+        provider.Setup(p => p.GetReplyTarget("regional")).Returns(namedTarget);
+
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> defaultBuilder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object, null, provider.Object)
+                .For<OperationResult>();
+        AsyncResponseReplyTarget? observedDefault = null;
+        await defaultBuilder.WithReplyTarget().WaitAsync(context =>
+        {
+            observedDefault = context.ReplyTarget;
+            return Task.CompletedTask;
+        });
+
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> namedBuilder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object, null, provider.Object)
+                .For<OperationResult>();
+        AsyncResponseReplyTarget? observedNamed = null;
+        await namedBuilder.WithReplyTarget("regional").WaitAsync(context =>
+        {
+            observedNamed = context.ReplyTarget;
+            return Task.CompletedTask;
+        });
+
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> explicitBuilder =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object)
+                .For<OperationResult>();
+        var explicitTarget = ReplyTarget("explicit");
+        AsyncResponseReplyTarget? observedExplicit = null;
+        await explicitBuilder.WithReplyTarget(explicitTarget).WaitAsync(context =>
+        {
+            observedExplicit = context.ReplyTarget;
+            return Task.CompletedTask;
+        });
+
+        Assert.Same(defaultTarget, observedDefault);
+        Assert.Same(namedTarget, observedNamed);
+        Assert.Same(explicitTarget, observedExplicit);
+        provider.Verify(p => p.GetReplyTarget(null), Times.Once);
+        provider.Verify(p => p.GetReplyTarget("regional"), Times.Once);
+    }
+
+    [Fact]
     public void OrdinaryBuilderInterfaces_DoNotExposeLostSubscriberCallbacks()
     {
         Assert.DoesNotContain(
@@ -438,6 +598,20 @@ public class AsyncResponseBuilderTests
             },
             call => Assert.Equal(nameof(IExpressionWorker.RunAsync), call.MethodName));
     }
+
+    private static AsyncResponseReplyTarget ReplyTarget(string name) => new()
+    {
+        Name = name,
+        Transport = "test",
+        Address = $"test://{name}"
+    };
+
+    private static ReflectionCallDto RecoveryCallback(string methodName, PlaceholderType placeholder) => new()
+    {
+        ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+        MethodName = methodName,
+        Params = [CallbackParam.ForPlaceholder(placeholder)]
+    };
 }
 
 public interface IExpressionWorker
