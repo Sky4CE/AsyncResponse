@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782147439325,
+  "lastUpdate": 1782147440803,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -16141,6 +16141,220 @@ window.BENCHMARK_DATA = {
           {
             "name": "rabbitmq_worker_ack_after_enqueue_observed p99 latency",
             "value": 18.48,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "442bd30053d373021f390964218348a9512de5b2",
+          "message": "Implemented the Redis transport end to end (missed files)",
+          "timestamp": "2026-06-22T18:54:51+02:00",
+          "tree_id": "cf38fd5a6b520278ac71920f6f329eb3ce9501f0",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/442bd30053d373021f390964218348a9512de5b2"
+        },
+        "date": 1782147440587,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "request_response_success_redis p95 latency",
+            "value": 1018.88,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_success_redis p99 latency",
+            "value": 1033.21,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p95 latency",
+            "value": 1019.9,
+            "unit": "ms"
+          },
+          {
+            "name": "request_response_domain_failure_redis p99 latency",
+            "value": 1044.48,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p95 latency",
+            "value": 1014.27,
+            "unit": "ms"
+          },
+          {
+            "name": "attach_redis p99 latency",
+            "value": 1027.07,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p95 latency",
+            "value": 61.54,
+            "unit": "ms"
+          },
+          {
+            "name": "worker_pubsub_observed p99 latency",
+            "value": 67.39,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p95 latency",
+            "value": 2034.69,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_success_redis p99 latency",
+            "value": 2057.22,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p95 latency",
+            "value": 2028.54,
+            "unit": "ms"
+          },
+          {
+            "name": "multi_step_domain_failure_redis p99 latency",
+            "value": 2043.9,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p95 latency",
+            "value": 12.86,
+            "unit": "ms"
+          },
+          {
+            "name": "ambient_exception_redis p99 latency",
+            "value": 23.58,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p95 latency",
+            "value": 17.76,
+            "unit": "ms"
+          },
+          {
+            "name": "shared_exception_fanout_redis p99 latency",
+            "value": 27.2,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p95 latency",
+            "value": 12.53,
+            "unit": "ms"
+          },
+          {
+            "name": "reply_target_pubsub p99 latency",
+            "value": 20.58,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed p95 latency",
+            "value": 17.01,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_default_ack_observed p99 latency",
+            "value": 24.82,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header p95 latency",
+            "value": 52.93,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_header p99 latency",
+            "value": 81.79,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body p95 latency",
+            "value": 49.92,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_response_ingress_body p99 latency",
+            "value": 70.91,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_reply_target p95 latency",
+            "value": 12.71,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_reply_target p99 latency",
+            "value": 17.57,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed p95 latency",
+            "value": 17.17,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq_worker_ack_after_enqueue_observed p99 latency",
+            "value": 25.07,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_default_ack_observed p95 latency",
+            "value": 54.18,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_default_ack_observed p99 latency",
+            "value": 65.06,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_field p95 latency",
+            "value": 60.35,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_field p99 latency",
+            "value": 80.32,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_body p95 latency",
+            "value": 64.61,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_response_ingress_body p99 latency",
+            "value": 82.05,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_reply_target p95 latency",
+            "value": 15.16,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_reply_target p99 latency",
+            "value": 21.04,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed p95 latency",
+            "value": 54.05,
+            "unit": "ms"
+          },
+          {
+            "name": "redis_worker_ack_after_enqueue_observed p99 latency",
+            "value": 62.82,
             "unit": "ms"
           }
         ]
