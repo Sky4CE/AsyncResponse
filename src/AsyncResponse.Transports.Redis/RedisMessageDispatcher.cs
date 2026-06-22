@@ -1,0 +1,500 @@
+using Microsoft.Extensions.Logging;
+using StackExchange.Redis;
+using System.Diagnostics;
+using System.Threading.Channels;
+
+namespace AsyncResponse.Transports.Redis;
+
+internal enum RedisSubscriberRole
+{
+    Worker,
+    ResponseIngress
+}
+
+internal sealed record RedisStreamDelivery(
+    RedisKey Stream,
+    RedisValue ConsumerGroup,
+    RedisValue MessageId,
+    string Payload,
+    string? CorrelationId,
+    int Attempt,
+    StreamEntry Entry);
+
+internal abstract class RedisMessageDispatcher : IAsyncDisposable
+{
+    private readonly Func<RedisStreamDelivery, CancellationToken, Task> _handler;
+    private readonly RedisSubscriberOptions _subscriberOptions;
+    private readonly IRedisStreamDatabase _database;
+    private readonly RedisTransportKeySchema _keys;
+    private readonly string _stream;
+    private readonly string _consumerGroup;
+    private readonly RedisSubscriberRole _role;
+
+    protected RedisMessageDispatcher(
+        Func<RedisStreamDelivery, CancellationToken, Task> handler,
+        IRedisStreamDatabase database,
+        RedisAsyncResponseTransportOptions transportOptions,
+        RedisSubscriberOptions subscriberOptions,
+        ILogger logger,
+        RedisKey stream,
+        RedisValue consumerGroup,
+        RedisSubscriberRole role)
+    {
+        _handler = handler;
+        _database = database;
+        TransportOptions = transportOptions;
+        _subscriberOptions = subscriberOptions;
+        _keys = new RedisTransportKeySchema(transportOptions);
+        Logger = logger;
+        _stream = stream.ToString();
+        _consumerGroup = consumerGroup.ToString();
+        _role = role;
+    }
+
+    protected RedisAsyncResponseTransportOptions TransportOptions { get; }
+    protected ILogger Logger { get; }
+
+    protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
+
+    public static RedisMessageDispatcher Create(
+        Func<RedisStreamDelivery, CancellationToken, Task> handler,
+        IRedisStreamDatabase database,
+        RedisAsyncResponseTransportOptions transportOptions,
+        RedisSubscriberOptions subscriberOptions,
+        ILogger logger,
+        RedisKey stream,
+        RedisValue consumerGroup,
+        RedisSubscriberRole role)
+    {
+        ValidateOptions(transportOptions, subscriberOptions, role);
+
+        if (subscriberOptions.AckMode is RedisAckMode.AckAfterEnqueue)
+        {
+            return new QueuedRedisMessageDispatcher(
+                handler,
+                database,
+                transportOptions,
+                subscriberOptions,
+                logger,
+                stream,
+                consumerGroup,
+                role);
+        }
+
+        return new AwaitingRedisMessageDispatcher(
+            handler,
+            database,
+            transportOptions,
+            subscriberOptions,
+            logger,
+            stream,
+            consumerGroup,
+            role);
+    }
+
+    public static void ValidateOptions(
+        RedisAsyncResponseTransportOptions transportOptions,
+        RedisSubscriberOptions subscriberOptions,
+        RedisSubscriberRole role)
+    {
+        RedisTransportOptionsValidator.ValidateCommon(transportOptions);
+
+        var optionPath = role is RedisSubscriberRole.Worker
+            ? $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.WorkerSubscriber)}"
+            : $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.ResponseSubscriber)}";
+
+        if (subscriberOptions.BatchSize <= 0)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BatchSize)} must be positive.");
+        if (subscriberOptions.EmptyPollDelay <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.EmptyPollDelay)} must be positive.");
+        if (subscriberOptions.PendingMessageMinIdleTime <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingMessageMinIdleTime)} must be positive.");
+        if (subscriberOptions.PendingClaimInterval <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingClaimInterval)} must be positive.");
+        if (subscriberOptions.PendingClaimBatchSize <= 0)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingClaimBatchSize)} must be positive.");
+        if (subscriberOptions.MaxDeliveryAttempts < 0)
+            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.MaxDeliveryAttempts)} cannot be negative.");
+
+        switch (subscriberOptions.AckMode)
+        {
+            case RedisAckMode.AckAfterHandlerCompletes:
+                return;
+
+            case RedisAckMode.AckAfterEnqueue:
+                if (subscriberOptions.BackgroundWorkerCount <= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundWorkerCount)} must be explicitly configured " +
+                        $"when {nameof(RedisSubscriberOptions.AckMode)} is {nameof(RedisAckMode.AckAfterEnqueue)}.");
+                }
+
+                if (subscriberOptions.BackgroundQueueCapacity <= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundQueueCapacity)} must be explicitly configured " +
+                        $"when {nameof(RedisSubscriberOptions.AckMode)} is {nameof(RedisAckMode.AckAfterEnqueue)}.");
+                }
+
+                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
+                    throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
+
+                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
+                {
+                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
+                    if (requiredShutdownBudget > hostShutdownTimeout)
+                    {
+                        throw new InvalidOperationException(
+                            $"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)} plus " +
+                            $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.ShutdownTimeout)} " +
+                            $"requires {requiredShutdownBudget}, which exceeds " +
+                            $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)} " +
+                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
+                            $"and mirror that value in {nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)}, " +
+                            "or reduce the Redis shutdown/drain timeouts.");
+                    }
+                }
+
+                return;
+
+            default:
+                throw new InvalidOperationException(
+                    $"{optionPath}.{nameof(RedisSubscriberOptions.AckMode)} has unsupported value '{subscriberOptions.AckMode}'.");
+        }
+    }
+
+    public abstract Task HandleAsync(
+        RedisStreamDelivery delivery,
+        CancellationToken subscriberCancellationToken);
+
+    public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    protected async Task ExecuteHandlerAsync(
+        RedisStreamDelivery delivery,
+        CancellationToken cancellationToken,
+        bool logFailures = true)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.redis.receive",
+            ActivityKind.Consumer,
+            delivery.CorrelationId);
+        activity?.SetTag("asyncresponse.transport", "redis");
+        activity?.SetTag("asyncresponse.redis.role", _role.ToString());
+        activity?.SetTag("asyncresponse.redis.ack_mode", _subscriberOptions.AckMode.ToString());
+        activity?.SetTag("asyncresponse.redis.delivery_attempt", delivery.Attempt);
+        activity?.SetTag("messaging.system", "redis");
+        activity?.SetTag("messaging.destination.name", _stream);
+        activity?.SetTag("messaging.message.id", delivery.MessageId.ToString());
+
+        try
+        {
+            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (logFailures)
+            {
+                Logger.LogError(
+                    ex,
+                    "Redis stream message handling failed for {Stream}/{MessageId}.",
+                    _stream,
+                    delivery.MessageId.ToString());
+            }
+
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    protected Task AckAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)
+        => _database.StreamAcknowledgeAsync(
+            delivery.Stream,
+            delivery.ConsumerGroup,
+            delivery.MessageId,
+            cancellationToken);
+
+    protected bool AlreadyExceededDeliveryAttempts(RedisStreamDelivery delivery)
+        => MaxDeliveryAttempts > 0 && delivery.Attempt > MaxDeliveryAttempts;
+
+    protected bool ReachedDeliveryAttempts(RedisStreamDelivery delivery)
+        => MaxDeliveryAttempts > 0 && delivery.Attempt >= MaxDeliveryAttempts;
+
+    protected async Task DeadLetterAndAckAsync(
+        RedisStreamDelivery delivery,
+        Exception exception,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        if (TransportOptions.DeadLetterEnabled)
+        {
+            var fields = new[]
+            {
+                new NameValueEntry("sourceStream", delivery.Stream.ToString()),
+                new NameValueEntry("consumerGroup", delivery.ConsumerGroup.ToString()),
+                new NameValueEntry("subscriberRole", _role.ToString()),
+                new NameValueEntry("messageId", delivery.MessageId.ToString()),
+                new NameValueEntry("correlationId", delivery.CorrelationId ?? string.Empty),
+                new NameValueEntry("attempt", delivery.Attempt),
+                new NameValueEntry("reason", reason),
+                new NameValueEntry("exceptionType", exception.GetType().FullName!),
+                new NameValueEntry("exceptionMessage", exception.Message),
+                new NameValueEntry("payload", delivery.Payload),
+                new NameValueEntry("occurredAtUtc", DateTimeOffset.UtcNow.ToString("O"))
+            };
+
+            await _database.StreamAddAsync(
+                _keys.DeadLetterStream,
+                fields,
+                TransportOptions.DeadLetterStreamMaxLength,
+                TransportOptions.UseApproximateStreamTrimming,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        await AckAsync(delivery, cancellationToken).ConfigureAwait(false);
+    }
+
+    protected async ValueTask NotifyBackgroundFailureAsync(
+        RedisStreamDelivery delivery,
+        Exception exception)
+    {
+        var callback = _subscriberOptions.OnBackgroundFailure;
+        if (callback is null)
+            return;
+
+        try
+        {
+            await callback(new RedisBackgroundFailureContext(
+                _stream,
+                _consumerGroup,
+                _role.ToString(),
+                delivery.MessageId.ToString(),
+                delivery.CorrelationId,
+                exception)).ConfigureAwait(false);
+        }
+        catch (Exception callbackException)
+        {
+            Logger.LogError(
+                callbackException,
+                "Redis background failure callback failed for already-ACKed message {MessageId} on {Stream}.",
+                delivery.MessageId.ToString(),
+                _stream);
+        }
+    }
+}
+
+internal sealed class AwaitingRedisMessageDispatcher(
+    Func<RedisStreamDelivery, CancellationToken, Task> handler,
+    IRedisStreamDatabase database,
+    RedisAsyncResponseTransportOptions transportOptions,
+    RedisSubscriberOptions subscriberOptions,
+    ILogger logger,
+    RedisKey stream,
+    RedisValue consumerGroup,
+    RedisSubscriberRole role)
+    : RedisMessageDispatcher(handler, database, transportOptions, subscriberOptions, logger, stream, consumerGroup, role)
+{
+    public override async Task HandleAsync(
+        RedisStreamDelivery delivery,
+        CancellationToken subscriberCancellationToken)
+    {
+        if (AlreadyExceededDeliveryAttempts(delivery))
+        {
+            await DeadLetterAndAckAsync(
+                delivery,
+                new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
+                "max_delivery_attempts_exceeded",
+                subscriberCancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ReachedDeliveryAttempts(delivery))
+        {
+            Logger.LogWarning(
+                ex,
+                "Redis message {MessageId} reached max delivery attempts ({MaxDeliveryAttempts}); writing to dead-letter stream.",
+                delivery.MessageId.ToString(),
+                MaxDeliveryAttempts);
+            await DeadLetterAndAckAsync(
+                delivery,
+                ex,
+                "handler_failed_max_attempts",
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Leave the entry pending. The subscriber's pending-claim loop reclaims it after
+            // PendingMessageMinIdleTime, giving Redis-backed retry without a hot loop.
+        }
+    }
+}
+
+internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
+{
+    private readonly Channel<RedisStreamDelivery> _queue;
+    private readonly Task[] _workers;
+    private readonly CancellationTokenSource _drainCancellation = new();
+    private readonly TimeSpan _drainTimeout;
+    private readonly string _stream;
+    private int _pendingCount;
+    private int _runningCount;
+    private int _disposeStarted;
+
+    public QueuedRedisMessageDispatcher(
+        Func<RedisStreamDelivery, CancellationToken, Task> handler,
+        IRedisStreamDatabase database,
+        RedisAsyncResponseTransportOptions transportOptions,
+        RedisSubscriberOptions subscriberOptions,
+        ILogger logger,
+        RedisKey stream,
+        RedisValue consumerGroup,
+        RedisSubscriberRole role)
+        : base(handler, database, transportOptions, subscriberOptions, logger, stream, consumerGroup, role)
+    {
+        _stream = stream.ToString();
+        _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _queue = Channel.CreateBounded<RedisStreamDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
+        {
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
+            SingleWriter = false
+        });
+
+        _workers = Enumerable.Range(0, subscriberOptions.BackgroundWorkerCount)
+            .Select(workerIndex => Task.Run(() => RunWorkerAsync(workerIndex)))
+            .ToArray();
+
+        Logger.LogInformation(
+            "Created Redis ACK-after-enqueue dispatcher for {Stream} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
+            _stream,
+            subscriberOptions.BackgroundWorkerCount,
+            subscriberOptions.BackgroundQueueCapacity,
+            _drainTimeout);
+    }
+
+    internal int PendingCount => Volatile.Read(ref _pendingCount);
+    internal int RunningCount => Volatile.Read(ref _runningCount);
+
+    public override async Task HandleAsync(
+        RedisStreamDelivery delivery,
+        CancellationToken subscriberCancellationToken)
+    {
+        try
+        {
+            Interlocked.Increment(ref _pendingCount);
+            if (_queue.Writer.TryWrite(delivery))
+            {
+                await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            Interlocked.Decrement(ref _pendingCount);
+            Logger.LogWarning(
+                "Redis background queue rejected message {MessageId} for {Stream}; leaving it pending for retry. Pending={PendingCount}, Running={RunningCount}.",
+                delivery.MessageId.ToString(),
+                _stream,
+                PendingCount,
+                RunningCount);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            Logger.LogError(
+                ex,
+                "Failed to enqueue Redis message {MessageId} for {Stream}; leaving it pending for retry.",
+                delivery.MessageId.ToString(),
+                _stream);
+        }
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+            return;
+
+        Logger.LogInformation(
+            "Draining Redis ACK-after-enqueue dispatcher for {Stream}. Pending={PendingCount}, Running={RunningCount}.",
+            _stream,
+            PendingCount,
+            RunningCount);
+        _queue.Writer.TryComplete();
+
+        try
+        {
+            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            _drainCancellation.Dispose();
+        }
+        catch (TimeoutException ex)
+        {
+            _drainCancellation.Cancel();
+            Logger.LogWarning(
+                ex,
+                "Timed out while draining Redis ACK-after-enqueue dispatcher for {Stream}. Pending={PendingCount}, Running={RunningCount}. Already ACKed work may be interrupted by host shutdown.",
+                _stream,
+                PendingCount,
+                RunningCount);
+
+            _ = Task.WhenAll(_workers).ContinueWith(
+                _ => _drainCancellation.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
+
+    private async Task RunWorkerAsync(int workerIndex)
+    {
+        await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            Interlocked.Increment(ref _runningCount);
+
+            try
+            {
+                await ExecuteHandlerAsync(
+                    delivery,
+                    _drainCancellation.Token,
+                    logFailures: false).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    ex,
+                    "Redis background handler failed for already-ACKed message {MessageId} on {Stream}.",
+                    delivery.MessageId.ToString(),
+                    _stream);
+                await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+
+                try
+                {
+                    await DeadLetterAndAckAsync(
+                        delivery,
+                        ex,
+                        "background_handler_failed_after_ack",
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception deadLetterException)
+                {
+                    Logger.LogError(
+                        deadLetterException,
+                        "Failed to dead-letter already-ACKed Redis message {MessageId} on {Stream}.",
+                        delivery.MessageId.ToString(),
+                        _stream);
+                }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _runningCount);
+            }
+        }
+    }
+}
