@@ -57,6 +57,20 @@ public interface IAsyncResponseBuilder
 }
 
 /// <summary>
+/// Builder exposed by durable response-channel packages that can recover a response that arrives
+/// after the original waiter disappeared. Use this when the flow registers lost-subscriber resume
+/// or failure callbacks; simple in-memory channels only expose <see cref="IAsyncResponseBuilder"/>.
+/// </summary>
+public interface IRecoverableAsyncResponseBuilder : IAsyncResponseBuilder
+{
+    /// <inheritdoc cref="IAsyncResponseBuilder.For{T}(string)"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload;
+
+    /// <inheritdoc cref="IAsyncResponseBuilder.For{T}()"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload;
+}
+
+/// <summary>
 /// Builder returned by <see cref="IAsyncResponseBuilder.For{T}(string)"/>, i.e. for waiters that
 /// <em>attach</em> to an operation already started elsewhere (an earlier run, another system).
 /// Its <see cref="WaitAsync"/> takes no trigger — the operation is already in flight, so there
@@ -65,36 +79,6 @@ public interface IAsyncResponseBuilder
 /// <typeparam name="T">The expected response payload type.</typeparam>
 public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayload
 {
-    /// <summary>
-    /// Registers the lost-subscriber <em>resume</em> callback: invoked when a response payload whose
-    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returns <c>true</c> arrives while
-    /// no waiter is listening (typically after a redeploy). The callback usually resumes or
-    /// re-registers the flow.
-    /// </summary>
-    IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback);
-
-    /// <summary>
-    /// Expression-based overload of <see cref="OnLostSubscriberResume(ReflectionCallDto)"/>:
-    /// <c>svc => svc.ResumeAsync(literalArg, Placeholder.Payload&lt;T&gt;(), Placeholder.CorrelationId())</c>.
-    /// Literal arguments are captured by value; <see cref="Placeholder"/> markers are substituted
-    /// when the callback fires.
-    /// </summary>
-    IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback);
-
-    /// <summary>
-    /// Registers the lost-subscriber <em>failure</em> callback: invoked when an exception
-    /// envelope — or a payload whose <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
-    /// returns <c>false</c> (or that cannot be classified) — arrives while no waiter is listening.
-    /// Domain failures are delivered as <see cref="AsyncResponseDomainFailureException"/>.
-    /// </summary>
-    IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback);
-
-    /// <summary>
-    /// Expression-based overload of <see cref="OnLostSubscriberFailure(ReflectionCallDto)"/>:
-    /// <c>svc => svc.FailAsync(literalArg, Placeholder.Exception(), Placeholder.CorrelationId())</c>.
-    /// </summary>
-    IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback);
-
     /// <summary>
     /// Specifies how long to wait before the waiter faults with a <see cref="TimeoutException"/>.
     /// When not specified, the response channel's default applies (for the built-in channels:
@@ -159,18 +143,6 @@ public interface IAsyncResponseAttachedBuilder<T> where T : IAsyncResponsePayloa
 /// <typeparam name="T">The expected response payload type.</typeparam>
 public interface IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePayload
 {
-    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.OnLostSubscriberResume(ReflectionCallDto)"/>
-    IAsyncResponseTriggeredBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback);
-
-    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.OnLostSubscriberResume{TService}(Expression{Func{TService, Task}})"/>
-    IAsyncResponseTriggeredBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback);
-
-    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.OnLostSubscriberFailure(ReflectionCallDto)"/>
-    IAsyncResponseTriggeredBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback);
-
-    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.OnLostSubscriberFailure{TService}(Expression{Func{TService, Task}})"/>
-    IAsyncResponseTriggeredBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback);
-
     /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithTimeout(TimeSpan)"/>
     IAsyncResponseTriggeredBuilder<T> WithTimeout(TimeSpan timeout);
 
@@ -208,4 +180,100 @@ public interface IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePaylo
     /// </summary>
     /// <param name="trigger">The action that starts the remote operation; receives the request context. Required.</param>
     Task<T> WaitAsync(Func<AsyncResponseRequestContext, Task> trigger);
+}
+
+/// <summary>
+/// Recoverable attached builder returned by <see cref="IRecoverableAsyncResponseBuilder.For{T}(string)"/>.
+/// It adds durable lost-subscriber callbacks to the ordinary attached wait API.
+/// </summary>
+/// <typeparam name="T">The expected response payload type.</typeparam>
+public interface IRecoverableAsyncResponseAttachedBuilder<T> : IAsyncResponseAttachedBuilder<T>
+    where T : IAsyncResponsePayload
+{
+    /// <summary>
+    /// Registers the lost-subscriber <em>resume</em> callback: invoked when a response payload whose
+    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returns <c>true</c> arrives while
+    /// no waiter is listening (typically after a redeploy). The callback usually resumes or
+    /// re-registers the flow.
+    /// </summary>
+    IRecoverableAsyncResponseAttachedBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback);
+
+    /// <summary>
+    /// Expression-based overload of <see cref="OnLostSubscriberResume(ReflectionCallDto)"/>:
+    /// <c>svc => svc.ResumeAsync(literalArg, Placeholder.Payload&lt;T&gt;(), Placeholder.CorrelationId())</c>.
+    /// Literal arguments are captured by value; <see cref="Placeholder"/> markers are substituted
+    /// when the callback fires.
+    /// </summary>
+    IRecoverableAsyncResponseAttachedBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback);
+
+    /// <summary>
+    /// Registers the lost-subscriber <em>failure</em> callback: invoked when an exception
+    /// envelope — or a payload whose <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
+    /// returns <c>false</c> (or that cannot be classified) — arrives while no waiter is listening.
+    /// Domain failures are delivered as <see cref="AsyncResponseDomainFailureException"/>.
+    /// </summary>
+    IRecoverableAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback);
+
+    /// <summary>
+    /// Expression-based overload of <see cref="OnLostSubscriberFailure(ReflectionCallDto)"/>:
+    /// <c>svc => svc.FailAsync(literalArg, Placeholder.Exception(), Placeholder.CorrelationId())</c>.
+    /// </summary>
+    IRecoverableAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithTimeout(TimeSpan)"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> WithTimeout(TimeSpan timeout);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget()"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> WithReplyTarget();
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget(string)"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> WithReplyTarget(string name);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.WithReplyTarget(AsyncResponseReplyTarget)"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> WithReplyTarget(AsyncResponseReplyTarget replyTarget);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.Until(Func{T, bool})"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> Until(Func<T, bool> predicate);
+
+    /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}.Until(Func{T, Task{bool}})"/>
+    new IRecoverableAsyncResponseAttachedBuilder<T> Until(Func<T, Task<bool>> predicate);
+}
+
+/// <summary>
+/// Recoverable triggered builder returned by <see cref="IRecoverableAsyncResponseBuilder.For{T}()"/>.
+/// It preserves the trigger-required terminal while exposing durable lost-subscriber callbacks.
+/// </summary>
+/// <typeparam name="T">The expected response payload type.</typeparam>
+public interface IRecoverableAsyncResponseTriggeredBuilder<T> : IAsyncResponseTriggeredBuilder<T>
+    where T : IAsyncResponsePayload
+{
+    /// <inheritdoc cref="IRecoverableAsyncResponseAttachedBuilder{T}.OnLostSubscriberResume(ReflectionCallDto)"/>
+    IRecoverableAsyncResponseTriggeredBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback);
+
+    /// <inheritdoc cref="IRecoverableAsyncResponseAttachedBuilder{T}.OnLostSubscriberResume{TService}(Expression{Func{TService, Task}})"/>
+    IRecoverableAsyncResponseTriggeredBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback);
+
+    /// <inheritdoc cref="IRecoverableAsyncResponseAttachedBuilder{T}.OnLostSubscriberFailure(ReflectionCallDto)"/>
+    IRecoverableAsyncResponseTriggeredBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback);
+
+    /// <inheritdoc cref="IRecoverableAsyncResponseAttachedBuilder{T}.OnLostSubscriberFailure{TService}(Expression{Func{TService, Task}})"/>
+    IRecoverableAsyncResponseTriggeredBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback);
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WithTimeout(TimeSpan)"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> WithTimeout(TimeSpan timeout);
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WithReplyTarget()"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> WithReplyTarget();
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WithReplyTarget(string)"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> WithReplyTarget(string name);
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.WithReplyTarget(AsyncResponseReplyTarget)"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> WithReplyTarget(AsyncResponseReplyTarget replyTarget);
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.Until(Func{T, bool})"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> Until(Func<T, bool> predicate);
+
+    /// <inheritdoc cref="IAsyncResponseTriggeredBuilder{T}.Until(Func{T, Task{bool}})"/>
+    new IRecoverableAsyncResponseTriggeredBuilder<T> Until(Func<T, Task<bool>> predicate);
 }

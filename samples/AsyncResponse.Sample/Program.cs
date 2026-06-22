@@ -624,8 +624,12 @@ app.MapPost("/worker", async (IAsyncResponseBuilder asyncResponse, string token,
 // 5a) Lost-subscriber recovery — arm: register a waiter with recovery callbacks and keep it waiting
 //     in the background. The HTTP request returns immediately; the subscription and persisted
 //     recovery state stay alive. The propagators capture the trace/tenant into the recovery state.
-app.MapPost("/arm", async (IAsyncResponseBuilder asyncResponse, FlowRecorder recorder, string? trace) =>
+app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, string? trace) =>
 {
+    var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
+    if (asyncResponse is null)
+        return Results.Conflict("Lost-subscriber recovery requires a durable channel such as Redis.");
+
     SampleTraceContext.Set(trace);
     SampleTenantContext.Set("tenant-acme");
     var armed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -685,7 +689,6 @@ app.MapPost("/publish", async (IAsyncResponsePublisher publisher, string correla
 //     and wait for the recovery callback in one request. This endpoint complements the lower-level
 //     /arm + /crash + /publish endpoints that integration tests can still drive step by step.
 app.MapPost("/lost-subscriber-flow", async (
-    IAsyncResponseBuilder asyncResponse,
     IAsyncResponsePublisher publisher,
     FlowRecorder recorder,
     IServiceProvider services,
@@ -693,8 +696,9 @@ app.MapPost("/lost-subscriber-flow", async (
     string? outcome,
     string? trace) =>
 {
+    var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
     var multiplexer = services.GetService<IConnectionMultiplexer>();
-    if (multiplexer is null)
+    if (asyncResponse is null || multiplexer is null)
         return Results.Conflict("Composed lost-subscriber recovery requires the Redis channel.");
 
     SampleTraceContext.Set(trace ?? $"trace-{Guid.NewGuid().ToString("N")[..8]}");

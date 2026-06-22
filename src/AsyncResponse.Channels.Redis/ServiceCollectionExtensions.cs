@@ -10,11 +10,13 @@ namespace Microsoft.Extensions.DependencyInjection;
 public static class RedisAsyncResponseServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers Redis pub/sub as the response channel — behind <see cref="IAsyncResponsePublisher"/>
-    /// and <see cref="IAsyncResponseSubscriber"/> — together with the durable Redis recovery-state
-    /// store, so a response that arrives after the waiter died (e.g. a redeploy) can still resume or
-    /// fail the owning flow. The same instance also serves the engine's recovery-state scanner and
-    /// active-subscriber probe, so the watchdog works against Redis automatically.
+    /// Registers Redis pub/sub as the response channel — behind <see cref="IAsyncResponsePublisher"/>,
+    /// <see cref="IAsyncResponseSubscriber"/>, and <see cref="IRecoverableAsyncResponseSubscriber"/> —
+    /// together with the durable Redis recovery-state store, so a response that arrives after the
+    /// waiter died (e.g. a redeploy) can still resume or fail the owning flow. It also registers
+    /// <see cref="IRecoverableAsyncResponseBuilder"/> for fluent durable recovery flows. The same
+    /// channel instance serves the engine's recovery-state scanner and active-subscriber probe, so the
+    /// watchdog works against Redis automatically.
     /// <para>
     /// Requires a <c>StackExchange.Redis.IConnectionMultiplexer</c> singleton registered by the
     /// host — reuse the application's existing multiplexer; don't create a second connection.
@@ -44,7 +46,18 @@ public static class RedisAsyncResponseServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
         services.Replace(ServiceDescriptor.Singleton<IRawAsyncResponsePublisher>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
+        services.Replace(ServiceDescriptor.Singleton<IRecoverableAsyncResponseSubscriber>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
         services.Replace(ServiceDescriptor.Singleton<IActiveSubscriberProbe>(provider => provider.GetRequiredService<RedisAsyncResponseChannel>()));
+
+        // Durable recovery capability: expose the recoverable fluent builder only when the Redis
+        // channel package is the selected response channel. Plain IAsyncResponseBuilder still works
+        // and shares the same implementation, but its static type does not offer recovery callbacks.
+        services.Replace(ServiceDescriptor.Singleton<IRecoverableAsyncResponseBuilder>(provider => new RecoverableAsyncResponseBuilder(
+            provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>(),
+            provider.GetService<IWorkerTransport>(),
+            provider.GetService<IAsyncResponseReplyTargetProvider>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>())));
+        services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         services.AddSingleton(new AsyncResponseChannelMarker("Redis"));
         return builder;

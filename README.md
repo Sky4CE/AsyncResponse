@@ -41,11 +41,11 @@ add durable recovery when the flow needs it:
 1. **Correlation** — `await` a response by correlation id, with fluent timeouts, progress
    predicates, and race-free triggering. `AsyncResponse.Core` ships a process-local response
    channel for simple apps and tests.
-2. **Recovery** — response channels persist *recovery state* through a pluggable
-   `IRecoveryStateStore`. The default store is in-memory; `AsyncResponse.Channels.Redis` adds durable
-   recovery. A response that arrives after the waiter died is **classified by its domain
-   outcome** and routed to the right callback: resume the flow, or fail it — never resume a
-   failure.
+2. **Recovery** — every wait records *recovery state* for cleanup and watchdog visibility; durable
+   channels persist it beyond the process. `AsyncResponse.Channels.Redis` adds the recoverable
+   builder API and durable callbacks, so a response that arrives after the waiter died is
+   **classified by its domain outcome** and routed to the right callback: resume the flow, or fail
+   it — never resume a failure.
 
 ## How it works
 
@@ -151,6 +151,12 @@ builder.Services.AddAsyncResponse()                // engine + recovery watchdog
 builder.Services.AddHealthChecks()
     .AddAsyncResponseRecoveryCheck();              // optional: surface the watchdog on /readyz
 ```
+
+`.WithRedisChannel()` also registers `IRecoverableAsyncResponseBuilder`. Use ordinary
+`IAsyncResponseBuilder` for normal request/response waits; inject
+`IRecoverableAsyncResponseBuilder` only in flows that register lost-subscriber callbacks. With the
+in-memory channel, the recoverable builder is not registered and `OnLostSubscriber*` methods are not
+part of the ordinary builder interfaces.
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
 exactly one channel (`.WithInMemoryChannel()` or `.WithRedisChannel()`) and exactly one transport
@@ -428,9 +434,10 @@ OrderResult result = await _asyncResponse
     .WaitAsync();                                  // wait-only terminal
 ```
 
-Need to arm recovery without awaiting in place? Start the wait as a background task
-(`_ = builder…WaitAsync(trigger)`): the subscription and the persisted recovery state stay
-alive while your code moves on (see the sample's `/arm` endpoint).
+Need to arm a durable recovery wait without awaiting in place? Use
+`IRecoverableAsyncResponseBuilder` and start the wait as a background task
+(`_ = builder…WaitAsync(trigger)`): the subscription and the persisted recovery state stay alive
+while your code moves on (see the sample's `/arm` endpoint).
 
 ### 3. Deliver responses (your broker → the ingress)
 
@@ -462,15 +469,28 @@ serializable method descriptors (persisted in Redis, invoked through DI by the p
 receives the late response — which may be a *different deployment*):
 
 ```csharp
-var result = await _asyncResponse
-    .For<OrderResult>()
-    .Until(r => r.Status != OrderStatus.Processing)
-    .OnLostSubscriberResume<IOrderFlow>(flow =>
-        flow.ResumeAsync(orderId, Placeholder.Payload<OrderResult>(), Placeholder.CorrelationId()))
-    .OnLostSubscriberFailure<IOrderFlow>(flow =>
-        flow.FailAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
-    .WaitAsync(context => _remoteSystem.SubmitAsync(orderId, context.CorrelationId));
+public sealed class OrderController(
+    IRecoverableAsyncResponseBuilder _asyncResponse,
+    IRemoteSystem _remoteSystem)
+{
+    public async Task<OrderResult> SubmitAsync(string orderId)
+    {
+        return await _asyncResponse
+            .For<OrderResult>()
+            .Until(r => r.Status != OrderStatus.Processing)
+            .OnLostSubscriberResume<IOrderFlow>(flow =>
+                flow.ResumeAsync(orderId, Placeholder.Payload<OrderResult>(), Placeholder.CorrelationId()))
+            .OnLostSubscriberFailure<IOrderFlow>(flow =>
+                flow.FailAsync(Placeholder.Exception(), Placeholder.CorrelationId()))
+            .WaitAsync(context => _remoteSystem.SubmitAsync(orderId, context.CorrelationId));
+    }
+}
 ```
+
+The `OnLostSubscriber*` methods intentionally live only on `IRecoverableAsyncResponseBuilder` and
+its fluent builders. If an app is configured with `.WithInMemoryChannel()`, those methods are absent
+at compile time; switch to `.WithRedisChannel()` and inject `IRecoverableAsyncResponseBuilder` for
+durable recovery flows.
 
 `Placeholder.Payload<T>()`, `Placeholder.Exception()`, and `Placeholder.CorrelationId()` are
 compile-time markers substituted with the real values when the callback fires. Literal arguments

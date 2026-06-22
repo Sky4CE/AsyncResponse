@@ -1,13 +1,13 @@
 namespace AsyncResponse;
 
 /// <summary>
-/// Expression markers for registering lost-subscriber callbacks with compile-time safety.
+/// Expression markers for registering recoverable lost-subscriber callbacks with compile-time safety.
 /// Use them inside the lambda passed to <c>OnLostSubscriberResume</c>/<c>OnLostSubscriberFailure</c>
 /// to mark which arguments the runtime should substitute when the callback fires:
 /// <code>
-/// builder.For&lt;OrderResult&gt;(correlationId)
-///        .OnLostSubscriberResume&lt;IOrderFlow&gt;(flow =>
-///            flow.ResumeAsync(orderId, Placeholder.Payload&lt;OrderResult&gt;(), Placeholder.CorrelationId()))
+/// recoverableBuilder.For&lt;OrderResult&gt;(correlationId)
+///                   .OnLostSubscriberResume&lt;IOrderFlow&gt;(flow =>
+///                       flow.ResumeAsync(orderId, Placeholder.Payload&lt;OrderResult&gt;(), Placeholder.CorrelationId()))
 /// </code>
 /// The marker methods are never executed; they only exist inside expression trees and throw if
 /// invoked directly.

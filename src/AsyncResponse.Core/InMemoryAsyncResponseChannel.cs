@@ -38,8 +38,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
     public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
         string correlationId,
-        ReflectionCallDto? resumeCallback = null,
-        ReflectionCallDto? failureCallback = null,
         Func<T, ValueTask<bool>>? completionPredicate = null,
         TimeSpan? timeout = null) where T : IAsyncResponsePayload
     {
@@ -79,8 +77,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 correlationId,
                 new RecoveryState
                 {
-                    ResumeCallback = resumeCallback,
-                    FailureCallback = failureCallback,
                     CorrelationId = correlationId,
                     PayloadTypeFullName = typeof(T).FullName,
                     RegisteredAtUtc = DateTime.UtcNow,

@@ -20,7 +20,7 @@ namespace AsyncResponse.Channels.Redis;
 /// ShouldResumeOnRecovery and invokes the resume or failure callback.</description></item>
 /// </list>
 /// </summary>
-internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
+internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
 {
 
     private readonly ISubscriber _subscriber;
@@ -53,15 +53,40 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     }
 
     // ---------------------------------------------------------------------------------------
-    // IAsyncResponseSubscriber
+    // IAsyncResponseSubscriber / IRecoverableAsyncResponseSubscriber
 
     /// <inheritdoc/>
-    public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+    public Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+        string correlationId,
+        Func<T, ValueTask<bool>>? completionPredicate = null,
+        TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(
+            correlationId,
+            resumeCallback: null,
+            failureCallback: null,
+            completionPredicate,
+            timeout);
+
+    /// <inheritdoc/>
+    public Task<IAsyncResponseWaiter<T>> CreateRecoverableResponseWaiter<T>(
         string correlationId,
         ReflectionCallDto? resumeCallback = null,
         ReflectionCallDto? failureCallback = null,
         Func<T, ValueTask<bool>>? completionPredicate = null,
         TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(
+            correlationId,
+            resumeCallback,
+            failureCallback,
+            completionPredicate,
+            timeout);
+
+    private async Task<IAsyncResponseWaiter<T>> CreateResponseWaiterCore<T>(
+        string correlationId,
+        ReflectionCallDto? resumeCallback,
+        ReflectionCallDto? failureCallback,
+        Func<T, ValueTask<bool>>? completionPredicate,
+        TimeSpan? timeout) where T : IAsyncResponsePayload
     {
         if (string.IsNullOrWhiteSpace(correlationId))
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");

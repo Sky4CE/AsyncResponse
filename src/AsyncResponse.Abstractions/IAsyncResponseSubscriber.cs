@@ -8,9 +8,37 @@ public interface IAsyncResponseSubscriber
 {
     /// <summary>
     /// Subscribes to the response channel associated with <paramref name="correlationId"/>,
-    /// stores the recovery callbacks, and returns a disposable
-    /// <see cref="IAsyncResponseWaiter{T}"/> for manual lifetime control. Disposing the waiter
-    /// cancels the subscription and clears the stored recovery state.
+    /// and returns a disposable <see cref="IAsyncResponseWaiter{T}"/> for manual lifetime control.
+    /// Disposing the waiter cancels the subscription and clears the stored recovery state.
+    /// </summary>
+    /// <typeparam name="T">The expected response payload type.</typeparam>
+    /// <param name="correlationId">The unique identifier linking the request to its response channel.</param>
+    /// <param name="completionPredicate">
+    /// Optional predicate deciding whether a received payload completes the wait; when
+    /// <c>null</c>, the first payload completes it. Return <c>false</c> to keep waiting
+    /// (intermediate/progress messages).
+    /// </param>
+    /// <param name="timeout">
+    /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/>.
+    /// When <c>null</c>, the response channel's default timeout applies — waits are never infinite.
+    /// </param>
+    Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+        string correlationId,
+        Func<T, ValueTask<bool>>? completionPredicate = null,
+        TimeSpan? timeout = null
+    ) where T : IAsyncResponsePayload;
+}
+
+/// <summary>
+/// Low-level subscriber capability exposed by durable response channels that can route a late
+/// response to stored lost-subscriber callbacks. Application code should usually prefer
+/// <see cref="IRecoverableAsyncResponseBuilder"/>.
+/// </summary>
+public interface IRecoverableAsyncResponseSubscriber : IAsyncResponseSubscriber
+{
+    /// <summary>
+    /// Subscribes to the response channel, stores durable recovery callbacks, and returns a
+    /// disposable <see cref="IAsyncResponseWaiter{T}"/> for manual lifetime control.
     /// </summary>
     /// <typeparam name="T">The expected response payload type.</typeparam>
     /// <param name="correlationId">The unique identifier linking the request to its response channel.</param>
@@ -31,7 +59,7 @@ public interface IAsyncResponseSubscriber
     /// Optional timeout after which the waiter faults with a <see cref="TimeoutException"/>.
     /// When <c>null</c>, the response channel's default timeout applies — waits are never infinite.
     /// </param>
-    Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+    Task<IAsyncResponseWaiter<T>> CreateRecoverableResponseWaiter<T>(
         string correlationId,
         ReflectionCallDto? resumeCallback = null,
         ReflectionCallDto? failureCallback = null,

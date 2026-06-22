@@ -30,9 +30,10 @@ public interface IAsyncResponsePayload
     /// <para>
     /// The default returns <c>false</c> (do not resume) so that a payload never resumes a flow by
     /// omission — a failed response can never accidentally take the happy path. Override it only for
-    /// payloads that can carry a domain failure, returning <c>true</c> for the states the flow
-    /// should resume on. Durable channels (e.g. Redis) require this override when recovery callbacks
-    /// are registered, and fail fast at waiter creation if it is missing.
+    /// payloads used with <see cref="IRecoverableAsyncResponseBuilder"/> that can carry a domain
+    /// failure, returning <c>true</c> for the states the flow should resume on. Durable channels
+    /// (e.g. Redis) require this override when recovery callbacks are registered, and fail fast at
+    /// waiter creation if it is missing.
     /// </para>
     /// </summary>
     bool ShouldResumeOnRecovery() => false;

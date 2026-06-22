@@ -10,6 +10,7 @@ namespace AsyncResponse.Tests;
 public class AsyncResponseBuilderTests
 {
     private readonly Mock<IAsyncResponseSubscriber> _subscriber = new();
+    private readonly Mock<IRecoverableAsyncResponseSubscriber> _recoverableSubscriber = new();
     private readonly Mock<IAsyncResponseWaiter<OperationResult>> _waiter = new();
 
     public AsyncResponseBuilderTests()
@@ -18,6 +19,12 @@ public class AsyncResponseBuilderTests
             .Returns(Task.FromResult(new OperationResult { Status = OperationStatus.Completed }));
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .ReturnsAsync(_waiter.Object);
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
                 It.IsAny<string>(),
                 It.IsAny<ReflectionCallDto?>(),
                 It.IsAny<ReflectionCallDto?>(),
@@ -32,8 +39,7 @@ public class AsyncResponseBuilderTests
         var callOrder = new List<string>();
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
-                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
-                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+                It.IsAny<string>(), It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
             .Callback(() => callOrder.Add("subscribe"))
             .ReturnsAsync(_waiter.Object);
 
@@ -80,10 +86,9 @@ public class AsyncResponseBuilderTests
         string? subscribedWith = null;
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
-                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
-                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
-            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
-                (correlationId, _, _, _, _) => subscribedWith = correlationId)
+                It.IsAny<string>(), It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _) => subscribedWith = correlationId)
             .ReturnsAsync(_waiter.Object);
 
         string? triggeredWith = null;
@@ -116,10 +121,9 @@ public class AsyncResponseBuilderTests
         string? subscribedWith = null;
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
-                It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
-                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
-            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
-                (correlationId, _, _, _, _) => subscribedWith = correlationId)
+                It.IsAny<string>(), It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _) => subscribedWith = correlationId)
             .ReturnsAsync(_waiter.Object);
 
         AsyncResponseRequestContext? observed = null;
@@ -171,15 +175,15 @@ public class AsyncResponseBuilderTests
     {
         ReflectionCallDto? resume = null;
         ReflectionCallDto? failure = null;
-        _subscriber
-            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
                 "corr-1", It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
                 It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
             .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
                 (_, r, f, _, _) => { resume = r; failure = f; })
             .ReturnsAsync(_waiter.Object);
 
-        await new AsyncResponseBuilder(_subscriber.Object)
+        await new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object)
             .For<OperationResult>("corr-1")
             .OnLostSubscriberResume<IRecoverySpy>(spy => spy.OnResume(Placeholder.Payload<OperationResult>()))
             .OnLostSubscriberFailure<IRecoverySpy>(spy => spy.OnFailure(Placeholder.Exception()))
@@ -191,6 +195,23 @@ public class AsyncResponseBuilderTests
         Assert.NotNull(failure);
         Assert.Equal(nameof(IRecoverySpy.OnFailure), failure!.MethodName);
         Assert.Equal(PlaceholderType.Exception, Assert.Single(failure.Params).Placeholder);
+    }
+
+    [Fact]
+    public void OrdinaryBuilderInterfaces_DoNotExposeLostSubscriberCallbacks()
+    {
+        Assert.DoesNotContain(
+            typeof(IAsyncResponseAttachedBuilder<OperationResult>).GetMethods(),
+            method => method.Name.StartsWith("OnLostSubscriber", StringComparison.Ordinal));
+        Assert.DoesNotContain(
+            typeof(IAsyncResponseTriggeredBuilder<OperationResult>).GetMethods(),
+            method => method.Name.StartsWith("OnLostSubscriber", StringComparison.Ordinal));
+        Assert.Contains(
+            typeof(IRecoverableAsyncResponseAttachedBuilder<OperationResult>).GetMethods(),
+            method => method.Name == nameof(IRecoverableAsyncResponseAttachedBuilder<OperationResult>.OnLostSubscriberResume));
+        Assert.Contains(
+            typeof(IRecoverableAsyncResponseTriggeredBuilder<OperationResult>).GetMethods(),
+            method => method.Name == nameof(IRecoverableAsyncResponseTriggeredBuilder<OperationResult>.OnLostSubscriberFailure));
     }
 
     [Fact]
@@ -286,8 +307,8 @@ public class AsyncResponseBuilderTests
         ReflectionCallDto? failure = null;
         TimeSpan? timeout = null;
         Func<OperationResult, ValueTask<bool>>? predicate = null;
-        _subscriber
-            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
                 It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
                 It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
             .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
@@ -306,7 +327,7 @@ public class AsyncResponseBuilderTests
             Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
         };
 
-        IAsyncResponseTriggeredBuilder<OperationResult> builder = new AsyncResponseBuilder(_subscriber.Object)
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> builder = new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object)
             .For<OperationResult>();
 
         await builder
@@ -330,15 +351,15 @@ public class AsyncResponseBuilderTests
         ReflectionCallDto? resume = null;
         ReflectionCallDto? failure = null;
         Func<OperationResult, ValueTask<bool>>? predicate = null;
-        _subscriber
-            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+        _recoverableSubscriber
+            .Setup(s => s.CreateRecoverableResponseWaiter<OperationResult>(
                 It.IsAny<string>(), It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
                 It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
             .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
                 (_, r, f, p, _) => { resume = r; failure = f; predicate = p; })
             .ReturnsAsync(_waiter.Object);
 
-        IAsyncResponseTriggeredBuilder<OperationResult> builder = new AsyncResponseBuilder(_subscriber.Object)
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> builder = new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object)
             .For<OperationResult>();
 
         await builder
@@ -360,10 +381,9 @@ public class AsyncResponseBuilderTests
         Func<OperationResult, ValueTask<bool>>? predicate = null;
         _subscriber
             .Setup(s => s.CreateResponseWaiter<OperationResult>(
-                "corr-1", It.IsAny<ReflectionCallDto?>(), It.IsAny<ReflectionCallDto?>(),
-                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
-            .Callback<string, ReflectionCallDto?, ReflectionCallDto?, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
-                (_, _, _, p, _) => predicate = p)
+                "corr-1", It.IsAny<Func<OperationResult, ValueTask<bool>>?>(), It.IsAny<TimeSpan?>()))
+            .Callback<string, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, p, _) => predicate = p)
             .ReturnsAsync(_waiter.Object);
         var replyTarget = new AsyncResponseReplyTarget
         {

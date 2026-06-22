@@ -37,6 +37,8 @@ public class ChannelTransportRegistrationTests
         Assert.Same(store, scanner);
         Assert.IsType<InMemoryRecoveryStateStore>(store);
 
+        Assert.Null(provider.GetService<IRecoverableAsyncResponseBuilder>());
+        Assert.Null(provider.GetService<IRecoverableAsyncResponseSubscriber>());
         Assert.Equal("InMemory", provider.GetRequiredService<AsyncResponseChannelMarker>().Name);
     }
 
@@ -113,12 +115,17 @@ public class ChannelTransportRegistrationTests
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
         var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
         var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var recoverableSubscriber = provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+        var builder = provider.GetRequiredService<IAsyncResponseBuilder>();
+        var recoverableBuilder = provider.GetRequiredService<IRecoverableAsyncResponseBuilder>();
         var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
 
         Assert.Same(store, scanner);
         Assert.IsType<RedisRecoveryStateStore>(store);
         Assert.Same(publisher, rawPublisher);
         Assert.Same(publisher, subscriber);
+        Assert.Same(publisher, recoverableSubscriber);
+        Assert.Same(builder, recoverableBuilder);
         Assert.Same(publisher, probe);
         Assert.IsType<RedisAsyncResponseChannel>(publisher);
     }

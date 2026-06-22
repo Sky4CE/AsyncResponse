@@ -7,10 +7,10 @@ namespace AsyncResponse;
 /// should <em>not</em> resume the flow, and no subscriber was listening on the correlation channel
 /// (typically after a redeploy/restart).
 /// <para>
-/// Instances of this exception are passed to the callback registered via
-/// <c>IAsyncResponseBuilder{T}.OnLostSubscriberFailure</c>, so a failed domain response takes the
-/// same failure path as a technical <c>SetException</c>. Handlers can pattern-match on this type to
-/// distinguish a domain failure (with its payload) from a technical error.
+    /// Instances of this exception are passed to the failure callback registered through
+    /// <see cref="IRecoverableAsyncResponseBuilder"/>, so a failed domain response takes the same
+    /// failure path as a technical <c>SetException</c>. Handlers can pattern-match on this type to
+    /// distinguish a domain failure (with its payload) from a technical error.
 /// </para>
 /// </summary>
 public sealed class AsyncResponseDomainFailureException : Exception

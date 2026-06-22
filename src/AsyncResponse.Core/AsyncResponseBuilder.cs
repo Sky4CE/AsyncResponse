@@ -1,29 +1,21 @@
-using System.Linq.Expressions;
 using System.Diagnostics;
+using System.Linq.Expressions;
 
 namespace AsyncResponse;
 
-/// <inheritdoc cref="IAsyncResponseBuilder"/>
-internal sealed class AsyncResponseBuilder(
-    IAsyncResponseSubscriber _subscriber,
+internal abstract class AsyncResponseBuilderBase(
     IWorkerTransport? _workerTransport = null,
     IAsyncResponseReplyTargetProvider? _replyTargetProvider = null,
-    AsyncResponseContextPropagation? _propagation = null) : IAsyncResponseBuilder
+    AsyncResponseContextPropagation? _propagation = null)
 {
-    /// <inheritdoc />
-    public IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
-        => new AsyncResponseBuilder<T>(
-            _subscriber,
-            _replyTargetProvider,
-            !string.IsNullOrWhiteSpace(correlationId)
-                ? correlationId
-                : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace."));
+    protected IAsyncResponseReplyTargetProvider? ReplyTargetProvider => _replyTargetProvider;
 
-    /// <inheritdoc />
-    public IAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
-        => new AsyncResponseBuilder<T>(_subscriber, _replyTargetProvider, AsyncResponseContext.CreateCorrelationId());
+    protected static string ValidateCorrelationId(string correlationId)
+        => !string.IsNullOrWhiteSpace(correlationId)
+            ? correlationId
+            : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
-    /// <inheritdoc />
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto)" />
     public async Task EnqueueWorkerAsync(ReflectionCallDto work)
     {
         ArgumentNullException.ThrowIfNull(work);
@@ -57,29 +49,70 @@ internal sealed class AsyncResponseBuilder(
         }
     }
 
-    /// <inheritdoc />
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Action{TService}})" />
     public Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work)
         => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
 
-    /// <inheritdoc />
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}})" />
     public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work)
         => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
 
-    /// <inheritdoc />
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}})" />
     public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work)
         => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
 }
 
+/// <inheritdoc cref="IAsyncResponseBuilder"/>
+internal sealed class AsyncResponseBuilder(
+    IAsyncResponseSubscriber _subscriber,
+    IWorkerTransport? workerTransport = null,
+    IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
+    AsyncResponseContextPropagation? propagation = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation),
+        IAsyncResponseBuilder
+{
+    /// <inheritdoc />
+    public IAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
+        => new AsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, ValidateCorrelationId(correlationId));
+
+    /// <inheritdoc />
+    public IAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
+        => new AsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.CreateCorrelationId());
+}
+
+/// <inheritdoc cref="IRecoverableAsyncResponseBuilder"/>
+internal sealed class RecoverableAsyncResponseBuilder(
+    IRecoverableAsyncResponseSubscriber _subscriber,
+    IWorkerTransport? workerTransport = null,
+    IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
+    AsyncResponseContextPropagation? propagation = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation),
+        IRecoverableAsyncResponseBuilder
+{
+    /// <inheritdoc />
+    public IRecoverableAsyncResponseAttachedBuilder<T> For<T>(string correlationId) where T : IAsyncResponsePayload
+        => new RecoverableAsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, ValidateCorrelationId(correlationId));
+
+    /// <inheritdoc />
+    public IRecoverableAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload
+        => new RecoverableAsyncResponseBuilder<T>(_subscriber, ReplyTargetProvider, AsyncResponseContext.CreateCorrelationId());
+
+    IAsyncResponseAttachedBuilder<T> IAsyncResponseBuilder.For<T>(string correlationId)
+        => For<T>(correlationId);
+
+    IAsyncResponseTriggeredBuilder<T> IAsyncResponseBuilder.For<T>()
+        => For<T>();
+}
+
 /// <inheritdoc cref="IAsyncResponseAttachedBuilder{T}" />
-internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyncResponseTriggeredBuilder<T> where T : IAsyncResponsePayload
+internal class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyncResponseTriggeredBuilder<T>
+    where T : IAsyncResponsePayload
 {
     private readonly IAsyncResponseSubscriber _subscriber;
     private readonly IAsyncResponseReplyTargetProvider? _replyTargetProvider;
-    private readonly string _correlationId;
-    private ReflectionCallDto? _resumeCallback;
-    private ReflectionCallDto? _failureCallback;
-    private Func<T, ValueTask<bool>>? _completionPredicate;
-    private TimeSpan? _timeout;
+    protected readonly string _correlationId;
+    protected Func<T, ValueTask<bool>>? _completionPredicate;
+    protected TimeSpan? _timeout;
     private bool _useReplyTarget;
     private string? _replyTargetName;
     private AsyncResponseReplyTarget? _replyTarget;
@@ -93,28 +126,6 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
         _replyTargetProvider = replyTargetProvider;
         _correlationId = correlationId;
     }
-
-    /// <inheritdoc />
-    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume(ReflectionCallDto callback)
-    {
-        _resumeCallback = callback ?? throw new ArgumentNullException(nameof(callback));
-        return this;
-    }
-
-    /// <inheritdoc />
-    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
-        => OnLostSubscriberResume(CallbackExpressionConverter.ToReflectionCall(callback));
-
-    /// <inheritdoc />
-    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure(ReflectionCallDto callback)
-    {
-        _failureCallback = callback ?? throw new ArgumentNullException(nameof(callback));
-        return this;
-    }
-
-    /// <inheritdoc />
-    public IAsyncResponseAttachedBuilder<T> OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
-        => OnLostSubscriberFailure(CallbackExpressionConverter.ToReflectionCall(callback));
 
     /// <inheritdoc />
     public IAsyncResponseAttachedBuilder<T> WithTimeout(TimeSpan timeout)
@@ -187,14 +198,8 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
         return WaitCoreAsync(trigger);
     }
 
-    private Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
-        => _subscriber.CreateResponseWaiter<T>(
-            _correlationId,
-            _resumeCallback,
-            _failureCallback,
-            _completionPredicate,
-            _timeout
-        );
+    protected virtual Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
+        => _subscriber.CreateResponseWaiter<T>(_correlationId, _completionPredicate, _timeout);
 
     private async Task<T> WaitCoreAsync(Func<AsyncResponseRequestContext, Task>? trigger)
     {
@@ -244,30 +249,6 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     // the trigger-required WaitAsync terminal is preserved through the fluent chain. The public
     // WaitAsync(Func<AsyncResponseRequestContext, Task>) overload above satisfies its terminal.
 
-    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
-    {
-        OnLostSubscriberResume(callback);
-        return this;
-    }
-
-    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
-    {
-        OnLostSubscriberResume(callback);
-        return this;
-    }
-
-    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
-    {
-        OnLostSubscriberFailure(callback);
-        return this;
-    }
-
-    IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
-    {
-        OnLostSubscriberFailure(callback);
-        return this;
-    }
-
     IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.WithTimeout(TimeSpan timeout)
     {
         WithTimeout(timeout);
@@ -299,6 +280,161 @@ internal sealed class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>
     }
 
     IAsyncResponseTriggeredBuilder<T> IAsyncResponseTriggeredBuilder<T>.Until(Func<T, Task<bool>> predicate)
+    {
+        Until(predicate);
+        return this;
+    }
+}
+
+/// <inheritdoc cref="IRecoverableAsyncResponseAttachedBuilder{T}" />
+internal sealed class RecoverableAsyncResponseBuilder<T> :
+    AsyncResponseBuilder<T>,
+    IRecoverableAsyncResponseAttachedBuilder<T>,
+    IRecoverableAsyncResponseTriggeredBuilder<T>
+    where T : IAsyncResponsePayload
+{
+    private readonly IRecoverableAsyncResponseSubscriber _subscriber;
+    private ReflectionCallDto? _resumeCallback;
+    private ReflectionCallDto? _failureCallback;
+
+    internal RecoverableAsyncResponseBuilder(
+        IRecoverableAsyncResponseSubscriber subscriber,
+        IAsyncResponseReplyTargetProvider? replyTargetProvider,
+        string correlationId)
+        : base(subscriber, replyTargetProvider, correlationId)
+    {
+        _subscriber = subscriber;
+    }
+
+    protected override Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
+        => _subscriber.CreateRecoverableResponseWaiter<T>(
+            _correlationId,
+            _resumeCallback,
+            _failureCallback,
+            _completionPredicate,
+            _timeout);
+
+    private void SetResumeCallback(ReflectionCallDto callback)
+        => _resumeCallback = callback ?? throw new ArgumentNullException(nameof(callback));
+
+    private void SetFailureCallback(ReflectionCallDto callback)
+        => _failureCallback = callback ?? throw new ArgumentNullException(nameof(callback));
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
+    {
+        SetResumeCallback(callback);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
+    {
+        SetResumeCallback(CallbackExpressionConverter.ToReflectionCall(callback));
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
+    {
+        SetFailureCallback(callback);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
+    {
+        SetFailureCallback(CallbackExpressionConverter.ToReflectionCall(callback));
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.WithTimeout(TimeSpan timeout)
+    {
+        WithTimeout(timeout);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget()
+    {
+        WithReplyTarget();
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget(string name)
+    {
+        WithReplyTarget(name);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget(AsyncResponseReplyTarget replyTarget)
+    {
+        WithReplyTarget(replyTarget);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.Until(Func<T, bool> predicate)
+    {
+        Until(predicate);
+        return this;
+    }
+
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.Until(Func<T, Task<bool>> predicate)
+    {
+        Until(predicate);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
+    {
+        SetResumeCallback(callback);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
+    {
+        SetResumeCallback(CallbackExpressionConverter.ToReflectionCall(callback));
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
+    {
+        SetFailureCallback(callback);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
+    {
+        SetFailureCallback(CallbackExpressionConverter.ToReflectionCall(callback));
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.WithTimeout(TimeSpan timeout)
+    {
+        WithTimeout(timeout);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget()
+    {
+        WithReplyTarget();
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget(string name)
+    {
+        WithReplyTarget(name);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget(AsyncResponseReplyTarget replyTarget)
+    {
+        WithReplyTarget(replyTarget);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.Until(Func<T, bool> predicate)
+    {
+        Until(predicate);
+        return this;
+    }
+
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.Until(Func<T, Task<bool>> predicate)
     {
         Until(predicate);
         return this;

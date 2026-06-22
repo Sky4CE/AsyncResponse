@@ -11,8 +11,9 @@ namespace AsyncResponse.Tests;
 /// The recovery-classification override and its durable-channel enforcement: the reflection helper
 /// that detects whether a payload overrides <c>ShouldResumeOnRecovery</c>, and the Redis channel's
 /// fail-fast when a recovery-enabled flow's payload would otherwise rely on the conservative
-/// default. The in-memory channel (which cannot survive a redeploy) is deliberately exempt. Also
-/// pins that the live path is untouched: omitting <c>Until</c> still returns the first response.
+    /// default. The in-memory channel (which cannot survive a redeploy) does not expose the
+    /// recoverable subscriber/builder capability. Also pins that the live path is untouched:
+    /// omitting <c>Until</c> still returns the first response.
 /// </summary>
 public class RecoveryEnforcementTests
 {
@@ -39,7 +40,7 @@ public class RecoveryEnforcementTests
         var subscriber = RedisSubscriber();
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => subscriber.CreateResponseWaiter<DefaultRecoveryPayload>(CorrelationId, resumeCallback: ResumeCallback()));
+            () => subscriber.CreateRecoverableResponseWaiter<DefaultRecoveryPayload>(CorrelationId, resumeCallback: ResumeCallback()));
 
         Assert.Contains(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery), ex.Message, StringComparison.Ordinal);
         Assert.Contains(typeof(DefaultRecoveryPayload).ToString(), ex.Message, StringComparison.Ordinal);
@@ -51,20 +52,16 @@ public class RecoveryEnforcementTests
         var subscriber = RedisSubscriber();
 
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => subscriber.CreateResponseWaiter<DefaultRecoveryPayload>(CorrelationId, failureCallback: ResumeCallback()));
+            () => subscriber.CreateRecoverableResponseWaiter<DefaultRecoveryPayload>(CorrelationId, failureCallback: ResumeCallback()));
     }
 
     [Fact]
-    public async Task InMemoryChannel_RecoveryCallbackWithoutOverride_IsExempt()
+    public void InMemoryChannel_DoesNotExposeRecoverableApis()
     {
-        var subscriber = InMemorySubscriber();
+        var provider = InMemoryProvider();
 
-        // Must NOT throw: the in-memory channel cannot recover across a redeploy anyway, so the
-        // override is not required; the conservative default applies to its in-process fallback.
-        await using var waiter = await subscriber.CreateResponseWaiter<DefaultRecoveryPayload>(
-            CorrelationId, resumeCallback: ResumeCallback(), timeout: TimeSpan.FromSeconds(5));
-
-        Assert.NotNull(waiter);
+        Assert.Null(provider.GetService<IRecoverableAsyncResponseBuilder>());
+        Assert.Null(provider.GetService<IRecoverableAsyncResponseSubscriber>());
     }
 
     [Fact]
@@ -84,7 +81,7 @@ public class RecoveryEnforcementTests
         Assert.Equal("first", result.Message);
     }
 
-    private static IAsyncResponseSubscriber RedisSubscriber()
+    private static IRecoverableAsyncResponseSubscriber RedisSubscriber()
     {
         var multiplexer = new Mock<IConnectionMultiplexer>();
         multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(Mock.Of<ISubscriber>());
@@ -94,11 +91,8 @@ public class RecoveryEnforcementTests
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton(multiplexer.Object);
         services.AddAsyncResponse().WithRedisChannel();
-        return services.BuildServiceProvider().GetRequiredService<IAsyncResponseSubscriber>();
+        return services.BuildServiceProvider().GetRequiredService<IRecoverableAsyncResponseSubscriber>();
     }
-
-    private static IAsyncResponseSubscriber InMemorySubscriber()
-        => InMemoryProvider().GetRequiredService<IAsyncResponseSubscriber>();
 
     private static ServiceProvider InMemoryProvider()
     {
