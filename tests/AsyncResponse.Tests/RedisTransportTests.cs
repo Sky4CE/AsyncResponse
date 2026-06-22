@@ -203,7 +203,8 @@ public class RedisTransportTests
         Assert.True(RedisTransportRetry.IsTransient(new RedisConnectionException(ConnectionFailureType.UnableToConnect, "down")));
         Assert.True(RedisTransportRetry.IsTransient(new RedisTimeoutException("timeout", CommandStatus.Unknown)));
         Assert.True(RedisTransportRetry.IsTransient(new TimeoutException()));
-        Assert.True(RedisTransportRetry.IsTransient(new OperationCanceledException()));
+        // Cancellation is intentional, not transient: a cancelled command must propagate, not be retried.
+        Assert.False(RedisTransportRetry.IsTransient(new OperationCanceledException()));
         Assert.False(RedisTransportRetry.IsTransient(new InvalidOperationException()));
     }
 

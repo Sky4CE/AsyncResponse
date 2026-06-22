@@ -1,7 +1,8 @@
 namespace AsyncResponse.Transports.Redis;
 
 /// <summary>
-/// Options for the Redis Streams AsyncResponse transport.
+/// Options for the Redis Streams AsyncResponse transport. Requires a Redis 8+ server (stream trimming
+/// uses Redis 8 KEEPREF semantics).
 /// </summary>
 public sealed class RedisAsyncResponseTransportOptions
 {
@@ -51,7 +52,9 @@ public sealed class RedisAsyncResponseTransportOptions
     /// <summary>
     /// Creates the worker and response consumer groups on subscriber startup. The groups start at
     /// the beginning of the stream so messages published before the first subscriber starts are not
-    /// skipped.
+    /// skipped. Corollary: pointing a brand-new consumer group at a stream that already holds history
+    /// replays that entire backlog (re-running old worker jobs, re-ingesting old responses). Use a
+    /// fresh <see cref="KeyPrefix"/>/stream per deployment, or only rename groups while the stream is empty.
     /// </summary>
     public bool CreateConsumerGroups { get; set; } = true;
 

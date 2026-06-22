@@ -122,7 +122,9 @@ public class RedisStreamDatabaseAdapterTests
             .Returns(never.Task);
         var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromMilliseconds(10));
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+        // An operation timeout (as opposed to caller cancellation) surfaces as TimeoutException so the
+        // publish/subscriber retry paths classify it as transient rather than as an intentional cancel.
+        await Assert.ThrowsAsync<TimeoutException>(() =>
             adapter.StreamAddAsync("stream", [new NameValueEntry("payload", "{}")], null, true, CancellationToken.None));
     }
 

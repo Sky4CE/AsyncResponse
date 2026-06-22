@@ -103,32 +103,63 @@ internal abstract class RedisSubscriberService : BackgroundService
         var nextPendingClaimAt = DateTimeOffset.UtcNow;
         while (!stoppingToken.IsCancellationRequested)
         {
-            var handled = 0;
-            var utcNow = DateTimeOffset.UtcNow;
+            var processed = 0;
 
-            if (utcNow >= nextPendingClaimAt)
+            // When the dispatcher is saturated (ACK-after-enqueue queue full) stop pulling new entries:
+            // reading them would only move the backlog into the pending-entry list and spin the loop.
+            // The unread entries stay as new messages in the stream until capacity frees.
+            if (dispatcher.CanAcceptMore)
             {
-                handled += await ClaimPendingAsync(dispatcher, consumerName, stoppingToken).ConfigureAwait(false);
-                nextPendingClaimAt = utcNow + SubscriberOptions.PendingClaimInterval;
+                var utcNow = DateTimeOffset.UtcNow;
+                if (utcNow >= nextPendingClaimAt)
+                {
+                    processed += await ClaimPendingAsync(dispatcher, consumerName, stoppingToken).ConfigureAwait(false);
+                    nextPendingClaimAt = utcNow + SubscriberOptions.PendingClaimInterval;
+                }
+
+                var entries = await _database.StreamReadGroupAsync(
+                    Stream,
+                    ConsumerGroup,
+                    consumerName,
+                    SubscriberOptions.BatchSize,
+                    stoppingToken).ConfigureAwait(false);
+
+                foreach (var entry in entries)
+                {
+                    if (await DispatchEntryAsync(dispatcher, entry, attempt: 1, stoppingToken).ConfigureAwait(false)
+                        == RedisDispatchOutcome.Processed)
+                    {
+                        processed++;
+                    }
+                }
             }
 
-            var entries = await _database.StreamReadGroupAsync(
-                Stream,
-                ConsumerGroup,
-                consumerName,
-                SubscriberOptions.BatchSize,
-                stoppingToken).ConfigureAwait(false);
-
-            foreach (var entry in entries)
-            {
-                var delivery = CreateDelivery(entry, attempt: 1);
-                await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
-                handled++;
-            }
-
-            if (handled == 0)
+            // Throttle when nothing advanced — an empty stream, or every entry deferred under backpressure.
+            if (processed == 0)
                 await Task.Delay(SubscriberOptions.EmptyPollDelay, stoppingToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task<RedisDispatchOutcome> DispatchEntryAsync(
+        RedisMessageDispatcher dispatcher,
+        StreamEntry entry,
+        int attempt,
+        CancellationToken cancellationToken)
+    {
+        RedisStreamDelivery delivery;
+        try
+        {
+            delivery = CreateDelivery(entry, attempt);
+        }
+        catch (InvalidDataException ex)
+        {
+            // A foreign/malformed entry (or a trimmed tombstone) can never be handled; dead-letter and
+            // ACK it so it drains instead of poisoning the pending-claim loop forever.
+            await dispatcher.DiscardUnprocessableAsync(Stream, ConsumerGroup, entry, ex, cancellationToken).ConfigureAwait(false);
+            return RedisDispatchOutcome.Processed;
+        }
+
+        return await dispatcher.HandleAsync(delivery, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureConsumerGroupAsync(CancellationToken cancellationToken)
@@ -178,16 +209,20 @@ internal abstract class RedisSubscriberService : BackgroundService
             pending.Select(item => item.MessageId).ToArray(),
             cancellationToken).ConfigureAwait(false);
 
+        var processed = 0;
         foreach (var entry in claimed)
         {
             var priorDeliveries = pendingById.TryGetValue(entry.Id.ToString(), out var info)
                 ? info.DeliveryCount
                 : 1;
-            var delivery = CreateDelivery(entry, attempt: Math.Max(1, priorDeliveries + 1));
-            await dispatcher.HandleAsync(delivery, cancellationToken).ConfigureAwait(false);
+            if (await DispatchEntryAsync(dispatcher, entry, Math.Max(1, priorDeliveries + 1), cancellationToken).ConfigureAwait(false)
+                == RedisDispatchOutcome.Processed)
+            {
+                processed++;
+            }
         }
 
-        return claimed.Length;
+        return processed;
     }
 
     private RedisStreamDelivery CreateDelivery(StreamEntry entry, int attempt)
@@ -220,10 +255,13 @@ internal abstract class RedisSubscriberService : BackgroundService
         RedisAsyncResponseTransportOptions options,
         RedisSubscriberRole role)
     {
-        if (!string.IsNullOrWhiteSpace(options.ConsumerName))
-            return options.ConsumerName;
+        // Append the role even to an explicitly configured name so the worker and response subscribers
+        // never share a consumer identity (and therefore a pending-entry list) within their groups.
+        var baseName = !string.IsNullOrWhiteSpace(options.ConsumerName)
+            ? options.ConsumerName
+            : GeneratedConsumerName;
 
-        return $"{GeneratedConsumerName}-{role.ToString().ToLowerInvariant()}";
+        return $"{baseName}-{role.ToString().ToLowerInvariant()}";
     }
 
     private static string CreateGeneratedConsumerName()

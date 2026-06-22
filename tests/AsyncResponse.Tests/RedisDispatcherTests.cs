@@ -448,6 +448,41 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_CanAcceptMore_IsFalseWhileQueueIsSaturated()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var firstHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandlers = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                firstHandlerStarted.TrySetResult();
+                await releaseHandlers.Task.ConfigureAwait(false);
+            },
+            database,
+            new RedisAsyncResponseTransportOptions(),
+            EnqueueSubscriber(workers: 1, capacity: 1),
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        Assert.True(dispatcher.CanAcceptMore);
+
+        // Worker picks up 1-0 and blocks; 2-0 then fills the single queue slot.
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None);
+
+        Assert.False(dispatcher.CanAcceptMore);
+
+        var outcome = await dispatcher.HandleAsync(Delivery("3-0", attempt: 1), CancellationToken.None);
+        Assert.Equal(RedisDispatchOutcome.Deferred, outcome);
+
+        releaseHandlers.TrySetResult();
+    }
+
+    [Fact]
     public async Task Queued_WhenAckAfterEnqueueFails_DoesNotThrowToSubscriberLoop()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase

@@ -48,6 +48,11 @@ internal static class RedisCorrelationIdExtractor
 
     internal static string? TryReadField(StreamEntry entry, string fieldName)
     {
+        // A tombstone left after trimming (an entry still referenced by a PEL but deleted from the
+        // stream) has null Values; treat it as a missing field rather than throwing.
+        if (entry.Values is null)
+            return null;
+
         foreach (var value in entry.Values)
         {
             if (StringComparer.Ordinal.Equals(value.Name.ToString(), fieldName))

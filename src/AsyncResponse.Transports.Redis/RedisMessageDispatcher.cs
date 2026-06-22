@@ -11,6 +11,15 @@ internal enum RedisSubscriberRole
     ResponseIngress
 }
 
+internal enum RedisDispatchOutcome
+{
+    /// <summary>The entry was handled, ACKed, or dead-lettered. Counts as progress for the poll loop.</summary>
+    Processed,
+
+    /// <summary>The entry could not be accepted right now (background queue full) and was left pending for retry.</summary>
+    Deferred
+}
+
 internal sealed record RedisStreamDelivery(
     RedisKey Stream,
     RedisValue ConsumerGroup,
@@ -163,9 +172,17 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         }
     }
 
-    public abstract Task HandleAsync(
+    public abstract Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken);
+
+    /// <summary>
+    /// Whether the dispatcher can accept more deliveries right now. Awaiting dispatchers always can
+    /// (handlers run inline); the queued dispatcher returns <c>false</c> while its bounded queue is
+    /// saturated so the subscriber stops pulling new entries into the pending-entry list instead of
+    /// busy-reading and rejecting them.
+    /// </summary>
+    public virtual bool CanAcceptMore => true;
 
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -253,6 +270,43 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         await AckAsync(delivery, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Dead-letters (when enabled) and ACKs a stream entry that could not be turned into a delivery —
+    /// for example a foreign or malformed entry with no payload field, or a tombstone left behind when
+    /// trimming evicts a still-pending entry. Without this, such an entry throws before
+    /// <see cref="HandleAsync"/> runs, so it is never ACKed: the pending-claim loop re-claims it every
+    /// cycle and the subscriber faults and restarts indefinitely while the entry never drains.
+    /// </summary>
+    public async Task DiscardUnprocessableAsync(
+        RedisKey stream,
+        RedisValue consumerGroup,
+        StreamEntry entry,
+        Exception failure,
+        CancellationToken cancellationToken)
+    {
+        Logger.LogError(
+            failure,
+            "Redis entry {MessageId} on {Stream} could not be parsed into a delivery; dead-lettering and ACKing it to avoid a poison-message loop.",
+            entry.Id.ToString(),
+            _stream);
+
+        var delivery = new RedisStreamDelivery(
+            stream,
+            consumerGroup,
+            entry.Id,
+            DescribeRawEntry(entry),
+            RedisCorrelationIdExtractor.TryReadField(entry, TransportOptions.CorrelationIdField),
+            Attempt: 0,
+            entry);
+
+        await DeadLetterAndAckAsync(delivery, failure, "unparsable_entry", cancellationToken).ConfigureAwait(false);
+    }
+
+    private static string DescribeRawEntry(StreamEntry entry)
+        => entry.Values is { Length: > 0 }
+            ? string.Join("; ", entry.Values.Select(value => $"{value.Name}={value.Value}"))
+            : string.Empty;
+
     protected async ValueTask NotifyBackgroundFailureAsync(
         RedisStreamDelivery delivery,
         Exception exception)
@@ -293,7 +347,7 @@ internal sealed class AwaitingRedisMessageDispatcher(
     RedisSubscriberRole role)
     : RedisMessageDispatcher(handler, database, transportOptions, subscriberOptions, logger, stream, consumerGroup, role)
 {
-    public override async Task HandleAsync(
+    public override async Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
@@ -304,7 +358,7 @@ internal sealed class AwaitingRedisMessageDispatcher(
                 new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
                 "max_delivery_attempts_exceeded",
                 subscriberCancellationToken).ConfigureAwait(false);
-            return;
+            return RedisDispatchOutcome.Processed;
         }
 
         try
@@ -334,6 +388,8 @@ internal sealed class AwaitingRedisMessageDispatcher(
             // Leave the entry pending. The subscriber's pending-claim loop reclaims it after
             // PendingMessageMinIdleTime, giving Redis-backed retry without a hot loop.
         }
+
+        return RedisDispatchOutcome.Processed;
     }
 }
 
@@ -343,6 +399,7 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
     private readonly Task[] _workers;
     private readonly CancellationTokenSource _drainCancellation = new();
     private readonly TimeSpan _drainTimeout;
+    private readonly int _capacity;
     private readonly string _stream;
     private int _pendingCount;
     private int _runningCount;
@@ -361,6 +418,7 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
     {
         _stream = stream.ToString();
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _capacity = subscriberOptions.BackgroundQueueCapacity;
         _queue = Channel.CreateBounded<RedisStreamDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
         {
             AllowSynchronousContinuations = false,
@@ -384,19 +442,15 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
     internal int PendingCount => Volatile.Read(ref _pendingCount);
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
-    public override async Task HandleAsync(
+    public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
+
+    public override async Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
-        try
+        Interlocked.Increment(ref _pendingCount);
+        if (!_queue.Writer.TryWrite(delivery))
         {
-            Interlocked.Increment(ref _pendingCount);
-            if (_queue.Writer.TryWrite(delivery))
-            {
-                await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
-                return;
-            }
-
             Interlocked.Decrement(ref _pendingCount);
             Logger.LogWarning(
                 "Redis background queue rejected message {MessageId} for {Stream}; leaving it pending for retry. Pending={PendingCount}, Running={RunningCount}.",
@@ -404,16 +458,25 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
                 _stream,
                 PendingCount,
                 RunningCount);
+            return RedisDispatchOutcome.Deferred;
+        }
+
+        // The entry now belongs to a background worker, which decrements _pendingCount when it dequeues.
+        // Do not touch the counter again here, even if the ACK below fails — otherwise it double-counts.
+        try
+        {
+            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Interlocked.Decrement(ref _pendingCount);
             Logger.LogError(
                 ex,
-                "Failed to enqueue Redis message {MessageId} for {Stream}; leaving it pending for retry.",
+                "Failed to ACK Redis message {MessageId} for {Stream} after enqueue; it is being processed but Redis will redeliver it after the pending idle window.",
                 delivery.MessageId.ToString(),
                 _stream);
         }
+
+        return RedisDispatchOutcome.Processed;
     }
 
     public override async ValueTask DisposeAsync()

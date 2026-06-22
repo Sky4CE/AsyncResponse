@@ -66,6 +66,9 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
                 maxLength: maxLength,
                 useApproximateMaxLength: useApproximateMaxLength,
                 limit: null,
+                // KEEPREF (Redis 8+): trim by MAXLEN without rewriting consumer-group PELs. An entry that
+                // is trimmed while still pending becomes a tombstone on claim; the subscriber dead-letters
+                // those via DiscardUnprocessableAsync rather than wedging. Requires a Redis 8+ server.
                 trimMode: StreamTrimMode.KeepReferences),
             cancellationToken);
 
@@ -142,9 +145,21 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
 
     private async Task<T> WithCancellation<T>(Task<T> command, CancellationToken cancellationToken)
     {
+        // StackExchange.Redis enforces its own sync/async command timeouts; this adds an upper bound that
+        // also honors the caller's token (e.g. host shutdown). On timeout the in-flight command is
+        // abandoned best-effort — the multiplexer keeps running it — and surfaced as a TimeoutException so
+        // the retry paths treat it as transient, while a genuine caller cancellation stays an
+        // OperationCanceledException and is not retried.
         using var timeout = new CancellationTokenSource(_operationTimeout);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-        return await command.WaitAsync(linked.Token).ConfigureAwait(false);
+        try
+        {
+            return await command.WaitAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"The Redis command did not complete within {_operationTimeout}.");
+        }
     }
 }
 
@@ -187,6 +202,5 @@ internal static class RedisTransportRetry
     public static bool IsTransient(Exception exception)
         => exception is RedisConnectionException
             or RedisTimeoutException
-            or TimeoutException
-            or OperationCanceledException;
+            or TimeoutException;
 }

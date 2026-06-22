@@ -147,7 +147,7 @@ public class RedisSubscriberTests
     }
 
     [Fact]
-    public async Task WorkerSubscriber_MissingPayload_RetriesLoopAndHandlesLaterMessage()
+    public async Task WorkerSubscriber_FreshEntryMissingPayload_DeadLettersAndContinues()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();
         database.ReadBatches.Enqueue(
@@ -172,8 +172,44 @@ public class RedisSubscriberTests
         await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await subscriber.StopAsync(CancellationToken.None);
 
+        // The payload-less entry is dead-lettered and ACKed (drained) rather than left to wedge the loop.
+        Assert.Contains(database.Acks, ack => ack.MessageId == "1-0");
+        Assert.Contains(
+            database.Adds,
+            add => RedisTransportTests.Field(add.Values, "reason") == "unparsable_entry"
+                && RedisTransportTests.Field(add.Values, "messageId") == "1-0");
+        // ...and the next valid message is still handled.
         Assert.Contains(database.Acks, ack => ack.MessageId == "2-0");
         ingress.Verify(i => i.HandleWorkerMessageAsync("worker-json"), Times.Once);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_ClaimedEntryMissingPayload_DeadLettersInsteadOfWedging()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase
+        {
+            PendingMessages =
+            [
+                Pending("1-0", "old-consumer", 500, 1)
+            ],
+            ClaimedMessages =
+            [
+                RedisTransportTests.Entry("1-0", ("correlationId", "no-payload"))
+            ]
+        };
+        var ingress = new Mock<IAsyncResponseIngress>();
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress.Object,
+            options => options.WorkerSubscriber.PendingMessageMinIdleTime = TimeSpan.FromMilliseconds(10));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitUntilAsync(() => database.Adds.Count >= 1);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal("unparsable_entry", RedisTransportTests.Field(Assert.Single(database.Adds).Values, "reason"));
+        Assert.Contains(database.Acks, ack => ack.MessageId == "1-0");
+        ingress.Verify(i => i.HandleWorkerMessageAsync(It.IsAny<string>()), Times.Never);
     }
 
     [Fact]
@@ -272,7 +308,7 @@ public class RedisSubscriberTests
         await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await subscriber.StopAsync(CancellationToken.None);
 
-        Assert.Contains(database.ReadGroupCalls, call => call.Consumer == "configured-consumer");
+        Assert.Contains(database.ReadGroupCalls, call => call.Consumer == "configured-consumer-worker");
     }
 
     [Fact]
