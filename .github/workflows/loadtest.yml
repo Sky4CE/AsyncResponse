@@ -9,10 +9,12 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/**'
-      - 'samples/**'
-      - 'benchmarks/**'
-      - 'tests/AsyncResponse.IntegrationTests.AppHost/**'
+      - '**/*.cs'
+      - '**/*.csproj'
+      - '**/*.sln'
+      - '**/*.props'
+      - '**/*.targets'
+      - 'global.json'
       - '.github/workflows/loadtest.yml'
   workflow_dispatch:
     inputs:

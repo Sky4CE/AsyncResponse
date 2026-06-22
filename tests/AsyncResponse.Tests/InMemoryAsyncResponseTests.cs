@@ -214,6 +214,63 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task RawObjectResponse_CompletesWaiterThroughRawPublisher()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-object";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(5));
+
+        await rawPublisher.SetRawResponse(
+            new OperationResult { Status = OperationStatus.Completed, Message = "raw object" },
+            correlationId);
+
+        Assert.Equal("raw object", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task RawJsonResponse_WithMultipleAsyncWaiters_FansOutAndWaitsForAll()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-fanout";
+        var predicateCalls = 0;
+
+        async ValueTask<bool> IsCompleteAsync(OperationResult payload)
+        {
+            Interlocked.Increment(ref predicateCalls);
+            await Task.Yield();
+            return payload.Status == OperationStatus.Completed;
+        }
+
+        await using var first = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: IsCompleteAsync,
+            timeout: TimeSpan.FromSeconds(5));
+        await using var second = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: IsCompleteAsync,
+            timeout: TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, await probe.CountActiveSubscribersAsync(correlationId));
+
+        await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"fanout"}""", correlationId);
+
+        Assert.Equal("fanout", (await first.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        Assert.Equal("fanout", (await second.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        Assert.Equal(2, predicateCalls);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
     public async Task RawJsonResponse_WhenMaterializationFails_FaultsWaiterAndCleansUp()
     {
         var provider = CreateProvider();
@@ -230,6 +287,94 @@ public class InMemoryAsyncResponseTests
 
         await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task SetResponse_AfterWaiterCleanup_DropsLateResponseWhenRecoveryStateIsGone()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var correlationId = $"{CorrelationId}-late-after-cleanup";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(5));
+
+        await publisher.SetResponse(
+            new OperationResult { Status = OperationStatus.Completed, Message = "first" },
+            correlationId);
+
+        Assert.Equal("first", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+        Assert.Null(await store.GetAsync(correlationId));
+
+        await publisher.SetResponse(
+            new OperationResult { Status = OperationStatus.Failed, Message = "late" },
+            correlationId);
+
+        Assert.Null(await store.GetAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task SetResponse_NoSubscriberWhenPayloadJsonCannotBeSerialized_StillInvokesFailureCallback()
+    {
+        var spy = new RecoverySpy();
+        var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-unserializable-domain-failure";
+        var payload = new SelfReferencingFailurePayload();
+        payload.Self = payload;
+
+        await store.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(SelfReferencingFailurePayload).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                FailureCallback = FailureCallback()
+            },
+            TimeSpan.FromMinutes(5));
+
+        await publisher.SetResponse(payload, correlationId);
+
+        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(spy.Failures));
+        Assert.Equal(correlationId, failure.CorrelationId);
+        Assert.Equal(typeof(SelfReferencingFailurePayload).FullName, failure.PayloadTypeFullName);
+        Assert.Null(failure.PayloadJson);
+        Assert.Null(await store.GetAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task RawObjectResponse_NoSubscriberWithNullPayload_InvokesFailureCallback()
+    {
+        var spy = new RecoverySpy();
+        var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-raw-null";
+
+        await store.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(OperationResult).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                FailureCallback = FailureCallback()
+            },
+            TimeSpan.FromMinutes(5));
+
+        await rawPublisher.SetRawResponse(null, correlationId);
+
+        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(spy.Failures));
+        Assert.Equal(correlationId, failure.CorrelationId);
+        Assert.Equal("null", failure.PayloadJson);
+        Assert.Null(await store.GetAsync(correlationId));
     }
 
     [Fact]
@@ -329,5 +474,19 @@ public class InMemoryAsyncResponseTests
             });
         configure?.Invoke(services);
         return services.BuildServiceProvider();
+    }
+
+    private static ReflectionCallDto FailureCallback() => new()
+    {
+        ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+        MethodName = nameof(IRecoverySpy.OnFailure),
+        Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+    };
+
+    private sealed class SelfReferencingFailurePayload : IAsyncResponsePayload
+    {
+        public SelfReferencingFailurePayload? Self { get; set; }
+
+        public bool ShouldResumeOnRecovery() => false;
     }
 }
