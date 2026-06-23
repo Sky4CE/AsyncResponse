@@ -52,7 +52,9 @@ jobs:
         run: |
           dotnet pack src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Channels.NATS/AsyncResponse.Channels.NATS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts

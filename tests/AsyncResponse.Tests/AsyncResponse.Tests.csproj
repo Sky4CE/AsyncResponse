@@ -34,8 +34,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj" />
   </ItemGroup>

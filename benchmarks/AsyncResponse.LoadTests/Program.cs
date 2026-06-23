@@ -36,6 +36,8 @@ var existingRabbitMqUrl = GetString("--rabbitmq-url");
 var existingRabbitMqEarlyAckUrl = GetString("--rabbitmq-early-ack-url");
 var existingRedisUrl = GetString("--redis-url");
 var existingRedisEarlyAckUrl = GetString("--redis-early-ack-url");
+var existingNatsUrl = GetString("--nats-url");
+var existingNatsEarlyAckUrl = GetString("--nats-early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
@@ -45,8 +47,10 @@ Uri? rabbitMqBaseAddress = null;
 Uri? rabbitMqEarlyAckBaseAddress = null;
 Uri? redisBaseAddress = null;
 Uri? redisEarlyAckBaseAddress = null;
+Uri? natsBaseAddress = null;
+Uri? natsEarlyAckBaseAddress = null;
 
-if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null)
+if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null)
 {
     baseAddress = new Uri(existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl!);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
@@ -71,6 +75,14 @@ if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisU
         redisEarlyAckBaseAddress = new Uri(existingRedisEarlyAckUrl);
         Console.WriteLine($"Load testing existing Redis transport ACK-after-enqueue instance at {redisEarlyAckBaseAddress}.");
     }
+
+    natsBaseAddress = new Uri(existingNatsUrl ?? existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl!);
+    Console.WriteLine($"Load testing existing NATS instance at {natsBaseAddress}.");
+    if (existingNatsEarlyAckUrl is not null)
+    {
+        natsEarlyAckBaseAddress = new Uri(existingNatsEarlyAckUrl);
+        Console.WriteLine($"Load testing existing NATS ACK-after-receive instance at {natsEarlyAckBaseAddress}.");
+    }
 }
 else
 {
@@ -84,6 +96,8 @@ else
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-rabbitmq-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-redis").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-redis-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-nats").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-nats-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
@@ -97,6 +111,10 @@ else
         redisBaseAddress = probe.BaseAddress!;
     using (var probe = app.CreateHttpClient("itest-app-redis-early-ack"))
         redisEarlyAckBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-nats"))
+        natsBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-nats-early-ack"))
+        natsEarlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
@@ -104,6 +122,8 @@ else
     Console.WriteLine($"RabbitMQ ACK-after-enqueue SUT at {rabbitMqEarlyAckBaseAddress}.");
     Console.WriteLine($"Redis transport SUT at {redisBaseAddress}.");
     Console.WriteLine($"Redis transport ACK-after-enqueue SUT at {redisEarlyAckBaseAddress}.");
+    Console.WriteLine($"NATS SUT at {natsBaseAddress}.");
+    Console.WriteLine($"NATS ACK-after-receive SUT at {natsEarlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -139,6 +159,16 @@ try
         BaseAddress = redisEarlyAckBaseAddress ?? redisBaseAddress ?? baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var natsHttpClient = new HttpClient
+    {
+        BaseAddress = natsBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+    using var natsEarlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = natsEarlyAckBaseAddress ?? natsBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
     if (earlyAckBaseAddress is not null)
@@ -151,6 +181,10 @@ try
         await TryResetAsync(redisHttpClient);
     if (redisEarlyAckBaseAddress is not null)
         await TryResetAsync(redisEarlyAckHttpClient);
+    if (natsBaseAddress is not null)
+        await TryResetAsync(natsHttpClient);
+    if (natsEarlyAckBaseAddress is not null)
+        await TryResetAsync(natsEarlyAckHttpClient);
 
     var definitions = FilterScenarios(SelectScenarios(
         profile,
@@ -158,7 +192,9 @@ try
         includeRabbitMqTarget: app is not null || existingRabbitMqUrl is not null,
         includeRabbitMqEarlyAckTarget: rabbitMqEarlyAckBaseAddress is not null,
         includeRedisTarget: app is not null || existingRedisUrl is not null,
-        includeRedisEarlyAckTarget: redisEarlyAckBaseAddress is not null), scenarioFilter);
+        includeRedisEarlyAckTarget: redisEarlyAckBaseAddress is not null,
+        includeNatsTarget: app is not null || existingNatsUrl is not null,
+        includeNatsEarlyAckTarget: natsEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
@@ -172,6 +208,8 @@ try
             rabbitMqEarlyAckHttpClient,
             redisHttpClient,
             redisEarlyAckHttpClient,
+            natsHttpClient,
+            natsEarlyAckHttpClient,
             rate,
             duration,
             warmup))
@@ -221,6 +259,8 @@ static ScenarioProps BuildScenario(
     HttpClient rabbitMqEarlyAckHttpClient,
     HttpClient redisHttpClient,
     HttpClient redisEarlyAckHttpClient,
+    HttpClient natsHttpClient,
+    HttpClient natsEarlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
@@ -230,7 +270,9 @@ static ScenarioProps BuildScenario(
         rabbitMqHttpClient,
         rabbitMqEarlyAckHttpClient,
         redisHttpClient,
-        redisEarlyAckHttpClient)))
+        redisEarlyAckHttpClient,
+        natsHttpClient,
+        natsEarlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
@@ -240,7 +282,9 @@ static ScenarioDefinition[] SelectScenarios(
     bool includeRabbitMqTarget,
     bool includeRabbitMqEarlyAckTarget,
     bool includeRedisTarget,
-    bool includeRedisEarlyAckTarget)
+    bool includeRedisEarlyAckTarget,
+    bool includeNatsTarget,
+    bool includeNatsEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -296,6 +340,28 @@ static ScenarioDefinition[] SelectScenarios(
         }
     }
 
+    if (includeNatsTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("nats_request_response_success", (_, _, _, _, _, _, natsHttp, _) => RequestResponseSuccessAsync(natsHttp)),
+            new ScenarioDefinition("nats_worker_default_ack_observed", (_, _, _, _, _, _, natsHttp, _) => WorkerObservedAsync(natsHttp)),
+            new ScenarioDefinition("nats_response_ingress_header", (_, _, _, _, _, _, natsHttp, _) => ResponseIngressAsync(natsHttp, useAttribute: true)),
+            new ScenarioDefinition("nats_response_ingress_body", (_, _, _, _, _, _, natsHttp, _) => ResponseIngressAsync(natsHttp, useAttribute: false)),
+            new ScenarioDefinition("nats_reply_target", (_, _, _, _, _, _, natsHttp, _) => ReplyTargetAsync(natsHttp))
+        ];
+
+        if (includeNatsEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("nats_worker_ack_after_receive_observed", (_, _, _, _, _, _, _, natsEarlyAckHttp) => WorkerObservedAsync(natsEarlyAckHttp))
+            ];
+        }
+    }
+
     var pubsub = new[]
     {
         new ScenarioDefinition("pubsub_worker_default_ack_observed", WorkerObservedAsync),
@@ -343,6 +409,24 @@ static ScenarioDefinition[] SelectScenarios(
         ];
     }
 
+    var nats = new[]
+    {
+        new ScenarioDefinition("nats_request_response_success", (_, _, _, _, _, _, natsHttp, _) => RequestResponseSuccessAsync(natsHttp)),
+        new ScenarioDefinition("nats_request_response_domain_failure", (_, _, _, _, _, _, natsHttp, _) => RequestResponseDomainFailureAsync(natsHttp)),
+        new ScenarioDefinition("nats_worker_default_ack_observed", (_, _, _, _, _, _, natsHttp, _) => WorkerObservedAsync(natsHttp)),
+        new ScenarioDefinition("nats_response_ingress_header", (_, _, _, _, _, _, natsHttp, _) => ResponseIngressAsync(natsHttp, useAttribute: true)),
+        new ScenarioDefinition("nats_response_ingress_body", (_, _, _, _, _, _, natsHttp, _) => ResponseIngressAsync(natsHttp, useAttribute: false)),
+        new ScenarioDefinition("nats_reply_target", (_, _, _, _, _, _, natsHttp, _) => ReplyTargetAsync(natsHttp))
+    };
+    if (includeNatsEarlyAckTarget)
+    {
+        nats =
+        [
+            .. nats,
+            new ScenarioDefinition("nats_worker_ack_after_receive_observed", (_, _, _, _, _, _, _, natsEarlyAckHttp) => WorkerObservedAsync(natsEarlyAckHttp))
+        ];
+    }
+
     var recovery = new[]
     {
         new ScenarioDefinition("lost_subscriber_resume_redis", http => LostSubscriberFlowAsync(http, "Completed")),
@@ -357,9 +441,10 @@ static ScenarioDefinition[] SelectScenarios(
         "pubsub" => pubsub,
         "rabbitmq" => rabbitmq,
         "redis" => redis,
+        "nats" => nats,
         "recovery" => recovery,
         _ => throw new ArgumentException(
-            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, redis, recovery.")
+            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, redis, nats, recovery.")
     };
 }
 
@@ -525,21 +610,27 @@ static string Trace() => $"trace-{Guid.NewGuid():N}";
 
 internal sealed record ScenarioDefinition(
     string Name,
-    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
+    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
 {
     public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
-        : this(name, (http, _, _, _, _, _) => runAsync(http))
+        : this(name, (http, _, _, _, _, _, _, _) => runAsync(http))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, _, _) => runAsync(http, earlyAckHttp))
+        : this(name, (http, earlyAckHttp, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _) =>
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp))
+    {
+    }
+
+    public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _) =>
+            runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp))
     {
     }
 }

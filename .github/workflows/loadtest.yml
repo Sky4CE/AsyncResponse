@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, recovery'
+        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, nats, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -54,6 +54,21 @@ on:
       redis_stream_max_length:
         description: 'Redis worker/response stream MAXLEN setting'
         default: '100000'
+      nats_url:
+        description: 'Optional existing NATS SUT URL for --nats-url'
+        default: ''
+      nats_early_ack_url:
+        description: 'Optional existing NATS early-ACK SUT URL for --nats-early-ack-url'
+        default: ''
+      nats_worker_ack_mode:
+        description: 'NATS worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
+        default: 'AckAfterReceive'
+      nats_worker_background_workers:
+        description: 'NATS early-ACK background worker count'
+        default: '4'
+      nats_worker_queue_capacity:
+        description: 'NATS early-ACK background queue capacity'
+        default: '256'
 
 # github-action-benchmark commits the results history to gh-pages.
 permissions:
@@ -93,6 +108,11 @@ jobs:
           ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS: ${{ github.event.inputs.redis_max_delivery_attempts || '5' }}
           ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS: ${{ github.event.inputs.redis_publish_max_attempts || '3' }}
           ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH: ${{ github.event.inputs.redis_stream_max_length || '100000' }}
+          NATS_URL: ${{ github.event.inputs.nats_url || '' }}
+          NATS_EARLY_ACK_URL: ${{ github.event.inputs.nats_early_ack_url || '' }}
+          ASYNCRESPONSE_ITEST_NATS_WORKER_ACK_MODE: ${{ github.event.inputs.nats_worker_ack_mode || 'AckAfterReceive' }}
+          ASYNCRESPONSE_ITEST_NATS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.nats_worker_background_workers || '4' }}
+          ASYNCRESPONSE_ITEST_NATS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.nats_worker_queue_capacity || '256' }}
         run: |
           args=(
             --profile "${{ github.event.inputs.profile || 'broad' }}"
@@ -106,6 +126,12 @@ jobs:
           fi
           if [ -n "$REDIS_EARLY_ACK_URL" ]; then
             args+=(--redis-early-ack-url "$REDIS_EARLY_ACK_URL")
+          fi
+          if [ -n "$NATS_URL" ]; then
+            args+=(--nats-url "$NATS_URL")
+          fi
+          if [ -n "$NATS_EARLY_ACK_URL" ]; then
+            args+=(--nats-early-ack-url "$NATS_EARLY_ACK_URL")
           fi
           dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- "${args[@]}"
 

@@ -1,0 +1,537 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System.Buffers;
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+
+namespace AsyncResponse.Channels.NATS;
+
+/// <summary>
+/// NATS-backed response channel:
+/// <list type="bullet">
+/// <item><description>Delivers responses over NATS Core request/reply on a subject keyed by
+/// correlation id: a waiter subscribes and acks each message, and the publisher requests so the NATS
+/// "no responders" signal reports precisely when nobody is listening.</description></item>
+/// <item><description>Persists <see cref="RecoveryState"/> in a JetStream Key-Value bucket so a
+/// response arriving after the waiter died (e.g. a redeploy) is routed through the lost-subscriber
+/// dispatcher, which asks the payload's ShouldResumeOnRecovery and invokes the resume or failure
+/// callback.</description></item>
+/// </list>
+/// </summary>
+internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
+{
+    private readonly INatsResponseChannelClient _client;
+    private readonly IRecoveryStateStore _recoveryStateStore;
+    private readonly AsyncResponseContextPropagation _propagation;
+    private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
+    private readonly NatsSubjectSchema _subjects;
+    private readonly NatsAsyncResponseChannelOptions _options;
+    private readonly ILogger<NatsAsyncResponseChannel> _logger;
+
+    public NatsAsyncResponseChannel(
+        IServiceScopeFactory scopeFactory,
+        INatsResponseChannelClient client,
+        IRecoveryStateStore recoveryStateStore,
+        IOptions<NatsAsyncResponseChannelOptions> options,
+        AsyncResponseContextPropagation propagation,
+        ILogger<NatsAsyncResponseChannel> logger)
+    {
+        _options = options.Value;
+        _options.Validate();
+        _client = client;
+        _recoveryStateStore = recoveryStateStore;
+        _propagation = propagation;
+        _subjects = new NatsSubjectSchema(_options.SubjectPrefix);
+        _logger = logger;
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // IAsyncResponseSubscriber / IRecoverableAsyncResponseSubscriber
+
+    /// <inheritdoc/>
+    public Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+        string correlationId,
+        Func<T, ValueTask<bool>>? completionPredicate = null,
+        TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(correlationId, resumeCallback: null, failureCallback: null, completionPredicate, timeout);
+
+    /// <inheritdoc/>
+    public Task<IAsyncResponseWaiter<T>> CreateRecoverableResponseWaiter<T>(
+        string correlationId,
+        ReflectionCallDto? resumeCallback = null,
+        ReflectionCallDto? failureCallback = null,
+        Func<T, ValueTask<bool>>? completionPredicate = null,
+        TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(correlationId, resumeCallback, failureCallback, completionPredicate, timeout);
+
+    private async Task<IAsyncResponseWaiter<T>> CreateResponseWaiterCore<T>(
+        string correlationId,
+        ReflectionCallDto? resumeCallback,
+        ReflectionCallDto? failureCallback,
+        Func<T, ValueTask<bool>>? completionPredicate,
+        TimeSpan? timeout) where T : IAsyncResponsePayload
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+            throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+
+        // Recovery callbacks only make sense if the payload can say whether a late response should
+        // resume or fail the flow. On this durable channel that decision is real (it survives a
+        // redeploy), so require the override rather than letting the conservative default silently
+        // route every recovered response to the failure callback.
+        if ((resumeCallback is not null || failureCallback is not null)
+            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+        {
+            throw new InvalidOperationException(
+                $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the NATS channel " +
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
+                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
+                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+        }
+
+        // default: first envelope completes the wait
+        completionPredicate ??= _ => new ValueTask<bool>(true);
+
+        // Default timeout aligned with the recovery-state expiry: an infinite wait is never
+        // meaningful, because once the recovery state expires the correlation id has no recovery
+        // anyway. Timing out routes the flow through its normal failure handling instead of
+        // leaving it stuck forever.
+        timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
+
+        var storedCorrelationId = correlationId;
+        // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
+        // scope) flow into the message handler, which runs on a background consume-loop thread.
+        var capturedContext = ExecutionContext.Capture();
+        var subject = _subjects.ResponseSubject(correlationId);
+
+        var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.wait", correlationId: correlationId);
+        activity?.SetTag("asyncresponse.channel", "nats");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
+        activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
+
+        if (_logger.IsEnabled(LogLevel.Information))
+            _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Single-use cancellation token implementing the timeout. Armed only after subscribe + recovery
+        // save succeed, but its callback is registered first so a very fast terminal message cleans up safely.
+        var cancellationTokenSource = new CancellationTokenSource();
+        CancellationTokenRegistration timeoutRegistration = default;
+        INatsChannelSubscription? subscription = null;
+
+        // -------------------------------------------------------------------------
+        // Local: CleanupOnceAsync — disposes the subscription (which ends the consume loop), deletes
+        // recovery state, and tears down the timeout, exactly once.
+        int cleanupStarted = 0;
+        async ValueTask CleanupOnceAsync()
+        {
+            if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
+                return;
+
+            try
+            {
+                if (subscription is not null)
+                    await subscription.DisposeAsync().ConfigureAwait(false);
+                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                _logger.LogDebug("Unsubscribed from subject {Subject}.", subject);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during cleanup for subject {Subject}.", subject);
+            }
+            finally
+            {
+                await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
+                cancellationTokenSource.Dispose();
+                activity?.Dispose();
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Local: ProcessResponseAsync — deserializes and handles a single envelope, completes the TCS when terminal.
+        async Task ProcessResponseAsync(string? payload)
+        {
+            bool finished = false;
+            try
+            {
+                if (string.IsNullOrEmpty(payload))
+                {
+                    // A non-probe message with no body cannot be a response; ignore it rather than fault.
+                    _logger.LogWarning("Received empty response message for correlationId {CorrelationId}; ignoring.", correlationId);
+                    return;
+                }
+
+                var envelope = JsonSerializer.Deserialize<AsyncResponseEnvelope<T>>(payload, AsyncResponseEnvelopeOptions<T>.Instance);
+
+                if (envelope == null)
+                {
+                    _logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", correlationId);
+                    finished = true;
+                    var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {correlationId}.");
+                    AsyncResponseDiagnostics.SetError(activity, "deserialize_failure", deserializationError.Message);
+                    if (!tcs.TrySetException(deserializationError))
+                        _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                }
+                else if (!envelope.Success)
+                {
+                    finished = true;
+                    var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
+                    if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
+                        remoteFailure.Data["RemoteStackTrace"] = envelope.ExceptionStackTrace;
+
+                    _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
+                    AsyncResponseDiagnostics.SetError(activity, "remote_failure", remoteFailure.Message);
+                    if (!tcs.TrySetException(remoteFailure))
+                        _logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                }
+                else
+                {
+                    _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
+                    finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
+                    if (finished && !tcs.TrySetResult(envelope.Payload!))
+                        _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing message on subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+                finished = true;
+                AsyncResponseDiagnostics.SetError(activity, ex);
+                if (!tcs.TrySetException(ex))
+                    _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+            }
+            finally
+            {
+                if (finished)
+                    await CleanupOnceAsync().ConfigureAwait(false);
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Local: ProcessUnderCapturedContextAsync — restores the waiter's subscribe-time
+        // ExecutionContext (app AsyncLocals) plus the correlation id before processing, since the
+        // consume loop runs on a background thread that never had them.
+        Task ProcessUnderCapturedContextAsync(string? payload)
+        {
+            async Task Process()
+            {
+                using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
+                await ProcessResponseAsync(payload).ConfigureAwait(false);
+            }
+
+            if (capturedContext is null)
+                return Process();
+
+            Task? task = null;
+            ExecutionContext.Run(capturedContext, _ => task = Process(), null);
+            return task!;
+        }
+
+        // -------------------------------------------------------------------------
+        // Local: ConsumeLoopAsync — reads messages serially from the subscription until it is disposed.
+        async Task ConsumeLoopAsync(INatsChannelSubscription sub)
+        {
+            try
+            {
+                await foreach (var message in sub.ReadAsync(CancellationToken.None).ConfigureAwait(false))
+                {
+                    // Ack first so the publisher's request resolves quickly (delivery/liveness confirmed)
+                    // even if processing the payload is slow. A failed ack must not abort the wait.
+                    try
+                    {
+                        await message.ReplyAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception replyEx)
+                    {
+                        _logger.LogDebug(replyEx, "Failed to acknowledge response on subject {Subject}.", subject);
+                    }
+
+                    if (message.IsProbe)
+                        continue;
+
+                    await ProcessUnderCapturedContextAsync(message.Payload).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Response subscription loop failed for subject {Subject}.", subject);
+                AsyncResponseDiagnostics.SetError(activity, ex);
+                if (!tcs.TrySetException(ex))
+                    _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                await CleanupOnceAsync().ConfigureAwait(false);
+            }
+        }
+
+        timeoutRegistration = cancellationTokenSource.Token.Register(() =>
+        {
+            _ = Task.Run(async () =>
+            {
+                _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
+                AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
+                tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
+                await CleanupOnceAsync().ConfigureAwait(false);
+            });
+        });
+
+        try
+        {
+            subscription = await _client.SubscribeAsync(subject, cancellationTokenSource.Token).ConfigureAwait(false);
+            _ = Task.Run(() => ConsumeLoopAsync(subscription));
+
+            var recoveryState = new RecoveryState
+            {
+                ResumeCallback = resumeCallback,
+                FailureCallback = failureCallback,
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(T).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                Context = _propagation.Capture()
+            };
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+
+            // Round-trip to the server so the subscription is guaranteed registered before the caller's
+            // trigger publishes the remote request — closing the subscribe/trigger race.
+            await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+
+            _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to subscribe to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
+            tcs.TrySetException(ex);
+            await CleanupOnceAsync().ConfigureAwait(false);
+            return new NatsAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
+        }
+
+        try
+        {
+            if (Volatile.Read(ref cleanupStarted) == 0)
+                cancellationTokenSource.CancelAfter(timeout.Value);
+        }
+        catch (ObjectDisposedException)
+        {
+            // A response completed and cleaned up between the check and CancelAfter.
+        }
+
+        return new NatsAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // IAsyncResponsePublisher
+
+    /// <inheritdoc/>
+    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId);
+
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
+        => SetResponseCore(response, correlationId);
+
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
+        => SetRawResponseJsonCore(responseJson, correlationId);
+
+    private async Task SetResponseCore<T>(T response, string? correlationId)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "nats");
+        AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
+
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("CorrelationId is null; cannot publish the response.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the response.");
+            return;
+        }
+
+        var subject = _subjects.ResponseSubject(correlationId);
+        try
+        {
+            var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
+            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+
+            if (outcome == NatsDeliveryOutcome.NoResponders)
+            {
+                // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response over
+                // to the lost-subscriber dispatcher, which asks the payload whether to resume or fail.
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+
+                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+
+                if (dispatchResult.CallbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+            }
+            else if (_logger.IsEnabled(LogLevel.Information))
+            {
+                _logger.LogInformation("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", correlationId, subject, typeof(T), outcome);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private async Task SetRawResponseJsonCore(string responseJson, string? correlationId)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "nats");
+
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
+            return;
+        }
+
+        var subject = _subjects.ResponseSubject(correlationId);
+        try
+        {
+            var json = SerializeRawSuccessEnvelope(responseJson);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+
+            if (outcome == NatsDeliveryOutcome.NoResponders)
+            {
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var response = new RawJsonResponse(responseJson).DeserializeUntyped();
+
+                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+
+                if (dispatchResult.CallbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+            }
+            else if (_logger.IsEnabled(LogLevel.Information))
+            {
+                _logger.LogInformation("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish raw response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task SetException(Exception exception, string? correlationId = null)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_exception", ActivityKind.Producer);
+        activity?.SetTag("asyncresponse.channel", "nats");
+        activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
+
+        correlationId ??= AsyncResponseContext.CorrelationId;
+        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the exception.");
+            return;
+        }
+
+        var subject = _subjects.ResponseSubject(correlationId);
+        try
+        {
+            var envelope = new AsyncResponseEnvelope<object>
+            {
+                Success = false,
+                ExceptionMessage = exception.Message,
+                ExceptionStackTrace = exception.StackTrace,
+                Payload = null
+            };
+            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+
+            if (outcome == NatsDeliveryOutcome.NoResponders)
+            {
+                // Nobody was listening: exception envelopes always go to the failure callback.
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+
+                var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, subject).ConfigureAwait(false);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
+
+                if (callbackInvoked)
+                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogInformation("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to publish exception response for correlationId {CorrelationId} on subject {Subject}.", correlationId, subject);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // IActiveSubscriberProbe
+
+    /// <inheritdoc/>
+    public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+            return 0L;
+
+        var subject = _subjects.ResponseSubject(correlationId);
+        try
+        {
+            // NATS Core does not expose exact subscriber counts to clients, so the probe reports
+            // presence: a live waiter answers the ping (1), no-responders or no timely answer means
+            // none (0). The watchdog only needs "is anyone listening".
+            var outcome = await _client.RequestAsync(subject, payload: null, probe: true, _options.PresenceProbeTimeout, cancellationToken).ConfigureAwait(false);
+            return outcome == NatsDeliveryOutcome.Replied ? 1L : 0L;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to probe active subscribers for subject {Subject}.", subject);
+            return 0L;
+        }
+    }
+
+    private static string SerializeRawSuccessEnvelope(string payloadJson)
+    {
+        JsonSafety.ThrowIfClearlyNotJson(payloadJson);
+
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writer.WriteBoolean("Success", true);
+            writer.WritePropertyName("Payload");
+            writer.WriteRawValue(payloadJson);
+            writer.WriteNull("ExceptionMessage");
+            writer.WriteNull("ExceptionStackTrace");
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+}

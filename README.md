@@ -91,9 +91,11 @@ somebody has to make the call.
 |---|---|
 | `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
 | `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
+| `AsyncResponse.Channels.NATS` | Optional NATS response channel (Core request/reply) and durable JetStream Key-Value recovery-state store; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Transports.Redis` | Optional Redis Streams worker transport and hosted subscribers for worker jobs and response ingress, with consumer-group ACKs, pending-entry retry, and dead-lettering. |
 | `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
+| `AsyncResponse.Transports.NATS` | Optional NATS JetStream worker transport and hosted subscribers for worker jobs and response ingress, with explicit ACKs, bounded redelivery, and dead-lettering. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
 
 Package naming follows the extension point: `AsyncResponse.Channels.*` packages provide
@@ -116,6 +118,12 @@ dotnet add package AsyncResponse.Transports.GooglePubSub
 
 # Optional RabbitMQ transport:
 dotnet add package AsyncResponse.Transports.RabbitMQ
+
+# Optional NATS channel:
+dotnet add package AsyncResponse.Channels.NATS
+
+# Optional NATS JetStream transport:
+dotnet add package AsyncResponse.Transports.NATS
 ```
 
 ## Quick start
@@ -424,6 +432,82 @@ OrderResult result = await _asyncResponse
 The hosted response subscriber feeds RabbitMQ deliveries into `IAsyncResponseIngress`. It resolves
 the correlation id from AMQP `CorrelationId` first, then from the configured message header
 (`correlationId` by default), then from the same JSON body paths used by the Pub/Sub transport.
+
+### NATS channel + transport
+
+NATS can serve **both** AsyncResponse axes on one connection: the **channel** (the response
+rendezvous + durable recovery) and the worker **transport**. Both packages resolve a single
+`NATS.Client.Core.INatsConnection` registered by the host, and both require a NATS server with
+**JetStream enabled** (start the server with `-js`).
+
+```csharp
+// Register the shared NATS connection (e.g. with NATS.Extensions.Microsoft.DependencyInjection,
+// or directly as shown here).
+builder.Services.AddSingleton<INatsConnection>(_ =>
+    new NatsConnection(new NatsOpts { Url = "nats://localhost:4222" }));
+
+builder.Services.AddAsyncResponse()
+    .WithNatsChannel(options =>
+    {
+        options.SubjectPrefix = "asyncresponse";          // response subjects: {prefix}.response.{cid}
+        options.RecoveryBucket = "asyncresponse-recovery"; // JetStream KV bucket for recovery state
+        options.RecoveryStateExpiry = TimeSpan.FromDays(7);
+    })
+    .WithNatsTransport(options =>
+    {
+        options.SubjectPrefix = "asyncresponse";           // worker/response subjects: {prefix}.transport.*
+        options.WorkerConsumer = "asyncresponse-workers";
+        options.ResponseConsumer = "asyncresponse-responses";
+    });
+```
+
+**How the channel works.** Unlike Redis pub/sub (which reports a subscriber count on publish), NATS
+Core has no such signal, so the channel uses **request/reply**: a waiter subscribes to its
+per-correlation subject and acknowledges each message, and the publisher *requests* the response.
+NATS's "no responders" reply is the precise "nobody is listening" signal that drives lost-subscriber
+recovery — exactly mirroring Redis's `numSubscribers == 0`. Durable `RecoveryState` lives in a
+**JetStream Key-Value bucket** (with a per-entry expiry layered over the bucket's `MaxAge`), so a
+response that arrives after the waiter died (e.g. a redeploy) is still classified by the payload's
+`ShouldResumeOnRecovery()` and routed to the resume or failure callback. The same channel instance
+serves the recovery-state scanner and the active-subscriber probe, so the watchdog works against NATS
+automatically. (Correlation ids are URL-safe-Base64 encoded into subject tokens and KV keys, so any
+id is legal regardless of its characters.)
+
+**How the transport works.** `.WithNatsTransport(...)` wires the worker publisher, the worker-job
+subscriber, the response-ingress subscriber, JetStream stream/consumer creation, reply-target
+support, and shutdown validation. Worker jobs are published to the worker subject and consumed
+through a durable JetStream consumer with explicit ACKs. The default ACK mode is
+`AckAfterHandlerCompletes`, which ACKs only after AsyncResponse handling succeeds and NAKs for
+redelivery (after `RedeliveryDelay`) if the handler throws, up to `MaxDeliveryAttempts` — after which
+the message is dead-lettered and terminated. For worker jobs that must be accepted quickly into the
+process, opt into early ACK:
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithNatsChannel()
+    .WithNatsTransport(options =>
+    {
+        options.WorkerSubscriber.UseAckAfterReceive(
+            backgroundWorkerCount: 64,
+            backgroundQueueCapacity: 10_000,
+            backgroundDrainTimeout: TimeSpan.FromMinutes(2));
+        options.WorkerSubscriber.OnBackgroundFailure = context =>
+        {
+            // Alert, increment a metric, or publish to a durable failure path.
+            return ValueTask.CompletedTask;
+        };
+    });
+```
+
+With `AckAfterReceive`, JetStream is ACKed once the delivery is accepted into a bounded in-process
+queue; if the queue is full the subscriber NAKs for redelivery, and a background handler failure is
+dead-lettered and reported through `OnBackgroundFailure`. Keep response ingress on the default
+`AckAfterHandlerCompletes` unless response processing is durable enough to tolerate early ACK.
+
+The NATS response subject is exposed as a transport-neutral reply target (`Transport = "NATS"`,
+`Address = {prefix}.transport.response`), and the hosted response subscriber resolves the correlation
+id from the configured message header (`AR-Correlation-Id` by default) first, then from the same JSON
+body paths used by the other transports.
 
 ### 1. Define a payload
 

@@ -6,8 +6,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Channels.NATS" />
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.GooglePubSub" />
+    <InternalsVisibleTo Include="AsyncResponse.Transports.NATS" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.RabbitMQ" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />

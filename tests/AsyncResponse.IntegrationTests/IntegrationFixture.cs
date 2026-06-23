@@ -26,6 +26,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient RabbitMqEarlyAckClient { get; private set; } = null!;
     public HttpClient RedisTransportClient { get; private set; } = null!;
     public HttpClient RedisTransportEarlyAckClient { get; private set; } = null!;
+    public HttpClient NatsClient { get; private set; } = null!;
+    public HttpClient NatsEarlyAckClient { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -53,6 +55,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-redis-early-ack")
             .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-nats")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-nats-early-ack")
+            .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
@@ -60,12 +68,16 @@ public sealed class IntegrationFixture : IAsyncLifetime
         RabbitMqEarlyAckClient = _app.CreateHttpClient("itest-app-rabbitmq-early-ack");
         RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
         RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
+        NatsClient = _app.CreateHttpClient("itest-app-nats");
+        NatsEarlyAckClient = _app.CreateHttpClient("itest-app-nats-early-ack");
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(NatsClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(NatsEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -76,6 +88,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         RabbitMqEarlyAckClient?.Dispose();
         RedisTransportClient?.Dispose();
         RedisTransportEarlyAckClient?.Dispose();
+        NatsClient?.Dispose();
+        NatsEarlyAckClient?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }

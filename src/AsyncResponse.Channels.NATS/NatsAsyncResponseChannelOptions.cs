@@ -1,0 +1,121 @@
+namespace AsyncResponse.Channels.NATS;
+
+/// <summary>
+/// Options for the NATS-backed async-response channel.
+/// <para>
+/// The channel delivers responses over NATS Core <em>request/reply</em>: a waiter subscribes to a
+/// per-correlation subject and replies to confirm receipt, and the publisher uses a request so the
+/// NATS "no responders" signal tells it precisely when nobody is listening (the moment that triggers
+/// lost-subscriber recovery). Durable <see cref="RecoveryState"/> lives in a NATS JetStream
+/// Key-Value bucket so a response that arrives after the waiter died (e.g. a redeploy) can still be
+/// routed to the resume or failure callback.
+/// </para>
+/// </summary>
+public sealed class NatsAsyncResponseChannelOptions
+{
+    /// <summary>The channel name reported to the startup validator.</summary>
+    public const string ChannelName = "NATS";
+
+    /// <summary>
+    /// Subject prefix for every response subject created by the channel. A response subject is
+    /// <c>{SubjectPrefix}.response.{encodedCorrelationId}</c>, where the correlation id is encoded
+    /// to a NATS-safe token. Change it to isolate multiple applications or environments sharing one
+    /// NATS system. Treat it as a deployment-wide contract: publishers and subscribers must agree on
+    /// it.
+    /// </summary>
+    public string SubjectPrefix { get; set; } = "asyncresponse";
+
+    /// <summary>
+    /// Name of the JetStream Key-Value bucket that stores durable <see cref="RecoveryState"/>.
+    /// Must be a valid bucket name (alphanumeric, dash, underscore). Changing it orphans existing
+    /// recovery state. The backing JetStream stream is <c>KV_{RecoveryBucket}</c>.
+    /// </summary>
+    public string RecoveryBucket { get; set; } = "asyncresponse-recovery";
+
+    /// <summary>
+    /// Replica count for the recovery Key-Value bucket. Use a value greater than <c>1</c> on a NATS
+    /// cluster so recovery state survives a single node loss. Default: <c>1</c>.
+    /// </summary>
+    public int RecoveryBucketReplicas { get; set; } = 1;
+
+    /// <summary>
+    /// How long persisted <see cref="RecoveryState"/> entries live. This bounds how long after a
+    /// crash/redeploy a late response can still trigger the lost-subscriber callbacks. It is applied
+    /// both as the per-entry logical expiry and as the Key-Value bucket's <c>MaxAge</c> ceiling.
+    /// Set it comfortably above your longest-running flow. Default: 7 days.
+    /// </summary>
+    public TimeSpan RecoveryStateExpiry { get; set; } = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Default timeout applied to waiters that do not specify <c>WithTimeout</c>. When <c>null</c>
+    /// (the default), <see cref="RecoveryStateExpiry"/> is used — once the recovery state has expired,
+    /// waiting longer is meaningless. Waits are never infinite: a response that never arrives faults
+    /// the waiter with a <see cref="TimeoutException"/> so the flow fails visibly instead of hanging.
+    /// </summary>
+    public TimeSpan? DefaultTimeout { get; set; }
+
+    /// <summary>
+    /// How long a publish waits for a waiter to acknowledge receipt before concluding that, although
+    /// at least one subscriber had interest, none confirmed in time — which is still treated as
+    /// <em>delivered</em> (the live subscriber received the message; only its ack was slow). The
+    /// definitive "nobody is listening" signal is NATS no-responders, which returns immediately and
+    /// is independent of this timeout. Keep it short. Default: 5 seconds.
+    /// </summary>
+    public TimeSpan DeliveryConfirmationTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// How long the active-subscriber probe (used by the watchdog) waits for a live waiter to answer
+    /// a presence ping before reporting zero live subscribers. NATS Core does not expose exact
+    /// subscriber counts to clients, so the probe reports presence (0 or 1). Default: 2 seconds.
+    /// </summary>
+    public TimeSpan PresenceProbeTimeout { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Validates the options, throwing <see cref="InvalidOperationException"/> on a misconfiguration.
+    /// Called by the channel, the recovery store, and the DI registration so a bad configuration
+    /// fails fast rather than at first use.
+    /// </summary>
+    public void Validate()
+    {
+        Required(SubjectPrefix, nameof(SubjectPrefix));
+        Required(RecoveryBucket, nameof(RecoveryBucket));
+
+        if (RecoveryBucketReplicas <= 0)
+            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(RecoveryBucketReplicas)} must be positive.");
+
+        Positive(RecoveryStateExpiry, nameof(RecoveryStateExpiry));
+        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
+        Positive(PresenceProbeTimeout, nameof(PresenceProbeTimeout));
+
+        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(DefaultTimeout)} must be positive when set.");
+
+        // A NATS bucket name must be a single token of [A-Za-z0-9_-]. A dotted/whitespace value would
+        // silently produce an unusable backing stream, so reject it explicitly.
+        foreach (var c in RecoveryBucket)
+        {
+            if (!(char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))
+                throw new InvalidOperationException(
+                    $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(RecoveryBucket)} '{RecoveryBucket}' is not a valid NATS bucket name " +
+                    "(allowed characters: letters, digits, '-', '_').");
+        }
+
+        // A subject prefix becomes leading tokens of every response subject; it must not contain the
+        // NATS subject wildcards or separators that would break addressing.
+        if (SubjectPrefix.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(SubjectPrefix)} '{SubjectPrefix}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+    }
+
+    private static void Required(string? value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{name} must be configured.");
+    }
+
+    private static void Positive(TimeSpan value, string name)
+    {
+        if (value <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{name} must be positive.");
+    }
+}

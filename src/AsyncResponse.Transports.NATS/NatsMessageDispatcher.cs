@@ -1,0 +1,234 @@
+using Microsoft.Extensions.Logging;
+using System.Threading.Channels;
+
+namespace AsyncResponse.Transports.NATS;
+
+internal enum NatsSubscriberRole
+{
+    Worker,
+    ResponseIngress
+}
+
+/// <summary>
+/// Applies the acknowledgement, redelivery, and dead-letter policy to JetStream deliveries.
+/// <list type="bullet">
+/// <item><description><see cref="NatsAckMode.AckAfterHandlerCompletes"/>: run the handler, then ACK;
+/// on failure NAK for redelivery until <see cref="NatsSubscriberOptions.MaxDeliveryAttempts"/>, then
+/// dead-letter and terminate.</description></item>
+/// <item><description><see cref="NatsAckMode.AckAfterReceive"/>: enqueue to a bounded background
+/// queue and ACK immediately; background handler failures are dead-lettered and reported.</description></item>
+/// </list>
+/// </summary>
+internal sealed class NatsMessageDispatcher : IAsyncDisposable
+{
+    private readonly Func<NatsJobDelivery, CancellationToken, Task> _handler;
+    private readonly INatsJetStreamTransport _jetStream;
+    private readonly NatsAsyncResponseTransportOptions _options;
+    private readonly NatsSubscriberOptions _subscriberOptions;
+    private readonly NatsTransportSubjectSchema _schema;
+    private readonly ILogger _logger;
+    private readonly NatsSubscriberRole _role;
+    private readonly string _consumer;
+
+    private readonly Channel<NatsJobDelivery>? _backgroundQueue;
+    private readonly Task[]? _backgroundWorkers;
+    private readonly CancellationTokenSource? _backgroundCts;
+
+    public NatsMessageDispatcher(
+        Func<NatsJobDelivery, CancellationToken, Task> handler,
+        INatsJetStreamTransport jetStream,
+        NatsAsyncResponseTransportOptions options,
+        NatsSubscriberOptions subscriberOptions,
+        NatsTransportSubjectSchema schema,
+        ILogger logger,
+        NatsSubscriberRole role,
+        string consumer)
+    {
+        NatsTransportOptionsValidator.ValidateSubscriber(subscriberOptions, role.ToString());
+
+        _handler = handler;
+        _jetStream = jetStream;
+        _options = options;
+        _subscriberOptions = subscriberOptions;
+        _schema = schema;
+        _logger = logger;
+        _role = role;
+        _consumer = consumer;
+
+        if (subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
+        {
+            _backgroundQueue = Channel.CreateBounded<NatsJobDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
+            {
+                SingleReader = false,
+                SingleWriter = true,
+                FullMode = BoundedChannelFullMode.Wait
+            });
+            _backgroundCts = new CancellationTokenSource();
+            _backgroundWorkers = new Task[subscriberOptions.BackgroundWorkerCount];
+            for (var i = 0; i < _backgroundWorkers.Length; i++)
+                _backgroundWorkers[i] = Task.Run(() => BackgroundWorkerLoopAsync(_backgroundCts.Token));
+        }
+    }
+
+    public async Task HandleAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
+    {
+        if (_subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
+        {
+            await HandleEarlyAckAsync(delivery).ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+            await delivery.AckAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task HandleEarlyAckAsync(NatsJobDelivery delivery)
+    {
+        // Accept into the background queue and ACK; if the queue is saturated, NAK so JetStream
+        // redelivers later rather than dropping the message or blocking the consume loop.
+        if (_backgroundQueue!.Writer.TryWrite(delivery))
+        {
+            await delivery.AckAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            _logger.LogDebug("Background queue full for {Role}; NAKing message for redelivery.", _role);
+            await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+        }
+    }
+
+    private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                try
+                {
+                    await _handler(delivery, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject);
+                    await DeadLetterAsync(delivery, ex, CancellationToken.None).ConfigureAwait(false);
+                    await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown.
+        }
+    }
+
+    private async Task HandleFailureAsync(NatsJobDelivery delivery, Exception exception, CancellationToken cancellationToken)
+    {
+        var maxAttempts = _subscriberOptions.MaxDeliveryAttempts;
+        if (maxAttempts > 0 && delivery.NumDelivered >= maxAttempts)
+        {
+            _logger.LogError(
+                exception,
+                "Message on subject {Subject} ({Role}) failed after {Attempts} attempts; dead-lettering.",
+                delivery.Subject,
+                _role,
+                delivery.NumDelivered);
+            await DeadLetterAsync(delivery, exception, cancellationToken).ConfigureAwait(false);
+            await delivery.TermAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            _logger.LogWarning(
+                exception,
+                "Message on subject {Subject} ({Role}) failed on attempt {Attempt}; NAKing for redelivery.",
+                delivery.Subject,
+                _role,
+                delivery.NumDelivered);
+            await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+        }
+    }
+
+    private async Task DeadLetterAsync(NatsJobDelivery delivery, Exception exception, CancellationToken cancellationToken)
+    {
+        if (!_options.DeadLetterEnabled)
+        {
+            _logger.LogError(
+                exception,
+                "Message on subject {Subject} ({Role}) is unprocessable and dead-lettering is disabled; it will be dropped.",
+                delivery.Subject,
+                _role);
+            return;
+        }
+
+        var headers = new Dictionary<string, string>(delivery.Headers, StringComparer.OrdinalIgnoreCase)
+        {
+            ["AR-DeadLetter-Reason"] = SanitizeHeaderValue(exception.Message),
+            ["AR-DeadLetter-Source-Subject"] = delivery.Subject,
+            ["AR-DeadLetter-Role"] = _role.ToString()
+        };
+
+        try
+        {
+            await _jetStream.PublishAsync(_schema.DeadLetterSubject, delivery.Payload, headers, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Dead-lettered message from subject {Subject} ({Role}) to {DeadLetterSubject}.", delivery.Subject, _role, _schema.DeadLetterSubject);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to dead-letter message from subject {Subject} ({Role}).", delivery.Subject, _role);
+        }
+    }
+
+    private async Task InvokeBackgroundFailureAsync(NatsJobDelivery delivery, Exception exception)
+    {
+        if (_subscriberOptions.OnBackgroundFailure is null)
+            return;
+
+        try
+        {
+            delivery.Headers.TryGetValue(_options.CorrelationIdHeader, out var correlationId);
+            var context = new NatsBackgroundFailureContext(delivery.Subject, _consumer, _role.ToString(), delivery.NumDelivered, correlationId, exception);
+            await _subscriberOptions.OnBackgroundFailure(context).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "OnBackgroundFailure callback threw for {Role}.", _role);
+        }
+    }
+
+    private static string SanitizeHeaderValue(string value)
+        => value.Replace('\r', ' ').Replace('\n', ' ');
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_backgroundQueue is null)
+            return;
+
+        _backgroundQueue.Writer.TryComplete();
+        try
+        {
+            await Task.WhenAll(_backgroundWorkers!).WaitAsync(_subscriberOptions.BackgroundDrainTimeout).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("Background handlers for {Role} did not drain within {Timeout}.", _role, _subscriberOptions.BackgroundDrainTimeout);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Background worker drain for {Role} ended with an error.", _role);
+        }
+        finally
+        {
+            if (_backgroundCts is not null)
+            {
+                await _backgroundCts.CancelAsync().ConfigureAwait(false);
+                _backgroundCts.Dispose();
+            }
+        }
+    }
+}

@@ -1,9 +1,12 @@
 using AsyncResponse;
+using AsyncResponse.Channels.NATS;
 using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
+using NATS.Client.Core;
 using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
@@ -22,19 +25,28 @@ builder.Services.AddOpenApi();
 // Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
-var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ
+var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ | Redis | NATS
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
+var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
 var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
+var useNatsTransport = string.Equals(transport, "NATS", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis || useRedisTransport)
 {
     var redisConnectionString = builder.Configuration.GetConnectionString("Redis") ?? "localhost:6379";
     builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(redisConnectionString));
+}
+
+if (useNats || useNatsTransport)
+{
+    // One shared NATS connection backs both the NATS channel and the NATS transport.
+    var natsUrl = builder.Configuration["Nats:Url"] ?? "nats://localhost:4222";
+    builder.Services.AddSingleton<INatsConnection>(_ => new NatsConnection(new NatsOpts { Url = natsUrl }));
 }
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start
@@ -74,6 +86,15 @@ if (useRedis)
         options.DefaultTimeout = TimeSpan.FromSeconds(30);
     });
 }
+else if (useNats)
+{
+    asyncResponse.WithNatsChannel(options =>
+    {
+        options.SubjectPrefix = builder.Configuration["Nats:SubjectPrefix"] ?? options.SubjectPrefix;
+        options.RecoveryBucket = builder.Configuration["Nats:RecoveryBucket"] ?? options.RecoveryBucket;
+        options.DefaultTimeout = TimeSpan.FromSeconds(30);
+    });
+}
 else if (useInMemoryChannel)
 {
     asyncResponse.WithInMemoryChannel();
@@ -81,7 +102,7 @@ else if (useInMemoryChannel)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Channel value. Use 'InMemory' or 'Redis'.");
+        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', or 'NATS'.");
 }
 
 // Exactly one worker transport (enforced at host startup).
@@ -166,6 +187,17 @@ else if (useRedisTransport)
         ConfigureRedisSubscriber(builder.Configuration, "Redis:Response", options.ResponseSubscriber);
     });
 }
+else if (useNatsTransport)
+{
+    asyncResponse.WithNatsTransport(options =>
+    {
+        options.SubjectPrefix = builder.Configuration["Nats:SubjectPrefix"] ?? options.SubjectPrefix;
+        options.WorkerConsumer = builder.Configuration["Nats:WorkerConsumer"] ?? options.WorkerConsumer;
+        options.ResponseConsumer = builder.Configuration["Nats:ResponseConsumer"] ?? options.ResponseConsumer;
+        ConfigureNatsSubscriber(builder.Configuration, "Nats:Worker", options.WorkerSubscriber);
+        ConfigureNatsSubscriber(builder.Configuration, "Nats:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -173,7 +205,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', or 'Redis'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', 'Redis', or 'NATS'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -222,6 +254,7 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? pubsub = null;
     object? rabbitmq = null;
     object? redis = null;
+    object? nats = null;
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
@@ -280,7 +313,50 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis });
+    if (useNats || useNatsTransport)
+    {
+        string? subjectPrefix = null;
+        string? recoveryBucket = null;
+        string? workerSubject = null;
+        string? responseSubject = null;
+        var workerAckMode = "n/a";
+        var responseAckMode = "n/a";
+        var workerBackgroundWorkerCount = 0;
+        var workerBackgroundQueueCapacity = 0;
+
+        if (useNatsTransport)
+        {
+            var natsOptions = services.GetRequiredService<IOptions<NatsAsyncResponseTransportOptions>>().Value;
+            subjectPrefix = natsOptions.SubjectPrefix;
+            workerSubject = string.IsNullOrWhiteSpace(natsOptions.WorkerSubject) ? $"{natsOptions.SubjectPrefix}.transport.worker" : natsOptions.WorkerSubject;
+            responseSubject = string.IsNullOrWhiteSpace(natsOptions.ResponseSubject) ? $"{natsOptions.SubjectPrefix}.transport.response" : natsOptions.ResponseSubject;
+            workerAckMode = natsOptions.WorkerSubscriber.AckMode.ToString();
+            workerBackgroundWorkerCount = natsOptions.WorkerSubscriber.BackgroundWorkerCount;
+            workerBackgroundQueueCapacity = natsOptions.WorkerSubscriber.BackgroundQueueCapacity;
+            responseAckMode = natsOptions.ResponseSubscriber.AckMode.ToString();
+        }
+
+        if (useNats)
+        {
+            var natsChannelOptions = services.GetRequiredService<IOptions<NatsAsyncResponseChannelOptions>>().Value;
+            recoveryBucket = natsChannelOptions.RecoveryBucket;
+            subjectPrefix ??= natsChannelOptions.SubjectPrefix;
+        }
+
+        nats = new
+        {
+            subjectPrefix,
+            recoveryBucket,
+            workerSubject,
+            responseSubject,
+            workerAckMode,
+            workerBackgroundWorkerCount,
+            workerBackgroundQueueCapacity,
+            responseAckMode
+        };
+    }
+
+    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis, nats });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -480,6 +556,47 @@ static void ConfigureRedisSubscriber(
     }
 
     subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigureNatsSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    NatsSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:BatchSize"], out var batchSize))
+        subscriberOptions.BatchSize = batchSize;
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<NatsAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<NatsAckMode>())}.");
+
+    if (mode is NatsAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = NatsAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not NatsAckMode.AckAfterReceive)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
 }
 
 static string ResolveRedisStream(string? configured, string keyPrefix, string role)
@@ -928,7 +1045,10 @@ app.MapPost("/emit-response", async (
     if (useRedisTransport)
         return await EmitRedisResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, or Redis.");
+    if (useNatsTransport)
+        return await EmitNatsResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, Redis, or NATS.");
 })
 .WithTags("Workers");
 
@@ -1057,6 +1177,37 @@ static async Task<IResult> EmitRedisResponseAsync(
         useApproximateMaxLength: o.UseApproximateStreamTrimming,
         limit: null,
         trimMode: StreamTrimMode.KeepReferences).WaitAsync(timeout.Token).ConfigureAwait(false);
+
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitNatsResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<NatsAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("NATS response ingress requires the NATS transport.");
+    var connection = services.GetService<INatsConnection>();
+    if (connection is null)
+        return Results.Conflict("NATS response ingress requires an INatsConnection.");
+
+    var o = options.Value;
+    var responseSubject = string.IsNullOrWhiteSpace(o.ResponseSubject)
+        ? $"{o.SubjectPrefix}.transport.response"
+        : o.ResponseSubject;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+
+    // The response stream (created by the hosted response-ingress subscriber on startup) captures any
+    // message on its subject, so a Core publish is sufficient to feed the transport's response ingress.
+    NatsHeaders? headers = useAttribute ? new NatsHeaders { [o.CorrelationIdHeader] = correlationId } : null;
+    await connection.PublishAsync(responseSubject, json, headers: headers, cancellationToken: cancellationToken).ConfigureAwait(false);
 
     return Results.Accepted();
 }

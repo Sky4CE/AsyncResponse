@@ -27,6 +27,8 @@ const string RabbitMqEarlyAckResponseQueue = "asyncresponse.itest.response.early
 const string RabbitMqEarlyAckResponseRoutingKey = "asyncresponse.itest.response.earlyack";
 const string RedisTransportKeyPrefix = "itest-redistransport";
 const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
+const string NatsSubjectPrefix = "itest-nats";
+const string NatsEarlyAckSubjectPrefix = "itest-nats-early-ack";
 
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
@@ -42,12 +44,21 @@ var pubsub = builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/goog
     .WithArgs("gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", $"--project={ProjectId}")
     .WithEndpoint(targetPort: 8085, scheme: "tcp", name: "pubsub");
 
+// `-js` enables JetStream, which the NATS channel's Key-Value recovery store and the NATS transport's
+// streams both require.
+var nats = builder.AddContainer("nats", "nats", "latest")
+    .WithArgs("-js")
+    .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
+
 var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
 var emulatorHost = ReferenceExpression.Create(
     $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
 var rabbitMqEndpoint = rabbitmq.GetEndpoint("amqp");
 var rabbitMqConnectionString = ReferenceExpression.Create(
     $"amqp://guest:guest@{rabbitMqEndpoint.Property(EndpointProperty.Host)}:{rabbitMqEndpoint.Property(EndpointProperty.Port)}/");
+var natsEndpoint = nats.GetEndpoint("nats");
+var natsConnectionString = ReferenceExpression.Create(
+    $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
@@ -166,6 +177,36 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis-early-ack", l
     .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
     .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
     .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+// NATS channel + NATS transport on one connection. A single NATS server backs both the response
+// rendezvous (Core request/reply + JetStream KV recovery) and the worker/response transport (JetStream).
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats", launchProfileName: null)
+    .WaitFor(nats)
+    .WithEnvironment("Nats:Url", natsConnectionString)
+    .WithEnvironment("Nats:SubjectPrefix", NatsSubjectPrefix)
+    .WithEnvironment("Nats:RecoveryBucket", "itest-nats-recovery")
+    .WithEnvironment("Nats:WorkerConsumer", "asyncresponse-itest-nats-workers")
+    .WithEnvironment("Nats:ResponseConsumer", "asyncresponse-itest-nats-responses")
+    .WithEnvironment("AsyncResponse:Channel", "NATS")
+    .WithEnvironment("AsyncResponse:Transport", "NATS")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats-early-ack", launchProfileName: null)
+    .WaitFor(nats)
+    .WithEnvironment("Nats:Url", natsConnectionString)
+    .WithEnvironment("Nats:SubjectPrefix", NatsEarlyAckSubjectPrefix)
+    .WithEnvironment("Nats:RecoveryBucket", "itest-nats-earlyack-recovery")
+    .WithEnvironment("Nats:WorkerConsumer", "asyncresponse-itest-nats-workers-earlyack")
+    .WithEnvironment("Nats:ResponseConsumer", "asyncresponse-itest-nats-responses-earlyack")
+    .WithEnvironment("Nats:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_ACK_MODE", "AckAfterReceive"))
+    .WithEnvironment("Nats:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("Nats:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("Nats:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("AsyncResponse:Channel", "NATS")
+    .WithEnvironment("AsyncResponse:Transport", "NATS")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 
