@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
 using Google.Cloud.PubSub.V1;
@@ -56,6 +57,7 @@ internal static class StressRunner
         failures += await GooglePubSubAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RabbitMqAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -405,6 +407,96 @@ internal static class StressRunner
         return Check(
             "redis-ack-after-enqueue-dispatch-storm",
             ("ackMismatch", Math.Abs(count - database.Acks)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3e) NATS JetStream ACK-after-receive dispatch storm. This bypasses a live NATS server and
+    //     hammers the subscriber callback dispatcher directly: every ACKed delivery must be processed
+    //     exactly once.
+    private static async Task<int> NatsAckAfterReceiveDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var jetStream = new BenchmarkNatsJetStreamTransport();
+        var options = new NatsAsyncResponseTransportOptions();
+        var schema = new NatsTransportSubjectSchema(options);
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var acks = 0;
+        var naks = 0;
+        var terms = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = new NatsMessageDispatcher(
+            (delivery, _) =>
+            {
+                var separator = delivery.Payload.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Payload[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            jetStream,
+            options,
+            new NatsSubscriberOptions().UseAckAfterReceive(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            schema,
+            NullLogger.Instance,
+            NatsSubscriberRole.Worker,
+            "stress-worker-consumer");
+
+        var metrics = await Measure("nats-ack-after-receive-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new NatsJobDelivery(
+                "asyncresponse.transport.worker",
+                $"{i}:{{}}",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["AR-Correlation-Id"] = $"stress-{i}"
+                },
+                NumDelivered: 1,
+                () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
+                _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
+                () => { Interlocked.Increment(ref terms); return ValueTask.CompletedTask; }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("nats-ack-after-receive-dispatch-storm");
+        return Check(
+            "nats-ack-after-receive-dispatch-storm",
+            ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
+            ("naks", Volatile.Read(ref naks)),
+            ("terms", Volatile.Read(ref terms)),
             ("duplicates", duplicates),
             ("outOfRange", outOfRange),
             ("notDrained", drained ? 0 : 1),

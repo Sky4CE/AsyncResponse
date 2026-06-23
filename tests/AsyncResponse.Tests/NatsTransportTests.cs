@@ -118,6 +118,11 @@ public class NatsTransportOptionsAndSchemaTests
     public void ValidateSubscriber_Throws_ForNonPositiveRedeliveryDelay()
         => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(
             new NatsSubscriberOptions { RedeliveryDelay = TimeSpan.Zero }, "Worker"));
+
+    [Fact]
+    public void ValidateSubscriber_Throws_ForUnsupportedAckMode()
+        => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(
+            new NatsSubscriberOptions { AckMode = (NatsAckMode)999 }, "Worker"));
 }
 
 public class NatsReplyTargetProviderTests

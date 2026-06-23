@@ -139,8 +139,21 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 delivery.Subject,
                 _role,
                 delivery.NumDelivered);
-            await DeadLetterAsync(delivery, exception, cancellationToken).ConfigureAwait(false);
-            await delivery.TermAsync().ConfigureAwait(false);
+
+            var shouldTerminate = await DeadLetterAsync(delivery, exception, cancellationToken).ConfigureAwait(false);
+            if (shouldTerminate)
+            {
+                await delivery.TermAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Dead-letter publish failed for subject {Subject} ({Role}); NAKing so the message can be retried.",
+                    delivery.Subject,
+                    _role);
+                await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+            }
         }
         else
         {
@@ -154,7 +167,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
     }
 
-    private async Task DeadLetterAsync(NatsJobDelivery delivery, Exception exception, CancellationToken cancellationToken)
+    private async Task<bool> DeadLetterAsync(NatsJobDelivery delivery, Exception exception, CancellationToken cancellationToken)
     {
         if (!_options.DeadLetterEnabled)
         {
@@ -163,7 +176,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 "Message on subject {Subject} ({Role}) is unprocessable and dead-lettering is disabled; it will be dropped.",
                 delivery.Subject,
                 _role);
-            return;
+            return true;
         }
 
         var headers = new Dictionary<string, string>(delivery.Headers, StringComparer.OrdinalIgnoreCase)
@@ -177,10 +190,12 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         {
             await _jetStream.PublishAsync(_schema.DeadLetterSubject, delivery.Payload, headers, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("Dead-lettered message from subject {Subject} ({Role}) to {DeadLetterSubject}.", delivery.Subject, _role, _schema.DeadLetterSubject);
+            return true;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to dead-letter message from subject {Subject} ({Role}).", delivery.Subject, _role);
+            return false;
         }
     }
 

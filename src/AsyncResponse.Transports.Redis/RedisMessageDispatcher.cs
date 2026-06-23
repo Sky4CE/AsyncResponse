@@ -528,6 +528,13 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (_drainCancellation.IsCancellationRequested)
+            {
+                Logger.LogDebug(
+                    "Redis background handler for already-ACKed message {MessageId} on {Stream} was canceled during dispatcher shutdown.",
+                    delivery.MessageId.ToString(),
+                    _stream);
+            }
             catch (Exception ex)
             {
                 Logger.LogError(

@@ -66,13 +66,22 @@ internal static class NatsTransportOptionsValidator
 
         Positive(subscriber.RedeliveryDelay, $"{nameof(subscriber.RedeliveryDelay)} ({role})");
 
-        if (subscriber.AckMode is NatsAckMode.AckAfterReceive)
+        switch (subscriber.AckMode)
         {
-            if (subscriber.BackgroundWorkerCount <= 0)
-                throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterReceive.");
-            if (subscriber.BackgroundQueueCapacity <= 0)
-                throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterReceive.");
-            Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+            case NatsAckMode.AckAfterHandlerCompletes:
+                return;
+
+            case NatsAckMode.AckAfterReceive:
+                if (subscriber.BackgroundWorkerCount <= 0)
+                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterReceive.");
+                if (subscriber.BackgroundQueueCapacity <= 0)
+                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterReceive.");
+                Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+                return;
+
+            default:
+                throw new InvalidOperationException(
+                    $"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.AckMode)} ({role}) has unsupported value '{subscriber.AckMode}'.");
         }
     }
 }

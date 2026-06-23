@@ -1040,6 +1040,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter 
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RedisAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RabbitMqAckDispatch*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*NatsAckDispatch*'
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
@@ -1059,7 +1060,8 @@ of progress messages then a terminal per flow), **worker-storm** (N fire-and-for
 exactly once), **google-pubsub-ack-after-enqueue-dispatch-storm** (bounded early-ACK dispatcher:
 every ACKed message must be processed once), **rabbitmq-ack-after-enqueue-dispatch-storm** (the same
 bounded early-ACK invariant for RabbitMQ deliveries), **redis-ack-after-enqueue-dispatch-storm** (the
-same bounded early-ACK invariant for Redis stream entries), **race-burst** (subscribe-before-send under contention),
+same bounded early-ACK invariant for Redis stream entries), **nats-ack-after-receive-dispatch-storm**
+(the same bounded early-ACK invariant for NATS JetStream deliveries), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured

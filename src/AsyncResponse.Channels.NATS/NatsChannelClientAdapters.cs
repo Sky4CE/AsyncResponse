@@ -235,8 +235,22 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
             existed = false;
         }
 
-        await store.DeleteAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return existed;
+        if (!existed)
+            return false;
+
+        try
+        {
+            await store.DeleteAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (NatsKVKeyNotFoundException)
+        {
+            return false;
+        }
+        catch (NatsKVKeyDeletedException)
+        {
+            return false;
+        }
     }
 
     public async IAsyncEnumerable<string> GetKeysAsync([EnumeratorCancellation] CancellationToken cancellationToken)

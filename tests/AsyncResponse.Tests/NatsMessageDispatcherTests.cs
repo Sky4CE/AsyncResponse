@@ -148,17 +148,17 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
-    public async Task HandlerFailureAtMaxAttempts_ToleratesDeadLetterPublishFailure()
+    public async Task HandlerFailureAtMaxAttempts_WhenDeadLetterPublishFails_NaksForRedelivery()
     {
         _jetStream.PublishFailureForAttempt = _ => new InvalidOperationException("dead-letter stream down");
         var rec = new RecordingDelivery();
-        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 1 };
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 1, RedeliveryDelay = TimeSpan.FromSeconds(11) };
         await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("boom"), subscriber);
 
-        // The dead-letter publish throws and is swallowed; the message is still terminated.
         await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
 
-        Assert.Equal(1, rec.Terms);
+        Assert.Equal(0, rec.Terms);
+        Assert.Equal([TimeSpan.FromSeconds(11)], rec.Naks);
         Assert.Empty(_jetStream.Published);
     }
 

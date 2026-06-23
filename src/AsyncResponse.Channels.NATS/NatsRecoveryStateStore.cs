@@ -108,7 +108,10 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 continue;
 
             if (IsExpired(stored))
+            {
+                await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
                 continue;
+            }
 
             // Older entries may predate the persisted correlation id; recover it from the key.
             if (string.IsNullOrWhiteSpace(stored.State.CorrelationId))

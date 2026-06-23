@@ -66,6 +66,80 @@ public class NatsResponseChannelClientTests
     }
 
     [Fact]
+    public async Task RawRequester_ForwardsRequestWithTimeout()
+    {
+        var connection = new Mock<INatsConnection>();
+        var timeout = TimeSpan.FromSeconds(3);
+        NatsSubOpts? capturedReplyOptions = null;
+        NatsHeaders? capturedHeaders = null;
+        using var cts = new CancellationTokenSource();
+        connection
+            .Setup(c => c.RequestAsync<string?, string>(
+                "subject",
+                "payload",
+                It.IsAny<NatsHeaders?>(),
+                It.IsAny<INatsSerialize<string?>?>(),
+                It.IsAny<INatsDeserialize<string>?>(),
+                It.IsAny<NatsPubOpts?>(),
+                It.IsAny<NatsSubOpts?>(),
+                cts.Token))
+            .Callback<string, string?, NatsHeaders?, INatsSerialize<string?>?, INatsDeserialize<string>?, NatsPubOpts?, NatsSubOpts?, CancellationToken>(
+                (_, _, headers, _, _, _, replyOptions, _) =>
+                {
+                    capturedHeaders = headers;
+                    capturedReplyOptions = replyOptions;
+                })
+            .ReturnsAsync(new NatsMsg<string>("reply", replyTo: null, 0, headers: null, data: "ack", connection: null));
+        var requester = new NatsRawRequester(connection.Object);
+        var headers = new NatsHeaders { ["h"] = "v" };
+
+        await requester.RequestAsync("subject", "payload", headers, timeout, cts.Token);
+
+        Assert.Same(headers, capturedHeaders);
+        Assert.NotNull(capturedReplyOptions);
+        Assert.Equal(timeout, capturedReplyOptions!.Timeout);
+    }
+
+    [Fact]
+    public async Task RawRequester_ForwardsSubscribePublishReplyAndFlush()
+    {
+        var connection = new Mock<INatsConnection>();
+        var sub = new Mock<INatsSub<string>>();
+        using var cts = new CancellationTokenSource();
+        connection
+            .Setup(c => c.SubscribeCoreAsync<string>(
+                "subject",
+                It.IsAny<string?>(),
+                It.IsAny<INatsDeserialize<string>?>(),
+                It.IsAny<NatsSubOpts?>(),
+                cts.Token))
+            .ReturnsAsync(sub.Object);
+        connection
+            .Setup(c => c.PublishAsync<string>(
+                "reply",
+                string.Empty,
+                It.IsAny<NatsHeaders?>(),
+                It.IsAny<string?>(),
+                It.IsAny<INatsSerialize<string>?>(),
+                It.IsAny<NatsPubOpts?>(),
+                cts.Token))
+            .Returns(ValueTask.CompletedTask);
+        connection
+            .Setup(c => c.PingAsync(cts.Token))
+            .ReturnsAsync(TimeSpan.FromMilliseconds(1));
+        var requester = new NatsRawRequester(connection.Object);
+
+        var subscribed = await requester.SubscribeAsync("subject", cts.Token);
+        await requester.PublishReplyAsync("reply", cts.Token);
+        await requester.FlushAsync(cts.Token);
+
+        Assert.Same(sub.Object, subscribed);
+        connection.Verify(c => c.SubscribeCoreAsync<string>("subject", null, It.IsAny<INatsDeserialize<string>?>(), null, cts.Token), Times.Once);
+        connection.Verify(c => c.PublishAsync<string>("reply", string.Empty, null, null, It.IsAny<INatsSerialize<string>?>(), null, cts.Token), Times.Once);
+        connection.Verify(c => c.PingAsync(cts.Token), Times.Once);
+    }
+
+    [Fact]
     public async Task Subscription_MapsMessages_DetectsProbe_AndRepliesWhenReplyToPresent()
     {
         var channel = Channel.CreateUnbounded<NatsMsg<string>>();
@@ -151,6 +225,7 @@ public class NatsKvStoreAdapterTests
         Assert.True(await adapter.DeleteAsync("present", CancellationToken.None));
         Assert.False(await adapter.DeleteAsync("absent", CancellationToken.None));
         _store.Verify(s => s.DeleteAsync("present", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.DeleteAsync("absent", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -237,6 +312,59 @@ public class NatsJetStreamTransportAdapterTests
     }
 
     [Fact]
+    public async Task PublishAsync_ForwardsHeaders()
+    {
+        NatsHeaders? captured = null;
+        _jetStream.Setup(c => c.PublishAsync(
+                "subj",
+                "payload",
+                It.IsAny<INatsSerialize<string>>(),
+                It.IsAny<NatsJSPubOpts>(),
+                It.IsAny<NatsHeaders>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<string, string?, INatsSerialize<string>, NatsJSPubOpts?, NatsHeaders?, CancellationToken>(
+                (_, _, _, _, headers, _) => captured = headers)
+            .ReturnsAsync(new PubAckResponse { Stream = "s", Seq = 8 });
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        var sequence = await adapter.PublishAsync(
+            "subj",
+            "payload",
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["AR-Correlation-Id"] = "corr-1",
+                ["Custom"] = "value"
+            },
+            CancellationToken.None);
+
+        Assert.Equal("8", sequence);
+        Assert.NotNull(captured);
+        Assert.Equal("corr-1", captured!["AR-Correlation-Id"]);
+        Assert.Equal("value", captured["Custom"]);
+    }
+
+    [Fact]
+    public async Task PublishAsync_EmptyHeaders_ForwardsNullHeaders()
+    {
+        NatsHeaders? captured = new();
+        _jetStream.Setup(c => c.PublishAsync(
+                "subj",
+                "payload",
+                It.IsAny<INatsSerialize<string>>(),
+                It.IsAny<NatsJSPubOpts>(),
+                It.IsAny<NatsHeaders>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<string, string?, INatsSerialize<string>, NatsJSPubOpts?, NatsHeaders?, CancellationToken>(
+                (_, _, _, _, headers, _) => captured = headers)
+            .ReturnsAsync(new PubAckResponse { Stream = "s", Seq = 9 });
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        await adapter.PublishAsync("subj", "payload", new Dictionary<string, string>(), CancellationToken.None);
+
+        Assert.Null(captured);
+    }
+
+    [Fact]
     public async Task ConsumeAsync_MapsMessages_AndAckNakTermDelegatesForward()
     {
         var message = new Mock<INatsJSMsg<string>>();
@@ -270,6 +398,44 @@ public class NatsJetStreamTransportAdapterTests
         try { await single.NakAsync(TimeSpan.FromSeconds(2)); } catch (Exception) { /* extension-over-mock */ }
         message.Verify(m => m.AckAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
         message.Verify(m => m.AckTerminateAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_MapsHeadersAndMetadata()
+    {
+        var headers = new NatsHeaders
+        {
+            ["AR-Correlation-Id"] = "corr-1",
+            ["Retry"] = "yes"
+        };
+        var message = new Mock<INatsJSMsg<string>>();
+        message.SetupGet(m => m.Subject).Returns("subj");
+        message.SetupGet(m => m.Data).Returns((string?)null);
+        message.SetupGet(m => m.Headers).Returns(headers);
+        message.SetupGet(m => m.Metadata).Returns(new NatsJSMsgMetadata(
+            new NatsJSSequencePair(11, 7),
+            4,
+            2,
+            DateTimeOffset.UtcNow,
+            "stream",
+            "durable",
+            "domain"));
+
+        var consumer = new Mock<INatsJSConsumer>();
+        consumer.Setup(c => c.ConsumeAsync<string>(It.IsAny<INatsDeserialize<string>>(), It.IsAny<NatsJSConsumeOpts>(), It.IsAny<CancellationToken>()))
+            .Returns(AsyncEnum(message.Object));
+        _jetStream.Setup(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>())).ReturnsAsync(consumer.Object);
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        var deliveries = new List<NatsJobDelivery>();
+        await foreach (var delivery in adapter.ConsumeAsync("stream", "durable", 16, CancellationToken.None))
+            deliveries.Add(delivery);
+
+        var single = Assert.Single(deliveries);
+        Assert.Equal(string.Empty, single.Payload);
+        Assert.Equal(4, single.NumDelivered);
+        Assert.Equal("corr-1", single.Headers["AR-Correlation-Id"]);
+        Assert.Equal("yes", single.Headers["Retry"]);
     }
 
     private static async IAsyncEnumerable<INatsJSMsg<string>> AsyncEnum(params INatsJSMsg<string>[] items)

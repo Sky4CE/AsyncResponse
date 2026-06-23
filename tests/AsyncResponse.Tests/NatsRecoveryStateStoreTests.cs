@@ -104,6 +104,7 @@ public class NatsRecoveryStateStoreTests
 
         Assert.Single(states);
         Assert.Equal("corr-live", states[0].CorrelationId);
+        Assert.False(_kv.Entries.ContainsKey(NatsSubjectSchema.RecoveryKey("corr-expired")));
     }
 
     [Fact]
