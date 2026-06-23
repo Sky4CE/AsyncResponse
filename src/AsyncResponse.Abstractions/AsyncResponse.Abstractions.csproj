@@ -11,8 +11,4 @@
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Update="Microsoft.SourceLink.GitHub" Version="10.0.300" />
-  </ItemGroup>
-
 </Project>

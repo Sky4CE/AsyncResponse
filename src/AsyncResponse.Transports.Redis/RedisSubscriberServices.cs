@@ -61,7 +61,7 @@ internal abstract class RedisSubscriberService : BackgroundService
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
                 failures++;
-                var retryDelay = RedisTransportRetry.Backoff(
+                var retryDelay = AsyncResponseRetry.Backoff(
                     failures,
                     Options.SubscriberRetryBaseDelay,
                     Options.SubscriberRetryMaxDelay);

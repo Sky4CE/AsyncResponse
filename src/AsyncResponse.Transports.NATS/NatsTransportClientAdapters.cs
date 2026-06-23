@@ -134,39 +134,13 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
 /// <summary>Bounded exponential-backoff retry for transient NATS failures, mirroring the other transports.</summary>
 internal static class NatsTransportRetry
 {
-    public static async Task<T> ExecuteAsync<T>(
+    public static Task<T> ExecuteAsync<T>(
         Func<CancellationToken, Task<T>> action,
         int maxAttempts,
         TimeSpan baseDelay,
         TimeSpan maxDelay,
         CancellationToken cancellationToken)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxAttempts);
-
-        var attempt = 0;
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            attempt++;
-
-            try
-            {
-                return await action(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (attempt < maxAttempts && IsTransient(ex))
-            {
-                var delay = Backoff(attempt, baseDelay, maxDelay);
-                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
-            }
-        }
-    }
-
-    public static TimeSpan Backoff(int completedAttempts, TimeSpan baseDelay, TimeSpan maxDelay)
-    {
-        var multiplier = 1 << Math.Min(completedAttempts - 1, 10);
-        var milliseconds = Math.Min(maxDelay.TotalMilliseconds, baseDelay.TotalMilliseconds * multiplier);
-        return TimeSpan.FromMilliseconds(Math.Max(1, milliseconds));
-    }
+        => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
     public static bool IsTransient(Exception exception)
         => exception is NatsException or TimeoutException && exception is not OperationCanceledException;

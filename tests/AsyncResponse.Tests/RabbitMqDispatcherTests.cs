@@ -2,6 +2,7 @@ using AsyncResponse.Transports.RabbitMQ;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using RabbitMQ.Client;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using Xunit;
@@ -746,9 +747,7 @@ public class RabbitMqDispatcherTests
 
     private sealed class ListLogger : ILogger
     {
-        private readonly object _gate = new();
-
-        public List<LogEntry> Entries { get; } = [];
+        public ConcurrentQueue<LogEntry> Entries { get; } = [];
 
         public IDisposable BeginScope<TState>(TState state)
             where TState : notnull
@@ -763,8 +762,7 @@ public class RabbitMqDispatcherTests
             Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
-            lock (_gate)
-                Entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+            Entries.Enqueue(new LogEntry(logLevel, formatter(state, exception), exception));
         }
     }
 

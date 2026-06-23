@@ -66,7 +66,7 @@ internal abstract class NatsSubscriberService : BackgroundService
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
                 failures++;
-                var retryDelay = NatsTransportRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
+                var retryDelay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
                 Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay);
                 await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
             }

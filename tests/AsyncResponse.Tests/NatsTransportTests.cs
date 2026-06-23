@@ -315,9 +315,9 @@ public class NatsTransportRetryTests
         var baseDelay = TimeSpan.FromMilliseconds(100);
         var maxDelay = TimeSpan.FromSeconds(1);
 
-        Assert.Equal(TimeSpan.FromMilliseconds(100), NatsTransportRetry.Backoff(1, baseDelay, maxDelay));
-        Assert.Equal(TimeSpan.FromMilliseconds(200), NatsTransportRetry.Backoff(2, baseDelay, maxDelay));
-        Assert.Equal(maxDelay, NatsTransportRetry.Backoff(10, baseDelay, maxDelay));
+        Assert.Equal(TimeSpan.FromMilliseconds(100), AsyncResponseRetry.Backoff(1, baseDelay, maxDelay));
+        Assert.Equal(TimeSpan.FromMilliseconds(200), AsyncResponseRetry.Backoff(2, baseDelay, maxDelay));
+        Assert.Equal(maxDelay, AsyncResponseRetry.Backoff(10, baseDelay, maxDelay));
     }
 
     [Fact]
