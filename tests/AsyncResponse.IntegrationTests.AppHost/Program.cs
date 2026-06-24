@@ -1,4 +1,6 @@
 using Aspire.Hosting.ApplicationModel;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 const string ProjectId = "itest-project";
 const string WorkerTopic = "worker-topic";
@@ -34,6 +36,8 @@ static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
 
 var builder = DistributedApplication.CreateBuilder(args);
+builder.Services.Configure<LoggerFilterOptions>(options =>
+    options.AddFilter("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.Critical));
 
 var redis = builder.AddRedis("redis");
 var rabbitmq = builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
