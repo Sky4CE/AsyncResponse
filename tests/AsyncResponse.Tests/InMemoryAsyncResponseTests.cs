@@ -378,19 +378,19 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task Waiter_DisposeSynchronously_CleansRecoveryStateAndSubscription()
+    public async Task Waiter_DisposeAsync_CleansRecoveryStateAndSubscription()
     {
         var provider = CreateProvider();
         var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
         var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
         var store = provider.GetRequiredService<IRecoveryStateStore>();
-        var correlationId = $"{CorrelationId}-sync-dispose";
+        var correlationId = $"{CorrelationId}-async-dispose";
 
         var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
             correlationId,
             timeout: TimeSpan.FromSeconds(5));
 
-        waiter.Dispose();
+        await waiter.DisposeAsync();
 
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
         Assert.Null(await store.GetAsync(correlationId));
@@ -409,18 +409,16 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task Publishers_WithoutCorrelationId_AreNoops()
+    public async Task Publishers_WithBlankCorrelationId_AreNoops()
     {
         var provider = CreateProvider();
         var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
         var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
         var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
 
-        AsyncResponseContext.ClearCorrelationId();
-
-        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed });
-        await rawPublisher.SetRawResponseJson("""{"Status":2}""", correlationId: null);
-        await publisher.SetException(new InvalidOperationException("missing correlation"));
+        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, " ");
+        await rawPublisher.SetRawResponseJson("""{"Status":2}""", " ");
+        await publisher.SetException(new InvalidOperationException("missing correlation"), " ");
 
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(" "));
     }

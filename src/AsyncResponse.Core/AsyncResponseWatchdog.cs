@@ -169,6 +169,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         _state = state;
         _options = options.Value.Watchdog;
         _logger = logger;
+
+        AsyncResponseDiagnostics.EnsureWatchdogGauges(state);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

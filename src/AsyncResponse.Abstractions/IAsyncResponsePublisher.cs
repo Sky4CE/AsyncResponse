@@ -19,10 +19,15 @@ public interface IAsyncResponsePublisher
     /// <typeparam name="T">The payload type.</typeparam>
     /// <param name="response">The payload to publish.</param>
     /// <param name="correlationId">
-    /// Optional correlation id; when <c>null</c>, the ambient
-    /// <see cref="AsyncResponseContext.CorrelationId"/> is used.
+    /// The correlation id identifying the response channel to publish on. Required — there is no
+    /// ambient fallback. Inside a wait trigger use <c>context.CorrelationId</c>; elsewhere pass
+    /// <see cref="AsyncResponseContext.CorrelationId"/> explicitly if you want the ambient value.
     /// </param>
-    Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload;
+    /// <param name="cancellationToken">
+    /// Propagates cancellation of the publish. The waiter side is unaffected — only the publisher's
+    /// own I/O (broker send, recovery-state lookup) observes the token.
+    /// </param>
+    Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload;
 
     /// <summary>
     /// Publishes a <em>technical</em> failure on the channel associated with the specified
@@ -41,8 +46,13 @@ public interface IAsyncResponsePublisher
     /// </summary>
     /// <param name="exception">The exception to publish as the error response.</param>
     /// <param name="correlationId">
-    /// Optional correlation id; when <c>null</c>, the ambient
-    /// <see cref="AsyncResponseContext.CorrelationId"/> is used.
+    /// The correlation id identifying the response channel to publish on. Required — there is no
+    /// ambient fallback. Inside a wait trigger use <c>context.CorrelationId</c>; elsewhere pass
+    /// <see cref="AsyncResponseContext.CorrelationId"/> explicitly if you want the ambient value.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Propagates cancellation of the publish. The waiter side is unaffected — only the publisher's
+    /// own I/O (broker send, recovery-state lookup) observes the token.
     /// </param>
     /// <remarks>
     /// <para>
@@ -78,5 +88,5 @@ public interface IAsyncResponsePublisher
     /// while remaining distinguishable by type.
     /// </para>
     /// </remarks>
-    Task SetException(Exception exception, string? correlationId = null);
+    Task SetException(Exception exception, string correlationId, CancellationToken cancellationToken = default);
 }

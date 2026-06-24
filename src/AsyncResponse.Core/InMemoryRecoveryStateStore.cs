@@ -44,6 +44,12 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             return Task.FromResult<RecoveryState?>(null);
         }
 
+        // Reject an entry written by an incompatible (newer) schema rather than risk misinterpreting
+        // it. In practice the in-memory store never crosses schema versions, but the check keeps it
+        // consistent with the durable stores and is unit-testable.
+        if (!RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+            return Task.FromResult<RecoveryState?>(null);
+
         return Task.FromResult<RecoveryState?>(entry.State);
     }
 
@@ -70,7 +76,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         foreach (var (_, entry) in _entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (entry.ExpiresAtUtc > nowUtc)
+            if (entry.ExpiresAtUtc > nowUtc && RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
                 yield return entry.State;
         }
     }

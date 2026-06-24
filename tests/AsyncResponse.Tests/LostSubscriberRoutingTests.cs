@@ -209,7 +209,7 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetException_WithoutExplicitCorrelation_UsesAmbientCorrelationId()
+    public async Task SetException_PublishesToExplicitCorrelationChannel()
     {
         RedisChannel publishedChannel = default;
         _subscriber
@@ -217,15 +217,7 @@ public class LostSubscriberRoutingTests
             .Callback<RedisChannel, RedisValue, CommandFlags>((channel, _, _) => publishedChannel = channel)
             .ReturnsAsync(1);
 
-        AsyncResponseContext.SetCorrelationId(CorrelationId);
-        try
-        {
-            await Publisher.SetException(new InvalidOperationException("ambient technical error"));
-        }
-        finally
-        {
-            AsyncResponseContext.ClearCorrelationId();
-        }
+        await Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId);
 
         Assert.Equal($"asyncresponse:response:{CorrelationId}", publishedChannel.ToString());
     }

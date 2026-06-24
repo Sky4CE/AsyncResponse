@@ -175,12 +175,24 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     if (!tcs.TrySetException(deserializationError))
                         _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 }
+                else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
+                {
+                    finished = true;
+                    var schemaError = new InvalidOperationException(
+                        $"Response envelope for correlationId {correlationId} has schema version {envelope.SchemaVersion}, " +
+                        $"newer than this build supports ({AsyncResponseEnvelopeSchema.Current}); it was produced by a newer deployment.");
+                    AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
+                    if (!tcs.TrySetException(schemaError))
+                        _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                }
                 else if (!envelope.Success)
                 {
                     finished = true;
                     var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
                     if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
-                        remoteFailure.Data["RemoteStackTrace"] = envelope.ExceptionStackTrace;
+                        // Cap on receive too: the publish-side cap only bounds traces we emit, not what
+                        // a remote we do not control can push at us.
+                        remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _options.MaxRemoteStackTraceLength);
 
                     _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
                     AsyncResponseDiagnostics.SetError(activity, "remote_failure", remoteFailure.Message);
@@ -189,7 +201,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
                 else
                 {
-                    _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
+                    if (_logger.IsEnabled(LogLevel.Information))
+                        _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
                     finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
                     if (finished && !tcs.TrySetResult(envelope.Payload!))
                         _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
@@ -271,6 +284,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
                 AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
+                AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
                 await CleanupOnceAsync().ConfigureAwait(false);
             });
@@ -324,22 +338,21 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     // IAsyncResponsePublisher
 
     /// <inheritdoc/>
-    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
-        => SetResponseCore(response, correlationId);
+    public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
-        => SetResponseCore(response, correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
-        => SetRawResponseJsonCore(responseJson, correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
+        => SetRawResponseJsonCore(responseJson, correlationId, cancellationToken);
 
-    private async Task SetResponseCore<T>(T response, string? correlationId)
+    private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "nats");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -354,21 +367,22 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         {
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
-            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.delivery", outcome.ToString());
 
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response over
                 // to the lost-subscriber dispatcher, which asks the payload whether to resume or fail.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Information))
             {
@@ -383,12 +397,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         }
     }
 
-    private async Task SetRawResponseJsonCore(string responseJson, string? correlationId)
+    private async Task SetRawResponseJsonCore(string responseJson, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "nats");
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -402,20 +415,21 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         try
         {
             var json = SerializeRawSuccessEnvelope(responseJson);
-            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.delivery", outcome.ToString());
 
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Information))
             {
@@ -431,7 +445,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     }
 
     /// <inheritdoc/>
-    public async Task SetException(Exception exception, string? correlationId = null)
+    public async Task SetException(Exception exception, string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
@@ -439,7 +453,6 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         activity?.SetTag("asyncresponse.channel", "nats");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -456,25 +469,26 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 Success = false,
                 ExceptionMessage = exception.Message,
-                ExceptionStackTrace = exception.StackTrace,
+                ExceptionStackTrace = RemoteStackTrace.ForWire(exception.StackTrace, _options.IncludeRemoteStackTrace, _options.MaxRemoteStackTraceLength),
                 Payload = null
             };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
-            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, CancellationToken.None).ConfigureAwait(false);
+            var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.delivery", outcome.ToString());
 
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, subject).ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
 
                 if (callbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
-            else
+            else if (_logger.IsEnabled(LogLevel.Information))
             {
                 _logger.LogInformation("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
             }
@@ -524,6 +538,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
+            writer.WriteNumber("SchemaVersion", AsyncResponseEnvelopeSchema.Current);
             writer.WriteBoolean("Success", true);
             writer.WritePropertyName("Payload");
             writer.WriteRawValue(payloadJson);

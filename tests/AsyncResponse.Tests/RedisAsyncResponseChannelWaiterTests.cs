@@ -201,16 +201,14 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
-    public async Task Publishers_WithoutCorrelationId_AreNoops()
+    public async Task Publishers_WithBlankCorrelationId_AreNoops()
     {
         var channel = CreateChannel();
         var rawPublisher = (IRawAsyncResponsePublisher)channel;
 
-        AsyncResponseContext.ClearCorrelationId();
-
-        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed });
-        await rawPublisher.SetRawResponseJson("""{"Status":2}""", correlationId: null);
-        await channel.SetException(new InvalidOperationException("missing correlation"));
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, " ");
+        await rawPublisher.SetRawResponseJson("""{"Status":2}""", " ");
+        await channel.SetException(new InvalidOperationException("missing correlation"), " ");
 
         _subscriber.Verify(s => s.PublishAsync(
             It.IsAny<RedisChannel>(),
@@ -239,7 +237,7 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
-    public async Task RedisWaiter_SynchronousDisposeRunsCleanup()
+    public async Task RedisWaiter_DisposeAsyncRunsCleanup()
     {
         var channel = CreateChannel();
 
@@ -247,24 +245,104 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-dispose",
             timeout: TimeSpan.FromSeconds(5));
 
-        waiter.Dispose();
+        await waiter.DisposeAsync();
 
         await Eventually(() =>
             _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
         _store.Verify(s => s.TryDeleteAsync("corr-dispose", It.IsAny<CancellationToken>()), Times.Once);
     }
 
-    private RedisAsyncResponseChannel CreateChannel() => new(
+    [Fact]
+    public async Task SetException_CapsRemoteStackTrace_OnPublish()
+    {
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+            MaxRemoteStackTraceLength = 16
+        });
+        RedisValue publishedValue = default;
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .Callback<RedisChannel, RedisValue, CommandFlags>((_, value, _) => publishedValue = value)
+            .ReturnsAsync(1);
+
+        await channel.SetException(MakeThrownException(), "corr-a");
+
+        using var document = JsonDocument.Parse(publishedValue.ToString());
+        var stackTrace = document.RootElement.GetProperty("ExceptionStackTrace").GetString();
+        Assert.NotNull(stackTrace);
+        Assert.Contains("truncated", stackTrace);
+        Assert.True(stackTrace!.Length < 80, $"stack trace was not capped: length {stackTrace.Length}");
+    }
+
+    [Fact]
+    public async Task SetException_OmitsRemoteStackTrace_WhenDisabled()
+    {
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+            IncludeRemoteStackTrace = false
+        });
+        RedisValue publishedValue = default;
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .Callback<RedisChannel, RedisValue, CommandFlags>((_, value, _) => publishedValue = value)
+            .ReturnsAsync(1);
+
+        await channel.SetException(MakeThrownException(), "corr-a");
+
+        using var document = JsonDocument.Parse(publishedValue.ToString());
+        var hasStackTrace = document.RootElement.TryGetProperty("ExceptionStackTrace", out var element)
+            && element.ValueKind != JsonValueKind.Null;
+        Assert.False(hasStackTrace);
+    }
+
+    private static Exception MakeThrownException()
+    {
+        try
+        {
+            throw new InvalidOperationException("boom with a real stack trace attached");
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    private RedisAsyncResponseChannel CreateChannel() => CreateChannel(new RedisAsyncResponseOptions
+    {
+        DefaultTimeout = TimeSpan.FromSeconds(5),
+        RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+    });
+
+    private RedisAsyncResponseChannel CreateChannel(RedisAsyncResponseOptions options) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _multiplexer.Object,
         _store.Object,
-        Options.Create(new RedisAsyncResponseOptions
-        {
-            DefaultTimeout = TimeSpan.FromSeconds(5),
-            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
-        }),
+        Options.Create(options),
         new AsyncResponseContextPropagation([]),
         NullLogger<RedisAsyncResponseChannel>.Instance);
+
+    [Fact]
+    public async Task CreateResponseWaiter_NewerEnvelopeSchema_FaultsWaiter()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-schema",
+            timeout: TimeSpan.FromSeconds(5));
+
+        PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
+        {
+            SchemaVersion = AsyncResponseEnvelopeSchema.Current + 1,
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed }
+        });
+
+        var ex = await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask);
+        Assert.IsType<InvalidOperationException>(ex);
+    }
 
     private void PublishSuccess(OperationResult payload)
         => PublishEnvelope(new AsyncResponseEnvelope<OperationResult>

@@ -29,7 +29,7 @@ public sealed class InMemorySetExceptionTests
     }
 
     [Fact]
-    public async Task SetException_WithoutExplicitCorrelation_UsesAmbientCorrelationId()
+    public async Task SetException_PublishesToExplicitCorrelationId()
     {
         await using var provider = CreateProvider();
         var asyncResponse = provider.GetRequiredService<IAsyncResponseBuilder>();
@@ -45,15 +45,7 @@ public sealed class InMemorySetExceptionTests
 
         Assert.True(await WaitForSubscriberCountAsync(probe, correlationId, expected: 1));
 
-        AsyncResponseContext.SetCorrelationId(correlationId);
-        try
-        {
-            await publisher.SetException(expected);
-        }
-        finally
-        {
-            AsyncResponseContext.ClearCorrelationId();
-        }
+        await publisher.SetException(expected, correlationId);
 
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await waitTask);
         Assert.Same(expected, thrown);

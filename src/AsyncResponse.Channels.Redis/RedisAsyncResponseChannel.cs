@@ -3,7 +3,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -32,7 +31,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     private readonly RedisAsyncResponseOptions _options;
     private readonly ILogger<RedisAsyncResponseChannel> _logger;
 
-    private readonly ConcurrentDictionary<string, ChannelSerialExecutor> _executors = new(StringComparer.Ordinal);
+    private readonly SerialExecutorRegistry _executors;
 
     public RedisAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
@@ -50,6 +49,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         _keys = new RedisKeySchema(_options.KeyPrefix);
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
+        _executors = new SerialExecutorRegistry(logger);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -154,7 +154,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
                 // deadlocks with work currently running on the executor.
-                _ = Task.Run(async () => await RemoveExecutorAsync(channel.ToString()!).ConfigureAwait(false));
+                _ = Task.Run(async () => await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false));
 
                 _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
             }
@@ -192,13 +192,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     if (!tcs.TrySetException(deserializationError))
                         _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 }
+                else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
+                {
+                    finished = true;
+                    var schemaError = new InvalidOperationException(
+                        $"Response envelope for correlationId {correlationId} has schema version {envelope.SchemaVersion}, " +
+                        $"newer than this build supports ({AsyncResponseEnvelopeSchema.Current}); it was produced by a newer deployment.");
+                    AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
+                    if (!tcs.TrySetException(schemaError))
+                        _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
+                }
                 else if (!envelope.Success)
                 {
                     finished = true;
                     var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
                     if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
                     {
-                        remoteFailure.Data["RemoteStackTrace"] = envelope.ExceptionStackTrace;
+                        // Cap on receive too: the publish-side cap only bounds traces we emit, not what
+                        // a remote we do not control can push at us.
+                        remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _options.MaxRemoteStackTraceLength);
                     }
 
                     _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
@@ -208,7 +220,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 else
                 {
-                    _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
+                    if (_logger.IsEnabled(LogLevel.Information))
+                        _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
 
                     finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
 
@@ -239,15 +252,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // Receives raw Redis pub/sub messages and enqueues them on the per-channel executor.
         void RedisHandler(RedisChannel messageChannel, RedisValue messageValue)
         {
-            _ = GetExecutor(messageChannel.ToString()!)
-                  .Enqueue(() => ProcessUnderCapturedContextAsync(messageChannel, messageValue, RedisHandler))
-                  .ContinueWith(t =>
-                  {
-                      if (t.IsFaulted)
-                          _logger.LogError(t.Exception!, "Enqueue faulted for channel {Channel}.", messageChannel.ToString()!);
-                      else if (!t.Result)
-                          _logger.LogWarning("Executor rejected message for channel {Channel}.", messageChannel.ToString()!);
-                  });
+            // The registry coordinates create/enqueue/retire under one lock, so the message is never
+            // enqueued onto an executor that is concurrently being torn down (no lost messages) and a
+            // correlation-id reused mid-drain never produces two live executors for one channel.
+            _executors.Enqueue(
+                messageChannel.ToString()!,
+                () => ProcessUnderCapturedContextAsync(messageChannel, messageValue, RedisHandler));
         }
 
         // -------------------------------------------------------------------------
@@ -277,6 +287,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
                 AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
+                AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
                 await CleanupOnceAsync(RedisHandler).ConfigureAwait(false);
             });
@@ -324,26 +335,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // IAsyncResponsePublisher
 
     /// <inheritdoc/>
-    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
-        => SetResponseCore(response, correlationId);
+    public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
-        => SetResponseCore(response, correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
-        => SetRawResponseJsonCore(responseJson, correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
+        => SetRawResponseJsonCore(responseJson, correlationId, cancellationToken);
 
     // Intentionally duplicated with SetRawResponseJsonCore: this publish method is a latency hot
     // path, and earlier shared helper/delegate refactors regressed throughput in benchmarks.
     // Keep the typed Redis path inline unless a benchmark run proves a refactor is free.
-    private async Task SetResponseCore<T>(T response, string? correlationId)
+    private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "redis");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
         // When no correlation id is provided, fall back to the ambient context.
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -370,16 +380,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response
                 // over to the lost-subscriber dispatcher, which asks the payload whether to resume
                 // the flow or fail it, and invokes the matching callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
-                await RemoveExecutorAsync(channel.ToString()!).ConfigureAwait(false);
+                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
             else
             {
@@ -397,12 +408,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     // Intentionally duplicated with SetResponseCore: raw ingress uses pre-serialized payload JSON
     // and a different lost-subscriber materialization path, so avoiding shared indirection matters.
-    private async Task SetRawResponseJsonCore(string responseJson, string? correlationId)
+    private async Task SetRawResponseJsonCore(string responseJson, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "redis");
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -421,17 +431,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
             if (numSubscribers == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
                 var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
-                await RemoveExecutorAsync(channel.ToString()!).ConfigureAwait(false);
+                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
             else
             {
@@ -448,7 +459,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     }
 
     /// <inheritdoc/>
-    public async Task SetException(Exception exception, string? correlationId = null)
+    public async Task SetException(Exception exception, string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
@@ -456,7 +467,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         activity?.SetTag("asyncresponse.channel", "redis");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
         if (string.IsNullOrWhiteSpace(correlationId))
@@ -473,7 +483,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             {
                 Success = false,
                 ExceptionMessage = exception.Message,
-                ExceptionStackTrace = exception.StackTrace,
+                ExceptionStackTrace = RemoteStackTrace.ForWire(exception.StackTrace, _options.IncludeRemoteStackTrace, _options.MaxRemoteStackTraceLength),
                 Payload = null
             };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
@@ -483,17 +493,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             if (numSubscribers == 0)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, channel.ToString()!).ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
 
                 if (callbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
-                await RemoveExecutorAsync(channel.ToString()!).ConfigureAwait(false);
+                await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
-            else
+            else if (_logger.IsEnabled(LogLevel.Information))
             {
                 _logger.LogInformation("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
             }
@@ -539,9 +550,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         return new ValueTask<long>(subscribers);
     }
 
-    private ChannelSerialExecutor GetExecutor(string channel) =>
-        _executors.GetOrAdd(channel, ch => new ChannelSerialExecutor(_logger, ch));
-
     private static string SerializeRawSuccessEnvelope(string payloadJson)
     {
         JsonSafety.ThrowIfClearlyNotJson(payloadJson);
@@ -550,6 +558,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         using (var writer = new Utf8JsonWriter(buffer))
         {
             writer.WriteStartObject();
+            writer.WriteNumber("SchemaVersion", AsyncResponseEnvelopeSchema.Current);
             writer.WriteBoolean("Success", true);
             writer.WritePropertyName("Payload");
             writer.WriteRawValue(payloadJson);
@@ -559,13 +568,5 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
 
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
-    }
-
-    private async ValueTask RemoveExecutorAsync(string channel)
-    {
-        if (_executors.TryRemove(channel, out var executor))
-        {
-            await executor.DisposeAsync().ConfigureAwait(false);
-        }
     }
 }

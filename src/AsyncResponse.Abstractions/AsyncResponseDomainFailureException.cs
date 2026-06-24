@@ -19,7 +19,7 @@ public sealed class AsyncResponseDomainFailureException : Exception
         string? correlationId,
         string? payloadTypeFullName,
         string? payloadJson)
-        : base(BuildMessage(correlationId, payloadTypeFullName, payloadJson))
+        : base(BuildMessage(correlationId, payloadTypeFullName))
     {
         CorrelationId = correlationId;
         PayloadTypeFullName = payloadTypeFullName;
@@ -32,13 +32,16 @@ public sealed class AsyncResponseDomainFailureException : Exception
     /// <summary>Full name of the payload type the original waiter was registered for.</summary>
     public string? PayloadTypeFullName { get; }
 
-    /// <summary>JSON snapshot of the payload that declined to resume the flow.</summary>
+    /// <summary>
+    /// JSON snapshot of the payload that declined to resume the flow. This is business data and may
+    /// carry PII — it lives on the property (opt-in to read) and is deliberately <em>not</em>
+    /// embedded in <see cref="Exception.Message"/>, so it is not swept into generic exception
+    /// logging by default.
+    /// </summary>
     public string? PayloadJson { get; }
 
-    private static string BuildMessage(
-        string? correlationId,
-        string? payloadTypeFullName,
-        string? payloadJson)
+    private static string BuildMessage(string? correlationId, string? payloadTypeFullName)
         => $"Async response for correlationId '{correlationId}' (payload type '{payloadTypeFullName}') " +
-           $"declined to resume the flow while no subscriber was listening. Payload: {payloadJson}";
+           "declined to resume the flow while no subscriber was listening. " +
+           "See the PayloadJson property for the response payload.";
 }

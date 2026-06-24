@@ -185,7 +185,7 @@ internal interface INatsKvStore
 /// <summary>
 /// Production <see cref="INatsKvStore"/> over a NATS JetStream Key-Value bucket. The bucket
 /// (<c>{RecoveryBucket}</c>, backed by stream <c>KV_{RecoveryBucket}</c>) is created on first use
-/// with a <c>MaxAge</c> ceiling equal to <see cref="NatsAsyncResponseChannelOptions.RecoveryStateExpiry"/>.
+/// with a <c>MaxAge</c> ceiling equal to <see cref="AsyncResponseChannelOptions.RecoveryStateExpiry"/>.
 /// </summary>
 internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncResponseChannelOptions _options) : INatsKvStore
 {

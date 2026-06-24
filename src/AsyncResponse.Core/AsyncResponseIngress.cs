@@ -14,12 +14,19 @@ internal sealed class AsyncResponseIngress(
     AsyncResponseContextPropagation _propagation,
     ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
 {
-    public async Task HandleResponseMessageAsync(string messageJson, string? correlationId = null)
+    public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.ingress.response",
             ActivityKind.Consumer,
             correlationId);
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            _logger.LogWarning("Ingress received a response message with no correlation id; cannot route it.");
+            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "No correlation id on the inbound response message.");
+            return;
+        }
 
         try
         {

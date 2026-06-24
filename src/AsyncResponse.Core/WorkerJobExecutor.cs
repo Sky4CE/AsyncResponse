@@ -20,6 +20,20 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
     {
         ArgumentNullException.ThrowIfNull(job);
 
+        // Reject a job stamped by a newer schema than this build understands rather than invoke a
+        // possibly-incompatible method shape. Throwing routes the job through the transport's normal
+        // failure/dead-letter handling. This is the single choke point every transport shares.
+        if (!WorkerJobEnvelopeSchema.IsReadable(job.SchemaVersion))
+        {
+            _logger.LogWarning(
+                "Worker job for correlationId {CorrelationId} has schema version {SchemaVersion}, newer than this build supports ({Current}); rejecting it.",
+                job.CorrelationId, job.SchemaVersion, WorkerJobEnvelopeSchema.Current);
+            AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            throw new InvalidOperationException(
+                $"Worker job schema version {job.SchemaVersion} is newer than this build supports " +
+                $"({WorkerJobEnvelopeSchema.Current}); it was produced by a newer deployment and cannot be executed safely.");
+        }
+
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.execute",
             ActivityKind.Consumer,
@@ -45,10 +59,12 @@ internal sealed class WorkerJobExecutor(IServiceScopeFactory _scopeFactory, ILog
             await scope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
 
             _logger.LogInformation("Executed worker job {Target}.{Method} successfully.", job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+            AsyncResponseDiagnostics.RecordWorkerOutcome("executed");
         }
         catch (Exception ex)
         {
             AsyncResponseDiagnostics.SetError(activity, ex);
+            AsyncResponseDiagnostics.RecordWorkerOutcome("failed");
             throw;
         }
     }

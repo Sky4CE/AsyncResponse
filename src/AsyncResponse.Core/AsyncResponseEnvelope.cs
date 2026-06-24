@@ -10,10 +10,31 @@ namespace AsyncResponse;
 /// <typeparam name="T">The payload type.</typeparam>
 internal sealed class AsyncResponseEnvelope<T>
 {
+    /// <summary>
+    /// Wire schema version, stamped with <see cref="AsyncResponseEnvelopeSchema.Current"/> when the
+    /// envelope is created. A waiter rejects an envelope whose version is newer than it supports
+    /// rather than risk misreading it. An envelope written before this field existed carries no
+    /// version on the wire and is read as the current version (and therefore accepted).
+    /// </summary>
+    public int SchemaVersion { get; set; } = AsyncResponseEnvelopeSchema.Current;
     public bool Success { get; set; }
     public T? Payload { get; set; }
     public string? ExceptionMessage { get; set; }
     public string? ExceptionStackTrace { get; set; }
+}
+
+/// <summary>
+/// Wire-schema version stamp for <see cref="AsyncResponseEnvelope{T}"/>. New envelopes are stamped
+/// with <see cref="Current"/>; a waiter rejects an envelope whose version is greater than
+/// <see cref="Current"/> so a newer publisher cannot feed an incompatible shape to an older waiter.
+/// </summary>
+internal static class AsyncResponseEnvelopeSchema
+{
+    /// <summary>The current wire schema version written by this build.</summary>
+    public const int Current = 1;
+
+    /// <summary>Returns <c>true</c> when an envelope with <paramref name="entryVersion"/> is safe to read on this build.</summary>
+    public static bool IsReadable(int entryVersion) => entryVersion <= Current;
 }
 
 /// <summary>
@@ -38,6 +59,7 @@ internal static class AsyncResponseEnvelopeOptions<T>
 /// </summary>
 internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncResponseEnvelope<T>>
 {
+    private static readonly JsonEncodedText SchemaVersionName = JsonEncodedText.Encode("SchemaVersion");
     private static readonly JsonEncodedText SuccessName = JsonEncodedText.Encode("Success");
     private static readonly JsonEncodedText PayloadName = JsonEncodedText.Encode("Payload");
     private static readonly JsonEncodedText ExceptionMessageName = JsonEncodedText.Encode("ExceptionMessage");
@@ -50,6 +72,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
             throw new JsonException();
         }
 
+        int schemaVersion = AsyncResponseEnvelopeSchema.Current;
         bool success = false;
         T? payload = default;
         string? exceptionMessage = null;
@@ -65,7 +88,11 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 var property = GetProperty(ref reader);
                 reader.Read();
 
-                if (property == EnvelopeProperty.Success)
+                if (property == EnvelopeProperty.SchemaVersion)
+                {
+                    schemaVersion = reader.TokenType == JsonTokenType.Null ? AsyncResponseEnvelopeSchema.Current : reader.GetInt32();
+                }
+                else if (property == EnvelopeProperty.Success)
                 {
                     success = reader.GetBoolean();
                 }
@@ -91,6 +118,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
         return new AsyncResponseEnvelope<T>
         {
+            SchemaVersion = schemaVersion,
             Success = success,
             Payload = payload!,
             ExceptionMessage = exceptionMessage,
@@ -101,6 +129,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
     public override void Write(Utf8JsonWriter writer, AsyncResponseEnvelope<T> value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
+        writer.WriteNumber(SchemaVersionName, value.SchemaVersion);
         writer.WriteBoolean(SuccessName, value.Success);
         writer.WritePropertyName(PayloadName);
         JsonSerializer.Serialize(writer, value.Payload, options);
@@ -116,6 +145,8 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
             var name = reader.ValueSpan;
             switch (name.Length)
             {
+                case 13 when name[0] == (byte)'S' && reader.ValueTextEquals("SchemaVersion"u8):
+                    return EnvelopeProperty.SchemaVersion;
                 case 7 when name[0] == (byte)'S' && reader.ValueTextEquals("Success"u8):
                     return EnvelopeProperty.Success;
                 case 7 when name[0] == (byte)'P' && reader.ValueTextEquals("Payload"u8):
@@ -127,6 +158,8 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
             }
         }
 
+        if (reader.ValueTextEquals("SchemaVersion"u8))
+            return EnvelopeProperty.SchemaVersion;
         if (reader.ValueTextEquals("Success"u8))
             return EnvelopeProperty.Success;
         if (reader.ValueTextEquals("Payload"u8))
@@ -142,6 +175,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
     private enum EnvelopeProperty
     {
         Unknown,
+        SchemaVersion,
         Success,
         Payload,
         ExceptionMessage,

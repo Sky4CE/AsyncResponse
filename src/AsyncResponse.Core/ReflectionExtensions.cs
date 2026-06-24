@@ -58,6 +58,17 @@ internal static class ReflectionExtensions
                 throw new InvalidOperationException(
                     $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
 
+            // 1b) Opt-in authorization: when an IAsyncResponseCallbackAuthorizer is registered, only
+            // allowed (service, method) pairs may be invoked — defense-in-depth even if the recovery
+            // store or worker transport is compromised. No authorizer registered ⇒ allow all.
+            if (provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
+                && !authorizer.IsAllowed(dto.ServiceInterfaceFullName, dto.MethodName))
+            {
+                throw new InvalidOperationException(
+                    $"Callback target '{dto.ServiceInterfaceFullName}.{dto.MethodName}' is not authorized by the registered " +
+                    $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
+            }
+
             // 2) Resolve the service instance
             var service = provider.GetService(serviceType)
                        ?? throw new InvalidOperationException(
@@ -102,6 +113,15 @@ internal static class ReflectionExtensions
             }
         }
 
+        // Opt-in fallback for callback targets loaded into a non-default AssemblyLoadContext (plugins).
+        var custom = AsyncResponseTypeResolution.Resolve(serviceInterfaceFullName);
+        if (custom is not null)
+        {
+            ServiceTypes.TryAdd(serviceInterfaceFullName, custom);
+            return custom;
+        }
+
+        AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
         return null;
     }
 

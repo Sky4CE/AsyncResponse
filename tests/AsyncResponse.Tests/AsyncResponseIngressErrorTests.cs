@@ -44,10 +44,10 @@ public class AsyncResponseIngressErrorTests
 
     private sealed class ThrowingRawPublisher(Exception? _exception = null) : IRawAsyncResponsePublisher
     {
-        public Task SetRawResponse(object? response, string? correlationId)
+        public Task SetRawResponse(object? response, string? correlationId, CancellationToken cancellationToken = default)
             => _exception is null ? Task.CompletedTask : Task.FromException(_exception);
 
-        public Task SetRawResponseJson(string responseJson, string? correlationId)
+        public Task SetRawResponseJson(string responseJson, string? correlationId, CancellationToken cancellationToken = default)
             => _exception is null ? Task.CompletedTask : Task.FromException(_exception);
     }
 
@@ -56,10 +56,10 @@ public class AsyncResponseIngressErrorTests
         public Exception? Exception { get; private set; }
         public string? CorrelationId { get; private set; }
 
-        public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
+        public Task SetResponse<T>(T response, string? correlationId = null, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
             => Task.CompletedTask;
 
-        public Task SetException(Exception exception, string? correlationId = null)
+        public Task SetException(Exception exception, string? correlationId = null, CancellationToken cancellationToken = default)
         {
             Exception = exception;
             CorrelationId = correlationId;

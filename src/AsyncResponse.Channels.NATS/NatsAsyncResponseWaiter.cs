@@ -8,9 +8,6 @@ internal sealed class NatsAsyncResponseWaiter<T>(
     /// <inheritdoc/>
     public Task<T> ResponseTask => _responseTask;
 
-    public void Dispose()
-        => _cleanupAsync().AsTask().GetAwaiter().GetResult();
-
     public ValueTask DisposeAsync()
         => _cleanupAsync();
 }

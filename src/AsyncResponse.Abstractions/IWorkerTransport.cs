@@ -6,6 +6,15 @@ namespace AsyncResponse;
 /// </summary>
 public sealed class WorkerJobEnvelope
 {
+    /// <summary>
+    /// The wire schema version this job was written with. New jobs are always stamped with
+    /// <see cref="WorkerJobEnvelopeSchema.Current"/>. Jobs written before this field existed carry no
+    /// version on the wire and are read as the current version (and therefore executed); a job whose
+    /// version is greater than the reader's current is rejected so a newer producer cannot silently
+    /// invoke an incompatible method shape on an older worker.
+    /// </summary>
+    public int SchemaVersion { get; set; } = WorkerJobEnvelopeSchema.Current;
+
     /// <summary>The service method to execute.</summary>
     public required ReflectionCallDto Call { get; set; }
 
@@ -42,4 +51,24 @@ public interface IWorkerTransport
 {
     /// <summary>Publishes a worker job for asynchronous execution.</summary>
     Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Wire-schema version stamp for <see cref="WorkerJobEnvelope"/>. New jobs are stamped with
+/// <see cref="Current"/>. The ingress loader rejects (dead-letters) any job whose version is
+/// greater than <see cref="Current"/>: a newer producer must never silently invoke an incompatible
+/// method shape on an older worker. Jobs whose version is missing or lower are read
+/// forward-compatibly — additive schema changes only.
+/// </summary>
+public static class WorkerJobEnvelopeSchema
+{
+    /// <summary>The current wire schema version written by this build.</summary>
+    public const int Current = 1;
+
+    /// <summary>
+    /// Returns <c>true</c> when a job with <paramref name="entryVersion"/> is safe to execute on
+    /// this build. See <see cref="RecoveryStateSchema.IsReadable"/> for the policy.
+    /// </summary>
+    public static bool IsReadable(int entryVersion)
+        => entryVersion <= Current;
 }

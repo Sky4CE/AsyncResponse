@@ -80,6 +80,9 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             return null;
         }
 
+        if (!IsSchemaReadable(stored.State, key))
+            return null;
+
         if (string.IsNullOrWhiteSpace(stored.State.CorrelationId))
             stored.State.CorrelationId = correlationId;
 
@@ -113,6 +116,9 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 continue;
             }
 
+            if (!IsSchemaReadable(stored.State, key))
+                continue;
+
             // Older entries may predate the persisted correlation id; recover it from the key.
             if (string.IsNullOrWhiteSpace(stored.State.CorrelationId))
                 stored.State.CorrelationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
@@ -122,6 +128,17 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     }
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
+
+    private bool IsSchemaReadable(RecoveryState state, string key)
+    {
+        if (RecoveryStateSchema.IsReadable(state.SchemaVersion))
+            return true;
+
+        _logger.LogWarning(
+            "Recovery state at key {RecoveryKey} has schema version {SchemaVersion}, newer than this build supports ({Current}); rejecting it instead of risking a misinterpreted recovery.",
+            key, state.SchemaVersion, RecoveryStateSchema.Current);
+        return false;
+    }
 
     private StoredRecoveryState? TryDeserialize(string json, string key)
     {

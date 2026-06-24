@@ -67,4 +67,70 @@ public class ChannelSerialExecutorTests
 
         Assert.False(accepted);
     }
+
+    [Fact]
+    public async Task ConcurrentProducers_NeverRunWorkConcurrently()
+    {
+        // The single-reader drain loop must serialize work even when many producers enqueue at once
+        // (mirrors a broker subscriber callback fanning messages in from multiple threads).
+        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
+        var concurrentlyActive = 0;
+        var observedOverlap = 0;
+        var completed = 0;
+
+        var producers = Enumerable.Range(0, 16).Select(_ => Task.Run(async () =>
+        {
+            for (var i = 0; i < 32; i++)
+            {
+                await executor.Enqueue(async () =>
+                {
+                    if (Interlocked.Increment(ref concurrentlyActive) > 1)
+                        Interlocked.Exchange(ref observedOverlap, 1);
+                    await Task.Yield();
+                    Interlocked.Decrement(ref concurrentlyActive);
+                    Interlocked.Increment(ref completed);
+                });
+            }
+        })).ToArray();
+
+        await Task.WhenAll(producers);
+        await executor.DisposeAsync();
+
+        Assert.Equal(0, observedOverlap);     // never ran two at once, regardless of producer count
+        Assert.Equal(16 * 32, completed);     // and every enqueued item ran exactly once
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WaitsForInFlightWorkToComplete()
+    {
+        var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
+        var completed = false;
+
+        await executor.Enqueue(async () =>
+        {
+            await Task.Delay(50);
+            completed = true;
+        });
+
+        // Dispose must drain in-flight work, not abandon it.
+        await executor.DisposeAsync();
+
+        Assert.True(completed);
+    }
+
+    [Fact]
+    public async Task Enqueue_WithCancelledToken_DoesNotRunWork()
+    {
+        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
+        var ran = false;
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await executor.Enqueue(() => { ran = true; return Task.CompletedTask; }, cts.Token));
+
+        await executor.DisposeAsync();
+
+        Assert.False(ran);
+    }
 }

@@ -199,15 +199,14 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task Publishers_WithoutCorrelationId_AreNoops()
+    public async Task Publishers_WithBlankCorrelationId_AreNoops()
     {
         var channel = CreateChannel();
         var raw = (IRawAsyncResponsePublisher)channel;
-        AsyncResponseContext.ClearCorrelationId();
 
-        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed });
-        await raw.SetRawResponseJson("""{"Status":2}""", correlationId: null);
-        await channel.SetException(new InvalidOperationException("no cid"));
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, " ");
+        await raw.SetRawResponseJson("""{"Status":2}""", " ");
+        await channel.SetException(new InvalidOperationException("no cid"), " ");
 
         Assert.Empty(_client.Requests);
     }
@@ -326,12 +325,12 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task Waiter_SynchronousDispose_RunsCleanup()
+    public async Task Waiter_DisposeAsync_RunsCleanup()
     {
         var channel = CreateChannel();
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-dispose", timeout: TimeSpan.FromSeconds(5));
 
-        waiter.Dispose(); // synchronous dispose path
+        await waiter.DisposeAsync();
 
         await Eventually(() => _store.Invocations.Any(i => i.Method.Name == nameof(IRecoveryStateStore.TryDeleteAsync)));
     }

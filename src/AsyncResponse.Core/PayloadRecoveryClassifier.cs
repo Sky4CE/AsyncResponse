@@ -78,8 +78,19 @@ internal static class PayloadRecoveryClassifier
             .Select(a => a.GetType(payloadTypeFullName, throwOnError: false))
             .FirstOrDefault(t => t != null);
 
+        // Opt-in fallback for payload types loaded into a non-default AssemblyLoadContext (plugins).
+        resolved ??= AsyncResponseTypeResolution.Resolve(payloadTypeFullName);
+
         if (resolved is not null)
+        {
             PayloadTypes.TryAdd(payloadTypeFullName, resolved);
+        }
+        else
+        {
+            // Surface the silent "couldn't materialize the payload type" path so operators can
+            // correlate a recovery that routed to failure with a missing/ALC-loaded type.
+            AsyncResponseDiagnostics.RecordTypeResolutionFailure("payload");
+        }
 
         return resolved;
     }

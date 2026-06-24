@@ -23,10 +23,12 @@ public interface IAsyncResponseIngress
     /// </summary>
     /// <param name="messageJson">The raw message body.</param>
     /// <param name="correlationId">
-    /// The correlation id, typically read from a message attribute/header. When <c>null</c>,
-    /// the ambient <see cref="AsyncResponseContext.CorrelationId"/> is used.
+    /// The correlation id the calling adapter extracted from the message (attribute/header/body).
+    /// It is nullable because extraction from an untrusted broker message can legitimately yield
+    /// nothing — a <c>null</c> or blank id means the message is unroutable, so it is logged and
+    /// skipped. There is no ambient fallback: pass the extracted id explicitly.
     /// </param>
-    Task HandleResponseMessageAsync(string messageJson, string? correlationId = null);
+    Task HandleResponseMessageAsync(string messageJson, string? correlationId);
 
     /// <summary>
     /// Handles an inbound worker-job message (a serialized <see cref="WorkerJobEnvelope"/>):

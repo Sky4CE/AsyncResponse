@@ -103,25 +103,24 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.CleanupOnceAsync);
     }
 
-    public Task SetResponse<T>(T response, string? correlationId = null) where T : IAsyncResponsePayload
-        => SetResponseCore(response, correlationId);
+    public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string? correlationId)
-        => SetResponseCore(response, correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponse(object? response, string correlationId, CancellationToken cancellationToken)
+        => SetResponseCore(response, correlationId, cancellationToken);
 
-    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string? correlationId)
-        => SetRawResponseJsonCore(new RawJsonResponse(responseJson), correlationId);
+    Task IRawAsyncResponsePublisher.SetRawResponseJson(string responseJson, string correlationId, CancellationToken cancellationToken)
+        => SetRawResponseJsonCore(new RawJsonResponse(responseJson), correlationId, cancellationToken);
 
     // Intentionally duplicated with SetRawResponseJsonCore: this is a microbenchmarked publish
     // hot path. Earlier generic/delegate/helper refactors made the code prettier but measurably
     // regressed latency and throughput, so keep the typed path inline unless benchmarks prove out.
-    private async Task SetResponseCore<T>(T response, string? correlationId)
+    private async Task SetResponseCore<T>(T response, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.set_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "inmemory");
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
         if (string.IsNullOrWhiteSpace(correlationId))
         {
@@ -136,16 +135,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponse(recoveryState, response, ChannelName(correlationId))
                     .ConfigureAwait(false);
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                 if (result.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -164,12 +164,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
     // Intentionally duplicated with SetResponseCore: raw ingress has different dispatch and
     // recovery materialization costs, and keeping the branch inline avoids hot-path indirection.
-    private async Task SetRawResponseJsonCore(RawJsonResponse response, string? correlationId)
+    private async Task SetRawResponseJsonCore(RawJsonResponse response, string correlationId, CancellationToken cancellationToken)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity("asyncresponse.ingress.raw_response", ActivityKind.Producer);
         activity?.SetTag("asyncresponse.channel", "inmemory");
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
         if (string.IsNullOrWhiteSpace(correlationId))
         {
@@ -184,16 +183,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponse(recoveryState, response.DeserializeUntyped(), ChannelName(correlationId))
                     .ConfigureAwait(false);
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                 if (result.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -210,7 +210,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         }
     }
 
-    public async Task SetException(Exception exception, string? correlationId = null)
+    public async Task SetException(Exception exception, string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
@@ -218,7 +218,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         activity?.SetTag("asyncresponse.channel", "inmemory");
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 
-        correlationId ??= AsyncResponseContext.CorrelationId;
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
         if (string.IsNullOrWhiteSpace(correlationId))
         {
@@ -233,22 +232,24 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId).ConfigureAwait(false);
+                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var invoked = await _lostSubscriberDispatcher
                     .DispatchLostException(recoveryState, exception, ChannelName(correlationId))
                     .ConfigureAwait(false);
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
 
                 if (invoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
 
-            _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -591,6 +592,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 return Task.CompletedTask;
 
             _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", CorrelationId);
+            AsyncResponseDiagnostics.RecordWaiterTimeout("inmemory");
 
             var exception = new TimeoutException($"Timed out waiting for response for correlationId {CorrelationId}.");
             AsyncResponseDiagnostics.SetError(_activity, "timeout", exception.Message);
@@ -759,9 +761,6 @@ internal sealed class InMemoryAsyncResponseWaiter<T>(
     Func<ValueTask> _cleanupAsync) : IAsyncResponseWaiter<T> where T : IAsyncResponsePayload
 {
     public Task<T> ResponseTask => _responseTask;
-
-    public void Dispose()
-        => _cleanupAsync().AsTask().GetAwaiter().GetResult();
 
     public ValueTask DisposeAsync()
         => _cleanupAsync();

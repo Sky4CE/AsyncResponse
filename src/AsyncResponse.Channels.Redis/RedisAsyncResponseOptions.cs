@@ -1,9 +1,10 @@
 namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
-/// Options for the Redis async-response channel.
+/// Options for the Redis async-response channel. Recovery-state expiry, default timeout, and the
+/// remote stack-trace policy are inherited from <see cref="DurableAsyncResponseChannelOptions"/>.
 /// </summary>
-public sealed class RedisAsyncResponseOptions
+public sealed class RedisAsyncResponseOptions : DurableAsyncResponseChannelOptions
 {
     /// <summary>
     /// Prefix for every Redis key and pub/sub channel created by the channel:
@@ -14,20 +15,4 @@ public sealed class RedisAsyncResponseOptions
     /// recovery state.
     /// </summary>
     public string KeyPrefix { get; set; } = "asyncresponse";
-
-    /// <summary>
-    /// How long persisted <see cref="RecoveryState"/> entries live. This bounds how long after a
-    /// crash/redeploy a late response can still trigger the lost-subscriber callbacks.
-    /// Set it comfortably above your longest-running flow. Default: 7 days.
-    /// </summary>
-    public TimeSpan RecoveryStateExpiry { get; set; } = TimeSpan.FromDays(7);
-
-    /// <summary>
-    /// Default timeout applied to waiters that do not specify <c>WithTimeout</c>. When
-    /// <c>null</c> (the default), <see cref="RecoveryStateExpiry"/> is used — once the recovery
-    /// state has expired, waiting longer is meaningless. Waits are never infinite: a response
-    /// that never arrives faults the waiter with a <see cref="TimeoutException"/> so the flow
-    /// fails visibly instead of hanging forever.
-    /// </summary>
-    public TimeSpan? DefaultTimeout { get; set; }
 }

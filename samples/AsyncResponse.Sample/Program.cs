@@ -802,8 +802,8 @@ app.MapPost("/multi-step", async (
 })
 .WithTags("Flows");
 
-// 2c) Demonstrates the publisher's ambient correlation fallback: the trigger receives a context,
-//     but SetException is intentionally called without passing the id.
+// 2c) Publishes a technical failure from inside the trigger, addressing the response channel with
+//     the request context's correlation id (the explicit, recommended way).
 app.MapPost("/ambient-exception", async (
     IAsyncResponseBuilder asyncResponse,
     IAsyncResponsePublisher publisher,
@@ -814,7 +814,7 @@ app.MapPost("/ambient-exception", async (
         await asyncResponse
             .For<OperationResult>()
             .WithTimeout(TimeSpan.FromSeconds(10))
-            .WaitAsync(_ => publisher.SetException(new InvalidOperationException(message ?? "ambient technical error")));
+            .WaitAsync(ctx => publisher.SetException(new InvalidOperationException(message ?? "trigger technical error"), ctx.CorrelationId));
 
         return Results.Problem("The waiter completed successfully; it was expected to fault.");
     }

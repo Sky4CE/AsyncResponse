@@ -58,7 +58,16 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
         try
         {
-            return JsonSerializer.Deserialize<RecoveryState>(value.ToString());
+            var state = JsonSerializer.Deserialize<RecoveryState>(value.ToString());
+            if (state is not null && !RecoveryStateSchema.IsReadable(state.SchemaVersion))
+            {
+                _logger.LogWarning(
+                    "Recovery state at {RecoveryKey} has schema version {SchemaVersion}, newer than this build supports ({Current}); rejecting it instead of risking a misinterpreted recovery.",
+                    recoveryKey.ToString(), state.SchemaVersion, RecoveryStateSchema.Current);
+                return null;
+            }
+
+            return state;
         }
         catch (JsonException ex)
         {
@@ -110,6 +119,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
 
                 if (state is null)
                     continue;
+
+                if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
+                {
+                    _logger.LogWarning(
+                        "Recovery state at {RecoveryKey} has schema version {SchemaVersion}, newer than this build supports ({Current}); skipping it during scan.",
+                        recoveryKey, state.SchemaVersion, RecoveryStateSchema.Current);
+                    continue;
+                }
 
                 // Older entries may predate the persisted correlation id; recover it from the key.
                 if (string.IsNullOrWhiteSpace(state.CorrelationId))

@@ -11,7 +11,7 @@ namespace AsyncResponse.Channels.NATS;
 /// routed to the resume or failure callback.
 /// </para>
 /// </summary>
-public sealed class NatsAsyncResponseChannelOptions
+public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChannelOptions
 {
     /// <summary>The channel name reported to the startup validator.</summary>
     public const string ChannelName = "NATS";
@@ -38,21 +38,8 @@ public sealed class NatsAsyncResponseChannelOptions
     /// </summary>
     public int RecoveryBucketReplicas { get; set; } = 1;
 
-    /// <summary>
-    /// How long persisted <see cref="RecoveryState"/> entries live. This bounds how long after a
-    /// crash/redeploy a late response can still trigger the lost-subscriber callbacks. It is applied
-    /// both as the per-entry logical expiry and as the Key-Value bucket's <c>MaxAge</c> ceiling.
-    /// Set it comfortably above your longest-running flow. Default: 7 days.
-    /// </summary>
-    public TimeSpan RecoveryStateExpiry { get; set; } = TimeSpan.FromDays(7);
-
-    /// <summary>
-    /// Default timeout applied to waiters that do not specify <c>WithTimeout</c>. When <c>null</c>
-    /// (the default), <see cref="RecoveryStateExpiry"/> is used — once the recovery state has expired,
-    /// waiting longer is meaningless. Waits are never infinite: a response that never arrives faults
-    /// the waiter with a <see cref="TimeoutException"/> so the flow fails visibly instead of hanging.
-    /// </summary>
-    public TimeSpan? DefaultTimeout { get; set; }
+    // RecoveryStateExpiry and DefaultTimeout are inherited from AsyncResponseChannelOptions (the NATS
+    // expiry is also applied as the Key-Value bucket's MaxAge ceiling — see the recovery store).
 
     /// <summary>
     /// How long a publish waits for a waiter to acknowledge receipt before concluding that, although
@@ -69,6 +56,9 @@ public sealed class NatsAsyncResponseChannelOptions
     /// subscriber counts to clients, so the probe reports presence (0 or 1). Default: 2 seconds.
     /// </summary>
     public TimeSpan PresenceProbeTimeout { get; set; } = TimeSpan.FromSeconds(2);
+
+    // IncludeRemoteStackTrace and MaxRemoteStackTraceLength are inherited from
+    // DurableAsyncResponseChannelOptions.
 
     /// <summary>
     /// Validates the options, throwing <see cref="InvalidOperationException"/> on a misconfiguration.
@@ -89,6 +79,9 @@ public sealed class NatsAsyncResponseChannelOptions
 
         if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(DefaultTimeout)} must be positive when set.");
+
+        if (MaxRemoteStackTraceLength < 0)
+            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
 
         // A NATS bucket name must be a single token of [A-Za-z0-9_-]. A dotted/whitespace value would
         // silently produce an unusable backing stream, so reject it explicitly.
