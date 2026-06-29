@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -60,7 +61,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         bool? shouldResume = null;
         var routeSet = false;
         var routeMixed = false;
-        Exception? firstException = null;
+        ExceptionDispatchInfo? firstException = null;
 
         foreach (var recoveryState in recoveryStates)
         {
@@ -88,12 +89,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
                     throw;
 
-                firstException ??= ex;
+                // Capture rather than re-throw a bare variable so the original throw site's stack
+                // trace survives the dispatch to the remaining registrations.
+                firstException ??= ExceptionDispatchInfo.Capture(ex);
             }
         }
 
-        if (firstException is not null)
-            throw firstException;
+        firstException?.Throw();
 
         return new LostSubscriberDispatchResult(routeMixed ? null : shouldResume, callbackInvoked);
     }
@@ -114,7 +116,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
             return await DispatchLostException(null, exception, channel).ConfigureAwait(false);
 
         var callbackInvoked = false;
-        Exception? firstException = null;
+        ExceptionDispatchInfo? firstException = null;
 
         foreach (var recoveryState in recoveryStates)
         {
@@ -131,12 +133,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
                     throw;
 
-                firstException ??= ex;
+                // Capture rather than re-throw a bare variable so the original throw site's stack
+                // trace survives the dispatch to the remaining registrations.
+                firstException ??= ExceptionDispatchInfo.Capture(ex);
             }
         }
 
-        if (firstException is not null)
-            throw firstException;
+        firstException?.Throw();
 
         return callbackInvoked;
     }

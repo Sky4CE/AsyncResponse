@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using StackExchange.Redis;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Xunit;
 
@@ -300,6 +301,38 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
+    public async Task SetException_FailureCallbackThrows_PreservesOriginalStackTrace()
+    {
+        // Regression guard: the multi-registration dispatcher captures the first callback exception
+        // and re-throws it after dispatching the rest. It must do so with ExceptionDispatchInfo so
+        // the original throw site survives; a bare `throw capturedVariable;` would reset the stack
+        // trace to the dispatcher and drop the throwing frame.
+        ArmRecoveryState();
+        _spy.FailureCallbackError = CaptureExceptionThrownAt();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Publisher.SetException(new InvalidOperationException("technical error"), CorrelationId));
+
+        Assert.NotNull(thrown.StackTrace);
+        Assert.Contains(nameof(ThrowMarkerSite), thrown.StackTrace);
+    }
+
+    [Fact]
+    public async Task SetResponse_ResumeCallbackThrows_PreservesOriginalStackTrace()
+    {
+        // Same regression guard for the response-dispatch path: a resuming payload whose resume
+        // callback throws must propagate with the original throw site intact.
+        ArmRecoveryState();
+        _spy.ResumeCallbackError = CaptureExceptionThrownAt();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, CorrelationId));
+
+        Assert.NotNull(thrown.StackTrace);
+        Assert.Contains(nameof(ThrowMarkerSite), thrown.StackTrace);
+    }
+
+    [Fact]
     public async Task SetException_NullException_ThrowsBeforePublishing()
     {
         await Assert.ThrowsAsync<ArgumentNullException>(() => Publisher.SetException(null!, CorrelationId));
@@ -406,6 +439,27 @@ public class LostSubscriberRoutingTests
 
     // ----- helpers -----
 
+    // Produces an exception carrying a real, test-controlled throw-site frame (ThrowMarkerSite),
+    // so a stack-trace assertion can prove the original trace survived dispatch. NoInlining keeps
+    // the frame present in Release builds.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static InvalidOperationException CaptureExceptionThrownAt()
+    {
+        try
+        {
+            ThrowMarkerSite();
+            throw new InvalidOperationException("unreachable");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ex;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowMarkerSite()
+        => throw new InvalidOperationException("handler exploded");
+
     private void ArmRecoveryState(string? payloadTypeFullName = "default", bool includeFailureCallback = true)
         => ArmRecoveryStates(NewRecoveryState(payloadTypeFullName, includeFailureCallback));
 
@@ -457,11 +511,12 @@ public sealed class RecoverySpy : IRecoverySpy
     public List<Exception> Failures { get; } = [];
     public List<(int OrderId, string? CorrelationId, string? ReplyTarget)> WorkerJobs { get; } = [];
     public Exception? FailureCallbackError { get; set; }
+    public Exception? ResumeCallbackError { get; set; }
 
     public Task OnResume(object payload)
     {
         ResumedPayloads.Add(payload);
-        return Task.CompletedTask;
+        return ResumeCallbackError is null ? Task.CompletedTask : Task.FromException(ResumeCallbackError);
     }
 
     public Task OnFailure(Exception exception)
