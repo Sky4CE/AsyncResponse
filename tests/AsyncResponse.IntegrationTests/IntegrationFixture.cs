@@ -28,6 +28,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient RedisTransportEarlyAckClient { get; private set; } = null!;
     public HttpClient NatsClient { get; private set; } = null!;
     public HttpClient NatsEarlyAckClient { get; private set; } = null!;
+    public HttpClient PostgreSqlClient { get; private set; } = null!;
+    public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -61,6 +63,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-nats-early-ack")
             .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-postgresql")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-postgresql-early-ack")
+            .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
@@ -70,6 +78,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
         NatsClient = _app.CreateHttpClient("itest-app-nats");
         NatsEarlyAckClient = _app.CreateHttpClient("itest-app-nats-early-ack");
+        PostgreSqlClient = _app.CreateHttpClient("itest-app-postgresql");
+        PostgreSqlEarlyAckClient = _app.CreateHttpClient("itest-app-postgresql-early-ack");
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
@@ -78,6 +88,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(NatsClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(NatsEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(PostgreSqlClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(PostgreSqlEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -90,6 +102,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         RedisTransportEarlyAckClient?.Dispose();
         NatsClient?.Dispose();
         NatsEarlyAckClient?.Dispose();
+        PostgreSqlClient?.Dispose();
+        PostgreSqlEarlyAckClient?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }

@@ -8,6 +8,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="AsyncResponse.Core" />
     <InternalsVisibleTo Include="AsyncResponse.Channels.NATS" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.PostgreSQL" />
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
   </ItemGroup>
 

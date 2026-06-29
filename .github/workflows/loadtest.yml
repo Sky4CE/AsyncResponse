@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, nats, recovery'
+        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, nats, postgresql, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -69,6 +69,21 @@ on:
       nats_worker_queue_capacity:
         description: 'NATS early-ACK background queue capacity'
         default: '256'
+      postgresql_url:
+        description: 'Optional existing PostgreSQL SUT URL for --postgresql-url'
+        default: ''
+      postgresql_early_ack_url:
+        description: 'Optional existing PostgreSQL early-ACK SUT URL for --postgresql-early-ack-url'
+        default: ''
+      postgresql_worker_ack_mode:
+        description: 'PostgreSQL worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
+        default: 'AckAfterReceive'
+      postgresql_worker_background_workers:
+        description: 'PostgreSQL early-ACK background worker count'
+        default: '4'
+      postgresql_worker_queue_capacity:
+        description: 'PostgreSQL early-ACK background queue capacity'
+        default: '256'
 
 # github-action-benchmark commits the results history to gh-pages.
 permissions:
@@ -113,6 +128,11 @@ jobs:
           ASYNCRESPONSE_ITEST_NATS_WORKER_ACK_MODE: ${{ github.event.inputs.nats_worker_ack_mode || 'AckAfterReceive' }}
           ASYNCRESPONSE_ITEST_NATS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.nats_worker_background_workers || '4' }}
           ASYNCRESPONSE_ITEST_NATS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.nats_worker_queue_capacity || '256' }}
+          POSTGRESQL_URL: ${{ github.event.inputs.postgresql_url || '' }}
+          POSTGRESQL_EARLY_ACK_URL: ${{ github.event.inputs.postgresql_early_ack_url || '' }}
+          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_ACK_MODE: ${{ github.event.inputs.postgresql_worker_ack_mode || 'AckAfterReceive' }}
+          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.postgresql_worker_background_workers || '4' }}
+          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.postgresql_worker_queue_capacity || '256' }}
         run: |
           args=(
             --profile "${{ github.event.inputs.profile || 'broad' }}"
@@ -132,6 +152,12 @@ jobs:
           fi
           if [ -n "$NATS_EARLY_ACK_URL" ]; then
             args+=(--nats-early-ack-url "$NATS_EARLY_ACK_URL")
+          fi
+          if [ -n "$POSTGRESQL_URL" ]; then
+            args+=(--postgresql-url "$POSTGRESQL_URL")
+          fi
+          if [ -n "$POSTGRESQL_EARLY_ACK_URL" ]; then
+            args+=(--postgresql-early-ack-url "$POSTGRESQL_EARLY_ACK_URL")
           fi
           dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- "${args[@]}"
 

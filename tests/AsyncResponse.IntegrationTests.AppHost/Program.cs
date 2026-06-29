@@ -31,6 +31,12 @@ const string RedisTransportKeyPrefix = "itest-redistransport";
 const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
 const string NatsSubjectPrefix = "itest-nats";
 const string NatsEarlyAckSubjectPrefix = "itest-nats-early-ack";
+const string PostgreSqlWorkerQueue = "worker";
+const string PostgreSqlResponseQueue = "response";
+const string PostgreSqlDeadLetterQueue = "deadletter";
+const string PostgreSqlEarlyAckWorkerQueue = "worker_earlyack";
+const string PostgreSqlEarlyAckResponseQueue = "response_earlyack";
+const string PostgreSqlEarlyAckDeadLetterQueue = "deadletter_earlyack";
 
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
@@ -54,6 +60,11 @@ var nats = builder.AddContainer("nats", "nats", "latest")
     .WithArgs("-js")
     .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
 
+var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
+    .WithEnvironment("POSTGRES_DB", "asyncresponse")
+    .WithEnvironment("POSTGRES_PASSWORD", "postgres")
+    .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
+
 var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
 var emulatorHost = ReferenceExpression.Create(
     $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
@@ -63,6 +74,9 @@ var rabbitMqConnectionString = ReferenceExpression.Create(
 var natsEndpoint = nats.GetEndpoint("nats");
 var natsConnectionString = ReferenceExpression.Create(
     $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
+var postgresEndpoint = postgres.GetEndpoint("postgres");
+var postgresConnectionString = ReferenceExpression.Create(
+    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse");
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
@@ -211,6 +225,33 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats-early-ack", la
     .WithEnvironment("Nats:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("AsyncResponse:Channel", "NATS")
     .WithEnvironment("AsyncResponse:Transport", "NATS")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql", launchProfileName: null)
+    .WaitFor(postgres)
+    .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
+    .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlWorkerQueue)
+    .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlResponseQueue)
+    .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlDeadLetterQueue)
+    .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
+    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql-early-ack", launchProfileName: null)
+    .WaitFor(postgres)
+    .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
+    .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlEarlyAckWorkerQueue)
+    .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlEarlyAckResponseQueue)
+    .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlEarlyAckDeadLetterQueue)
+    .WithEnvironment("PostgreSQL:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_ACK_MODE", "AckAfterReceive"))
+    .WithEnvironment("PostgreSQL:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("PostgreSQL:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("PostgreSQL:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("PostgreSQL:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
+    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

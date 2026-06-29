@@ -15,6 +15,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile postgresql
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed
@@ -22,6 +23,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --postgresql-url http://localhost:5008 --postgresql-early-ack-url http://localhost:5009 --profile postgresql
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
 // The process exits non-zero if any scenario records failed requests.
@@ -38,6 +40,8 @@ var existingRedisUrl = GetString("--redis-url");
 var existingRedisEarlyAckUrl = GetString("--redis-early-ack-url");
 var existingNatsUrl = GetString("--nats-url");
 var existingNatsEarlyAckUrl = GetString("--nats-early-ack-url");
+var existingPostgreSqlUrl = GetString("--postgresql-url");
+var existingPostgreSqlEarlyAckUrl = GetString("--postgresql-early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
@@ -49,10 +53,12 @@ Uri? redisBaseAddress = null;
 Uri? redisEarlyAckBaseAddress = null;
 Uri? natsBaseAddress = null;
 Uri? natsEarlyAckBaseAddress = null;
+Uri? postgreSqlBaseAddress = null;
+Uri? postgreSqlEarlyAckBaseAddress = null;
 
-if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null)
+if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null || existingPostgreSqlUrl is not null)
 {
-    baseAddress = new Uri(existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl!);
+    baseAddress = new Uri(existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl!);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
     if (existingEarlyAckUrl is not null)
     {
@@ -76,12 +82,20 @@ if (existingUrl is not null || existingRabbitMqUrl is not null || existingRedisU
         Console.WriteLine($"Load testing existing Redis transport ACK-after-enqueue instance at {redisEarlyAckBaseAddress}.");
     }
 
-    natsBaseAddress = new Uri(existingNatsUrl ?? existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl!);
+    natsBaseAddress = new Uri(existingNatsUrl ?? existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingPostgreSqlUrl!);
     Console.WriteLine($"Load testing existing NATS instance at {natsBaseAddress}.");
     if (existingNatsEarlyAckUrl is not null)
     {
         natsEarlyAckBaseAddress = new Uri(existingNatsEarlyAckUrl);
         Console.WriteLine($"Load testing existing NATS ACK-after-receive instance at {natsEarlyAckBaseAddress}.");
+    }
+
+    postgreSqlBaseAddress = new Uri(existingPostgreSqlUrl ?? existingUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl!);
+    Console.WriteLine($"Load testing existing PostgreSQL instance at {postgreSqlBaseAddress}.");
+    if (existingPostgreSqlEarlyAckUrl is not null)
+    {
+        postgreSqlEarlyAckBaseAddress = new Uri(existingPostgreSqlEarlyAckUrl);
+        Console.WriteLine($"Load testing existing PostgreSQL ACK-after-receive instance at {postgreSqlEarlyAckBaseAddress}.");
     }
 }
 else
@@ -98,6 +112,8 @@ else
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-redis-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-nats").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-nats-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-postgresql").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-postgresql-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
@@ -115,6 +131,10 @@ else
         natsBaseAddress = probe.BaseAddress!;
     using (var probe = app.CreateHttpClient("itest-app-nats-early-ack"))
         natsEarlyAckBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-postgresql"))
+        postgreSqlBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-postgresql-early-ack"))
+        postgreSqlEarlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
@@ -124,6 +144,8 @@ else
     Console.WriteLine($"Redis transport ACK-after-enqueue SUT at {redisEarlyAckBaseAddress}.");
     Console.WriteLine($"NATS SUT at {natsBaseAddress}.");
     Console.WriteLine($"NATS ACK-after-receive SUT at {natsEarlyAckBaseAddress}.");
+    Console.WriteLine($"PostgreSQL SUT at {postgreSqlBaseAddress}.");
+    Console.WriteLine($"PostgreSQL ACK-after-receive SUT at {postgreSqlEarlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -169,6 +191,16 @@ try
         BaseAddress = natsEarlyAckBaseAddress ?? natsBaseAddress ?? baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var postgreSqlHttpClient = new HttpClient
+    {
+        BaseAddress = postgreSqlBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+    using var postgreSqlEarlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = postgreSqlEarlyAckBaseAddress ?? postgreSqlBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
     if (earlyAckBaseAddress is not null)
@@ -185,6 +217,10 @@ try
         await TryResetAsync(natsHttpClient);
     if (natsEarlyAckBaseAddress is not null)
         await TryResetAsync(natsEarlyAckHttpClient);
+    if (postgreSqlBaseAddress is not null)
+        await TryResetAsync(postgreSqlHttpClient);
+    if (postgreSqlEarlyAckBaseAddress is not null)
+        await TryResetAsync(postgreSqlEarlyAckHttpClient);
 
     var definitions = FilterScenarios(SelectScenarios(
         profile,
@@ -194,7 +230,9 @@ try
         includeRedisTarget: app is not null || existingRedisUrl is not null,
         includeRedisEarlyAckTarget: redisEarlyAckBaseAddress is not null,
         includeNatsTarget: app is not null || existingNatsUrl is not null,
-        includeNatsEarlyAckTarget: natsEarlyAckBaseAddress is not null), scenarioFilter);
+        includeNatsEarlyAckTarget: natsEarlyAckBaseAddress is not null,
+        includePostgreSqlTarget: app is not null || existingPostgreSqlUrl is not null,
+        includePostgreSqlEarlyAckTarget: postgreSqlEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
@@ -210,6 +248,8 @@ try
             redisEarlyAckHttpClient,
             natsHttpClient,
             natsEarlyAckHttpClient,
+            postgreSqlHttpClient,
+            postgreSqlEarlyAckHttpClient,
             rate,
             duration,
             warmup))
@@ -261,6 +301,8 @@ static ScenarioProps BuildScenario(
     HttpClient redisEarlyAckHttpClient,
     HttpClient natsHttpClient,
     HttpClient natsEarlyAckHttpClient,
+    HttpClient postgreSqlHttpClient,
+    HttpClient postgreSqlEarlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
@@ -272,7 +314,9 @@ static ScenarioProps BuildScenario(
         redisHttpClient,
         redisEarlyAckHttpClient,
         natsHttpClient,
-        natsEarlyAckHttpClient)))
+        natsEarlyAckHttpClient,
+        postgreSqlHttpClient,
+        postgreSqlEarlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
@@ -284,7 +328,9 @@ static ScenarioDefinition[] SelectScenarios(
     bool includeRedisTarget,
     bool includeRedisEarlyAckTarget,
     bool includeNatsTarget,
-    bool includeNatsEarlyAckTarget)
+    bool includeNatsEarlyAckTarget,
+    bool includePostgreSqlTarget,
+    bool includePostgreSqlEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -362,6 +408,28 @@ static ScenarioDefinition[] SelectScenarios(
         }
     }
 
+    if (includePostgreSqlTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("postgresql_request_response_success", (_, _, _, _, _, _, _, _, pgHttp, _) => RequestResponseSuccessAsync(pgHttp)),
+            new ScenarioDefinition("postgresql_worker_default_ack_observed", (_, _, _, _, _, _, _, _, pgHttp, _) => WorkerObservedAsync(pgHttp)),
+            new ScenarioDefinition("postgresql_response_ingress_header", (_, _, _, _, _, _, _, _, pgHttp, _) => ResponseIngressAsync(pgHttp, useAttribute: true)),
+            new ScenarioDefinition("postgresql_response_ingress_body", (_, _, _, _, _, _, _, _, pgHttp, _) => ResponseIngressAsync(pgHttp, useAttribute: false)),
+            new ScenarioDefinition("postgresql_reply_target", (_, _, _, _, _, _, _, _, pgHttp, _) => ReplyTargetAsync(pgHttp))
+        ];
+
+        if (includePostgreSqlEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("postgresql_worker_ack_after_receive_observed", (_, _, _, _, _, _, _, _, _, pgEarlyAckHttp) => WorkerObservedAsync(pgEarlyAckHttp))
+            ];
+        }
+    }
+
     var pubsub = new[]
     {
         new ScenarioDefinition("pubsub_worker_default_ack_observed", WorkerObservedAsync),
@@ -427,6 +495,24 @@ static ScenarioDefinition[] SelectScenarios(
         ];
     }
 
+    var postgresql = new[]
+    {
+        new ScenarioDefinition("postgresql_request_response_success", (_, _, _, _, _, _, _, _, pgHttp, _) => RequestResponseSuccessAsync(pgHttp)),
+        new ScenarioDefinition("postgresql_request_response_domain_failure", (_, _, _, _, _, _, _, _, pgHttp, _) => RequestResponseDomainFailureAsync(pgHttp)),
+        new ScenarioDefinition("postgresql_worker_default_ack_observed", (_, _, _, _, _, _, _, _, pgHttp, _) => WorkerObservedAsync(pgHttp)),
+        new ScenarioDefinition("postgresql_response_ingress_header", (_, _, _, _, _, _, _, _, pgHttp, _) => ResponseIngressAsync(pgHttp, useAttribute: true)),
+        new ScenarioDefinition("postgresql_response_ingress_body", (_, _, _, _, _, _, _, _, pgHttp, _) => ResponseIngressAsync(pgHttp, useAttribute: false)),
+        new ScenarioDefinition("postgresql_reply_target", (_, _, _, _, _, _, _, _, pgHttp, _) => ReplyTargetAsync(pgHttp))
+    };
+    if (includePostgreSqlEarlyAckTarget)
+    {
+        postgresql =
+        [
+            .. postgresql,
+            new ScenarioDefinition("postgresql_worker_ack_after_receive_observed", (_, _, _, _, _, _, _, _, _, pgEarlyAckHttp) => WorkerObservedAsync(pgEarlyAckHttp))
+        ];
+    }
+
     var recovery = new[]
     {
         new ScenarioDefinition("lost_subscriber_resume_redis", http => LostSubscriberFlowAsync(http, "Completed")),
@@ -442,9 +528,10 @@ static ScenarioDefinition[] SelectScenarios(
         "rabbitmq" => rabbitmq,
         "redis" => redis,
         "nats" => nats,
+        "postgresql" => postgresql,
         "recovery" => recovery,
         _ => throw new ArgumentException(
-            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, redis, nats, recovery.")
+            $"Unknown --profile '{profile}'. Use one of: broad, core, pubsub, rabbitmq, redis, nats, postgresql, recovery.")
     };
 }
 
@@ -610,27 +697,33 @@ static string Trace() => $"trace-{Guid.NewGuid():N}";
 
 internal sealed record ScenarioDefinition(
     string Name,
-    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
+    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
 {
     public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
-        : this(name, (http, _, _, _, _, _, _, _) => runAsync(http))
+        : this(name, (http, _, _, _, _, _, _, _, _, _) => runAsync(http))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
+        : this(name, (http, earlyAckHttp, _, _, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _) =>
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp))
+    {
+    }
+
+    public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
+        : this(name, (http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, _, _) =>
+            runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp))
     {
     }
 }

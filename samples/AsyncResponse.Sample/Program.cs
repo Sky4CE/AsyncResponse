@@ -1,9 +1,11 @@
 using AsyncResponse;
 using AsyncResponse.Channels.NATS;
+using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.NATS;
+using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
 using NATS.Client.Core;
@@ -16,6 +18,7 @@ using RabbitMQ.Client;
 using System.Text;
 using StackExchange.Redis;
 using System.Text.Json;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
@@ -25,16 +28,18 @@ builder.Services.AddOpenApi();
 // Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
-var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ | Redis | NATS
+var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ | Redis | NATS | PostgreSQL
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
+var usePostgreSql = string.Equals(channel, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
 var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNatsTransport = string.Equals(transport, "NATS", StringComparison.OrdinalIgnoreCase);
+var usePostgreSqlTransport = string.Equals(transport, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis || useRedisTransport)
 {
@@ -47,6 +52,14 @@ if (useNats || useNatsTransport)
     // One shared NATS connection backs both the NATS channel and the NATS transport.
     var natsUrl = builder.Configuration["Nats:Url"] ?? "nats://localhost:4222";
     builder.Services.AddSingleton<INatsConnection>(_ => new NatsConnection(new NatsOpts { Url = natsUrl }));
+}
+
+if (usePostgreSql || usePostgreSqlTransport)
+{
+    var postgresConnectionString = builder.Configuration.GetConnectionString("PostgreSQL")
+        ?? builder.Configuration["PostgreSQL:ConnectionString"]
+        ?? "Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=postgres";
+    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(postgresConnectionString));
 }
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start
@@ -67,6 +80,10 @@ else if (useRabbitMq)
 else if (useRedisTransport)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "Redis");
+}
+else if (usePostgreSqlTransport)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "PostgreSQL");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -95,6 +112,19 @@ else if (useNats)
         options.DefaultTimeout = TimeSpan.FromSeconds(30);
     });
 }
+else if (usePostgreSql)
+{
+    asyncResponse.WithPostgreSqlChannel(options =>
+    {
+        options.SchemaName = builder.Configuration["PostgreSQL:SchemaName"] ?? options.SchemaName;
+        options.RecoveryStateTable = builder.Configuration["PostgreSQL:RecoveryStateTable"] ?? options.RecoveryStateTable;
+        options.MessageTable = builder.Configuration["PostgreSQL:ChannelMessageTable"] ?? options.MessageTable;
+        options.SubscriberTable = builder.Configuration["PostgreSQL:SubscriberTable"] ?? options.SubscriberTable;
+        options.NotificationChannel = builder.Configuration["PostgreSQL:ChannelNotificationChannel"] ?? options.NotificationChannel;
+        options.DefaultTimeout = TimeSpan.FromSeconds(30);
+        ApplyOptionalTimeout(builder.Configuration, "PostgreSQL:ChannelDeliveryConfirmationTimeoutSeconds", value => options.DeliveryConfirmationTimeout = value);
+    });
+}
 else if (useInMemoryChannel)
 {
     asyncResponse.WithInMemoryChannel();
@@ -102,7 +132,7 @@ else if (useInMemoryChannel)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', or 'NATS'.");
+        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', 'NATS', or 'PostgreSQL'.");
 }
 
 // Exactly one worker transport (enforced at host startup).
@@ -198,6 +228,33 @@ else if (useNatsTransport)
         ConfigureNatsSubscriber(builder.Configuration, "Nats:Response", options.ResponseSubscriber);
     });
 }
+else if (usePostgreSqlTransport)
+{
+    asyncResponse.WithPostgreSqlTransport(options =>
+    {
+        options.SchemaName = builder.Configuration["PostgreSQL:SchemaName"] ?? options.SchemaName;
+        options.MessageTable = builder.Configuration["PostgreSQL:TransportMessageTable"] ?? options.MessageTable;
+        options.NotificationChannel = builder.Configuration["PostgreSQL:TransportNotificationChannel"] ?? options.NotificationChannel;
+        options.WorkerQueue = builder.Configuration["PostgreSQL:WorkerQueue"] ?? options.WorkerQueue;
+        options.ResponseQueue = builder.Configuration["PostgreSQL:ResponseQueue"] ?? options.ResponseQueue;
+        options.DeadLetterQueue = builder.Configuration["PostgreSQL:DeadLetterQueue"] ?? options.DeadLetterQueue;
+        options.CorrelationIdHeader = builder.Configuration["PostgreSQL:CorrelationIdHeader"] ?? options.CorrelationIdHeader;
+
+        if (bool.TryParse(builder.Configuration["PostgreSQL:DeadLetterEnabled"], out var deadLetterEnabled))
+            options.DeadLetterEnabled = deadLetterEnabled;
+        if (int.TryParse(builder.Configuration["PostgreSQL:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "PostgreSQL:LockTimeoutSeconds", value => options.LockTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "PostgreSQL:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "PostgreSQL:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "PostgreSQL:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "PostgreSQL:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+
+        ConfigurePostgreSqlSubscriber(builder.Configuration, "PostgreSQL:Worker", options.WorkerSubscriber);
+        ConfigurePostgreSqlSubscriber(builder.Configuration, "PostgreSQL:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -205,7 +262,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', 'Redis', or 'NATS'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -255,6 +312,7 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? rabbitmq = null;
     object? redis = null;
     object? nats = null;
+    object? postgres = null;
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
@@ -356,7 +414,56 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis, nats });
+    if (usePostgreSql || usePostgreSqlTransport)
+    {
+        string? schemaName = null;
+        string? recoveryStateTable = null;
+        string? channelMessageTable = null;
+        string? transportMessageTable = null;
+        string? workerQueue = null;
+        string? responseQueue = null;
+        var workerAckMode = "n/a";
+        var responseAckMode = "n/a";
+        var workerBackgroundWorkerCount = 0;
+        var workerBackgroundQueueCapacity = 0;
+
+        if (usePostgreSql)
+        {
+            var channelOptions = services.GetRequiredService<IOptions<PostgreSqlAsyncResponseChannelOptions>>().Value;
+            schemaName = channelOptions.SchemaName;
+            recoveryStateTable = channelOptions.RecoveryStateTable;
+            channelMessageTable = channelOptions.MessageTable;
+        }
+
+        if (usePostgreSqlTransport)
+        {
+            var transportOptions = services.GetRequiredService<IOptions<PostgreSqlAsyncResponseTransportOptions>>().Value;
+            schemaName ??= transportOptions.SchemaName;
+            transportMessageTable = transportOptions.MessageTable;
+            workerQueue = transportOptions.WorkerQueue;
+            responseQueue = transportOptions.ResponseQueue;
+            workerAckMode = transportOptions.WorkerSubscriber.AckMode.ToString();
+            workerBackgroundWorkerCount = transportOptions.WorkerSubscriber.BackgroundWorkerCount;
+            workerBackgroundQueueCapacity = transportOptions.WorkerSubscriber.BackgroundQueueCapacity;
+            responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
+        }
+
+        postgres = new
+        {
+            schemaName,
+            recoveryStateTable,
+            channelMessageTable,
+            transportMessageTable,
+            workerQueue,
+            responseQueue,
+            workerAckMode,
+            workerBackgroundWorkerCount,
+            workerBackgroundQueueCapacity,
+            responseAckMode
+        };
+    }
+
+    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis, nats, postgres });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -582,6 +689,49 @@ static void ConfigureNatsSubscriber(
     }
 
     if (mode is not NatsAckMode.AckAfterReceive)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigurePostgreSqlSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    PostgreSqlSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:BatchSize"], out var batchSize))
+        subscriberOptions.BatchSize = batchSize;
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:EmptyPollDelayMs", value => subscriberOptions.EmptyPollDelay = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<PostgreSqlAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<PostgreSqlAckMode>())}.");
+
+    if (mode is PostgreSqlAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = PostgreSqlAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not PostgreSqlAckMode.AckAfterReceive)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -924,11 +1074,18 @@ app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, str
 
 // 5b) Lost-subscriber recovery — crash: drop every Redis subscription, like a redeploy would. The
 //     recovery state stays in Redis; only the in-memory waiters die. (Redis channel only.)
-app.MapPost("/crash", (IServiceProvider services) =>
+app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancellationToken) =>
 {
     var multiplexer = services.GetService<IConnectionMultiplexer>();
     if (multiplexer is null)
-        return Results.Conflict("Crash simulation requires the Redis channel (the in-memory channel has no durable recovery to survive it).");
+    {
+        var postgres = services.GetService<PostgreSqlAsyncResponseChannel>();
+        if (postgres is null)
+            return Results.Conflict("Crash simulation requires a durable channel such as Redis or PostgreSQL.");
+
+        await postgres.DropLocalSubscriptionsAsync(cancellationToken);
+        return Results.Ok();
+    }
 
     multiplexer.GetSubscriber().UnsubscribeAll();
     return Results.Ok();
@@ -1048,7 +1205,10 @@ app.MapPost("/emit-response", async (
     if (useNatsTransport)
         return await EmitNatsResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, Redis, or NATS.");
+    if (usePostgreSqlTransport)
+        return await EmitPostgreSqlResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, Redis, NATS, or PostgreSQL.");
 })
 .WithTags("Workers");
 
@@ -1209,6 +1369,33 @@ static async Task<IResult> EmitNatsResponseAsync(
     NatsHeaders? headers = useAttribute ? new NatsHeaders { [o.CorrelationIdHeader] = correlationId } : null;
     await connection.PublishAsync(responseSubject, json, headers: headers, cancellationToken: cancellationToken).ConfigureAwait(false);
 
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitPostgreSqlResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<PostgreSqlAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("PostgreSQL response ingress requires the PostgreSQL transport.");
+    var store = services.GetService<PostgreSqlTransportStore>();
+    if (store is null)
+        return Results.Conflict("PostgreSQL response ingress requires the transport store.");
+
+    var o = options.Value;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+    var headers = useAttribute
+        ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
+        : null;
+
+    await store.PublishAsync(o.ResponseQueue, json, headers, cancellationToken).ConfigureAwait(false);
     return Results.Accepted();
 }
 

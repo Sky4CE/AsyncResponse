@@ -84,10 +84,12 @@ somebody has to make the call. See [docs/recovery.md](docs/recovery.md) for the 
 | `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
 | `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Channels.NATS` | Optional NATS response channel (Core request/reply) and durable JetStream Key-Value recovery-state store; the Core watchdog and health check work against it automatically. |
+| `AsyncResponse.Channels.PostgreSQL` | Optional PostgreSQL response channel using `LISTEN/NOTIFY` plus durable recovery-state tables; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Transports.Redis` | Optional Redis Streams worker transport and hosted subscribers for worker jobs and response ingress, with consumer-group ACKs, pending-entry retry, and dead-lettering. |
 | `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.NATS` | Optional NATS JetStream worker transport and hosted subscribers for worker jobs and response ingress, with explicit ACKs, bounded redelivery, and dead-lettering. |
+| `AsyncResponse.Transports.PostgreSQL` | Optional PostgreSQL queue-table worker transport and hosted response-ingress subscribers, with `FOR UPDATE SKIP LOCKED`, bounded redelivery, and dead-lettering. |
 | `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
 
 Package naming follows the extension point: `AsyncResponse.Channels.*` packages provide
@@ -102,12 +104,14 @@ dotnet add package AsyncResponse.Core
 # Optional durable channels:
 dotnet add package AsyncResponse.Channels.Redis
 dotnet add package AsyncResponse.Channels.NATS
+dotnet add package AsyncResponse.Channels.PostgreSQL
 
 # Optional transports:
 dotnet add package AsyncResponse.Transports.Redis
 dotnet add package AsyncResponse.Transports.GooglePubSub
 dotnet add package AsyncResponse.Transports.RabbitMQ
 dotnet add package AsyncResponse.Transports.NATS
+dotnet add package AsyncResponse.Transports.PostgreSQL
 ```
 
 ## Quick start
@@ -157,6 +161,52 @@ builder.Services.AddHealthChecks()
 only in flows that register lost-subscriber callbacks (the `OnLostSubscriber*` methods are absent on
 the in-memory channel at compile time). See [docs/recovery.md](docs/recovery.md).
 
+### PostgreSQL-backed channel and transport
+
+Use this when PostgreSQL is already your durable infrastructure and you do not want to add Redis just
+for async-response recovery. The channel stores response envelopes in a PostgreSQL table and wakes
+waiters with `LISTEN/NOTIFY`; notifications carry only a message id, so large payloads are not limited
+by PostgreSQL's NOTIFY payload cap. Recovery state is row-per-waiter registration. The transport uses
+one queue table for worker, response-ingress, and dead-letter rows, claiming work with
+`FOR UPDATE SKIP LOCKED`.
+
+```csharp
+using AsyncResponse;
+using Npgsql;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton(_ =>
+    NpgsqlDataSource.Create(builder.Configuration.GetConnectionString("PostgreSQL")!));
+
+builder.Services.AddAsyncResponse()
+    .WithPostgreSqlChannel(options =>
+    {
+        options.SchemaName = "public";
+        options.RecoveryStateTable = "asyncresponse_recovery_state";
+        options.MessageTable = "asyncresponse_channel_messages";
+        options.SubscriberTable = "asyncresponse_channel_subscribers";
+        options.NotificationChannel = "asyncresponse_channel_notify";
+    })
+    .WithPostgreSqlTransport(options =>
+    {
+        options.MessageTable = "asyncresponse_transport_messages";
+        options.WorkerQueue = "worker";
+        options.ResponseQueue = "response";
+        options.DeadLetterQueue = "deadletter";
+        options.WorkerSubscriber.UseAckAfterReceive(
+            backgroundWorkerCount: 4,
+            backgroundQueueCapacity: 256);
+    });
+```
+
+Set `AutoCreateSchema = false` on either options object when migrations provision the schema. Key
+channel options: `RecoveryStateExpiry`, `DefaultTimeout`, `MessageRetention`,
+`DeliveryConfirmationTimeout`, `SubscriberHeartbeatInterval`, `SubscriberHeartbeatTimeout`.
+Key transport options: `LockTimeout`, `WorkerSubscriber`, `ResponseSubscriber`,
+`MaxDeliveryAttempts`, `RedeliveryDelay`, `DeadLetterEnabled`, `CorrelationIdHeader`, and
+`CorrelationIdJsonPaths`.
+
 ### Define a payload and await a response
 
 Every payload implements `IAsyncResponsePayload` — a marker that also keeps scalars out of `For<T>()`:
@@ -201,8 +251,8 @@ await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsy
 ```
 
 For durable lost-subscriber recovery callbacks, broker transports (Redis Streams, Google Pub/Sub,
-RabbitMQ, NATS JetStream), reply targets, ambient-context propagation, timeouts/cancellation, and the
-watchdog, see the docs below.
+RabbitMQ, NATS JetStream, PostgreSQL), reply targets, ambient-context propagation,
+timeouts/cancellation, and the watchdog, see the docs below.
 
 ## Documentation
 

@@ -17,6 +17,7 @@
     <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj" />
   </ItemGroup>

@@ -20,4 +20,11 @@
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
   </ItemGroup>
 
+  <Target Name="BuildAspireProjectResourceDebugOutput" BeforeTargets="Build">
+    <MSBuild
+      Projects="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj"
+      Targets="Build"
+      Properties="Configuration=Debug;TargetFramework=net10.0" />
+  </Target>
+
 </Project>
