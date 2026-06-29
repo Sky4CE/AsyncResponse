@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782726220648,
+  "lastUpdate": 1782726232591,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -13383,6 +13383,105 @@ window.BENCHMARK_DATA = {
           {
             "name": "watchdog-scan-storm throughput",
             "value": 1567201.6048144433,
+            "unit": "entries/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "3a556cfcbdc8b7bf270a5bb32e3077f4bfece22d",
+          "message": "upgrade libs",
+          "timestamp": "2026-06-29T11:35:35+02:00",
+          "tree_id": "e0664c0bccd14d40756a5d087f5bc6ac66a281e6",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/3a556cfcbdc8b7bf270a5bb32e3077f4bfece22d"
+        },
+        "date": 1782726231972,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 178804.25725784362,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 118320.23133971631,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 83573.35601179922,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 365973.26931240945,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 527927.3571956499,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 386518.2436611008,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 470996.0624729177,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 230837.27449506652,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 81719.00169452523,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 62184.59971026951,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 22729.165446868123,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4833.9642059452435,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 252637.53587453012,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 113236.43314294516,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1603026.5140585424,
             "unit": "entries/s"
           }
         ]
