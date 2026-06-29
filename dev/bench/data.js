@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782725517923,
+  "lastUpdate": 1782725519779,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -17789,6 +17789,175 @@ window.BENCHMARK_DATA = {
           {
             "name": "watchdog-scan-storm allocations",
             "value": 98.2472,
+            "unit": "B/entry"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "7fa908b6b83b2dde7e515f43228a49722069fd49",
+          "message": "In-Memory performance fix",
+          "timestamp": "2026-06-29T11:23:34+02:00",
+          "tree_id": "6915c4f995598ebc2c12837e4143aedddc85a38b",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/7fa908b6b83b2dde7e515f43228a49722069fd49"
+        },
+        "date": 1782725519564,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0324,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1626.09856,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 0.0435,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 2513.4624,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 2818.15488,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0022,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 456.9216,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0023,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 334.2688,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0027,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 523.952,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0026,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 451.8432,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0307,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1491.44896,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.051,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1868.15424,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 2.0754,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 5052.39936,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 3.954,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 9172.11264,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 53.7986,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 2813.312,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0224,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1218.96,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.053,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2741.0368,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 6.3808,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
             "unit": "B/entry"
           }
         ]
