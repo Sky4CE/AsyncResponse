@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace AsyncResponse;
@@ -11,8 +12,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
 {
     private sealed record Entry(RecoveryState State, DateTime ExpiresAtUtc);
 
-    private readonly object _gate = new();
-    private readonly Dictionary<string, List<Entry>> _entries = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, EntryBucket> _entries = new(StringComparer.Ordinal);
 
     /// <inheritdoc />
     public Task SaveAsync(
@@ -30,26 +30,47 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         if (state.RegistrationId == Guid.Empty)
             state.RegistrationId = Guid.NewGuid();
 
-        lock (_gate)
+        var nowUtc = DateTime.UtcNow;
+        var entry = new Entry(state, nowUtc.Add(ttl));
+        while (true)
         {
-            var nowUtc = DateTime.UtcNow;
-            var expiresAtUtc = nowUtc.Add(ttl);
-            if (!_entries.TryGetValue(correlationId, out var entries))
+            if (!_entries.TryGetValue(correlationId, out var bucket))
             {
-                _entries[correlationId] = [new Entry(state, expiresAtUtc)];
-                return Task.CompletedTask;
+                if (_entries.TryAdd(correlationId, EntryBucket.Single(entry)))
+                    return Task.CompletedTask;
+
+                continue;
             }
 
-            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc || entry.State.RegistrationId == state.RegistrationId);
-            entries.Add(new Entry(state, expiresAtUtc));
+            var next = bucket.PruneExpired(nowUtc).Upsert(entry);
+            if (_entries.TryUpdate(correlationId, next, bucket))
+                return Task.CompletedTask;
         }
-
-        return Task.CompletedTask;
     }
 
     /// <inheritdoc />
-    public async Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
-        => (await GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
+    public Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        while (_entries.TryGetValue(correlationId, out var bucket))
+        {
+            var pruned = bucket.PruneExpired(DateTime.UtcNow);
+            if (pruned.IsEmpty)
+            {
+                TryRemove(correlationId, bucket);
+                return Task.FromResult<RecoveryState?>(null);
+            }
+
+            if (!pruned.Equals(bucket) && !_entries.TryUpdate(correlationId, pruned, bucket))
+                continue;
+
+            return Task.FromResult(pruned.FirstReadableState());
+        }
+
+        return Task.FromResult<RecoveryState?>(null);
+    }
 
     /// <inheritdoc />
     public Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
@@ -57,25 +78,22 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
 
-        lock (_gate)
+        while (_entries.TryGetValue(correlationId, out var bucket))
         {
-            if (!_entries.TryGetValue(correlationId, out var entries))
-                return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
-
-            var nowUtc = DateTime.UtcNow;
-            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
-            if (entries.Count == 0)
+            var pruned = bucket.PruneExpired(DateTime.UtcNow);
+            if (pruned.IsEmpty)
             {
-                _entries.Remove(correlationId);
+                TryRemove(correlationId, bucket);
                 return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
             }
 
-            var states = entries
-                .Where(entry => RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                .Select(entry => entry.State)
-                .ToArray();
-            return Task.FromResult<IReadOnlyList<RecoveryState>>(states);
+            if (!pruned.Equals(bucket) && !_entries.TryUpdate(correlationId, pruned, bucket))
+                continue;
+
+            return Task.FromResult(pruned.ReadableStates());
         }
+
+        return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
     }
 
     /// <inheritdoc />
@@ -83,8 +101,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
-        lock (_gate)
-            return Task.FromResult(_entries.Remove(correlationId));
+        return Task.FromResult(_entries.TryRemove(correlationId, out _));
     }
 
     /// <inheritdoc />
@@ -93,17 +110,224 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
 
-        lock (_gate)
+        while (_entries.TryGetValue(correlationId, out var bucket))
         {
-            if (!_entries.TryGetValue(correlationId, out var entries))
+            var pruned = bucket.PruneExpired(DateTime.UtcNow);
+            if (pruned.IsEmpty)
+            {
+                TryRemove(correlationId, bucket);
                 return Task.FromResult(false);
+            }
 
-            var removed = entries.RemoveAll(entry => entry.State.RegistrationId == registrationId) > 0;
-            if (entries.Count == 0)
-                _entries.Remove(correlationId);
+            var next = pruned.Remove(registrationId, out var removed);
+            if (!removed)
+            {
+                if (!pruned.Equals(bucket) && !_entries.TryUpdate(correlationId, pruned, bucket))
+                    continue;
 
-            return Task.FromResult(removed);
+                return Task.FromResult(false);
+            }
+
+            if (next.IsEmpty)
+            {
+                if (TryRemove(correlationId, bucket))
+                    return Task.FromResult(true);
+            }
+            else if (_entries.TryUpdate(correlationId, next, bucket))
+            {
+                return Task.FromResult(true);
+            }
         }
+
+        return Task.FromResult(false);
+    }
+
+    private bool TryRemove(string correlationId, EntryBucket bucket)
+        => ((ICollection<KeyValuePair<string, EntryBucket>>)_entries)
+            .Remove(new KeyValuePair<string, EntryBucket>(correlationId, bucket));
+
+    private readonly struct EntryBucket : IEquatable<EntryBucket>
+    {
+        private readonly Entry? _single;
+        private readonly Entry[]? _many;
+
+        private EntryBucket(Entry? single, Entry[]? many)
+        {
+            _single = single;
+            _many = many;
+        }
+
+        public bool IsEmpty => _single is null && _many is null;
+        public Entry? SingleEntry => _single;
+        public Entry[]? ManyEntries => _many;
+
+        public static EntryBucket Single(Entry entry) => new(entry, null);
+
+        public EntryBucket Upsert(Entry entry)
+        {
+            if (_single is null)
+            {
+                if (_many is null)
+                    return Single(entry);
+
+                for (var i = 0; i < _many.Length; i++)
+                {
+                    if (_many[i].State.RegistrationId != entry.State.RegistrationId)
+                        continue;
+
+                    var replaced = (Entry[])_many.Clone();
+                    replaced[i] = entry;
+                    return new EntryBucket(null, replaced);
+                }
+
+                var appended = new Entry[_many.Length + 1];
+                Array.Copy(_many, appended, _many.Length);
+                appended[^1] = entry;
+                return new EntryBucket(null, appended);
+            }
+
+            if (_single.State.RegistrationId == entry.State.RegistrationId)
+                return Single(entry);
+
+            return new EntryBucket(null, [_single, entry]);
+        }
+
+        public EntryBucket PruneExpired(DateTime nowUtc)
+        {
+            if (_single is not null)
+                return _single.ExpiresAtUtc <= nowUtc ? default : this;
+
+            if (_many is null)
+                return this;
+
+            var liveCount = 0;
+            Entry? lastLive = null;
+            foreach (var entry in _many)
+            {
+                if (entry.ExpiresAtUtc <= nowUtc)
+                    continue;
+
+                liveCount++;
+                lastLive = entry;
+            }
+
+            if (liveCount == _many.Length)
+                return this;
+            if (liveCount == 0)
+                return default;
+            if (liveCount == 1)
+                return Single(lastLive!);
+
+            var live = new Entry[liveCount];
+            var index = 0;
+            foreach (var entry in _many)
+            {
+                if (entry.ExpiresAtUtc > nowUtc)
+                    live[index++] = entry;
+            }
+
+            return new EntryBucket(null, live);
+        }
+
+        public EntryBucket Remove(Guid registrationId, out bool removed)
+        {
+            if (_single is not null)
+            {
+                removed = _single.State.RegistrationId == registrationId;
+                return removed ? default : this;
+            }
+
+            if (_many is null)
+            {
+                removed = false;
+                return this;
+            }
+
+            var removeIndex = -1;
+            for (var i = 0; i < _many.Length; i++)
+            {
+                if (_many[i].State.RegistrationId == registrationId)
+                {
+                    removeIndex = i;
+                    break;
+                }
+            }
+
+            if (removeIndex < 0)
+            {
+                removed = false;
+                return this;
+            }
+
+            removed = true;
+            if (_many.Length == 2)
+                return Single(_many[removeIndex == 0 ? 1 : 0]);
+
+            var remaining = new Entry[_many.Length - 1];
+            if (removeIndex > 0)
+                Array.Copy(_many, 0, remaining, 0, removeIndex);
+            if (removeIndex < _many.Length - 1)
+                Array.Copy(_many, removeIndex + 1, remaining, removeIndex, _many.Length - removeIndex - 1);
+
+            return new EntryBucket(null, remaining);
+        }
+
+        public RecoveryState? FirstReadableState()
+        {
+            if (_single is not null)
+                return RecoveryStateSchema.IsReadable(_single.State.SchemaVersion) ? _single.State : null;
+
+            if (_many is null)
+                return null;
+
+            foreach (var entry in _many)
+            {
+                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                    return entry.State;
+            }
+
+            return null;
+        }
+
+        public IReadOnlyList<RecoveryState> ReadableStates()
+        {
+            if (_single is not null)
+                return RecoveryStateSchema.IsReadable(_single.State.SchemaVersion) ? [_single.State] : [];
+
+            if (_many is null)
+                return [];
+
+            var readableCount = 0;
+            foreach (var entry in _many)
+            {
+                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                    readableCount++;
+            }
+
+            if (readableCount == 0)
+                return [];
+
+            var states = new RecoveryState[readableCount];
+            var index = 0;
+            foreach (var entry in _many)
+            {
+                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                    states[index++] = entry.State;
+            }
+
+            return states;
+        }
+
+        public bool Equals(EntryBucket other)
+            => ReferenceEquals(_single, other._single) && ReferenceEquals(_many, other._many);
+
+        public override bool Equals(object? obj)
+            => obj is EntryBucket other && Equals(other);
+
+        public override int GetHashCode()
+            => HashCode.Combine(
+                _single is null ? 0 : RuntimeHelpers.GetHashCode(_single),
+                _many is null ? 0 : RuntimeHelpers.GetHashCode(_many));
     }
 
     /// <inheritdoc />
@@ -111,42 +335,36 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     {
         await Task.CompletedTask.ConfigureAwait(false); // process-local store: no async I/O to await
 
-        RecoveryState[] states;
-        lock (_gate)
-        {
-            var nowUtc = DateTime.UtcNow;
-            List<string>? emptyKeys = null;
-            var liveStates = new List<RecoveryState>();
-
-            foreach (var (correlationId, entries) in _entries)
-            {
-                entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
-                if (entries.Count == 0)
-                {
-                    (emptyKeys ??= []).Add(correlationId);
-                    continue;
-                }
-
-                foreach (var entry in entries)
-                {
-                    if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                        liveStates.Add(entry.State);
-                }
-            }
-
-            if (emptyKeys is not null)
-            {
-                foreach (var key in emptyKeys)
-                    _entries.Remove(key);
-            }
-
-            states = liveStates.ToArray();
-        }
-
-        foreach (var state in states)
+        var nowUtc = DateTime.UtcNow;
+        foreach (var (correlationId, bucket) in _entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            yield return state;
+
+            var pruned = bucket.PruneExpired(nowUtc);
+            if (pruned.IsEmpty)
+            {
+                TryRemove(correlationId, bucket);
+                continue;
+            }
+
+            if (!pruned.Equals(bucket))
+                _entries.TryUpdate(correlationId, pruned, bucket);
+
+            if (pruned.SingleEntry is { } single)
+            {
+                if (RecoveryStateSchema.IsReadable(single.State.SchemaVersion))
+                    yield return single.State;
+                continue;
+            }
+
+            if (pruned.ManyEntries is null)
+                continue;
+
+            foreach (var entry in pruned.ManyEntries)
+            {
+                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                    yield return entry.State;
+            }
         }
     }
 }

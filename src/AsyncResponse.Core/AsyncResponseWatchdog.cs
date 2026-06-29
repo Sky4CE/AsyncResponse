@@ -108,8 +108,8 @@ public sealed record AsyncResponseWatchdogReport(
 
         foreach (var entry in entries)
         {
-            if (!string.IsNullOrWhiteSpace(entry.CorrelationId)
-                && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
+            if (!string.IsNullOrEmpty(entry.CorrelationId)
+                && !(seenCorrelationIds ??= new HashSet<string>(entries.Count, StringComparer.Ordinal)).Add(entry.CorrelationId))
             {
                 continue;
             }
@@ -249,7 +249,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 if (entry is null)
                     continue;
 
-                if (!string.IsNullOrWhiteSpace(entry.CorrelationId)
+                if (!string.IsNullOrEmpty(entry.CorrelationId)
                     && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
                 {
                     continue;
