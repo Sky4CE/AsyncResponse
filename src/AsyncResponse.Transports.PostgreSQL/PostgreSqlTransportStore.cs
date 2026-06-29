@@ -2,6 +2,7 @@ using Microsoft.Extensions.Options;
 using Npgsql;
 using NpgsqlTypes;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 
 namespace AsyncResponse.Transports.PostgreSQL;
@@ -30,6 +31,7 @@ internal sealed class PostgreSqlTransportStore
     private readonly PostgreSqlAsyncResponseTransportOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
+    private readonly long _schemaLockKey;
     private long _lastDeadLetterPruneTicks;
 
     public PostgreSqlTransportStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlAsyncResponseTransportOptions> options)
@@ -39,6 +41,7 @@ internal sealed class PostgreSqlTransportStore
         PostgreSqlTransportOptionsValidator.ValidateCommon(_options);
         Schema = Quote(_options.SchemaName);
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
+        _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
     }
 
     public string Schema { get; }
@@ -56,7 +59,23 @@ internal sealed class PostgreSqlTransportStore
                 return;
 
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
+            // concurrent create of the same object: two instances starting together both pass the existence
+            // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
+            // transaction-scoped advisory lock (keyed by schema, shared with the channel store) lets one
+            // instance build the schema while the rest wait and then find it already present.
+            await using (var lockCommand = connection.CreateCommand())
+            {
+                lockCommand.Transaction = transaction;
+                lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
+                lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
+                await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText =
                 $"""
                 CREATE SCHEMA IF NOT EXISTS {Schema};
@@ -79,6 +98,7 @@ internal sealed class PostgreSqlTransportStore
                     ON {MessageTable} (created_at);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -321,6 +341,25 @@ internal sealed class PostgreSqlTransportStore
     }
 
     private static string Sanitize(string value) => value.Replace('\r', ' ').Replace('\n', ' ');
+
+    /// <summary>
+    /// Stable 64-bit advisory-lock key for serializing schema creation. Must be byte-for-byte identical
+    /// to the channel store's algorithm/discriminator so that, for a shared schema, the channel and
+    /// transport take the same lock and never race each other on CREATE SCHEMA.
+    /// </summary>
+    internal static long SchemaAdvisoryLockKey(string schemaName)
+    {
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset;
+        foreach (var b in Encoding.UTF8.GetBytes($"asyncresponse:ddl:{schemaName}"))
+        {
+            hash ^= b;
+            hash *= prime;
+        }
+
+        return unchecked((long)hash);
+    }
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 

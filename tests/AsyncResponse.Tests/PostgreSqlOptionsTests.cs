@@ -112,6 +112,25 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void SchemaAdvisoryLockKey_AgreesAcrossChannelAndTransport()
+    {
+        // Channel and transport must take the SAME advisory lock for a shared schema, otherwise they
+        // still race each other on CREATE SCHEMA. The keys are computed independently in each package,
+        // so this guards against the two implementations drifting apart.
+        foreach (var schema in new[] { "public", "async_response", "Tenant_42" })
+        {
+            Assert.Equal(
+                AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql.SchemaAdvisoryLockKey(schema),
+                AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore.SchemaAdvisoryLockKey(schema));
+        }
+
+        // Distinct schemas must map to distinct keys so unrelated deployments don't serialize.
+        Assert.NotEqual(
+            AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql.SchemaAdvisoryLockKey("public"),
+            AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql.SchemaAdvisoryLockKey("other"));
+    }
+
+    [Fact]
     public void CorrelationExtractor_ReadsConfiguredJsonPath()
     {
         var options = new PostgreSqlAsyncResponseTransportOptions();

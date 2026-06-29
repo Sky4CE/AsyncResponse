@@ -18,6 +18,7 @@ internal sealed class PostgreSqlChannelSql
     private readonly PostgreSqlAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
+    private readonly long _schemaLockKey;
     private long _lastRecoveryPruneTicks;
     private long _lastMessagePruneTicks;
     private long _lastSubscriberPruneTicks;
@@ -32,6 +33,7 @@ internal sealed class PostgreSqlChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
+        _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
     }
 
     public string Schema { get; }
@@ -52,7 +54,23 @@ internal sealed class PostgreSqlChannelSql
                 return;
 
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
+            // concurrent create of the same object: two instances starting together both pass the existence
+            // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
+            // transaction-scoped advisory lock (keyed by schema, shared with the transport store) lets one
+            // instance build the schema while the rest wait and then find it already present.
+            await using (var lockCommand = connection.CreateCommand())
+            {
+                lockCommand.Transaction = transaction;
+                lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
+                lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
+                await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText =
                 $"""
                 CREATE SCHEMA IF NOT EXISTS {Schema};
@@ -94,6 +112,7 @@ internal sealed class PostgreSqlChannelSql
                     ON {SubscriberTable} (expires_at);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -461,6 +480,26 @@ internal sealed class PostgreSqlChannelSql
     internal static bool IsTransient(Exception exception)
         => exception is not OperationCanceledException
            && (exception is NpgsqlException { IsTransient: true } || exception is TimeoutException);
+
+    /// <summary>
+    /// Stable 64-bit advisory-lock key for serializing schema creation. Uses FNV-1a over a
+    /// schema-scoped discriminator: it must be deterministic across processes (so
+    /// <see cref="string.GetHashCode()"/>, which is per-process randomized, is unusable) and identical
+    /// to the transport store's key for the same schema so both serialize their shared CREATE SCHEMA.
+    /// </summary>
+    internal static long SchemaAdvisoryLockKey(string schemaName)
+    {
+        const ulong offset = 14695981039346656037UL;
+        const ulong prime = 1099511628211UL;
+        var hash = offset;
+        foreach (var b in Encoding.UTF8.GetBytes($"asyncresponse:ddl:{schemaName}"))
+        {
+            hash ^= b;
+            hash *= prime;
+        }
+
+        return unchecked((long)hash);
+    }
 
     /// <summary>
     /// Time-gates opportunistic pruning so the housekeeping DELETE runs at most once per
