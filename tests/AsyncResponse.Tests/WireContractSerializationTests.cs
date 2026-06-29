@@ -16,6 +16,7 @@ public class WireContractSerializationTests
     {
         var state = new RecoveryState
         {
+            RegistrationId = Guid.Parse("11111111-1111-1111-1111-111111111111"),
             CorrelationId = "corr-1",
             PayloadTypeFullName = "My.Payload",
             RegisteredAtUtc = new DateTime(2026, 1, 2, 3, 4, 5, DateTimeKind.Utc),
@@ -38,6 +39,7 @@ public class WireContractSerializationTests
 
         // Property names are the contract — assert the wire shape, not just round-trip equality.
         Assert.Contains("\"CorrelationId\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"RegistrationId\"", json, StringComparison.Ordinal);
         Assert.Contains("\"PayloadTypeFullName\"", json, StringComparison.Ordinal);
         Assert.Contains("\"RegisteredAtUtc\"", json, StringComparison.Ordinal);
         Assert.Contains("\"ResumeCallback\"", json, StringComparison.Ordinal);
@@ -47,6 +49,7 @@ public class WireContractSerializationTests
         var restored = JsonSerializer.Deserialize<RecoveryState>(json);
         Assert.NotNull(restored);
         Assert.Equal("corr-1", restored!.CorrelationId);
+        Assert.Equal(state.RegistrationId, restored.RegistrationId);
         Assert.Equal("My.Payload", restored.PayloadTypeFullName);
         Assert.Equal(state.RegisteredAtUtc, restored.RegisteredAtUtc);
         Assert.Equal("abc", restored.Context!["trace"]);

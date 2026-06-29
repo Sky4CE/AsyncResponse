@@ -28,6 +28,7 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     /// <summary>How many work items are currently buffered (waiting to run) in this executor.</summary>
     private int PendingCount => Volatile.Read(ref _pending);
 
+    /// <summary>Runs the ChannelSerialExecutor operation.</summary>
     public ChannelSerialExecutor(ILogger logger, string channel)
     {
         _logger = logger;

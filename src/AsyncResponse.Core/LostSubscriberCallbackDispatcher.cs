@@ -41,6 +41,106 @@ internal sealed class LostSubscriberCallbackDispatcher(
     AsyncResponseContextPropagation _propagation,
     ILogger _logger)
 {
+    /// <summary>
+    /// Loads every recovery registration for <paramref name="correlationId"/> and dispatches a lost
+    /// response to each registration's resume/failure callback.
+    /// </summary>
+    public async Task<LostSubscriberDispatchResult> DispatchLostResponses<T>(
+        IRecoveryStateStore recoveryStateStore,
+        string correlationId,
+        T response,
+        string channel,
+        CancellationToken cancellationToken)
+    {
+        var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (recoveryStates.Count == 0)
+            return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
+
+        var callbackInvoked = false;
+        bool? shouldResume = null;
+        var routeSet = false;
+        var routeMixed = false;
+        Exception? firstException = null;
+
+        foreach (var recoveryState in recoveryStates)
+        {
+            try
+            {
+                var result = await DispatchLostResponse(recoveryState, response, channel).ConfigureAwait(false);
+                if (!routeSet)
+                {
+                    shouldResume = result.ShouldResume;
+                    routeSet = true;
+                }
+                else if (shouldResume != result.ShouldResume)
+                {
+                    routeMixed = true;
+                }
+
+                if (!result.CallbackInvoked)
+                    continue;
+
+                callbackInvoked = true;
+                await recoveryStateStore.TryDeleteAsync(correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                    throw;
+
+                firstException ??= ex;
+            }
+        }
+
+        if (firstException is not null)
+            throw firstException;
+
+        return new LostSubscriberDispatchResult(routeMixed ? null : shouldResume, callbackInvoked);
+    }
+
+    /// <summary>
+    /// Loads every recovery registration for <paramref name="correlationId"/> and dispatches a lost
+    /// exception to each registration's failure callback.
+    /// </summary>
+    public async Task<bool> DispatchLostExceptions(
+        IRecoveryStateStore recoveryStateStore,
+        string correlationId,
+        Exception exception,
+        string channel,
+        CancellationToken cancellationToken)
+    {
+        var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (recoveryStates.Count == 0)
+            return await DispatchLostException(null, exception, channel).ConfigureAwait(false);
+
+        var callbackInvoked = false;
+        Exception? firstException = null;
+
+        foreach (var recoveryState in recoveryStates)
+        {
+            try
+            {
+                if (!await DispatchLostException(recoveryState, exception, channel).ConfigureAwait(false))
+                    continue;
+
+                callbackInvoked = true;
+                await recoveryStateStore.TryDeleteAsync(correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                    throw;
+
+                firstException ??= ex;
+            }
+        }
+
+        if (firstException is not null)
+            throw firstException;
+
+        return callbackInvoked;
+    }
+
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>
     public async Task<LostSubscriberDispatchResult> DispatchLostResponse<T>(RecoveryState? recoveryState, T response, string channel)
     {

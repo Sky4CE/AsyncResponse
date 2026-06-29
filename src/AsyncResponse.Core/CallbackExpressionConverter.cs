@@ -10,12 +10,15 @@ namespace AsyncResponse;
 /// </summary>
 internal static class CallbackExpressionConverter
 {
+    /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
     public static ReflectionCallDto ToReflectionCall<TService>(Expression<Action<TService>> expression)
         => Build<TService>(expression.Body);
 
+    /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
     public static ReflectionCallDto ToReflectionCall<TService>(Expression<Func<TService, Task>> expression)
         => Build<TService>(expression.Body);
 
+    /// <summary>Converts the callback expression to a reflection call descriptor.</summary>
     public static ReflectionCallDto ToReflectionCall<TService>(Expression<Func<TService, ValueTask>> expression)
         => Build<TService>(expression.Body);
 
@@ -102,6 +105,7 @@ internal static class CallbackExpressionConverter
     {
         public bool Found;
 
+        /// <summary>Runs the Visit operation.</summary>
         public override Expression? Visit(Expression? node)
         {
             if (Found || node is null) return node;
@@ -114,6 +118,7 @@ internal static class CallbackExpressionConverter
     {
         public bool Found;
 
+        /// <summary>Runs the VisitParameter operation.</summary>
         protected override Expression VisitParameter(ParameterExpression node)
         {
             if (node == _parameter) Found = true;

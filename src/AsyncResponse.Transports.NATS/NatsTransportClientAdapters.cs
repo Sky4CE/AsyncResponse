@@ -45,6 +45,7 @@ internal interface INatsJetStreamTransport
 /// <summary>Production <see cref="INatsJetStreamTransport"/> over a NATS <see cref="INatsJSContext"/>.</summary>
 internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) : INatsJetStreamTransport
 {
+    /// <summary>Ensures the required resource exists.</summary>
     public async Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
     {
         var config = new StreamConfig(stream, [subject])
@@ -55,6 +56,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
         await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Ensures the required resource exists.</summary>
     public async Task EnsureConsumerAsync(string stream, string durable, TimeSpan ackWait, CancellationToken cancellationToken)
     {
         var config = new ConsumerConfig(durable)
@@ -69,6 +71,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
         await _jetStream.CreateOrUpdateConsumerAsync(stream, config, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Publishes the supplied message.</summary>
     public async Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)
     {
         var ack = await _jetStream.PublishAsync(
@@ -80,6 +83,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
         return ack.Seq.ToString();
     }
 
+    /// <summary>Runs the ConsumeAsync operation.</summary>
     public async IAsyncEnumerable<NatsJobDelivery> ConsumeAsync(
         string stream,
         string durable,
@@ -134,6 +138,7 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
 /// <summary>Bounded exponential-backoff retry for transient NATS failures, mirroring the other transports.</summary>
 internal static class NatsTransportRetry
 {
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     public static Task<T> ExecuteAsync<T>(
         Func<CancellationToken, Task<T>> action,
         int maxAttempts,
@@ -142,6 +147,7 @@ internal static class NatsTransportRetry
         CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
+    /// <summary>Runs the IsTransient operation.</summary>
     public static bool IsTransient(Exception exception)
         => exception is NatsException or TimeoutException && exception is not OperationCanceledException;
 }

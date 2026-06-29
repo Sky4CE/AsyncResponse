@@ -32,6 +32,7 @@ internal sealed class AsyncResponseStartupValidator(
     IEnumerable<AsyncResponseChannelMarker> _channels,
     IEnumerable<AsyncResponseTransportMarker> _transports) : IHostedService
 {
+    /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
@@ -64,5 +65,6 @@ internal sealed class AsyncResponseStartupValidator(
         return Task.CompletedTask;
     }
 
+    /// <summary>Stops this service.</summary>
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }

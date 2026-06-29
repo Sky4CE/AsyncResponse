@@ -21,6 +21,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     private readonly ILogger<NatsRecoveryStateStore> _logger;
     private readonly TimeProvider _timeProvider;
 
+    /// <summary>Creates a NATS JetStream Key-Value recovery state store.</summary>
     public NatsRecoveryStateStore(
         INatsKvStore store,
         IOptions<NatsAsyncResponseChannelOptions> options,
@@ -33,7 +34,8 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public Task SaveAsync(
+    /// <inheritdoc />
+    public async Task SaveAsync(
         string correlationId,
         RecoveryState state,
         TimeSpan ttl,
@@ -45,50 +47,61 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
 
         cancellationToken.ThrowIfCancellationRequested();
+        if (state.RegistrationId == Guid.Empty)
+            state.RegistrationId = Guid.NewGuid();
 
-        var stored = new StoredRecoveryState
-        {
-            State = state,
-            ExpiresAtUtc = _timeProvider.GetUtcNow() + ttl
-        };
+        var key = NatsSubjectSchema.RecoveryKey(correlationId);
+        var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+        var states = stored is not null && !IsExpired(stored)
+            ? StatesFrom(stored)
+            : [];
+        states.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
+        states.Add(state);
 
-        return _store.PutAsync(
-            NatsSubjectSchema.RecoveryKey(correlationId),
-            JsonSerializer.Serialize(stored),
-            cancellationToken);
+        await PutStatesAsync(key, states, _timeProvider.GetUtcNow() + ttl, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc />
     public async Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
+        => (await GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
 
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
-        var json = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-        if (json is null)
-            return null;
-
-        var stored = TryDeserialize(json, key);
-        if (stored?.State is null)
-            return null;
+        var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+        if (stored is null)
+            return [];
 
         if (IsExpired(stored))
         {
             // Past its logical expiry but still physically present (bucket MaxAge has not collected it
             // yet): treat as gone and remove it best-effort so it never resurfaces.
             await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
-            return null;
+            return [];
         }
 
-        if (!IsSchemaReadable(stored.State, key))
-            return null;
+        var states = StatesFrom(stored);
+        for (var i = states.Count - 1; i >= 0; i--)
+        {
+            var state = states[i];
+            if (!IsSchemaReadable(state, key))
+            {
+                states.RemoveAt(i);
+                continue;
+            }
 
-        if (string.IsNullOrWhiteSpace(stored.State.CorrelationId))
-            stored.State.CorrelationId = correlationId;
+            if (string.IsNullOrWhiteSpace(state.CorrelationId))
+                state.CorrelationId = correlationId;
+        }
 
-        return stored.State;
+        return states;
     }
 
+    /// <inheritdoc />
     public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
@@ -96,18 +109,44 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         return _store.DeleteAsync(NatsSubjectSchema.RecoveryKey(correlationId), cancellationToken);
     }
 
+    /// <inheritdoc />
+    public async Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var key = NatsSubjectSchema.RecoveryKey(correlationId);
+        var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+        if (stored is null)
+            return false;
+
+        if (IsExpired(stored))
+        {
+            await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+
+        var states = StatesFrom(stored);
+        var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
+        if (!removed)
+            return false;
+
+        if (states.Count == 0)
+            return await _store.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+
+        await PutStatesAsync(key, states, stored.ExpiresAtUtc, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await foreach (var key in _store.GetKeysAsync(cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var json = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-            if (json is null)
-                continue;
-
-            var stored = TryDeserialize(json, key);
-            if (stored?.State is null)
+            var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+            if (stored is null)
                 continue;
 
             if (IsExpired(stored))
@@ -116,15 +155,43 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 continue;
             }
 
-            if (!IsSchemaReadable(stored.State, key))
-                continue;
+            foreach (var state in StatesFrom(stored))
+            {
+                if (!IsSchemaReadable(state, key))
+                    continue;
 
-            // Older entries may predate the persisted correlation id; recover it from the key.
-            if (string.IsNullOrWhiteSpace(stored.State.CorrelationId))
-                stored.State.CorrelationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
+                // Older entries may predate the persisted correlation id; recover it from the key.
+                if (string.IsNullOrWhiteSpace(state.CorrelationId))
+                    state.CorrelationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
 
-            yield return stored.State;
+                yield return state;
+            }
         }
+    }
+
+    private async Task<StoredRecoveryState?> LoadStoredAsync(string key, CancellationToken cancellationToken)
+    {
+        var json = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
+        return json is null ? null : TryDeserialize(json, key);
+    }
+
+    private Task PutStatesAsync(
+        string key,
+        List<RecoveryState> states,
+        DateTimeOffset expiresAtUtc,
+        CancellationToken cancellationToken)
+    {
+        var stored = new StoredRecoveryState
+        {
+            State = states[0],
+            States = states,
+            ExpiresAtUtc = expiresAtUtc
+        };
+
+        return _store.PutAsync(
+            key,
+            JsonSerializer.Serialize(stored),
+            cancellationToken);
     }
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
@@ -153,6 +220,11 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
     }
 
+    private static List<RecoveryState> StatesFrom(StoredRecoveryState stored)
+        => stored.States is { Count: > 0 }
+            ? [.. stored.States]
+            : stored.State is null ? [] : [stored.State];
+
     private async Task TryDeleteSilentlyAsync(string key, CancellationToken cancellationToken)
     {
         try
@@ -169,6 +241,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     internal sealed class StoredRecoveryState
     {
         public RecoveryState? State { get; set; }
+        public List<RecoveryState>? States { get; set; }
         public DateTimeOffset ExpiresAtUtc { get; set; }
     }
 }

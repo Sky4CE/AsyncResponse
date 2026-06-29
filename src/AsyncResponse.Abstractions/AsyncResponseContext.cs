@@ -111,6 +111,7 @@ public static class AsyncResponseContext
     {
         private int _disposed;
 
+        /// <summary>Releases resources held by this instance.</summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
@@ -126,6 +127,7 @@ public static class AsyncResponseContext
     {
         private int _disposed;
 
+        /// <summary>Releases resources held by this instance.</summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)

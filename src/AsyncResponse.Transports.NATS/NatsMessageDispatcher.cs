@@ -34,6 +34,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     private readonly Task[]? _backgroundWorkers;
     private readonly CancellationTokenSource? _backgroundCts;
 
+    /// <summary>Runs the NatsMessageDispatcher operation.</summary>
     public NatsMessageDispatcher(
         Func<NatsJobDelivery, CancellationToken, Task> handler,
         INatsJetStreamTransport jetStream,
@@ -70,6 +71,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Handles the delivered message.</summary>
     public async Task HandleAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
         if (_subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
@@ -219,6 +221,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     private static string SanitizeHeaderValue(string value)
         => value.Replace('\r', ' ').Replace('\n', ' ');
 
+    /// <summary>Releases resources held by this instance.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_backgroundQueue is null)

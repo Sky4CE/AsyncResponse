@@ -6,6 +6,7 @@ namespace AsyncResponse.Transports.GooglePubSub;
 
 internal static class GooglePubSubCorrelationIdExtractor
 {
+    /// <summary>Extracts the correlation id from the supplied message.</summary>
     public static string? Extract(
         PubsubMessage message,
         string messageJson,

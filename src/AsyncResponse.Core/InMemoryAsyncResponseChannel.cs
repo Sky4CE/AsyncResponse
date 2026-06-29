@@ -22,6 +22,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly ILogger<InMemoryAsyncResponseChannel> _logger;
 
+    /// <summary>Creates a process-local async-response channel.</summary>
     public InMemoryAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         IRecoveryStateStore recoveryStateStore,
@@ -36,6 +37,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
     }
 
+    /// <inheritdoc />
     public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
         string correlationId,
         Func<T, ValueTask<bool>>? completionPredicate = null,
@@ -77,6 +79,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 correlationId,
                 new RecoveryState
                 {
+                    RegistrationId = subscription.Id,
                     CorrelationId = correlationId,
                     PayloadTypeFullName = typeof(T).FullName,
                     RegisteredAtUtc = DateTime.UtcNow,
@@ -85,7 +88,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 _options.RecoveryStateExpiry).ConfigureAwait(false);
 
             if (subscription.CleanupStarted)
-                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
             else
                 subscription.ArmTimeout();
 
@@ -103,6 +106,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.CleanupOnceAsync);
     }
 
+    /// <inheritdoc />
     public Task SetResponse<T>(T response, string correlationId, CancellationToken cancellationToken = default) where T : IAsyncResponsePayload
         => SetResponseCore(response, correlationId, cancellationToken);
 
@@ -135,17 +139,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var result = await _lostSubscriberDispatcher
-                    .DispatchLostResponse(recoveryState, response, ChannelName(correlationId))
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
-
-                if (result.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -183,17 +183,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var result = await _lostSubscriberDispatcher
-                    .DispatchLostResponse(recoveryState, response.DeserializeUntyped(), ChannelName(correlationId))
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response.DeserializeUntyped(), ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
-
-                if (result.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -210,6 +206,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         }
     }
 
+    /// <inheritdoc />
     public async Task SetException(Exception exception, string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(exception);
@@ -232,16 +229,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var invoked = await _lostSubscriberDispatcher
-                    .DispatchLostException(recoveryState, exception, ChannelName(correlationId))
+                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
-
-                if (invoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 return;
             }
@@ -370,6 +363,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <summary>Adds a subscription to this correlation-id group.</summary>
         public bool TryAdd(SubscriptionBase subscription)
         {
             lock (_gate)
@@ -395,6 +389,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <summary>Removes a subscription and returns whether the group became empty.</summary>
         public bool Remove(Guid subscriptionId)
         {
             lock (_gate)
@@ -434,6 +429,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <summary>Captures the current subscriptions for lock-free dispatch outside the group lock.</summary>
         public SubscriptionSnapshot Snapshot()
         {
             lock (_gate)
@@ -465,9 +461,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             get => Single is not null ? 1 : Many?.Length ?? 0;
         }
 
+        /// <summary>Creates a snapshot containing one subscription.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static SubscriptionSnapshot ForSingle(SubscriptionBase single) => new(single, null);
 
+        /// <summary>Creates a snapshot containing multiple subscriptions.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static SubscriptionSnapshot ForMany(SubscriptionBase[] many) => new(null, many);
     }
@@ -483,6 +481,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         private int _terminal;
         private int _cleanupStarted;
 
+        /// <summary>Creates the common state for an in-memory waiter subscription.</summary>
         protected SubscriptionBase(InMemoryAsyncResponseChannel owner, string correlationId, TimeSpan timeout, Activity? activity)
         {
             _owner = owner;
@@ -492,6 +491,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             _timeoutCts = new CancellationTokenSource();
         }
 
+        /// <summary>Per-waiter registration id used for subscription and recovery-state cleanup.</summary>
         public Guid Id { get; } = Guid.NewGuid();
         protected string CorrelationId { get; }
         protected Activity? WaitActivity => _activity;
@@ -502,6 +502,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             get => Volatile.Read(ref _cleanupStarted) != 0;
         }
 
+        /// <summary>Arms the subscription timeout after registration has succeeded.</summary>
         public void ArmTimeout()
         {
             if (CleanupStarted)
@@ -528,10 +529,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <summary>Dispatches a typed or materializable response to this subscription.</summary>
         public abstract Task DispatchResponseAsync(object? response);
 
+        /// <summary>Dispatches a raw JSON response to this subscription.</summary>
         public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response);
 
+        /// <summary>Faults this subscription with a published exception.</summary>
         public Task DispatchExceptionAsync(Exception exception)
         {
             if (!TryBeginTerminal())
@@ -542,6 +546,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return CleanupOnceAsTask();
         }
 
+        /// <summary>Runs subscription, recovery-state, timeout, and activity cleanup once.</summary>
         public ValueTask CleanupOnceAsync()
         {
             Task cleanupTask;
@@ -561,7 +566,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             try
             {
                 _owner.RemoveSubscription(CorrelationId, Id);
-                await _owner._recoveryStateStore.TryDeleteAsync(CorrelationId).ConfigureAwait(false);
+                await _owner._recoveryStateStore.TryDeleteAsync(CorrelationId, Id).ConfigureAwait(false);
             }
             finally
             {
@@ -571,14 +576,18 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <summary>Marks this subscription as terminal if no terminal signal has won yet.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected bool TryBeginTerminal()
             => Interlocked.Exchange(ref _terminal, 1) == 0;
 
+        /// <summary>Stores the timeout exception on the concrete waiter task.</summary>
         protected abstract void SetTimeoutException(Exception exception);
 
+        /// <summary>Attempts to fault the concrete waiter task.</summary>
         public abstract void TrySetException(Exception exception);
 
+        /// <summary>Returns cleanup as a task for dispatch paths that already operate on <see cref="Task"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected Task CleanupOnceAsTask()
         {
@@ -607,6 +616,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         private readonly ExecutionContext? _capturedContext;
         private readonly TaskCompletionSource<T> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        /// <summary>Creates a typed in-memory waiter subscription.</summary>
         public Subscription(
             InMemoryAsyncResponseChannel owner,
             string correlationId,
@@ -622,6 +632,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         public Task<T> ResponseTask => _tcs.Task;
 
+        /// <inheritdoc />
         public override Task DispatchResponseAsync(object? response)
         {
             if (CleanupStarted)
@@ -638,6 +649,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return dispatch!;
         }
 
+        /// <inheritdoc />
         public override Task DispatchRawJsonResponseAsync(RawJsonResponse response)
         {
             if (CleanupStarted)
@@ -748,9 +760,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
+        /// <inheritdoc />
         protected override void SetTimeoutException(Exception exception)
             => _tcs.TrySetException(exception);
 
+        /// <inheritdoc />
         public override void TrySetException(Exception exception)
             => _tcs.TrySetException(exception);
     }
@@ -762,6 +776,7 @@ internal sealed class InMemoryAsyncResponseWaiter<T>(
 {
     public Task<T> ResponseTask => _responseTask;
 
+    /// <inheritdoc />
     public ValueTask DisposeAsync()
         => _cleanupAsync();
 }

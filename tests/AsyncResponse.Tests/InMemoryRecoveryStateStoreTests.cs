@@ -69,4 +69,31 @@ public class InMemoryRecoveryStateStoreTests
             }
         });
     }
+
+    [Fact]
+    public async Task SameCorrelationId_AppendsAndDeletesOneRegistration()
+    {
+        var store = new InMemoryRecoveryStateStore();
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+
+        await store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a", RegisteredAtUtc = DateTime.UtcNow },
+            TimeSpan.FromMinutes(1));
+        await store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a", RegisteredAtUtc = DateTime.UtcNow },
+            TimeSpan.FromMinutes(1));
+
+        var states = await store.GetAllAsync("corr-a");
+        Assert.Equal(2, states.Count);
+
+        Assert.True(await store.TryDeleteAsync("corr-a", firstId));
+
+        var remaining = Assert.Single(await store.GetAllAsync("corr-a"));
+        Assert.Equal(secondId, remaining.RegistrationId);
+        Assert.True(await store.TryDeleteAsync("corr-a"));
+        Assert.Empty(await store.GetAllAsync("corr-a"));
+    }
 }

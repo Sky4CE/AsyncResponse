@@ -6,171 +6,227 @@ internal static class AsyncResponseLoggerExtensions
 {
     private static readonly LogDefineOptions Options = new() { SkipEnabledCheck = true };
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug(this ILogger logger, string message)
         => Log(logger, LogLevel.Debug, exception: null, message);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0>(this ILogger logger, string message, T0 arg0)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1>(this ILogger logger, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0, arg1);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3, T4>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3, T4, T5>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Debug, exception: null, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug(this ILogger logger, Exception? exception, string message)
         => Log(logger, LogLevel.Debug, exception, message);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0>(this ILogger logger, Exception? exception, string message, T0 arg0)
         => Log(logger, LogLevel.Debug, exception, message, arg0);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Debug, exception, message, arg0, arg1);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Debug, exception, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Debug, exception, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3, T4>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Debug, exception, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogDebug operation.</summary>
     public static void LogDebug<T0, T1, T2, T3, T4, T5>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Debug, exception, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation(this ILogger logger, string message)
         => Log(logger, LogLevel.Information, exception: null, message);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0>(this ILogger logger, string message, T0 arg0)
         => Log(logger, LogLevel.Information, exception: null, message, arg0);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1>(this ILogger logger, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Information, exception: null, message, arg0, arg1);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Information, exception: null, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Information, exception: null, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3, T4>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Information, exception: null, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3, T4, T5>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Information, exception: null, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation(this ILogger logger, Exception? exception, string message)
         => Log(logger, LogLevel.Information, exception, message);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0>(this ILogger logger, Exception? exception, string message, T0 arg0)
         => Log(logger, LogLevel.Information, exception, message, arg0);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Information, exception, message, arg0, arg1);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Information, exception, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Information, exception, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3, T4>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Information, exception, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogInformation operation.</summary>
     public static void LogInformation<T0, T1, T2, T3, T4, T5>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Information, exception, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning(this ILogger logger, string message)
         => Log(logger, LogLevel.Warning, exception: null, message);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0>(this ILogger logger, string message, T0 arg0)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1>(this ILogger logger, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0, arg1);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3, T4>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3, T4, T5>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Warning, exception: null, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning(this ILogger logger, Exception? exception, string message)
         => Log(logger, LogLevel.Warning, exception, message);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0>(this ILogger logger, Exception? exception, string message, T0 arg0)
         => Log(logger, LogLevel.Warning, exception, message, arg0);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Warning, exception, message, arg0, arg1);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Warning, exception, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Warning, exception, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3, T4>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Warning, exception, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogWarning operation.</summary>
     public static void LogWarning<T0, T1, T2, T3, T4, T5>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Warning, exception, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError(this ILogger logger, string message)
         => Log(logger, LogLevel.Error, exception: null, message);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0>(this ILogger logger, string message, T0 arg0)
         => Log(logger, LogLevel.Error, exception: null, message, arg0);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1>(this ILogger logger, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Error, exception: null, message, arg0, arg1);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Error, exception: null, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Error, exception: null, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3, T4>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Error, exception: null, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3, T4, T5>(this ILogger logger, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Error, exception: null, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError(this ILogger logger, Exception? exception, string message)
         => Log(logger, LogLevel.Error, exception, message);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0>(this ILogger logger, Exception? exception, string message, T0 arg0)
         => Log(logger, LogLevel.Error, exception, message, arg0);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1)
         => Log(logger, LogLevel.Error, exception, message, arg0, arg1);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2)
         => Log(logger, LogLevel.Error, exception, message, arg0, arg1, arg2);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3)
         => Log(logger, LogLevel.Error, exception, message, arg0, arg1, arg2, arg3);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3, T4>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
         => Log(logger, LogLevel.Error, exception, message, arg0, arg1, arg2, arg3, arg4);
 
+    /// <summary>Runs the LogError operation.</summary>
     public static void LogError<T0, T1, T2, T3, T4, T5>(this ILogger logger, Exception? exception, string message, T0 arg0, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
         => Log(logger, LogLevel.Error, exception, message, arg0, arg1, arg2, arg3, arg4, arg5);
 
@@ -236,6 +292,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -246,6 +303,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -256,6 +314,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, T1, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, T1, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -266,6 +325,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, T1, T2, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, T1, T2, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -276,6 +336,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, T1, T2, T3, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, T1, T2, T3, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -286,6 +347,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, T1, T2, T3, T4, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, T1, T2, T3, T4, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),
@@ -296,6 +358,7 @@ internal static class AsyncResponseLoggerExtensions
     {
         private static readonly ConcurrentDictionary<LogKey, Action<ILogger, T0, T1, T2, T3, T4, T5, Exception?>> Delegates = new();
 
+        /// <summary>Runs the Get operation.</summary>
         public static Action<ILogger, T0, T1, T2, T3, T4, T5, Exception?> Get(LogLevel level, string message)
             => Delegates.GetOrAdd(
                 new LogKey(level, message),

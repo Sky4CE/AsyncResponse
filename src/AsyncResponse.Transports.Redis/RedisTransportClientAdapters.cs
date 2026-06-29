@@ -52,6 +52,7 @@ internal interface IRedisStreamDatabase
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
 {
+    /// <summary>Runs the StreamAddAsync operation.</summary>
     public Task<RedisValue> StreamAddAsync(
         RedisKey stream,
         NameValueEntry[] values,
@@ -72,6 +73,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
                 trimMode: StreamTrimMode.KeepReferences),
             cancellationToken);
 
+    /// <summary>Runs the StreamCreateConsumerGroupAsync operation.</summary>
     public Task<bool> StreamCreateConsumerGroupAsync(
         RedisKey stream,
         RedisValue groupName,
@@ -82,6 +84,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
             _database.StreamCreateConsumerGroupAsync(stream, groupName, position, createStream),
             cancellationToken);
 
+    /// <summary>Runs the StreamReadGroupAsync operation.</summary>
     public Task<StreamEntry[]> StreamReadGroupAsync(
         RedisKey stream,
         RedisValue groupName,
@@ -98,6 +101,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
                 noAck: false),
             cancellationToken);
 
+    /// <summary>Runs the StreamAcknowledgeAsync operation.</summary>
     public Task<long> StreamAcknowledgeAsync(
         RedisKey stream,
         RedisValue groupName,
@@ -107,6 +111,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
             _database.StreamAcknowledgeAsync(stream, groupName, messageId),
             cancellationToken);
 
+    /// <summary>Runs the StreamPendingMessagesAsync operation.</summary>
     public Task<StreamPendingMessageInfo[]> StreamPendingMessagesAsync(
         RedisKey stream,
         RedisValue groupName,
@@ -127,6 +132,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
                 minIdleTimeInMilliseconds),
             cancellationToken);
 
+    /// <summary>Runs the StreamClaimAsync operation.</summary>
     public Task<StreamEntry[]> StreamClaimAsync(
         RedisKey stream,
         RedisValue groupName,
@@ -165,6 +171,7 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
 
 internal static class RedisTransportRetry
 {
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     public static Task<T> ExecuteAsync<T>(
         Func<CancellationToken, Task<T>> action,
         int maxAttempts,
@@ -173,6 +180,7 @@ internal static class RedisTransportRetry
         CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
+    /// <summary>Runs the IsTransient operation.</summary>
     public static bool IsTransient(Exception exception)
         => exception is RedisConnectionException
             or RedisTimeoutException

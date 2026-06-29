@@ -49,6 +49,9 @@ public class RedisAsyncResponseChannelWaiterTests
         _store
             .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
     }
 
     [Fact]
@@ -142,7 +145,7 @@ public class RedisAsyncResponseChannelWaiterTests
         await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         await Eventually(() =>
             _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
-        _store.Verify(s => s.TryDeleteAsync("corr-timeout", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.TryDeleteAsync("corr-timeout", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -249,7 +252,7 @@ public class RedisAsyncResponseChannelWaiterTests
 
         await Eventually(() =>
             _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
-        _store.Verify(s => s.TryDeleteAsync("corr-dispose", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.TryDeleteAsync("corr-dispose", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

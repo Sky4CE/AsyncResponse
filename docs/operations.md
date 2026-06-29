@@ -36,10 +36,9 @@
    longest flow duration.
 10. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create a
     second connection for AsyncResponse.
-11. **Give each recoverable flow its own correlation id.** Lost-subscriber recovery keeps one
-    registration per correlation id, so if several recoverable waiters share a correlation id and all
-    are lost, only one recovery callback fires (the rest are reported stale). Live shared-correlation
-    fan-out is unaffected. See [recovery.md](recovery.md#shared-correlation-recovery-is-one-registration-per-correlation-id).
+11. **Share correlation ids deliberately.** Live delivery and lost-subscriber recovery both fan out
+    across multiple waiters on one correlation id; a normally completing waiter removes only its own
+    recovery registration. See [recovery.md](recovery.md#shared-correlation-recovery).
 12. **Measure hot paths in isolation before comparing profiles.** The sample's remote simulator
     deliberately waits before progress and terminal messages, so broad HTTP load-test latency mostly
     reflects sample workflow timing. Use the micro-benchmarks, stress harness, and NBomber

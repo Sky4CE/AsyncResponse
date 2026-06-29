@@ -39,6 +39,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     private readonly string _consumerGroup;
     private readonly RedisSubscriberRole _role;
 
+    /// <summary>Runs the RedisMessageDispatcher operation.</summary>
     protected RedisMessageDispatcher(
         Func<RedisStreamDelivery, CancellationToken, Task> handler,
         IRedisStreamDatabase database,
@@ -65,6 +66,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
 
     protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
 
+    /// <summary>Creates the configured dispatcher.</summary>
     public static RedisMessageDispatcher Create(
         Func<RedisStreamDelivery, CancellationToken, Task> handler,
         IRedisStreamDatabase database,
@@ -101,6 +103,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             role);
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateOptions(
         RedisAsyncResponseTransportOptions transportOptions,
         RedisSubscriberOptions subscriberOptions,
@@ -172,6 +175,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Handles the delivered message.</summary>
     public abstract Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken);
@@ -184,8 +188,10 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
     /// </summary>
     public virtual bool CanAcceptMore => true;
 
+    /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
         RedisStreamDelivery delivery,
         CancellationToken cancellationToken,
@@ -223,6 +229,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Acknowledges the delivered message.</summary>
     protected Task AckAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)
         => _database.StreamAcknowledgeAsync(
             delivery.Stream,
@@ -230,12 +237,15 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             delivery.MessageId,
             cancellationToken);
 
+    /// <summary>Runs the AlreadyExceededDeliveryAttempts operation.</summary>
     protected bool AlreadyExceededDeliveryAttempts(RedisStreamDelivery delivery)
         => MaxDeliveryAttempts > 0 && delivery.Attempt > MaxDeliveryAttempts;
 
+    /// <summary>Runs the ReachedDeliveryAttempts operation.</summary>
     protected bool ReachedDeliveryAttempts(RedisStreamDelivery delivery)
         => MaxDeliveryAttempts > 0 && delivery.Attempt >= MaxDeliveryAttempts;
 
+    /// <summary>Moves the delivered message to dead-letter storage and acknowledges it.</summary>
     protected async Task DeadLetterAndAckAsync(
         RedisStreamDelivery delivery,
         Exception exception,
@@ -307,6 +317,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
             ? string.Join("; ", entry.Values.Select(value => $"{value.Name}={value.Value}"))
             : string.Empty;
 
+    /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
     protected async ValueTask NotifyBackgroundFailureAsync(
         RedisStreamDelivery delivery,
         Exception exception)
@@ -347,6 +358,7 @@ internal sealed class AwaitingRedisMessageDispatcher(
     RedisSubscriberRole role)
     : RedisMessageDispatcher(handler, database, transportOptions, subscriberOptions, logger, stream, consumerGroup, role)
 {
+    /// <summary>Handles the delivered message.</summary>
     public override async Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken)
@@ -405,6 +417,7 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
     private int _runningCount;
     private int _disposeStarted;
 
+    /// <summary>Runs the QueuedRedisMessageDispatcher operation.</summary>
     public QueuedRedisMessageDispatcher(
         Func<RedisStreamDelivery, CancellationToken, Task> handler,
         IRedisStreamDatabase database,
@@ -444,6 +457,7 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
 
     public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
 
+    /// <summary>Handles the delivered message.</summary>
     public override async Task<RedisDispatchOutcome> HandleAsync(
         RedisStreamDelivery delivery,
         CancellationToken subscriberCancellationToken)
@@ -479,6 +493,7 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
         return RedisDispatchOutcome.Processed;
     }
 
+    /// <summary>Releases resources held by this instance.</summary>
     public override async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)

@@ -10,6 +10,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
 {
     private readonly Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
 
+    /// <summary>Runs the GooglePubSubSubscriberService operation.</summary>
     protected GooglePubSubSubscriberService(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         ILogger logger)
@@ -17,6 +18,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     {
     }
 
+    /// <summary>Runs the GooglePubSubSubscriberService operation.</summary>
     protected GooglePubSubSubscriberService(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         ILogger logger,
@@ -33,6 +35,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     protected abstract string SubscriptionId { get; }
     protected abstract GooglePubSubSubscriberOptions SubscriberOptions { get; }
     protected abstract GooglePubSubSubscriberRole SubscriberRole { get; }
+    /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken);
 
     private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
@@ -48,6 +51,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         return new GooglePubSubSubscriberClientAdapter(subscriber);
     }
 
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
@@ -93,6 +97,7 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the GooglePubSubWorkerSubscriber operation.</summary>
     public GooglePubSubWorkerSubscriber(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
@@ -118,6 +123,7 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
     protected override GooglePubSubSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override GooglePubSubSubscriberRole SubscriberRole => GooglePubSubSubscriberRole.Worker;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
         => _ingress.HandleWorkerMessageAsync(message.Data.ToStringUtf8());
 }
@@ -126,6 +132,7 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the GooglePubSubResponseIngressSubscriber operation.</summary>
     public GooglePubSubResponseIngressSubscriber(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
@@ -151,6 +158,7 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
     protected override GooglePubSubSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override GooglePubSubSubscriberRole SubscriberRole => GooglePubSubSubscriberRole.ResponseIngress;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken)
     {
         var messageJson = message.Data.ToStringUtf8();

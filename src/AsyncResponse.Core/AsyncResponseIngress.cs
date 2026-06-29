@@ -14,6 +14,7 @@ internal sealed class AsyncResponseIngress(
     AsyncResponseContextPropagation _propagation,
     ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
 {
+    /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity(
@@ -49,6 +50,7 @@ internal sealed class AsyncResponseIngress(
         }
     }
 
+    /// <summary>Handles the delivered message.</summary>
     public async Task HandleWorkerMessageAsync(string messageJson)
     {
         using var activity = AsyncResponseDiagnostics.StartActivity(

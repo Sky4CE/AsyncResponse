@@ -19,6 +19,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     private readonly string _subscriptionId;
     private readonly GooglePubSubSubscriberRole _role;
 
+    /// <summary>Runs the GooglePubSubMessageDispatcher operation.</summary>
     protected GooglePubSubMessageDispatcher(
         Func<PubsubMessage, CancellationToken, Task> handler,
         GooglePubSubAsyncResponseOptions transportOptions,
@@ -37,6 +38,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
 
     protected ILogger Logger { get; }
 
+    /// <summary>Creates the configured dispatcher.</summary>
     public static GooglePubSubMessageDispatcher Create(
         Func<PubsubMessage, CancellationToken, Task> handler,
         GooglePubSubAsyncResponseOptions transportOptions,
@@ -68,6 +70,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         };
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateOptions(
         GooglePubSubAsyncResponseOptions transportOptions,
         GooglePubSubSubscriberOptions subscriberOptions,
@@ -139,12 +142,15 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Handles the delivered message.</summary>
     public abstract Task<SubscriberClient.Reply> HandleAsync(
         PubsubMessage message,
         CancellationToken subscriberCancellationToken);
 
+    /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
         PubsubMessage message,
         CancellationToken cancellationToken,
@@ -176,6 +182,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
     protected async ValueTask NotifyBackgroundFailureAsync(
         PubsubMessage message,
         Exception exception,
@@ -214,6 +221,7 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
     GooglePubSubSubscriberRole role)
     : GooglePubSubMessageDispatcher(handler, transportOptions, subscriberOptions, logger, subscriptionId, role)
 {
+    /// <summary>Handles the delivered message.</summary>
     public override async Task<SubscriberClient.Reply> HandleAsync(
         PubsubMessage message,
         CancellationToken subscriberCancellationToken)
@@ -242,6 +250,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
     private int _runningCount;
     private int _disposeStarted;
 
+    /// <summary>Runs the QueuedGooglePubSubMessageDispatcher operation.</summary>
     public QueuedGooglePubSubMessageDispatcher(
         Func<PubsubMessage, CancellationToken, Task> handler,
         GooglePubSubAsyncResponseOptions transportOptions,
@@ -279,6 +288,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
     internal int PendingCount => Volatile.Read(ref _pendingCount);
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
+    /// <summary>Handles the delivered message.</summary>
     public override Task<SubscriberClient.Reply> HandleAsync(
         PubsubMessage message,
         CancellationToken subscriberCancellationToken)
@@ -314,6 +324,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         }
     }
 
+    /// <summary>Releases resources held by this instance.</summary>
     public override async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)

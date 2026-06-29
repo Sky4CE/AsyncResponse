@@ -6,6 +6,7 @@ namespace AsyncResponse.Transports.GooglePubSub;
 internal sealed class GooglePubSubReplyTargetProvider(
     IOptions<GooglePubSubAsyncResponseOptions> _options) : IAsyncResponseReplyTargetProvider
 {
+    /// <summary>Gets the configured reply target.</summary>
     public AsyncResponseReplyTarget GetReplyTarget(string? name = null)
     {
         var options = _options.Value;

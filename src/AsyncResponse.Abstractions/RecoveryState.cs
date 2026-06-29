@@ -14,16 +14,6 @@ namespace AsyncResponse;
 /// misinterpret) entries written by an incompatible schema — see
 /// <see cref="RecoveryStateSchema"/>.
 /// </para>
-/// <para>
-/// <b>One recovery registration per correlation id (current limitation).</b> The store keeps a
-/// single recovery registration per correlation id. If multiple <em>recoverable</em> waiters share
-/// one correlation id and all of them are lost (e.g. a redeploy drops every process), only one
-/// flow's callback is invoked when a late response arrives; the others are surfaced by the watchdog
-/// as stale rather than recovered. This is specific to the lost-subscriber recovery path — live
-/// shared-correlation fan-out (pub/sub delivery to several live waiters) is unaffected. Give each
-/// recoverable flow its own correlation id to guarantee independent recovery. Making recovery
-/// fan-out coherent end-to-end (a registration list per correlation id) is tracked as future work.
-/// </para>
 /// </summary>
 public sealed class RecoveryState
 {
@@ -35,6 +25,14 @@ public sealed class RecoveryState
     /// silently misroute an older deployment's recovery path.
     /// </summary>
     public int SchemaVersion { get; set; } = RecoveryStateSchema.Current;
+
+    /// <summary>
+    /// Per-waiter registration id. Multiple recoverable waiters may share one correlation id; this
+    /// id lets normal waiter cleanup remove only its own registration while lost-subscriber recovery
+    /// can fan out to every stored registration for the correlation id.
+    /// </summary>
+    public Guid RegistrationId { get; set; }
+
     /// <summary>
     /// Invoked when a response payload whose
     /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returns <c>true</c> arrives with

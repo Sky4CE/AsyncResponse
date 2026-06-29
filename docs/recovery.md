@@ -164,11 +164,12 @@ Practically: rolling a newer build forward is fine (newer readers understand old
 *newer* writer's data back into an *older* reader is the case versioning protects against — the older
 reader refuses the payload rather than guessing.
 
-## Shared-correlation recovery is one-registration-per-correlation-id
+## Shared-correlation recovery
 
-> Lost-subscriber recovery keeps a single recovery registration per correlation id. If multiple
-> recoverable waiters share one correlation id and all of them are lost (e.g. a redeploy drops every
-> process), only one flow's recovery callback fires on a late response; the others are reported by
-> the watchdog as stale. Live shared-correlation fan-out (pub/sub to several live waiters) is
-> unaffected. Give each recoverable flow its own correlation id for independent recovery. (Coherent
-> recovery fan-out is planned future work.)
+Multiple recoverable waiters may share one correlation id. Live delivery still fans out to every
+active waiter; if all waiters are lost, the recovery store keeps one registration per waiter and a
+late response/exception dispatches to every stored callback for that correlation id. A waiter that
+completes normally removes only its own registration, so a still-active sibling remains recoverable.
+
+The watchdog reports shared-correlation recovery state once per correlation id, not once per stored
+waiter registration.

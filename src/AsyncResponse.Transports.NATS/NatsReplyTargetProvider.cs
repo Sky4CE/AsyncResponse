@@ -5,6 +5,7 @@ namespace AsyncResponse.Transports.NATS;
 internal sealed class NatsReplyTargetProvider(
     IOptions<NatsAsyncResponseTransportOptions> _options) : IAsyncResponseReplyTargetProvider
 {
+    /// <summary>Gets the configured reply target.</summary>
     public AsyncResponseReplyTarget GetReplyTarget(string? name = null)
     {
         var options = _options.Value;

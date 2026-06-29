@@ -16,6 +16,7 @@ internal abstract class NatsSubscriberService : BackgroundService
 {
     private readonly INatsJetStreamTransport _jetStream;
 
+    /// <summary>Runs the NatsSubscriberService operation.</summary>
     protected NatsSubscriberService(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
@@ -24,6 +25,7 @@ internal abstract class NatsSubscriberService : BackgroundService
     {
     }
 
+    /// <summary>Runs the NatsSubscriberService operation.</summary>
     protected NatsSubscriberService(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsJetStreamTransport jetStream,
@@ -45,8 +47,10 @@ internal abstract class NatsSubscriberService : BackgroundService
     protected abstract string Consumer { get; }
     protected abstract NatsSubscriberOptions SubscriberOptions { get; }
     protected abstract NatsSubscriberRole Role { get; }
+    /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(NatsJobDelivery delivery, CancellationToken cancellationToken);
 
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         NatsTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
@@ -110,6 +114,7 @@ internal sealed class NatsWorkerSubscriber : NatsSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the NatsWorkerSubscriber operation.</summary>
     public NatsWorkerSubscriber(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
@@ -132,6 +137,7 @@ internal sealed class NatsWorkerSubscriber : NatsSubscriberService
     protected override NatsSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override NatsSubscriberRole Role => NatsSubscriberRole.Worker;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
         => _ingress.HandleWorkerMessageAsync(delivery.Payload);
 }
@@ -141,6 +147,7 @@ internal sealed class NatsResponseIngressSubscriber : NatsSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the NatsResponseIngressSubscriber operation.</summary>
     public NatsResponseIngressSubscriber(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection,
@@ -163,6 +170,7 @@ internal sealed class NatsResponseIngressSubscriber : NatsSubscriberService
     protected override NatsSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override NatsSubscriberRole Role => NatsSubscriberRole.ResponseIngress;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
         var correlationId = NatsCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);

@@ -8,6 +8,7 @@ internal sealed class RedisAsyncResponseWaiter<T>(
     /// <inheritdoc/>
     public Task<T> ResponseTask => _responseTask;
 
+    /// <summary>Releases resources held by this instance.</summary>
     public ValueTask DisposeAsync()
         => _cleanupAsync();
 }

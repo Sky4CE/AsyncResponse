@@ -112,6 +112,26 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
+    public async Task DuplicateCorrelationIds_AreProbedAndCountedOnce()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var probe = new FakeProbe(activeSubscribers: 0);
+        var watchdog = Build(
+            state,
+            Options(enabled: true),
+            new FakeScanner(StaleEntry("same-cid"), StaleEntry("same-cid")),
+            probe);
+
+        var snapshot = await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.NotNull(snapshot.Report);
+        Assert.Equal(1, snapshot.Report!.TotalEntries);
+        Assert.Single(snapshot.Report.StaleEntries);
+        Assert.Equal(1, probe.Calls);
+    }
+
+
+    [Fact]
     public async Task MissingSubscriberProbe_TreatsLivenessAsUnknown()
     {
         var state = new AsyncResponseWatchdogState();
@@ -224,8 +244,13 @@ public class AsyncResponseWatchdogLoopTests
 
     private sealed class FakeProbe(long activeSubscribers) : IActiveSubscriberProbe
     {
+        public int Calls { get; private set; }
+
         public ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
-            => ValueTask.FromResult(activeSubscribers);
+        {
+            Calls++;
+            return ValueTask.FromResult(activeSubscribers);
+        }
     }
 
     private sealed class ThrowingProbe : IActiveSubscriberProbe

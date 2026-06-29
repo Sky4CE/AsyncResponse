@@ -32,6 +32,9 @@ public class RedisRecoveryStateStoreTests
     {
         RedisValue savedValue = default;
         _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        _database
             .Setup(d => d.StringSetAsync(
                 It.IsAny<RedisKey>(),
                 It.IsAny<RedisValue>(),
@@ -62,8 +65,10 @@ public class RedisRecoveryStateStoreTests
         Assert.Equal("ar:recovery:corr-a", stringSet.Arguments[0]!.ToString());
         Assert.Equal("EX 180", stringSet.Arguments[2]!.ToString());
         savedValue = (RedisValue)stringSet.Arguments[1]!;
-        var savedState = JsonSerializer.Deserialize<RecoveryState>(savedValue.ToString());
+        var savedStates = JsonSerializer.Deserialize<List<RecoveryState>>(savedValue.ToString());
+        var savedState = Assert.Single(savedStates!);
         Assert.Equal("corr-a", savedState!.CorrelationId);
+        Assert.NotEqual(Guid.Empty, savedState.RegistrationId);
 
         await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(" ", state, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentNullException>(() => _store.SaveAsync("corr-a", null!, TimeSpan.FromSeconds(1)));
@@ -115,6 +120,22 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task GetAllAsync_DeserializesArrayAndLegacySingleObject()
+    {
+        var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first, second }));
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:legacy", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new RecoveryState { CorrelationId = "legacy" }));
+
+        Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
+        Assert.Single(await _store.GetAllAsync("legacy"));
+    }
+
+    [Fact]
     public async Task TryDeleteAsync_DeletesRecoveryKey()
     {
         RedisKey deletedKey = default;
@@ -131,6 +152,57 @@ public class RedisRecoveryStateStoreTests
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
         await Assert.ThrowsAsync<OperationCanceledException>(() => _store.TryDeleteAsync("corr-a", canceled.Token));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_WithRegistrationId_RemovesOnlyThatRegistration()
+    {
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+        RedisValue savedValue = default;
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[]
+            {
+                new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a" },
+                new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a" }
+            }));
+        _database
+            .Setup(d => d.KeyTimeToLiveAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(TimeSpan.FromMinutes(3));
+        _database
+            .Setup(d => d.StringSetAsync(
+                (RedisKey)"ar:recovery:corr-a",
+                It.IsAny<RedisValue>(),
+                It.IsAny<Expiration>(),
+                It.IsAny<ValueCondition>(),
+                It.IsAny<CommandFlags>()))
+            .Callback<RedisKey, RedisValue, Expiration, ValueCondition, CommandFlags>((_, value, _, _, _) => savedValue = value)
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.StringSetAsync(
+                (RedisKey)"ar:recovery:corr-a",
+                It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<When>(),
+                It.IsAny<CommandFlags>()))
+            .Callback<RedisKey, RedisValue, TimeSpan?, When, CommandFlags>((_, value, _, _, _) => savedValue = value)
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.StringSetAsync(
+                (RedisKey)"ar:recovery:corr-a",
+                It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<bool>(),
+                It.IsAny<When>(),
+                It.IsAny<CommandFlags>()))
+            .Callback<RedisKey, RedisValue, TimeSpan?, bool, When, CommandFlags>((_, value, _, _, _, _) => savedValue = value)
+            .ReturnsAsync(true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", firstId));
+
+        var remaining = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(savedValue.ToString())!);
+        Assert.Equal(secondId, remaining.RegistrationId);
     }
 
     [Fact]

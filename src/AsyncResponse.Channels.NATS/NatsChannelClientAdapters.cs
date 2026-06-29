@@ -82,6 +82,7 @@ internal interface INatsRawRequester
 /// <summary>Production <see cref="INatsRawRequester"/> over a NATS <see cref="INatsConnection"/>.</summary>
 internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRequester
 {
+    /// <summary>Runs the RequestAsync operation.</summary>
     public async Task RequestAsync(string subject, string? payload, NatsHeaders? headers, TimeSpan timeout, CancellationToken cancellationToken)
         => _ = await _connection.RequestAsync<string?, string>(
             subject,
@@ -90,12 +91,15 @@ internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRe
             replyOpts: new NatsSubOpts { Timeout = timeout },
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Runs the SubscribeAsync operation.</summary>
     public async Task<INatsSub<string>> SubscribeAsync(string subject, CancellationToken cancellationToken)
         => await _connection.SubscribeCoreAsync<string>(subject, cancellationToken: cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Publishes the supplied message.</summary>
     public ValueTask PublishReplyAsync(string replyTo, CancellationToken cancellationToken)
         => _connection.PublishAsync(replyTo, string.Empty, cancellationToken: cancellationToken);
 
+    /// <summary>Runs the FlushAsync operation.</summary>
     public async Task FlushAsync(CancellationToken cancellationToken)
         => await _connection.PingAsync(cancellationToken).ConfigureAwait(false);
 }
@@ -106,6 +110,7 @@ internal sealed class NatsRawRequester(INatsConnection _connection) : INatsRawRe
 /// </summary>
 internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsResponseChannelClient
 {
+    /// <summary>Runs the RequestAsync operation.</summary>
     public async Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
         NatsHeaders? headers = probe ? new NatsHeaders { [NatsChannelHeaders.Probe] = "1" } : null;
@@ -130,16 +135,19 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
         }
     }
 
+    /// <summary>Runs the SubscribeAsync operation.</summary>
     public async Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
     {
         var subscription = await _raw.SubscribeAsync(subject, cancellationToken).ConfigureAwait(false);
         return new NatsChannelSubscription(subscription, _raw);
     }
 
+    /// <summary>Runs the FlushAsync operation.</summary>
     public Task FlushAsync(CancellationToken cancellationToken) => _raw.FlushAsync(cancellationToken);
 
     private sealed class NatsChannelSubscription(INatsSub<string> _subscription, INatsRawRequester _raw) : INatsChannelSubscription
     {
+        /// <summary>Runs the ReadAsync operation.</summary>
         public async IAsyncEnumerable<NatsInboundResponse> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
             await foreach (var message in _subscription.Msgs.ReadAllAsync(cancellationToken).ConfigureAwait(false))
@@ -158,6 +166,7 @@ internal sealed class NatsResponseChannelClient(INatsRawRequester _raw) : INatsR
             }
         }
 
+        /// <summary>Releases resources held by this instance.</summary>
         public ValueTask DisposeAsync() => _subscription.DisposeAsync();
     }
 }
@@ -192,12 +201,14 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private INatsKVStore? _store;
 
+    /// <summary>Runs the PutAsync operation.</summary>
     public async Task PutAsync(string key, string value, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
         await store.PutAsync(key, value, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Runs the GetAsync operation.</summary>
     public async Task<string?> GetAsync(string key, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
@@ -216,6 +227,7 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         }
     }
 
+    /// <summary>Runs the DeleteAsync operation.</summary>
     public async Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
@@ -253,6 +265,7 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         }
     }
 
+    /// <summary>Runs the GetKeysAsync operation.</summary>
     public async IAsyncEnumerable<string> GetKeysAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);

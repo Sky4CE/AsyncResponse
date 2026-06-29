@@ -19,6 +19,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     private readonly string _queue;
     private readonly RabbitMqSubscriberRole _role;
 
+    /// <summary>Runs the RabbitMqMessageDispatcher operation.</summary>
     protected RabbitMqMessageDispatcher(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
         RabbitMqAsyncResponseOptions transportOptions,
@@ -83,6 +84,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         return max;
     }
 
+    /// <summary>Creates the configured dispatcher.</summary>
     public static RabbitMqMessageDispatcher Create(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
         RabbitMqAsyncResponseOptions transportOptions,
@@ -114,6 +116,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         };
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateOptions(
         RabbitMqAsyncResponseOptions transportOptions,
         RabbitMqSubscriberOptions subscriberOptions,
@@ -179,13 +182,16 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Handles the delivered message.</summary>
     public abstract Task HandleAsync(
         RabbitMqDelivery delivery,
         IRabbitMqChannel channel,
         CancellationToken subscriberCancellationToken);
 
+    /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
+    /// <summary>Runs the ExecuteHandlerAsync operation.</summary>
     protected async Task ExecuteHandlerAsync(
         RabbitMqDelivery delivery,
         CancellationToken cancellationToken,
@@ -220,6 +226,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         }
     }
 
+    /// <summary>Runs the NotifyBackgroundFailureAsync operation.</summary>
     protected async ValueTask NotifyBackgroundFailureAsync(
         RabbitMqDelivery delivery,
         Exception exception,
@@ -260,6 +267,7 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
     RabbitMqSubscriberRole role)
     : RabbitMqMessageDispatcher(handler, transportOptions, subscriberOptions, logger, queue, role)
 {
+    /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
         RabbitMqDelivery delivery,
         IRabbitMqChannel channel,
@@ -293,6 +301,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     private int _runningCount;
     private int _disposeStarted;
 
+    /// <summary>Runs the QueuedRabbitMqMessageDispatcher operation.</summary>
     public QueuedRabbitMqMessageDispatcher(
         Func<RabbitMqDelivery, CancellationToken, Task> handler,
         RabbitMqAsyncResponseOptions transportOptions,
@@ -328,6 +337,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     internal int PendingCount => Volatile.Read(ref _pendingCount);
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
+    /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
         RabbitMqDelivery delivery,
         IRabbitMqChannel channel,
@@ -359,6 +369,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         }
     }
 
+    /// <summary>Releases resources held by this instance.</summary>
     public override async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)

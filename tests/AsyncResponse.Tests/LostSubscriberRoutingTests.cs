@@ -34,6 +34,34 @@ public class LostSubscriberRoutingTests
         _database
             .Setup(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(true);
+        _database
+            .Setup(d => d.KeyTimeToLiveAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(TimeSpan.FromMinutes(5));
+        _database
+            .Setup(d => d.StringSetAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<Expiration>(),
+                It.IsAny<ValueCondition>(),
+                It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.StringSetAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<When>(),
+                It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.StringSetAsync(
+                It.IsAny<RedisKey>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<bool>(),
+                It.IsAny<When>(),
+                It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
         _multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(_subscriber.Object);
         _multiplexer.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(_database.Object);
 
@@ -90,6 +118,17 @@ public class LostSubscriberRoutingTests
         Assert.Single(_spy.ResumedPayloads);
         Assert.Empty(_spy.Failures);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task SetResponse_NoSubscribers_DispatchesAllRecoveryRegistrationsForCorrelationId()
+    {
+        ArmRecoveryStates(NewRecoveryState(), NewRecoveryState());
+
+        await Publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "done" }, CorrelationId);
+
+        Assert.Equal(2, _spy.ResumedPayloads.Count);
+        Assert.Empty(_spy.Failures);
     }
 
     [Fact]
@@ -180,6 +219,19 @@ public class LostSubscriberRoutingTests
         var failure = Assert.Single(_spy.Failures);
         Assert.IsType<InvalidOperationException>(failure);
         Assert.Equal("technical error", failure.Message);
+    }
+
+    [Fact]
+    public async Task SetException_NoSubscribers_DispatchesAllRecoveryRegistrationsForCorrelationId()
+    {
+        ArmRecoveryStates(NewRecoveryState(), NewRecoveryState());
+        var original = new InvalidOperationException("technical error");
+
+        await Publisher.SetException(original, CorrelationId);
+
+        Assert.Empty(_spy.ResumedPayloads);
+        Assert.Equal(2, _spy.Failures.Count);
+        Assert.All(_spy.Failures, failure => Assert.Same(original, failure));
     }
 
     [Fact]
@@ -355,9 +407,18 @@ public class LostSubscriberRoutingTests
     // ----- helpers -----
 
     private void ArmRecoveryState(string? payloadTypeFullName = "default", bool includeFailureCallback = true)
+        => ArmRecoveryStates(NewRecoveryState(payloadTypeFullName, includeFailureCallback));
+
+    private void ArmRecoveryStates(params RecoveryState[] states)
+        => _database
+            .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(states.Length == 1 ? JsonSerializer.Serialize(states[0]) : JsonSerializer.Serialize(states));
+
+    private static RecoveryState NewRecoveryState(string? payloadTypeFullName = "default", bool includeFailureCallback = true)
     {
-        var state = new RecoveryState
+        return new RecoveryState
         {
+            RegistrationId = Guid.NewGuid(),
             CorrelationId = CorrelationId,
             PayloadTypeFullName = payloadTypeFullName == "default" ? typeof(OperationResult).FullName : payloadTypeFullName,
             RegisteredAtUtc = DateTime.UtcNow,
@@ -376,10 +437,6 @@ public class LostSubscriberRoutingTests
                 }
                 : null
         };
-
-        _database
-            .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(JsonSerializer.Serialize(state));
     }
 }
 

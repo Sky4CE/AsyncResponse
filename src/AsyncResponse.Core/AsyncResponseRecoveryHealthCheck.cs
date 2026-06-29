@@ -24,6 +24,7 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
     /// <summary>Caps the number of stale entries listed in the health payload.</summary>
     private const int MaxReportedStaleEntries = 10;
 
+    /// <summary>Runs the CheckHealthAsync operation.</summary>
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
         => Task.FromResult(Evaluate(_state.Latest, DateTime.UtcNow));
 

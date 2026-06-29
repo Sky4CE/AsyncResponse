@@ -30,6 +30,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     private readonly NatsAsyncResponseChannelOptions _options;
     private readonly ILogger<NatsAsyncResponseChannel> _logger;
 
+    /// <summary>Creates a NATS-backed async-response channel.</summary>
     public NatsAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         INatsResponseChannelClient client,
@@ -115,6 +116,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registrationId = Guid.NewGuid();
 
         // Single-use cancellation token implementing the timeout. Armed only after subscribe + recovery
         // save succeed, but its callback is registered first so a very fast terminal message cleans up safely.
@@ -135,7 +137,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 if (subscription is not null)
                     await subscription.DisposeAsync().ConfigureAwait(false);
-                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
                 _logger.LogDebug("Unsubscribed from subject {Subject}.", subject);
             }
             catch (Exception ex)
@@ -297,6 +299,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             var recoveryState = new RecoveryState
             {
+                RegistrationId = registrationId,
                 ResumeCallback = resumeCallback,
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
@@ -374,15 +377,12 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response over
                 // to the lost-subscriber dispatcher, which asks the payload whether to resume or fail.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
-
-                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                    .ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-
-                if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Information))
             {
@@ -420,16 +420,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
-                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, subject).ConfigureAwait(false);
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                    .ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-
-                if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Information))
             {
@@ -479,14 +477,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
-
-                var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, subject).ConfigureAwait(false);
+                var callbackInvoked = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, subject, cancellationToken)
+                    .ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
-
-                if (callbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
             }
             else if (_logger.IsEnabled(LogLevel.Information))
             {

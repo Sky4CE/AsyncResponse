@@ -5,6 +5,7 @@ namespace AsyncResponse.Transports.RabbitMQ;
 internal sealed class RabbitMqReplyTargetProvider(
     IOptions<RabbitMqAsyncResponseOptions> _options) : IAsyncResponseReplyTargetProvider
 {
+    /// <summary>Gets the configured reply target.</summary>
     public AsyncResponseReplyTarget GetReplyTarget(string? name = null)
     {
         var options = _options.Value;

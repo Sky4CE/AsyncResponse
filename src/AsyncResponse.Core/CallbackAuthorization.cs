@@ -46,6 +46,7 @@ public sealed class AsyncResponseCallbackAllowList
     private sealed class AllowListAuthorizer(HashSet<string> allowedTypes, List<Func<string, string, bool>> predicates)
         : IAsyncResponseCallbackAuthorizer
     {
+        /// <summary>Runs the IsAllowed operation.</summary>
         public bool IsAllowed(string serviceInterfaceFullName, string methodName)
         {
             if (allowedTypes.Contains(serviceInterfaceFullName))

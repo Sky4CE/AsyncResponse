@@ -138,6 +138,35 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task CompletingOneWaiter_RemovesOnlyItsRecoveryRegistration()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var correlationId = $"{CorrelationId}-partial-cleanup";
+
+        await using var first = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: payload => new ValueTask<bool>(payload.Status == OperationStatus.Running),
+            timeout: TimeSpan.FromSeconds(5));
+        await using var second = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: payload => new ValueTask<bool>(payload.Status == OperationStatus.Completed),
+            timeout: TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, (await store.GetAllAsync(correlationId)).Count);
+
+        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Running }, correlationId);
+        Assert.Equal(OperationStatus.Running, (await first.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Status);
+        await Eventually(async () => (await store.GetAllAsync(correlationId)).Count == 1);
+
+        await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId);
+        Assert.Equal(OperationStatus.Completed, (await second.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Status);
+        await Eventually(async () => (await store.GetAllAsync(correlationId)).Count == 0);
+    }
+
+    [Fact]
     public async Task AsyncCompletionPredicate_FalseThenTrue_CompletesOnLaterResponse()
     {
         var provider = CreateProvider();
@@ -439,6 +468,9 @@ public class InMemoryAsyncResponseTests
         store
             .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
+        store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
         var channel = new InMemoryAsyncResponseChannel(
             services.GetRequiredService<IServiceScopeFactory>(),
             store.Object,
@@ -480,6 +512,20 @@ public class InMemoryAsyncResponseTests
         MethodName = nameof(IRecoverySpy.OnFailure),
         Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
     };
+
+    private static async Task Eventually(Func<Task<bool>> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (await condition())
+                return;
+
+            await Task.Delay(10);
+        }
+
+        Assert.True(await condition());
+    }
 
     private sealed class SelfReferencingFailurePayload : IAsyncResponsePayload
     {

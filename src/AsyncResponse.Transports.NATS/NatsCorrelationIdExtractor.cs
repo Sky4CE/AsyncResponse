@@ -9,6 +9,7 @@ namespace AsyncResponse.Transports.NATS;
 /// </summary>
 internal static class NatsCorrelationIdExtractor
 {
+    /// <summary>Extracts the correlation id from the supplied message.</summary>
     public static string? Extract(
         IReadOnlyDictionary<string, string>? headers,
         string messageJson,

@@ -104,10 +104,9 @@ id, then one `SetException` faults both. This works with the in-memory and Redis
 multiplex local handlers through one server-side subscription, so the sample waits for both waiter
 registrations directly rather than relying on Redis subscriber counts.
 
-> Shared-correlation fan-out is a **live** feature: every live waiter on the id is faulted. Durable
-> recovery is different — it keeps one registration per correlation id, so if all waiters on a shared
-> id are lost, only one recovery callback fires (the rest are reported stale). Give each recoverable
-> flow its own correlation id. See [recovery.md](recovery.md#shared-correlation-recovery-is-one-registration-per-correlation-id).
+> Shared-correlation fan-out applies to both live delivery and durable lost-subscriber recovery:
+> every live waiter on the id is faulted, and if all waiters are lost, every stored recovery
+> registration for that id is dispatched. See [recovery.md](recovery.md#shared-correlation-recovery).
 
 The sample also wires two context propagators (`SampleTracePropagator`, `SampleTenantPropagator`) —
 watch the `traceId`/`tenant` fields in the logs: `/request-response` shows them on `HANDLER:` lines

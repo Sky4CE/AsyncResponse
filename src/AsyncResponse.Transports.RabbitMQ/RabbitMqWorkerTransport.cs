@@ -25,6 +25,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
     private int _disposeGate;
     private bool _disposed;
 
+    /// <summary>Runs the RabbitMqWorkerTransport operation.</summary>
     public RabbitMqWorkerTransport(IOptions<RabbitMqAsyncResponseOptions> options)
         : this(options, new RabbitMqConnectionFactoryAdapter(options.Value))
     {
@@ -77,6 +78,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         }
     }
 
+    /// <summary>Publishes the supplied message.</summary>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);
@@ -112,6 +114,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         }
     }
 
+    /// <summary>Releases resources held by this instance.</summary>
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeGate, 1) != 0)

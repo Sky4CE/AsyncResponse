@@ -22,7 +22,11 @@ public class NatsAsyncResponseChannelTests
             .Returns(Task.CompletedTask);
         _store.Setup(s => s.GetAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync((RecoveryState?)null);
+        _store.Setup(s => s.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<RecoveryState>());
         _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
 
         var services = new ServiceCollection();
@@ -157,7 +161,7 @@ public class NatsAsyncResponseChannelTests
 
         await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-lost");
 
-        _store.Verify(s => s.GetAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.GetAllAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -168,7 +172,7 @@ public class NatsAsyncResponseChannelTests
 
         await channel.SetException(new InvalidOperationException("boom"), "corr-lost");
 
-        _store.Verify(s => s.GetAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.GetAllAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -259,7 +263,7 @@ public class NatsAsyncResponseChannelTests
 
         await raw.SetRawResponseJson("""{"Status":2,"Message":"late"}""", "corr-lost");
 
-        _store.Verify(s => s.GetAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.GetAllAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -299,7 +303,7 @@ public class NatsAsyncResponseChannelTests
     public async Task SetResponse_NoResponders_FiresResumeCallback_AndDeletesState()
     {
         _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
-        _store.Setup(s => s.GetAsync("corr-x", It.IsAny<CancellationToken>())).ReturnsAsync(ArmedState("corr-x"));
+        _store.Setup(s => s.GetAllAsync("corr-x", It.IsAny<CancellationToken>())).ReturnsAsync(new[] { ArmedState("corr-x") });
         var channel = CreateChannel();
 
         await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "late" }, "corr-x");
@@ -307,21 +311,21 @@ public class NatsAsyncResponseChannelTests
         Assert.NotNull(_spy.Resumed);
         Assert.Equal(OperationStatus.Completed, _spy.Resumed!.Status);
         Assert.Equal("corr-x", _spy.CorrelationId);
-        _store.Verify(s => s.TryDeleteAsync("corr-x", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.TryDeleteAsync("corr-x", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
     public async Task SetException_NoResponders_FiresFailureCallback_AndDeletesState()
     {
         _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
-        _store.Setup(s => s.GetAsync("corr-x", It.IsAny<CancellationToken>())).ReturnsAsync(ArmedState("corr-x"));
+        _store.Setup(s => s.GetAllAsync("corr-x", It.IsAny<CancellationToken>())).ReturnsAsync(new[] { ArmedState("corr-x") });
         var channel = CreateChannel();
 
         await channel.SetException(new InvalidOperationException("boom"), "corr-x");
 
         Assert.NotNull(_spy.Failed);
         Assert.Equal("boom", _spy.Failed!.Message);
-        _store.Verify(s => s.TryDeleteAsync("corr-x", It.IsAny<CancellationToken>()), Times.Once);
+        _store.Verify(s => s.TryDeleteAsync("corr-x", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -338,7 +342,7 @@ public class NatsAsyncResponseChannelTests
     [Fact]
     public async Task Waiter_Cleanup_ToleratesRecoveryStoreDeleteFailure()
     {
-        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("delete failed"));
         var channel = CreateChannel();
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-e", timeout: TimeSpan.FromSeconds(5));

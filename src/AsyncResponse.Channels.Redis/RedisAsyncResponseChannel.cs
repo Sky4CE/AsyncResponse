@@ -33,6 +33,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
     private readonly SerialExecutorRegistry _executors;
 
+    /// <summary>Creates a Redis-backed async-response channel.</summary>
     public RedisAsyncResponseChannel(
         IServiceScopeFactory scopeFactory,
         IConnectionMultiplexer multiplexer,
@@ -130,6 +131,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var registrationId = Guid.NewGuid();
 
         // Single-use cancellation token implementing the timeout. The timer is armed only
         // after subscribe + recovery-state save succeeds, but the callback is registered before
@@ -150,7 +152,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             try
             {
                 await _subscriber.UnsubscribeAsync(channel, redisHandler).ConfigureAwait(false);
-                await _recoveryStateStore.TryDeleteAsync(correlationId).ConfigureAwait(false);
+                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
                 // deadlocks with work currently running on the executor.
@@ -298,6 +300,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             await _subscriber.SubscribeAsync(channel, RedisHandler).ConfigureAwait(false);
             var recoveryState = new RecoveryState
             {
+                RegistrationId = registrationId,
                 ResumeCallback = resumeCallback,
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
@@ -380,15 +383,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response
                 // over to the lost-subscriber dispatcher, which asks the payload whether to resume
                 // the flow or fail it, and invokes the matching callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
-
-                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                    .ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-
-                if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
@@ -431,16 +431,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
             if (numSubscribers == 0)
             {
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
-                var dispatchResult = await _lostSubscriberDispatcher.DispatchLostResponse(recoveryState, response, channel.ToString()!).ConfigureAwait(false);
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                    .ConfigureAwait(false);
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-
-                if (dispatchResult.CallbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
@@ -493,14 +491,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             if (numSubscribers == 0)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var recoveryState = await _recoveryStateStore.GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
-
-                var callbackInvoked = await _lostSubscriberDispatcher.DispatchLostException(recoveryState, exception, channel.ToString()!).ConfigureAwait(false);
+                var callbackInvoked = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, channel.ToString()!, cancellationToken)
+                    .ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
-
-                if (callbackInvoked)
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }

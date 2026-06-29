@@ -63,6 +63,7 @@ internal sealed class InMemoryWorkerHost(
     WorkerJobExecutor _executor,
     ILogger<InMemoryWorkerHost> _logger) : BackgroundService
 {
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try

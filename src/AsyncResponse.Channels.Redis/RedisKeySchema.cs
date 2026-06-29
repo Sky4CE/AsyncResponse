@@ -10,11 +10,14 @@ internal sealed class RedisKeySchema(string _keyPrefix)
 {
     public string RecoveryKeyPattern => $"{_keyPrefix}:recovery:*";
 
+    /// <summary>Runs the Channel operation.</summary>
     public RedisChannel Channel(string correlationId)
         => new($"{_keyPrefix}:response:{correlationId}", RedisChannel.PatternMode.Literal);
 
+    /// <summary>Runs the RecoveryKey operation.</summary>
     public string RecoveryKey(string correlationId) => $"{_keyPrefix}:recovery:{correlationId}";
 
+    /// <summary>Runs the CorrelationIdFromRecoveryKey operation.</summary>
     public string CorrelationIdFromRecoveryKey(string recoveryKey)
         => recoveryKey[$"{_keyPrefix}:recovery:".Length..];
 }

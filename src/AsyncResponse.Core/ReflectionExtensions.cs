@@ -247,6 +247,7 @@ internal static class ReflectionExtensions
 
     private sealed class InvocationPlan(ConversionPlan[] converters, AsyncMethodInvoker invoker)
     {
+        /// <summary>Runs the ConvertArguments operation.</summary>
         public object?[] ConvertArguments(object?[] args)
         {
             object?[]? converted = null;
@@ -269,6 +270,7 @@ internal static class ReflectionExtensions
             return converted ?? args;
         }
 
+        /// <summary>Invokes the reflected operation.</summary>
         public ValueTask Invoke(object service, object?[] args)
             => invoker(service, args);
 
@@ -287,6 +289,7 @@ internal static class ReflectionExtensions
         private readonly bool _isNonNullableValueType = targetType.IsValueType && Nullable.GetUnderlyingType(targetType) is null;
         private readonly bool _isString = targetType == typeof(string);
 
+        /// <summary>Converts the supplied value.</summary>
         public object? Convert(object? value)
         {
             // Handle JSON payloads

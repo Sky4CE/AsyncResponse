@@ -11,6 +11,7 @@ internal interface IRabbitMqConnectionFactory
 internal sealed class RabbitMqConnectionFactoryAdapter(
     RabbitMqAsyncResponseOptions options) : IRabbitMqConnectionFactory
 {
+    /// <summary>Creates the requested resource.</summary>
     public async Task<IRabbitMqConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
     {
         var factory = CreateFactory(options);
@@ -53,6 +54,7 @@ internal interface IRabbitMqConnection : IAsyncDisposable
 
 internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqConnection
 {
+    /// <summary>Creates the requested resource.</summary>
     public async Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default)
     {
         // Enabling publisher confirmations with tracking makes BasicPublishAsync await the broker
@@ -65,9 +67,11 @@ internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqCo
         return new RabbitMqChannelAdapter(channel);
     }
 
+    /// <summary>Runs the CloseAsync operation.</summary>
     public Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
         => inner.CloseAsync(200, "AsyncResponse shutdown", timeout, abort: false, cancellationToken);
 
+    /// <summary>Releases resources held by this instance.</summary>
     public ValueTask DisposeAsync() => inner.DisposeAsync();
 }
 
@@ -87,21 +91,27 @@ internal interface IRabbitMqChannel : IAsyncDisposable
 
 internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
 {
+    /// <summary>Runs the ExchangeDeclareAsync operation.</summary>
     public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         => inner.ExchangeDeclareAsync(exchange, type, durable, autoDelete, cancellationToken: cancellationToken);
 
+    /// <summary>Runs the QueueDeclareAsync operation.</summary>
     public async Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default)
         => await inner.QueueDeclareAsync(queue, durable, exclusive, autoDelete, arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
 
+    /// <summary>Runs the QueueBindAsync operation.</summary>
     public Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default)
         => inner.QueueBindAsync(queue, exchange, routingKey, cancellationToken: cancellationToken);
 
+    /// <summary>Runs the BasicQosAsync operation.</summary>
     public Task BasicQosAsync(ushort prefetchCount, CancellationToken cancellationToken = default)
         => inner.BasicQosAsync(0, prefetchCount, global: false, cancellationToken);
 
+    /// <summary>Runs the BasicPublishAsync operation.</summary>
     public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
         => inner.BasicPublishAsync(exchange, routingKey, mandatory: true, properties, body, cancellationToken);
 
+    /// <summary>Runs the BasicConsumeAsync operation.</summary>
     public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
     {
         var consumer = new AsyncEventingBasicConsumer(inner);
@@ -130,18 +140,23 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
             cancellationToken);
     }
 
+    /// <summary>Runs the BasicCancelAsync operation.</summary>
     public Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default)
         => inner.BasicCancelAsync(consumerTag, cancellationToken: cancellationToken);
 
+    /// <summary>Runs the BasicAckAsync operation.</summary>
     public ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default)
         => inner.BasicAckAsync(deliveryTag, multiple: false, cancellationToken);
 
+    /// <summary>Runs the BasicNackAsync operation.</summary>
     public ValueTask BasicNackAsync(ulong deliveryTag, bool requeue, CancellationToken cancellationToken = default)
         => inner.BasicNackAsync(deliveryTag, multiple: false, requeue, cancellationToken);
 
+    /// <summary>Runs the CloseAsync operation.</summary>
     public Task CloseAsync(CancellationToken cancellationToken = default)
         => inner.CloseAsync(200, "AsyncResponse shutdown", abort: false, cancellationToken);
 
+    /// <summary>Releases resources held by this instance.</summary>
     public ValueTask DisposeAsync() => inner.DisposeAsync();
 }
 

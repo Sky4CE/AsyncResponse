@@ -7,6 +7,7 @@ namespace AsyncResponse.Transports.RabbitMQ;
 
 internal static class RabbitMqCorrelationIdExtractor
 {
+    /// <summary>Extracts the correlation id from the supplied message.</summary>
     public static string? Extract(
         RabbitMqDelivery delivery,
         string messageJson,

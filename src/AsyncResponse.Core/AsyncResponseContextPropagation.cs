@@ -11,6 +11,7 @@ internal sealed class AsyncResponseContextPropagation
 {
     private readonly IReadOnlyList<IAsyncResponseContextPropagator> _propagators;
 
+    /// <summary>Runs the AsyncResponseContextPropagation operation.</summary>
     public AsyncResponseContextPropagation(IEnumerable<IAsyncResponseContextPropagator> propagators)
         => _propagators = propagators as IReadOnlyList<IAsyncResponseContextPropagator> ?? propagators.ToArray();
 
@@ -87,6 +88,7 @@ internal sealed class AsyncResponseContextPropagation
     private sealed class NullScope : IDisposable
     {
         public static readonly NullScope Instance = new();
+        /// <summary>Releases resources held by this instance.</summary>
         public void Dispose() { }
     }
 
@@ -99,6 +101,7 @@ internal sealed class AsyncResponseContextPropagation
     {
         private int _disposed;
 
+        /// <summary>Releases resources held by this instance.</summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -116,6 +119,7 @@ internal sealed class AsyncResponseContextPropagation
     {
         private int _disposed;
 
+        /// <summary>Releases resources held by this instance.</summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -194,16 +198,21 @@ internal sealed class AsyncResponseContextPropagation
         public int Count => _inner?.Count ?? 0;
         public bool IsReadOnly => false;
 
+        /// <summary>Runs the Add operation.</summary>
         public void Add(string key, string value) => EnsureWritable().Add(key, value);
 
+        /// <summary>Runs the Add operation.</summary>
         public void Add(KeyValuePair<string, string> item)
             => ((ICollection<KeyValuePair<string, string>>)EnsureWritable()).Add(item);
 
+        /// <summary>Runs the ContainsKey operation.</summary>
         public bool ContainsKey(string key) => _inner?.ContainsKey(key) ?? false;
 
+        /// <summary>Runs the Contains operation.</summary>
         public bool Contains(KeyValuePair<string, string> item)
             => _inner is { } inner && ((ICollection<KeyValuePair<string, string>>)inner).Contains(item);
 
+        /// <summary>Runs the TryGetValue operation.</summary>
         public bool TryGetValue(string key, out string value)
         {
             if (_inner is { } inner)
@@ -213,16 +222,21 @@ internal sealed class AsyncResponseContextPropagation
             return false;
         }
 
+        /// <summary>Runs the Remove operation.</summary>
         public bool Remove(string key) => _inner?.Remove(key) ?? false;
 
+        /// <summary>Runs the Remove operation.</summary>
         public bool Remove(KeyValuePair<string, string> item)
             => _inner is { } inner && ((ICollection<KeyValuePair<string, string>>)inner).Remove(item);
 
+        /// <summary>Runs the Clear operation.</summary>
         public void Clear() => _inner?.Clear();
 
+        /// <summary>Runs the CopyTo operation.</summary>
         public void CopyTo(KeyValuePair<string, string>[] array, int arrayIndex)
             => ((ICollection<KeyValuePair<string, string>>)ReadView).CopyTo(array, arrayIndex);
 
+        /// <summary>Runs the GetEnumerator operation.</summary>
         public IEnumerator<KeyValuePair<string, string>> GetEnumerator() => ReadView.GetEnumerator();
 
         IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();

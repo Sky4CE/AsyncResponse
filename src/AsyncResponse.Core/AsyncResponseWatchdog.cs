@@ -70,6 +70,7 @@ public sealed class AsyncResponseWatchdogState
     /// <summary>The most recent scan outcome, or <c>null</c> when no scan has completed yet.</summary>
     public AsyncResponseWatchdogSnapshot? Latest => _latest;
 
+    /// <summary>Publishes the latest watchdog snapshot for health checks and metrics.</summary>
     public void Publish(AsyncResponseWatchdogSnapshot snapshot) => _latest = snapshot;
 }
 
@@ -93,8 +94,10 @@ public sealed record AsyncResponseWatchdogReport(
         DateTime utcNow,
         TimeSpan staleAfter)
     {
+        var totalEntries = 0;
         var entriesWithActiveWaiter = 0;
         var unknownAgeEntries = 0;
+        HashSet<string>? seenCorrelationIds = null;
 
         // Single pass: classify each entry once and collect the stale ones inline. The previous
         // implementation walked the collection twice (once to count, once to materialize the list)
@@ -105,6 +108,13 @@ public sealed record AsyncResponseWatchdogReport(
 
         foreach (var entry in entries)
         {
+            if (!string.IsNullOrWhiteSpace(entry.CorrelationId)
+                && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
+            {
+                continue;
+            }
+
+            totalEntries++;
             var activeSubscribers = entry.ActiveSubscribers;
             if (activeSubscribers > 0)
             {
@@ -127,7 +137,7 @@ public sealed record AsyncResponseWatchdogReport(
         }
 
         return new AsyncResponseWatchdogReport(
-            entries.Count,
+            totalEntries,
             entriesWithActiveWaiter,
             staleEntries ?? [],
             unknownAgeEntries);
@@ -157,6 +167,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
     private readonly AsyncResponseWatchdogOptions _options;
     private readonly ILogger<AsyncResponseWatchdog> _logger;
 
+    /// <summary>Creates the background recovery watchdog.</summary>
     public AsyncResponseWatchdog(
         IEnumerable<IRecoveryStateScanner> scanners,
         IEnumerable<IActiveSubscriberProbe> subscriberProbes,
@@ -173,6 +184,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         AsyncResponseDiagnostics.EnsureWatchdogGauges(state);
     }
 
+    /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         if (!_options.Enabled)
@@ -229,12 +241,19 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             var entriesWithActiveWaiter = 0;
             var unknownAgeEntries = 0;
             List<RecoveryStateObservation>? staleEntries = null;
+            HashSet<string>? seenCorrelationIds = null;
             var utcNow = DateTime.UtcNow;
 
             await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (entry is null)
                     continue;
+
+                if (!string.IsNullOrWhiteSpace(entry.CorrelationId)
+                    && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
+                {
+                    continue;
+                }
 
                 var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
                 totalEntries++;

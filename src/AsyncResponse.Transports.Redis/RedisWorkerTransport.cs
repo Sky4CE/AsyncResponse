@@ -19,6 +19,7 @@ public sealed class RedisWorkerTransport : IWorkerTransport
     private readonly IRedisStreamDatabase _database;
     private readonly RedisTransportKeySchema _keys;
 
+    /// <summary>Runs the RedisWorkerTransport operation.</summary>
     public RedisWorkerTransport(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IConnectionMultiplexer multiplexer)
@@ -55,6 +56,7 @@ public sealed class RedisWorkerTransport : IWorkerTransport
         _ = RedisTransportOptionsValidator.Required(options.PayloadField, nameof(options.PayloadField));
     }
 
+    /// <summary>Publishes the supplied message.</summary>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);

@@ -9,6 +9,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
 {
     private readonly IRabbitMqConnectionFactory _connectionFactory;
 
+    /// <summary>Runs the RabbitMqSubscriberService operation.</summary>
     protected RabbitMqSubscriberService(
         IOptions<RabbitMqAsyncResponseOptions> options,
         ILogger logger)
@@ -16,6 +17,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     {
     }
 
+    /// <summary>Runs the RabbitMqSubscriberService operation.</summary>
     protected RabbitMqSubscriberService(
         IOptions<RabbitMqAsyncResponseOptions> options,
         ILogger logger,
@@ -32,9 +34,12 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     protected abstract string QueueName { get; }
     protected abstract RabbitMqSubscriberOptions SubscriberOptions { get; }
     protected abstract RabbitMqSubscriberRole SubscriberRole { get; }
+    /// <summary>Ensures the required resource exists.</summary>
     protected abstract Task EnsureTopologyAsync(IRabbitMqChannel channel, CancellationToken cancellationToken);
+    /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken);
 
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
@@ -111,6 +116,7 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the RabbitMqWorkerSubscriber operation.</summary>
     public RabbitMqWorkerSubscriber(
         IOptions<RabbitMqAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
@@ -136,9 +142,11 @@ internal sealed class RabbitMqWorkerSubscriber : RabbitMqSubscriberService
     protected override RabbitMqSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override RabbitMqSubscriberRole SubscriberRole => RabbitMqSubscriberRole.Worker;
 
+    /// <summary>Ensures the required resource exists.</summary>
     protected override Task EnsureTopologyAsync(IRabbitMqChannel channel, CancellationToken cancellationToken)
         => RabbitMqTopology.EnsureWorkerAsync(channel, Options, cancellationToken);
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken)
         => _ingress.HandleWorkerMessageAsync(Encoding.UTF8.GetString(delivery.Body.Span));
 }
@@ -147,6 +155,7 @@ internal sealed class RabbitMqResponseIngressSubscriber : RabbitMqSubscriberServ
 {
     private readonly IAsyncResponseIngress _ingress;
 
+    /// <summary>Runs the RabbitMqResponseIngressSubscriber operation.</summary>
     public RabbitMqResponseIngressSubscriber(
         IOptions<RabbitMqAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
@@ -172,9 +181,11 @@ internal sealed class RabbitMqResponseIngressSubscriber : RabbitMqSubscriberServ
     protected override RabbitMqSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override RabbitMqSubscriberRole SubscriberRole => RabbitMqSubscriberRole.ResponseIngress;
 
+    /// <summary>Ensures the required resource exists.</summary>
     protected override Task EnsureTopologyAsync(IRabbitMqChannel channel, CancellationToken cancellationToken)
         => RabbitMqTopology.EnsureResponseAsync(channel, Options, cancellationToken);
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken)
     {
         var messageJson = Encoding.UTF8.GetString(delivery.Body.Span);

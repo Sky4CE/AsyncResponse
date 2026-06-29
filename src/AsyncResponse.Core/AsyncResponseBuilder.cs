@@ -10,6 +10,7 @@ internal abstract class AsyncResponseBuilderBase(
 {
     protected IAsyncResponseReplyTargetProvider? ReplyTargetProvider => _replyTargetProvider;
 
+    /// <summary>Validates the supplied options.</summary>
     protected static string ValidateCorrelationId(string correlationId)
         => !string.IsNullOrWhiteSpace(correlationId)
             ? correlationId
@@ -198,6 +199,7 @@ internal class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyn
         return WaitCoreAsync(trigger);
     }
 
+    /// <summary>Creates the requested resource.</summary>
     protected virtual Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
         => _subscriber.CreateResponseWaiter<T>(_correlationId, _completionPredicate, _timeout);
 
@@ -306,6 +308,7 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
         _subscriber = subscriber;
     }
 
+    /// <summary>Creates the requested resource.</summary>
     protected override Task<IAsyncResponseWaiter<T>> CreateWaiterAsync()
         => _subscriber.CreateRecoverableResponseWaiter<T>(
             _correlationId,

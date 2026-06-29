@@ -6,6 +6,7 @@ internal static class RabbitMqTopology
 {
     private const string DirectExchange = "direct";
 
+    /// <summary>Ensures the required resource exists.</summary>
     public static Task EnsureWorkerAsync(
         IRabbitMqChannel channel,
         RabbitMqAsyncResponseOptions options,
@@ -21,6 +22,7 @@ internal static class RabbitMqTopology
         return DeclareQueueTopologyAsync(channel, options, exchange, queue, routingKey, cancellationToken);
     }
 
+    /// <summary>Ensures the required resource exists.</summary>
     public static Task EnsureResponseAsync(
         IRabbitMqChannel channel,
         RabbitMqAsyncResponseOptions options,
@@ -90,6 +92,7 @@ internal static class RabbitMqTopology
         return arguments;
     }
 
+    /// <summary>Creates the requested resource.</summary>
     public static BasicProperties CreatePersistentJsonProperties(string? correlationId, string correlationHeader)
     {
         var properties = new BasicProperties

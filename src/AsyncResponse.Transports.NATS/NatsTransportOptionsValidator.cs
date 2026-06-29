@@ -2,23 +2,27 @@ namespace AsyncResponse.Transports.NATS;
 
 internal static class NatsTransportOptionsValidator
 {
+    /// <summary>Validates the supplied options.</summary>
     public static string Required(string? value, string name)
         => !string.IsNullOrWhiteSpace(value)
             ? value
             : throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be configured.");
 
+    /// <summary>Validates the supplied options.</summary>
     public static void Positive(TimeSpan value, string name)
     {
         if (value <= TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be positive.");
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void PositiveOrNull(long? value, string name)
     {
         if (value is <= 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be positive when set.");
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateCommon(NatsAsyncResponseTransportOptions options)
     {
         _ = Required(options.SubjectPrefix, nameof(options.SubjectPrefix));
@@ -56,6 +60,7 @@ internal static class NatsTransportOptionsValidator
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.SubscriberRetryMaxDelay)}.");
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateSubscriber(NatsSubscriberOptions subscriber, string role)
     {
         if (subscriber.BatchSize <= 0)

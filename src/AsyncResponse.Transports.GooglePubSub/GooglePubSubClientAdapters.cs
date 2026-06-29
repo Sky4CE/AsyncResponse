@@ -10,9 +10,11 @@ internal interface IGooglePubSubPublisherClient
 
 internal sealed class GooglePubSubPublisherClientAdapter(PublisherClient inner) : IGooglePubSubPublisherClient
 {
+    /// <summary>Publishes the supplied message.</summary>
     public Task<string> PublishAsync(PubsubMessage message)
         => inner.PublishAsync(message);
 
+    /// <summary>Runs the ShutdownAsync operation.</summary>
     public Task ShutdownAsync(TimeSpan timeout)
         => inner.ShutdownAsync(timeout);
 }
@@ -25,9 +27,11 @@ internal interface IGooglePubSubSubscriberClient
 
 internal sealed class GooglePubSubSubscriberClientAdapter(SubscriberClient inner) : IGooglePubSubSubscriberClient
 {
+    /// <summary>Starts this service.</summary>
     public Task StartAsync(Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler)
         => inner.StartAsync(handler);
 
+    /// <summary>Stops this service.</summary>
     public Task StopAsync(SubscriberClient.ShutdownOptions options, CancellationToken cancellationToken)
         => inner.StopAsync(options, cancellationToken);
 }

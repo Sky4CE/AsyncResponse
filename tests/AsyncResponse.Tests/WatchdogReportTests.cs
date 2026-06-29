@@ -76,6 +76,18 @@ public class WatchdogReportTests
         Assert.Equal("stale", report.StaleEntries.Single().CorrelationId);
     }
 
+    [Fact]
+    public void DuplicateCorrelationIds_AreCountedOnce()
+    {
+        var first = Entry(TimeSpan.FromDays(3), activeSubscribers: 0, correlationId: "same-cid");
+        var second = Entry(TimeSpan.FromDays(3), activeSubscribers: 0, correlationId: "same-cid");
+
+        var report = AsyncResponseWatchdogReport.Evaluate([first, second], Now, StaleAfter);
+
+        Assert.Equal(1, report.TotalEntries);
+        Assert.Single(report.StaleEntries);
+    }
+
     private static RecoveryStateObservation Entry(TimeSpan registeredAgo, long activeSubscribers, string correlationId = "corr-1")
         => new(
             correlationId,

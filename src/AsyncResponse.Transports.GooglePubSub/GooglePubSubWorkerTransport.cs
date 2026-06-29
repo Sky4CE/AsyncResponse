@@ -15,6 +15,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
     private readonly GooglePubSubAsyncResponseOptions _options;
     private readonly Lazy<Task<IGooglePubSubPublisherClient>> _publisher;
 
+    /// <summary>Runs the GooglePubSubWorkerTransport operation.</summary>
     public GooglePubSubWorkerTransport(IOptions<GooglePubSubAsyncResponseOptions> options)
         : this(options, () => CreatePublisherAsync(options.Value))
     {
@@ -46,6 +47,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         return new GooglePubSubPublisherClientAdapter(publisher);
     }
 
+    /// <summary>Publishes the supplied message.</summary>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);
@@ -81,6 +83,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         }
     }
 
+    /// <summary>Releases resources held by this instance.</summary>
     public async ValueTask DisposeAsync()
     {
         if (!_publisher.IsValueCreated)

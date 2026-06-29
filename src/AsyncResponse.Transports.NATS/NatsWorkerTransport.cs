@@ -23,6 +23,7 @@ public sealed class NatsWorkerTransport : IWorkerTransport
     private readonly SemaphoreSlim _ensureStreamGate = new(1, 1);
     private bool _streamEnsured;
 
+    /// <summary>Runs the NatsWorkerTransport operation.</summary>
     public NatsWorkerTransport(
         IOptions<NatsAsyncResponseTransportOptions> options,
         INatsConnection connection)
@@ -40,6 +41,7 @@ public sealed class NatsWorkerTransport : IWorkerTransport
         _schema = new NatsTransportSubjectSchema(_options);
     }
 
+    /// <summary>Publishes the supplied message.</summary>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);

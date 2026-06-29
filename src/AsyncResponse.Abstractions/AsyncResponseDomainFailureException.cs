@@ -15,6 +15,7 @@ namespace AsyncResponse;
 /// </summary>
 public sealed class AsyncResponseDomainFailureException : Exception
 {
+    /// <summary>Runs the AsyncResponseDomainFailureException operation.</summary>
     public AsyncResponseDomainFailureException(
         string? correlationId,
         string? payloadTypeFullName,

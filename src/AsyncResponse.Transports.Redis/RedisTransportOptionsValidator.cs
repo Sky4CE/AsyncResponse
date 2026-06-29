@@ -2,23 +2,27 @@ namespace AsyncResponse.Transports.Redis;
 
 internal static class RedisTransportOptionsValidator
 {
+    /// <summary>Validates the supplied options.</summary>
     public static string Required(string? value, string name)
         => !string.IsNullOrWhiteSpace(value)
             ? value
             : throw new InvalidOperationException($"{nameof(RedisAsyncResponseTransportOptions)}.{name} must be configured.");
 
+    /// <summary>Validates the supplied options.</summary>
     public static void Positive(TimeSpan value, string name)
     {
         if (value <= TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(RedisAsyncResponseTransportOptions)}.{name} must be positive.");
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void PositiveOrNull(long? value, string name)
     {
         if (value is <= 0)
             throw new InvalidOperationException($"{nameof(RedisAsyncResponseTransportOptions)}.{name} must be positive when set.");
     }
 
+    /// <summary>Validates the supplied options.</summary>
     public static void ValidateCommon(RedisAsyncResponseTransportOptions options)
     {
         _ = Required(options.KeyPrefix, nameof(options.KeyPrefix));

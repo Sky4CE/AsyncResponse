@@ -6,6 +6,7 @@ namespace AsyncResponse.Transports.Redis;
 
 internal static class RedisCorrelationIdExtractor
 {
+    /// <summary>Extracts the correlation id from the supplied message.</summary>
     public static string? Extract(
         StreamEntry entry,
         string messageJson,

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace AsyncResponse;
@@ -12,8 +11,10 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
 {
     private sealed record Entry(RecoveryState State, DateTime ExpiresAtUtc);
 
-    private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly object _gate = new();
+    private readonly Dictionary<string, List<Entry>> _entries = new(StringComparer.Ordinal);
 
+    /// <inheritdoc />
     public Task SaveAsync(
         string correlationId,
         RecoveryState state,
@@ -26,58 +27,126 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
 
         cancellationToken.ThrowIfCancellationRequested();
-        _entries[correlationId] = new Entry(state, DateTime.UtcNow.Add(ttl));
+        if (state.RegistrationId == Guid.Empty)
+            state.RegistrationId = Guid.NewGuid();
+
+        lock (_gate)
+        {
+            var nowUtc = DateTime.UtcNow;
+            var expiresAtUtc = nowUtc.Add(ttl);
+            if (!_entries.TryGetValue(correlationId, out var entries))
+            {
+                _entries[correlationId] = [new Entry(state, expiresAtUtc)];
+                return Task.CompletedTask;
+            }
+
+            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc || entry.State.RegistrationId == state.RegistrationId);
+            entries.Add(new Entry(state, expiresAtUtc));
+        }
+
         return Task.CompletedTask;
     }
 
-    public Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
+    /// <inheritdoc />
+    public async Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
+        => (await GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!_entries.TryGetValue(correlationId, out var entry))
-            return Task.FromResult<RecoveryState?>(null);
-
-        if (entry.ExpiresAtUtc <= DateTime.UtcNow)
+        lock (_gate)
         {
-            _entries.TryRemove(correlationId, out _);
-            return Task.FromResult<RecoveryState?>(null);
+            if (!_entries.TryGetValue(correlationId, out var entries))
+                return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
+
+            var nowUtc = DateTime.UtcNow;
+            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
+            if (entries.Count == 0)
+            {
+                _entries.Remove(correlationId);
+                return Task.FromResult<IReadOnlyList<RecoveryState>>([]);
+            }
+
+            var states = entries
+                .Where(entry => RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                .Select(entry => entry.State)
+                .ToArray();
+            return Task.FromResult<IReadOnlyList<RecoveryState>>(states);
         }
-
-        // Reject an entry written by an incompatible (newer) schema rather than risk misinterpreting
-        // it. In practice the in-memory store never crosses schema versions, but the check keeps it
-        // consistent with the durable stores and is unit-testable.
-        if (!RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-            return Task.FromResult<RecoveryState?>(null);
-
-        return Task.FromResult<RecoveryState?>(entry.State);
     }
 
+    /// <inheritdoc />
     public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
         cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(_entries.TryRemove(correlationId, out _));
+        lock (_gate)
+            return Task.FromResult(_entries.Remove(correlationId));
     }
 
+    /// <inheritdoc />
+    public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(correlationId, out var entries))
+                return Task.FromResult(false);
+
+            var removed = entries.RemoveAll(entry => entry.State.RegistrationId == registrationId) > 0;
+            if (entries.Count == 0)
+                _entries.Remove(correlationId);
+
+            return Task.FromResult(removed);
+        }
+    }
+
+    /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await Task.CompletedTask.ConfigureAwait(false); // process-local store: no async I/O to await
 
-        var nowUtc = DateTime.UtcNow;
+        RecoveryState[] states;
+        lock (_gate)
+        {
+            var nowUtc = DateTime.UtcNow;
+            List<string>? emptyKeys = null;
+            var liveStates = new List<RecoveryState>();
 
-        // Enumerate the dictionary directly rather than materializing ConcurrentDictionary.Values.
-        // The Values property builds a fresh List/ReadOnlyCollection holding a copy of every value,
-        // acquiring all of the dictionary's bucket locks to do so — an O(N) heap allocation and a
-        // latency spike that grow with the store on every scan. The dictionary's own enumerator is
-        // allocation-light and lock-free: it walks the buckets in place and hands back
-        // KeyValuePair<,> structs without snapshotting, so a scan over N entries adds no per-scan
-        // heap traffic beyond the states it actually yields.
-        foreach (var (_, entry) in _entries)
+            foreach (var (correlationId, entries) in _entries)
+            {
+                entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
+                if (entries.Count == 0)
+                {
+                    (emptyKeys ??= []).Add(correlationId);
+                    continue;
+                }
+
+                foreach (var entry in entries)
+                {
+                    if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
+                        liveStates.Add(entry.State);
+                }
+            }
+
+            if (emptyKeys is not null)
+            {
+                foreach (var key in emptyKeys)
+                    _entries.Remove(key);
+            }
+
+            states = liveStates.ToArray();
+        }
+
+        foreach (var state in states)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (entry.ExpiresAtUtc > nowUtc && RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                yield return entry.State;
+            yield return state;
         }
     }
 }

@@ -11,6 +11,7 @@ internal abstract class RedisSubscriberService : BackgroundService
 
     private readonly IRedisStreamDatabase _database;
 
+    /// <summary>Runs the RedisSubscriberService operation.</summary>
     protected RedisSubscriberService(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IConnectionMultiplexer multiplexer,
@@ -22,6 +23,7 @@ internal abstract class RedisSubscriberService : BackgroundService
     {
     }
 
+    /// <summary>Runs the RedisSubscriberService operation.</summary>
     protected RedisSubscriberService(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IRedisStreamDatabase database,
@@ -40,8 +42,10 @@ internal abstract class RedisSubscriberService : BackgroundService
     protected abstract RedisValue ConsumerGroup { get; }
     protected abstract RedisSubscriberOptions SubscriberOptions { get; }
     protected abstract RedisSubscriberRole SubscriberRole { get; }
+    /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken);
 
+    /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         RedisMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
@@ -279,6 +283,7 @@ internal sealed class RedisWorkerSubscriber : RedisSubscriberService
     private readonly IAsyncResponseIngress _ingress;
     private readonly RedisTransportKeySchema _keys;
 
+    /// <summary>Runs the RedisWorkerSubscriber operation.</summary>
     public RedisWorkerSubscriber(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IConnectionMultiplexer multiplexer,
@@ -306,6 +311,7 @@ internal sealed class RedisWorkerSubscriber : RedisSubscriberService
     protected override RedisSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override RedisSubscriberRole SubscriberRole => RedisSubscriberRole.Worker;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)
         => _ingress.HandleWorkerMessageAsync(delivery.Payload);
 }
@@ -315,6 +321,7 @@ internal sealed class RedisResponseIngressSubscriber : RedisSubscriberService
     private readonly IAsyncResponseIngress _ingress;
     private readonly RedisTransportKeySchema _keys;
 
+    /// <summary>Runs the RedisResponseIngressSubscriber operation.</summary>
     public RedisResponseIngressSubscriber(
         IOptions<RedisAsyncResponseTransportOptions> options,
         IConnectionMultiplexer multiplexer,
@@ -342,6 +349,7 @@ internal sealed class RedisResponseIngressSubscriber : RedisSubscriberService
     protected override RedisSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override RedisSubscriberRole SubscriberRole => RedisSubscriberRole.ResponseIngress;
 
+    /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)
         => _ingress.HandleResponseMessageAsync(delivery.Payload, delivery.CorrelationId);
 }

@@ -32,6 +32,7 @@ internal static class JsonSafety
         }
     }
 
+    /// <summary>Runs the SafeDeserialize operation.</summary>
     public static object? SafeDeserialize(string json, Type returnType, JsonSerializerOptions? options = null)
     {
         ThrowIfClearlyNotJson(json);
@@ -47,6 +48,7 @@ internal static class JsonSafety
         }
     }
 
+    /// <summary>Runs the ThrowIfClearlyNotJson operation.</summary>
     public static void ThrowIfClearlyNotJson(string json)
     {
         if (string.IsNullOrWhiteSpace(json))

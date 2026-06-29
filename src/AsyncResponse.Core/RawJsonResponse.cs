@@ -13,6 +13,7 @@ internal sealed class RawJsonResponse
     private object? _untypedPayload;
     private bool _hasUntypedPayload;
 
+    /// <summary>Runs the RawJsonResponse operation.</summary>
     public RawJsonResponse(string json)
     {
         JsonSafety.ThrowIfClearlyNotJson(json);
@@ -21,6 +22,7 @@ internal sealed class RawJsonResponse
 
     public string Json => _json;
 
+    /// <summary>Runs the DeserializeUntyped operation.</summary>
     public object? DeserializeUntyped()
     {
         if (_hasUntypedPayload)
@@ -31,8 +33,10 @@ internal sealed class RawJsonResponse
         return _untypedPayload;
     }
 
+    /// <summary>Runs the Deserialize operation.</summary>
     public T? Deserialize<T>() => (T?)Deserialize(typeof(T));
 
+    /// <summary>Runs the Deserialize operation.</summary>
     public object? Deserialize(Type payloadType)
     {
         if (_singlePayloadType == payloadType)

@@ -65,6 +65,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
     private static readonly JsonEncodedText ExceptionMessageName = JsonEncodedText.Encode("ExceptionMessage");
     private static readonly JsonEncodedText ExceptionStackTraceName = JsonEncodedText.Encode("ExceptionStackTrace");
 
+    /// <summary>Reads the JSON value.</summary>
     public override AsyncResponseEnvelope<T>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         if (reader.TokenType != JsonTokenType.StartObject)
@@ -126,6 +127,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         };
     }
 
+    /// <summary>Writes the JSON value.</summary>
     public override void Write(Utf8JsonWriter writer, AsyncResponseEnvelope<T> value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();

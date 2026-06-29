@@ -37,6 +37,8 @@ public class NatsRecoveryStateStoreTests
         Assert.True(_kv.Entries.ContainsKey(key));
         using var doc = JsonDocument.Parse(_kv.Entries[key]);
         Assert.Equal("corr-a", doc.RootElement.GetProperty("State").GetProperty("CorrelationId").GetString());
+        Assert.Equal("corr-a", doc.RootElement.GetProperty("States")[0].GetProperty("CorrelationId").GetString());
+        Assert.NotEqual(Guid.Empty, doc.RootElement.GetProperty("States")[0].GetProperty("RegistrationId").GetGuid());
         Assert.Equal(
             (_time.Now + TimeSpan.FromMinutes(3)).UtcDateTime,
             doc.RootElement.GetProperty("ExpiresAtUtc").GetDateTimeOffset().UtcDateTime);
@@ -60,6 +62,25 @@ public class NatsRecoveryStateStoreTests
         Assert.NotNull(loaded);
         Assert.Equal("corr-a", loaded!.CorrelationId);
         Assert.Equal(typeof(OperationResult).FullName, loaded.PayloadTypeFullName);
+    }
+
+    [Fact]
+    public async Task GetAllAsync_ReturnsAllRegistrations_AndLegacySingleState()
+    {
+        var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", first, TimeSpan.FromMinutes(5));
+        await _store.SaveAsync("corr-a", second, TimeSpan.FromMinutes(5));
+
+        Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
+
+        _kv.Entries[NatsSubjectSchema.RecoveryKey("legacy")] = JsonSerializer.Serialize(new NatsRecoveryStateStore.StoredRecoveryState
+        {
+            State = new RecoveryState { CorrelationId = "legacy" },
+            ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
+        });
+
+        Assert.Single(await _store.GetAllAsync("legacy"));
     }
 
     [Fact]
@@ -87,6 +108,20 @@ public class NatsRecoveryStateStoreTests
         Assert.True(await _store.TryDeleteAsync("corr-a"));
         Assert.False(await _store.TryDeleteAsync("corr-a"));
         await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync(" "));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_WithRegistrationId_RemovesOnlyThatRegistration()
+    {
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+        await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+        await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", firstId));
+
+        var remaining = Assert.Single(await _store.GetAllAsync("corr-a"));
+        Assert.Equal(secondId, remaining.RegistrationId);
     }
 
     [Fact]
