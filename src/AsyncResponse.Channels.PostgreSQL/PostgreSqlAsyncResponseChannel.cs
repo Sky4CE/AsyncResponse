@@ -22,7 +22,10 @@ internal sealed class PostgreSqlAsyncResponseChannel :
     IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, IPostgreSqlSubscription>> _subscriptions = new(StringComparer.Ordinal);
-    private readonly Channel<bool> _signals = Channel.CreateUnbounded<bool>(new UnboundedChannelOptions
+
+    // A signal carries the correlation id to scan (targeted), or null to scan every subscribed
+    // correlation id (the periodic missed-notification safety net).
+    private readonly Channel<string?> _signals = Channel.CreateUnbounded<string?>(new UnboundedChannelOptions
     {
         SingleReader = true,
         SingleWriter = false
@@ -106,6 +109,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         await _sql.EnsureCreatedAsync().ConfigureAwait(false);
         EnsureListenerStarted();
 
+        // Watermark from the database clock, not the app clock: the dispatch loop filters pending
+        // messages with created_at >= started, and mixing an app-side timestamp with DB-side created_at
+        // would silently drop live deliveries under clock skew.
+        var startedAtUtc = await _sql.GetServerTimeUtcAsync(CancellationToken.None).ConfigureAwait(false);
+
         var storedCorrelationId = correlationId;
         var capturedContext = ExecutionContext.Capture();
 
@@ -120,13 +128,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             this,
             correlationId,
             registrationId,
-            DateTimeOffset.UtcNow,
+            startedAtUtc,
             completionPredicate,
             tcs,
             capturedContext,
             activity);
-
-        AddSubscription(correlationId, subscription);
 
         var timeoutCts = new CancellationTokenSource();
         CancellationTokenRegistration timeoutRegistration = default;
@@ -145,36 +151,8 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             });
         });
 
-        try
-        {
-            var recoveryState = new RecoveryState
-            {
-                RegistrationId = registrationId,
-                ResumeCallback = resumeCallback,
-                FailureCallback = failureCallback,
-                CorrelationId = correlationId,
-                PayloadTypeFullName = typeof(T).FullName,
-                RegisteredAtUtc = DateTime.UtcNow,
-                Context = _propagation.Capture()
-            };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
-            await _sql.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
-
-            subscription.StartHeartbeat();
-            timeoutCts.CancelAfter(timeout.Value);
-            SignalDispatcher();
-
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Waiting for PostgreSQL response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to create PostgreSQL waiter for correlationId {CorrelationId}.", correlationId);
-            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            tcs.TrySetException(ex);
-            await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
-        }
-
+        // Wire the captured-context delegate before the subscription becomes discoverable, so a
+        // response already stored for this correlation id is processed with the caller's context.
         Task ProcessUnderCapturedContextAsync(PostgreSqlChannelMessage message)
         {
             async Task Process()
@@ -192,6 +170,46 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
 
         subscription.ProcessUnderContextAsync = ProcessUnderCapturedContextAsync;
+
+        var armed = false;
+        try
+        {
+            var recoveryState = new RecoveryState
+            {
+                RegistrationId = registrationId,
+                ResumeCallback = resumeCallback,
+                FailureCallback = failureCallback,
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(T).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                Context = _propagation.Capture()
+            };
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            await _sql.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
+
+            subscription.StartHeartbeat();
+            timeoutCts.CancelAfter(timeout.Value);
+            armed = true;
+
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation("Waiting for PostgreSQL response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create PostgreSQL waiter for correlationId {CorrelationId}.", correlationId);
+            AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
+            tcs.TrySetException(ex);
+            await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
+        }
+
+        if (armed)
+        {
+            // Publish the subscription only once it is fully armed (heartbeat + timeout + context
+            // delegate), then signal a scan targeted at this correlation id so any already-stored
+            // response is delivered promptly without a full-table sweep.
+            AddSubscription(correlationId, subscription);
+            SignalDispatcher(correlationId);
+        }
 
         return new PostgreSqlAsyncResponseWaiter<T>(tcs.Task, () => subscription.CleanupOnceAsync(deleteRecoveryState: true));
     }
@@ -222,7 +240,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
         try
         {
-            var subscribers = await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            var subscribers = await _sql.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", subscribers);
             if (subscribers <= 0)
             {
@@ -237,10 +255,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
-            var messageId = await _sql.InsertMessageAsync(correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher();
+            var messageId = Guid.NewGuid();
+            await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
+            SignalDispatcher(correlationId);
 
-            if (!await WaitForAcknowledgementAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
             {
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
@@ -273,7 +292,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
         try
         {
-            var subscribers = await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            var subscribers = await _sql.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", subscribers);
             if (subscribers <= 0)
             {
@@ -287,10 +306,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                 return;
             }
 
-            var messageId = await _sql.InsertMessageAsync(correlationId, SerializeRawSuccessEnvelope(responseJson), _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher();
+            var messageId = Guid.NewGuid();
+            await _sql.InsertMessageAsync(messageId, correlationId, SerializeRawSuccessEnvelope(responseJson), _options.MessageRetention, cancellationToken).ConfigureAwait(false);
+            SignalDispatcher(correlationId);
 
-            if (!await WaitForAcknowledgementAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
             {
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
                 var dispatchResult = await _lostSubscriberDispatcher
@@ -328,7 +348,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
         try
         {
-            var subscribers = await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+            var subscribers = await _sql.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", subscribers);
             if (subscribers <= 0)
             {
@@ -348,10 +368,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                 Payload = null
             };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
-            var messageId = await _sql.InsertMessageAsync(correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher();
+            var messageId = Guid.NewGuid();
+            await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
+            SignalDispatcher(correlationId);
 
-            if (!await WaitForAcknowledgementAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
             {
                 var invoked = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
@@ -445,9 +466,9 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         {
             try
             {
-                await _sql.ExecuteListenAsync(() =>
+                await _sql.ExecuteListenAsync(payload =>
                 {
-                    SignalDispatcher();
+                    SignalDispatcher(string.IsNullOrEmpty(payload) ? null : payload);
                     return Task.CompletedTask;
                 }, cancellationToken).ConfigureAwait(false);
                 failures = 0;
@@ -472,8 +493,8 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         {
             try
             {
-                await DispatchPendingMessagesAsync(cancellationToken).ConfigureAwait(false);
-                await WaitForSignalOrDelayAsync(cancellationToken).ConfigureAwait(false);
+                var scope = await CollectDispatchScopeAsync(cancellationToken).ConfigureAwait(false);
+                await DispatchPendingMessagesAsync(scope, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -487,10 +508,42 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    private async Task DispatchPendingMessagesAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Waits for the next dispatch trigger and returns its scope. <c>null</c> means scan every
+    /// subscribed correlation id — a full sweep requested explicitly (a null signal) or by the
+    /// periodic poll that is the missed-notification safety net. A non-null set scans only the
+    /// signaled correlation ids, so a flood of notifications never forces a scan of every waiter.
+    /// </summary>
+    private async Task<HashSet<string>?> CollectDispatchScopeAsync(CancellationToken cancellationToken)
+    {
+        var delay = Task.Delay(_options.ListenerPollInterval, cancellationToken);
+        var signal = _signals.Reader.WaitToReadAsync(cancellationToken).AsTask();
+        var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
+        if (completed == delay)
+            return null;
+
+        await signal.ConfigureAwait(false);
+
+        var scope = new HashSet<string>(StringComparer.Ordinal);
+        var fullSweep = false;
+        while (_signals.Reader.TryRead(out var correlationId))
+        {
+            if (string.IsNullOrEmpty(correlationId))
+                fullSweep = true;
+            else
+                scope.Add(correlationId);
+        }
+
+        return fullSweep || scope.Count == 0 ? null : scope;
+    }
+
+    private async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)
     {
         foreach (var (correlationId, group) in _subscriptions.ToArray())
         {
+            if (scope is not null && !scope.Contains(correlationId))
+                continue;
+
             var subscriptions = group.Values.Where(static s => !s.Dropped).ToArray();
             if (subscriptions.Length == 0)
                 continue;
@@ -499,17 +552,31 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             var messages = await _sql.LoadMessagesAsync(correlationId, since, _options.PendingMessageBatchSize, cancellationToken).ConfigureAwait(false);
             foreach (var message in messages)
             {
-                await _sql.AcknowledgeMessageAsync(message.Id, cancellationToken).ConfigureAwait(false);
                 _executors.Enqueue(
                     ChannelName(correlationId),
-                    () => DispatchMessageToSubscribersAsync(message, subscriptions));
+                    () => DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken));
             }
         }
     }
 
-    private async Task DispatchMessageToSubscribersAsync(PostgreSqlChannelMessage message, IReadOnlyList<IPostgreSqlSubscription> subscriptions)
+    private async Task DispatchMessageToSubscribersAsync(
+        PostgreSqlChannelMessage message,
+        IReadOnlyList<IPostgreSqlSubscription> subscriptions,
+        CancellationToken cancellationToken)
     {
-        foreach (var subscription in subscriptions)
+        // Only subscriptions that are still live and have not already processed this message. Skipping
+        // when there is nothing to deliver also avoids a redundant claim on every re-sweep.
+        var targets = subscriptions.Where(s => !s.Dropped && !s.HasSeen(message.Id)).ToArray();
+        if (targets.Length == 0)
+            return;
+
+        // Take the message for live delivery. The claim sets acked_at unless the publisher already
+        // routed it to recovery (recovery_claimed); losing the claim means recovery owns it, so it is
+        // not delivered to the waiter and handled a second time.
+        if (!await _sql.TryClaimForDeliveryAsync(message.Id, cancellationToken).ConfigureAwait(false))
+            return;
+
+        foreach (var subscription in targets)
         {
             if (subscription.Dropped || !subscription.MarkSeen(message.Id))
                 continue;
@@ -518,21 +585,21 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    private async Task WaitForSignalOrDelayAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Confirms a published response reached a live waiter. Returns <c>true</c> once a waiter has
+    /// acknowledged it; on confirmation timeout, atomically claims the message for the lost-subscriber
+    /// path and returns <c>false</c> only if that claim wins — so the recovery callback and a
+    /// slow-but-live waiter are mutually exclusive.
+    /// </summary>
+    private async Task<bool> TryConfirmDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
-        var delay = Task.Delay(_options.ListenerPollInterval, cancellationToken);
-        var signal = _signals.Reader.WaitToReadAsync(cancellationToken).AsTask();
-        var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
-        if (completed == signal)
-        {
-            await signal.ConfigureAwait(false);
-            while (_signals.Reader.TryRead(out _))
-            {
-            }
-        }
+        if (await WaitForAcknowledgementAsync(messageId, cancellationToken).ConfigureAwait(false))
+            return true;
+
+        return !await _sql.TryClaimForRecoveryAsync(messageId, cancellationToken).ConfigureAwait(false);
     }
 
-    private void SignalDispatcher() => _signals.Writer.TryWrite(true);
+    private void SignalDispatcher(string? correlationId = null) => _signals.Writer.TryWrite(correlationId);
 
     private async Task<bool> WaitForAcknowledgementAsync(Guid messageId, CancellationToken cancellationToken)
     {
@@ -621,6 +688,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         DateTimeOffset StartedAtUtc { get; }
         bool Dropped { get; }
         Func<PostgreSqlChannelMessage, Task> ProcessUnderContextAsync { get; set; }
+        bool HasSeen(Guid messageId);
         bool MarkSeen(Guid messageId);
         Task ProcessAsync(PostgreSqlChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
@@ -666,6 +734,14 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         public Func<ValueTask>? TimeoutRegistration { get; set; }
         public CancellationTokenSource? TimeoutCancellation { get; set; }
         public Func<PostgreSqlChannelMessage, Task> ProcessUnderContextAsync { get; set; }
+
+        public bool HasSeen(Guid messageId)
+        {
+            lock (_seenGate)
+            {
+                return _seen.Contains(messageId);
+            }
+        }
 
         public bool MarkSeen(Guid messageId)
         {

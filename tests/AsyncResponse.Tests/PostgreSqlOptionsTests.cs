@@ -39,6 +39,46 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void TransportOptions_RejectQueueNameCollision()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions { ResponseQueue = "worker" };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(PostgreSqlAsyncResponseTransportOptions.WorkerQueue), ex.Message);
+    }
+
+    [Fact]
+    public void TransportOptions_RejectNonPositiveDeadLetterRetention()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions { DeadLetterRetention = TimeSpan.FromSeconds(-1) };
+
+        var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectPublishBaseDelayAboveMax()
+    {
+        var options = new PostgreSqlAsyncResponseChannelOptions
+        {
+            PublishRetryBaseDelay = TimeSpan.FromSeconds(2),
+            PublishRetryMaxDelay = TimeSpan.FromSeconds(1)
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(PostgreSqlAsyncResponseChannelOptions.PublishRetryBaseDelay), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectNegativePruneInterval()
+    {
+        var options = new PostgreSqlAsyncResponseChannelOptions { PruneInterval = TimeSpan.FromSeconds(-1) };
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(PostgreSqlAsyncResponseChannelOptions.PruneInterval), ex.Message);
+    }
+
+    [Fact]
     public void ReplyTargetProvider_UsesDefaultResponseQueue()
     {
         var provider = new PostgreSqlReplyTargetProvider(Options.Create(new PostgreSqlAsyncResponseTransportOptions

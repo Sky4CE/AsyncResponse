@@ -67,7 +67,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_AcksBeforeBackgroundHandlerRuns()
+    public async Task AckAfterReceive_AcksOnReceive_WithoutWaitingForHandler()
     {
         var calls = new Calls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -75,7 +75,6 @@ public sealed class PostgreSqlDispatcherTests
             (_, _) =>
             {
                 calls.Handler++;
-                Assert.Equal(1, calls.Ack);
                 handled.SetResult();
                 return Task.CompletedTask;
             },
@@ -85,9 +84,15 @@ public sealed class PostgreSqlDispatcherTests
             PostgreSqlSubscriberRole.Worker);
 
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
-        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
+        // AckAfterReceive acks the row as part of accepting it into the background queue, so it is
+        // already acknowledged the moment HandleAsync returns — without waiting for the handler. The
+        // handler runs on the background worker and may execute concurrently with the ack, so the test
+        // must not assert their relative ordering (asserting calls.Ack inside the handler was the
+        // source of an intermittent timeout when the handler won that race).
         Assert.Equal(1, calls.Ack);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(1, calls.Handler);
     }
 

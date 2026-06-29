@@ -1,5 +1,6 @@
 using Npgsql;
 using NpgsqlTypes;
+using System.Text;
 using System.Text.Json;
 
 namespace AsyncResponse.Channels.PostgreSQL;
@@ -9,10 +10,17 @@ internal readonly record struct PostgreSqlChannelMessage(Guid Id, string Correla
 /// <summary>SQL helper for the PostgreSQL channel tables and notification channel.</summary>
 internal sealed class PostgreSqlChannelSql
 {
+    // PostgreSQL rejects a NOTIFY payload of 8000 bytes or more; stay well under it. A correlation
+    // id longer than this is sent as an empty payload, which the listener treats as "scan all".
+    private const int MaxNotifyPayloadBytes = 7000;
+
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
+    private long _lastRecoveryPruneTicks;
+    private long _lastMessagePruneTicks;
+    private long _lastSubscriberPruneTicks;
 
     public PostgreSqlChannelSql(NpgsqlDataSource dataSource, Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseChannelOptions> options)
     {
@@ -66,8 +74,10 @@ internal sealed class PostgreSqlChannelSql
                     envelope_json jsonb NOT NULL,
                     created_at timestamptz NOT NULL DEFAULT now(),
                     expires_at timestamptz NOT NULL,
-                    acked_at timestamptz NULL
+                    acked_at timestamptz NULL,
+                    recovery_claimed boolean NOT NULL DEFAULT false
                 );
+                ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                     ON {MessageTable} (correlation_id, created_at);
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "expires"))}
@@ -116,7 +126,8 @@ internal sealed class PostgreSqlChannelSql
     public async Task<IReadOnlyList<string>> LoadRecoveryStatesAsync(string correlationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await PruneExpiredRecoveryAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (ShouldPrune(ref _lastRecoveryPruneTicks))
+            await PruneExpiredRecoveryAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -169,18 +180,33 @@ internal sealed class PostgreSqlChannelSql
             yield return reader.GetString(0);
     }
 
-    public async Task<Guid> InsertMessageAsync(string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    /// <summary>
+    /// Inserts a response envelope row and notifies listeners. The caller supplies the message id so
+    /// the insert is idempotent under retry (<c>ON CONFLICT DO NOTHING</c>); the NOTIFY still fires so
+    /// a retried publish never strands an active waiter.
+    /// </summary>
+    public Task InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+        => AsyncResponseRetry.ExecuteAsync(
+            token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
+            IsTransient,
+            _options.PublishMaxAttempts,
+            _options.PublishRetryBaseDelay,
+            _options.PublishRetryMaxDelay,
+            cancellationToken);
+
+    private async Task<bool> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await PruneExpiredMessagesAsync(cancellationToken).ConfigureAwait(false);
+        if (ShouldPrune(ref _lastMessagePruneTicks))
+            await PruneExpiredMessagesAsync(cancellationToken).ConfigureAwait(false);
 
-        var id = Guid.NewGuid();
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
             INSERT INTO {MessageTable} (id, correlation_id, envelope_json, expires_at)
-            VALUES (@id, @correlation_id, @envelope_json, now() + @retention);
+            VALUES (@id, @correlation_id, @envelope_json, now() + @retention)
+            ON CONFLICT (id) DO NOTHING;
             SELECT pg_notify(@channel, @payload);
             """;
         command.Parameters.AddWithValue("id", id);
@@ -188,9 +214,9 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.Add("envelope_json", NpgsqlDbType.Jsonb).Value = envelopeJson;
         command.Parameters.AddWithValue("retention", retention);
         command.Parameters.AddWithValue("channel", NotificationChannel);
-        command.Parameters.AddWithValue("payload", JsonSerializer.Serialize(new PostgreSqlNotification(id, correlationId)));
+        command.Parameters.AddWithValue("payload", NotifyPayload(correlationId));
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        return id;
+        return true;
     }
 
     public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesAsync(
@@ -223,14 +249,67 @@ internal sealed class PostgreSqlChannelSql
         return messages;
     }
 
-    public async Task AcknowledgeMessageAsync(Guid messageId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Atomically claims a message for live delivery: sets <c>acked_at</c> unless the publisher has
+    /// already routed it to the lost-subscriber path (<c>recovery_claimed</c>). Returns <c>false</c>
+    /// when recovery owns the message, so a slow-but-live waiter does not deliver a response the
+    /// recovery callback already handled. Multiple processes may each win this claim, preserving
+    /// cross-process fan-out, because it gates only on <c>recovery_claimed</c>, not on <c>acked_at</c>.
+    /// </summary>
+    public async Task<bool> TryClaimForDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"UPDATE {MessageTable} SET acked_at = COALESCE(acked_at, now()) WHERE id = @id;";
+        command.CommandText =
+            $"""
+            UPDATE {MessageTable}
+            SET acked_at = COALESCE(acked_at, now())
+            WHERE id = @id AND NOT recovery_claimed AND expires_at > now()
+            RETURNING id;
+            """;
         command.Parameters.AddWithValue("id", messageId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// Atomically claims a message for the lost-subscriber path: sets <c>recovery_claimed</c> only
+    /// while no waiter has delivered (<c>acked_at IS NULL</c>). Returns <c>true</c> when recovery wins;
+    /// <c>false</c> means a live waiter already took the message, so the publisher must not also fire
+    /// the recovery callback. Row-level locking serializes this against <see cref="TryClaimForDeliveryAsync"/>.
+    /// </summary>
+    public async Task<bool> TryClaimForRecoveryAsync(Guid messageId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            UPDATE {MessageTable}
+            SET recovery_claimed = true
+            WHERE id = @id AND acked_at IS NULL
+            RETURNING id;
+            """;
+        command.Parameters.AddWithValue("id", messageId);
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result is not null and not DBNull;
+    }
+
+    /// <summary>Returns the database server's current UTC time, used as a clock-safe delivery watermark.</summary>
+    public async Task<DateTimeOffset> GetServerTimeUtcAsync(CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT now();";
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        return result switch
+        {
+            DateTimeOffset dto => dto.ToUniversalTime(),
+            DateTime dt => new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc), TimeSpan.Zero),
+            _ => DateTimeOffset.UtcNow
+        };
     }
 
     public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
@@ -247,7 +326,8 @@ internal sealed class PostgreSqlChannelSql
     public async Task UpsertSubscriberAsync(string correlationId, Guid registrationId, string instanceId, TimeSpan ttl, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (ShouldPrune(ref _lastSubscriberPruneTicks))
+            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -280,7 +360,8 @@ internal sealed class PostgreSqlChannelSql
     public async Task<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (ShouldPrune(ref _lastSubscriberPruneTicks))
+            await PruneExpiredSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -295,11 +376,11 @@ internal sealed class PostgreSqlChannelSql
         return result is long count ? count : 0L;
     }
 
-    public async Task ExecuteListenAsync(Func<Task> onNotification, CancellationToken cancellationToken)
+    public async Task ExecuteListenAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        connection.Notification += (_, _) => _ = onNotification();
+        connection.Notification += (_, args) => _ = onNotification(args.Payload);
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = $"LISTEN {Quote(NotificationChannel)};";
@@ -373,5 +454,28 @@ internal sealed class PostgreSqlChannelSql
         return name.Length <= 63 ? name : name[..63];
     }
 
-    private sealed record PostgreSqlNotification(Guid Id, string CorrelationId);
+    /// <summary>NOTIFY payload for a publish: the correlation id, or empty when it is too long to carry.</summary>
+    private static string NotifyPayload(string correlationId)
+        => Encoding.UTF8.GetByteCount(correlationId) <= MaxNotifyPayloadBytes ? correlationId : string.Empty;
+
+    internal static bool IsTransient(Exception exception)
+        => exception is not OperationCanceledException
+           && (exception is NpgsqlException { IsTransient: true } || exception is TimeoutException);
+
+    /// <summary>
+    /// Time-gates opportunistic pruning so the housekeeping DELETE runs at most once per
+    /// <see cref="PostgreSqlAsyncResponseChannelOptions.PruneInterval"/> instead of on every operation.
+    /// Read queries already filter on <c>expires_at</c>, so throttling pruning never affects correctness.
+    /// </summary>
+    private bool ShouldPrune(ref long lastTicks)
+    {
+        var interval = _options.PruneInterval;
+        if (interval <= TimeSpan.Zero)
+            return true;
+
+        var now = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref lastTicks);
+        return now - last >= interval.Ticks
+            && Interlocked.CompareExchange(ref lastTicks, now, last) == last;
+    }
 }

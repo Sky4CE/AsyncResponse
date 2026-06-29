@@ -53,10 +53,13 @@ public sealed class PostgreSqlWorkerTransport : IWorkerTransport
                 };
 
             var payload = JsonSerializer.Serialize(job);
+            // Stable id outside the retry loop so a retried publish is idempotent rather than enqueuing
+            // the same worker job twice.
+            var messageId = Guid.NewGuid();
             await PostgreSqlTransportRetry.ExecuteAsync(
                 async token =>
                 {
-                    await _store.PublishAsync(_options.WorkerQueue, payload, headers, token).ConfigureAwait(false);
+                    await _store.PublishAsync(messageId, _options.WorkerQueue, payload, headers, token).ConfigureAwait(false);
                     return true;
                 },
                 _options.PublishMaxAttempts,

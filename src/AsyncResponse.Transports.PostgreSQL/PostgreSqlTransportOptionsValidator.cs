@@ -13,6 +13,20 @@ internal static class PostgreSqlTransportOptionsValidator
         Required(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
         Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
+        // All three logical queues share one table, distinguished only by the queue column. Equal
+        // names would make subscribers consume each other's rows (or re-consume dead letters).
+        if (StringComparer.Ordinal.Equals(options.WorkerQueue, options.ResponseQueue)
+            || StringComparer.Ordinal.Equals(options.WorkerQueue, options.DeadLetterQueue)
+            || StringComparer.Ordinal.Equals(options.ResponseQueue, options.DeadLetterQueue))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.WorkerQueue)}, " +
+                $"{nameof(options.ResponseQueue)}, and {nameof(options.DeadLetterQueue)} must be distinct; they share one queue table.");
+        }
+
+        if (options.DeadLetterRetention is { } deadLetterRetention && deadLetterRetention <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.DeadLetterRetention)} must be positive when set.");
+
         Positive(options.LockTimeout, nameof(options.LockTimeout));
         Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));

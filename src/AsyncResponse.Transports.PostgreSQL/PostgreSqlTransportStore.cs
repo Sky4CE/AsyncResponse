@@ -30,6 +30,7 @@ internal sealed class PostgreSqlTransportStore
     private readonly PostgreSqlAsyncResponseTransportOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
+    private long _lastDeadLetterPruneTicks;
 
     public PostgreSqlTransportStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlAsyncResponseTransportOptions> options)
     {
@@ -86,12 +87,20 @@ internal sealed class PostgreSqlTransportStore
         }
     }
 
-    public Task PublishAsync(
+    /// <summary>
+    /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
+    /// (<c>ON CONFLICT DO NOTHING</c>) rather than inserting a duplicate job.
+    /// </summary>
+    public async Task PublishAsync(
+        Guid id,
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
         CancellationToken cancellationToken)
-        => InsertAsync(queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken);
+    {
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken).ConfigureAwait(false);
+        await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
+    }
 
     public async Task<PostgreSqlTransportDelivery?> TryClaimAsync(string queue, TimeSpan lockTimeout, CancellationToken cancellationToken)
     {
@@ -161,6 +170,7 @@ internal sealed class PostgreSqlTransportStore
     }
 
     private async Task InsertAsync(
+        Guid id,
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
@@ -174,12 +184,13 @@ internal sealed class PostgreSqlTransportStore
         command.CommandText =
             $"""
             INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-            VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason);
+            VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
+            ON CONFLICT (id) DO NOTHING;
             """;
         if (notify)
             command.CommandText += "SELECT pg_notify(@channel, @payload);";
 
-        command.Parameters.AddWithValue("id", Guid.NewGuid());
+        command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("queue", queue);
         command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
         command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = JsonSerializer.Serialize(headers ?? EmptyHeaders);
@@ -249,7 +260,7 @@ internal sealed class PostgreSqlTransportStore
 
         try
         {
-            await InsertAsync(_options.DeadLetterQueue, payload, deadHeaders, exception.Message, notify: false, cancellationToken).ConfigureAwait(false);
+            await InsertAsync(Guid.NewGuid(), _options.DeadLetterQueue, payload, deadHeaders, exception.Message, notify: false, cancellationToken).ConfigureAwait(false);
             if (deleteOriginal)
                 await AckAsync(id, lockId).ConfigureAwait(false);
             return true;
@@ -275,6 +286,32 @@ internal sealed class PostgreSqlTransportStore
             await connection.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Opportunistically deletes dead-letter rows older than the configured retention. No-op unless
+    /// <see cref="PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention"/> is set, and throttled
+    /// so the DELETE runs at most once per minute regardless of publish rate.
+    /// </summary>
+    private async Task PruneDeadLettersIfDueAsync(CancellationToken cancellationToken)
+    {
+        if (_options.DeadLetterRetention is not { } retention || !ShouldPruneDeadLetters())
+            return;
+
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"DELETE FROM {MessageTable} WHERE queue = @queue AND created_at < now() - @retention;";
+        command.Parameters.AddWithValue("queue", _options.DeadLetterQueue);
+        command.Parameters.AddWithValue("retention", retention);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool ShouldPruneDeadLetters()
+    {
+        var now = DateTime.UtcNow.Ticks;
+        var last = Interlocked.Read(ref _lastDeadLetterPruneTicks);
+        return now - last >= DeadLetterPruneThrottle.Ticks
+            && Interlocked.CompareExchange(ref _lastDeadLetterPruneTicks, now, last) == last;
+    }
+
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
     {
         var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
@@ -292,6 +329,8 @@ internal sealed class PostgreSqlTransportStore
         var name = $"{table}_{suffix}_idx";
         return name.Length <= 63 ? name : name[..63];
     }
+
+    private static readonly TimeSpan DeadLetterPruneThrottle = TimeSpan.FromMinutes(1);
 
     private static readonly IReadOnlyDictionary<string, string> EmptyHeaders =
         new Dictionary<string, string>(0, StringComparer.OrdinalIgnoreCase);

@@ -36,6 +36,13 @@ public sealed class PostgreSqlAsyncResponseTransportOptions
     /// <summary>Enables dead-lettering when a message exhausts attempts or fails after early ACK.</summary>
     public bool DeadLetterEnabled { get; set; } = true;
 
+    /// <summary>
+    /// How long dead-letter rows are retained before being pruned opportunistically. The dead-letter
+    /// queue has no consumer by default, so without a retention its rows accumulate indefinitely.
+    /// Leave <c>null</c> (the default) to keep them forever for manual inspection.
+    /// </summary>
+    public TimeSpan? DeadLetterRetention { get; set; }
+
     /// <summary>How long a claimed row remains locked before another subscriber may retry it.</summary>
     public TimeSpan LockTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -158,7 +165,13 @@ public sealed class PostgreSqlSubscriberOptions
     /// <summary>Controls when a row is acknowledged. Defaults to <see cref="PostgreSqlAckMode.AckAfterHandlerCompletes"/>.</summary>
     public PostgreSqlAckMode AckMode { get; set; } = PostgreSqlAckMode.AckAfterHandlerCompletes;
 
-    /// <summary>Maximum rows claimed per subscriber loop pass. Default: <c>16</c>.</summary>
+    /// <summary>
+    /// Maximum rows claimed per subscriber loop pass. In the default
+    /// <see cref="PostgreSqlAckMode.AckAfterHandlerCompletes"/> mode the claimed rows are handled
+    /// one at a time, so this bounds claim round-trips, not handler concurrency. Use
+    /// <see cref="PostgreSqlAckMode.AckAfterReceive"/> (or run multiple subscriber instances) to
+    /// process messages in parallel. Default: <c>16</c>.
+    /// </summary>
     public int BatchSize { get; set; } = 16;
 
     /// <summary>

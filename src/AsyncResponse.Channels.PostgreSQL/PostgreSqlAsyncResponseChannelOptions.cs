@@ -87,6 +87,22 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
     /// </summary>
     public TimeSpan SubscriberHeartbeatTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Minimum interval between opportunistic prunes of expired channel rows. Pruning is housekeeping
+    /// only (read queries filter on expiry), so throttling it keeps publishes off a full-table delete
+    /// on every call. Set to <see cref="TimeSpan.Zero"/> to prune on every operation. Default: 30 seconds.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Maximum attempts for a response-row insert. Set to 1 to disable publish retries. Default: 3.</summary>
+    public int PublishMaxAttempts { get; set; } = 3;
+
+    /// <summary>Initial delay before retrying a failed response-row insert. Default: 50 ms.</summary>
+    public TimeSpan PublishRetryBaseDelay { get; set; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>Maximum delay between response-row insert retries. Default: 1 second.</summary>
+    public TimeSpan PublishRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(1);
+
     /// <summary>Validates the option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -117,6 +133,18 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(SubscriberHeartbeatInterval)} must be less than " +
                 $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(SubscriberHeartbeatTimeout)}.");
+
+        if (PruneInterval < TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(PruneInterval)} must not be negative.");
+
+        if (PublishMaxAttempts <= 0)
+            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(PublishMaxAttempts)} must be positive.");
+
+        Positive(PublishRetryBaseDelay, nameof(PublishRetryBaseDelay));
+        Positive(PublishRetryMaxDelay, nameof(PublishRetryMaxDelay));
+        if (PublishRetryBaseDelay > PublishRetryMaxDelay)
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(PublishRetryBaseDelay)} cannot exceed {nameof(PublishRetryMaxDelay)}.");
     }
 
     private static void Positive(TimeSpan value, string name)

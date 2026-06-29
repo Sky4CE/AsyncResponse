@@ -1395,7 +1395,7 @@ static async Task<IResult> EmitPostgreSqlResponseAsync(
         ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
         : null;
 
-    await store.PublishAsync(o.ResponseQueue, json, headers, cancellationToken).ConfigureAwait(false);
+    await store.PublishAsync(Guid.NewGuid(), o.ResponseQueue, json, headers, cancellationToken).ConfigureAwait(false);
     return Results.Accepted();
 }
 
