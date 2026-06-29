@@ -60,9 +60,14 @@ var nats = builder.AddContainer("nats", "nats", "latest")
     .WithArgs("-js")
     .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
 
+// Two PostgreSQL app instances (default + early-ack) share this one server, each with its own Npgsql
+// pool. The image default max_connections=100 is exhausted under the load-test profile ("FATAL: sorry,
+// too many clients already"). Raise the server ceiling well above the combined pool budget below
+// (2 apps x Maximum Pool Size=120 = 240) so neither the load test nor parallel integration apps starve.
 var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
     .WithEnvironment("POSTGRES_DB", "asyncresponse")
     .WithEnvironment("POSTGRES_PASSWORD", "postgres")
+    .WithArgs("-c", "max_connections=400")
     .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
 
 var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
@@ -75,8 +80,11 @@ var natsEndpoint = nats.GetEndpoint("nats");
 var natsConnectionString = ReferenceExpression.Create(
     $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
 var postgresEndpoint = postgres.GetEndpoint("postgres");
+// Cap each app's Npgsql pool so the two PostgreSQL instances sharing the server above cannot, even
+// combined (2 x 120 = 240), exceed its max_connections=400 ceiling — bounding aggregate connection use
+// rather than letting Npgsql's default (100 per app) race the server limit under load.
 var postgresConnectionString = ReferenceExpression.Create(
-    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse");
+    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120");
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
