@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782769367835,
+  "lastUpdate": 1782769380897,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -13852,6 +13852,103 @@ window.BENCHMARK_DATA = {
           {
             "name": "watchdog-scan-storm throughput",
             "value": 1603026.5140585424,
+            "unit": "entries/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Sky4CE",
+            "username": "Sky4CE",
+            "email": "tyunisov@gmail.com"
+          },
+          "committer": {
+            "name": "Sky4CE",
+            "username": "Sky4CE",
+            "email": "tyunisov@gmail.com"
+          },
+          "id": "860ab74b186844900d2b6c6d741238d382baf7df",
+          "message": "Fix neame typo",
+          "timestamp": "2026-06-29T21:31:08Z",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/860ab74b186844900d2b6c6d741238d382baf7df"
+        },
+        "date": 1782769380239,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 174454.91561615732,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 127177.92191275593,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 72214.15830787783,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 210670.01491543706,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 351716.3759144626,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 328878.13091980637,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 309601.3572923504,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 226417.69173502972,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 90018.04321658233,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 58227.66177274815,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 22677.43185522437,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4844.361562800728,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 180983.6825111848,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 67949.55425092412,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1494947.0788734078,
             "unit": "entries/s"
           }
         ]
