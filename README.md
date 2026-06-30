@@ -176,8 +176,14 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddSingleton(_ =>
-    NpgsqlDataSource.Create(builder.Configuration.GetConnectionString("PostgreSQL")!));
+// The channel/transport are table-backed and chatty, so tune the pooled connection string:
+//   No Reset On Close=true  — skip the per-checkin DISCARD ALL (otherwise the single most-executed
+//                             statement under load) and keep auto-prepared statements alive across reuse.
+//   Max Auto Prepare=20     — auto-prepare the recurring queries, cutting parse/plan CPU on the server.
+// Both roughly halve server-side work under load. (LISTEN runs only on dedicated long-lived
+// connections, so skipping reset on the pooled query connections is safe.)
+builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(
+    builder.Configuration.GetConnectionString("PostgreSQL")! + ";No Reset On Close=true;Max Auto Prepare=20"));
 
 builder.Services.AddAsyncResponse()
     .WithPostgreSqlChannel(options =>

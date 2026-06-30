@@ -59,7 +59,16 @@ if (usePostgreSql || usePostgreSqlTransport)
     var postgresConnectionString = builder.Configuration.GetConnectionString("PostgreSQL")
         ?? builder.Configuration["PostgreSQL:ConnectionString"]
         ?? "Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=postgres";
-    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(postgresConnectionString));
+    // Recommended Npgsql tuning for the table-backed channel/transport: skip the per-checkin DISCARD
+    // ALL and keep auto-prepared statements across pooled reuse. Together they roughly halve
+    // server-side statements and parse/plan CPU under load. Applied unless the caller set them
+    // explicitly, so a provided connection string still wins.
+    var postgresBuilder = new NpgsqlConnectionStringBuilder(postgresConnectionString);
+    if (!postgresConnectionString.Contains("Reset On Close", StringComparison.OrdinalIgnoreCase))
+        postgresBuilder.NoResetOnClose = true;
+    if (postgresBuilder.MaxAutoPrepare == 0)
+        postgresBuilder.MaxAutoPrepare = 20;
+    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(postgresBuilder.ConnectionString));
 }
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start

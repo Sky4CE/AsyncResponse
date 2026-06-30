@@ -83,8 +83,14 @@ var postgresEndpoint = postgres.GetEndpoint("postgres");
 // Cap each app's Npgsql pool so the two PostgreSQL instances sharing the server above cannot, even
 // combined (2 x 120 = 240), exceed its max_connections=400 ceiling — bounding aggregate connection use
 // rather than letting Npgsql's default (100 per app) race the server limit under load.
+//
+// "No Reset On Close=true" drops the per-checkin DISCARD ALL (the single most-executed statement under
+// load) and lets "Max Auto Prepare" actually retain prepared statements across pooled reuse; together
+// they roughly halve server-side statements and cut parse/plan CPU — decisive on the load-test runner
+// where one small Postgres backs every PostgreSQL scenario at once. The channel only LISTENs on
+// dedicated long-lived connections, so skipping reset on the pooled query connections is safe.
 var postgresConnectionString = ReferenceExpression.Create(
-    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120");
+    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
