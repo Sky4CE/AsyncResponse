@@ -1,5 +1,6 @@
 using AsyncResponse.Sample;
 using System.Net.Http.Json;
+using System.Text.Json;
 using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
@@ -53,6 +54,20 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
     }
 
     [Fact]
+    public async Task ConcurrentRequestResponse_SucceedsWithoutFalseRecovery()
+    {
+        var responses = await Task.WhenAll(Enumerable.Range(0, 12)
+            .Select(_ => Fixture.PostgreSqlClient.PostAsync("/request-response?behavior=Succeed", content: null)));
+
+        foreach (var response in responses)
+        {
+            response.EnsureSuccessStatusCode();
+            var result = (await response.Content.ReadFromJsonAsync<RequestResponseResult>())!;
+            Assert.Equal(OperationStatus.Completed, result.Status);
+        }
+    }
+
+    [Fact]
     public async Task WorkerJob_RoundTripsThroughPostgreSql_WithRestoredCorrelationAndTrace()
     {
         var token = NewId("postgres-token");
@@ -82,6 +97,18 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
         Assert.Equal("worker", call.Kind);
         Assert.Equal(correlationId, call.CorrelationId);
         Assert.Equal(trace, call.Trace);
+    }
+
+    [Fact]
+    public async Task SharedCorrelationException_FaultsBothPostgreSqlWaiters()
+    {
+        var response = await Fixture.PostgreSqlClient.PostAsync("/shared-correlation-exception?message=postgres%20fanout%20boom", content: null);
+        response.EnsureSuccessStatusCode();
+
+        var result = await response.Content.ReadFromJsonAsync<SharedExceptionResult>();
+        Assert.Equal(2, result!.Failures.Count);
+        Assert.All(result.Failures, failure =>
+            Assert.Contains("postgres fanout boom", failure, StringComparison.Ordinal));
     }
 
     [Fact]
@@ -140,6 +167,22 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
     }
 
     [Fact]
+    public async Task LostSubscriberFlow_ComposesArmCrashPublishAndResumeCallback()
+    {
+        var trace = NewId("postgres-composed-trace");
+
+        var response = await Fixture.PostgreSqlClient.PostAsync($"/lost-subscriber-flow?outcome=Completed&trace={trace}", content: null);
+        response.EnsureSuccessStatusCode();
+
+        var result = await response.Content.ReadFromJsonAsync<LostSubscriberFlowResult>();
+        Assert.Equal("Completed", result!.Outcome);
+        Assert.Equal("resume", result.Callback.Kind);
+        Assert.Equal(OperationStatus.Completed, result.Callback.Status);
+        Assert.Equal(trace, result.Callback.Trace);
+        Assert.Equal("tenant-acme", result.Callback.Tenant);
+    }
+
+    [Fact]
     public async Task FailedDomainResponse_AfterCrash_InvokesFailureCallback()
     {
         var correlationId = await ArmAsync(Fixture.PostgreSqlClient, NewId("postgres-late-trace"));
@@ -167,8 +210,39 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
         Assert.Equal(nameof(InvalidOperationException), call.Detail);
     }
 
+    [Fact]
+    public async Task Watchdog_ScansPostgreSqlRecoveryStateAndReturnsHealthyAfterCleanup()
+    {
+        var correlationId = NewId("postgres-stale");
+
+        (await Fixture.PostgreSqlClient.PostAsync($"/seed-recovery?correlationId={correlationId}&ageMinutes=5", content: null))
+            .EnsureSuccessStatusCode();
+
+        var degraded = await PollAsync(
+            GetPostgreSqlHealthStatusAsync,
+            status => status == "Degraded",
+            TimeSpan.FromSeconds(20));
+        Assert.Equal("Degraded", degraded);
+
+        (await Fixture.PostgreSqlClient.DeleteAsync($"/test/recovery/{correlationId}")).EnsureSuccessStatusCode();
+
+        var healthy = await PollAsync(
+            GetPostgreSqlHealthStatusAsync,
+            status => status == "Healthy",
+            TimeSpan.FromSeconds(20));
+        Assert.Equal("Healthy", healthy);
+    }
+
+    private async Task<string?> GetPostgreSqlHealthStatusAsync()
+    {
+        using var document = JsonDocument.Parse(await Fixture.PostgreSqlClient.GetStringAsync("/healthz"));
+        return document.RootElement.GetProperty("status").GetString();
+    }
+
     private sealed record WorkerResponse(string CorrelationId);
     private sealed record ReplyTargetResult(string Transport, string Address);
+    private sealed record SharedExceptionResult(string CorrelationId, IReadOnlyList<string> Failures);
+    private sealed record LostSubscriberFlowResult(string CorrelationId, string Outcome, FlowCall Callback);
     private sealed record ConfigResponse(string Channel, string Transport, PostgreSqlConfig? Postgres);
     private sealed record PostgreSqlConfig(
         string? SchemaName,

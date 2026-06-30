@@ -6,7 +6,7 @@ namespace AsyncResponse;
 /// Response channels use this store to remember the callbacks registered by a waiter. If a
 /// response later arrives while no live waiter is subscribed, the publisher can load this state
 /// and invoke the appropriate resume/failure callback. Implementations may be durable
-/// (Redis/Postgres) or process-local (the default in-memory store in <c>AsyncResponse.Core</c>).
+/// (Redis/PostgreSQL) or process-local (the default in-memory store in <c>AsyncResponse.Core</c>).
 /// </para>
 /// </summary>
 public interface IRecoveryStateStore

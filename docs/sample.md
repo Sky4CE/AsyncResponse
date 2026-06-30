@@ -20,8 +20,9 @@ service-default endpoints at `/health` and `/alive`.
 Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
 such as Docker or Podman for the Redis resource.
 
-The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis`) and
-`AsyncResponse:Transport` (`InMemory` | `GooglePubSub` | `RabbitMQ`) select the providers,
+The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
+`PostgreSQL`) and `AsyncResponse:Transport` (`InMemory` | `GooglePubSub` | `RabbitMQ` | `Redis` |
+`NATS` | `PostgreSQL`) select the providers,
 defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
@@ -58,6 +59,21 @@ RabbitMQ__ConnectionString=amqp://guest:guest@localhost:5672/ \
 dotnet run --project samples/AsyncResponse.Sample
 ```
 
+To run the standalone sample on PostgreSQL for both the durable response channel and the worker/ingress
+transport:
+
+```bash
+docker run -d --rm --name asyncresponse-postgres -p 5432:5432 \
+  -e POSTGRES_DB=asyncresponse \
+  -e POSTGRES_PASSWORD=postgres \
+  postgres:16-alpine
+
+AsyncResponse__Channel=PostgreSQL \
+AsyncResponse__Transport=PostgreSQL \
+ConnectionStrings__PostgreSQL='Host=localhost;Port=5432;Username=postgres;Password=postgres;Database=asyncresponse' \
+dotnet run --project samples/AsyncResponse.Sample
+```
+
 ## Walking the scenarios
 
 Then walk the scenarios (the same HTTP endpoints the integration tests drive):
@@ -77,7 +93,7 @@ curl -X POST 'http://localhost:5000/emit-response?correlationId=<id>&status=Comp
 curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
 curl      'http://localhost:5000/alive'                                     # liveness check
 
-# Recovery after a "redeploy" (needs the Redis channel):
+# Recovery after a "redeploy" (needs a durable channel such as Redis or PostgreSQL):
 curl -X POST 'http://localhost:5000/arm'                                          # returns a correlationId
 curl -X POST 'http://localhost:5000/crash'                                        # drops every subscription
 curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Completed'  # → resume callback
@@ -94,10 +110,13 @@ For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and re
 `/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
 callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical
 failure path through `IAsyncResponsePublisher.SetException`. (`/arm`, `/crash`, `/publish`, and
-`/lost-subscriber-flow` require the Redis channel — run with `AsyncResponse__Channel=Redis`.)
-`/crash` is intentionally a blunt manual demo that drops all Redis subscriptions, while
-`/lost-subscriber-flow` drops only the correlation id it just armed so load tests can run many
-recovery flows concurrently without disturbing each other.
+`/lost-subscriber-flow` require a durable channel — run with `AsyncResponse__Channel=Redis` or
+`AsyncResponse__Channel=PostgreSQL`.)
+`/crash` is intentionally a blunt manual demo that drops all local durable-channel subscriptions. For
+Redis, `/lost-subscriber-flow` drops only the correlation id it just armed so load tests can run many
+recovery flows concurrently without disturbing each other; for PostgreSQL, it uses the channel's local
+subscription-drop hook to simulate the same lost-subscriber condition before publishing the late
+response.
 
 `/shared-correlation-exception` demonstrates fan-out: two waiters attach to the same correlation
 id, then one `SetException` faults both. This works with the in-memory and Redis channels; Redis may

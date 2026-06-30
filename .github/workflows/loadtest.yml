@@ -2,9 +2,9 @@ name: Load test
 
 # End-to-end HTTP load test (NBomber) against the real Redis + broker transport stack. Runs the broad
 # non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
-# dashboard as the benchmarks workflow; manual runs can select focused pubsub/rabbitmq/recovery profiles. It is
-# Docker-backed, so it shares a concurrency group with the benchmarks workflow to avoid racing on the
-# gh-pages history.
+# dashboard as the benchmarks workflow; manual runs can select focused pubsub/rabbitmq/redis/nats/
+# postgresql/recovery profiles. It is Docker-backed, so it shares a concurrency group with the
+# benchmarks workflow to avoid racing on the gh-pages history.
 on:
   push:
     branches: [main]
@@ -110,8 +110,9 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      # Boots Redis + a Pub/Sub emulator + RabbitMQ + sample SUTs via Aspire, drives them with NBomber, and
-      # emits github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
+      # Boots Redis + a Pub/Sub emulator + RabbitMQ + NATS + PostgreSQL sample SUTs via Aspire, drives
+      # them with NBomber, and emits github-action-benchmark JSON. Exits non-zero (failing the job) if
+      # any request failed.
       - name: Run NBomber load test
         env:
           REDIS_URL: ${{ github.event.inputs.redis_url || '' }}

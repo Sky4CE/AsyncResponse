@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.NATS;
+using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
 using Google.Cloud.PubSub.V1;
@@ -58,6 +59,7 @@ internal static class StressRunner
         failures += await RabbitMqAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -497,6 +499,91 @@ internal static class StressRunner
             ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
             ("naks", Volatile.Read(ref naks)),
             ("terms", Volatile.Read(ref terms)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3f) PostgreSQL ACK-after-receive dispatch storm. This bypasses a live PostgreSQL server and
+    //     hammers the queue-row callback dispatcher directly: every ACKed row must be processed once.
+    private static async Task<int> PostgreSqlAckAfterReceiveDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var options = new PostgreSqlAsyncResponseTransportOptions();
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var acks = 0;
+        var naks = 0;
+        var deadLetters = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (delivery, _) =>
+            {
+                var separator = delivery.Payload.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Payload[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            options,
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        var metrics = await Measure("postgresql-ack-after-receive-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new PostgreSqlTransportDelivery(
+                Guid.NewGuid(),
+                "stress-worker-queue",
+                $"{i}:{{}}",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [options.CorrelationIdHeader] = $"stress-{i}"
+                },
+                Attempt: 1,
+                () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
+                _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("postgresql-ack-after-receive-dispatch-storm");
+        return Check(
+            "postgresql-ack-after-receive-dispatch-storm",
+            ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
+            ("naks", Volatile.Read(ref naks)),
+            ("deadLetters", Volatile.Read(ref deadLetters)),
             ("duplicates", duplicates),
             ("outOfRange", outOfRange),
             ("notDrained", drained ? 0 : 1),

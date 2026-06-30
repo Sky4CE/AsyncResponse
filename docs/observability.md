@@ -73,6 +73,7 @@ The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
 `route=unclassified` rate means flows are dying mid-wait and being failed on recovery, and a rising
 `asyncresponse.recovery.stale` gauge is your earliest signal of stuck flows.
 
-> **Not emitted:** broker-native queue depth and store size (Redis key count, JetStream stream
-> backlog, Pub/Sub subscription depth) are *not* surfaced by AsyncResponse — read those from your
-> broker's own metrics. AsyncResponse only measures what happens inside the library.
+> **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream
+> backlog, Pub/Sub subscription depth, PostgreSQL table row counts) are *not* surfaced by
+> AsyncResponse — read those from your broker or database metrics. AsyncResponse only measures what
+> happens inside the library.

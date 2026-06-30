@@ -8,6 +8,10 @@ namespace AsyncResponse.Tests;
 public sealed class PostgreSqlOptionsTests
 {
     [Fact]
+    public void ChannelOptions_Validate_PassesForDefaults()
+        => new PostgreSqlAsyncResponseChannelOptions().Validate();
+
+    [Fact]
     public void ChannelOptions_RejectInvalidSqlIdentifier()
     {
         var options = new PostgreSqlAsyncResponseChannelOptions { MessageTable = "bad-name" };
@@ -28,6 +32,44 @@ public sealed class PostgreSqlOptionsTests
         var ex = Assert.Throws<InvalidOperationException>(options.Validate);
         Assert.Contains(nameof(PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatInterval), ex.Message);
     }
+
+    [Fact]
+    public void ChannelOptions_RejectNonPositiveRetentionAndConfirmationSettings()
+    {
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.ListenerPollInterval = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval));
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectInvalidWaiterAndEnvelopeSettings()
+    {
+        AssertChannelInvalid(
+            options => options.DefaultTimeout = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DefaultTimeout));
+        AssertChannelInvalid(
+            options => options.MaxRemoteStackTraceLength = -1,
+            nameof(PostgreSqlAsyncResponseChannelOptions.MaxRemoteStackTraceLength));
+        AssertChannelInvalid(
+            options => options.PendingMessageBatchSize = 0,
+            nameof(PostgreSqlAsyncResponseChannelOptions.PendingMessageBatchSize));
+        AssertChannelInvalid(
+            options => options.PublishMaxAttempts = 0,
+            nameof(PostgreSqlAsyncResponseChannelOptions.PublishMaxAttempts));
+    }
+
+    [Fact]
+    public void TransportOptions_ValidateCommon_PassesForDefaults()
+        => PostgreSqlTransportOptionsValidator.ValidateCommon(new PostgreSqlAsyncResponseTransportOptions());
 
     [Fact]
     public void TransportOptions_RejectInvalidSqlIdentifier()
@@ -54,6 +96,61 @@ public sealed class PostgreSqlOptionsTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
         Assert.Contains(nameof(PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention), ex.Message);
+    }
+
+    [Fact]
+    public void TransportOptions_RejectNonPositiveAndMisorderedRetrySettings()
+    {
+        AssertTransportInvalid(
+            options => options.LockTimeout = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseTransportOptions.LockTimeout));
+        AssertTransportInvalid(
+            options => options.PublishMaxAttempts = 0,
+            nameof(PostgreSqlAsyncResponseTransportOptions.PublishMaxAttempts));
+        AssertTransportInvalid(
+            options => options.PublishRetryBaseDelay = TimeSpan.FromSeconds(2),
+            nameof(PostgreSqlAsyncResponseTransportOptions.PublishRetryBaseDelay));
+        AssertTransportInvalid(
+            options => options.SubscriberRetryBaseDelay = TimeSpan.FromSeconds(6),
+            nameof(PostgreSqlAsyncResponseTransportOptions.SubscriberRetryBaseDelay));
+        AssertTransportInvalid(
+            options => options.CorrelationIdHeader = " ",
+            nameof(PostgreSqlAsyncResponseTransportOptions.CorrelationIdHeader));
+    }
+
+    [Fact]
+    public void TransportSubscriberOptions_ValidateEarlyAckAndFailureSettings()
+    {
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterReceive },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions { BatchSize = 0 },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions { MaxDeliveryAttempts = -1 },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions { RedeliveryDelay = TimeSpan.Zero },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions { AckMode = (PostgreSqlAckMode)999 },
+            "Worker"));
+
+        var subscriber = new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 8, TimeSpan.FromSeconds(3));
+        PostgreSqlTransportOptionsValidator.ValidateSubscriber(subscriber, "Worker");
+        Assert.Equal(PostgreSqlAckMode.AckAfterReceive, subscriber.AckMode);
+        Assert.Equal(2, subscriber.BackgroundWorkerCount);
+        Assert.Equal(8, subscriber.BackgroundQueueCapacity);
+        Assert.Equal(TimeSpan.FromSeconds(3), subscriber.BackgroundDrainTimeout);
+    }
+
+    [Fact]
+    public void UseAckAfterReceive_RejectsInvalidArguments()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(0, 8));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 8, TimeSpan.Zero));
     }
 
     [Fact]
@@ -95,6 +192,33 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void ReplyTargetProvider_ResolvesNamedTargetAndCopiesProperties()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions { SchemaName = "orders" };
+        options.AddReplyTarget("regional", "regional_responses");
+        options.ReplyTargets["regional"].Properties["tenant"] = "acme";
+        var provider = new PostgreSqlReplyTargetProvider(Options.Create(options));
+
+        var target = provider.GetReplyTarget("regional");
+
+        Assert.Equal("regional", target.Name);
+        Assert.Equal("regional_responses", target.Address);
+        Assert.Equal("regional_responses", target.Properties["queue"]);
+        Assert.Equal("orders", target.Properties["schema"]);
+        Assert.Equal("acme", target.Properties["tenant"]);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_UnknownName_Throws()
+    {
+        var provider = new PostgreSqlReplyTargetProvider(Options.Create(new PostgreSqlAsyncResponseTransportOptions()));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("missing"));
+
+        Assert.Contains("missing", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CorrelationExtractor_ReadsHeaderBeforeJsonBody()
     {
         var options = new PostgreSqlAsyncResponseTransportOptions();
@@ -109,6 +233,34 @@ public sealed class PostgreSqlOptionsTests
             options);
 
         Assert.Equal("from-header", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReadsNestedJsonStringAndIsCaseInsensitive()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions
+        {
+            CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+        };
+
+        var correlationId = PostgreSqlCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"customparameters":"{\"correlationid\":\"from-nested-json-string\"}"}""",
+            options);
+
+        Assert.Equal("from-nested-json-string", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReturnsNullForInvalidJsonBlankPathsOrBlankMessage()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions();
+
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, "{not-json", options));
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, "", options));
+
+        options.CorrelationIdJsonPaths = [];
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, """{"CorrelationId":"ignored"}""", options));
     }
 
     [Fact]
@@ -141,5 +293,40 @@ public sealed class PostgreSqlOptionsTests
             options);
 
         Assert.Equal("from-json", correlationId);
+    }
+
+    [Fact]
+    public void PostgreSqlRetry_ClassifiesTransientExceptions()
+    {
+        Assert.True(PostgreSqlTransportRetry.IsTransient(new TimeoutException()));
+        Assert.True(PostgreSqlChannelSql.IsTransient(new TimeoutException()));
+        Assert.False(PostgreSqlTransportRetry.IsTransient(new OperationCanceledException()));
+        Assert.False(PostgreSqlChannelSql.IsTransient(new OperationCanceledException()));
+        Assert.False(PostgreSqlTransportRetry.IsTransient(new InvalidOperationException()));
+        Assert.False(PostgreSqlChannelSql.IsTransient(new InvalidOperationException()));
+    }
+
+    private static void AssertChannelInvalid(
+        Action<PostgreSqlAsyncResponseChannelOptions> configure,
+        string expectedMessageFragment)
+    {
+        var options = new PostgreSqlAsyncResponseChannelOptions();
+        configure(options);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    private static void AssertTransportInvalid(
+        Action<PostgreSqlAsyncResponseTransportOptions> configure,
+        string expectedMessageFragment)
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions();
+        configure(options);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
+
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
     }
 }

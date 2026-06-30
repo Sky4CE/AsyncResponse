@@ -87,7 +87,7 @@ var postgresEndpoint = postgres.GetEndpoint("postgres");
 // "No Reset On Close=true" drops the per-checkin DISCARD ALL (the single most-executed statement under
 // load) and lets "Max Auto Prepare" actually retain prepared statements across pooled reuse; together
 // they roughly halve server-side statements and cut parse/plan CPU — decisive on the load-test runner
-// where one small Postgres backs every PostgreSQL scenario at once. The channel only LISTENs on
+// where one small PostgreSQL server backs every PostgreSQL scenario at once. The channel only LISTENs on
 // dedicated long-lived connections, so skipping reset on the pooled query connections is safe.
 var postgresConnectionString = ReferenceExpression.Create(
     $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");

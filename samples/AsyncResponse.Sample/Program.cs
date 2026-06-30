@@ -301,8 +301,8 @@ app.MapGet("/", () => Results.Text(
       POST /ambient-exception                                    SetException via ambient correlation id
       POST /shared-correlation-exception                         one SetException faults multiple waiters
       POST /worker?token=42                                      fire-and-forget background worker job
-      POST /arm  + POST /crash + POST /publish                   lost-subscriber recovery flow (Redis)
-      POST /lost-subscriber-flow?outcome=Completed|Failed|Exception  composed recovery flow (Redis)
+      POST /arm  + POST /crash + POST /publish                   lost-subscriber recovery flow (durable channels)
+      POST /lost-subscriber-flow?outcome=Completed|Failed|Exception  composed recovery flow (Redis/PostgreSQL)
       GET  /reply-target                                         provider-resolved reply target (broker transports)
       GET  /config                                               resolved channel/transport/ACK mode
       GET  /healthz                                              health report incl. the recovery watchdog
@@ -1055,7 +1055,7 @@ app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, str
 {
     var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
     if (asyncResponse is null)
-        return Results.Conflict("Lost-subscriber recovery requires a durable channel such as Redis.");
+        return Results.Conflict("Lost-subscriber recovery requires a durable channel such as Redis, NATS, or PostgreSQL.");
 
     SampleTraceContext.Set(trace);
     SampleTenantContext.Set("tenant-acme");
@@ -1081,8 +1081,8 @@ app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, str
 })
 .WithTags("Recovery");
 
-// 5b) Lost-subscriber recovery — crash: drop every Redis subscription, like a redeploy would. The
-//     recovery state stays in Redis; only the in-memory waiters die. (Redis channel only.)
+// 5b) Lost-subscriber recovery — crash: drop every local subscription, like a redeploy would. The
+//     durable recovery state stays in the channel store; only the in-memory waiters die.
 app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancellationToken) =>
 {
     var multiplexer = services.GetService<IConnectionMultiplexer>();
@@ -1126,14 +1126,13 @@ app.MapPost("/lost-subscriber-flow", async (
     IAsyncResponsePublisher publisher,
     FlowRecorder recorder,
     IServiceProvider services,
-    IOptions<RedisAsyncResponseOptions> redisOptions,
     string? outcome,
-    string? trace) =>
+    string? trace,
+    CancellationToken cancellationToken) =>
 {
     var asyncResponse = services.GetService<IRecoverableAsyncResponseBuilder>();
-    var multiplexer = services.GetService<IConnectionMultiplexer>();
-    if (asyncResponse is null || multiplexer is null)
-        return Results.Conflict("Composed lost-subscriber recovery requires the Redis channel.");
+    if (asyncResponse is null)
+        return Results.Conflict("Composed lost-subscriber recovery requires a durable channel such as Redis, NATS, or PostgreSQL.");
 
     SampleTraceContext.Set(trace ?? $"trace-{Guid.NewGuid().ToString("N")[..8]}");
     SampleTenantContext.Set("tenant-acme");
@@ -1156,11 +1155,9 @@ app.MapPost("/lost-subscriber-flow", async (
     var correlationId = await armed.Task.WaitAsync(TimeSpan.FromSeconds(10));
     _ = waitTask.ContinueWith(t => recorder.RecordWaiterResult(correlationId, t), TaskScheduler.Default);
 
-    var responseChannel = new RedisChannel(
-        $"{redisOptions.Value.KeyPrefix}:response:{correlationId}",
-        RedisChannel.PatternMode.Literal);
-    await multiplexer.GetSubscriber().UnsubscribeAsync(responseChannel);
-    await Task.Delay(100);
+    var crashed = await DropLocalSubscriptionAsync(services, correlationId, cancellationToken).ConfigureAwait(false);
+    if (!crashed)
+        return Results.Conflict("Composed lost-subscriber recovery currently supports Redis or PostgreSQL channels.");
 
     var normalized = (outcome ?? "Completed").Trim().ToLowerInvariant();
     if (normalized is "exception" or "failtechnical" or "technical")
@@ -1188,6 +1185,34 @@ app.MapPost("/lost-subscriber-flow", async (
     return Results.Ok(new LostSubscriberFlowResult(correlationId, normalized, callback));
 })
 .WithTags("Recovery");
+
+static async Task<bool> DropLocalSubscriptionAsync(
+    IServiceProvider services,
+    string correlationId,
+    CancellationToken cancellationToken)
+{
+    var multiplexer = services.GetService<IConnectionMultiplexer>();
+    if (multiplexer is not null)
+    {
+        var redisOptions = services.GetRequiredService<IOptions<RedisAsyncResponseOptions>>();
+        var responseChannel = new RedisChannel(
+            $"{redisOptions.Value.KeyPrefix}:response:{correlationId}",
+            RedisChannel.PatternMode.Literal);
+        await multiplexer.GetSubscriber().UnsubscribeAsync(responseChannel).ConfigureAwait(false);
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    var postgres = services.GetService<PostgreSqlAsyncResponseChannel>();
+    if (postgres is not null)
+    {
+        await postgres.DropLocalSubscriptionsAsync(cancellationToken).ConfigureAwait(false);
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    return false;
+}
 
 // 6) Publish a raw response to the configured broker response destination, acting as the remote
 //    system. With useAttribute the correlation id rides broker metadata; otherwise it goes in the

@@ -206,12 +206,33 @@ builder.Services.AddAsyncResponse()
     });
 ```
 
-Set `AutoCreateSchema = false` on either options object when migrations provision the schema. Key
-channel options: `RecoveryStateExpiry`, `DefaultTimeout`, `MessageRetention`,
-`DeliveryConfirmationTimeout`, `SubscriberHeartbeatInterval`, `SubscriberHeartbeatTimeout`.
-Key transport options: `LockTimeout`, `WorkerSubscriber`, `ResponseSubscriber`,
-`MaxDeliveryAttempts`, `RedeliveryDelay`, `DeadLetterEnabled`, `CorrelationIdHeader`, and
-`CorrelationIdJsonPaths`.
+The two packages share the same `NpgsqlDataSource` but use separate table sets:
+
+| Area | Storage | Runtime behavior |
+|---|---|---|
+| Channel messages | `MessageTable` (`asyncresponse_channel_messages`) | Inserts a response envelope, sends a small `NOTIFY`, then waits for live delivery confirmation. If no waiter confirms before `DeliveryConfirmationTimeout`, the row is atomically claimed for lost-subscriber recovery. |
+| Recovery state | `RecoveryStateTable` (`asyncresponse_recovery_state`) | One row per waiter registration, so shared correlation ids recover every registered callback instead of only one. |
+| Live subscribers | `SubscriberTable` (`asyncresponse_channel_subscribers`) | Short-lived heartbeat rows let publishers distinguish "no subscribers" from "subscriber should confirm delivery". |
+| Transport queue | `MessageTable` (`asyncresponse_transport_messages`) | Worker and response-ingress rows are claimed with `FOR UPDATE SKIP LOCKED`; failed rows are redelivered or moved to `DeadLetterQueue`. |
+
+Set `AutoCreateSchema = false` on either options object when migrations provision the schema. Channel
+and transport schema creation take the same PostgreSQL advisory lock for a shared schema, avoiding the
+`CREATE SCHEMA IF NOT EXISTS` race that can otherwise appear when multiple app instances start at
+once.
+
+Key channel options: `SchemaName`, `RecoveryStateTable`, `MessageTable`, `SubscriberTable`,
+`NotificationChannel`, `RecoveryStateExpiry`, `DefaultTimeout`, `MessageRetention`,
+`DeliveryConfirmationTimeout`, `DeliveryConfirmationPollInterval`, `ListenerPollInterval`,
+`PendingMessageBatchSize`, `SubscriberHeartbeatInterval`, `SubscriberHeartbeatTimeout`,
+`PublishMaxAttempts`, and `PruneInterval`.
+
+Key transport options: `SchemaName`, `MessageTable`, `NotificationChannel`, `WorkerQueue`,
+`ResponseQueue`, `DeadLetterQueue`, `LockTimeout`, `WorkerSubscriber`, `ResponseSubscriber`,
+`DeadLetterEnabled`, `DeadLetterRetention`, `CorrelationIdHeader`, `CorrelationIdJsonPaths`,
+`PublishMaxAttempts`, and subscriber `AckMode`/`MaxDeliveryAttempts`/`RedeliveryDelay`.
+`AckAfterReceive` deletes a row as soon as it is accepted into a bounded in-process queue; handler
+failures after that point are logged, reported through `OnBackgroundFailure`, and dead-lettered when
+enabled.
 
 ### Define a payload and await a response
 
@@ -274,6 +295,8 @@ timeouts/cancellation, and the watchdog, see the docs below.
   plugin/ALC scenarios.
 - **[Operations](docs/operations.md)** — best practices, building and testing, and benchmarking and
   load testing.
+- **[PostgreSQL](docs/postgresql.md)** — channel/transport architecture, schema, delivery
+  confirmation, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable testbed and curl walkthroughs for every scenario.
 
 Transports, reply targets, and ambient-context propagation are covered alongside their configuration

@@ -29,13 +29,14 @@
    rename with a migration window.
 7. **Set timeouts per flow.** The 7-day default is a backstop, not a recommendation; a payment flow
    should fail in minutes.
-8. **Run the watchdog in exactly one host per Redis** and alert on its warnings or the `Degraded`
-   health status — stale recovery state is your earliest signal of stuck flows.
-9. **Mind Redis pub/sub semantics.** Delivery is at-most-once to live subscribers; the recovery state
+8. **Run the watchdog in exactly one host per durable store** and alert on its warnings or the
+   `Degraded` health status — stale recovery state is your earliest signal of stuck flows.
+9. **Mind channel wakeup semantics.** Redis pub/sub delivery is at-most-once to live subscribers, and
+   PostgreSQL `NOTIFY` is only a wakeup signal; the durable response/recovery state
    is what makes the system safe across gaps. Don't disable it (`RecoveryStateExpiry`) below your
    longest flow duration.
-10. **One `IConnectionMultiplexer`.** Reuse your application's existing multiplexer; don't create a
-    second connection for AsyncResponse.
+10. **Reuse client singletons.** Reuse your application's existing Redis `IConnectionMultiplexer`,
+    NATS connection, or PostgreSQL `NpgsqlDataSource`; don't create a second pool for AsyncResponse.
 11. **Share correlation ids deliberately.** Live delivery and lost-subscriber recovery both fan out
     across multiple waiters on one correlation id; a normally completing waiter removes only its own
     recovery registration. See [recovery.md](recovery.md#shared-correlation-recovery).
@@ -68,9 +69,9 @@ no separate fixture app to keep in sync). They run at two levels:
   and transport, covering the core request/response, attach, worker, and concurrency paths. They need
   no containers, so they stay fast and reliable even where Docker is unavailable.
 - **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
-  a Google Pub/Sub emulator container, RabbitMQ, and four sample-app SUTs: Pub/Sub default ACK,
-  Pub/Sub worker `AckAfterEnqueue`, RabbitMQ default ACK, and RabbitMQ worker `AckAfterEnqueue`.
-  Tests drive the Redis-channel, Pub/Sub, and RabbitMQ scenarios over HTTP. They need a running
+  a Google Pub/Sub emulator container, RabbitMQ, NATS, PostgreSQL, and sample-app SUTs for default and
+  early-ACK variants. Tests drive the Redis, Pub/Sub, RabbitMQ, Redis transport, NATS, and PostgreSQL
+  scenarios over HTTP. They need a running
   Docker daemon (and pull broker images on first run), so CI runs them in a separate Docker-backed
   `integration-tests` job:
 
@@ -92,7 +93,7 @@ modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harne
 request/response round-trip, raw broker ingress, shared-correlation fanout, exception fanout,
 recovery-state save/scan, watchdog/health evaluation, context propagation, envelope
 (de)serialization, payload classification, expression→callback conversion, reflection invoke, and
-Google Pub/Sub/RabbitMQ subscriber ACK dispatch modes).
+Google Pub/Sub/RabbitMQ/Redis/NATS/PostgreSQL subscriber ACK dispatch modes).
 `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections per op alongside
 mean/median/percentile timings:
 
@@ -104,6 +105,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter 
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RabbitMqAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*NatsAckDispatch*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*PostgreSqlAckDispatch*'
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
@@ -124,7 +126,9 @@ exactly once), **google-pubsub-ack-after-enqueue-dispatch-storm** (bounded early
 every ACKed message must be processed once), **rabbitmq-ack-after-enqueue-dispatch-storm** (the same
 bounded early-ACK invariant for RabbitMQ deliveries), **redis-ack-after-enqueue-dispatch-storm** (the
 same bounded early-ACK invariant for Redis stream entries), **nats-ack-after-receive-dispatch-storm**
-(the same bounded early-ACK invariant for NATS JetStream deliveries), **race-burst** (subscribe-before-send under contention),
+(the same bounded early-ACK invariant for NATS JetStream deliveries),
+**postgresql-ack-after-receive-dispatch-storm** (the same bounded early-ACK invariant for PostgreSQL
+queue rows), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
@@ -132,18 +136,19 @@ same bounded early-ACK invariant for Redis stream entries), **nats-ack-after-rec
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
-dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ/Redis brokers while exercising
-the transport callback/ACK dispatchers.
+dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ/Redis/NATS/PostgreSQL
+servers while exercising the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](../benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
-Redis channel + broker transports — reporting throughput, latency percentiles, and failures per
-scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + six SUTs via Aspire (Docker
-required): default/early-ACK Pub/Sub apps, default/early-ACK RabbitMQ apps, and default/early-ACK
-Redis Streams transport apps. Pass `--url` to load an
-already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK target, and
-`--rabbitmq-url` / `--rabbitmq-early-ack-url` for RabbitMQ targets, or `--redis-url` /
-`--redis-early-ack-url` for Redis transport targets. Profiles let you choose the scenario set:
+durable channels + broker/table transports — reporting throughput, latency percentiles, and failures
+per scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + NATS + PostgreSQL + ten SUTs
+via Aspire (Docker required): default/early-ACK Pub/Sub apps, RabbitMQ apps, Redis Streams apps, NATS
+apps, and PostgreSQL apps. Pass `--url` to load an already-running default instance,
+`--early-ack-url` for the Pub/Sub early-ACK target, `--rabbitmq-url` /
+`--rabbitmq-early-ack-url` for RabbitMQ targets, `--redis-url` / `--redis-early-ack-url` for Redis
+transport targets, `--nats-url` / `--nats-early-ack-url` for NATS targets, or `--postgresql-url` /
+`--postgresql-early-ack-url` for PostgreSQL targets. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
 exception, shared exception, reply target, plus RabbitMQ worker/response/reply-target throughput when
 a RabbitMQ target is available), `pubsub` (default worker dispatch, response-topic ingress
@@ -151,7 +156,10 @@ with attribute/body correlation ids, and early-ACK worker dispatch when an early
 `rabbitmq` (default worker dispatch, response-queue ingress with header/body correlation ids, reply
 target, and early-ACK worker dispatch when an early target is available), `redis` (default worker
 dispatch, response-stream ingress with field/body correlation ids, reply target, and early-ACK worker
-dispatch when an early target is available), or `recovery`
+dispatch when an early target is available), `nats` (request/response, worker dispatch,
+response-subject ingress, reply target, and early-ACK worker dispatch), `postgresql`
+(request/response, worker dispatch, response-table ingress through header/body correlation ids, reply
+target, and early-ACK worker dispatch), or `recovery`
 (lost-subscriber resume/failure/exception and stale health). Run the
 recovery profile separately because it intentionally simulates subscriber loss:
 
@@ -160,6 +168,8 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile 
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile nats --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile postgresql --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed --rate 10 --duration 60
@@ -167,6 +177,8 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --nats-url http://localhost:5006 --nats-early-ack-url http://localhost:5007 --profile nats
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --postgresql-url http://localhost:5008 --postgresql-early-ack-url http://localhost:5009 --profile postgresql
 ```
 
 Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;
@@ -176,8 +188,9 @@ to model an external producer. It writes an HTML/CSV/Markdown report to `nbomber
 The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
-`duration`, plus Redis transport URLs and Redis stream/retry knobs such as pending idle time, max
-delivery attempts, publish attempts, stream max length, and early-ACK queue sizing; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
+`duration`, plus Redis/NATS/PostgreSQL target URLs and provider knobs such as pending idle time, max
+delivery attempts, publish attempts, stream max length, ACK mode, background worker count, and
+early-ACK queue sizing; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
 `customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
 `gh-pages`.
 
@@ -185,7 +198,7 @@ delivery attempts, publish attempts, stream max length, and early-ACK queue sizi
 ([`benchmarks.yml`](../.github/workflows/benchmarks.yml)) and publishes them with
 [github-action-benchmark](https://github.com/benchmark-action/github-action-benchmark) as
 interactive, per-commit charts: micro-benchmark timings & allocations, the in-process stress suites,
-and — from the load-test workflow — end-to-end throughput & latency over the real Redis/broker stack:
+and — from the load-test workflow — end-to-end throughput & latency over the real Redis/broker/table stack:
 
 **📈 [Benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/)**
 

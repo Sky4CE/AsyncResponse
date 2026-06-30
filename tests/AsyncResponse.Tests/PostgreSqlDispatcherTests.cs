@@ -67,6 +67,43 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_NaksWhenDeadLetterPublishFails()
+    {
+        var calls = new Calls { DeadLetterResult = false };
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.True(calls.DeleteOriginalOnDeadLetter);
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(TimeSpan.FromSeconds(5), calls.LastNakDelay);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_UnlimitedAttemptsAlwaysNaks()
+    {
+        var calls = new Calls();
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions { MaxDeliveryAttempts = 0 },
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.ResponseIngress);
+
+        await dispatcher.HandleAsync(Delivery(calls, attempt: 99), CancellationToken.None);
+
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
     public async Task AckAfterReceive_AcksOnReceive_WithoutWaitingForHandler()
     {
         var calls = new Calls();
@@ -96,12 +133,96 @@ public sealed class PostgreSqlDispatcherTests
         Assert.Equal(1, calls.Handler);
     }
 
-    private static PostgreSqlTransportDelivery Delivery(Calls calls, int attempt = 1)
+    [Fact]
+    public async Task AckAfterReceive_BackgroundFailure_DeadLettersWithoutDeletingOriginal_AndInvokesCallback()
+    {
+        var calls = new Calls();
+        PostgreSqlBackgroundFailureContext? callback = null;
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.SetResult();
+                throw new InvalidOperationException("background boom");
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions
+            {
+                OnBackgroundFailure = context =>
+                {
+                    callback = context;
+                    return ValueTask.CompletedTask;
+                }
+            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["AR-Correlation-Id"] = "corr-background"
+        }), CancellationToken.None);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => calls.DeadLetter == 1);
+
+        Assert.Equal(1, calls.Ack);
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.False(calls.DeleteOriginalOnDeadLetter);
+        Assert.NotNull(callback);
+        Assert.Equal("worker", callback!.Queue);
+        Assert.Equal("Worker", callback.SubscriberRole);
+        Assert.Equal("corr-background", callback.CorrelationId);
+        Assert.IsType<InvalidOperationException>(callback.Exception);
+    }
+
+    [Fact]
+    public async Task AckAfterReceive_BackgroundFailureCallbackExceptionsAreSwallowed()
+    {
+        var calls = new Calls();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.SetResult();
+                throw new InvalidOperationException("background boom");
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions
+            {
+                OnBackgroundFailure = _ => throw new InvalidOperationException("callback boom")
+            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        Assert.Equal(1, calls.DeadLetter);
+    }
+
+    [Fact]
+    public void Constructor_RejectsInvalidSubscriberOptions()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => new PostgreSqlMessageDispatcher(
+            (_, _) => Task.CompletedTask,
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterReceive },
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker));
+
+        Assert.Contains(nameof(PostgreSqlSubscriberOptions.BackgroundWorkerCount), ex.Message);
+    }
+
+    private static PostgreSqlTransportDelivery Delivery(
+        Calls calls,
+        int attempt = 1,
+        IReadOnlyDictionary<string, string>? headers = null)
         => new(
             Guid.NewGuid(),
             "worker",
             "{}",
-            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+            headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             attempt,
             () =>
             {
@@ -111,21 +232,36 @@ public sealed class PostgreSqlDispatcherTests
             _ =>
             {
                 calls.Nak++;
+                calls.LastNakDelay = _;
                 return ValueTask.CompletedTask;
             },
             (_, deleteOriginal, _) =>
             {
                 calls.DeadLetter++;
                 calls.DeleteOriginalOnDeadLetter = deleteOriginal;
-                return ValueTask.FromResult(true);
+                return ValueTask.FromResult(calls.DeadLetterResult);
             });
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            await Task.Delay(20, cts.Token);
+        }
+    }
 
     private sealed class Calls
     {
+        public Calls() => DeadLetterResult = true;
+
         public int Handler;
         public int Ack;
         public int Nak;
         public int DeadLetter;
         public bool DeleteOriginalOnDeadLetter;
+        public bool DeadLetterResult;
+        public TimeSpan LastNakDelay;
     }
 }

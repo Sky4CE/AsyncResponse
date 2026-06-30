@@ -3,14 +3,15 @@
 [← Back to README](../README.md)
 
 Every wait records *recovery state* for cleanup and watchdog visibility; durable channels (Redis,
-NATS JetStream KV) persist it beyond the process. When a response arrives after the waiter died
+NATS JetStream KV, PostgreSQL) persist it beyond the process. When a response arrives after the waiter died
 (e.g. a redeploy), it is **classified by its domain outcome** and routed to the right callback:
 resume the flow, or fail it — never resume a failure.
 
 The `OnLostSubscriber*` methods intentionally live only on `IRecoverableAsyncResponseBuilder` and
 its fluent builders. If an app is configured with `.WithInMemoryChannel()`, those methods are absent
-at compile time; switch to a durable channel (`.WithRedisChannel()` / `.WithNatsChannel()`) and
-inject `IRecoverableAsyncResponseBuilder` for durable recovery flows.
+at compile time; switch to a durable channel (`.WithRedisChannel()` / `.WithNatsChannel()` /
+`.WithPostgreSqlChannel(...)`) and inject `IRecoverableAsyncResponseBuilder` for durable recovery
+flows.
 
 ## `ShouldResumeOnRecovery()`
 
@@ -119,7 +120,7 @@ information available.
 ## The recovery watchdog + health check
 
 The recovery watchdog is part of the engine: `AddAsyncResponse()` starts it by default, and it works
-for whichever channel you registered (in-memory, Redis, or NATS). It periodically scans the
+for whichever channel you registered (in-memory, Redis, NATS, or PostgreSQL). It periodically scans the
 persisted recovery state and warns about entries that are old and have no live waiter — flows that
 are probably stuck. `AddAsyncResponseRecoveryCheck()` surfaces the cached findings on your health
 endpoint with stats and the offending correlation ids.
@@ -146,11 +147,19 @@ Recovery state lives in the durable channel's store and survives a redeploy:
   `RecoveryStateExpiry` (7 days default).
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
   per-entry expiry layered over the bucket's `MaxAge`.
+- **PostgreSQL** — recovery state lives in `RecoveryStateTable` (default
+  `asyncresponse_recovery_state`) as one row per waiter registration. Rows expire by `expires_at`
+  and are pruned opportunistically during channel operations.
 
 The carrier for propagated ambient context (trace id, principal, tenant) is persisted alongside the
 recovery state as a `string`→`string` bag, so it survives the redeploy too. Don't set
 `RecoveryStateExpiry` below your longest flow duration — once recovery state is gone, a late response
 has nothing to route against.
+
+On PostgreSQL, late-delivery routing is protected by two columns on the channel message table:
+`acked_at` means a live waiter claimed the response, while `recovery_claimed` means the publisher
+won the lost-subscriber path after the confirmation timeout. The channel updates those columns
+atomically so a slow live waiter and a recovery callback cannot both process the same response.
 
 ## Wire/schema versioning
 
