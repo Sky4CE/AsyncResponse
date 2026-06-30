@@ -163,7 +163,7 @@ public sealed class PostgreSqlDispatcherTests
         }), CancellationToken.None);
 
         await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        await WaitUntilAsync(() => calls.DeadLetter == 1 && callback is not null);
 
         Assert.Equal(1, calls.Ack);
         Assert.Equal(1, calls.DeadLetter);
@@ -199,6 +199,106 @@ public sealed class PostgreSqlDispatcherTests
         await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await WaitUntilAsync(() => calls.DeadLetter == 1);
         Assert.Equal(1, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task AckAfterReceive_Overflow_ReleasesRowForRetry()
+    {
+        var calls = new Calls();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                entered.Set();
+                release.Wait(TimeSpan.FromSeconds(5));
+                return Task.CompletedTask;
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        await WaitUntilAsync(() => calls.Nak == 1);
+        Assert.Equal(TimeSpan.FromSeconds(5), calls.LastNakDelay);
+
+        release.Set();
+    }
+
+    [Fact]
+    public async Task AckAfterReceive_BackgroundFailureWithoutCallback_DeadLetters()
+    {
+        var calls = new Calls();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.SetResult();
+                throw new InvalidOperationException("background boom");
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.ResponseIngress);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        Assert.Equal(1, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task AckAfterReceive_BackgroundOperationCanceled_DeadLettersLikeHandlerFailure()
+    {
+        var calls = new Calls();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.SetResult();
+                throw new OperationCanceledException();
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        Assert.Equal(1, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_TimesOutWhenBackgroundWorkerDoesNotDrain()
+    {
+        var calls = new Calls();
+        var handlerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            async (_, _) =>
+            {
+                handlerEntered.SetResult();
+                await release.Task;
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(1)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await handlerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.DisposeAsync();
+        release.SetResult();
+
+        Assert.Equal(1, calls.Ack);
     }
 
     [Fact]

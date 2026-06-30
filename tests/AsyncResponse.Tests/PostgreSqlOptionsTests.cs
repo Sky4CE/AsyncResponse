@@ -18,6 +18,13 @@ public sealed class PostgreSqlOptionsTests
 
         var ex = Assert.Throws<InvalidOperationException>(options.Validate);
         Assert.Contains(nameof(PostgreSqlAsyncResponseChannelOptions.MessageTable), ex.Message);
+
+        AssertChannelInvalid(
+            options => options.SchemaName = " ",
+            nameof(PostgreSqlAsyncResponseChannelOptions.SchemaName));
+        AssertChannelInvalid(
+            options => options.SchemaName = "1bad",
+            nameof(PostgreSqlAsyncResponseChannelOptions.SchemaName));
     }
 
     [Fact]
@@ -78,6 +85,13 @@ public sealed class PostgreSqlOptionsTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
         Assert.Contains(nameof(PostgreSqlAsyncResponseTransportOptions.NotificationChannel), ex.Message);
+
+        AssertTransportInvalid(
+            options => options.SchemaName = " ",
+            nameof(PostgreSqlAsyncResponseTransportOptions.SchemaName));
+        AssertTransportInvalid(
+            options => options.SchemaName = "1bad",
+            nameof(PostgreSqlAsyncResponseTransportOptions.SchemaName));
     }
 
     [Fact]
@@ -123,6 +137,14 @@ public sealed class PostgreSqlOptionsTests
     {
         Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
             new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterReceive },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlSubscriberOptions
+            {
+                AckMode = PostgreSqlAckMode.AckAfterReceive,
+                BackgroundWorkerCount = 1,
+                BackgroundQueueCapacity = 0
+            },
             "Worker"));
         Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
             new PostgreSqlSubscriberOptions { BatchSize = 0 },
@@ -258,9 +280,40 @@ public sealed class PostgreSqlOptionsTests
 
         Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, "{not-json", options));
         Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, "", options));
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, "null", options));
 
         options.CorrelationIdJsonPaths = [];
         Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(null, """{"CorrelationId":"ignored"}""", options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_HandlesUnmatchedBlankPrimitiveAndMalformedNestedPaths()
+    {
+        var options = new PostgreSqlAsyncResponseTransportOptions
+        {
+            CorrelationIdJsonPaths =
+            [
+                "",
+                "Missing.Value",
+                "CustomParameters.CorrelationId",
+                "CorrelationId"
+            ]
+        };
+
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(
+            null,
+            """{"CustomParameters":42,"Other":"x"}""",
+            options));
+
+        Assert.Null(PostgreSqlCorrelationIdExtractor.Extract(
+            null,
+            """{"CustomParameters":"{not-json"}""",
+            options));
+
+        Assert.Equal("42", PostgreSqlCorrelationIdExtractor.Extract(
+            null,
+            """{"CorrelationId":42}""",
+            options));
     }
 
     [Fact]
@@ -304,6 +357,49 @@ public sealed class PostgreSqlOptionsTests
         Assert.False(PostgreSqlChannelSql.IsTransient(new OperationCanceledException()));
         Assert.False(PostgreSqlTransportRetry.IsTransient(new InvalidOperationException()));
         Assert.False(PostgreSqlChannelSql.IsTransient(new InvalidOperationException()));
+    }
+
+    [Fact]
+    public async Task PostgreSqlRetry_RetriesTransientTimeouts()
+    {
+        var attempts = 0;
+
+        var result = await PostgreSqlTransportRetry.ExecuteAsync(
+            _ =>
+            {
+                attempts++;
+                return attempts < 3
+                    ? throw new TimeoutException("try again")
+                    : Task.FromResult("ok");
+            },
+            maxAttempts: 3,
+            baseDelay: TimeSpan.FromMilliseconds(1),
+            maxDelay: TimeSpan.FromMilliseconds(1),
+            CancellationToken.None);
+
+        Assert.Equal("ok", result);
+        Assert.Equal(3, attempts);
+    }
+
+    [Fact]
+    public async Task PostgreSqlRetry_DoesNotRetryCancellation()
+    {
+        var attempts = 0;
+
+        Task<int> Action(CancellationToken _)
+        {
+            attempts++;
+            throw new OperationCanceledException();
+        }
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => PostgreSqlTransportRetry.ExecuteAsync(
+            Action,
+            maxAttempts: 3,
+            baseDelay: TimeSpan.FromMilliseconds(1),
+            maxDelay: TimeSpan.FromMilliseconds(1),
+            CancellationToken.None));
+
+        Assert.Equal(1, attempts);
     }
 
     private static void AssertChannelInvalid(

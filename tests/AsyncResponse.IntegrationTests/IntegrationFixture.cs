@@ -30,6 +30,7 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient NatsEarlyAckClient { get; private set; } = null!;
     public HttpClient PostgreSqlClient { get; private set; } = null!;
     public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
+    public string PostgreSqlConnectionString { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -80,6 +81,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
         NatsEarlyAckClient = _app.CreateHttpClient("itest-app-nats-early-ack");
         PostgreSqlClient = _app.CreateHttpClient("itest-app-postgresql");
         PostgreSqlEarlyAckClient = _app.CreateHttpClient("itest-app-postgresql-early-ack");
+
+        var postgresEndpoint = _app.GetEndpoint("postgres", "postgres");
+        PostgreSqlConnectionString =
+            $"Host={postgresEndpoint.Host};Port={postgresEndpoint.Port};Username=postgres;Password=postgres;Database=asyncresponse;" +
+            "Maximum Pool Size=40;No Reset On Close=true;Max Auto Prepare=20";
+
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);

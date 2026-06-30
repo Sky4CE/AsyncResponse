@@ -33,6 +33,8 @@
          point for the in-process WebApplicationFactory tests. -->
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
   </ItemGroup>
 
 </Project>
