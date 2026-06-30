@@ -31,6 +31,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         SingleWriter = false
     });
 
+    // Maps a just-published message id to a completion the local dispatch loop trips the instant it
+    // delivers the message to a live waiter. Same-process delivery (the overwhelmingly common case)
+    // is confirmed without polling the database; cross-process delivery falls back to polling acked_at.
+    private readonly ConcurrentDictionary<Guid, TaskCompletionSource<bool>> _pendingConfirmations = new();
+
     private readonly PostgreSqlChannelSql _sql;
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly AsyncResponseContextPropagation _propagation;
@@ -256,10 +261,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
             var messageId = Guid.NewGuid();
+            using var confirmation = BeginConfirmation(messageId);
             await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
             SignalDispatcher(correlationId);
 
-            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
@@ -307,10 +313,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             }
 
             var messageId = Guid.NewGuid();
+            using var confirmation = BeginConfirmation(messageId);
             await _sql.InsertMessageAsync(messageId, correlationId, SerializeRawSuccessEnvelope(responseJson), _options.MessageRetention, cancellationToken).ConfigureAwait(false);
             SignalDispatcher(correlationId);
 
-            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
                 var dispatchResult = await _lostSubscriberDispatcher
@@ -369,10 +376,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             };
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
             var messageId = Guid.NewGuid();
+            using var confirmation = BeginConfirmation(messageId);
             await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
             SignalDispatcher(correlationId);
 
-            if (!await TryConfirmDeliveryAsync(messageId, cancellationToken).ConfigureAwait(false))
+            if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
                 var invoked = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
@@ -576,6 +584,10 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         if (!await _sql.TryClaimForDeliveryAsync(message.Id, cancellationToken).ConfigureAwait(false))
             return;
 
+        // Wake the publisher immediately if it is waiting in this process — no acked_at polling needed.
+        if (_pendingConfirmations.TryGetValue(message.Id, out var confirmation))
+            confirmation.TrySetResult(true);
+
         foreach (var subscription in targets)
         {
             if (subscription.Dropped || !subscription.MarkSeen(message.Id))
@@ -586,40 +598,57 @@ internal sealed class PostgreSqlAsyncResponseChannel :
     }
 
     /// <summary>
+    /// Registers an in-process delivery completion for a message id. Disposing it removes the entry,
+    /// so a publish that throws or completes never leaks the registration.
+    /// </summary>
+    private PendingConfirmation BeginConfirmation(Guid messageId)
+    {
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingConfirmations[messageId] = tcs;
+        return new PendingConfirmation(this, messageId, tcs);
+    }
+
+    /// <summary>
     /// Confirms a published response reached a live waiter. Returns <c>true</c> once a waiter has
     /// acknowledged it; on confirmation timeout, atomically claims the message for the lost-subscriber
     /// path and returns <c>false</c> only if that claim wins — so the recovery callback and a
     /// slow-but-live waiter are mutually exclusive.
     /// </summary>
-    private async Task<bool> TryConfirmDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
+    private async Task<bool> TryConfirmDeliveryAsync(PendingConfirmation confirmation, CancellationToken cancellationToken)
     {
-        if (await WaitForAcknowledgementAsync(messageId, cancellationToken).ConfigureAwait(false))
+        if (await WaitForAcknowledgementAsync(confirmation, cancellationToken).ConfigureAwait(false))
             return true;
 
-        return !await _sql.TryClaimForRecoveryAsync(messageId, cancellationToken).ConfigureAwait(false);
+        return !await _sql.TryClaimForRecoveryAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false);
     }
 
     private void SignalDispatcher(string? correlationId = null) => _signals.Writer.TryWrite(correlationId);
 
-    private async Task<bool> WaitForAcknowledgementAsync(Guid messageId, CancellationToken cancellationToken)
+    private async Task<bool> WaitForAcknowledgementAsync(PendingConfirmation confirmation, CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow + _options.DeliveryConfirmationTimeout;
         while (DateTimeOffset.UtcNow < deadline)
         {
-            if (await _sql.IsMessageAcknowledgedAsync(messageId, cancellationToken).ConfigureAwait(false))
-                return true;
-
             var remaining = deadline - DateTimeOffset.UtcNow;
             if (remaining <= TimeSpan.Zero)
                 break;
 
-            var delay = remaining < _options.DeliveryConfirmationPollInterval
+            var pollDelay = remaining < _options.DeliveryConfirmationPollInterval
                 ? remaining
                 : _options.DeliveryConfirmationPollInterval;
-            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+
+            // Fast path: an in-process delivery trips the completion and we return without a query.
+            await Task.WhenAny(confirmation.Delivered, Task.Delay(pollDelay, cancellationToken)).ConfigureAwait(false);
+            if (confirmation.Delivered.IsCompletedSuccessfully)
+                return true;
+
+            // Slow path: a delivery in another process only set acked_at, so poll for it.
+            if (await _sql.IsMessageAcknowledgedAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false))
+                return true;
         }
 
-        return await _sql.IsMessageAcknowledgedAsync(messageId, cancellationToken).ConfigureAwait(false);
+        return confirmation.Delivered.IsCompletedSuccessfully
+            || await _sql.IsMessageAcknowledgedAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false);
     }
 
     private string ChannelName(string correlationId) => $"{_options.NotificationChannel}:{correlationId}";
@@ -680,6 +709,17 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                 await subscription.CleanupOnceAsync(deleteRecoveryState: false).ConfigureAwait(false);
             await _executors.RemoveAsync(ChannelName(correlationId)).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Scopes an in-process delivery completion; <see cref="Dispose"/> unregisters it.</summary>
+    private readonly struct PendingConfirmation(
+        PostgreSqlAsyncResponseChannel owner,
+        Guid messageId,
+        TaskCompletionSource<bool> tcs) : IDisposable
+    {
+        public Guid MessageId => messageId;
+        public Task<bool> Delivered => tcs.Task;
+        public void Dispose() => owner._pendingConfirmations.TryRemove(messageId, out _);
     }
 
     private interface IPostgreSqlSubscription
