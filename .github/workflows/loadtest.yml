@@ -65,6 +65,9 @@ jobs:
       # any request failed.
       - name: Run NBomber load test
         env:
+          LOADTEST_PROFILE: ${{ github.event.inputs.profile || 'broad' }}
+          LOADTEST_RATE: ${{ github.event.inputs.rate || '' }}
+          LOADTEST_DURATION: ${{ github.event.inputs.duration || '30' }}
           LOADTEST_EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
           LOADTEST_APPHOST_ENV: ${{ github.event.inputs.apphost_env || '' }}
         run: |
@@ -96,10 +99,15 @@ jobs:
             fi
           done < "$RUNNER_TEMP/loadtest-env"
 
+          rate="${LOADTEST_RATE:-20}"
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            rate="${LOADTEST_RATE:-5}"
+          fi
+
           args=(
-            --profile "${{ github.event.inputs.profile || 'broad' }}"
-            --rate "${{ github.event.inputs.rate || '20' }}"
-            --duration "${{ github.event.inputs.duration || '30' }}"
+            --profile "$LOADTEST_PROFILE"
+            --rate "$rate"
+            --duration "$LOADTEST_DURATION"
             --warmup 10
             --gh-json "${{ github.workspace }}/loadtest"
           )

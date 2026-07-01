@@ -195,8 +195,10 @@ broker clients per request to model an external producer. It writes an HTML/CSV/
 `nbomber-report/`.
 The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
-uploading the full report as an artifact. Manual workflow runs keep `profile`, `rate`, and `duration`
-as first-class inputs. Put any current or future `AsyncResponse.LoadTests` CLI switches in
+uploading the full report as an artifact. Push runs execute the broad profile at a conservative
+`5` requests/sec per scenario so every defined provider scenario can run together on a shared GitHub
+runner without overloading one backing service. Manual workflow runs keep `profile`, `rate`, and
+`duration` as first-class inputs. Put any current or future `AsyncResponse.LoadTests` CLI switches in
 `extra_args`, for example `--azure-servicebus-url http://host --azure-servicebus-early-ack-url
 http://host-early --scenario azure_servicebus_worker_ack_after_receive_observed`. Put Aspire SUT
 tuning in `apphost_env` as newline-separated or shell-style `KEY=VALUE` entries, for example

@@ -23,7 +23,10 @@ public class AzureServiceBusAckDispatchBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var options = new AzureServiceBusAsyncResponseOptions();
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(60)
+        };
 
         _awaiting = AzureServiceBusMessageDispatcher.Create(
             (_, _) => Task.CompletedTask,

@@ -321,6 +321,10 @@ try
             .ToArray();
 
         var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+        var outputDirectory = Path.GetDirectoryName(Path.GetFullPath(ghJsonPrefix));
+        if (!string.IsNullOrEmpty(outputDirectory))
+            Directory.CreateDirectory(outputDirectory);
+
         File.WriteAllText($"{ghJsonPrefix}.bigger.json", JsonSerializer.Serialize(throughput, jsonOptions));
         File.WriteAllText($"{ghJsonPrefix}.smaller.json", JsonSerializer.Serialize(latency, jsonOptions));
         Console.WriteLine($"Wrote {ghJsonPrefix}.bigger.json + {ghJsonPrefix}.smaller.json for github-action-benchmark.");
