@@ -598,7 +598,10 @@ internal static class StressRunner
     private static async Task<int> AzureServiceBusAckAfterReceiveDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
-        var options = new AzureServiceBusAsyncResponseOptions();
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
+        };
         var seen = new int[count];
         var processed = 0;
         var duplicates = 0;
