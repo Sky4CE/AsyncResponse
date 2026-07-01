@@ -251,6 +251,50 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
     }
 
     [Fact]
+    public async Task Channel_DeliversLocalResponsesWithoutWaitingForListenerBacklog()
+    {
+        var schema = NewSchema("fast");
+        await using var cleanupDataSource = NpgsqlDataSource.Create(Fixture.PostgreSqlConnectionString);
+        ServiceProvider? provider = null;
+        var waiters = new List<IAsyncResponseWaiter<OperationResult>>();
+        try
+        {
+            provider = BuildProvider(schema, options =>
+            {
+                options.DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(20);
+                options.ListenerPollInterval = TimeSpan.FromSeconds(10);
+            });
+            var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+            var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+
+            var correlationIds = Enumerable.Range(0, 32)
+                .Select(_ => NewId("local-fast"))
+                .ToArray();
+
+            foreach (var correlationId in correlationIds)
+                waiters.Add(await subscriber.CreateResponseWaiter<OperationResult>(
+                    correlationId,
+                    timeout: TimeSpan.FromSeconds(5)));
+
+            await Task.WhenAll(correlationIds.Select(correlationId =>
+                publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId)))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            var results = await Task.WhenAll(waiters.Select(waiter => waiter.ResponseTask))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.All(results, result => Assert.Equal(OperationStatus.Completed, result.Status));
+        }
+        finally
+        {
+            foreach (var waiter in waiters)
+                await waiter.DisposeAsync();
+            if (provider is not null)
+                await provider.DisposeAsync();
+            await DropSchemaAsync(cleanupDataSource, schema);
+        }
+    }
+
+    [Fact]
     public async Task Channel_RegressionEdges_HandleFallbacksFaultedEnvelopesAndSetupFailures()
     {
         var schema = NewSchema("channel_edges");

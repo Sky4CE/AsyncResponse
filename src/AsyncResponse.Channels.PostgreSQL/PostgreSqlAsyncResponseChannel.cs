@@ -262,8 +262,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
             var messageId = Guid.NewGuid();
             using var confirmation = BeginConfirmation(messageId);
-            await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher(correlationId);
+            await PublishMessageAsync(messageId, correlationId, json, cancellationToken).ConfigureAwait(false);
 
             if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
@@ -314,8 +313,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
             var messageId = Guid.NewGuid();
             using var confirmation = BeginConfirmation(messageId);
-            await _sql.InsertMessageAsync(messageId, correlationId, SerializeRawSuccessEnvelope(responseJson), _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher(correlationId);
+            await PublishMessageAsync(messageId, correlationId, SerializeRawSuccessEnvelope(responseJson), cancellationToken).ConfigureAwait(false);
 
             if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
@@ -377,8 +375,7 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
             var messageId = Guid.NewGuid();
             using var confirmation = BeginConfirmation(messageId);
-            await _sql.InsertMessageAsync(messageId, correlationId, json, _options.MessageRetention, cancellationToken).ConfigureAwait(false);
-            SignalDispatcher(correlationId);
+            await PublishMessageAsync(messageId, correlationId, json, cancellationToken).ConfigureAwait(false);
 
             if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
@@ -567,6 +564,20 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
+    private async Task PublishMessageAsync(
+        Guid messageId,
+        string correlationId,
+        string envelopeJson,
+        CancellationToken cancellationToken)
+    {
+        await _sql.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
+            .ConfigureAwait(false);
+        await TryDispatchLocalSubscribersAsync(
+            new PostgreSqlChannelMessage(messageId, correlationId, envelopeJson),
+            cancellationToken).ConfigureAwait(false);
+        SignalDispatcher(correlationId);
+    }
+
     private async Task DispatchMessageToSubscribersAsync(
         PostgreSqlChannelMessage message,
         IReadOnlyList<IPostgreSqlSubscription> subscriptions,
@@ -594,6 +605,28 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                 continue;
 
             await subscription.ProcessUnderContextAsync(message).ConfigureAwait(false);
+        }
+    }
+
+    private async Task TryDispatchLocalSubscribersAsync(PostgreSqlChannelMessage message, CancellationToken cancellationToken)
+    {
+        if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
+            return;
+
+        var subscriptions = group.Values.Where(static s => !s.Dropped).ToArray();
+        if (subscriptions.Length == 0)
+            return;
+
+        try
+        {
+            await DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(
+                ex,
+                "Local PostgreSQL response dispatch failed for correlationId {CorrelationId}; listener retry will pick it up.",
+                message.CorrelationId);
         }
     }
 
