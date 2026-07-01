@@ -3,8 +3,9 @@ name: Load test
 # End-to-end HTTP load test (NBomber) against the real Redis + broker transport stack. Runs the broad
 # non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
 # dashboard as the benchmarks workflow; manual runs can select focused azure-servicebus/pubsub/
-# rabbitmq/redis/nats/postgresql/recovery profiles. It is Docker-backed, so it shares a concurrency group with the
-# benchmarks workflow to avoid racing on the gh-pages history.
+# rabbitmq/redis/nats/postgresql/recovery profiles. Extra CLI args and AppHost env overrides keep
+# workflow_dispatch below GitHub's 25-input limit as new transports/channels are added. It is Docker-backed,
+# so it shares a concurrency group with the benchmarks workflow to avoid racing on the gh-pages history.
 on:
   push:
     branches: [main]
@@ -27,78 +28,12 @@ on:
       duration:
         description: 'Load duration in seconds'
         default: '30'
-      azure_servicebus_url:
-        description: 'Optional existing Azure Service Bus SUT URL for --azure-servicebus-url'
+      extra_args:
+        description: 'Shell-style extra AsyncResponse.LoadTests args, e.g. --redis-url http://host --scenario request_response_success_redis'
         default: ''
-      azure_servicebus_early_ack_url:
-        description: 'Optional existing Azure Service Bus early-ACK SUT URL for --azure-servicebus-early-ack-url'
+      apphost_env:
+        description: 'Optional KEY=VALUE Aspire SUT env overrides, newline or shell-space separated'
         default: ''
-      azure_servicebus_worker_ack_mode:
-        description: 'Azure Service Bus worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
-        default: 'AckAfterReceive'
-      azure_servicebus_worker_background_workers:
-        description: 'Azure Service Bus early-ACK background worker count'
-        default: '4'
-      azure_servicebus_worker_queue_capacity:
-        description: 'Azure Service Bus early-ACK background queue capacity'
-        default: '256'
-      redis_url:
-        description: 'Optional existing Redis transport SUT URL for --redis-url'
-        default: ''
-      redis_early_ack_url:
-        description: 'Optional existing Redis transport early-ACK SUT URL for --redis-early-ack-url'
-        default: ''
-      redis_worker_ack_mode:
-        description: 'Redis worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterEnqueue'
-        default: 'AckAfterEnqueue'
-      redis_worker_background_workers:
-        description: 'Redis early-ACK background worker count'
-        default: '4'
-      redis_worker_queue_capacity:
-        description: 'Redis early-ACK background queue capacity'
-        default: '256'
-      redis_pending_idle_seconds:
-        description: 'Redis pending-entry idle seconds before retry/claim'
-        default: '1'
-      redis_max_delivery_attempts:
-        description: 'Redis max delivery attempts before dead-lettering'
-        default: '5'
-      redis_publish_max_attempts:
-        description: 'Redis XADD publish retry attempts'
-        default: '3'
-      redis_stream_max_length:
-        description: 'Redis worker/response stream MAXLEN setting'
-        default: '100000'
-      nats_url:
-        description: 'Optional existing NATS SUT URL for --nats-url'
-        default: ''
-      nats_early_ack_url:
-        description: 'Optional existing NATS early-ACK SUT URL for --nats-early-ack-url'
-        default: ''
-      nats_worker_ack_mode:
-        description: 'NATS worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
-        default: 'AckAfterReceive'
-      nats_worker_background_workers:
-        description: 'NATS early-ACK background worker count'
-        default: '4'
-      nats_worker_queue_capacity:
-        description: 'NATS early-ACK background queue capacity'
-        default: '256'
-      postgresql_url:
-        description: 'Optional existing PostgreSQL SUT URL for --postgresql-url'
-        default: ''
-      postgresql_early_ack_url:
-        description: 'Optional existing PostgreSQL early-ACK SUT URL for --postgresql-early-ack-url'
-        default: ''
-      postgresql_worker_ack_mode:
-        description: 'PostgreSQL worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
-        default: 'AckAfterReceive'
-      postgresql_worker_background_workers:
-        description: 'PostgreSQL early-ACK background worker count'
-        default: '4'
-      postgresql_worker_queue_capacity:
-        description: 'PostgreSQL early-ACK background queue capacity'
-        default: '256'
 
 # github-action-benchmark commits the results history to gh-pages.
 permissions:
@@ -130,31 +65,37 @@ jobs:
       # any request failed.
       - name: Run NBomber load test
         env:
-          REDIS_URL: ${{ github.event.inputs.redis_url || '' }}
-          REDIS_EARLY_ACK_URL: ${{ github.event.inputs.redis_early_ack_url || '' }}
-          AZURE_SERVICEBUS_URL: ${{ github.event.inputs.azure_servicebus_url || '' }}
-          AZURE_SERVICEBUS_EARLY_ACK_URL: ${{ github.event.inputs.azure_servicebus_early_ack_url || '' }}
-          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_ACK_MODE: ${{ github.event.inputs.azure_servicebus_worker_ack_mode || 'AckAfterReceive' }}
-          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.azure_servicebus_worker_background_workers || '4' }}
-          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.azure_servicebus_worker_queue_capacity || '256' }}
-          ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE: ${{ github.event.inputs.redis_worker_ack_mode || 'AckAfterEnqueue' }}
-          ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.redis_worker_background_workers || '4' }}
-          ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.redis_worker_queue_capacity || '256' }}
-          ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS: ${{ github.event.inputs.redis_pending_idle_seconds || '1' }}
-          ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS: ${{ github.event.inputs.redis_max_delivery_attempts || '5' }}
-          ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS: ${{ github.event.inputs.redis_publish_max_attempts || '3' }}
-          ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH: ${{ github.event.inputs.redis_stream_max_length || '100000' }}
-          NATS_URL: ${{ github.event.inputs.nats_url || '' }}
-          NATS_EARLY_ACK_URL: ${{ github.event.inputs.nats_early_ack_url || '' }}
-          ASYNCRESPONSE_ITEST_NATS_WORKER_ACK_MODE: ${{ github.event.inputs.nats_worker_ack_mode || 'AckAfterReceive' }}
-          ASYNCRESPONSE_ITEST_NATS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.nats_worker_background_workers || '4' }}
-          ASYNCRESPONSE_ITEST_NATS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.nats_worker_queue_capacity || '256' }}
-          POSTGRESQL_URL: ${{ github.event.inputs.postgresql_url || '' }}
-          POSTGRESQL_EARLY_ACK_URL: ${{ github.event.inputs.postgresql_early_ack_url || '' }}
-          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_ACK_MODE: ${{ github.event.inputs.postgresql_worker_ack_mode || 'AckAfterReceive' }}
-          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.postgresql_worker_background_workers || '4' }}
-          ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.postgresql_worker_queue_capacity || '256' }}
+          LOADTEST_EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
+          LOADTEST_APPHOST_ENV: ${{ github.event.inputs.apphost_env || '' }}
         run: |
+          python3 - <<'PY' > "$RUNNER_TEMP/loadtest-env"
+          import os
+          import re
+          import shlex
+          import sys
+
+          for raw in os.environ.get("LOADTEST_APPHOST_ENV", "").splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              try:
+                  assignments = shlex.split(line)
+              except ValueError as ex:
+                  sys.exit(f"Invalid apphost_env line: {ex}")
+              for assignment in assignments:
+                  if "=" not in assignment:
+                      sys.exit(f"Invalid apphost_env entry (expected KEY=VALUE): {assignment}")
+                  key, value = assignment.split("=", 1)
+                  if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                      sys.exit(f"Invalid apphost_env key: {key}")
+                  print(f"{key}={value}")
+          PY
+          while IFS= read -r assignment; do
+            if [ -n "$assignment" ]; then
+              export "$assignment"
+            fi
+          done < "$RUNNER_TEMP/loadtest-env"
+
           args=(
             --profile "${{ github.event.inputs.profile || 'broad' }}"
             --rate "${{ github.event.inputs.rate || '20' }}"
@@ -162,30 +103,24 @@ jobs:
             --warmup 10
             --gh-json "${{ github.workspace }}/loadtest"
           )
-          if [ -n "$REDIS_URL" ]; then
-            args+=(--redis-url "$REDIS_URL")
+
+          python3 - <<'PY' > "$RUNNER_TEMP/loadtest-extra-args"
+          import os
+          import shlex
+
+          for arg in shlex.split(os.environ.get("LOADTEST_EXTRA_ARGS", "")):
+              print(arg)
+          PY
+          extra_args=()
+          while IFS= read -r arg; do
+            if [ -n "$arg" ]; then
+              extra_args+=("$arg")
+            fi
+          done < "$RUNNER_TEMP/loadtest-extra-args"
+          if [ "${#extra_args[@]}" -gt 0 ]; then
+            args+=("${extra_args[@]}")
           fi
-          if [ -n "$REDIS_EARLY_ACK_URL" ]; then
-            args+=(--redis-early-ack-url "$REDIS_EARLY_ACK_URL")
-          fi
-          if [ -n "$AZURE_SERVICEBUS_URL" ]; then
-            args+=(--azure-servicebus-url "$AZURE_SERVICEBUS_URL")
-          fi
-          if [ -n "$AZURE_SERVICEBUS_EARLY_ACK_URL" ]; then
-            args+=(--azure-servicebus-early-ack-url "$AZURE_SERVICEBUS_EARLY_ACK_URL")
-          fi
-          if [ -n "$NATS_URL" ]; then
-            args+=(--nats-url "$NATS_URL")
-          fi
-          if [ -n "$NATS_EARLY_ACK_URL" ]; then
-            args+=(--nats-early-ack-url "$NATS_EARLY_ACK_URL")
-          fi
-          if [ -n "$POSTGRESQL_URL" ]; then
-            args+=(--postgresql-url "$POSTGRESQL_URL")
-          fi
-          if [ -n "$POSTGRESQL_EARLY_ACK_URL" ]; then
-            args+=(--postgresql-early-ack-url "$POSTGRESQL_EARLY_ACK_URL")
-          fi
+
           dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- "${args[@]}"
 
       - name: Publish load-test throughput (bigger is better)

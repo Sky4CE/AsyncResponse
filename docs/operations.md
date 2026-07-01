@@ -195,12 +195,16 @@ broker clients per request to model an external producer. It writes an HTML/CSV/
 `nbomber-report/`.
 The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
-uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
-`duration`, plus Azure Service Bus/Redis/NATS/PostgreSQL target URLs and provider knobs such as
-pending idle time, max delivery attempts, publish attempts, stream max length, ACK mode, background
-worker count, and
-early-ACK queue sizing; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
-`customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
+uploading the full report as an artifact. Manual workflow runs keep `profile`, `rate`, and `duration`
+as first-class inputs. Put any current or future `AsyncResponse.LoadTests` CLI switches in
+`extra_args`, for example `--azure-servicebus-url http://host --azure-servicebus-early-ack-url
+http://host-early --scenario azure_servicebus_worker_ack_after_receive_observed`. Put Aspire SUT
+tuning in `apphost_env` as newline-separated or shell-style `KEY=VALUE` entries, for example
+`ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY=512
+ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS=8`. This avoids GitHub's `workflow_dispatch`
+input limit while still allowing new transports/channels and provider knobs to be tested without
+changing the workflow. The pushed JSON still uses github-action-benchmark's `customBiggerIsBetter`
+and `customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
 `gh-pages`.
 
 **Performance over time.** Every push to `main` runs the micro-benchmarks and the stress harness
