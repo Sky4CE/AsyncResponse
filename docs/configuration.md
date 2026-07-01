@@ -5,7 +5,7 @@
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
 exactly one channel (`.WithInMemoryChannel()`, `.WithRedisChannel()`, `.WithNatsChannel()`, or
 `.WithPostgreSqlChannel(...)`) and exactly one transport (`.WithInMemoryTransport()`,
-`.WithRedisTransport(...)`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`,
+`.WithRedisTransport(...)`, `.WithAzureServiceBusTransport(...)`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`,
 `.WithNatsTransport(...)`, `.WithPostgreSqlTransport(...)`, or another full AsyncResponse transport
 package). An app that starts without either one fails fast at host startup with setup guidance, so a
 misconfiguration can never silently hang every waiter or drop worker dispatch. The recovery watchdog
@@ -25,7 +25,7 @@ builder.Services.AddAsyncResponse(options =>
     options.RecoveryStateExpiry = TimeSpan.FromDays(7);     // how long recovery survives
     options.DefaultTimeout = TimeSpan.FromHours(12);        // default per-waiter timeout
 })
-.WithInMemoryTransport();                                   // or .WithGooglePubSubTransport(...) / .WithRabbitMqTransport(...)
+.WithInMemoryTransport();                                   // or .WithAzureServiceBusTransport(...) / .WithRabbitMqTransport(...)
 ```
 
 ## Engine options (`AsyncResponseOptions`)
@@ -80,18 +80,27 @@ its own option type; the common shapes are summarized here. See the transport se
 | Option | Transports | Purpose |
 |---|---|---|
 | `KeyPrefix` / `SubjectPrefix` / `SchemaName` | Redis / NATS / PostgreSQL | Namespace for worker and response streams/subjects/tables. |
+| `ConnectionString` | Azure Service Bus | Service Bus namespace connection string. Omit when you register your own singleton `ServiceBusClient`. |
+| `WorkerQueue` / `ResponseQueue` | Azure Service Bus | Service Bus queues used for worker jobs and response ingress; they must be distinct. |
 | `MessageTable` | PostgreSQL | Single queue table containing worker, response-ingress, and dead-letter rows. |
 | `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL | Logical queue names stored in the PostgreSQL queue table. They must be distinct. |
 | `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. |
 | `LockTimeout` | PostgreSQL | How long a claimed row stays locked before another subscriber may retry it. |
+| `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus | Receive-loop batch size and long-poll timeout for queue subscribers. |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports | Redeliveries before dead-lettering. |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
-| `CorrelationIdAttribute` / `CorrelationIdHeader` | Pub/Sub / RabbitMQ / NATS / PostgreSQL | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. |
+| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / NATS / PostgreSQL / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. |
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL also unwraps nested JSON strings at those paths. |
 | `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL | Whether poison messages are preserved and, for PostgreSQL, how long dead-letter rows are retained. |
+
+Azure Service Bus uses peek-lock settlement. In `AckAfterHandlerCompletes`, a successful handler
+completes the message, failures abandon it until `MaxDeliveryAttempts`, then dead-letter it through
+Service Bus. In `AckAfterReceive`, the message is completed as soon as it enters the bounded
+background queue; later handler failures cannot be broker-dead-lettered because the lock is gone, so
+use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path.
 
 See [postgresql.md](postgresql.md) for PostgreSQL table layout, delivery-confirmation details, and
 connection-string tuning.

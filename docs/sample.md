@@ -21,8 +21,8 @@ Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported contai
 such as Docker or Podman for the Redis resource.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
-`PostgreSQL`) and `AsyncResponse:Transport` (`InMemory` | `GooglePubSub` | `RabbitMQ` | `Redis` |
-`NATS` | `PostgreSQL`) select the providers,
+`PostgreSQL`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` | `GooglePubSub` |
+`RabbitMQ` | `Redis` | `NATS` | `PostgreSQL`) select the providers,
 defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
@@ -56,6 +56,22 @@ docker run -d --rm --name asyncresponse-rabbitmq -p 5672:5672 -p 15672:15672 rab
 AsyncResponse__Channel=Redis \
 AsyncResponse__Transport=RabbitMQ \
 RabbitMQ__ConnectionString=amqp://guest:guest@localhost:5672/ \
+dotnet run --project samples/AsyncResponse.Sample
+```
+
+To run the standalone sample against the Azure Service Bus emulator, use Redis for the durable
+response channel and point the transport at the emulator connection string. The emulator queues must
+exist in its `Config.json` before startup (see the integration AppHost's
+`servicebus-emulator-config.json` for a working queue-only example):
+
+```bash
+docker compose up -d                                                  # local Redis
+
+AsyncResponse__Channel=Redis \
+AsyncResponse__Transport=AzureServiceBus \
+ConnectionStrings__AzureServiceBus='Endpoint=sb://localhost:5672;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;' \
+AzureServiceBus__WorkerQueue=asyncresponse-itest-asb-worker \
+AzureServiceBus__ResponseQueue=asyncresponse-itest-asb-response \
 dotnet run --project samples/AsyncResponse.Sample
 ```
 

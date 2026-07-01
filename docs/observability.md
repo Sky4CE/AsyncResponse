@@ -32,6 +32,7 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.ingress.response`, `asyncresponse.ingress.worker` | transport-neutral response and worker message ingress |
 | `asyncresponse.enqueue_worker`, `asyncresponse.worker.publish`, `asyncresponse.worker.execute` | worker enqueue, transport publish, and execution |
 | `asyncresponse.redis.receive` | Redis Streams subscriber message handling |
+| `asyncresponse.azure_service_bus.receive` | Azure Service Bus subscriber message handling |
 | `asyncresponse.pubsub.receive` | Google Pub/Sub subscriber message handling |
 | `asyncresponse.rabbitmq.receive` | RabbitMQ subscriber message handling |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
@@ -74,6 +75,6 @@ The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
 `asyncresponse.recovery.stale` gauge is your earliest signal of stuck flows.
 
 > **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream
-> backlog, Pub/Sub subscription depth, PostgreSQL table row counts) are *not* surfaced by
+> backlog, Service Bus queue length, Pub/Sub subscription depth, PostgreSQL table row counts) are *not* surfaced by
 > AsyncResponse — read those from your broker or database metrics. AsyncResponse only measures what
 > happens inside the library.

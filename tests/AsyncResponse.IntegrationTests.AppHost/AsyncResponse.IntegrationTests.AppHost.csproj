@@ -20,6 +20,10 @@
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="servicebus-emulator-config.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <Target Name="BuildAspireProjectResourceDebugOutput" BeforeTargets="Build">
     <MSBuild
       Projects="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj"

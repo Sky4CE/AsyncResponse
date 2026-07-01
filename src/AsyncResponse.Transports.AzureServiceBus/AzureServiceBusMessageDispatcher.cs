@@ -1,0 +1,351 @@
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
+using System.Threading.Channels;
+
+namespace AsyncResponse.Transports.AzureServiceBus;
+
+internal enum AzureServiceBusSubscriberRole
+{
+    Worker,
+    ResponseIngress
+}
+
+internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
+{
+    private readonly Func<AzureServiceBusTransportDelivery, CancellationToken, Task> _handler;
+    private readonly AzureServiceBusAsyncResponseOptions _transportOptions;
+    private readonly AzureServiceBusSubscriberOptions _subscriberOptions;
+    private readonly string _queue;
+    private readonly AzureServiceBusSubscriberRole _role;
+
+    protected AzureServiceBusMessageDispatcher(
+        Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
+        AzureServiceBusAsyncResponseOptions transportOptions,
+        AzureServiceBusSubscriberOptions subscriberOptions,
+        ILogger logger,
+        string queue,
+        AzureServiceBusSubscriberRole role)
+    {
+        _handler = handler;
+        _transportOptions = transportOptions;
+        _subscriberOptions = subscriberOptions;
+        Logger = logger;
+        _queue = queue;
+        _role = role;
+    }
+
+    protected ILogger Logger { get; }
+    protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
+
+    /// <summary>Creates the dispatcher configured by the subscriber options.</summary>
+    public static AzureServiceBusMessageDispatcher Create(
+        Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
+        AzureServiceBusAsyncResponseOptions transportOptions,
+        AzureServiceBusSubscriberOptions subscriberOptions,
+        ILogger logger,
+        string queue,
+        AzureServiceBusSubscriberRole role)
+    {
+        AzureServiceBusOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
+
+        return subscriberOptions.AckMode switch
+        {
+            AzureServiceBusAckMode.AckAfterHandlerCompletes => new AwaitingAzureServiceBusMessageDispatcher(
+                handler,
+                transportOptions,
+                subscriberOptions,
+                logger,
+                queue,
+                role),
+            AzureServiceBusAckMode.AckAfterReceive => new QueuedAzureServiceBusMessageDispatcher(
+                handler,
+                transportOptions,
+                subscriberOptions,
+                logger,
+                queue,
+                role),
+            _ => throw new InvalidOperationException(
+                $"Unsupported Azure Service Bus ACK mode '{subscriberOptions.AckMode}'.")
+        };
+    }
+
+    /// <summary>Validates the supplied subscriber options.</summary>
+    public static void ValidateOptions(
+        AzureServiceBusAsyncResponseOptions transportOptions,
+        AzureServiceBusSubscriberOptions subscriberOptions,
+        AzureServiceBusSubscriberRole role)
+        => AzureServiceBusOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
+
+    /// <summary>Handles the delivered message.</summary>
+    public abstract Task HandleAsync(
+        AzureServiceBusTransportDelivery delivery,
+        CancellationToken subscriberCancellationToken);
+
+    /// <summary>Releases resources held by this instance.</summary>
+    public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    protected async Task ExecuteHandlerAsync(
+        AzureServiceBusTransportDelivery delivery,
+        CancellationToken cancellationToken,
+        bool logFailures = true)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.azure_service_bus.receive",
+            ActivityKind.Consumer);
+        activity?.SetTag("asyncresponse.transport", "azure_service_bus");
+        activity?.SetTag("asyncresponse.azure_service_bus.role", _role.ToString());
+        activity?.SetTag("asyncresponse.azure_service_bus.ack_mode", _subscriberOptions.AckMode.ToString());
+        activity?.SetTag("messaging.system", "azure_service_bus");
+        activity?.SetTag("messaging.destination.name", _queue);
+        activity?.SetTag("messaging.message.id", delivery.MessageId);
+        activity?.SetTag("messaging.azure_service_bus.sequence_number", delivery.SequenceNumber);
+
+        if (!string.IsNullOrWhiteSpace(delivery.CorrelationId))
+            AsyncResponseDiagnostics.SetCorrelationId(activity, delivery.CorrelationId);
+
+        try
+        {
+            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (logFailures)
+                Logger.LogError(ex, "Azure Service Bus message handling failed for message {MessageId}.", delivery.MessageId);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    protected async ValueTask NotifyBackgroundFailureAsync(
+        AzureServiceBusTransportDelivery delivery,
+        Exception exception,
+        string queue,
+        AzureServiceBusSubscriberRole role)
+    {
+        var callback = _subscriberOptions.OnBackgroundFailure;
+        if (callback is null)
+            return;
+
+        try
+        {
+            var context = new AzureServiceBusBackgroundFailureContext(
+                queue,
+                role.ToString(),
+                delivery.SequenceNumber,
+                delivery.MessageId,
+                delivery.CorrelationId ?? TryReadApplicationCorrelationId(delivery),
+                exception);
+            await callback(context).ConfigureAwait(false);
+        }
+        catch (Exception callbackException)
+        {
+            Logger.LogError(
+                callbackException,
+                "Azure Service Bus background failure callback failed for already-completed message {MessageId} on {Queue}.",
+                delivery.MessageId,
+                queue);
+        }
+    }
+
+    private string? TryReadApplicationCorrelationId(AzureServiceBusTransportDelivery delivery)
+    {
+        if (!string.IsNullOrWhiteSpace(_transportOptions.CorrelationIdProperty)
+            && delivery.ApplicationProperties.TryGetValue(_transportOptions.CorrelationIdProperty, out var value))
+        {
+            return AzureServiceBusCorrelationIdExtractor.TryConvertProperty(value);
+        }
+
+        return null;
+    }
+}
+
+internal sealed class AwaitingAzureServiceBusMessageDispatcher(
+    Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
+    AzureServiceBusAsyncResponseOptions transportOptions,
+    AzureServiceBusSubscriberOptions subscriberOptions,
+    ILogger logger,
+    string queue,
+    AzureServiceBusSubscriberRole role)
+    : AzureServiceBusMessageDispatcher(handler, transportOptions, subscriberOptions, logger, queue, role)
+{
+    /// <summary>Handles the delivered message.</summary>
+    public override async Task HandleAsync(
+        AzureServiceBusTransportDelivery delivery,
+        CancellationToken subscriberCancellationToken)
+    {
+        try
+        {
+            await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+            await delivery.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (MaxDeliveryAttempts > 0 && delivery.DeliveryCount >= MaxDeliveryAttempts)
+            {
+                await delivery.DeadLetterAsync(
+                    "AsyncResponseHandlerFailed",
+                    ex.Message).ConfigureAwait(false);
+                return;
+            }
+
+            await delivery.AbandonAsync().ConfigureAwait(false);
+        }
+    }
+}
+
+internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMessageDispatcher
+{
+    private readonly Channel<AzureServiceBusTransportDelivery> _queue;
+    private readonly Task[] _workers;
+    private readonly CancellationTokenSource _drainCancellation = new();
+    private readonly TimeSpan _drainTimeout;
+    private readonly string _queueName;
+    private readonly AzureServiceBusSubscriberRole _role;
+    private int _pendingCount;
+    private int _runningCount;
+    private int _disposeStarted;
+
+    /// <summary>Creates an ACK-after-receive dispatcher with a bounded background queue.</summary>
+    public QueuedAzureServiceBusMessageDispatcher(
+        Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
+        AzureServiceBusAsyncResponseOptions transportOptions,
+        AzureServiceBusSubscriberOptions subscriberOptions,
+        ILogger logger,
+        string queue,
+        AzureServiceBusSubscriberRole role)
+        : base(handler, transportOptions, subscriberOptions, logger, queue, role)
+    {
+        _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _queueName = queue;
+        _role = role;
+        _queue = Channel.CreateBounded<AzureServiceBusTransportDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
+        {
+            AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
+            SingleWriter = false
+        });
+
+        _workers = Enumerable.Range(0, subscriberOptions.BackgroundWorkerCount)
+            .Select(workerIndex => Task.Run(() => RunWorkerAsync(workerIndex)))
+            .ToArray();
+
+        Logger.LogInformation(
+            "Created Azure Service Bus ACK-after-receive dispatcher for {Queue} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
+            _queueName,
+            subscriberOptions.BackgroundWorkerCount,
+            subscriberOptions.BackgroundQueueCapacity,
+            _drainTimeout);
+    }
+
+    internal int PendingCount => Volatile.Read(ref _pendingCount);
+    internal int RunningCount => Volatile.Read(ref _runningCount);
+
+    /// <summary>Handles the delivered message.</summary>
+    public override async Task HandleAsync(
+        AzureServiceBusTransportDelivery delivery,
+        CancellationToken subscriberCancellationToken)
+    {
+        try
+        {
+            Interlocked.Increment(ref _pendingCount);
+            if (_queue.Writer.TryWrite(delivery))
+            {
+                await delivery.CompleteAsync().ConfigureAwait(false);
+                return;
+            }
+
+            Interlocked.Decrement(ref _pendingCount);
+            Logger.LogWarning(
+                "Azure Service Bus background queue rejected message {MessageId} for {Queue}; abandoning for redelivery. Pending={PendingCount}, Running={RunningCount}.",
+                delivery.MessageId,
+                _queueName,
+                PendingCount,
+                RunningCount);
+            await delivery.AbandonAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            Logger.LogError(ex, "Failed to enqueue Azure Service Bus message {MessageId} for {Queue}; abandoning for redelivery.", delivery.MessageId, _queueName);
+            await delivery.AbandonAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Releases resources held by this instance.</summary>
+    public override async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+            return;
+
+        Logger.LogInformation(
+            "Draining Azure Service Bus ACK-after-receive dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}.",
+            _queueName,
+            PendingCount,
+            RunningCount);
+        _queue.Writer.TryComplete();
+
+        try
+        {
+            await Task.WhenAll(_workers).WaitAsync(_drainTimeout).ConfigureAwait(false);
+            _drainCancellation.Dispose();
+        }
+        catch (TimeoutException ex)
+        {
+            _drainCancellation.Cancel();
+            Logger.LogWarning(
+                ex,
+                "Timed out while draining Azure Service Bus ACK-after-receive dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}. Already-completed work may be interrupted by host shutdown.",
+                _queueName,
+                PendingCount,
+                RunningCount);
+
+            _ = Task.WhenAll(_workers).ContinueWith(
+                _ => _drainCancellation.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+    }
+
+    private async Task RunWorkerAsync(int workerIndex)
+    {
+        await foreach (var delivery in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
+        {
+            Interlocked.Decrement(ref _pendingCount);
+            Interlocked.Increment(ref _runningCount);
+
+            try
+            {
+                Logger.LogDebug(
+                    "Azure Service Bus background worker {WorkerIndex} handling message {MessageId} for {Queue}. Pending={PendingCount}, Running={RunningCount}.",
+                    workerIndex,
+                    delivery.MessageId,
+                    _queueName,
+                    PendingCount,
+                    RunningCount);
+                await ExecuteHandlerAsync(
+                    delivery,
+                    _drainCancellation.Token,
+                    logFailures: false).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(
+                    ex,
+                    "Azure Service Bus background handler failed for already-completed message {MessageId} on {Queue}.",
+                    delivery.MessageId,
+                    _queueName);
+                await NotifyBackgroundFailureAsync(
+                    delivery,
+                    ex,
+                    _queueName,
+                    _role).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _runningCount);
+            }
+        }
+    }
+}

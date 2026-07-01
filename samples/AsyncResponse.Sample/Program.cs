@@ -3,6 +3,7 @@ using AsyncResponse.Channels.NATS;
 using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
+using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
@@ -19,6 +20,7 @@ using System.Text;
 using StackExchange.Redis;
 using System.Text.Json;
 using Npgsql;
+using Azure.Messaging.ServiceBus;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
@@ -29,12 +31,13 @@ builder.Services.AddOpenApi();
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | GooglePubSub | RabbitMQ | Redis | NATS | PostgreSQL
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | RabbitMQ | Redis | NATS | PostgreSQL
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
 var usePostgreSql = string.Equals(channel, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
+var useAzureServiceBus = string.Equals(transport, "AzureServiceBus", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
 var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
 var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
@@ -73,7 +76,11 @@ if (usePostgreSql || usePostgreSqlTransport)
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start
 // (emulator-only; no-op against real GCP). Registered first so its StartAsync completes first.
-if (useGooglePubSub)
+if (useAzureServiceBus)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "AzureServiceBus");
+}
+else if (useGooglePubSub)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services);
     builder.Services.AddHostedService<PubSubEmulatorProvisioner>();
@@ -157,6 +164,31 @@ if (useGooglePubSub)
         ConfigurePubSubShutdownBudget(builder.Configuration, options);
         ConfigurePubSubSubscriberAckMode(builder.Configuration, "PubSub:Worker", options.WorkerSubscriber);
         ConfigurePubSubSubscriberAckMode(builder.Configuration, "PubSub:Response", options.ResponseSubscriber);
+    });
+}
+else if (useAzureServiceBus)
+{
+    asyncResponse.WithAzureServiceBusTransport(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("AzureServiceBus")
+            ?? builder.Configuration["AzureServiceBus:ConnectionString"];
+        options.WorkerQueue = builder.Configuration["AzureServiceBus:WorkerQueue"] ?? options.WorkerQueue;
+        options.ResponseQueue = builder.Configuration["AzureServiceBus:ResponseQueue"] ?? options.ResponseQueue;
+        options.CorrelationIdProperty = builder.Configuration["AzureServiceBus:CorrelationIdProperty"] ?? options.CorrelationIdProperty;
+
+        if (int.TryParse(builder.Configuration["AzureServiceBus:MaxMessagesPerReceive"], out var maxMessagesPerReceive))
+            options.MaxMessagesPerReceive = maxMessagesPerReceive;
+        if (int.TryParse(builder.Configuration["AzureServiceBus:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "AzureServiceBus:ReceiveWaitTimeSeconds", value => options.ReceiveWaitTime = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "AzureServiceBus:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "AzureServiceBus:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "AzureServiceBus:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "AzureServiceBus:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+        ConfigureAzureServiceBusShutdownBudget(builder.Configuration, options);
+        ConfigureAzureServiceBusSubscriber(builder.Configuration, "AzureServiceBus:Worker", options.WorkerSubscriber);
+        ConfigureAzureServiceBusSubscriber(builder.Configuration, "AzureServiceBus:Response", options.ResponseSubscriber);
     });
 }
 else if (useRabbitMq)
@@ -271,7 +303,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'GooglePubSub', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -322,6 +354,25 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? redis = null;
     object? nats = null;
     object? postgres = null;
+    object? azureServiceBus = null;
+    if (useAzureServiceBus)
+    {
+        var serviceBusOptions = services.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value;
+        azureServiceBus = new
+        {
+            workerQueue = serviceBusOptions.WorkerQueue,
+            responseQueue = serviceBusOptions.ResponseQueue,
+            workerAckMode = serviceBusOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = serviceBusOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = serviceBusOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            workerMaxDeliveryAttempts = serviceBusOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            responseAckMode = serviceBusOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = serviceBusOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = serviceBusOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            responseMaxDeliveryAttempts = serviceBusOptions.ResponseSubscriber.MaxDeliveryAttempts
+        };
+    }
+
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
@@ -472,7 +523,7 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, pubsub, rabbitmq, redis, nats, postgres });
+    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, rabbitmq, redis, nats, postgres });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -510,6 +561,15 @@ static void ConfigureRedisShutdownBudget(
     RedisAsyncResponseTransportOptions options)
 {
     var timeout = ReadOptionalPositiveTimeout(configuration, "Redis:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
+static void ConfigureAzureServiceBusShutdownBudget(
+    IConfiguration configuration,
+    AzureServiceBusAsyncResponseOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "AzureServiceBus:HostShutdownTimeoutSeconds");
     if (timeout is not null)
         options.HostShutdownTimeout = timeout.Value;
 }
@@ -553,6 +613,47 @@ static void ApplyOptionalMilliseconds(IConfiguration configuration, string key, 
         throw new InvalidOperationException($"{key} must be a positive integer when set.");
 
     apply(TimeSpan.FromMilliseconds(milliseconds));
+}
+
+static void ConfigureAzureServiceBusSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    AzureServiceBusSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+    if (int.TryParse(configuration[$"{prefix}:PrefetchCount"], out var prefetchCount))
+        subscriberOptions.PrefetchCount = prefetchCount;
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<AzureServiceBusAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<AzureServiceBusAckMode>())}.");
+
+    if (mode is AzureServiceBusAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = AzureServiceBusAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not AzureServiceBusAckMode.AckAfterReceive)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigurePubSubSubscriberAckMode(
@@ -1230,6 +1331,9 @@ app.MapPost("/emit-response", async (
     if (useGooglePubSub)
         return await EmitPubSubResponseAsync(services, correlationId, parsedStatus, useAttribute, message).ConfigureAwait(false);
 
+    if (useAzureServiceBus)
+        return await EmitAzureServiceBusResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
     if (useRabbitMq)
         return await EmitRabbitMqResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
@@ -1242,7 +1346,7 @@ app.MapPost("/emit-response", async (
     if (usePostgreSqlTransport)
         return await EmitPostgreSqlResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as GooglePubSub, RabbitMQ, Redis, NATS, or PostgreSQL.");
+    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, RabbitMQ, Redis, NATS, or PostgreSQL.");
 })
 .WithTags("Workers");
 
@@ -1271,6 +1375,45 @@ static async Task<IResult> EmitPubSubResponseAsync(
 
     var publisher = await publisherFactory.Value.ConfigureAwait(false);
     await publisher.PublishAsync(TopicName.FromProjectTopic(o.ProjectId!, o.ResponseTopicId!), [pubsubMessage]);
+
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitAzureServiceBusResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<AzureServiceBusAsyncResponseOptions>>();
+    if (options is null)
+        return Results.Conflict("Azure Service Bus response ingress requires the Azure Service Bus transport.");
+
+    var o = options.Value;
+    var connectionString = o.ConnectionString;
+    if (string.IsNullOrWhiteSpace(connectionString))
+        return Results.Conflict("Azure Service Bus response ingress requires AzureServiceBus:ConnectionString.");
+
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+    var serviceBusMessage = new ServiceBusMessage(BinaryData.FromString(json))
+    {
+        ContentType = "application/json",
+        MessageId = Guid.NewGuid().ToString("N")
+    };
+
+    if (useAttribute)
+    {
+        serviceBusMessage.CorrelationId = correlationId;
+        serviceBusMessage.ApplicationProperties[o.CorrelationIdProperty] = correlationId;
+    }
+
+    await using var client = new ServiceBusClient(connectionString);
+    await using var sender = client.CreateSender(o.ResponseQueue);
+    await sender.SendMessageAsync(serviceBusMessage, cancellationToken).ConfigureAwait(false);
 
     return Results.Accepted();
 }

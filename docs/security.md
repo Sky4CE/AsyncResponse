@@ -15,9 +15,9 @@ name a service interface and method that the receiving process will resolve from
 invoke. Anyone who can write to the recovery store or worker stream can therefore ask a consuming
 process to invoke any registered (service, method) pair with attacker-influenced arguments.
 
-- Authenticate and authorize access to Redis / NATS / PostgreSQL / your broker; isolate it from untrusted
+- Authenticate and authorize access to Redis / NATS / PostgreSQL / Azure Service Bus / your broker; isolate it from untrusted
   networks.
-- Use a dedicated `KeyPrefix`, subject prefix, or PostgreSQL schema/table set per app so
+- Use a dedicated `KeyPrefix`, subject prefix, Service Bus queue pair, or PostgreSQL schema/table set per app so
   tenants/environments can't read or write each other's recovery state and jobs.
 - Enable transport-level TLS and credentials end to end.
 

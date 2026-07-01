@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
@@ -60,6 +61,7 @@ internal static class StressRunner
         failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -583,6 +585,95 @@ internal static class StressRunner
             "postgresql-ack-after-receive-dispatch-storm",
             ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
             ("naks", Volatile.Read(ref naks)),
+            ("deadLetters", Volatile.Read(ref deadLetters)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3g) Azure Service Bus ACK-after-receive dispatch storm. This bypasses a live Service Bus
+    //     namespace and hammers the callback dispatcher directly: every completed message must be
+    //     processed once.
+    private static async Task<int> AzureServiceBusAckAfterReceiveDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var options = new AzureServiceBusAsyncResponseOptions();
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var completes = 0;
+        var abandons = 0;
+        var deadLetters = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                var separator = delivery.Body.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Body[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            options,
+            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-queue",
+            AzureServiceBusSubscriberRole.Worker);
+
+        var metrics = await Measure("azure-servicebus-ack-after-receive-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new AzureServiceBusTransportDelivery(
+                "stress-worker-queue",
+                $"{i}:{{}}",
+                Guid.NewGuid().ToString("N"),
+                $"stress-{i}",
+                SequenceNumber: i,
+                DeliveryCount: 1,
+                new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [options.CorrelationIdProperty] = $"stress-{i}"
+                },
+                () => { Interlocked.Increment(ref completes); return ValueTask.CompletedTask; },
+                () => { Interlocked.Increment(ref abandons); return ValueTask.CompletedTask; },
+                (_, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.CompletedTask; }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("azure-servicebus-ack-after-receive-dispatch-storm");
+        return Check(
+            "azure-servicebus-ack-after-receive-dispatch-storm",
+            ("completeMismatch", Math.Abs(count - Volatile.Read(ref completes))),
+            ("abandons", Volatile.Read(ref abandons)),
             ("deadLetters", Volatile.Read(ref deadLetters)),
             ("duplicates", duplicates),
             ("outOfRange", outOfRange),

@@ -27,6 +27,12 @@ const string RabbitMqEarlyAckWorkerRoutingKey = "asyncresponse.itest.worker.earl
 const string RabbitMqEarlyAckResponseExchange = "asyncresponse.itest.response.earlyack";
 const string RabbitMqEarlyAckResponseQueue = "asyncresponse.itest.response.earlyack";
 const string RabbitMqEarlyAckResponseRoutingKey = "asyncresponse.itest.response.earlyack";
+const string AzureServiceBusRedisKeyPrefix = "itest-azure-servicebus";
+const string AzureServiceBusEarlyAckRedisKeyPrefix = "itest-azure-servicebus-early-ack";
+const string AzureServiceBusWorkerQueue = "asyncresponse-itest-asb-worker";
+const string AzureServiceBusResponseQueue = "asyncresponse-itest-asb-response";
+const string AzureServiceBusEarlyAckWorkerQueue = "asyncresponse-itest-asb-worker-earlyack";
+const string AzureServiceBusEarlyAckResponseQueue = "asyncresponse-itest-asb-response-earlyack";
 const string RedisTransportKeyPrefix = "itest-redistransport";
 const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
 const string NatsSubjectPrefix = "itest-nats";
@@ -70,12 +76,32 @@ var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
     .WithArgs("-c", "max_connections=400")
     .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
 
+var serviceBusSqlPassword = Env("ASYNCRESPONSE_ITEST_SERVICEBUS_SQL_PASSWORD", "P@ssword12345");
+var serviceBusSql = builder.AddContainer("servicebus-sql", "mcr.microsoft.com/mssql/server", "2022-latest")
+    .WithEnvironment("ACCEPT_EULA", "Y")
+    .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword);
+var serviceBusConfigPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "servicebus-emulator-config.json"));
+var serviceBus = builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "latest")
+    .WithBindMount(serviceBusConfigPath, "/ServiceBus_Emulator/ConfigFiles/Config.json", isReadOnly: true)
+    .WithEnvironment("SQL_SERVER", "servicebus-sql")
+    .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
+    .WithEnvironment("ACCEPT_EULA", "Y")
+    .WithEnvironment("EMULATOR_HTTP_PORT", "5300")
+    .WithEnvironment("SQL_WAIT_INTERVAL", "30")
+    .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
+    .WithEndpoint(targetPort: 5300, scheme: "http", name: "management")
+    .WaitFor(serviceBusSql)
+    .WithHttpHealthCheck("/health", endpointName: "management");
+
 var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
 var emulatorHost = ReferenceExpression.Create(
     $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
 var rabbitMqEndpoint = rabbitmq.GetEndpoint("amqp");
 var rabbitMqConnectionString = ReferenceExpression.Create(
     $"amqp://guest:guest@{rabbitMqEndpoint.Property(EndpointProperty.Host)}:{rabbitMqEndpoint.Property(EndpointProperty.Port)}/");
+var serviceBusEndpoint = serviceBus.GetEndpoint("amqp");
+var serviceBusConnectionString = ReferenceExpression.Create(
+    $"Endpoint=sb://{serviceBusEndpoint.Property(EndpointProperty.Host)}:{serviceBusEndpoint.Property(EndpointProperty.Port)};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;");
 var natsEndpoint = nats.GetEndpoint("nats");
 var natsConnectionString = ReferenceExpression.Create(
     $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
@@ -168,6 +194,37 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq-early-ack"
     .WithEnvironment("AsyncResponse:KeyPrefix", RabbitMqEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "RabbitMQ")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WaitFor(serviceBus)
+    .WithEnvironment("ConnectionStrings:AzureServiceBus", serviceBusConnectionString)
+    .WithEnvironment("AzureServiceBus:WorkerQueue", AzureServiceBusWorkerQueue)
+    .WithEnvironment("AzureServiceBus:ResponseQueue", AzureServiceBusResponseQueue)
+    .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus-early-ack", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WaitFor(serviceBus)
+    .WithEnvironment("ConnectionStrings:AzureServiceBus", serviceBusConnectionString)
+    .WithEnvironment("AzureServiceBus:WorkerQueue", AzureServiceBusEarlyAckWorkerQueue)
+    .WithEnvironment("AzureServiceBus:ResponseQueue", AzureServiceBusEarlyAckResponseQueue)
+    .WithEnvironment("AzureServiceBus:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_ACK_MODE", "AckAfterReceive"))
+    .WithEnvironment("AzureServiceBus:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("AzureServiceBus:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("AzureServiceBus:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("AzureServiceBus:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusEarlyAckRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

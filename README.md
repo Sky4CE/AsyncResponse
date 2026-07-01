@@ -86,6 +86,7 @@ somebody has to make the call. See [docs/recovery.md](docs/recovery.md) for the 
 | `AsyncResponse.Channels.NATS` | Optional NATS response channel (Core request/reply) and durable JetStream Key-Value recovery-state store; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Channels.PostgreSQL` | Optional PostgreSQL response channel using `LISTEN/NOTIFY` plus durable recovery-state tables; the Core watchdog and health check work against it automatically. |
 | `AsyncResponse.Transports.Redis` | Optional Redis Streams worker transport and hosted subscribers for worker jobs and response ingress, with consumer-group ACKs, pending-entry retry, and dead-lettering. |
+| `AsyncResponse.Transports.AzureServiceBus` | Optional Azure Service Bus queue transport and hosted subscribers for worker jobs and response ingress, with peek-lock ACKs, bounded redelivery, and emulator-backed integration tests. |
 | `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
 | `AsyncResponse.Transports.NATS` | Optional NATS JetStream worker transport and hosted subscribers for worker jobs and response ingress, with explicit ACKs, bounded redelivery, and dead-lettering. |
@@ -108,6 +109,7 @@ dotnet add package AsyncResponse.Channels.PostgreSQL
 
 # Optional transports:
 dotnet add package AsyncResponse.Transports.Redis
+dotnet add package AsyncResponse.Transports.AzureServiceBus
 dotnet add package AsyncResponse.Transports.GooglePubSub
 dotnet add package AsyncResponse.Transports.RabbitMQ
 dotnet add package AsyncResponse.Transports.NATS
@@ -160,6 +162,48 @@ builder.Services.AddHealthChecks()
 `IAsyncResponseBuilder` for normal request/response waits; inject `IRecoverableAsyncResponseBuilder`
 only in flows that register lost-subscriber callbacks (the `OnLostSubscriber*` methods are absent on
 the in-memory channel at compile time). See [docs/recovery.md](docs/recovery.md).
+
+### Azure Service Bus transport with a durable channel
+
+Use this when worker jobs and external response ingress should flow through Azure Service Bus queues.
+Azure Service Bus is a transport only: pair it with a channel such as Redis, NATS, or PostgreSQL for
+active waiters and lost-subscriber recovery.
+
+```csharp
+using AsyncResponse;
+using AsyncResponse.Transports.AzureServiceBus;
+using StackExchange.Redis;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddSingleton<IConnectionMultiplexer>(
+    _ => ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
+
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel(options =>
+    {
+        options.KeyPrefix = "orders";
+    })
+    .WithAzureServiceBusTransport(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("AzureServiceBus");
+        options.WorkerQueue = "orders-worker";
+        options.ResponseQueue = "orders-response";
+        options.CorrelationIdProperty = "correlationId";
+
+        // Early ACK is opt-in: complete the Service Bus message after bounded enqueue, then
+        // process on background workers. Handler failures after completion are reported through
+        // OnBackgroundFailure because Service Bus cannot dead-letter an already-completed message.
+        options.WorkerSubscriber.UseAckAfterReceive(
+            backgroundWorkerCount: 4,
+            backgroundQueueCapacity: 256,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(30));
+    });
+```
+
+You may also register your own singleton `Azure.Messaging.ServiceBus.ServiceBusClient` (for example
+one constructed with Azure Identity credentials) before calling `.WithAzureServiceBusTransport(...)`;
+the package reuses it instead of constructing a client from `ConnectionString`.
 
 ### PostgreSQL-backed channel and transport
 
@@ -277,8 +321,8 @@ await publisher.SetResponse(new OrderResult { Status = OrderStatus.Completed }, 
 await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsync(orderId));
 ```
 
-For durable lost-subscriber recovery callbacks, broker transports (Redis Streams, Google Pub/Sub,
-RabbitMQ, NATS JetStream, PostgreSQL), reply targets, ambient-context propagation,
+For durable lost-subscriber recovery callbacks, broker transports (Redis Streams, Azure Service Bus,
+Google Pub/Sub, RabbitMQ, NATS JetStream, PostgreSQL), reply targets, ambient-context propagation,
 timeouts/cancellation, and the watchdog, see the docs below.
 
 ## Documentation

@@ -69,9 +69,9 @@ no separate fixture app to keep in sync). They run at two levels:
   and transport, covering the core request/response, attach, worker, and concurrency paths. They need
   no containers, so they stay fast and reliable even where Docker is unavailable.
 - **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
-  a Google Pub/Sub emulator container, RabbitMQ, NATS, PostgreSQL, and sample-app SUTs for default and
-  early-ACK variants. Tests drive the Redis, Pub/Sub, RabbitMQ, Redis transport, NATS, and PostgreSQL
-  scenarios over HTTP. They need a running
+  a Google Pub/Sub emulator container, the Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL,
+  and sample-app SUTs for default and early-ACK variants. Tests drive the Redis, Pub/Sub, Azure
+  Service Bus, RabbitMQ, Redis transport, NATS, and PostgreSQL scenarios over HTTP. They need a running
   Docker daemon (and pull broker images on first run), so CI runs them in a separate Docker-backed
   `integration-tests` job:
 
@@ -93,7 +93,7 @@ modes — micro-benchmarks (BenchmarkDotNet) and an in-process load/stress harne
 request/response round-trip, raw broker ingress, shared-correlation fanout, exception fanout,
 recovery-state save/scan, watchdog/health evaluation, context propagation, envelope
 (de)serialization, payload classification, expression→callback conversion, reflection invoke, and
-Google Pub/Sub/RabbitMQ/Redis/NATS/PostgreSQL subscriber ACK dispatch modes).
+Google Pub/Sub/Azure Service Bus/RabbitMQ/Redis/NATS/PostgreSQL subscriber ACK dispatch modes).
 `[MemoryDiagnoser]` reports allocated bytes and Gen0/1/2 collections per op alongside
 mean/median/percentile timings:
 
@@ -102,6 +102,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks             
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Channel*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*Ingress*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RedisAckDispatch*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*AzureServiceBusAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*GooglePubSubAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*RabbitMqAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*NatsAckDispatch*'
@@ -128,7 +129,8 @@ bounded early-ACK invariant for RabbitMQ deliveries), **redis-ack-after-enqueue-
 same bounded early-ACK invariant for Redis stream entries), **nats-ack-after-receive-dispatch-storm**
 (the same bounded early-ACK invariant for NATS JetStream deliveries),
 **postgresql-ack-after-receive-dispatch-storm** (the same bounded early-ACK invariant for PostgreSQL
-queue rows), **race-burst** (subscribe-before-send under contention),
+queue rows), **azure-servicebus-ack-after-receive-dispatch-storm** (the same bounded early-ACK
+invariant for Azure Service Bus messages), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
@@ -136,16 +138,17 @@ queue rows), **race-burst** (subscribe-before-send under contention),
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
-dispatch storms stay in-process too: they bypass external Pub/Sub/RabbitMQ/Redis/NATS/PostgreSQL
+dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/RabbitMQ/Redis/NATS/PostgreSQL
 servers while exercising the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](../benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 durable channels + broker/table transports — reporting throughput, latency percentiles, and failures
-per scenario. By default it boots Redis + a Pub/Sub emulator + RabbitMQ + NATS + PostgreSQL + ten SUTs
-via Aspire (Docker required): default/early-ACK Pub/Sub apps, RabbitMQ apps, Redis Streams apps, NATS
-apps, and PostgreSQL apps. Pass `--url` to load an already-running default instance,
-`--early-ack-url` for the Pub/Sub early-ACK target, `--rabbitmq-url` /
+per scenario. By default it boots Redis + a Pub/Sub emulator + the Azure Service Bus emulator +
+RabbitMQ + NATS + PostgreSQL + twelve SUTs via Aspire (Docker required): default/early-ACK Pub/Sub
+apps, Azure Service Bus apps, RabbitMQ apps, Redis Streams apps, NATS apps, and PostgreSQL apps. Pass
+`--url` to load an already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK
+target, `--azure-servicebus-url` / `--azure-servicebus-early-ack-url` for Azure Service Bus targets, `--rabbitmq-url` /
 `--rabbitmq-early-ack-url` for RabbitMQ targets, `--redis-url` / `--redis-early-ack-url` for Redis
 transport targets, `--nats-url` / `--nats-early-ack-url` for NATS targets, or `--postgresql-url` /
 `--postgresql-early-ack-url` for PostgreSQL targets. Profiles let you choose the scenario set:
@@ -153,6 +156,8 @@ transport targets, `--nats-url` / `--nats-early-ack-url` for NATS targets, or `-
 exception, shared exception, reply target, plus RabbitMQ worker/response/reply-target throughput when
 a RabbitMQ target is available), `pubsub` (default worker dispatch, response-topic ingress
 with attribute/body correlation ids, and early-ACK worker dispatch when an early target is available),
+`azure-servicebus` (request/response, worker dispatch, response-queue ingress through property/body
+correlation ids, reply target, and early-ACK worker dispatch when an early target is available),
 `rabbitmq` (default worker dispatch, response-queue ingress with header/body correlation ids, reply
 target, and early-ACK worker dispatch when an early target is available), `redis` (default worker
 dispatch, response-stream ingress with field/body correlation ids, reply target, and early-ACK worker
@@ -165,6 +170,7 @@ recovery profile separately because it intentionally simulates subscriber loss:
 
 ```bash
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile azure-servicebus --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis --rate 10 --duration 60
@@ -175,6 +181,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile 
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --url http://localhost:5000 --early-ack-url http://localhost:5001 --profile pubsub
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --azure-servicebus-url http://localhost:5010 --azure-servicebus-early-ack-url http://localhost:5011 --profile azure-servicebus
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --nats-url http://localhost:5006 --nats-early-ack-url http://localhost:5007 --profile nats
@@ -183,13 +190,15 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --postgres
 
 Use `--scenario name` (or a comma-separated list) when you want a cleaner single-scenario baseline;
 the mixed profiles are better at finding interference between flows. The sample Pub/Sub emit endpoint
-reuses its publisher client, while RabbitMQ response emits open a short-lived AMQP channel per request
-to model an external producer. It writes an HTML/CSV/Markdown report to `nbomber-report/`.
+reuses its publisher client, while Azure Service Bus and RabbitMQ response emits open short-lived
+broker clients per request to model an external producer. It writes an HTML/CSV/Markdown report to
+`nbomber-report/`.
 The [load-test workflow](../.github/workflows/loadtest.yml) runs it on every push to `main` (and on demand),
 publishing per-scenario throughput and latency to the **same dashboard** as the benchmarks and
 uploading the full report as an artifact. Manual workflow runs can switch `profile`, `rate`, and
-`duration`, plus Redis/NATS/PostgreSQL target URLs and provider knobs such as pending idle time, max
-delivery attempts, publish attempts, stream max length, ACK mode, background worker count, and
+`duration`, plus Azure Service Bus/Redis/NATS/PostgreSQL target URLs and provider knobs such as
+pending idle time, max delivery attempts, publish attempts, stream max length, ACK mode, background
+worker count, and
 early-ACK queue sizing; the pushed JSON still uses github-action-benchmark's `customBiggerIsBetter` and
 `customSmallerIsBetter` formats, so new scenario series appear automatically under `dev/bench` on
 `gh-pages`.

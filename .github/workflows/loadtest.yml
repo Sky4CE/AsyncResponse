@@ -2,8 +2,8 @@ name: Load test
 
 # End-to-end HTTP load test (NBomber) against the real Redis + broker transport stack. Runs the broad
 # non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
-# dashboard as the benchmarks workflow; manual runs can select focused pubsub/rabbitmq/redis/nats/
-# postgresql/recovery profiles. It is Docker-backed, so it shares a concurrency group with the
+# dashboard as the benchmarks workflow; manual runs can select focused azure-servicebus/pubsub/
+# rabbitmq/redis/nats/postgresql/recovery profiles. It is Docker-backed, so it shares a concurrency group with the
 # benchmarks workflow to avoid racing on the gh-pages history.
 on:
   push:
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, pubsub, rabbitmq, redis, nats, postgresql, recovery'
+        description: 'Scenario profile: broad, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -27,6 +27,21 @@ on:
       duration:
         description: 'Load duration in seconds'
         default: '30'
+      azure_servicebus_url:
+        description: 'Optional existing Azure Service Bus SUT URL for --azure-servicebus-url'
+        default: ''
+      azure_servicebus_early_ack_url:
+        description: 'Optional existing Azure Service Bus early-ACK SUT URL for --azure-servicebus-early-ack-url'
+        default: ''
+      azure_servicebus_worker_ack_mode:
+        description: 'Azure Service Bus worker ACK mode for Aspire SUT: AckAfterHandlerCompletes or AckAfterReceive'
+        default: 'AckAfterReceive'
+      azure_servicebus_worker_background_workers:
+        description: 'Azure Service Bus early-ACK background worker count'
+        default: '4'
+      azure_servicebus_worker_queue_capacity:
+        description: 'Azure Service Bus early-ACK background queue capacity'
+        default: '256'
       redis_url:
         description: 'Optional existing Redis transport SUT URL for --redis-url'
         default: ''
@@ -110,13 +125,18 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      # Boots Redis + a Pub/Sub emulator + RabbitMQ + NATS + PostgreSQL sample SUTs via Aspire, drives
+      # Boots Redis + a Pub/Sub emulator + Azure Service Bus emulator + RabbitMQ + NATS + PostgreSQL sample SUTs via Aspire, drives
       # them with NBomber, and emits github-action-benchmark JSON. Exits non-zero (failing the job) if
       # any request failed.
       - name: Run NBomber load test
         env:
           REDIS_URL: ${{ github.event.inputs.redis_url || '' }}
           REDIS_EARLY_ACK_URL: ${{ github.event.inputs.redis_early_ack_url || '' }}
+          AZURE_SERVICEBUS_URL: ${{ github.event.inputs.azure_servicebus_url || '' }}
+          AZURE_SERVICEBUS_EARLY_ACK_URL: ${{ github.event.inputs.azure_servicebus_early_ack_url || '' }}
+          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_ACK_MODE: ${{ github.event.inputs.azure_servicebus_worker_ack_mode || 'AckAfterReceive' }}
+          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.azure_servicebus_worker_background_workers || '4' }}
+          ASYNCRESPONSE_ITEST_AZURE_SERVICEBUS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.azure_servicebus_worker_queue_capacity || '256' }}
           ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE: ${{ github.event.inputs.redis_worker_ack_mode || 'AckAfterEnqueue' }}
           ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS: ${{ github.event.inputs.redis_worker_background_workers || '4' }}
           ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY: ${{ github.event.inputs.redis_worker_queue_capacity || '256' }}
@@ -147,6 +167,12 @@ jobs:
           fi
           if [ -n "$REDIS_EARLY_ACK_URL" ]; then
             args+=(--redis-early-ack-url "$REDIS_EARLY_ACK_URL")
+          fi
+          if [ -n "$AZURE_SERVICEBUS_URL" ]; then
+            args+=(--azure-servicebus-url "$AZURE_SERVICEBUS_URL")
+          fi
+          if [ -n "$AZURE_SERVICEBUS_EARLY_ACK_URL" ]; then
+            args+=(--azure-servicebus-early-ack-url "$AZURE_SERVICEBUS_EARLY_ACK_URL")
           fi
           if [ -n "$NATS_URL" ]; then
             args+=(--nats-url "$NATS_URL")

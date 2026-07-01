@@ -6,8 +6,9 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>
 /// Boots the Aspire AppHost once for the whole collection — real Redis, a Google Pub/Sub emulator,
-/// RabbitMQ, and the system-under-test sample apps, all orchestrated by the dedicated integration
-/// AppHost. Tests drive the SUTs entirely over HTTP via <see cref="Client"/>.
+/// Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL, and the system-under-test sample apps, all
+/// orchestrated by the dedicated integration AppHost. Tests drive the SUTs entirely over HTTP via
+/// <see cref="Client"/>.
 /// </summary>
 public sealed class IntegrationFixture : IAsyncLifetime
 {
@@ -22,6 +23,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
     public HttpClient Client { get; private set; } = null!;
     public HttpClient EarlyAckClient { get; private set; } = null!;
+    public HttpClient AzureServiceBusClient { get; private set; } = null!;
+    public HttpClient AzureServiceBusEarlyAckClient { get; private set; } = null!;
     public HttpClient RabbitMqClient { get; private set; } = null!;
     public HttpClient RabbitMqEarlyAckClient { get; private set; } = null!;
     public HttpClient RedisTransportClient { get; private set; } = null!;
@@ -45,6 +48,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
             .WaitAsync(StartupTimeout);
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-early-ack")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-azure-servicebus")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-azure-servicebus-early-ack")
             .WaitAsync(StartupTimeout);
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-rabbitmq")
@@ -73,6 +82,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
+        AzureServiceBusClient = _app.CreateHttpClient("itest-app-azure-servicebus");
+        AzureServiceBusEarlyAckClient = _app.CreateHttpClient("itest-app-azure-servicebus-early-ack");
         RabbitMqClient = _app.CreateHttpClient("itest-app-rabbitmq");
         RabbitMqEarlyAckClient = _app.CreateHttpClient("itest-app-rabbitmq-early-ack");
         RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
@@ -89,6 +100,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(AzureServiceBusClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(AzureServiceBusEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
@@ -103,6 +116,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     {
         Client?.Dispose();
         EarlyAckClient?.Dispose();
+        AzureServiceBusClient?.Dispose();
+        AzureServiceBusEarlyAckClient?.Dispose();
         RabbitMqClient?.Dispose();
         RabbitMqEarlyAckClient?.Dispose();
         RedisTransportClient?.Dispose();
