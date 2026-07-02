@@ -215,6 +215,25 @@ public class NatsKvStoreAdapterTests
     }
 
     [Fact]
+    public async Task TryCreateAndTryUpdate_ReturnStoreSuccess()
+    {
+        _store.Setup(s => s.TryCreateAsync("new", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(1UL));
+        _store.Setup(s => s.TryCreateAsync("existing", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(new InvalidOperationException("exists")));
+        _store.Setup(s => s.TryUpdateAsync("hit", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(2UL));
+        _store.Setup(s => s.TryUpdateAsync("stale", "v2", 3UL, It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsResult<ulong>(new InvalidOperationException("stale")));
+        var adapter = CreateAdapter();
+
+        Assert.True(await adapter.TryCreateAsync("new", "v", CancellationToken.None));
+        Assert.False(await adapter.TryCreateAsync("existing", "v", CancellationToken.None));
+        Assert.True(await adapter.TryUpdateAsync("hit", "v2", 3UL, CancellationToken.None));
+        Assert.False(await adapter.TryUpdateAsync("stale", "v2", 3UL, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task TryDeleteAsync_MapsRevisionConflictAndMissingKeyToFalse()
     {
         _store.Setup(s => s.DeleteAsync("present", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
@@ -228,6 +247,16 @@ public class NatsKvStoreAdapterTests
         Assert.True(await adapter.TryDeleteAsync("present", 3UL, CancellationToken.None));
         Assert.False(await adapter.TryDeleteAsync("conflict", 3UL, CancellationToken.None));
         Assert.False(await adapter.TryDeleteAsync("missing", 3UL, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_TreatsDeletedKeyAsFalse()
+    {
+        _store.Setup(s => s.DeleteAsync("deleted", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsKVKeyDeletedException(revision: 1));
+        var adapter = CreateAdapter();
+
+        Assert.False(await adapter.TryDeleteAsync("deleted", 3UL, CancellationToken.None));
     }
 
     [Fact]
@@ -255,6 +284,18 @@ public class NatsKvStoreAdapterTests
         var adapter = CreateAdapter();
 
         Assert.False(await adapter.DeleteAsync("tombstone", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_ReturnsFalseWhenKeyIsDeletedAfterRead()
+    {
+        _store.Setup(s => s.GetEntryAsync<string>("raced", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsKVEntry<string>("bucket", "raced") { Value = "v" });
+        _store.Setup(s => s.DeleteAsync("raced", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsKVKeyDeletedException(revision: 2));
+        var adapter = CreateAdapter();
+
+        Assert.False(await adapter.DeleteAsync("raced", CancellationToken.None));
     }
 
     [Fact]

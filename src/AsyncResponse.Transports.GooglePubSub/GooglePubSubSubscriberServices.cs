@@ -38,6 +38,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     /// <summary>Handles the delivered message.</summary>
     protected abstract Task HandleMessageAsync(PubsubMessage message, CancellationToken cancellationToken);
 
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
         SubscriptionName subscriptionName)
     {

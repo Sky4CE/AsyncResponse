@@ -38,6 +38,10 @@ internal sealed class FakeNatsKvStore : INatsKvStore
 
     public readonly Dictionary<string, string> Entries = new(StringComparer.Ordinal);
     public int PutCount, DeleteCount;
+    public int ForcedCreateConflicts { get; set; }
+    public int ForcedUpdateConflicts { get; set; }
+    public int ForcedDeleteConflicts { get; set; }
+    public Exception? DeleteException { get; set; }
 
     /// <summary>
     /// One-shot hook that runs after a successful <see cref="GetAsync"/>, before the value is
@@ -62,6 +66,12 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     {
         lock (_gate)
         {
+            if (ForcedCreateConflicts > 0)
+            {
+                ForcedCreateConflicts--;
+                return Task.FromResult(false);
+            }
+
             if (Entries.ContainsKey(key))
                 return Task.FromResult(false);
 
@@ -76,6 +86,12 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     {
         lock (_gate)
         {
+            if (ForcedUpdateConflicts > 0)
+            {
+                ForcedUpdateConflicts--;
+                return Task.FromResult(false);
+            }
+
             if (!Entries.ContainsKey(key) || !_revisions.TryGetValue(key, out var revision) || revision != expectedRevision)
                 return Task.FromResult(false);
 
@@ -120,6 +136,9 @@ internal sealed class FakeNatsKvStore : INatsKvStore
 
     public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
     {
+        if (DeleteException is not null)
+            throw DeleteException;
+
         lock (_gate)
         {
             DeleteCount++;
@@ -132,6 +151,12 @@ internal sealed class FakeNatsKvStore : INatsKvStore
     {
         lock (_gate)
         {
+            if (ForcedDeleteConflicts > 0)
+            {
+                ForcedDeleteConflicts--;
+                return Task.FromResult(false);
+            }
+
             if (!_revisions.TryGetValue(key, out var revision) || revision != expectedRevision)
                 return Task.FromResult(false);
 
@@ -165,6 +190,7 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 {
     public NatsDeliveryOutcome NextOutcome { get; set; } = NatsDeliveryOutcome.Replied;
     public Func<bool, NatsDeliveryOutcome>? OutcomeForProbe { get; set; }
+    public Exception? RequestException { get; set; }
     public readonly List<(string Subject, string? Payload, bool Probe)> Requests = new();
     public readonly List<string> SubscribedSubjects = new();
     public int FlushCount;
@@ -174,6 +200,9 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 
     public Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
+        if (RequestException is not null)
+            throw RequestException;
+
         Requests.Add((subject, payload, probe));
         var outcome = OutcomeForProbe is not null && probe
             ? OutcomeForProbe(probe)
@@ -201,6 +230,9 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     /// <summary>Pushes a raw message (e.g. malformed JSON or a probe) into the live subscription.</summary>
     public void Push(string? payload, bool isProbe = false)
         => _subscription!.Push(new NatsInboundResponse(payload, isProbe, () => ValueTask.CompletedTask));
+
+    public void PushWithReplyFailure(string? payload, Exception exception)
+        => _subscription!.Push(new NatsInboundResponse(payload, IsProbe: false, () => throw exception));
 
     /// <summary>Faults the live subscription's read loop with <paramref name="exception"/>.</summary>
     public void FailSubscription(Exception exception) => _subscription!.Fail(exception);

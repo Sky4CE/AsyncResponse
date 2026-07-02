@@ -103,6 +103,28 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_RemoteFailureCarriesCappedStackTrace()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
+        Exception failure;
+        try
+        {
+            throw new InvalidOperationException("remote failed");
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+        }
+
+        await channel.SetException(failure, "corr-a");
+
+        var caught = await Assert.ThrowsAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal("remote failed", caught.Message);
+        Assert.Contains(nameof(CreateResponseWaiter_RemoteFailureCarriesCappedStackTrace), (string)caught.Data["RemoteStackTrace"]!);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_MalformedMessageFaultsWaiter()
     {
         var channel = CreateChannel();
@@ -111,6 +133,44 @@ public class NatsAsyncResponseChannelTests
         _client.Push("{not-json");
 
         await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_NullEnvelopeFaultsWaiter()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
+
+        _client.Push("null");
+
+        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_NewerEnvelopeSchemaFaultsWaiter()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
+
+        _client.Push("""{"SchemaVersion":999,"Success":true,"Payload":{"Status":2}}""");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Contains("newer than this build supports", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SyncPredicateFailureFaultsWaiter()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-a",
+            _ => throw new InvalidOperationException("predicate failed"),
+            timeout: TimeSpan.FromSeconds(5));
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-a");
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal("predicate failed", ex.Message);
     }
 
     [Fact]
@@ -127,6 +187,25 @@ public class NatsAsyncResponseChannelTests
         await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "after" }, "corr-a");
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal("after", result.Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_AckFailureDoesNotAbortProcessing()
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
+        var envelope = JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed, Message = "after-ack-failure" }
+            },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        _client.PushWithReplyFailure(envelope, new InvalidOperationException("ack failed"));
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("after-ack-failure", result.Message);
     }
 
     [Fact]
@@ -165,6 +244,16 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task SetResponse_WhenRequestFails_Propagates()
+    {
+        _client.RequestException = new InvalidOperationException("request failed");
+        var channel = CreateChannel();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-a"));
+    }
+
+    [Fact]
     public async Task SetException_NoResponders_ConsultsRecoveryStore()
     {
         _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
@@ -173,6 +262,16 @@ public class NatsAsyncResponseChannelTests
         await channel.SetException(new InvalidOperationException("boom"), "corr-lost");
 
         _store.Verify(s => s.GetAllAsync("corr-lost", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task SetException_WhenRequestFails_Propagates()
+    {
+        _client.RequestException = new InvalidOperationException("request failed");
+        var channel = CreateChannel();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetException(new InvalidOperationException("boom"), "corr-a"));
     }
 
     [Fact]
@@ -187,6 +286,17 @@ public class NatsAsyncResponseChannelTests
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal(OperationStatus.Completed, result.Status);
         Assert.Equal("raw", result.Message);
+    }
+
+    [Fact]
+    public async Task RawResponseJson_WhenRequestFails_Propagates()
+    {
+        _client.RequestException = new InvalidOperationException("request failed");
+        var channel = CreateChannel();
+        var raw = (IRawAsyncResponsePublisher)channel;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            raw.SetRawResponseJson("""{"Status":2}""", "corr-a"));
     }
 
     [Fact]

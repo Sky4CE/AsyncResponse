@@ -21,6 +21,19 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
+    public async Task HandleResponseMessageAsync_BlankCorrelationId_DropsMessage()
+    {
+        var rawPublisher = new ThrowingRawPublisher();
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", " ");
+
+        Assert.Equal(0, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
+    }
+
+    [Fact]
     public async Task HandleWorkerMessageAsync_InvalidPayload_PropagatesForTransportRetryOrDeadLetter()
     {
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
@@ -46,11 +59,16 @@ public class AsyncResponseIngressErrorTests
 
     private sealed class ThrowingRawPublisher(Exception? _exception = null) : IRawAsyncResponsePublisher
     {
+        public int RawJsonCalls { get; private set; }
+
         public Task SetRawResponse(object? response, string? correlationId, CancellationToken cancellationToken = default)
             => _exception is null ? Task.CompletedTask : Task.FromException(_exception);
 
         public Task SetRawResponseJson(string responseJson, string? correlationId, CancellationToken cancellationToken = default)
-            => _exception is null ? Task.CompletedTask : Task.FromException(_exception);
+        {
+            RawJsonCalls++;
+            return _exception is null ? Task.CompletedTask : Task.FromException(_exception);
+        }
     }
 
     private sealed class RecordingPublisher(Exception? _throwOnException = null) : IAsyncResponsePublisher

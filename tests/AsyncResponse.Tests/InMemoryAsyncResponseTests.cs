@@ -138,6 +138,71 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task SetResponse_WhenSubscriberAppearsDuringRecoveryRead_DeliversLive()
+    {
+        var services = new ServiceCollection().BuildServiceProvider();
+        var store = new RetryLiveRecoveryStore();
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+        IAsyncResponseWaiter<OperationResult>? waiter = null;
+        store.BeforeGetAllAsync = async () =>
+        {
+            waiter ??= await channel.CreateResponseWaiter<OperationResult>(
+                CorrelationId,
+                timeout: TimeSpan.FromSeconds(5));
+        };
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "live" }, CorrelationId);
+
+        var liveWaiter = waiter ?? throw new InvalidOperationException("Retry-live waiter was not created.");
+        await using (liveWaiter)
+        {
+            Assert.Equal("live", (await liveWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        }
+    }
+
+    [Fact]
+    public async Task RawJsonResponse_WhenSubscriberAppearsDuringRecoveryRead_DeliversLive()
+    {
+        var services = new ServiceCollection().BuildServiceProvider();
+        var store = new RetryLiveRecoveryStore();
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+        var rawPublisher = (IRawAsyncResponsePublisher)channel;
+        IAsyncResponseWaiter<OperationResult>? waiter = null;
+        store.BeforeGetAllAsync = async () =>
+        {
+            waiter ??= await channel.CreateResponseWaiter<OperationResult>(
+                CorrelationId,
+                timeout: TimeSpan.FromSeconds(5));
+        };
+
+        await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"live raw"}""", CorrelationId);
+
+        var liveWaiter = waiter ?? throw new InvalidOperationException("Retry-live waiter was not created.");
+        await using (liveWaiter)
+        {
+            Assert.Equal("live raw", (await liveWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        }
+    }
+
+    [Fact]
     public async Task CompletingOneWaiter_RemovesOnlyItsRecoveryRegistration()
     {
         var provider = CreateProvider();
@@ -221,6 +286,25 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task RawObjectResponse_WhenMaterializationFails_FaultsWaiterAndCleansUp()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-object-invalid";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(5));
+
+        await rawPublisher.SetRawResponse("not-json", correlationId);
+
+        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
     public async Task RawJsonResponse_AsyncCompletionPredicate_CompletesFromRawPublisher()
     {
         var provider = CreateProvider();
@@ -240,6 +324,28 @@ public class InMemoryAsyncResponseTests
         await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"done"}""", correlationId);
 
         Assert.Equal("done", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+    }
+
+    [Fact]
+    public async Task RawJsonResponse_WhenCompletionPredicateThrows_FaultsWaiter()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-predicate-throws";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: _ => throw new InvalidOperationException("raw predicate failed"),
+            timeout: TimeSpan.FromSeconds(5));
+
+        await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"done"}""", correlationId);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal("raw predicate failed", ex.Message);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
     }
 
     [Fact]
@@ -297,6 +403,37 @@ public class InMemoryAsyncResponseTests
         Assert.Equal("fanout", (await second.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         Assert.Equal(2, predicateCalls);
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task LivePublishBranches_LogAndDeliverResponseRawAndException()
+    {
+        var provider = CreateProvider(services => services.AddSingleton(typeof(ILogger<>), typeof(TestLogger<>)));
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+
+        await using var responseWaiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            $"{CorrelationId}-logged-response",
+            timeout: TimeSpan.FromSeconds(5));
+        await publisher.SetResponse(
+            new OperationResult { Status = OperationStatus.Completed, Message = "logged" },
+            $"{CorrelationId}-logged-response");
+        Assert.Equal("logged", (await responseWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+
+        await using var rawWaiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            $"{CorrelationId}-logged-raw",
+            timeout: TimeSpan.FromSeconds(5));
+        await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"logged raw"}""", $"{CorrelationId}-logged-raw");
+        Assert.Equal("logged raw", (await rawWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+
+        await using var exceptionWaiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            $"{CorrelationId}-logged-exception",
+            timeout: TimeSpan.FromSeconds(5));
+        await publisher.SetException(new InvalidOperationException("logged exception"), $"{CorrelationId}-logged-exception");
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            exceptionWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal("logged exception", ex.Message);
     }
 
     [Fact]
@@ -426,6 +563,30 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task Waiter_DisposeAsync_RemovesSubscriptionsFromManyGroup()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-many-dispose";
+
+        await using var first = await subscriber.CreateResponseWaiter<OperationResult>(correlationId, timeout: TimeSpan.FromSeconds(5));
+        await using var second = await subscriber.CreateResponseWaiter<OperationResult>(correlationId, timeout: TimeSpan.FromSeconds(5));
+        await using var third = await subscriber.CreateResponseWaiter<OperationResult>(correlationId, timeout: TimeSpan.FromSeconds(5));
+
+        Assert.Equal(3, await probe.CountActiveSubscribersAsync(correlationId));
+
+        await second.DisposeAsync();
+        Assert.Equal(2, await probe.CountActiveSubscribersAsync(correlationId));
+
+        await first.DisposeAsync();
+        Assert.Equal(1, await probe.CountActiveSubscribersAsync(correlationId));
+
+        await third.DisposeAsync();
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_RejectsInvalidCorrelationAndTimeout()
     {
         var provider = CreateProvider();
@@ -491,6 +652,168 @@ public class InMemoryAsyncResponseTests
         Assert.Equal(0, await channel.CountActiveSubscribersAsync(CorrelationId));
     }
 
+    [Fact]
+    public async Task CreateResponseWaiter_WhenResponseCompletesBeforeRecoverySaveFinishes_DeletesRegistrationAfterSave()
+    {
+        var services = new ServiceCollection().BuildServiceProvider();
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSave = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new Mock<IRecoveryStateStore>();
+        store
+            .Setup(s => s.SaveAsync(
+                It.IsAny<string>(),
+                It.IsAny<RecoveryState>(),
+                It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await releaseSave.Task.ConfigureAwait(false);
+            });
+        store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store.Object,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>(
+            CorrelationId,
+            timeout: TimeSpan.FromSeconds(5));
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "early" }, CorrelationId);
+        releaseSave.TrySetResult();
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("early", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        store.Verify(s => s.TryDeleteAsync(CorrelationId, It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.AtLeast(2));
+    }
+
+    [Fact]
+    public async Task Publishers_WhenRecoveryReadFails_Propagate()
+    {
+        var services = new ServiceCollection().BuildServiceProvider();
+        var failure = new InvalidOperationException("recovery read failed");
+        var store = new Mock<IRecoveryStateStore>();
+        store
+            .Setup(s => s.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(failure);
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store.Object,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+        var rawPublisher = (IRawAsyncResponsePublisher)channel;
+
+        Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, $"{CorrelationId}-response")));
+        Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            rawPublisher.SetRawResponseJson("""{"Status":2}""", $"{CorrelationId}-raw")));
+        Assert.Same(failure, await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetException(new InvalidOperationException("remote failure"), $"{CorrelationId}-exception")));
+    }
+
+    [Fact]
+    public async Task NoSubscriber_CompletedPayloadWithoutResumeCallback_DoesNotInvokeFailure()
+    {
+        var spy = new RecoverySpy();
+        var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-no-resume-callback";
+
+        await store.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(OperationResult).FullName,
+                RegisteredAtUtc = DateTime.UtcNow
+            },
+            TimeSpan.FromMinutes(5));
+
+        await publisher.SetResponse(
+            new OperationResult { Status = OperationStatus.Completed, Message = "done" },
+            correlationId);
+
+        Assert.Empty(spy.ResumedPayloads);
+        Assert.Empty(spy.Failures);
+        Assert.NotNull(await store.GetAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task NoSubscriber_ExceptionWithoutRecoveryState_IsDropped()
+    {
+        var provider = CreateProvider();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-missing-exception-state";
+
+        await publisher.SetException(new InvalidOperationException("remote failure"), correlationId);
+
+        Assert.Null(await store.GetAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task NoSubscriber_MixedRecoveryRoutes_DispatchesBothCallbacks()
+    {
+        var spy = new RecoverySpy();
+        var provider = CreateProvider(services => services.AddSingleton<IRecoverySpy>(spy));
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-mixed-routes";
+
+        await store.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = correlationId,
+                PayloadTypeFullName = typeof(OperationResult).FullName,
+                RegisteredAtUtc = DateTime.UtcNow,
+                ResumeCallback = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+                    MethodName = nameof(IRecoverySpy.OnResume),
+                    Params = [CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
+                }
+            },
+            TimeSpan.FromMinutes(5));
+        await store.SaveAsync(
+            correlationId,
+            new RecoveryState
+            {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = correlationId,
+                PayloadTypeFullName = "Missing.Payload.Type",
+                RegisteredAtUtc = DateTime.UtcNow,
+                FailureCallback = FailureCallback()
+            },
+            TimeSpan.FromMinutes(5));
+
+        await rawPublisher.SetRawResponseJson("""{"Status":2,"Message":"done"}""", correlationId);
+
+        Assert.Single(spy.ResumedPayloads);
+        Assert.Single(spy.Failures);
+        Assert.Empty(await store.GetAllAsync(correlationId));
+    }
+
     private static ServiceProvider CreateProvider(Action<IServiceCollection>? configure = null)
     {
         var services = new ServiceCollection();
@@ -531,5 +854,51 @@ public class InMemoryAsyncResponseTests
         public SelfReferencingFailurePayload? Self { get; set; }
 
         public bool ShouldResumeOnRecovery() => false;
+    }
+
+    private sealed class RetryLiveRecoveryStore : IRecoveryStateStore
+    {
+        public Func<Task>? BeforeGetAllAsync { get; set; }
+
+        public Task SaveAsync(
+            string correlationId,
+            RecoveryState state,
+            TimeSpan ttl,
+            CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
+            => Task.FromResult<RecoveryState?>(null);
+
+        public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(
+            string correlationId,
+            CancellationToken cancellationToken = default)
+        {
+            if (BeforeGetAllAsync is not null)
+            {
+                var callback = BeforeGetAllAsync;
+                BeforeGetAllAsync = null;
+                await callback().ConfigureAwait(false);
+            }
+
+            return
+            [
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = correlationId,
+                    PayloadTypeFullName = typeof(OperationResult).FullName
+                }
+            ];
+        }
+
+        public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
+
+        public Task<bool> TryDeleteAsync(
+            string correlationId,
+            Guid registrationId,
+            CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
     }
 }

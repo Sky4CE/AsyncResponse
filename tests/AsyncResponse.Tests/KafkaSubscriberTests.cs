@@ -171,6 +171,26 @@ public class KafkaSubscriberTests
     }
 
     [Fact]
+    public async Task Subscriber_CloseFailure_StillDisposesConsumer()
+    {
+        var consumer = new FakeKafkaConsumerClient
+        {
+            CloseException = new InvalidOperationException("close failed")
+        };
+        var subscriber = CreateWorkerSubscriber(
+            consumer,
+            Mock.Of<IAsyncResponseIngress>(),
+            options => options.WorkerTopic = "workers");
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await KafkaTestData.WaitUntilAsync(() => consumer.Subscriptions.Count == 1);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.True(consumer.Closed);
+        Assert.True(consumer.Disposed);
+    }
+
+    [Fact]
     public async Task Subscriber_RestartsWithFreshConsumerAfterConsumeFailure()
     {
         var failingConsumer = new FakeKafkaConsumerClient

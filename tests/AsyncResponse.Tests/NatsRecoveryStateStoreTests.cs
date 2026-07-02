@@ -89,6 +89,18 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_WhenCasKeepsFailing_FallsBackToPut()
+    {
+        _kv.ForcedCreateConflicts = 4;
+        var state = new RecoveryState { CorrelationId = "corr-fallback", RegistrationId = Guid.NewGuid() };
+
+        await _store.SaveAsync("corr-fallback", state, TimeSpan.FromMinutes(5));
+
+        Assert.Equal(1, _kv.PutCount);
+        Assert.Single(await _store.GetAllAsync("corr-fallback"));
+    }
+
+    [Fact]
     public async Task TryDeleteAsync_CompetingSaveBetweenReadAndDelete_RetriesAndKeepsCompetingRegistration()
     {
         var first = new RecoveryState
@@ -187,6 +199,66 @@ public class NatsRecoveryStateStoreTests
 
         var remaining = Assert.Single(await _store.GetAllAsync("corr-a"));
         Assert.Equal(secondId, remaining.RegistrationId);
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_WithRegistrationId_ReturnsFalseForMissingMalformedExpiredAndUnknown()
+    {
+        Assert.False(await _store.TryDeleteAsync("missing", Guid.NewGuid()));
+
+        _kv.Entries[NatsSubjectSchema.RecoveryKey("broken")] = "{not-json";
+        Assert.False(await _store.TryDeleteAsync("broken", Guid.NewGuid()));
+
+        var id = Guid.NewGuid();
+        await _store.SaveAsync("expired", new RecoveryState { RegistrationId = id, CorrelationId = "expired" }, TimeSpan.FromMinutes(1));
+        _time.Advance(TimeSpan.FromMinutes(2));
+        Assert.False(await _store.TryDeleteAsync("expired", id));
+        Assert.False(_kv.Entries.ContainsKey(NatsSubjectSchema.RecoveryKey("expired")));
+
+        await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = id, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+        Assert.False(await _store.TryDeleteAsync("corr-a", Guid.NewGuid()));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_WhenCasKeepsFailing_LeavesRegistrationForExpiry()
+    {
+        var firstId = Guid.NewGuid();
+        var secondId = Guid.NewGuid();
+        await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+        await _store.SaveAsync("corr-a", new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+        _kv.ForcedUpdateConflicts = 4;
+
+        Assert.False(await _store.TryDeleteAsync("corr-a", firstId));
+
+        Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
+    }
+
+    [Fact]
+    public async Task GetAllAsync_FiltersUnreadableSchemaAndBackfillsCorrelationId()
+    {
+        _kv.Entries[NatsSubjectSchema.RecoveryKey("mixed")] = JsonSerializer.Serialize(new NatsRecoveryStateStore.StoredRecoveryState
+        {
+            States =
+            [
+                new RecoveryState { PayloadTypeFullName = "old" },
+                new RecoveryState { CorrelationId = "mixed", PayloadTypeFullName = "future", SchemaVersion = RecoveryStateSchema.Current + 1 }
+            ],
+            ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
+        });
+
+        var state = Assert.Single(await _store.GetAllAsync("mixed"));
+        Assert.Equal("mixed", state.CorrelationId);
+        Assert.Equal("old", state.PayloadTypeFullName);
+    }
+
+    [Fact]
+    public async Task ExpiredRead_SwallowsBestEffortDeleteFailure()
+    {
+        await _store.SaveAsync("expired", new RecoveryState { CorrelationId = "expired" }, TimeSpan.FromMinutes(1));
+        _time.Advance(TimeSpan.FromMinutes(2));
+        _kv.DeleteException = new InvalidOperationException("delete failed");
+
+        Assert.Empty(await _store.GetAllAsync("expired"));
     }
 
     [Fact]

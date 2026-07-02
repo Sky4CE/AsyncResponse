@@ -1,5 +1,6 @@
 using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -134,6 +135,64 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_NullEnvelopeFaultsWaiter()
+    {
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-null",
+            timeout: TimeSpan.FromSeconds(5));
+
+        _handler!.Invoke(_subscribedChannel, "null");
+
+        await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_UnsubscribeFailureDoesNotMaskCompletedResponse()
+    {
+        var failure = new InvalidOperationException("unsubscribe failed");
+        _subscriber
+            .Setup(s => s.UnsubscribeAsync(
+                It.IsAny<RedisChannel>(),
+                It.IsAny<Action<RedisChannel, RedisValue>?>(),
+                It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-cleanup",
+            timeout: TimeSpan.FromSeconds(5));
+
+        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("done", result.Message);
+        await Eventually(() =>
+            _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) >= 1);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_WhenExecutionContextFlowIsSuppressed_StillProcessesMessage()
+    {
+        var channel = CreateChannel();
+        Task<IAsyncResponseWaiter<OperationResult>> waiterTask;
+        using (ExecutionContext.SuppressFlow())
+        {
+            waiterTask = channel.CreateResponseWaiter<OperationResult>(
+                "corr-no-context",
+                timeout: TimeSpan.FromSeconds(5));
+        }
+
+        await using var waiter = await waiterTask;
+
+        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("done", result.Message);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_TimeoutFaultsAndCleansUp()
     {
         var channel = CreateChannel();
@@ -240,6 +299,75 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task Publishers_LogSuccessfulPublishWhenSubscribersArePresent()
+    {
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, new TestLogger<RedisAsyncResponseChannel>());
+        var rawPublisher = (IRawAsyncResponsePublisher)channel;
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(1);
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-a");
+        await rawPublisher.SetRawResponseJson("""{"Status":2}""", "corr-a");
+        await channel.SetException(new InvalidOperationException("remote failure"), "corr-a");
+
+        _subscriber.Verify(s => s.PublishAsync(
+            It.IsAny<RedisChannel>(),
+            It.IsAny<RedisValue>(),
+            It.IsAny<CommandFlags>()), Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task SetResponse_WhenPublishFails_Propagates()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetRawResponseJson_WhenPublishFails_Propagates()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel();
+        var rawPublisher = (IRawAsyncResponsePublisher)channel;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            rawPublisher.SetRawResponseJson("""{"Status":2}""", "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task SetException_WhenPublishFails_Propagates()
+    {
+        var failure = new InvalidOperationException("publish failed");
+        _subscriber
+            .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(failure);
+        var channel = CreateChannel();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SetException(new InvalidOperationException("remote failure"), "corr-a"));
+
+        Assert.Same(failure, ex);
+    }
+
+    [Fact]
     public async Task RedisWaiter_DisposeAsyncRunsCleanup()
     {
         var channel = CreateChannel();
@@ -320,13 +448,15 @@ public class RedisAsyncResponseChannelWaiterTests
         RecoveryStateExpiry = TimeSpan.FromMinutes(5)
     });
 
-    private RedisAsyncResponseChannel CreateChannel(RedisAsyncResponseOptions options) => new(
+    private RedisAsyncResponseChannel CreateChannel(
+        RedisAsyncResponseOptions options,
+        ILogger<RedisAsyncResponseChannel>? logger = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _multiplexer.Object,
         _store.Object,
         Options.Create(options),
         new AsyncResponseContextPropagation([]),
-        NullLogger<RedisAsyncResponseChannel>.Instance);
+        logger ?? NullLogger<RedisAsyncResponseChannel>.Instance);
 
     [Fact]
     public async Task CreateResponseWaiter_NewerEnvelopeSchema_FaultsWaiter()

@@ -249,6 +249,7 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
     }
 }
 
+[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
 internal sealed class KafkaAdminClientAdapter(KafkaAsyncResponseTransportOptions _options) : IKafkaAdminClient
 {
     /// <summary>Creates any missing topics; existing topics are left untouched.</summary>

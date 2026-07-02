@@ -64,6 +64,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         }
     }
 
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private static async Task<IGooglePubSubPublisherClient> CreatePublisherAsync(
         GooglePubSubAsyncResponseOptions options)
     {

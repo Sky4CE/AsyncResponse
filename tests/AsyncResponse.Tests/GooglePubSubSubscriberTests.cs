@@ -396,6 +396,164 @@ public class GooglePubSubSubscriberTests
         Assert.Equal(2, Volatile.Read(ref calls));
     }
 
+    [Theory]
+    [MemberData(nameof(InvalidDispatcherOptions))]
+    public void DispatcherValidateOptions_RejectsInvalidOptions(
+        GooglePubSubAsyncResponseOptions transportOptions,
+        GooglePubSubSubscriberOptions subscriberOptions,
+        string expectedMessageFragment)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            GooglePubSubMessageDispatcher.ValidateOptions(
+                transportOptions,
+                subscriberOptions,
+                GooglePubSubSubscriberRole.ResponseIngress));
+
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<GooglePubSubAsyncResponseOptions, GooglePubSubSubscriberOptions, string> InvalidDispatcherOptions()
+        => new()
+        {
+            {
+                new GooglePubSubAsyncResponseOptions(),
+                new GooglePubSubSubscriberOptions
+                {
+                    AckMode = GooglePubSubAckMode.AckAfterEnqueue,
+                    BackgroundWorkerCount = 1
+                },
+                nameof(GooglePubSubSubscriberOptions.BackgroundQueueCapacity)
+            },
+            {
+                new GooglePubSubAsyncResponseOptions(),
+                new GooglePubSubSubscriberOptions
+                {
+                    AckMode = GooglePubSubAckMode.AckAfterEnqueue,
+                    BackgroundWorkerCount = 1,
+                    BackgroundQueueCapacity = 8,
+                    BackgroundDrainTimeout = TimeSpan.Zero
+                },
+                nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)
+            },
+            {
+                new GooglePubSubAsyncResponseOptions { ShutdownTimeout = TimeSpan.Zero },
+                new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 8),
+                nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)
+            },
+            {
+                new GooglePubSubAsyncResponseOptions { HostShutdownTimeout = TimeSpan.Zero },
+                new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 8),
+                nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)
+            },
+            {
+                new GooglePubSubAsyncResponseOptions
+                {
+                    ShutdownTimeout = TimeSpan.FromSeconds(10),
+                    HostShutdownTimeout = TimeSpan.FromSeconds(20)
+                },
+                new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(15)),
+                nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)
+            },
+            {
+                new GooglePubSubAsyncResponseOptions(),
+                new GooglePubSubSubscriberOptions { AckMode = (GooglePubSubAckMode)999 },
+                nameof(GooglePubSubSubscriberOptions.AckMode)
+            }
+        };
+
+    [Fact]
+    public void DispatcherValidateOptions_AllowsEarlyAckWithinHostShutdownBudget()
+    {
+        GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions
+            {
+                ShutdownTimeout = TimeSpan.FromSeconds(10),
+                HostShutdownTimeout = TimeSpan.FromSeconds(45)
+            },
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(15)),
+            GooglePubSubSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public async Task DispatcherCreate_ReturnsConfiguredDispatcherTypes()
+    {
+        await using var awaiting = GooglePubSubMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions(),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+        await using var queued = GooglePubSubMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.IsType<AwaitingGooglePubSubMessageDispatcher>(awaiting);
+        Assert.IsType<QueuedGooglePubSubMessageDispatcher>(queued);
+    }
+
+    [Fact]
+    public async Task Dispatcher_AwaitingHandlerSucceeds_EmitsReceiveActivityTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions(),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+        var message = Message("message-activity");
+        message.Attributes["correlationId"] = "corr-activity";
+
+        var reply = await dispatcher.HandleAsync(message, CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        var activity = collector.Single("asyncresponse.pubsub.receive", "asyncresponse.transport", "google_pubsub");
+        Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.pubsub.role"));
+        Assert.Equal(nameof(GooglePubSubAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.pubsub.ack_mode"));
+        Assert.Equal("gcp_pubsub", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal("workers", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal("message-activity", AsyncResponseActivityCollector.Tag(activity, "messaging.message.id"));
+        Assert.Equal("corr-activity", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_CallbackFailureIsSwallowed()
+    {
+        var logger = new ListLogger();
+        var failureObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriberOptions = new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        subscriberOptions.OnBackgroundFailure = _ =>
+        {
+            failureObserved.TrySetResult();
+            throw new InvalidOperationException("callback-failed");
+        };
+
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            (_, _) => Task.FromException(new InvalidOperationException("handler-failed")),
+            new GooglePubSubAsyncResponseOptions(),
+            subscriberOptions,
+            logger,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        var reply = await dispatcher.HandleAsync(Message("message-callback-failure"), CancellationToken.None);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+        await failureObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Eventually(() => logger.Entries.Any(entry =>
+            entry.Level == LogLevel.Error &&
+            entry.Exception is InvalidOperationException { Message: "callback-failed" }));
+    }
+
     [Fact]
     public async Task Dispatcher_AckAfterEnqueue_BackgroundFailureLogsOnceAndInvokesHook()
     {
@@ -656,6 +814,16 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public void SubscriberOptions_UseAckAfterEnqueue_LeavesDefaultDrainTimeoutWhenOmitted()
+    {
+        var options = new GooglePubSubSubscriberOptions();
+
+        options.UseAckAfterEnqueue(2, 32);
+
+        Assert.Equal(TimeSpan.FromSeconds(30), options.BackgroundDrainTimeout);
+    }
+
+    [Fact]
     public async Task WorkerSubscriber_ForwardsMessageBodyToWorkerIngress()
     {
         var ingress = new Mock<IAsyncResponseIngress>();
@@ -757,6 +925,13 @@ public class GooglePubSubSubscriberTests
         return client.Handler;
     }
 
+    private static async Task Eventually(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        while (!condition())
+            await Task.Delay(10, cts.Token);
+    }
+
     private sealed class FakeSubscriberClient : IGooglePubSubSubscriberClient
     {
         private readonly TaskCompletionSource _run = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -793,7 +968,17 @@ public class GooglePubSubSubscriberTests
 
     private sealed class ListLogger : ILogger
     {
-        public List<LogEntry> Entries { get; } = [];
+        private readonly object _gate = new();
+        private readonly List<LogEntry> _entries = [];
+
+        public IReadOnlyList<LogEntry> Entries
+        {
+            get
+            {
+                lock (_gate)
+                    return _entries.ToList();
+            }
+        }
 
         public IDisposable BeginScope<TState>(TState state)
             where TState : notnull
@@ -807,7 +992,10 @@ public class GooglePubSubSubscriberTests
             TState state,
             Exception? exception,
             Func<TState, Exception?, string> formatter)
-            => Entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+        {
+            lock (_gate)
+                _entries.Add(new LogEntry(logLevel, formatter(state, exception), exception));
+        }
     }
 
     private sealed record LogEntry(LogLevel Level, string Message, Exception? Exception);

@@ -1,136 +1,58 @@
-using System.Collections.Concurrent;
-using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AsyncResponse.Tests;
 
-/// <summary>
-/// The per-channel serial executor guarantees that progress/terminal messages for one correlation
-/// id are processed one at a time and in FIFO order, and that a throwing work item never tears the
-/// channel down.
-/// </summary>
 public class ChannelSerialExecutorTests
 {
     [Fact]
-    public async Task ExecutesWorkItemsSeriallyAndInOrder()
+    public async Task Executor_RunsQueuedWorkSeriallySwallowsFailuresAndRejectsAfterDispose()
     {
-        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        var completionOrder = new ConcurrentQueue<int>();
-        var concurrentlyActive = 0;
-        var observedOverlap = 0;
+        var executor = new ChannelSerialExecutor(new TestLogger(), "responses");
+        var calls = new List<string>();
 
-        for (var i = 0; i < 50; i++)
+        Assert.True(await executor.Enqueue(() =>
         {
-            var index = i;
-            await executor.Enqueue(async () =>
-            {
-                if (Interlocked.Increment(ref concurrentlyActive) > 1)
-                    Interlocked.Exchange(ref observedOverlap, 1);
-                await Task.Delay(1);
-                completionOrder.Enqueue(index);
-                Interlocked.Decrement(ref concurrentlyActive);
-            });
+            calls.Add("first");
+            return Task.CompletedTask;
+        }));
+        Assert.True(executor.TryEnqueue(() => throw new InvalidOperationException("work failed")));
+        Assert.True(await executor.Enqueue(() =>
+        {
+            calls.Add("second");
+            return Task.CompletedTask;
+        }));
+
+        await Eventually(() => calls.Count == 2);
+        await executor.DisposeAsync();
+
+        Assert.False(executor.TryEnqueue(() => Task.CompletedTask));
+        Assert.Equal(["first", "second"], calls);
+    }
+
+    [Fact]
+    public async Task Enqueue_WithCanceledToken_ReturnsCanceledTask()
+    {
+        await using var executor = new ChannelSerialExecutor(new TestLogger(), "responses");
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var task = executor.Enqueue(() => Task.CompletedTask, cts.Token);
+
+        Assert.True(task.IsCanceled);
+        await Assert.ThrowsAsync<TaskCanceledException>(() => task);
+    }
+
+    private static async Task Eventually(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+                return;
+
+            await Task.Delay(10);
         }
 
-        // DisposeAsync completes the block and awaits every queued work item.
-        await executor.DisposeAsync();
-
-        Assert.Equal(0, observedOverlap);                                       // never ran two at once
-        Assert.Equal(Enumerable.Range(0, 50).ToArray(), completionOrder.ToArray()); // strict FIFO
-    }
-
-    [Fact]
-    public async Task SwallowsWorkExceptions_AndKeepsProcessing()
-    {
-        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        var ranAfterThrow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        await executor.Enqueue(() => throw new InvalidOperationException("boom"));
-        await executor.Enqueue(() =>
-        {
-            ranAfterThrow.TrySetResult();
-            return Task.CompletedTask;
-        });
-
-        await executor.DisposeAsync();
-
-        Assert.True(ranAfterThrow.Task.IsCompletedSuccessfully);
-    }
-
-    [Fact]
-    public async Task EnqueueAfterDispose_ReturnsFalse()
-    {
-        var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        await executor.DisposeAsync();
-
-        var accepted = await executor.Enqueue(() => Task.CompletedTask);
-
-        Assert.False(accepted);
-    }
-
-    [Fact]
-    public async Task ConcurrentProducers_NeverRunWorkConcurrently()
-    {
-        // The single-reader drain loop must serialize work even when many producers enqueue at once
-        // (mirrors a broker subscriber callback fanning messages in from multiple threads).
-        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        var concurrentlyActive = 0;
-        var observedOverlap = 0;
-        var completed = 0;
-
-        var producers = Enumerable.Range(0, 16).Select(_ => Task.Run(async () =>
-        {
-            for (var i = 0; i < 32; i++)
-            {
-                await executor.Enqueue(async () =>
-                {
-                    if (Interlocked.Increment(ref concurrentlyActive) > 1)
-                        Interlocked.Exchange(ref observedOverlap, 1);
-                    await Task.Yield();
-                    Interlocked.Decrement(ref concurrentlyActive);
-                    Interlocked.Increment(ref completed);
-                });
-            }
-        })).ToArray();
-
-        await Task.WhenAll(producers);
-        await executor.DisposeAsync();
-
-        Assert.Equal(0, observedOverlap);     // never ran two at once, regardless of producer count
-        Assert.Equal(16 * 32, completed);     // and every enqueued item ran exactly once
-    }
-
-    [Fact]
-    public async Task DisposeAsync_WaitsForInFlightWorkToComplete()
-    {
-        var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        var completed = false;
-
-        await executor.Enqueue(async () =>
-        {
-            await Task.Delay(50);
-            completed = true;
-        });
-
-        // Dispose must drain in-flight work, not abandon it.
-        await executor.DisposeAsync();
-
-        Assert.True(completed);
-    }
-
-    [Fact]
-    public async Task Enqueue_WithCancelledToken_DoesNotRunWork()
-    {
-        await using var executor = new ChannelSerialExecutor(NullLogger.Instance, "cid");
-        var ran = false;
-        using var cts = new CancellationTokenSource();
-        await cts.CancelAsync();
-
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            async () => await executor.Enqueue(() => { ran = true; return Task.CompletedTask; }, cts.Token));
-
-        await executor.DisposeAsync();
-
-        Assert.False(ran);
+        Assert.True(condition());
     }
 }

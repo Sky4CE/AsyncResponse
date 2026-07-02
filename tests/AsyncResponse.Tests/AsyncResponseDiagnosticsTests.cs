@@ -119,6 +119,30 @@ public class AsyncResponseDiagnosticsTests
         Assert.Equal((9, "corr-execute", null), Assert.Single(spy.WorkerJobs));
     }
 
+    [Fact]
+    public void DiagnosticHelpers_TolerateNullsAndSetRouteVariants()
+    {
+        AsyncResponseDiagnostics.SetPayloadType(null, typeof(OperationResult));
+        AsyncResponseDiagnostics.SetWorker(null, null);
+        AsyncResponseDiagnostics.SetError(null, new InvalidOperationException("boom"));
+        AsyncResponseDiagnostics.SetError(null, "custom.error");
+
+        using var activity = new Activity("diagnostics").Start();
+
+        AsyncResponseDiagnostics.SetWorker(activity, null);
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, true);
+        Assert.Equal("resume", Tag(activity, "asyncresponse.lost_subscriber_route"));
+
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, false);
+        Assert.Equal("failure", Tag(activity, "asyncresponse.lost_subscriber_route"));
+
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, null);
+        Assert.Equal("unclassified", Tag(activity, "asyncresponse.lost_subscriber_route"));
+
+        AsyncResponseDiagnostics.SetError(activity, "custom.error");
+        Assert.Equal("custom.error", Tag(activity, "error.type"));
+    }
+
     private static ServiceProvider CreateProvider()
     {
         var services = new ServiceCollection();

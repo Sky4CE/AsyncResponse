@@ -81,6 +81,19 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
+    public async Task WaitAsync_RejectsBuilderReuse()
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>("corr-1");
+
+        await builder.WaitAsync();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(builder.WaitAsync);
+
+        Assert.Contains("single-use", ex.Message);
+    }
+
+    [Fact]
     public async Task For_WithoutCorrelationId_GeneratesOneAndSharesItWithAmbientContextAndTrigger()
     {
         string? subscribedWith = null;
@@ -431,6 +444,17 @@ public class AsyncResponseBuilderTests
         Assert.Throws<ArgumentOutOfRangeException>(() => builder.WithTimeout(TimeSpan.FromTicks(-1)));
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void For_WithBlankCorrelationId_Throws(string? correlationId)
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object);
+
+        Assert.Throws<ArgumentNullException>(() => builder.For<OperationResult>(correlationId!));
+    }
+
     [Fact]
     public async Task WithReplyTarget_WithoutProvider_ThrowsWithGuidance()
     {
@@ -442,6 +466,14 @@ public class AsyncResponseBuilderTests
             builder.WaitAsync(_ => Task.CompletedTask));
 
         Assert.Contains("reply target provider", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WithReplyTarget_RejectsBlankName()
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
+
+        Assert.Throws<ArgumentException>(() => builder.WithReplyTarget(" "));
     }
 
     [Theory]
@@ -458,6 +490,15 @@ public class AsyncResponseBuilderTests
             Transport = transport!,
             Address = address!
         }));
+    }
+
+    [Fact]
+    public void Until_RejectsNullPredicates()
+    {
+        var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");
+
+        Assert.Throws<ArgumentNullException>(() => builder.Until((Func<OperationResult, bool>)null!));
+        Assert.Throws<ArgumentNullException>(() => builder.Until((Func<OperationResult, Task<bool>>)null!));
     }
 
     [Fact]
@@ -503,6 +544,45 @@ public class AsyncResponseBuilderTests
         Assert.NotNull(predicate);
         Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
         Assert.False(await predicate(new OperationResult { Status = OperationStatus.Running }));
+    }
+
+    [Fact]
+    public async Task TriggeredBuilder_TaskPredicateViaOrdinaryInterface_PassesConfiguredOptions()
+    {
+        Func<OperationResult, ValueTask<bool>>? predicate = null;
+        _subscriber
+            .Setup(s => s.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .Callback<string, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (_, p, _) => predicate = p)
+            .ReturnsAsync(_waiter.Object);
+
+        IAsyncResponseTriggeredBuilder<OperationResult> builder =
+            new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>();
+
+        await builder
+            .Until(payload => Task.FromResult(payload.Status == OperationStatus.Completed))
+            .WaitAsync(_ => Task.CompletedTask);
+
+        Assert.NotNull(predicate);
+        Assert.True(await predicate!(new OperationResult { Status = OperationStatus.Completed }));
+        Assert.False(await predicate(new OperationResult { Status = OperationStatus.Running }));
+    }
+
+    [Fact]
+    public void RecoverableBuilder_RejectsNullReflectionCallbacks()
+    {
+        IRecoverableAsyncResponseAttachedBuilder<OperationResult> attached =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object).For<OperationResult>("corr-1");
+        IRecoverableAsyncResponseTriggeredBuilder<OperationResult> triggered =
+            new RecoverableAsyncResponseBuilder(_recoverableSubscriber.Object).For<OperationResult>();
+
+        Assert.Throws<ArgumentNullException>(() => attached.OnLostSubscriberResume((ReflectionCallDto)null!));
+        Assert.Throws<ArgumentNullException>(() => attached.OnLostSubscriberFailure((ReflectionCallDto)null!));
+        Assert.Throws<ArgumentNullException>(() => triggered.OnLostSubscriberResume((ReflectionCallDto)null!));
+        Assert.Throws<ArgumentNullException>(() => triggered.OnLostSubscriberFailure((ReflectionCallDto)null!));
     }
 
     [Fact]

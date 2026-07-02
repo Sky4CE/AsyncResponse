@@ -78,6 +78,24 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
+    public async Task YoungEntryWithNoSubscriber_IsNotStale()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = Build(state, Options(enabled: true), new FakeScanner(new RecoveryState
+        {
+            CorrelationId = "young-cid",
+            PayloadTypeFullName = typeof(OperationResult).FullName,
+            RegisteredAtUtc = DateTime.UtcNow
+        }), new FakeProbe(0));
+
+        var snapshot = await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.NotNull(snapshot.Report);
+        Assert.Equal(1, snapshot.Report!.TotalEntries);
+        Assert.Empty(snapshot.Report.StaleEntries);
+    }
+
+    [Fact]
     public async Task EntryWithoutRegisteredAt_IsReportedAsUnknownAge()
     {
         var state = new AsyncResponseWatchdogState();

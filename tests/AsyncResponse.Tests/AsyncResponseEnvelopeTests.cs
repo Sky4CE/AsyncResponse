@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Text;
 using System.Text.Json;
 using Xunit;
 
@@ -77,7 +79,64 @@ public class AsyncResponseEnvelopeTests
     }
 
     [Fact]
+    public void SegmentedJsonPropertyNames_AreReadCorrectly()
+    {
+        var sequence = Segmented(
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"done"},"ExceptionMessage":null,"ExceptionStackTrace":null}""",
+            chunkSize: 3);
+        var reader = new Utf8JsonReader(sequence);
+
+        var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            ref reader,
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        Assert.NotNull(restored);
+        Assert.Equal(AsyncResponseEnvelopeSchema.Current, restored!.SchemaVersion);
+        Assert.True(restored.Success);
+        Assert.Equal("done", restored.Payload!.Message);
+        Assert.Null(restored.ExceptionMessage);
+        Assert.Null(restored.ExceptionStackTrace);
+    }
+
+    [Fact]
     public void NonObjectToken_Throws()
         => Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
             "123", AsyncResponseEnvelopeOptions<int>.Instance));
+
+    private static ReadOnlySequence<byte> Segmented(string json, int chunkSize)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json);
+        BufferSegment? first = null;
+        BufferSegment? last = null;
+        var runningIndex = 0L;
+        for (var offset = 0; offset < bytes.Length; offset += chunkSize)
+        {
+            var length = Math.Min(chunkSize, bytes.Length - offset);
+            var segment = new BufferSegment(bytes.AsMemory(offset, length), runningIndex);
+            if (first is null)
+            {
+                first = segment;
+            }
+            else
+            {
+                last!.SetNext(segment);
+            }
+
+            last = segment;
+            runningIndex += length;
+        }
+
+        return new ReadOnlySequence<byte>(first!, 0, last!, last!.Memory.Length);
+    }
+
+    private sealed class BufferSegment : ReadOnlySequenceSegment<byte>
+    {
+        public BufferSegment(ReadOnlyMemory<byte> memory, long runningIndex)
+        {
+            Memory = memory;
+            RunningIndex = runningIndex;
+        }
+
+        public void SetNext(BufferSegment next) => Next = next;
+    }
 }

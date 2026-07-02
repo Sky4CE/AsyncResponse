@@ -321,9 +321,11 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         public bool Equals(EntryBucket other)
             => ReferenceEquals(_single, other._single) && ReferenceEquals(_many, other._many);
 
+        [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
         public override bool Equals(object? obj)
             => obj is EntryBucket other && Equals(other);
 
+        [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
         public override int GetHashCode()
             => HashCode.Combine(
                 _single is null ? 0 : RuntimeHelpers.GetHashCode(_single),

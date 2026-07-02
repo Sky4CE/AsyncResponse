@@ -143,6 +143,18 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
+    public void ValidateOptions_UnsupportedAckMode_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                KafkaTestData.NewOptions(),
+                new KafkaSubscriberOptions { AckMode = (KafkaAckMode)999 },
+                KafkaSubscriberRole.Worker));
+
+        Assert.Contains(nameof(KafkaSubscriberOptions.AckMode), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void UseAckAfterEnqueue_RejectsNonPositiveArguments()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new KafkaSubscriberOptions().UseAckAfterEnqueue(0, 8));
@@ -198,6 +210,27 @@ public class KafkaDispatcherTests
         var stored = Assert.Single(consumer.StoredOffsets);
         Assert.Equal(new FakeKafkaConsumerClient.StoredOffset(Topic, 0, 7), stored);
         Assert.Empty(producer.Publishes);
+    }
+
+    [Fact]
+    public async Task Awaiting_HandlerSucceeds_EmitsKafkaReceiveActivityTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions());
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 7), CancellationToken.None);
+
+        var activity = collector.Single("asyncresponse.kafka.receive", "asyncresponse.transport", "kafka");
+        Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.kafka.role"));
+        Assert.Equal(nameof(KafkaAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.kafka.ack_mode"));
+        Assert.Equal(1, AsyncResponseActivityCollector.Tag(activity, "asyncresponse.kafka.delivery_attempt"));
+        Assert.Equal("kafka", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal(Topic, AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal(Group, AsyncResponseActivityCollector.Tag(activity, "messaging.kafka.consumer.group"));
+        Assert.Equal(0, AsyncResponseActivityCollector.Tag(activity, "messaging.kafka.destination.partition"));
+        Assert.Equal(7L, AsyncResponseActivityCollector.Tag(activity, "messaging.kafka.message.offset"));
     }
 
     [Fact]
@@ -462,6 +495,27 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_BackgroundDeadLetterFailure_IsSwallowed()
+    {
+        var producer = new FakeKafkaProducerClient { PublishException = new InvalidOperationException("broker gone") };
+        var attempts = 0;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                throw new InvalidOperationException("background boom");
+            },
+            FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 1 })
+                .UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            producer: producer);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+        await KafkaTestData.WaitUntilAsync(() => Volatile.Read(ref attempts) == 1 && producer.PublishAttempts == 1);
+        Assert.Equal(1, producer.PublishAttempts);
+    }
+
+    [Fact]
     public async Task Queued_BackgroundFailureRecoversOnRetry_DoesNotDeadLetter()
     {
         var producer = new FakeKafkaProducerClient();
@@ -534,6 +588,32 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_WriteWaitCancellation_RollsBackPendingCount()
+    {
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = (QueuedKafkaMessageDispatcher)CreateDispatcher(
+            async (_, _) =>
+            {
+                handlerStarted.TrySetResult();
+                await releaseHandler.Task.ConfigureAwait(false);
+            },
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(1, backgroundQueueCapacity: 1, TimeSpan.FromSeconds(5)));
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None);
+
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 3), cancellation.Token));
+
+        Assert.Equal(1, dispatcher.PendingCount);
+        releaseHandler.TrySetResult();
+    }
+
+    [Fact]
     public async Task Queued_Dispose_DrainsQueuedWork()
     {
         var processed = 0;
@@ -551,6 +631,17 @@ public class KafkaDispatcherTests
         await dispatcher.DisposeAsync();
 
         Assert.Equal(16, Volatile.Read(ref processed));
+    }
+
+    [Fact]
+    public async Task Queued_Dispose_IsIdempotent()
+    {
+        var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)));
+
+        await dispatcher.DisposeAsync();
+        await dispatcher.DisposeAsync();
     }
 
     [Fact]

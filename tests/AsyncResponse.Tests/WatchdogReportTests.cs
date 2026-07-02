@@ -61,6 +61,18 @@ public class WatchdogReportTests
     }
 
     [Fact]
+    public void UnknownLiveness_IsNotStaleOrUnknownAge()
+    {
+        var entry = Entry(registeredAgo: TimeSpan.FromDays(3), activeSubscribers: -1);
+
+        var report = AsyncResponseWatchdogReport.Evaluate([entry], Now, StaleAfter);
+
+        Assert.Equal(1, report.TotalEntries);
+        Assert.Empty(report.StaleEntries);
+        Assert.Equal(0, report.UnknownAgeEntries);
+    }
+
+    [Fact]
     public void MixedSnapshot_ReportsAllBucketsCorrectly()
     {
         var stale = Entry(TimeSpan.FromDays(3), activeSubscribers: 0, correlationId: "stale");

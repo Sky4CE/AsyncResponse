@@ -49,6 +49,10 @@ public class NatsAsyncResponseChannelOptionsTests
     }
 
     [Fact]
+    public void Validate_Throws_ForNegativeRemoteStackTraceLength()
+        => AssertInvalid(o => o.MaxRemoteStackTraceLength = -1);
+
+    [Fact]
     public void Validate_Accepts_NullDefaultTimeout()
         => new NatsAsyncResponseChannelOptions { DefaultTimeout = null }.Validate();
 

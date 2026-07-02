@@ -74,6 +74,9 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
     /// <summary>When set, every StoreOffset call throws this exception.</summary>
     public Exception? StoreOffsetException { get; set; }
 
+    /// <summary>When set, Close throws this exception.</summary>
+    public Exception? CloseException { get; set; }
+
     public void Enqueue(KafkaIncomingMessage message)
     {
         lock (_gate)
@@ -139,7 +142,12 @@ internal sealed class FakeKafkaConsumerClient : IKafkaConsumerClient
         }
     }
 
-    public void Close() => Closed = true;
+    public void Close()
+    {
+        Closed = true;
+        if (CloseException is not null)
+            throw CloseException;
+    }
 
     public void Dispose() => Disposed = true;
 

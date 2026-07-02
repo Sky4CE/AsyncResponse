@@ -72,6 +72,33 @@ public class CallbackAuthorizationTests
         await provider.InvokeAsync(TargetCall());
         Assert.Equal("hello", Assert.Single(target.Calls));
     }
+
+    [Fact]
+    public async Task CustomAuthorizer_OverloadIsRegistered()
+    {
+        var (provider, target) = BuildProvider(b => b.AuthorizeCallbacks(new StaticAuthorizer(allowed: true)));
+
+        await provider.InvokeAsync(TargetCall());
+
+        Assert.Equal("hello", Assert.Single(target.Calls));
+    }
+
+    [Fact]
+    public void AuthorizeCallbacks_ValidatesArguments()
+    {
+        var services = new ServiceCollection();
+        var builder = services.AddAsyncResponse();
+
+        Assert.Throws<ArgumentNullException>(() => ((AsyncResponseRegistrationBuilder)null!).AuthorizeCallbacks(_ => { }));
+        Assert.Throws<ArgumentNullException>(() => builder.AuthorizeCallbacks((Action<AsyncResponseCallbackAllowList>)null!));
+        Assert.Throws<ArgumentNullException>(() => ((AsyncResponseRegistrationBuilder)null!).AuthorizeCallbacks(new StaticAuthorizer(true)));
+        Assert.Throws<ArgumentNullException>(() => builder.AuthorizeCallbacks((IAsyncResponseCallbackAuthorizer)null!));
+    }
+
+    private sealed class StaticAuthorizer(bool allowed) : IAsyncResponseCallbackAuthorizer
+    {
+        public bool IsAllowed(string serviceInterfaceFullName, string methodName) => allowed;
+    }
 }
 
 /// <summary>

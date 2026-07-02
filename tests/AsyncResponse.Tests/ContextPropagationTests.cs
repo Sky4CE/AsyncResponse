@@ -367,6 +367,14 @@ public class ContextPropagationTests
         Assert.Null(published!.Context); // empty carrier collapses to null, not an empty dictionary
     }
 
+    [Fact]
+    public void Capture_ExposesDictionarySemanticsToPropagators()
+    {
+        var propagation = new AsyncResponseContextPropagation([new CarrierInspectionPropagator()]);
+
+        Assert.Null(propagation.Capture());
+    }
+
     // ----- helpers -----
 
     private static ServiceProvider BuildProvider<TProbe>(TProbe probe, Action<AsyncResponseRegistrationBuilder> configure)
@@ -468,6 +476,40 @@ public sealed class TenantPropagator : IAsyncResponseContextPropagator
     private sealed class NullScope : IDisposable
     {
         public static readonly NullScope Instance = new();
+        public void Dispose() { }
+    }
+}
+
+public sealed class CarrierInspectionPropagator : IAsyncResponseContextPropagator
+{
+    public void Capture(IDictionary<string, string> carrier)
+    {
+        Assert.False(carrier.ContainsKey("missing"));
+        Assert.False(carrier.TryGetValue("missing", out _));
+        Assert.Empty(carrier.Keys);
+        Assert.Empty(carrier.Values);
+
+        carrier.Add("first", "1");
+        Assert.Equal("1", carrier["first"]);
+        Assert.True(carrier.Contains(new KeyValuePair<string, string>("first", "1")));
+
+        var copy = new KeyValuePair<string, string>[1];
+        carrier.CopyTo(copy, 0);
+        Assert.Equal(new KeyValuePair<string, string>("first", "1"), copy[0]);
+        Assert.True(carrier.Remove(new KeyValuePair<string, string>("first", "1")));
+
+        carrier["second"] = "2";
+        Assert.True(carrier.Remove("second"));
+
+        carrier.Add(new KeyValuePair<string, string>("third", "3"));
+        Assert.Collection(carrier, item => Assert.Equal(new KeyValuePair<string, string>("third", "3"), item));
+        carrier.Clear();
+    }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier) => new Scope();
+
+    private sealed class Scope : IDisposable
+    {
         public void Dispose() { }
     }
 }

@@ -68,6 +68,57 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
+    public async Task WorkerTransport_Publish_EmitsActivityTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var publisher = new FakePublisherClient { MessageId = "message-activity" };
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        await transport.PublishAsync(WorkerJob("corr-activity"));
+
+        var activity = collector.Single("asyncresponse.worker.publish", "asyncresponse.transport", "google_pubsub");
+        Assert.Equal("gcp_pubsub", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal("jobs", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal("message-activity", AsyncResponseActivityCollector.Tag(activity, "messaging.message.id"));
+        Assert.Equal("reply", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.reply_target.name"));
+        Assert.Equal(GooglePubSubAsyncResponseOptions.TransportName, AsyncResponseActivityCollector.Tag(activity, "asyncresponse.reply_target.transport"));
+        Assert.Equal("DoWork", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.worker.method"));
+    }
+
+    [Fact]
+    public async Task WorkerTransport_SequentialPublishes_ReusePublisherAndDisposeOnce()
+    {
+        var publisher = new FakePublisherClient();
+        var factoryCalls = 0;
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () =>
+            {
+                factoryCalls++;
+                return Task.FromResult<IGooglePubSubPublisherClient>(publisher);
+            });
+
+        await transport.PublishAsync(WorkerJob("corr-1"));
+        await transport.PublishAsync(WorkerJob("corr-2"));
+        await transport.DisposeAsync();
+        await transport.DisposeAsync();
+
+        Assert.Equal(1, factoryCalls);
+        Assert.Equal(2, publisher.Messages.Count);
+        Assert.Equal(1, publisher.ShutdownCalls);
+    }
+
+    [Fact]
     public async Task WorkerTransport_WhenCorrelationIdIsBlank_DoesNotAddAttribute()
     {
         var publisher = new FakePublisherClient();
@@ -393,6 +444,20 @@ public class GooglePubSubTransportTests
         Assert.Null(correlationId);
     }
 
+    [Fact]
+    public void CorrelationIdExtractor_WhenNestedJsonStringIsArray_ReturnsNull()
+    {
+        var correlationId = GooglePubSubCorrelationIdExtractor.Extract(
+            new PubsubMessage(),
+            """{"CustomParameters":"[\"corr-array\"]"}""",
+            new GooglePubSubAsyncResponseOptions
+            {
+                CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+            });
+
+        Assert.Null(correlationId);
+    }
+
     private static WorkerJobEnvelope WorkerJob(string? correlationId)
         => new()
         {
@@ -414,7 +479,18 @@ public class GooglePubSubTransportTests
 
     private sealed class FakePublisherClient : IGooglePubSubPublisherClient
     {
-        public List<PubsubMessage> Messages { get; } = [];
+        private readonly object _gate = new();
+        private readonly List<PubsubMessage> _messages = [];
+
+        public IReadOnlyList<PubsubMessage> Messages
+        {
+            get
+            {
+                lock (_gate)
+                    return [.. _messages];
+            }
+        }
+
         public string MessageId { get; init; } = "message-id";
         public Exception? PublishException { get; init; }
         public TaskCompletionSource<string>? PublishCompletion { get; init; }
@@ -423,7 +499,8 @@ public class GooglePubSubTransportTests
 
         public Task<string> PublishAsync(PubsubMessage message)
         {
-            Messages.Add(message);
+            lock (_gate)
+                _messages.Add(message);
 
             if (PublishException is not null)
                 return Task.FromException<string>(PublishException);

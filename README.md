@@ -349,10 +349,10 @@ per-commit trends with regression alerting are published to the
 
 ## How it's tested
 
-- **700+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+- **2000+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **90 integration tests** drive the shipped sample app black-box over HTTP against **real
-  brokers** — Redis, NATS, PostgreSQL, RabbitMQ containers plus the official Azure Service Bus and
+- **97 integration tests** drive the shipped sample app black-box over HTTP against **real
+  brokers** — Redis, NATS, PostgreSQL, RabbitMQ, Kafka containers plus the official Azure Service Bus and
   Google Pub/Sub emulators — orchestrated by .NET Aspire, with a dedicated early-ACK app instance
   per transport.
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,

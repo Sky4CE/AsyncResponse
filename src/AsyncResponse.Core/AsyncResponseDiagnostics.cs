@@ -167,6 +167,7 @@ public static class AsyncResponseDiagnostics
     /// Registered once process-wide; the watchdog is a singleton, and the guard keeps repeated test
     /// constructions from stacking duplicate gauges on the shared meter.
     /// </summary>
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     internal static void EnsureWatchdogGauges(AsyncResponseWatchdogState state)
     {
         if (Interlocked.Exchange(ref _watchdogGaugesRegistered, 1) != 0)

@@ -1,6 +1,10 @@
 using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Transports.PostgreSQL;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
+using System.Reflection;
+using System.Text.Json;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -360,6 +364,78 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void ChannelSql_HelperBoundaries_HandleIdentifierIndexAndNotifyPayload()
+    {
+        Assert.True(InvokeChannelSqlStatic<bool>("IsIdentifier", "valid_1"));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", ""));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", "1bad"));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", "bad-name"));
+
+        var indexName = InvokeChannelSqlStatic<string>("IndexName", new string('a', 70), "expires");
+        Assert.Equal(63, indexName.Length);
+
+        Assert.Equal("short", InvokeChannelSqlStatic<string>("NotifyPayload", "short"));
+        Assert.Equal(string.Empty, InvokeChannelSqlStatic<string>("NotifyPayload", new string('x', 7001)));
+    }
+
+    [Fact]
+    public void ChannelSql_ShouldPrune_ThrottlesByConfiguredInterval()
+    {
+        using var dataSource = CreatePostgreSqlDataSource();
+        var options = new PostgreSqlAsyncResponseChannelOptions
+        {
+            PruneInterval = TimeSpan.FromMinutes(10)
+        };
+        var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+        var lastTicks = 0L;
+
+        Assert.True(InvokeShouldPrune(sql, ref lastTicks));
+        Assert.NotEqual(0L, lastTicks);
+        Assert.False(InvokeShouldPrune(sql, ref lastTicks));
+
+        options.PruneInterval = TimeSpan.Zero;
+        Assert.True(InvokeShouldPrune(sql, ref lastTicks));
+    }
+
+    [Fact]
+    public async Task RecoveryStateStore_SaveAsync_RejectsNonPositiveTtlBeforeSql()
+    {
+        using var dataSource = CreatePostgreSqlDataSource();
+        var store = CreateRecoveryStateStore(dataSource);
+
+        var ex = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            store.SaveAsync("corr", new RecoveryState(), TimeSpan.Zero));
+
+        Assert.Equal("ttl", ex.ParamName);
+    }
+
+    [Fact]
+    public void RecoveryStateStore_DeserializeState_FiltersUnreadableJsonAndFillsLegacyCorrelationId()
+    {
+        using var dataSource = CreatePostgreSqlDataSource();
+        var store = CreateRecoveryStateStore(dataSource);
+
+        Assert.Null(InvokeDeserializeState(store, "null", "fallback"));
+        Assert.Null(InvokeDeserializeState(store, "{not-json", "fallback"));
+        Assert.Null(InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState
+            {
+                SchemaVersion = RecoveryStateSchema.Current + 1,
+                CorrelationId = "future"
+            }),
+            "fallback"));
+
+        var state = InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState { RegistrationId = Guid.NewGuid() }),
+            "fallback");
+
+        Assert.NotNull(state);
+        Assert.Equal("fallback", state.CorrelationId);
+    }
+
+    [Fact]
     public async Task PostgreSqlRetry_RetriesTransientTimeouts()
     {
         var attempts = 0;
@@ -425,4 +501,36 @@ public sealed class PostgreSqlOptionsTests
 
         Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
     }
+
+    private static NpgsqlDataSource CreatePostgreSqlDataSource()
+        => NpgsqlDataSource.Create("Host=localhost;Username=postgres;Password=postgres;Database=postgres");
+
+    private static PostgreSqlRecoveryStateStore CreateRecoveryStateStore(NpgsqlDataSource dataSource)
+    {
+        var sql = new PostgreSqlChannelSql(dataSource, Options.Create(new PostgreSqlAsyncResponseChannelOptions()));
+        return new PostgreSqlRecoveryStateStore(sql, NullLogger<PostgreSqlRecoveryStateStore>.Instance);
+    }
+
+    private static T InvokeChannelSqlStatic<T>(string name, params object?[] args)
+        => (T)typeof(PostgreSqlChannelSql)
+            .GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, args)!;
+
+    private static bool InvokeShouldPrune(PostgreSqlChannelSql sql, ref long lastTicks)
+    {
+        object?[] args = [lastTicks];
+        var result = (bool)typeof(PostgreSqlChannelSql)
+            .GetMethod("ShouldPrune", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(sql, args)!;
+        lastTicks = (long)args[0]!;
+        return result;
+    }
+
+    private static RecoveryState? InvokeDeserializeState(
+        PostgreSqlRecoveryStateStore store,
+        string json,
+        string? correlationId)
+        => (RecoveryState?)typeof(PostgreSqlRecoveryStateStore)
+            .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(store, [json, correlationId]);
 }
