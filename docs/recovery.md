@@ -103,6 +103,13 @@ tell the difference. And **register both callbacks** for any flow that must surv
 failed payload with no failure callback is logged and dropped (never resumed), but dropped is still
 a stuck flow.
 
+Recovery callbacks are **at-least-once**. Two publishers racing on the same orphaned correlation id
+can each load the registration before either deletes it, and a crash between "callback invoked" and
+"registration deleted" re-invokes the callback on the next publish. There is deliberately no
+distributed claim step in front of the callback — resume must already be re-attach-safe, so the
+extra store round-trip per recovery would buy nothing. Treat both callbacks as idempotent: key side
+effects on the correlation id, not on the invocation.
+
 ## Why recovery routing and `Until` stay separate
 
 `ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
@@ -144,9 +151,14 @@ signal of stuck flows. The watchdog also feeds the `asyncresponse.recovery.*` ga
 Recovery state lives in the durable channel's store and survives a redeploy:
 
 - **Redis** — recovery state is stored in Redis keys under `KeyPrefix`, expiring after
-  `RecoveryStateExpiry` (7 days default).
+  `RecoveryStateExpiry` (7 days default). The per-correlation registration list is updated with a
+  read-modify-write, so two waiters registering the **same** correlation id at the same instant can
+  lose one registration; prefer distinct correlation ids per waiter, or the NATS/PostgreSQL
+  channels for shared-correlation flows.
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
-  per-entry expiry layered over the bucket's `MaxAge`.
+  per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
+  revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one
+  correlation id all survive.
 - **PostgreSQL** — recovery state lives in `RecoveryStateTable` (default
   `asyncresponse_recovery_state`) as one row per waiter registration. Rows expire by `expires_at`
   and are pruned opportunistically during channel operations.

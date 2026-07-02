@@ -181,15 +181,27 @@ internal interface INatsKvStore
     /// <summary>Stores <paramref name="value"/> under <paramref name="key"/>, creating or replacing it.</summary>
     Task PutAsync(string key, string value, CancellationToken cancellationToken);
 
-    /// <summary>Returns the stored value for <paramref name="key"/>, or <c>null</c> when absent or deleted.</summary>
-    Task<string?> GetAsync(string key, CancellationToken cancellationToken);
+    /// <summary>Creates <paramref name="key"/> only when absent; <c>false</c> when it already exists.</summary>
+    Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken);
+
+    /// <summary>Replaces <paramref name="key"/> only while its revision still equals <paramref name="expectedRevision"/>; <c>false</c> on a conflict.</summary>
+    Task<bool> TryUpdateAsync(string key, string value, ulong expectedRevision, CancellationToken cancellationToken);
+
+    /// <summary>Returns the stored entry (value plus revision) for <paramref name="key"/>, or <c>null</c> when absent or deleted.</summary>
+    Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken);
 
     /// <summary>Deletes <paramref name="key"/>; returns <c>true</c> when it existed, <c>false</c> when already gone.</summary>
     Task<bool> DeleteAsync(string key, CancellationToken cancellationToken);
 
+    /// <summary>Deletes <paramref name="key"/> only while its revision still equals <paramref name="expectedRevision"/>; <c>false</c> on a conflict.</summary>
+    Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken);
+
     /// <summary>Streams the live (non-deleted) keys in the bucket.</summary>
     IAsyncEnumerable<string> GetKeysAsync(CancellationToken cancellationToken);
 }
+
+/// <summary>A stored value together with the KV revision it was read at, for optimistic conditional writes.</summary>
+internal readonly record struct NatsKvEntry(string Value, ulong Revision);
 
 /// <summary>
 /// Production <see cref="INatsKvStore"/> over a NATS JetStream Key-Value bucket. The bucket
@@ -208,14 +220,30 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         await store.PutAsync(key, value, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Runs the TryCreateAsync operation.</summary>
+    public async Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken)
+    {
+        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        var result = await store.TryCreateAsync(key, value, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return result.Success;
+    }
+
+    /// <summary>Runs the TryUpdateAsync operation.</summary>
+    public async Task<bool> TryUpdateAsync(string key, string value, ulong expectedRevision, CancellationToken cancellationToken)
+    {
+        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        var result = await store.TryUpdateAsync(key, value, expectedRevision, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return result.Success;
+    }
+
     /// <summary>Runs the GetAsync operation.</summary>
-    public async Task<string?> GetAsync(string key, CancellationToken cancellationToken)
+    public async Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken)
     {
         var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var entry = await store.GetEntryAsync<string>(key, cancellationToken: cancellationToken).ConfigureAwait(false);
-            return entry.Value;
+            return entry.Value is null ? null : new NatsKvEntry(entry.Value, entry.Revision);
         }
         catch (NatsKVKeyNotFoundException)
         {
@@ -254,6 +282,32 @@ internal sealed class NatsKvStoreAdapter(INatsKVContext _kvContext, NatsAsyncRes
         {
             await store.DeleteAsync(key, cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
+        }
+        catch (NatsKVKeyNotFoundException)
+        {
+            return false;
+        }
+        catch (NatsKVKeyDeletedException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Runs the TryDeleteAsync operation.</summary>
+    public async Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken)
+    {
+        var store = await GetStoreAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await store.DeleteAsync(
+                key,
+                new NatsKVDeleteOpts { Revision = expectedRevision },
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (NatsKVWrongLastRevisionException)
+        {
+            return false;
         }
         catch (NatsKVKeyNotFoundException)
         {

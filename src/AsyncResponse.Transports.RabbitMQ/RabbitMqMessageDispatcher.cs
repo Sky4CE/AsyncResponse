@@ -343,15 +343,16 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         IRabbitMqChannel channel,
         CancellationToken subscriberCancellationToken)
     {
-        try
-        {
-            Interlocked.Increment(ref _pendingCount);
-            if (_queue.Writer.TryWrite(delivery))
-            {
-                await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
-                return;
-            }
+        // The client owns the delivery body's memory only until the consumer callback returns
+        // ("Accessing the body at a later point is unsafe as its memory can be already
+        // released" — RabbitMQ.Client v7). This dispatcher hands the delivery to background
+        // workers that read the body after the callback, so materialize a private copy now.
+        // The awaiting dispatcher consumes the body inside the callback and stays zero-copy.
+        delivery = delivery with { Body = delivery.Body.ToArray() };
 
+        Interlocked.Increment(ref _pendingCount);
+        if (!_queue.Writer.TryWrite(delivery))
+        {
             Interlocked.Decrement(ref _pendingCount);
             Logger.LogWarning(
                 "RabbitMQ background queue rejected delivery {DeliveryTag} for {Queue}; returning NACK. Pending={PendingCount}, Running={RunningCount}.",
@@ -360,12 +361,23 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                 PendingCount,
                 RunningCount);
             await channel.BasicNackAsync(delivery.DeliveryTag, requeue: true, subscriberCancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The delivery now belongs to a background worker, which decrements _pendingCount when it dequeues.
+        // Do not touch the counter or NACK here, even if the ACK below fails — the message is already
+        // executing in-process and a NACK would trigger a duplicate execution via requeue.
+        try
+        {
+            await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Interlocked.Decrement(ref _pendingCount);
-            Logger.LogError(ex, "Failed to enqueue RabbitMQ delivery {DeliveryTag} for {Queue}; returning NACK.", delivery.DeliveryTag, _queueName);
-            await channel.BasicNackAsync(delivery.DeliveryTag, requeue: true, CancellationToken.None).ConfigureAwait(false);
+            Logger.LogError(
+                ex,
+                "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after enqueue; it is being processed but the broker will redeliver it when the channel closes.",
+                delivery.DeliveryTag,
+                _queueName);
         }
     }
 

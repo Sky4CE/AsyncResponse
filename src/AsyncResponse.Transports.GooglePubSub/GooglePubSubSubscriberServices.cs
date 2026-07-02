@@ -58,6 +58,42 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         var subscriptionId = SubscriptionId;
         GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
+
+        var failures = 0;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunSubscriberAsync(subscriptionName, subscriptionId, stoppingToken).ConfigureAwait(false);
+                return;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            {
+                failures++;
+                var retryDelay = AsyncResponseRetry.Backoff(
+                    failures,
+                    Options.SubscriberRetryBaseDelay,
+                    Options.SubscriberRetryMaxDelay);
+                Logger.LogWarning(
+                    ex,
+                    "Pub/Sub subscriber failed for subscription {Subscription} ({Role}); retrying in {RetryDelay}.",
+                    subscriptionName.ToString(),
+                    SubscriberRole,
+                    retryDelay);
+                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task RunSubscriberAsync(
+        SubscriptionName subscriptionName,
+        string subscriptionId,
+        CancellationToken stoppingToken)
+    {
         var subscriber = await _subscriberFactory(subscriptionName).ConfigureAwait(false);
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(
             HandleMessageAsync,

@@ -25,31 +25,129 @@ internal sealed class TestTimeProvider : TimeProvider
     public void Advance(TimeSpan by) => Now += by;
 }
 
-/// <summary>In-memory <see cref="INatsKvStore"/> backed by a dictionary, for recovery-store tests.</summary>
+/// <summary>
+/// In-memory <see cref="INatsKvStore"/> backed by a dictionary with per-key revisions, for
+/// recovery-store tests. Revisions make the store's optimistic CAS paths real: a conditional write
+/// or delete with a stale revision fails exactly like NATS KV, so retry loops are exercised.
+/// </summary>
 internal sealed class FakeNatsKvStore : INatsKvStore
 {
+    private readonly object _gate = new();
+    private readonly Dictionary<string, ulong> _revisions = new(StringComparer.Ordinal);
+    private ulong _revisionCounter;
+
     public readonly Dictionary<string, string> Entries = new(StringComparer.Ordinal);
     public int PutCount, DeleteCount;
 
+    /// <summary>
+    /// One-shot hook that runs after a successful <see cref="GetAsync"/>, before the value is
+    /// returned — lets a test interleave a competing write between a CAS read and its conditional
+    /// write deterministically. Cleared before it runs so a re-entrant store call cannot recurse.
+    /// </summary>
+    public Func<string, Task>? AfterGet;
+
     public Task PutAsync(string key, string value, CancellationToken cancellationToken)
     {
-        PutCount++;
-        Entries[key] = value;
+        lock (_gate)
+        {
+            PutCount++;
+            Entries[key] = value;
+            _revisions[key] = ++_revisionCounter;
+        }
+
         return Task.CompletedTask;
     }
 
-    public Task<string?> GetAsync(string key, CancellationToken cancellationToken)
-        => Task.FromResult(Entries.TryGetValue(key, out var value) ? value : null);
+    public Task<bool> TryCreateAsync(string key, string value, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (Entries.ContainsKey(key))
+                return Task.FromResult(false);
+
+            PutCount++;
+            Entries[key] = value;
+            _revisions[key] = ++_revisionCounter;
+            return Task.FromResult(true);
+        }
+    }
+
+    public Task<bool> TryUpdateAsync(string key, string value, ulong expectedRevision, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (!Entries.ContainsKey(key) || !_revisions.TryGetValue(key, out var revision) || revision != expectedRevision)
+                return Task.FromResult(false);
+
+            PutCount++;
+            Entries[key] = value;
+            _revisions[key] = ++_revisionCounter;
+            return Task.FromResult(true);
+        }
+    }
+
+    public async Task<NatsKvEntry?> GetAsync(string key, CancellationToken cancellationToken)
+    {
+        NatsKvEntry? result;
+        lock (_gate)
+        {
+            if (!Entries.TryGetValue(key, out var value))
+            {
+                result = null;
+            }
+            else
+            {
+                // Entries seeded directly by a test carry no revision yet; assign one lazily so
+                // conditional writes against seeded data behave like NATS KV.
+                if (!_revisions.TryGetValue(key, out var revision))
+                {
+                    revision = ++_revisionCounter;
+                    _revisions[key] = revision;
+                }
+
+                result = new NatsKvEntry(value, revision);
+            }
+        }
+
+        if (result is not null && AfterGet is { } hook)
+        {
+            AfterGet = null;
+            await hook(key);
+        }
+
+        return result;
+    }
 
     public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
     {
-        DeleteCount++;
-        return Task.FromResult(Entries.Remove(key));
+        lock (_gate)
+        {
+            DeleteCount++;
+            _revisions.Remove(key);
+            return Task.FromResult(Entries.Remove(key));
+        }
+    }
+
+    public Task<bool> TryDeleteAsync(string key, ulong expectedRevision, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            if (!_revisions.TryGetValue(key, out var revision) || revision != expectedRevision)
+                return Task.FromResult(false);
+
+            DeleteCount++;
+            _revisions.Remove(key);
+            return Task.FromResult(Entries.Remove(key));
+        }
     }
 
     public async IAsyncEnumerable<string> GetKeysAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        foreach (var key in Entries.Keys.ToArray())
+        string[] keys;
+        lock (_gate)
+            keys = Entries.Keys.ToArray();
+
+        foreach (var key in keys)
         {
             cancellationToken.ThrowIfCancellationRequested();
             yield return key;

@@ -422,11 +422,16 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
-    public async Task Queued_WhenAckThrows_DecrementsPendingAndNacks()
+    public async Task Queued_WhenAckThrows_DoesNotNackEnqueuedDelivery()
     {
         var channel = new FakeDispatcherChannel { ThrowOnAck = new InvalidOperationException("ack failed") };
-        await using var dispatcher = (QueuedRabbitMqMessageDispatcher)RabbitMqMessageDispatcher.Create(
-            (_, _) => Task.CompletedTask,
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = (QueuedRabbitMqMessageDispatcher)RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
             new RabbitMqAsyncResponseOptions(),
             EnqueueSubscriber(workers: 1, capacity: 8),
             NullLogger.Instance,
@@ -435,9 +440,14 @@ public class RabbitMqDispatcherTests
 
         await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 31), channel, CancellationToken.None);
 
-        var nack = Assert.Single(channel.Nacks);
-        Assert.Equal(31UL, nack.DeliveryTag);
-        Assert.True(nack.Requeue);
+        // The delivery was already handed to a background worker: a NACK here would race a duplicate
+        // redelivery against the in-process execution, so the failed ACK is only logged.
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Empty(channel.Nacks);
+
+        // Draining proves the pending counter was not double-decremented for the enqueued delivery.
+        await dispatcher.DisposeAsync();
+        Assert.Equal(0, dispatcher.PendingCount);
     }
 
     [Fact]

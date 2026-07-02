@@ -608,26 +608,37 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    private async Task TryDispatchLocalSubscribersAsync(PostgreSqlChannelMessage message, CancellationToken cancellationToken)
+    private Task TryDispatchLocalSubscribersAsync(PostgreSqlChannelMessage message, CancellationToken cancellationToken)
     {
         if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
-            return;
+            return Task.CompletedTask;
 
         var subscriptions = group.Values.Where(static s => !s.Dropped).ToArray();
         if (subscriptions.Length == 0)
-            return;
+            return Task.CompletedTask;
 
-        try
-        {
-            await DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-        {
-            _logger.LogDebug(
-                ex,
-                "Local PostgreSQL response dispatch failed for correlationId {CorrelationId}; listener retry will pick it up.",
-                message.CorrelationId);
-        }
+        // Same-process fast path: skips the LISTEN round trip but still runs on the per-correlation
+        // serial executor — completion predicates are guaranteed serial, in-order invocation on every
+        // channel, and a direct dispatch here could otherwise run concurrently with a sweep-enqueued
+        // dispatch of a different message for the same subscription. MarkSeen keeps the sweep from
+        // double-processing this message.
+        _executors.Enqueue(
+            ChannelName(message.CorrelationId),
+            async () =>
+            {
+                try
+                {
+                    await DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogDebug(
+                        ex,
+                        "Local PostgreSQL response dispatch failed for correlationId {CorrelationId}; listener retry will pick it up.",
+                        message.CorrelationId);
+                }
+            });
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -829,9 +840,9 @@ internal sealed class PostgreSqlAsyncResponseChannel :
 
         private async Task HeartbeatLoopAsync()
         {
-            try
+            while (!_heartbeatCts.IsCancellationRequested)
             {
-                while (!_heartbeatCts.IsCancellationRequested)
+                try
                 {
                     await Task.Delay(_owner._options.SubscriberHeartbeatInterval, _heartbeatCts.Token).ConfigureAwait(false);
                     await _owner._sql.UpsertSubscriberAsync(
@@ -841,13 +852,17 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                         _owner._options.SubscriberHeartbeatTimeout,
                         _heartbeatCts.Token).ConfigureAwait(false);
                 }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (Exception ex)
-            {
-                _owner._logger.LogDebug(ex, "PostgreSQL subscriber heartbeat failed for correlationId {CorrelationId}.", _correlationId);
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // A transient upsert failure must not end the loop: once the heartbeat row
+                    // expires, publishers treat this live waiter as gone and route its responses
+                    // to lost-subscriber recovery. Retry on the next interval instead.
+                    _owner._logger.LogWarning(ex, "PostgreSQL subscriber heartbeat failed for correlationId {CorrelationId}; retrying.", _correlationId);
+                }
             }
         }
 
@@ -919,7 +934,12 @@ internal sealed class PostgreSqlAsyncResponseChannel :
                 await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
                 if (deleteRecoveryState)
                     await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
-                await _owner._executors.RemoveAsync(_owner.ChannelName(_correlationId)).ConfigureAwait(false);
+
+                // Schedule the executor retirement on the thread pool; do not await directly —
+                // dispatch-loop deliveries run this cleanup ON the executor, and RemoveAsync waits
+                // for the executor's drain loop to finish, which would be a circular await.
+                var channelName = _owner.ChannelName(_correlationId);
+                _ = Task.Run(async () => await _owner._executors.RemoveAsync(channelName).ConfigureAwait(false));
             }
             catch (Exception ex)
             {

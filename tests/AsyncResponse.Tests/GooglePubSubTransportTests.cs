@@ -104,6 +104,78 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
+    public async Task WorkerTransport_WhenPublisherBuildFails_RetriesOnNextPublish()
+    {
+        var publisher = new FakePublisherClient();
+        var factoryCalls = 0;
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Interlocked.Increment(ref factoryCalls) == 1
+                ? Task.FromException<IGooglePubSubPublisherClient>(new InvalidOperationException("build failed"))
+                : Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-1")));
+        Assert.Equal("build failed", ex.Message);
+
+        // The faulted build attempt must not be cached: the next publish rebuilds and succeeds.
+        await transport.PublishAsync(WorkerJob("corr-2"));
+        await transport.DisposeAsync();
+
+        Assert.Equal(2, factoryCalls);
+        var message = Assert.Single(publisher.Messages);
+        Assert.Equal("corr-2", message.Attributes["correlationId"]);
+        Assert.Equal(1, publisher.ShutdownCalls);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_ConcurrentPublishes_BuildPublisherOnce()
+    {
+        var publisher = new FakePublisherClient();
+        var releaseFactory = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factoryCalls = 0;
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            async () =>
+            {
+                Interlocked.Increment(ref factoryCalls);
+                await releaseFactory.Task.ConfigureAwait(false);
+                return publisher;
+            });
+
+        var first = transport.PublishAsync(WorkerJob("corr-1"));
+        var second = transport.PublishAsync(WorkerJob("corr-2"));
+        releaseFactory.TrySetResult();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, factoryCalls);
+        Assert.Equal(2, publisher.Messages.Count);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_Throws()
+    {
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
+
+        await transport.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("corr-late")));
+    }
+
+    [Fact]
     public async Task WorkerTransport_WhenPublishIsCanceled_PropagatesCancellation()
     {
         var publisher = new FakePublisherClient

@@ -4,16 +4,21 @@
   <img src="icon.png" alt="AsyncResponse Icon" width="128" />
 </p>
 
-**Await responses from message brokers and background workers as if they were local async calls — with optional durable, domain-aware recovery when your process dies mid-wait.**
+<p align="center"><b>
+Await responses from message brokers, webhooks, and background workers as if they were local async calls —
+with optional durable, domain-aware recovery when your process dies mid-wait.
+</b></p>
 
-[![CI](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg)](https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml)
-[![NuGet](https://img.shields.io/nuget/v/AsyncResponse.Channels.Redis.svg)](https://www.nuget.org/packages/AsyncResponse.Channels.Redis)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml"><img src="https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://www.nuget.org/packages/AsyncResponse.Core"><img src="https://img.shields.io/nuget/v/AsyncResponse.Core.svg" alt="NuGet"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
 ```csharp
 OrderResult result = await asyncResponse
     .For<OrderResult>()                                       // correlation id generated for you
-    .WithTimeout(TimeSpan.FromMinutes(10))
+    .WithTimeout(TimeSpan.FromMinutes(10))                    // waits are never infinite
     .Until(r => r.Status != OrderStatus.Processing)           // consume progress messages
     .WaitAsync(context =>                                     // looks sync, is fully async
         paymentGateway.StartAsync(orderId, context.CorrelationId)); // sent only AFTER subscribing
@@ -29,19 +34,38 @@ queue. Correlating that answer back to the code that asked for it usually means 
 `TaskCompletionSource` registries, polling loops, or callback spaghetti.
 
 And then the hard part: **your service redeploys while it's waiting.** The in-memory waiter is gone.
-The response arrives anyway. If you drop it, the flow hangs "in progress" forever; if you blindly
-resume it, you just resumed the **happy path on a failed response**.
+The response arrives anyway. Drop it and the flow hangs "in progress" forever; blindly resume it and
+you just resumed the **happy path on a failed response**.
 
-AsyncResponse solves the core correlation problem without requiring infrastructure, and lets you add
-durable recovery when the flow needs it:
+AsyncResponse solves the correlation problem with zero infrastructure, and lets you add durable
+recovery when a flow needs it.
 
-1. **Correlation** — `await` a response by correlation id, with fluent timeouts, progress predicates,
-   and race-free triggering. `AsyncResponse.Core` ships a process-local response channel for simple
-   apps and tests.
-2. **Recovery** — every wait records *recovery state* for cleanup and watchdog visibility; durable
-   channels persist it beyond the process. A response that arrives after the waiter died is
-   **classified by its domain outcome** and routed to the right callback: resume the flow, or fail it
-   — never resume a failure.
+## Why AsyncResponse
+
+- **Feels local, runs distributed.** One fluent expression replaces the `TaskCompletionSource`
+  registry, the timeout plumbing, and the correlation bookkeeping.
+- **Race-free by construction.** The request is sent by a *trigger* that runs only after the
+  subscription and recovery state exist, so the first response can never beat its waiter — and a
+  failing trigger tears the registration down. `For<T>()` **requires** a trigger;
+  `For<T>(correlationId)` (attaching to an operation started elsewhere) **forbids** one. The
+  compiler enforces the difference.
+- **Progress-aware waits.** `Until(...)` consumes progress messages and completes only on the
+  terminal one — no extra queues, no hand-rolled state machine.
+- **Recovery that understands your domain.** A response that arrives after its waiter died is
+  classified by the payload's `ShouldResumeOnRecovery()` and routed to a durable resume or failure
+  callback. A failed response is **never** blindly resumed.
+- **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL. Worker
+  transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS
+  JetStream, PostgreSQL. Every combination works; your flow code never changes.
+- **One contract everywhere.** Schema-versioned wire envelopes, capped remote stack traces,
+  ambient-context restoration into foreign callback threads, and identical `Until`/recovery
+  semantics on every channel — switching infrastructure is a DI change, not a rewrite.
+- **Built to operate.** Recovery watchdog + readiness health check, `ActivitySource` tracing and
+  `System.Diagnostics.Metrics` under the `"AsyncResponse"` source/meter, OpenTelemetry messaging
+  attributes on the transports, and an opt-in callback authorization allowlist.
+- **Fast where it counts.** Benchmark-tuned hot path — a complete in-memory round trip
+  (subscribe → publish → complete) runs in well under a microsecond; broker channels deliver by
+  push, not polling. See [Performance](#performance).
 
 ## How it works
 
@@ -72,60 +96,68 @@ Three layers, one decision each, made exactly where its deciding fact is knowabl
 | **Response channel** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
 | **Lost-subscriber dispatcher** | "Should this late response resume the flow?" | `ShouldResumeOnRecovery()` true → resume callback. false (or unclassifiable) → failure callback. |
 
-A failed payload is **still a valid response** for an active waiter (your `Until` predicate and flow
-code want to see it — persist details, decide to retry, throw a rich domain error).
+A failed payload is **still a valid response** for an active waiter — your `Until` predicate and
+flow code want to see it (persist details, decide to retry, throw a rich domain error).
 `ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
-somebody has to make the call. See [docs/recovery.md](docs/recovery.md) for the full model.
+somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
 
-## Packages
+## Pick your channel and transport
 
-| Package | What's inside |
+A **channel** delivers responses to waiters and persists recovery state. A **transport** moves
+worker jobs and inbound responses through a broker. They are independent axes — pair any channel
+with any transport.
+
+**Channels** (`AsyncResponse.Channels.*`) — exactly one required:
+
+| Channel | Delivery | Recovery durability |
+|---|---|---|
+| In-memory (in `Core`) | in-process | process lifetime |
+| Redis | pub/sub push, zero polling | TTL'd Redis keys |
+| NATS | core request/reply — "no responders" is a positive lost-waiter signal | JetStream Key-Value |
+| PostgreSQL | `LISTEN/NOTIFY` wake + table rows — notifications carry only ids, so payload size is unbounded | row per waiter registration, database-clock TTLs |
+
+**Transports** (`AsyncResponse.Transports.*`) — exactly one required:
+
+| Transport | Broker mechanics |
 |---|---|
-| `AsyncResponse.Core` | Fluent registration + waiter builder, process-local response channel and recovery store, transport-neutral ingress, outcome classifier, expression-based callbacks, in-memory worker queue, and the recovery watchdog + readiness health check. |
-| `AsyncResponse.Channels.Redis` | Optional durable Redis response channel and recovery-state store; the Core watchdog and health check work against it automatically. |
-| `AsyncResponse.Channels.NATS` | Optional NATS response channel (Core request/reply) and durable JetStream Key-Value recovery-state store; the Core watchdog and health check work against it automatically. |
-| `AsyncResponse.Channels.PostgreSQL` | Optional PostgreSQL response channel using `LISTEN/NOTIFY` plus durable recovery-state tables; the Core watchdog and health check work against it automatically. |
-| `AsyncResponse.Transports.Redis` | Optional Redis Streams worker transport and hosted subscribers for worker jobs and response ingress, with consumer-group ACKs, pending-entry retry, and dead-lettering. |
-| `AsyncResponse.Transports.AzureServiceBus` | Optional Azure Service Bus queue transport and hosted subscribers for worker jobs and response ingress, with peek-lock ACKs, bounded redelivery, and emulator-backed integration tests. |
-| `AsyncResponse.Transports.GooglePubSub` | Optional Google Pub/Sub worker transport and hosted subscribers for worker jobs and response ingress. |
-| `AsyncResponse.Transports.RabbitMQ` | Optional RabbitMQ worker transport and hosted subscribers for worker jobs and response ingress. |
-| `AsyncResponse.Transports.NATS` | Optional NATS JetStream worker transport and hosted subscribers for worker jobs and response ingress, with explicit ACKs, bounded redelivery, and dead-lettering. |
-| `AsyncResponse.Transports.PostgreSQL` | Optional PostgreSQL queue-table worker transport and hosted response-ingress subscribers, with `FOR UPDATE SKIP LOCKED`, bounded redelivery, and dead-lettering. |
-| `AsyncResponse.Abstractions` | Contracts only — reference from class libraries that define payloads or flows. |
+| In-memory (in `Core`) | in-process queue |
+| Redis | Redis Streams consumer groups, pending-entry retry, poison-entry discard, dead-lettering |
+| RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
+| Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
+| Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
+| NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
+| PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
 
-Package naming follows the extension point: `AsyncResponse.Channels.*` packages provide
-response/recovery channels; `AsyncResponse.Transports.*` packages provide broker transports for
-workers and ingress.
+Every transport ships hosted subscribers for worker jobs and response ingress with two ACK modes:
+the default acknowledges only after your handler completes; opt-in **early ACK** trades that
+guarantee for throughput, with an explicitly bounded in-process queue, a drain budget validated
+against host shutdown, and post-ACK failures surfaced through `OnBackgroundFailure`. Per-transport
+semantics: [docs/configuration.md](docs/configuration.md).
+
+`AsyncResponse.Abstractions` holds contracts only — reference it from class libraries that define
+payloads or flows.
 
 ## Installation
 
 ```bash
 dotnet add package AsyncResponse.Core
 
-# Optional durable channels:
-dotnet add package AsyncResponse.Channels.Redis
-dotnet add package AsyncResponse.Channels.NATS
-dotnet add package AsyncResponse.Channels.PostgreSQL
+# exactly one channel (skip for in-memory):
+dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL
 
-# Optional transports:
-dotnet add package AsyncResponse.Transports.Redis
-dotnet add package AsyncResponse.Transports.AzureServiceBus
-dotnet add package AsyncResponse.Transports.GooglePubSub
-dotnet add package AsyncResponse.Transports.RabbitMQ
-dotnet add package AsyncResponse.Transports.NATS
-dotnet add package AsyncResponse.Transports.PostgreSQL
+# exactly one transport (skip for in-memory):
+dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL
 ```
+
+Targets .NET 8 and .NET 10.
 
 ## Quick start
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
-exactly one channel and exactly one transport. An app that starts without either fails fast at host
-startup, so a misconfiguration can never silently hang every waiter or drop worker dispatch.
+exactly one of each. An app that starts without either fails fast at host startup, so a
+misconfiguration can never silently hang every waiter or drop worker dispatch.
 
-### Core-only, no external dependencies
-
-Use this when you want the async-response pattern without durable recovery. Waiters and recovery
-state live in the current process.
+### In-memory — no external dependencies
 
 ```csharp
 using AsyncResponse;
@@ -133,14 +165,14 @@ using AsyncResponse;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddAsyncResponse()   // engine: fluent builder, ingress, recovery watchdog
-    .WithInMemoryChannel()            // process-local response channel + recovery store (required)
-    .WithInMemoryTransport();         // in-process worker transport (required)
+    .WithInMemoryChannel()            // process-local response channel + recovery store
+    .WithInMemoryTransport();         // in-process worker transport
 ```
 
-### Redis-backed response channel and recovery
+The full programming model, process-local: ideal for single-node apps, prototypes, and tests.
+Waiters and recovery state disappear with the process.
 
-Use this when waiters may die during redeploys and late responses must resume/fail the owning flow
-durably.
+### Durable recovery — Redis channel
 
 ```csharp
 using AsyncResponse;
@@ -151,68 +183,45 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<IConnectionMultiplexer>(
     _ => ConnectionMultiplexer.Connect("localhost:6379"));
 
-builder.Services.AddAsyncResponse()                // engine + recovery watchdog (on by default)
-    .WithRedisChannel()                            // Redis response channel + Redis recovery store
-    .WithInMemoryTransport();                      // in-process worker transport
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()                    // Redis response channel + Redis recovery store
+    .WithInMemoryTransport();
+
 builder.Services.AddHealthChecks()
-    .AddAsyncResponseRecoveryCheck();              // optional: surface the watchdog on /readyz
+    .AddAsyncResponseRecoveryCheck();      // optional: surface the watchdog on /readyz
 ```
 
-`.WithRedisChannel()` also registers `IRecoverableAsyncResponseBuilder`. Use ordinary
-`IAsyncResponseBuilder` for normal request/response waits; inject `IRecoverableAsyncResponseBuilder`
-only in flows that register lost-subscriber callbacks (the `OnLostSubscriber*` methods are absent on
-the in-memory channel at compile time). See [docs/recovery.md](docs/recovery.md).
+A durable channel also registers `IRecoverableAsyncResponseBuilder`, which adds the
+`OnLostSubscriber*` callback methods. Keep injecting plain `IAsyncResponseBuilder` for ordinary
+waits — the recovery API doesn't exist on it, so flows that don't opt in can't misuse it at compile
+time. See [docs/recovery.md](docs/recovery.md).
 
-### Azure Service Bus transport with a durable channel
+### Broker transport — Azure Service Bus
 
-Use this when worker jobs and external response ingress should flow through Azure Service Bus queues.
-Azure Service Bus is a transport only: pair it with a channel such as Redis, NATS, or PostgreSQL for
-active waiters and lost-subscriber recovery.
+Transports pair with any channel; here Redis holds waiters/recovery while Service Bus queues move
+worker jobs and inbound responses.
 
 ```csharp
-using AsyncResponse;
-using AsyncResponse.Transports.AzureServiceBus;
-using StackExchange.Redis;
-
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddSingleton<IConnectionMultiplexer>(
-    _ => ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")!));
-
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel(options =>
-    {
-        options.KeyPrefix = "orders";
-    })
+    .WithRedisChannel()
     .WithAzureServiceBusTransport(options =>
     {
         options.ConnectionString = builder.Configuration.GetConnectionString("AzureServiceBus");
         options.WorkerQueue = "orders-worker";
         options.ResponseQueue = "orders-response";
         options.CorrelationIdProperty = "correlationId";
-
-        // Early ACK is opt-in: complete the Service Bus message after bounded enqueue, then
-        // process on background workers. Handler failures after completion are reported through
-        // OnBackgroundFailure because Service Bus cannot dead-letter an already-completed message.
-        options.WorkerSubscriber.UseAckAfterReceive(
-            backgroundWorkerCount: 4,
-            backgroundQueueCapacity: 256,
-            backgroundDrainTimeout: TimeSpan.FromSeconds(30));
     });
 ```
 
-You may also register your own singleton `Azure.Messaging.ServiceBus.ServiceBusClient` (for example
-one constructed with Azure Identity credentials) before calling `.WithAzureServiceBusTransport(...)`;
-the package reuses it instead of constructing a client from `ConnectionString`.
+Need more throughput than ack-per-handler? Opt into early ACK with
+`options.WorkerSubscriber.UseAckAfterReceive(backgroundWorkerCount: 4, backgroundQueueCapacity: 256)`
+— messages are completed after bounded enqueue and processed by background workers, with failures
+reported through `OnBackgroundFailure`.
 
-### PostgreSQL-backed channel and transport
+### Everything on PostgreSQL
 
-Use this when PostgreSQL is already your durable infrastructure and you do not want to add Redis just
-for async-response recovery. The channel stores response envelopes in a PostgreSQL table and wakes
-waiters with `LISTEN/NOTIFY`; notifications carry only a message id, so large payloads are not limited
-by PostgreSQL's NOTIFY payload cap. Recovery state is row-per-waiter registration. The transport uses
-one queue table for worker, response-ingress, and dead-letter rows, claiming work with
-`FOR UPDATE SKIP LOCKED`.
+Use this when PostgreSQL is already your durable infrastructure and you don't want to add a broker
+just for async-response recovery.
 
 ```csharp
 using AsyncResponse;
@@ -220,65 +229,32 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// The channel/transport are table-backed and chatty, so tune the pooled connection string:
-//   No Reset On Close=true  — skip the per-checkin DISCARD ALL (otherwise the single most-executed
-//                             statement under load) and keep auto-prepared statements alive across reuse.
-//   Max Auto Prepare=20     — auto-prepare the recurring queries, cutting parse/plan CPU on the server.
-// Both roughly halve server-side work under load. (LISTEN runs only on dedicated long-lived
-// connections, so skipping reset on the pooled query connections is safe.)
 builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(
-    builder.Configuration.GetConnectionString("PostgreSQL")! + ";No Reset On Close=true;Max Auto Prepare=20"));
+    builder.Configuration.GetConnectionString("PostgreSQL")!));
 
 builder.Services.AddAsyncResponse()
-    .WithPostgreSqlChannel(options =>
+    .WithPostgreSqlChannel()               // LISTEN/NOTIFY channel + row-per-waiter recovery
+    .WithPostgreSqlTransport(options =>    // queue table, FOR UPDATE SKIP LOCKED
     {
-        options.SchemaName = "public";
-        options.RecoveryStateTable = "asyncresponse_recovery_state";
-        options.MessageTable = "asyncresponse_channel_messages";
-        options.SubscriberTable = "asyncresponse_channel_subscribers";
-        options.NotificationChannel = "asyncresponse_channel_notify";
-    })
-    .WithPostgreSqlTransport(options =>
-    {
-        options.MessageTable = "asyncresponse_transport_messages";
-        options.WorkerQueue = "worker";
-        options.ResponseQueue = "response";
-        options.DeadLetterQueue = "deadletter";
         options.WorkerSubscriber.UseAckAfterReceive(
             backgroundWorkerCount: 4,
             backgroundQueueCapacity: 256);
     });
 ```
 
-The two packages share the same `NpgsqlDataSource` but use separate table sets:
+The channel and transport share the `NpgsqlDataSource` but use separate table sets, and schema
+creation is serialized across app instances with an advisory lock (set `AutoCreateSchema = false`
+when migrations own the schema). Table names, delivery-confirmation mechanics, and the
+connection-string settings worth tuning under load (`No Reset On Close`, `Max Auto Prepare`) are in
+[docs/postgresql.md](docs/postgresql.md).
 
-| Area | Storage | Runtime behavior |
-|---|---|---|
-| Channel messages | `MessageTable` (`asyncresponse_channel_messages`) | Inserts a response envelope, sends a small `NOTIFY`, then waits for live delivery confirmation. If no waiter confirms before `DeliveryConfirmationTimeout`, the row is atomically claimed for lost-subscriber recovery. |
-| Recovery state | `RecoveryStateTable` (`asyncresponse_recovery_state`) | One row per waiter registration, so shared correlation ids recover every registered callback instead of only one. |
-| Live subscribers | `SubscriberTable` (`asyncresponse_channel_subscribers`) | Short-lived heartbeat rows let publishers distinguish "no subscribers" from "subscriber should confirm delivery". |
-| Transport queue | `MessageTable` (`asyncresponse_transport_messages`) | Worker and response-ingress rows are claimed with `FOR UPDATE SKIP LOCKED`; failed rows are redelivered or moved to `DeadLetterQueue`. |
+### The other combinations
 
-Set `AutoCreateSchema = false` on either options object when migrations provision the schema. Channel
-and transport schema creation take the same PostgreSQL advisory lock for a shared schema, avoiding the
-`CREATE SCHEMA IF NOT EXISTS` race that can otherwise appear when multiple app instances start at
-once.
+Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithRedisTransport()`,
+`.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`, `.WithNatsTransport()` — every channel,
+transport, and option is documented in [docs/configuration.md](docs/configuration.md).
 
-Key channel options: `SchemaName`, `RecoveryStateTable`, `MessageTable`, `SubscriberTable`,
-`NotificationChannel`, `RecoveryStateExpiry`, `DefaultTimeout`, `MessageRetention`,
-`DeliveryConfirmationTimeout`, `DeliveryConfirmationPollInterval`, `ListenerPollInterval`,
-`PendingMessageBatchSize`, `SubscriberHeartbeatInterval`, `SubscriberHeartbeatTimeout`,
-`PublishMaxAttempts`, and `PruneInterval`.
-
-Key transport options: `SchemaName`, `MessageTable`, `NotificationChannel`, `WorkerQueue`,
-`ResponseQueue`, `DeadLetterQueue`, `LockTimeout`, `WorkerSubscriber`, `ResponseSubscriber`,
-`DeadLetterEnabled`, `DeadLetterRetention`, `CorrelationIdHeader`, `CorrelationIdJsonPaths`,
-`PublishMaxAttempts`, and subscriber `AckMode`/`MaxDeliveryAttempts`/`RedeliveryDelay`.
-`AckAfterReceive` deletes a row as soon as it is accepted into a bounded in-process queue; handler
-failures after that point are logged, reported through `OnBackgroundFailure`, and dead-lettered when
-enabled.
-
-### Define a payload and await a response
+## Define a payload and await it
 
 Every payload implements `IAsyncResponsePayload` — a marker that also keeps scalars out of `For<T>()`:
 
@@ -299,16 +275,14 @@ public async Task<OrderResult> PlaceOrderAsync(int orderId)
 }
 ```
 
-The `WaitAsync` trigger is the race-killer: the request is sent **after** the subscription and
-recovery state exist, so the first response can never arrive before anyone is listening, and a
-failing trigger tears the registration down. Rule of thumb: *never send the request yourself — pass
-the send as the trigger.* `For<T>(correlationId)` instead *attaches* to an operation already started
-elsewhere, and its `WaitAsync()` takes no trigger.
+Rule of thumb: **never send the request yourself — pass the send as the trigger.** That is what
+makes the subscribe-before-send guarantee hold. Use `For<T>(correlationId)` to *attach* to an
+operation already started elsewhere; its `WaitAsync()` takes no trigger.
 
 `IAsyncResponseWaiter<T>` is `IAsyncDisposable` — use `await using` if you hold a waiter directly.
 `IAsyncResponsePublisher.SetResponse`/`SetException` accept an optional `CancellationToken`.
 
-### Deliver responses, recover, enqueue workers
+## Deliver responses, recover, enqueue workers
 
 ```csharp
 // Feed raw broker/webhook JSON into the transport-neutral ingress:
@@ -321,9 +295,57 @@ await publisher.SetResponse(new OrderResult { Status = OrderStatus.Completed }, 
 await _asyncResponse.EnqueueWorkerAsync<IOrderFlow>(flow => flow.ProcessOrderAsync(orderId));
 ```
 
-For durable lost-subscriber recovery callbacks, broker transports (Redis Streams, Azure Service Bus,
-Google Pub/Sub, RabbitMQ, NATS JetStream, PostgreSQL), reply targets, ambient-context propagation,
-timeouts/cancellation, and the watchdog, see the docs below.
+Durable lost-subscriber callbacks, reply targets, ambient-context propagation, timeouts and
+cancellation, and the watchdog are covered in the [docs](#documentation).
+
+## Performance
+
+- A complete in-memory round trip — create waiter, publish, complete, clean up — benchmarks at
+  **≈0.7–0.8 µs with ≈1.3–1.6 KB allocated** end-to-end (Apple M4 Pro, .NET 10).
+- Hot paths are allocation-conscious by design: single-subscriber fast paths, cached
+  `JsonEncodedText` envelope fields with a hand-rolled `Utf8JsonReader` converter, memoized raw-JSON
+  materialization shared across waiters, and log/trace/metric gating so observability costs nothing
+  when disabled.
+- Broker channels deliver by push (Redis pub/sub, NATS request/reply, PostgreSQL `LISTEN/NOTIFY`) —
+  no polling on the response hot path.
+- Every wait has a timeout (defaulted when unset) and a single-winner terminal state, so abandoned
+  waiters clean themselves up — no leaked registrations under load.
+
+Benchmarks, a 17-scenario stress harness, and NBomber load tests run in CI on every push;
+per-commit trends with regression alerting are published to the
+[live benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/). Methodology:
+[docs/operations.md](docs/operations.md).
+
+## How it's tested
+
+- **700+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+  parallel waiters with cross-correlation leak detection, duplicate-execution detection).
+- **90 integration tests** drive the shipped sample app black-box over HTTP against **real
+  brokers** — Redis, NATS, PostgreSQL, RabbitMQ containers plus the official Azure Service Bus and
+  Google Pub/Sub emulators — orchestrated by .NET Aspire, with a dedicated early-ACK app instance
+  per transport.
+- A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,
+  duplicated, or leaked responses) and fails CI on violation; NBomber load profiles include a
+  destructive recovery scenario.
+- Docs are kept code-true: option defaults, metric/span names, and behavior claims are verified
+  against the source.
+
+## When to use it — and when not
+
+**Reach for AsyncResponse when**
+
+- a flow needs the *answer* to a specific request that arrives asynchronously — job results,
+  payment confirmations, DAG completions, webhook callbacks;
+- you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
+- waits must survive redeploys, and a late **failure** must never be resumed as a success.
+
+**Reach for something else when**
+
+- you need multi-step orchestration with compensation — that's a workflow engine (Temporal, Durable
+  Task, MassTransit sagas). AsyncResponse deliberately owns one decision: deliver this response to
+  its waiter, or route it to the right recovery callback.
+- you need fire-and-forget pub/sub fan-out with nobody waiting — that's your message bus, and
+  AsyncResponse coexists with it happily.
 
 ## Documentation
 
@@ -341,10 +363,8 @@ timeouts/cancellation, and the watchdog, see the docs below.
   load testing.
 - **[PostgreSQL](docs/postgresql.md)** — channel/transport architecture, schema, delivery
   confirmation, ACK modes, and operational tuning.
-- **[Sample app](docs/sample.md)** — the runnable testbed and curl walkthroughs for every scenario.
-
-Transports, reply targets, and ambient-context propagation are covered alongside their configuration
-in [docs/configuration.md](docs/configuration.md) and the per-transport Quick start examples.
+- **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
+  scenario.
 
 ## License
 

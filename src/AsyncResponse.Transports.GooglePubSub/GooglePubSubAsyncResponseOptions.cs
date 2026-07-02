@@ -69,6 +69,12 @@ public sealed class GooglePubSubAsyncResponseOptions
         "DagJsonParameters.CorrelationId"
     ];
 
+    /// <summary>Initial delay before restarting a failed hosted subscriber.</summary>
+    public TimeSpan SubscriberRetryBaseDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Maximum delay between restarts of a repeatedly failing hosted subscriber.</summary>
+    public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
+
     /// <summary>How long hosted subscribers/publishers are allowed to shut down gracefully.</summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
 

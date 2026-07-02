@@ -99,8 +99,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
             AsyncResponseDiagnostics.SetError(activity, ex);
-            subscription.TrySetException(ex);
             await subscription.CleanupOnceAsync().ConfigureAwait(false);
+
+            // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
+            // the trigger runs only once the subscription AND recovery state exist. A returned
+            // waiter would still let the trigger fire the remote operation with no registration
+            // left to receive (or recover) its response. Cleanup cancels ResponseTask, so no
+            // pending task is left behind.
+            throw;
         }
 
         return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.CleanupOnceAsync);
@@ -140,14 +146,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (subscribers.Count == 0)
             {
                 var result = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => SnapshotSubscribers(correlationId).Count > 0)
                     .ConfigureAwait(false);
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
+                if (!result.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
-                return;
+                    return;
+                }
+
+                // A waiter registered between the snapshot and the recovery-state read — deliver
+                // live instead of consuming its registration.
+                subscribers = SnapshotSubscribers(correlationId);
+                activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             }
 
             await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
@@ -184,14 +204,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (subscribers.Count == 0)
             {
                 var result = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response.DeserializeUntyped(), ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response.DeserializeUntyped(),
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => SnapshotSubscribers(correlationId).Count > 0)
                     .ConfigureAwait(false);
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
+                if (!result.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
-                return;
+                    return;
+                }
+
+                // A waiter registered between the snapshot and the recovery-state read — deliver
+                // live instead of consuming its registration.
+                subscribers = SnapshotSubscribers(correlationId);
+                activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             }
 
             await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
@@ -563,13 +597,25 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         private async Task StartCleanupAsync()
         {
             Volatile.Write(ref _cleanupStarted, 1);
+
+            // A waiter disposed before any terminal signal must not leave ResponseTask pending
+            // forever for callers that hold it directly. Cancellation is a no-op after a normal
+            // completion, timeout, or fault.
+            TrySetCanceled();
+
             try
             {
-                _owner.RemoveSubscription(CorrelationId, Id);
+                // Delete the recovery state BEFORE removing the subscription. In the reverse order
+                // a publish landing in the window sees "no subscriber, state present" and fires a
+                // spurious recovery callback for a wait that already reached a terminal state. In
+                // this order the window shows a subscriber that drops the message (CleanupStarted)
+                // — a late or duplicate terminal message is droppable; a resurrected recovery
+                // callback is not.
                 await _owner._recoveryStateStore.TryDeleteAsync(CorrelationId, Id).ConfigureAwait(false);
             }
             finally
             {
+                _owner.RemoveSubscription(CorrelationId, Id);
                 await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 _timeoutCts.Dispose();
                 _activity?.Dispose();
@@ -586,6 +632,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         /// <summary>Attempts to fault the concrete waiter task.</summary>
         public abstract void TrySetException(Exception exception);
+
+        /// <summary>Attempts to cancel the concrete waiter task (dispose before any terminal signal).</summary>
+        public abstract void TrySetCanceled();
 
         /// <summary>Returns cleanup as a task for dispatch paths that already operate on <see cref="Task"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -767,6 +816,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// <inheritdoc />
         public override void TrySetException(Exception exception)
             => _tcs.TrySetException(exception);
+
+        /// <inheritdoc />
+        public override void TrySetCanceled()
+            => _tcs.TrySetCanceled();
     }
 }
 

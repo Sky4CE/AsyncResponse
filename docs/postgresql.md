@@ -107,7 +107,10 @@ Recommended Npgsql connection-string settings:
 - Use simple PostgreSQL identifiers for schema/table/notification names: letters, digits, and
   underscores, not starting with a digit.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
-  rows to decide whether to wait for live delivery.
+  rows to decide whether to wait for live delivery. Heartbeat upserts retry on transient database
+  errors (logged at Warning) — a subscriber row only expires if upserts keep failing for longer
+  than `SubscriberHeartbeatTimeout`, so leave headroom for more than one interval inside the
+  timeout.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery, but short
   enough that a truly lost subscriber routes to recovery promptly.
 - Set `DeadLetterRetention` if operators do not inspect dead-letter rows indefinitely.

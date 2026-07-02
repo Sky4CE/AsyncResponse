@@ -453,7 +453,7 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
-    public async Task CreateResponseWaiter_WhenRecoverySaveFails_ReturnsFaultedWaiterAndCleansSubscription()
+    public async Task CreateResponseWaiter_WhenRecoverySaveFails_ThrowsAndCleansSubscription()
     {
         var services = new ServiceCollection().BuildServiceProvider();
         var store = new Mock<IRecoveryStateStore>();
@@ -482,12 +482,11 @@ public class InMemoryAsyncResponseTests
             new AsyncResponseContextPropagation([]),
             NullLogger<InMemoryAsyncResponseChannel>.Instance);
 
-        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
-            CorrelationId,
-            timeout: TimeSpan.FromSeconds(5));
-
+        // Must throw rather than return a pre-faulted waiter: the builder's contract is that the
+        // trigger only runs once the subscription AND recovery state exist, so a save failure has
+        // to surface before any trigger could fire the remote operation.
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+            channel.CreateResponseWaiter<OperationResult>(CorrelationId, timeout: TimeSpan.FromSeconds(5)));
         Assert.Same(failure, ex);
         Assert.Equal(0, await channel.CountActiveSubscribersAsync(CorrelationId));
     }

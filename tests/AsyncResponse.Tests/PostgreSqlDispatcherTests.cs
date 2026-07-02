@@ -302,6 +302,33 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
+    public async Task DisposeAsync_DrainTimeout_RunningWorkerStillDeadLettersAfterDispose()
+    {
+        var calls = new Calls();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(50)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // worker is blocked in the handler
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The drain CTS must stay alive until the worker actually finishes: after the timed-out dispose the
+        // cancelled handler still dead-letters through the background failure path (no ObjectDisposedException).
+        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        Assert.False(calls.DeleteOriginalOnDeadLetter);
+    }
+
+    [Fact]
     public void Constructor_RejectsInvalidSubscriberOptions()
     {
         var ex = Assert.Throws<InvalidOperationException>(() => new PostgreSqlMessageDispatcher(

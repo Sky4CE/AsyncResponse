@@ -162,22 +162,27 @@ internal sealed class PostgreSqlMessageDispatcher : IAsyncDisposable
         try
         {
             await Task.WhenAll(_backgroundWorkers!).WaitAsync(_subscriberOptions.BackgroundDrainTimeout).ConfigureAwait(false);
+            _backgroundCts!.Dispose();
         }
         catch (TimeoutException)
         {
             _logger.LogWarning("PostgreSQL background handlers for {Role} did not drain within {Timeout}.", _role, _subscriberOptions.BackgroundDrainTimeout);
+            await _backgroundCts!.CancelAsync().ConfigureAwait(false);
+
+            // The workers are still running and observe _backgroundCts.Token inside ReadAllAsync, so disposing
+            // it now would throw ObjectDisposedException inside them. Dispose once they actually finish, off
+            // the shutdown path, so the source is not leaked either.
+            _ = Task.WhenAll(_backgroundWorkers!).ContinueWith(
+                _ => _backgroundCts.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
         catch (Exception ex)
         {
+            // WhenAll only completes once every worker has finished, so the source is safe to dispose here.
             _logger.LogDebug(ex, "PostgreSQL background worker drain for {Role} ended with an error.", _role);
-        }
-        finally
-        {
-            if (_backgroundCts is not null)
-            {
-                await _backgroundCts.CancelAsync().ConfigureAwait(false);
-                _backgroundCts.Dispose();
-            }
+            _backgroundCts!.Dispose();
         }
     }
 }

@@ -325,9 +325,9 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Fact]
-    public async Task WorkerTransport_WhenPublishKeepsFailing_Propagates()
+    public async Task WorkerTransport_WhenTransientPublishKeepsFailing_Propagates()
     {
-        var sender = new FakeSender { PublishException = new InvalidOperationException("send failed") };
+        var sender = new FakeSender { PublishException = new ServiceBusException(isTransient: true, "send failed") };
         var transport = new AzureServiceBusWorkerTransport(
             Options.Create(new AzureServiceBusAsyncResponseOptions
             {
@@ -337,10 +337,52 @@ public sealed class AzureServiceBusTransportTests
             }),
             new FakeServiceBusClient { Sender = sender });
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-fail")));
+        var ex = await Assert.ThrowsAsync<ServiceBusException>(() => transport.PublishAsync(WorkerJob("corr-fail")));
 
-        Assert.Equal("send failed", ex.Message);
+        Assert.StartsWith("send failed", ex.Message, StringComparison.Ordinal);
         Assert.Equal(2, sender.SendAttempts);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_NonTransientServiceBusFailure_ThrowsWithoutRetry()
+    {
+        var sender = new FakeSender
+        {
+            PublishException = new ServiceBusException(
+                isTransient: false,
+                "message too large",
+                reason: ServiceBusFailureReason.MessageSizeExceeded)
+        };
+        var transport = new AzureServiceBusWorkerTransport(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                PublishMaxAttempts = 3,
+                PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                PublishRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            new FakeServiceBusClient { Sender = sender });
+
+        await Assert.ThrowsAsync<ServiceBusException>(() => transport.PublishAsync(WorkerJob("corr-too-large")));
+
+        Assert.Equal(1, sender.SendAttempts);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_NonServiceBusFailure_ThrowsWithoutRetry()
+    {
+        var sender = new FakeSender { PublishException = new InvalidOperationException("serialization failed") };
+        var transport = new AzureServiceBusWorkerTransport(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                PublishMaxAttempts = 3,
+                PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                PublishRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            new FakeServiceBusClient { Sender = sender });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("corr-fatal")));
+
+        Assert.Equal(1, sender.SendAttempts);
     }
 
     [Fact]
@@ -751,7 +793,7 @@ public sealed class AzureServiceBusTransportTests
             if (FailuresBeforeSuccess > 0)
             {
                 FailuresBeforeSuccess--;
-                throw new InvalidOperationException("transient send failed");
+                throw new ServiceBusException(isTransient: true, "transient send failed");
             }
 
             if (PublishException is not null)

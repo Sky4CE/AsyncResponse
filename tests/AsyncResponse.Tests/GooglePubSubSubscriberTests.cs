@@ -479,6 +479,68 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task SubscriberService_WhenSubscriberFactoryFails_RetriesWithBackoff()
+    {
+        var client = new FakeSubscriberClient();
+        var attempts = 0;
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Interlocked.Increment(ref attempts) == 1
+                ? Task.FromException<IGooglePubSubSubscriberClient>(new InvalidOperationException("pubsub unreachable"))
+                : Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        // Reaching a live handler proves the loop retried past the failed factory attempt instead of
+        // letting the fault stop the hosted service.
+        var handler = await WaitForHandlerAsync(client);
+        var reply = await handler(new PubsubMessage
+        {
+            MessageId = "message-after-retry",
+            Data = ByteString.CopyFromUtf8("{}")
+        }, CancellationToken.None);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.True(Volatile.Read(ref attempts) >= 2);
+        Assert.Equal(SubscriberClient.Reply.Ack, reply);
+    }
+
+    [Fact]
+    public async Task SubscriberService_WhenStreamingPullFaults_RestartsSubscriber()
+    {
+        var client = new FakeSubscriberClient();
+        var clients = 0;
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            _ => Interlocked.Increment(ref clients) == 1
+                ? Task.FromResult<IGooglePubSubSubscriberClient>(new FaultingSubscriberClient())
+                : Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        // A faulted streaming pull must restart the subscriber, not stop the hosted service.
+        var handler = await WaitForHandlerAsync(client);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.NotNull(handler);
+        Assert.Equal(2, Volatile.Read(ref clients));
+    }
+
+    [Fact]
     public async Task SubscriberClientAdapter_DelegatesStartAndStop()
     {
         Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler =
@@ -718,6 +780,15 @@ public class GooglePubSubSubscriberTests
             _run.TrySetResult();
             return Task.CompletedTask;
         }
+    }
+
+    private sealed class FaultingSubscriberClient : IGooglePubSubSubscriberClient
+    {
+        public Task StartAsync(Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler)
+            => Task.FromException(new InvalidOperationException("streaming pull faulted"));
+
+        public Task StopAsync(SubscriberClient.ShutdownOptions options, CancellationToken cancellationToken)
+            => Task.CompletedTask;
     }
 
     private sealed class ListLogger : ILogger

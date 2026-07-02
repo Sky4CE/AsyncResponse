@@ -280,9 +280,36 @@ internal sealed class PostgreSqlTransportStore
 
         try
         {
-            await InsertAsync(Guid.NewGuid(), _options.DeadLetterQueue, payload, deadHeaders, exception.Message, notify: false, cancellationToken).ConfigureAwait(false);
-            if (deleteOriginal)
-                await AckAsync(id, lockId).ConfigureAwait(false);
+            if (!deleteOriginal)
+            {
+                await InsertAsync(Guid.NewGuid(), _options.DeadLetterQueue, payload, deadHeaders, exception.Message, notify: false, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+
+            // The DLQ insert and the original-row delete must commit atomically: split across two
+            // connections, a crash between them leaves the original row to be redelivered and
+            // dead-lettered again, duplicating the DLQ entry.
+            await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText =
+                $"""
+                INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
+                VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
+                ON CONFLICT (id) DO NOTHING;
+                DELETE FROM {MessageTable} WHERE id = @source_id AND lock_id = @lock_id;
+                """;
+            command.Parameters.AddWithValue("id", Guid.NewGuid());
+            command.Parameters.AddWithValue("queue", _options.DeadLetterQueue);
+            command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
+            command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = JsonSerializer.Serialize(deadHeaders);
+            command.Parameters.AddWithValue("dead_letter_reason", exception.Message);
+            command.Parameters.AddWithValue("source_id", id);
+            command.Parameters.AddWithValue("lock_id", lockId);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         catch

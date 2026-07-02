@@ -121,13 +121,17 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDis
                 await sender.SendMessageAsync(message, cancellationToken).ConfigureAwait(false);
                 return;
             }
-            catch when (attempt < _options.PublishMaxAttempts && !cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (IsTransient(ex) && attempt < _options.PublishMaxAttempts && !cancellationToken.IsCancellationRequested)
             {
                 var delay = RetryDelay(attempt);
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
     }
+
+    /// <summary>Runs the IsTransient operation.</summary>
+    internal static bool IsTransient(Exception exception)
+        => exception is ServiceBusException { IsTransient: true };
 
     private TimeSpan RetryDelay(int failedAttempt)
     {

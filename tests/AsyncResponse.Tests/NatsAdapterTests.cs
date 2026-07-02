@@ -207,9 +207,27 @@ public class NatsKvStoreAdapterTests
             .ThrowsAsync(new NatsKVKeyDeletedException(revision: 1));
         var adapter = CreateAdapter();
 
-        Assert.Equal("value", await adapter.GetAsync("hit", CancellationToken.None));
+        var hit = await adapter.GetAsync("hit", CancellationToken.None);
+        Assert.NotNull(hit);
+        Assert.Equal("value", hit.Value.Value);
         Assert.Null(await adapter.GetAsync("missing", CancellationToken.None));
         Assert.Null(await adapter.GetAsync("deleted", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_MapsRevisionConflictAndMissingKeyToFalse()
+    {
+        _store.Setup(s => s.DeleteAsync("present", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .Returns(ValueTask.CompletedTask);
+        _store.Setup(s => s.DeleteAsync("conflict", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsKVWrongLastRevisionException(new NATS.Client.JetStream.Models.ApiError()));
+        _store.Setup(s => s.DeleteAsync("missing", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsKVKeyNotFoundException());
+        var adapter = CreateAdapter();
+
+        Assert.True(await adapter.TryDeleteAsync("present", 3UL, CancellationToken.None));
+        Assert.False(await adapter.TryDeleteAsync("conflict", 3UL, CancellationToken.None));
+        Assert.False(await adapter.TryDeleteAsync("missing", 3UL, CancellationToken.None));
     }
 
     [Fact]

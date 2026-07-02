@@ -330,11 +330,16 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_WhenCompleteFails_AbandonsForRetry()
+    public async Task AckAfterReceive_WhenCompleteFails_DoesNotAbandonEnqueuedDelivery()
     {
         var calls = new SettlementCalls { CompleteException = new InvalidOperationException("complete failed") };
-        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
-            (_, _) => Task.CompletedTask,
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = (QueuedAzureServiceBusMessageDispatcher)AzureServiceBusMessageDispatcher.Create(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
             new AzureServiceBusAsyncResponseOptions(),
             new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
@@ -343,8 +348,15 @@ public sealed class AzureServiceBusDispatcherTests
 
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
 
+        // The delivery was already handed to a background worker: abandoning it would race a duplicate
+        // redelivery against the in-process execution, so the failed Complete is only logged.
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal(1, calls.Complete);
-        Assert.Equal(1, calls.Abandon);
+        Assert.Equal(0, calls.Abandon);
+
+        // Draining proves the pending counter was not double-decremented for the enqueued delivery.
+        await dispatcher.DisposeAsync();
+        Assert.Equal(0, dispatcher.PendingCount);
     }
 
     [Fact]

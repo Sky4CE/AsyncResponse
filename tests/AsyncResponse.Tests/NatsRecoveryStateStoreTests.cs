@@ -53,6 +53,71 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_CompetingWriteBetweenReadAndWrite_RetriesAndKeepsAllRegistrations()
+    {
+        var first = new RecoveryState
+        {
+            CorrelationId = "corr-cas",
+            RegistrationId = Guid.NewGuid(),
+            PayloadTypeFullName = typeof(OperationResult).FullName
+        };
+        await _store.SaveAsync("corr-cas", first, TimeSpan.FromMinutes(5));
+
+        // A competing waiter registers between our read and our conditional write. The old
+        // read-modify-write overwrote its registration; the CAS loop must retry and keep it.
+        var competing = new RecoveryState
+        {
+            CorrelationId = "corr-cas",
+            RegistrationId = Guid.NewGuid(),
+            PayloadTypeFullName = typeof(OperationResult).FullName
+        };
+        _kv.AfterGet = _ => _store.SaveAsync("corr-cas", competing, TimeSpan.FromMinutes(5));
+
+        var second = new RecoveryState
+        {
+            CorrelationId = "corr-cas",
+            RegistrationId = Guid.NewGuid(),
+            PayloadTypeFullName = typeof(OperationResult).FullName
+        };
+        await _store.SaveAsync("corr-cas", second, TimeSpan.FromMinutes(5));
+
+        var states = await _store.GetAllAsync("corr-cas");
+        Assert.Equal(3, states.Count);
+        Assert.Contains(states, s => s.RegistrationId == first.RegistrationId);
+        Assert.Contains(states, s => s.RegistrationId == competing.RegistrationId);
+        Assert.Contains(states, s => s.RegistrationId == second.RegistrationId);
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_CompetingSaveBetweenReadAndDelete_RetriesAndKeepsCompetingRegistration()
+    {
+        var first = new RecoveryState
+        {
+            CorrelationId = "corr-cas-del",
+            RegistrationId = Guid.NewGuid(),
+            PayloadTypeFullName = typeof(OperationResult).FullName
+        };
+        await _store.SaveAsync("corr-cas-del", first, TimeSpan.FromMinutes(5));
+
+        // The delete reads a single-registration list and would delete the whole key; a competing
+        // registration lands before its conditional delete, which must fail and retry into a
+        // conditional update that removes only the targeted registration.
+        var competing = new RecoveryState
+        {
+            CorrelationId = "corr-cas-del",
+            RegistrationId = Guid.NewGuid(),
+            PayloadTypeFullName = typeof(OperationResult).FullName
+        };
+        _kv.AfterGet = _ => _store.SaveAsync("corr-cas-del", competing, TimeSpan.FromMinutes(5));
+
+        Assert.True(await _store.TryDeleteAsync("corr-cas-del", first.RegistrationId));
+
+        var states = await _store.GetAllAsync("corr-cas-del");
+        var survivor = Assert.Single(states);
+        Assert.Equal(competing.RegistrationId, survivor.RegistrationId);
+    }
+
+    [Fact]
     public async Task GetAsync_ReturnsState_AndBackfillsCorrelationIdFromKey()
     {
         await _store.SaveAsync("corr-a", new RecoveryState { PayloadTypeFullName = typeof(OperationResult).FullName }, TimeSpan.FromMinutes(5));

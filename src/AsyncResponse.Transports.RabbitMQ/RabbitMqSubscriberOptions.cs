@@ -82,9 +82,12 @@ public sealed class RabbitMqSubscriberOptions
     /// <see cref="RabbitMqAsyncResponseOptions.DeadLetterExchange"/> when configured, otherwise dropping it).
     /// Default: <c>0</c>, meaning unlimited — a failing handler requeues forever, which can hot-loop on a poison
     /// message. Set a positive cap (with a dead-letter exchange) to bound retries. The attempt count is read from
-    /// the broker's <c>x-death</c> header and the <c>redelivered</c> flag; counts above 2 require a dead-letter
-    /// path that re-delivers (classic-queue requeues are not counted by the broker). Ignored for
-    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling and never redelivers.
+    /// the broker's <c>x-death</c> header and the <c>redelivered</c> flag; because <c>basic.nack</c> requeue does
+    /// not increment <c>x-death</c>, the resolved attempt never exceeds 2 on its own, so values above 2 only take
+    /// effect when the dead-letter path forms a TTL-retry cycle that re-delivers the message (each dead-letter
+    /// hop increments <c>x-death</c>). A value above 2 without such a cycle behaves like 2 and logs a startup
+    /// warning. Ignored for <see cref="RabbitMqAckMode.AckAfterEnqueue"/>, which acknowledges before handling
+    /// and never redelivers.
     /// </summary>
     public int MaxDeliveryAttempts { get; set; }
 

@@ -45,6 +45,21 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         var queue = QueueName;
         RabbitMqMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
 
+        // basic.nack requeue does not increment the x-death header, so the resolved attempt for a plain
+        // requeued delivery never exceeds 2. Warn once at startup instead of silently never enforcing the cap.
+        if (SubscriberOptions.AckMode is RabbitMqAckMode.AckAfterHandlerCompletes
+            && SubscriberOptions.MaxDeliveryAttempts > 2)
+        {
+            Logger.LogWarning(
+                "RabbitMQ {OptionName} is {MaxDeliveryAttempts} for queue {Queue} ({Role}), but attempts beyond 2 cannot be counted: "
+                + "basic.nack requeue does not increment x-death, so the cap only takes effect once a TTL-retry dead-letter cycle "
+                + "re-delivers the message through a dead-letter exchange.",
+                nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts),
+                SubscriberOptions.MaxDeliveryAttempts,
+                queue,
+                SubscriberRole);
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

@@ -21,12 +21,14 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
-    public async Task HandleWorkerMessageAsync_InvalidPayload_IsContained()
+    public async Task HandleWorkerMessageAsync_InvalidPayload_PropagatesForTransportRetryOrDeadLetter()
     {
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
 
-        await ingress.HandleWorkerMessageAsync("null");
-        await ingress.HandleWorkerMessageAsync("{not-json");
+        // The transport dispatcher owns the retry/dead-letter decision for worker jobs, so a
+        // failing worker message must propagate instead of being acknowledged as a success.
+        await Assert.ThrowsAsync<InvalidDataException>(() => ingress.HandleWorkerMessageAsync("null"));
+        await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync("{not-json"));
     }
 
     private static AsyncResponseIngress CreateIngress(

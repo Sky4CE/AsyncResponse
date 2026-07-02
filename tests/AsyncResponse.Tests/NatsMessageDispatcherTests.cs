@@ -203,4 +203,41 @@ public class NatsMessageDispatcherTests
 
         gate.TrySetResult();
     }
+
+    [Fact]
+    public async Task DisposeAsync_DrainTimeout_RunningWorkerStillCompletesFailurePathAfterDispose()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions
+        {
+            OnBackgroundFailure = ctx =>
+            {
+                failure.TrySetResult(ctx);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterReceive(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 4,
+            backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
+        var dispatcher = CreateDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            },
+            subscriber);
+
+        var rec = new RecordingDelivery();
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2)); // worker is blocked in the handler
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The drain CTS must stay alive until the worker actually finishes: after the timed-out dispose the
+        // cancelled handler still dead-letters and reports through the failure callback (no ObjectDisposedException).
+        var context = await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.IsAssignableFrom<OperationCanceledException>(context.Exception);
+        Assert.Contains(_jetStream.Published, p => p.Subject == DeadLetterSubject);
+    }
 }

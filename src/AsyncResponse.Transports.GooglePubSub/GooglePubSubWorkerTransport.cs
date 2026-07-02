@@ -10,10 +10,18 @@ namespace AsyncResponse.Transports.GooglePubSub;
 /// <summary>
 /// Publishes <see cref="WorkerJobEnvelope"/> messages to a Google Pub/Sub topic.
 /// </summary>
+/// <remarks>
+/// The publisher client is created lazily and re-created on demand: a transient build failure when the
+/// first job is published does not permanently break the transport (a faulted build attempt is not cached).
+/// </remarks>
 public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDisposable
 {
     private readonly GooglePubSubAsyncResponseOptions _options;
-    private readonly Lazy<Task<IGooglePubSubPublisherClient>> _publisher;
+    private readonly Func<Task<IGooglePubSubPublisherClient>> _publisherFactory;
+    private readonly SemaphoreSlim _publisherGate = new(1, 1);
+    private IGooglePubSubPublisherClient? _publisher;
+    private int _disposeGate;
+    private bool _disposed;
 
     /// <summary>Runs the GooglePubSubWorkerTransport operation.</summary>
     public GooglePubSubWorkerTransport(IOptions<GooglePubSubAsyncResponseOptions> options)
@@ -28,7 +36,32 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         _options = options.Value;
         _ = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
         _ = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
-        _publisher = new Lazy<Task<IGooglePubSubPublisherClient>>(publisherFactory);
+        _publisherFactory = publisherFactory;
+    }
+
+    private async Task<IGooglePubSubPublisherClient> GetPublisherAsync(CancellationToken cancellationToken)
+    {
+        var publisher = Volatile.Read(ref _publisher);
+        if (publisher is not null)
+            return publisher;
+
+        await _publisherGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_publisher is not null)
+                return _publisher;
+
+            // Assign only after the await succeeds, so a faulted build attempt is not cached and the next
+            // publish retries instead of awaiting a permanently faulted task.
+            var created = await _publisherFactory().ConfigureAwait(false);
+            _publisher = created;
+            return created;
+        }
+        finally
+        {
+            _publisherGate.Release();
+        }
     }
 
     private static async Task<IGooglePubSubPublisherClient> CreatePublisherAsync(
@@ -72,7 +105,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
             if (!string.IsNullOrWhiteSpace(job.CorrelationId))
                 message.Attributes[_options.CorrelationIdAttribute] = job.CorrelationId;
 
-            var publisher = await _publisher.Value.ConfigureAwait(false);
+            var publisher = await GetPublisherAsync(cancellationToken).ConfigureAwait(false);
             var messageId = await publisher.PublishAsync(message).WaitAsync(cancellationToken).ConfigureAwait(false);
             activity?.SetTag("messaging.message.id", messageId);
         }
@@ -86,10 +119,20 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
     /// <summary>Releases resources held by this instance.</summary>
     public async ValueTask DisposeAsync()
     {
-        if (!_publisher.IsValueCreated)
+        if (Interlocked.Exchange(ref _disposeGate, 1) != 0)
             return;
 
-        var publisher = await _publisher.Value.ConfigureAwait(false);
-        await publisher.ShutdownAsync(_options.ShutdownTimeout).ConfigureAwait(false);
+        await _publisherGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _disposed = true;
+            if (_publisher is not null)
+                await _publisher.ShutdownAsync(_options.ShutdownTimeout).ConfigureAwait(false);
+        }
+        finally
+        {
+            _publisherGate.Release();
+            _publisherGate.Dispose();
+        }
     }
 }

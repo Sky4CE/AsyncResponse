@@ -88,7 +88,8 @@ its own option type; the common shapes are summarized here. See the transport se
 | `LockTimeout` | PostgreSQL | How long a claimed row stays locked before another subscriber may retry it. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus | Receive-loop batch size and long-poll timeout for queue subscribers. |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
-| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports | Redeliveries before dead-lettering. |
+| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub | Redeliveries before dead-lettering. Google Pub/Sub performs redelivery itself — bound attempts with the subscription's `DeadLetterPolicy`. On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. |
+| `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub | Bounded backoff for restarting a failed hosted subscriber (streaming-pull fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
@@ -96,11 +97,22 @@ its own option type; the common shapes are summarized here. See the transport se
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL also unwraps nested JSON strings at those paths. |
 | `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL | Whether poison messages are preserved and, for PostgreSQL, how long dead-letter rows are retained. |
 
+A worker handler failure propagates out of the ingress to the transport dispatcher, which owns the
+retry decision: in `AckAfterHandlerCompletes` the delivery is NACKed/abandoned and redelivered up
+to `MaxDeliveryAttempts`, then dead-lettered; after an early ACK the failure is reported through
+`OnBackgroundFailure` (and written to the transport's own dead-letter queue where one exists). A
+failing worker never completes the waiter by itself — publish a failure response from the worker's
+error handling when the flow should fail fast instead of waiting out its timeout.
+
 Azure Service Bus uses peek-lock settlement. In `AckAfterHandlerCompletes`, a successful handler
 completes the message, failures abandon it until `MaxDeliveryAttempts`, then dead-letter it through
 Service Bus. In `AckAfterReceive`, the message is completed as soon as it enters the bounded
 background queue; later handler failures cannot be broker-dead-lettered because the lock is gone, so
-use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path.
+use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path. Mind the peek-lock
+budget: a receive batch is processed sequentially, so the last message in a batch waits up to
+`MaxMessagesPerReceive × handler latency` before settlement — keep that product well under the
+queue's lock duration (or lower `MaxMessagesPerReceive`) to avoid `MessageLockLostException`
+redeliveries of already-processed messages.
 
 See [postgresql.md](postgresql.md) for PostgreSQL table layout, delivery-confirmation details, and
 connection-string tuning.

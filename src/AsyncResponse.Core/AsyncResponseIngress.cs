@@ -76,6 +76,12 @@ internal sealed class AsyncResponseIngress(
         {
             _logger.LogError(ex, "Ingress worker job execution failed.");
             AsyncResponseDiagnostics.SetError(activity, ex);
+
+            // Propagate: the transport dispatcher owns the retry/dead-letter decision for worker
+            // jobs (per its AckMode and MaxDeliveryAttempts). Swallowing here acknowledged failed
+            // jobs as successes, which disabled redelivery entirely and left the waiter to burn
+            // its full timeout.
+            throw;
         }
     }
 }

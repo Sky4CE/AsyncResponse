@@ -117,6 +117,7 @@ internal class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyn
     private bool _useReplyTarget;
     private string? _replyTargetName;
     private AsyncResponseReplyTarget? _replyTarget;
+    private int _consumed;
 
     internal AsyncResponseBuilder(
         IAsyncResponseSubscriber subscriber,
@@ -205,6 +206,15 @@ internal class AsyncResponseBuilder<T> : IAsyncResponseAttachedBuilder<T>, IAsyn
 
     private async Task<T> WaitCoreAsync(Func<AsyncResponseRequestContext, Task>? trigger)
     {
+        // Builders are single-use: reuse would re-register the SAME correlation id and re-fire
+        // the trigger — exactly the double-send the attached/triggered split exists to prevent.
+        if (Interlocked.Exchange(ref _consumed, 1) != 0)
+        {
+            throw new InvalidOperationException(
+                "This async-response builder has already been awaited. Builders are single-use — " +
+                "call For<T>() again so every wait gets its own correlation id and registration.");
+        }
+
         await using var waiter = await CreateWaiterAsync().ConfigureAwait(false);
         var replyTarget = ResolveReplyTarget();
         var requestContext = new AsyncResponseRequestContext(_correlationId, replyTarget);

@@ -246,15 +246,9 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
         AzureServiceBusTransportDelivery delivery,
         CancellationToken subscriberCancellationToken)
     {
-        try
+        Interlocked.Increment(ref _pendingCount);
+        if (!_queue.Writer.TryWrite(delivery))
         {
-            Interlocked.Increment(ref _pendingCount);
-            if (_queue.Writer.TryWrite(delivery))
-            {
-                await delivery.CompleteAsync().ConfigureAwait(false);
-                return;
-            }
-
             Interlocked.Decrement(ref _pendingCount);
             Logger.LogWarning(
                 "Azure Service Bus background queue rejected message {MessageId} for {Queue}; abandoning for redelivery. Pending={PendingCount}, Running={RunningCount}.",
@@ -263,12 +257,23 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                 PendingCount,
                 RunningCount);
             await delivery.AbandonAsync().ConfigureAwait(false);
+            return;
+        }
+
+        // The delivery now belongs to a background worker, which decrements _pendingCount when it dequeues.
+        // Do not touch the counter or abandon here, even if the Complete below fails — the message is already
+        // executing in-process and abandoning it would trigger a duplicate execution via redelivery.
+        try
+        {
+            await delivery.CompleteAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Interlocked.Decrement(ref _pendingCount);
-            Logger.LogError(ex, "Failed to enqueue Azure Service Bus message {MessageId} for {Queue}; abandoning for redelivery.", delivery.MessageId, _queueName);
-            await delivery.AbandonAsync().ConfigureAwait(false);
+            Logger.LogError(
+                ex,
+                "Failed to complete Azure Service Bus message {MessageId} for {Queue} after enqueue; it is being processed but Service Bus will redeliver it after the lock expires.",
+                delivery.MessageId,
+                _queueName);
         }
     }
 

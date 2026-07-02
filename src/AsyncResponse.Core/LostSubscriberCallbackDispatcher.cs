@@ -18,7 +18,15 @@ namespace AsyncResponse;
 /// <c>true</c> when a callback was invoked successfully — the recovery state is consumed and the
 /// caller should delete it.
 /// </param>
-internal readonly record struct LostSubscriberDispatchResult(bool? ShouldResume, bool CallbackInvoked);
+internal readonly record struct LostSubscriberDispatchResult(bool? ShouldResume, bool CallbackInvoked)
+{
+    /// <summary>
+    /// <c>true</c> when a live subscriber re-appeared between the caller's empty snapshot and the
+    /// recovery-state read. No callback was invoked and no state was consumed — the caller should
+    /// re-snapshot and dispatch live.
+    /// </summary>
+    public bool RetryLive { get; init; }
+}
 
 /// <summary>
 /// The single decision point of the lost-subscriber fallback: when an async response is published
@@ -51,11 +59,19 @@ internal sealed class LostSubscriberCallbackDispatcher(
         string correlationId,
         T response,
         string channel,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<bool>? hasLiveSubscriber = null)
     {
         var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
         if (recoveryStates.Count == 0)
             return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
+
+        // A waiter registers its subscription before saving its recovery state, so a state that is
+        // visible here implies its subscription is visible too. If the caller can now see a live
+        // subscriber, the "nobody listening" premise was a snapshot race — hand the response back
+        // for live delivery instead of consuming the registration and stranding the waiter.
+        if (hasLiveSubscriber?.Invoke() == true)
+            return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
 
         var callbackInvoked = false;
         bool? shouldResume = null;
