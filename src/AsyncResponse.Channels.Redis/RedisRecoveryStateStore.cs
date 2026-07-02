@@ -45,15 +45,41 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             state.RegistrationId = Guid.NewGuid();
 
         var recoveryKey = _keys.RecoveryKey(correlationId);
-        var states = await LoadStatesAsync(recoveryKey, correlationId).ConfigureAwait(false);
-        states.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
-        states.Add(state);
 
-        // ponytail: read-modify-write can lose a genuinely concurrent same-cid registration; use
-        // a Lua append/remove script if this becomes a measured production race.
+        // Optimistic read-modify-write: two waiters registering the same correlation id
+        // concurrently must both survive, so each write commits only while the stored value is
+        // still the one we read (transaction condition), retrying on a conflict.
+        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
+            var states = previous.IsNullOrEmpty
+                ? []
+                : DeserializeStates(previous, recoveryKey, correlationId, logAsError: true);
+            states.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
+            states.Add(state);
+
+            var transaction = _database.CreateTransaction();
+            transaction.AddCondition(previous.IsNull
+                ? Condition.KeyNotExists(recoveryKey)
+                : Condition.StringEqual(recoveryKey, previous));
+            _ = transaction.StringSetAsync(recoveryKey, JsonSerializer.Serialize(states), ttl);
+            if (await transaction.ExecuteAsync().ConfigureAwait(false))
+                return;
+        }
+
+        // Registering recovery must not fail the wait: fall back to last-writer-wins after
+        // sustained contention (pathological for a single correlation id) and say so.
+        _logger.LogWarning(
+            "Recovery-state save for correlationId {CorrelationId} exhausted {Attempts} optimistic attempts; falling back to an unconditional write.",
+            correlationId, MaxCasAttempts);
+        var fallbackStates = await LoadStatesAsync(recoveryKey, correlationId).ConfigureAwait(false);
+        fallbackStates.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
+        fallbackStates.Add(state);
         await _database.StringSetAsync(
             recoveryKey,
-            JsonSerializer.Serialize(states),
+            JsonSerializer.Serialize(fallbackStates),
             ttl).ConfigureAwait(false);
     }
 
@@ -86,23 +112,38 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         cancellationToken.ThrowIfCancellationRequested();
 
         var recoveryKey = _keys.RecoveryKey(correlationId);
-        var states = await LoadStatesAsync(recoveryKey, correlationId).ConfigureAwait(false);
-        if (states.Count == 0)
-            return false;
 
-        var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
-        if (!removed)
-            return false;
+        // Optimistic removal: deleting one registration must not clobber a registration that a
+        // concurrent writer appended between our read and our write.
+        for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
 
-        if (states.Count == 0)
-            return await _database.KeyDeleteAsync(recoveryKey).ConfigureAwait(false);
+            var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
+            if (previous.IsNullOrEmpty)
+                return false;
 
-        await _database.StringSetAsync(
-            recoveryKey,
-            JsonSerializer.Serialize(states),
-            Expiration.KeepTtl,
-            ValueCondition.Always).ConfigureAwait(false);
-        return true;
+            var states = DeserializeStates(previous, recoveryKey, correlationId, logAsError: true);
+            var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
+            if (!removed)
+                return false;
+
+            var transaction = _database.CreateTransaction();
+            transaction.AddCondition(Condition.StringEqual(recoveryKey, previous));
+            if (states.Count == 0)
+                _ = transaction.KeyDeleteAsync(recoveryKey);
+            else
+                _ = transaction.StringSetAsync(recoveryKey, JsonSerializer.Serialize(states), Expiration.KeepTtl, ValueCondition.Always);
+            if (await transaction.ExecuteAsync().ConfigureAwait(false))
+                return true;
+        }
+
+        // Leave the registration for expiry rather than risking a lost concurrent registration
+        // with an unconditional rewrite; the caller treats false as "nothing deleted".
+        _logger.LogWarning(
+            "Recovery-state delete for correlationId {CorrelationId} registration {RegistrationId} exhausted {Attempts} optimistic attempts; leaving the registration for expiry.",
+            correlationId, registrationId, MaxCasAttempts);
+        return false;
     }
 
     /// <inheritdoc />
@@ -135,6 +176,8 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             }
         }
     }
+
+    private const int MaxCasAttempts = 4;
 
     private async Task<List<RecoveryState>> LoadStatesAsync(string recoveryKey, string correlationId)
     {

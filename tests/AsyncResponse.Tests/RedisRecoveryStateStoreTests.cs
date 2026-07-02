@@ -14,6 +14,7 @@ public class RedisRecoveryStateStoreTests
     private readonly Mock<IConnectionMultiplexer> _multiplexer = new();
     private readonly Mock<IDatabase> _database = new();
     private readonly RedisRecoveryStateStore _store;
+    private readonly List<Mock<ITransaction>> _transactions = new();
 
     public RedisRecoveryStateStoreTests()
     {
@@ -27,30 +28,49 @@ public class RedisRecoveryStateStoreTests
             NullLogger<RedisRecoveryStateStore>.Instance);
     }
 
+    /// <summary>
+    /// Wires <see cref="IDatabase.CreateTransaction"/> to hand out one recording transaction per
+    /// CAS attempt; the nth transaction's ExecuteAsync returns the nth result (the last result
+    /// repeats), so a <c>false</c> simulates a condition conflict exactly like Redis.
+    /// </summary>
+    private void SetupTransactions(params bool[] executeResults)
+    {
+        var next = 0;
+        _database
+            .Setup(d => d.CreateTransaction(It.IsAny<object?>()))
+            .Returns(() =>
+            {
+                var transaction = new Mock<ITransaction>();
+                transaction
+                    .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
+                    .ReturnsAsync(true);
+                transaction
+                    .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<Expiration>(), It.IsAny<ValueCondition>(), It.IsAny<CommandFlags>()))
+                    .ReturnsAsync(true);
+                transaction
+                    .Setup(t => t.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+                    .ReturnsAsync(true);
+                var result = executeResults[Math.Min(next++, executeResults.Length - 1)];
+                transaction
+                    .Setup(t => t.ExecuteAsync(It.IsAny<CommandFlags>()))
+                    .ReturnsAsync(result);
+                _transactions.Add(transaction);
+                return transaction.Object;
+            });
+    }
+
+    private static RedisValue WrittenValue(Mock<ITransaction> transaction)
+        => (RedisValue)Assert.Single(
+            transaction.Invocations,
+            invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync)).Arguments[1]!;
+
     [Fact]
     public async Task SaveAsync_ValidatesAndPersistsJsonWithTtl()
     {
-        RedisValue savedValue = default;
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
             .ReturnsAsync(RedisValue.Null);
-        _database
-            .Setup(d => d.StringSetAsync(
-                It.IsAny<RedisKey>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<TimeSpan?>(),
-                It.IsAny<When>(),
-                It.IsAny<CommandFlags>()))
-            .ReturnsAsync(true);
-        _database
-            .Setup(d => d.StringSetAsync(
-                It.IsAny<RedisKey>(),
-                It.IsAny<RedisValue>(),
-                It.IsAny<TimeSpan?>(),
-                It.IsAny<bool>(),
-                It.IsAny<When>(),
-                It.IsAny<CommandFlags>()))
-            .ReturnsAsync(true);
+        SetupTransactions(true);
 
         var state = new RecoveryState
         {
@@ -61,11 +81,12 @@ public class RedisRecoveryStateStoreTests
 
         await _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3));
 
-        var stringSet = Assert.Single(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        var transaction = Assert.Single(_transactions);
+        Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(ITransaction.AddCondition));
+        var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
         Assert.Equal("ar:recovery:corr-a", stringSet.Arguments[0]!.ToString());
         Assert.Equal("EX 180", stringSet.Arguments[2]!.ToString());
-        savedValue = (RedisValue)stringSet.Arguments[1]!;
-        var savedStates = JsonSerializer.Deserialize<List<RecoveryState>>(savedValue.ToString());
+        var savedStates = JsonSerializer.Deserialize<List<RecoveryState>>(((RedisValue)stringSet.Arguments[1]!).ToString());
         var savedState = Assert.Single(savedStates!);
         Assert.Equal("corr-a", savedState!.CorrelationId);
         Assert.NotEqual(Guid.Empty, savedState.RegistrationId);
@@ -159,7 +180,6 @@ public class RedisRecoveryStateStoreTests
     {
         var firstId = Guid.NewGuid();
         var secondId = Guid.NewGuid();
-        RedisValue savedValue = default;
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
             .ReturnsAsync(JsonSerializer.Serialize(new[]
@@ -167,42 +187,116 @@ public class RedisRecoveryStateStoreTests
                 new RecoveryState { RegistrationId = firstId, CorrelationId = "corr-a" },
                 new RecoveryState { RegistrationId = secondId, CorrelationId = "corr-a" }
             }));
+        SetupTransactions(true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", firstId));
+
+        var transaction = Assert.Single(_transactions);
+        Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(ITransaction.AddCondition));
+        var remaining = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(WrittenValue(transaction).ToString())!);
+        Assert.Equal(secondId, remaining.RegistrationId);
+    }
+
+    [Fact]
+    public async Task SaveAsync_CompetingWriteBetweenReadAndWrite_RetriesAndKeepsAllRegistrations()
+    {
+        var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var competing = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+
+        // A competing waiter's registration lands between our read and our conditional write: the
+        // first transaction fails its condition, and the retry re-reads the merged list. The old
+        // read-modify-write overwrote `competing` here.
         _database
-            .Setup(d => d.KeyTimeToLiveAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
-            .ReturnsAsync(TimeSpan.FromMinutes(3));
+            .SetupSequence(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first }))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first, competing }));
+        SetupTransactions(false, true);
+
+        var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", second, TimeSpan.FromMinutes(3));
+
+        Assert.Equal(2, _transactions.Count);
+        var written = JsonSerializer.Deserialize<List<RecoveryState>>(WrittenValue(_transactions[1]).ToString())!;
+        Assert.Equal(3, written.Count);
+        Assert.Contains(written, s => s.RegistrationId == first.RegistrationId);
+        Assert.Contains(written, s => s.RegistrationId == competing.RegistrationId);
+        Assert.Contains(written, s => s.RegistrationId == second.RegistrationId);
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_CompetingSaveBetweenReadAndDelete_RetriesIntoConditionalUpdate()
+    {
+        var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var competing = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+
+        // First read sees only `first`, so the attempt is a whole-key delete — which must fail its
+        // condition because `competing` registered in between; the retry becomes a conditional
+        // update that removes only the targeted registration.
+        _database
+            .SetupSequence(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first }))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first, competing }));
+        SetupTransactions(false, true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", first.RegistrationId));
+
+        Assert.Equal(2, _transactions.Count);
+        Assert.Single(_transactions[0].Invocations, invocation => invocation.Method.Name == nameof(IDatabase.KeyDeleteAsync));
+        var survivor = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(WrittenValue(_transactions[1]).ToString())!);
+        Assert.Equal(competing.RegistrationId, survivor.RegistrationId);
+    }
+
+    [Fact]
+    public async Task SaveAsync_ExhaustedOptimisticAttempts_FallsBackToUnconditionalWrite()
+    {
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        SetupTransactions(false);
         _database
             .Setup(d => d.StringSetAsync(
-                (RedisKey)"ar:recovery:corr-a",
+                It.IsAny<RedisKey>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<TimeSpan?>(),
+                It.IsAny<When>(),
+                It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.StringSetAsync(
+                It.IsAny<RedisKey>(),
                 It.IsAny<RedisValue>(),
                 It.IsAny<Expiration>(),
                 It.IsAny<ValueCondition>(),
                 It.IsAny<CommandFlags>()))
-            .Callback<RedisKey, RedisValue, Expiration, ValueCondition, CommandFlags>((_, value, _, _, _) => savedValue = value)
-            .ReturnsAsync(true);
-        _database
-            .Setup(d => d.StringSetAsync(
-                (RedisKey)"ar:recovery:corr-a",
-                It.IsAny<RedisValue>(),
-                It.IsAny<TimeSpan?>(),
-                It.IsAny<When>(),
-                It.IsAny<CommandFlags>()))
-            .Callback<RedisKey, RedisValue, TimeSpan?, When, CommandFlags>((_, value, _, _, _) => savedValue = value)
-            .ReturnsAsync(true);
-        _database
-            .Setup(d => d.StringSetAsync(
-                (RedisKey)"ar:recovery:corr-a",
-                It.IsAny<RedisValue>(),
-                It.IsAny<TimeSpan?>(),
-                It.IsAny<bool>(),
-                It.IsAny<When>(),
-                It.IsAny<CommandFlags>()))
-            .Callback<RedisKey, RedisValue, TimeSpan?, bool, When, CommandFlags>((_, value, _, _, _, _) => savedValue = value)
             .ReturnsAsync(true);
 
-        Assert.True(await _store.TryDeleteAsync("corr-a", firstId));
+        var state = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3));
 
-        var remaining = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(savedValue.ToString())!);
-        Assert.Equal(secondId, remaining.RegistrationId);
+        // Registration must never fail the wait: after exhausting conditional attempts, the save
+        // degrades to last-writer-wins directly on the database.
+        Assert.Equal(4, _transactions.Count);
+        var fallback = Assert.Single(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        var written = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(((RedisValue)fallback.Arguments[1]!).ToString())!);
+        Assert.Equal(state.RegistrationId, written.RegistrationId);
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_ExhaustedOptimisticAttempts_LeavesRegistrationForExpiry()
+    {
+        var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { first }));
+        SetupTransactions(false);
+
+        Assert.False(await _store.TryDeleteAsync("corr-a", first.RegistrationId));
+
+        // No unconditional delete or write may run — a lost concurrent registration is worse than
+        // one row waiting out its TTL.
+        Assert.Equal(4, _transactions.Count);
+        Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.KeyDeleteAsync));
+        Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
     }
 
     [Fact]

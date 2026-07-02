@@ -63,6 +63,29 @@ public class LostSubscriberRoutingTests
                 It.IsAny<When>(),
                 It.IsAny<CommandFlags>()))
             .ReturnsAsync(true);
+        // Recovery-store writes/deletes now run through a conditioned transaction (optimistic
+        // concurrency). Forward the transaction's operations to the database mock so the existing
+        // Times.Once/Never verifications keep observing them, and commit unconditionally — these
+        // tests exercise routing, not CAS conflicts.
+        var transaction = new Mock<ITransaction>();
+        transaction
+            .Setup(t => t.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey, CommandFlags>((key, flags) => _database.Object.KeyDeleteAsync(key, flags));
+        transaction
+            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<Expiration>(), It.IsAny<ValueCondition>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey, RedisValue, Expiration, ValueCondition, CommandFlags>(
+                (key, value, expiration, condition, flags) => _database.Object.StringSetAsync(key, value, expiration, condition, flags));
+        transaction
+            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
+            .Returns<RedisKey, RedisValue, TimeSpan?, When, CommandFlags>(
+                (key, value, expiry, when, flags) => _database.Object.StringSetAsync(key, value, expiry, when, flags));
+        transaction
+            .Setup(t => t.ExecuteAsync(It.IsAny<CommandFlags>()))
+            .ReturnsAsync(true);
+        _database
+            .Setup(d => d.CreateTransaction(It.IsAny<object?>()))
+            .Returns(transaction.Object);
+
         _multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(_subscriber.Object);
         _multiplexer.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(_database.Object);
 

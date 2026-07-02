@@ -151,10 +151,9 @@ signal of stuck flows. The watchdog also feeds the `asyncresponse.recovery.*` ga
 Recovery state lives in the durable channel's store and survives a redeploy:
 
 - **Redis** — recovery state is stored in Redis keys under `KeyPrefix`, expiring after
-  `RecoveryStateExpiry` (7 days default). The per-correlation registration list is updated with a
-  read-modify-write, so two waiters registering the **same** correlation id at the same instant can
-  lose one registration; prefer distinct correlation ids per waiter, or the NATS/PostgreSQL
-  channels for shared-correlation flows.
+  `RecoveryStateExpiry` (7 days default). Registration-list updates are optimistic
+  (transaction-conditioned compare-and-set with retries), so concurrent registrations for one
+  correlation id all survive.
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
   per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
   revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one
