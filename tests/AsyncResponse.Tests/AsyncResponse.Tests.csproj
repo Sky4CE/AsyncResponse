@@ -39,6 +39,7 @@
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />

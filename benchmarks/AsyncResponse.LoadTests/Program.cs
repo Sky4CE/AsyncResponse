@@ -7,13 +7,14 @@ using NBomber.CSharp;
 
 // End-to-end HTTP load tests of the sample app over the REAL stack (durable channels + broker/table
 // transports), driven with NBomber. By default it boots Redis + Pub/Sub emulator + Azure Service Bus
-// emulator + RabbitMQ + NATS + PostgreSQL sample SUTs via Aspire (Docker required) and loads a broad,
-// non-destructive scenario mix; pass --url to target an already-running instance instead.
+// emulator + RabbitMQ + NATS + PostgreSQL + Kafka sample SUTs via Aspire (Docker required) and loads a
+// broad, non-destructive scenario mix; pass --url to target an already-running instance instead.
 //
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --rate 20 --duration 60
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile azure-servicebus
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile pubsub
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile kafka
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile rabbitmq
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile postgresql
@@ -25,6 +26,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --azure-servicebus-url http://localhost:5010 --azure-servicebus-early-ack-url http://localhost:5011 --profile azure-servicebus
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --rabbitmq-url http://localhost:5002 --rabbitmq-early-ack-url http://localhost:5003 --profile rabbitmq
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --redis-url http://localhost:5004 --redis-early-ack-url http://localhost:5005 --profile redis
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --kafka-url http://localhost:5012 --kafka-early-ack-url http://localhost:5013 --profile kafka
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --postgresql-url http://localhost:5008 --postgresql-early-ack-url http://localhost:5009 --profile postgresql
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
@@ -46,6 +48,8 @@ var existingNatsUrl = GetString("--nats-url");
 var existingNatsEarlyAckUrl = GetString("--nats-early-ack-url");
 var existingPostgreSqlUrl = GetString("--postgresql-url");
 var existingPostgreSqlEarlyAckUrl = GetString("--postgresql-early-ack-url");
+var existingKafkaUrl = GetString("--kafka-url");
+var existingKafkaEarlyAckUrl = GetString("--kafka-early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
@@ -61,10 +65,12 @@ Uri? natsBaseAddress = null;
 Uri? natsEarlyAckBaseAddress = null;
 Uri? postgreSqlBaseAddress = null;
 Uri? postgreSqlEarlyAckBaseAddress = null;
+Uri? kafkaBaseAddress = null;
+Uri? kafkaEarlyAckBaseAddress = null;
 
-if (existingUrl is not null || existingAzureServiceBusUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null || existingPostgreSqlUrl is not null)
+if (existingUrl is not null || existingAzureServiceBusUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null || existingPostgreSqlUrl is not null || existingKafkaUrl is not null)
 {
-    baseAddress = new Uri(existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl!);
+    baseAddress = new Uri(existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl!);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
     if (existingEarlyAckUrl is not null)
     {
@@ -107,17 +113,25 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
         Console.WriteLine($"Load testing existing NATS ACK-after-receive instance at {natsEarlyAckBaseAddress}.");
     }
 
-    postgreSqlBaseAddress = new Uri(existingPostgreSqlUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl!);
+    postgreSqlBaseAddress = new Uri(existingPostgreSqlUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingKafkaUrl!);
     Console.WriteLine($"Load testing existing PostgreSQL instance at {postgreSqlBaseAddress}.");
     if (existingPostgreSqlEarlyAckUrl is not null)
     {
         postgreSqlEarlyAckBaseAddress = new Uri(existingPostgreSqlEarlyAckUrl);
         Console.WriteLine($"Load testing existing PostgreSQL ACK-after-receive instance at {postgreSqlEarlyAckBaseAddress}.");
     }
+
+    kafkaBaseAddress = new Uri(existingKafkaUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl!);
+    Console.WriteLine($"Load testing existing Kafka instance at {kafkaBaseAddress}.");
+    if (existingKafkaEarlyAckUrl is not null)
+    {
+        kafkaEarlyAckBaseAddress = new Uri(existingKafkaEarlyAckUrl);
+        Console.WriteLine($"Load testing existing Kafka ACK-after-enqueue instance at {kafkaEarlyAckBaseAddress}.");
+    }
 }
 else
 {
-    Console.WriteLine("Booting Redis + Google Pub/Sub emulator + Azure Service Bus emulator + RabbitMQ + sample SUTs via Aspire (Docker required)...");
+    Console.WriteLine("Booting Redis + Google Pub/Sub emulator + Azure Service Bus emulator + RabbitMQ + NATS + PostgreSQL + Kafka + sample SUTs via Aspire (Docker required)...");
     var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_IntegrationTests_AppHost>();
     app = await appHost.BuildAsync().WaitAsync(TimeSpan.FromMinutes(5));
     await app.StartAsync().WaitAsync(TimeSpan.FromMinutes(5));
@@ -133,6 +147,8 @@ else
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-nats-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-postgresql").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-postgresql-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-kafka").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-kafka-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
@@ -158,6 +174,10 @@ else
         postgreSqlBaseAddress = probe.BaseAddress!;
     using (var probe = app.CreateHttpClient("itest-app-postgresql-early-ack"))
         postgreSqlEarlyAckBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-kafka"))
+        kafkaBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-kafka-early-ack"))
+        kafkaEarlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
@@ -171,6 +191,8 @@ else
     Console.WriteLine($"NATS ACK-after-receive SUT at {natsEarlyAckBaseAddress}.");
     Console.WriteLine($"PostgreSQL SUT at {postgreSqlBaseAddress}.");
     Console.WriteLine($"PostgreSQL ACK-after-receive SUT at {postgreSqlEarlyAckBaseAddress}.");
+    Console.WriteLine($"Kafka SUT at {kafkaBaseAddress}.");
+    Console.WriteLine($"Kafka ACK-after-enqueue SUT at {kafkaEarlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -236,6 +258,16 @@ try
         BaseAddress = postgreSqlEarlyAckBaseAddress ?? postgreSqlBaseAddress ?? baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var kafkaHttpClient = new HttpClient
+    {
+        BaseAddress = kafkaBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+    using var kafkaEarlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = kafkaEarlyAckBaseAddress ?? kafkaBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
     if (earlyAckBaseAddress is not null)
@@ -260,6 +292,10 @@ try
         await TryResetAsync(postgreSqlHttpClient);
     if (postgreSqlEarlyAckBaseAddress is not null)
         await TryResetAsync(postgreSqlEarlyAckHttpClient);
+    if (kafkaBaseAddress is not null)
+        await TryResetAsync(kafkaHttpClient);
+    if (kafkaEarlyAckBaseAddress is not null)
+        await TryResetAsync(kafkaEarlyAckHttpClient);
 
     var definitions = FilterScenarios(SelectScenarios(
         profile,
@@ -273,7 +309,9 @@ try
         includeNatsTarget: app is not null || existingNatsUrl is not null,
         includeNatsEarlyAckTarget: natsEarlyAckBaseAddress is not null,
         includePostgreSqlTarget: app is not null || existingPostgreSqlUrl is not null,
-        includePostgreSqlEarlyAckTarget: postgreSqlEarlyAckBaseAddress is not null), scenarioFilter);
+        includePostgreSqlEarlyAckTarget: postgreSqlEarlyAckBaseAddress is not null,
+        includeKafkaTarget: app is not null || existingKafkaUrl is not null,
+        includeKafkaEarlyAckTarget: kafkaEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
@@ -293,6 +331,8 @@ try
             natsEarlyAckHttpClient,
             postgreSqlHttpClient,
             postgreSqlEarlyAckHttpClient,
+            kafkaHttpClient,
+            kafkaEarlyAckHttpClient,
             rate,
             duration,
             warmup))
@@ -352,6 +392,8 @@ static ScenarioProps BuildScenario(
     HttpClient natsEarlyAckHttpClient,
     HttpClient postgreSqlHttpClient,
     HttpClient postgreSqlEarlyAckHttpClient,
+    HttpClient kafkaHttpClient,
+    HttpClient kafkaEarlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
@@ -367,7 +409,9 @@ static ScenarioProps BuildScenario(
         natsHttpClient,
         natsEarlyAckHttpClient,
         postgreSqlHttpClient,
-        postgreSqlEarlyAckHttpClient)))
+        postgreSqlEarlyAckHttpClient,
+        kafkaHttpClient,
+        kafkaEarlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
@@ -383,7 +427,9 @@ static ScenarioDefinition[] SelectScenarios(
     bool includeNatsTarget,
     bool includeNatsEarlyAckTarget,
     bool includePostgreSqlTarget,
-    bool includePostgreSqlEarlyAckTarget)
+    bool includePostgreSqlEarlyAckTarget,
+    bool includeKafkaTarget,
+    bool includeKafkaEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -505,6 +551,27 @@ static ScenarioDefinition[] SelectScenarios(
         }
     }
 
+    if (includeKafkaTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("kafka_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => WorkerObservedAsync(kafkaHttp)),
+            new ScenarioDefinition("kafka_response_ingress_header", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ResponseIngressAsync(kafkaHttp, useAttribute: true)),
+            new ScenarioDefinition("kafka_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ResponseIngressAsync(kafkaHttp, useAttribute: false)),
+            new ScenarioDefinition("kafka_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ReplyTargetAsync(kafkaHttp))
+        ];
+
+        if (includeKafkaEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("kafka_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, kafkaEarlyAckHttp) => WorkerObservedAsync(kafkaEarlyAckHttp))
+            ];
+        }
+    }
+
     var pubsub = new[]
     {
         new ScenarioDefinition("pubsub_worker_default_ack_observed", WorkerObservedAsync),
@@ -606,6 +673,24 @@ static ScenarioDefinition[] SelectScenarios(
         ];
     }
 
+    var kafka = new[]
+    {
+        new ScenarioDefinition("kafka_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => RequestResponseSuccessAsync(kafkaHttp)),
+        new ScenarioDefinition("kafka_request_response_domain_failure", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => RequestResponseDomainFailureAsync(kafkaHttp)),
+        new ScenarioDefinition("kafka_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => WorkerObservedAsync(kafkaHttp)),
+        new ScenarioDefinition("kafka_response_ingress_header", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ResponseIngressAsync(kafkaHttp, useAttribute: true)),
+        new ScenarioDefinition("kafka_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ResponseIngressAsync(kafkaHttp, useAttribute: false)),
+        new ScenarioDefinition("kafka_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, kafkaHttp, _) => ReplyTargetAsync(kafkaHttp))
+    };
+    if (includeKafkaEarlyAckTarget)
+    {
+        kafka =
+        [
+            .. kafka,
+            new ScenarioDefinition("kafka_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, kafkaEarlyAckHttp) => WorkerObservedAsync(kafkaEarlyAckHttp))
+        ];
+    }
+
     var recovery = new[]
     {
         new ScenarioDefinition("lost_subscriber_resume_redis", http => LostSubscriberFlowAsync(http, "Completed")),
@@ -623,9 +708,10 @@ static ScenarioDefinition[] SelectScenarios(
         "redis" => redis,
         "nats" => nats,
         "postgresql" => postgresql,
+        "kafka" => kafka,
         "recovery" => recovery,
         _ => throw new ArgumentException(
-            $"Unknown --profile '{profile}'. Use one of: broad, core, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, recovery.")
+            $"Unknown --profile '{profile}'. Use one of: broad, core, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, kafka, recovery.")
     };
 }
 
@@ -791,39 +877,45 @@ static string Trace() => $"trace-{Guid.NewGuid():N}";
 
 internal sealed record ScenarioDefinition(
     string Name,
-    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
+    Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> RunAsync)
 {
     public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
-        : this(name, (http, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http))
+        : this(name, (http, _, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, _, _, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
+        : this(name, (http, earlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp))
+    {
+    }
+
+    public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
+        : this(name, (http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _) =>
+            runAsync(http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp))
     {
     }
 }

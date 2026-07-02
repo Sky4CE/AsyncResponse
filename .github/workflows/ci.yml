@@ -49,6 +49,7 @@ jobs:
           dotnet pack src/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -o ./artifacts
@@ -85,7 +86,7 @@ jobs:
 
       - name: Test (integration)
         # The integration fixture boots the Aspire AppHost, which starts Redis, the Google Pub/Sub
-        # emulator, Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL, and SUT apps.
+        # emulator, Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL, Kafka, and SUT apps.
         run: |
           dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
             --configuration Release --no-build \

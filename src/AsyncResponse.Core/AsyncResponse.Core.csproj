@@ -11,6 +11,7 @@
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.AzureServiceBus" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.GooglePubSub" />
+    <InternalsVisibleTo Include="AsyncResponse.Transports.Kafka" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.NATS" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.PostgreSQL" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.RabbitMQ" />

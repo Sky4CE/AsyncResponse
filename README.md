@@ -127,6 +127,7 @@ with any transport.
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
+| Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
 
@@ -148,7 +149,7 @@ dotnet add package AsyncResponse.Core
 dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL
 
 # exactly one transport (skip for in-memory):
-dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL
+dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL
 ```
 
 Targets .NET 8 and .NET 10.
@@ -220,6 +221,33 @@ Need more throughput than ack-per-handler? Opt into early ACK with
 — messages are completed after bounded enqueue and processed by background workers, with failures
 reported through `OnBackgroundFailure`.
 
+### Broker transport — Kafka
+
+One package covers everything that speaks the Kafka protocol: Apache Kafka, Redpanda, Amazon MSK,
+WarpStream, Aiven, Confluent Cloud. Kafka is a transport only, by design — its partitioned log has
+no targeted waiter wake and no per-key TTL store, so pair it with a durable channel.
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithKafkaTransport(options =>
+    {
+        options.BootstrapServers = builder.Configuration["Kafka:BootstrapServers"];
+        options.WorkerTopic = "orders-worker";
+        options.ResponseTopic = "orders-response";
+        options.CorrelationIdHeader = "correlationId";
+    });
+```
+
+The correlation id travels as a message header and doubles as the partition key, so one flow's jobs
+stay ordered within their partition. Honest caveats: consumer parallelism equals the partition
+count (size `TopicNumPartitions` accordingly), and a slow message delays its partition — retries run
+in-process with backoff because offsets cannot NACK a single message; after
+`WorkerSubscriber.MaxDeliveryAttempts` the message is produced to `{topic}.deadletter` with
+failure-detail headers and its offset committed so the partition keeps moving. These trade-offs are
+inherent to classic consumer groups; a KIP-932 share-group consumption mode can slot in behind the
+same options once librdkafka supports it.
+
 ### Everything on PostgreSQL
 
 Use this when PostgreSQL is already your durable infrastructure and you don't want to add a broker
@@ -253,8 +281,9 @@ connection-string settings worth tuning under load (`No Reset On Close`, `Max Au
 ### The other combinations
 
 Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithRedisTransport()`,
-`.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`, `.WithNatsTransport()` — every channel,
-transport, and option is documented in [docs/configuration.md](docs/configuration.md).
+`.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`, `.WithKafkaTransport()`,
+`.WithNatsTransport()` — every channel, transport, and option is documented in
+[docs/configuration.md](docs/configuration.md).
 
 ## Define a payload and await it
 

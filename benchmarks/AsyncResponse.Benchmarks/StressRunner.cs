@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.Kafka;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
@@ -62,6 +63,7 @@ internal static class StressRunner
         failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await KafkaAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
         failures += await SharedResponseFanoutStorm(concurrency, Math.Max(1, count / Math.Max(1, fanout)), fanout);
@@ -678,6 +680,88 @@ internal static class StressRunner
             ("completeMismatch", Math.Abs(count - Volatile.Read(ref completes))),
             ("abandons", Volatile.Read(ref abandons)),
             ("deadLetters", Volatile.Read(ref deadLetters)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3h) Kafka ACK-after-enqueue dispatch storm. This bypasses a live broker and hammers the
+    //     subscriber callback dispatcher directly: every offset-stored message must be processed
+    //     exactly once and nothing may dead-letter.
+    private static async Task<int> KafkaAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var consumer = new BenchmarkKafkaConsumerClient();
+        var producer = new BenchmarkKafkaProducerClient();
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = KafkaMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                var index = (int)delivery.Offset;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            consumer,
+            producer,
+            new KafkaAsyncResponseTransportOptions
+            {
+                BootstrapServers = "localhost:9092",
+                HostShutdownTimeout = TimeSpan.FromSeconds(90)
+            },
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-topic",
+            "stress-worker-group",
+            KafkaSubscriberRole.Worker);
+
+        var metrics = await Measure("kafka-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new KafkaDelivery(
+                "stress-worker-topic",
+                Partition: 0,
+                Offset: i,
+                "{}",
+                $"stress-{i}",
+                [KafkaTransportHeader.Utf8("correlationId", $"stress-{i}")]),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("kafka-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "kafka-ack-after-enqueue-dispatch-storm",
+            ("offsetStoreMismatch", Math.Abs(count - consumer.StoredOffsets)),
+            ("deadLetters", (int)producer.Publishes),
             ("duplicates", duplicates),
             ("outOfRange", outOfRange),
             ("notDrained", drained ? 0 : 1),

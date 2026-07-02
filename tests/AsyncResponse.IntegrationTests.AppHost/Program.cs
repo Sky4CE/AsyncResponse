@@ -37,6 +37,12 @@ const string RedisTransportKeyPrefix = "itest-redistransport";
 const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
 const string NatsSubjectPrefix = "itest-nats";
 const string NatsEarlyAckSubjectPrefix = "itest-nats-early-ack";
+const string KafkaRedisKeyPrefix = "itest-kafka";
+const string KafkaEarlyAckRedisKeyPrefix = "itest-kafka-early-ack";
+const string KafkaWorkerTopic = "asyncresponse.itest.worker";
+const string KafkaResponseTopic = "asyncresponse.itest.response";
+const string KafkaEarlyAckWorkerTopic = "asyncresponse.itest.worker.earlyack";
+const string KafkaEarlyAckResponseTopic = "asyncresponse.itest.response.earlyack";
 const string PostgreSqlWorkerQueue = "worker";
 const string PostgreSqlResponseQueue = "response";
 const string PostgreSqlDeadLetterQueue = "deadletter";
@@ -65,6 +71,11 @@ var pubsub = builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/goog
 var nats = builder.AddContainer("nats", "nats", "latest")
     .WithArgs("-js")
     .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
+
+// Single-broker KRaft Kafka (the Aspire integration uses the confluent-local image). One broker backs
+// both Kafka app variants; they isolate through distinct topics and consumer groups. This container
+// doubles as the roadmap's Redpanda-compatibility reference: everything speaks the Kafka protocol.
+var kafka = builder.AddKafka("kafka");
 
 // Two PostgreSQL app instances (default + early-ack) share this one server, each with its own Npgsql
 // pool. The image default max_connections=100 is exhausted under the load-test profile ("FATAL: sorry,
@@ -296,6 +307,47 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats-early-ack", la
     .WithEnvironment("Nats:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("AsyncResponse:Channel", "NATS")
     .WithEnvironment("AsyncResponse:Transport", "NATS")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka", launchProfileName: null)
+    .WithReference(redis)
+    .WithReference(kafka)
+    .WaitFor(redis)
+    .WaitFor(kafka)
+    .WithEnvironment("Kafka:WorkerTopic", KafkaWorkerTopic)
+    .WithEnvironment("Kafka:ResponseTopic", KafkaResponseTopic)
+    .WithEnvironment("Kafka:WorkerConsumerGroup", "asyncresponse-itest-kafka-workers")
+    .WithEnvironment("Kafka:ResponseConsumerGroup", "asyncresponse-itest-kafka-responses")
+    .WithEnvironment("Kafka:TopicNumPartitions", Env("ASYNCRESPONSE_ITEST_KAFKA_TOPIC_PARTITIONS", "3"))
+    .WithEnvironment("Kafka:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_KAFKA_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Kafka:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_KAFKA_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("AsyncResponse:KeyPrefix", KafkaRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "Kafka")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka-early-ack", launchProfileName: null)
+    .WithReference(redis)
+    .WithReference(kafka)
+    .WaitFor(redis)
+    .WaitFor(kafka)
+    .WithEnvironment("Kafka:WorkerTopic", KafkaEarlyAckWorkerTopic)
+    .WithEnvironment("Kafka:ResponseTopic", KafkaEarlyAckResponseTopic)
+    .WithEnvironment("Kafka:WorkerConsumerGroup", "asyncresponse-itest-kafka-workers-earlyack")
+    .WithEnvironment("Kafka:ResponseConsumerGroup", "asyncresponse-itest-kafka-responses-earlyack")
+    .WithEnvironment("Kafka:TopicNumPartitions", Env("ASYNCRESPONSE_ITEST_KAFKA_TOPIC_PARTITIONS", "3"))
+    .WithEnvironment("Kafka:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_KAFKA_WORKER_ACK_MODE", "AckAfterEnqueue"))
+    .WithEnvironment("Kafka:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_KAFKA_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("Kafka:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_KAFKA_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("Kafka:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_KAFKA_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("Kafka:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_KAFKA_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Kafka:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_KAFKA_MAX_DELIVERY_ATTEMPTS", "5"))
+    .WithEnvironment("Kafka:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:KeyPrefix", KafkaEarlyAckRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "Kafka")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

@@ -79,8 +79,14 @@ its own option type; the common shapes are summarized here. See the transport se
 
 | Option | Transports | Purpose |
 |---|---|---|
-| `KeyPrefix` / `SubjectPrefix` / `SchemaName` | Redis / NATS / PostgreSQL | Namespace for worker and response streams/subjects/tables. |
+| `KeyPrefix` / `SubjectPrefix` / `SchemaName` / `TopicPrefix` | Redis / NATS / PostgreSQL / Kafka | Namespace for worker and response streams/subjects/tables/topics. |
 | `ConnectionString` | Azure Service Bus | Service Bus namespace connection string. Omit when you register your own singleton `ServiceBusClient`. |
+| `BootstrapServers` | Kafka | Comma-separated broker list. The package speaks the Kafka protocol via `Confluent.Kafka`, so Redpanda, Amazon MSK, WarpStream, Aiven, and Confluent Cloud all work. |
+| `WorkerTopic` / `ResponseTopic` + `WorkerConsumerGroup` / `ResponseConsumerGroup` | Kafka | Topics for worker jobs and response ingress (default `{TopicPrefix}.transport.worker` / `.response`) and the consumer group per role. |
+| `CreateTopics` / `TopicNumPartitions` / `TopicReplicationFactor` | Kafka | Provision missing topics on subscriber startup. Partitions are the unit of consumer parallelism and ordering; `-1` uses broker defaults. |
+| `OffsetCommitInterval` | Kafka | Auto-commit cadence for offsets stored after each resolved message; a crash inside the window redelivers at-least-once. |
+| `DeadLetterTopic` / `DeadLetterTopicSuffix` | Kafka | Explicit dead-letter topic, or the suffix appended per source topic (default `.deadletter` → `{topic}.deadletter`). |
+| `ConfigureProducer` / `ConfigureConsumer` / `ConfigureAdminClient` | Kafka | Last-chance hooks over the Confluent client configs (security, compression, fetch tuning, `max.poll.interval.ms`, …). |
 | `WorkerQueue` / `ResponseQueue` | Azure Service Bus | Service Bus queues used for worker jobs and response ingress; they must be distinct. |
 | `MessageTable` | PostgreSQL | Single queue table containing worker, response-ingress, and dead-letter rows. |
 | `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL | Logical queue names stored in the PostgreSQL queue table. They must be distinct. |
@@ -88,14 +94,14 @@ its own option type; the common shapes are summarized here. See the transport se
 | `LockTimeout` | PostgreSQL | How long a claimed row stays locked before another subscriber may retry it. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus | Receive-loop batch size and long-poll timeout for queue subscribers. |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
-| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub | Redeliveries before dead-lettering. Google Pub/Sub performs redelivery itself — bound attempts with the subscription's `DeadLetterPolicy`. On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. |
+| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub | Redeliveries before dead-lettering. Google Pub/Sub performs redelivery itself — bound attempts with the subscription's `DeadLetterPolicy`. On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
 | `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub | Bounded backoff for restarting a failed hosted subscriber (streaming-pull fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
-| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / NATS / PostgreSQL / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. |
+| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / Kafka / NATS / PostgreSQL / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition. |
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL also unwraps nested JSON strings at those paths. |
-| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL | Whether poison messages are preserved and, for PostgreSQL, how long dead-letter rows are retained. |
+| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / Kafka | Whether poison messages are preserved and, for PostgreSQL, how long dead-letter rows are retained. |
 
 A worker handler failure propagates out of the ingress to the transport dispatcher, which owns the
 retry decision: in `AckAfterHandlerCompletes` the delivery is NACKed/abandoned and redelivered up
@@ -113,6 +119,18 @@ budget: a receive batch is processed sequentially, so the last message in a batc
 `MaxMessagesPerReceive × handler latency` before settlement — keep that product well under the
 queue's lock duration (or lower `MaxMessagesPerReceive`) to avoid `MessageLockLostException`
 redeliveries of already-processed messages.
+
+Kafka is built on classic consumer groups with manual offset management (`enable.auto.commit=true` +
+`enable.auto.offset.store=false`; an offset is stored only once its message is fully resolved). Two
+consequences to plan for: ordering is per-partition, so consumer parallelism equals the partition
+count — size `TopicNumPartitions` accordingly — and a slow or retrying message delays its partition
+(head-of-line blocking). Keep the worst-case in-process retry budget
+(`MaxDeliveryAttempts × HandlerRetryMaxDelay`) well under the consumer's `max.poll.interval.ms`
+(default 5 minutes, adjustable via `ConfigureConsumer`) or the broker evicts the consumer mid-retry.
+In `AckAfterEnqueue`, the offset is stored at enqueue time and partition fetching pauses while the
+bounded in-process queue is full; later handler failures are retried in-process, then reported via
+`OnBackgroundFailure` and produced to the dead-letter topic with failure-detail headers. The message
+that exhausts its attempts is always dead-lettered *and committed* so the partition keeps moving.
 
 See [postgresql.md](postgresql.md) for PostgreSQL table layout, delivery-confirmation details, and
 connection-string tuning.

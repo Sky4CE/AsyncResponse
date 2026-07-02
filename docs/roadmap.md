@@ -17,7 +17,7 @@ facts were re-verified July 2026 (sources at the end).
 | Axis | Shipped | Coverage gap |
 |---|---|---|
 | **Channels** | In-memory, Redis, NATS, PostgreSQL | SQL Server shops; teams standardized on a Redis *fork* wanting an explicit compatibility statement |
-| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL | **Kafka** (the single most-requested broker), **all of AWS**, broker-free durable execution (Hangfire-style) |
+| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka | **all of AWS**, broker-free durable execution (Hangfire-style) |
 
 Three of the original #14/#17 top picks — Azure Service Bus, the NATS pair, and the PostgreSQL
 pair — have shipped since that investigation was written. This roadmap re-baselines on what
@@ -73,7 +73,7 @@ Google Pub/Sub ≈ 1.2k LOC, the PostgreSQL channel+transport pair ≈ 3.2k LOC 
 
 ### 🔴 MUST — release train 1
 
-#### 3.1 Kafka transport — `AsyncResponse.Transports.Kafka`
+#### 3.1 Kafka transport — `AsyncResponse.Transports.Kafka` 🟢 shipped
 
 The #1 ask in #14 (242M `Confluent.Kafka` downloads) and the largest single audience gap.
 Protocol compatibility means one package also unlocks **Redpanda, Amazon MSK, WarpStream, Aiven,

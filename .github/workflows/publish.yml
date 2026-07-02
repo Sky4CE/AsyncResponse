@@ -56,6 +56,7 @@ jobs:
           dotnet pack src/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts

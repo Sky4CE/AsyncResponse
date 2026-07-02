@@ -5,10 +5,12 @@ using AsyncResponse.Channels.Redis;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.Kafka;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
+using Confluent.Kafka;
 using NATS.Client.Core;
 using Google.Api.Gax;
 using Google.Cloud.PubSub.V1;
@@ -31,7 +33,7 @@ builder.Services.AddOpenApi();
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | RabbitMQ | Redis | NATS | PostgreSQL
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
@@ -39,6 +41,7 @@ var usePostgreSql = string.Equals(channel, "PostgreSQL", StringComparison.Ordina
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useAzureServiceBus = string.Equals(transport, "AzureServiceBus", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
+var useKafka = string.Equals(transport, "Kafka", StringComparison.OrdinalIgnoreCase);
 var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalIgnoreCase);
 var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNatsTransport = string.Equals(transport, "NATS", StringComparison.OrdinalIgnoreCase);
@@ -88,6 +91,10 @@ else if (useGooglePubSub)
     {
         EmulatorDetection = EmulatorDetection.EmulatorOrProduction
     }.BuildAsync()));
+}
+else if (useKafka)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "Kafka");
 }
 else if (useRabbitMq)
 {
@@ -218,6 +225,44 @@ else if (useRabbitMq)
         ConfigureRabbitMqSubscriberAckMode(builder.Configuration, "RabbitMQ:Response", options.ResponseSubscriber);
     });
 }
+else if (useKafka)
+{
+    asyncResponse.WithKafkaTransport(options =>
+    {
+        options.BootstrapServers = builder.Configuration.GetConnectionString("Kafka")
+            ?? builder.Configuration["Kafka:BootstrapServers"]
+            ?? "localhost:9092";
+        options.TopicPrefix = builder.Configuration["Kafka:TopicPrefix"] ?? options.TopicPrefix;
+        options.WorkerTopic = builder.Configuration["Kafka:WorkerTopic"] ?? options.WorkerTopic;
+        options.WorkerConsumerGroup = builder.Configuration["Kafka:WorkerConsumerGroup"] ?? options.WorkerConsumerGroup;
+        options.ResponseTopic = builder.Configuration["Kafka:ResponseTopic"] ?? options.ResponseTopic;
+        options.ResponseConsumerGroup = builder.Configuration["Kafka:ResponseConsumerGroup"] ?? options.ResponseConsumerGroup;
+        options.DeadLetterTopic = builder.Configuration["Kafka:DeadLetterTopic"] ?? options.DeadLetterTopic;
+        options.CorrelationIdHeader = builder.Configuration["Kafka:CorrelationIdHeader"] ?? options.CorrelationIdHeader;
+        options.ClientId = builder.Configuration["Kafka:ClientId"] ?? options.ClientId;
+
+        if (bool.TryParse(builder.Configuration["Kafka:CreateTopics"], out var createTopics))
+            options.CreateTopics = createTopics;
+        if (bool.TryParse(builder.Configuration["Kafka:DeadLetterEnabled"], out var deadLetterEnabled))
+            options.DeadLetterEnabled = deadLetterEnabled;
+        if (int.TryParse(builder.Configuration["Kafka:TopicNumPartitions"], out var topicNumPartitions))
+            options.TopicNumPartitions = topicNumPartitions;
+        if (short.TryParse(builder.Configuration["Kafka:TopicReplicationFactor"], out var topicReplicationFactor))
+            options.TopicReplicationFactor = topicReplicationFactor;
+        if (int.TryParse(builder.Configuration["Kafka:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalMilliseconds(builder.Configuration, "Kafka:OffsetCommitIntervalMs", value => options.OffsetCommitInterval = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Kafka:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Kafka:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Kafka:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "Kafka:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+
+        ConfigureKafkaShutdownBudget(builder.Configuration, options);
+        ConfigureKafkaSubscriber(builder.Configuration, "Kafka:Worker", options.WorkerSubscriber);
+        ConfigureKafkaSubscriber(builder.Configuration, "Kafka:Response", options.ResponseSubscriber);
+    });
+}
 else if (useRedisTransport)
 {
     asyncResponse.WithRedisTransport(options =>
@@ -303,7 +348,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -350,6 +395,7 @@ app.MapGet("/alive", () => Results.Ok("alive")).ExcludeFromDescription();
 app.MapGet("/config", (IServiceProvider services) =>
 {
     object? pubsub = null;
+    object? kafka = null;
     object? rabbitmq = null;
     object? redis = null;
     object? nats = null;
@@ -384,6 +430,33 @@ app.MapGet("/config", (IServiceProvider services) =>
             responseAckMode = googleOptions.ResponseSubscriber.AckMode.ToString(),
             responseBackgroundWorkerCount = googleOptions.ResponseSubscriber.BackgroundWorkerCount,
             responseBackgroundQueueCapacity = googleOptions.ResponseSubscriber.BackgroundQueueCapacity
+        };
+    }
+
+    if (useKafka)
+    {
+        var kafkaOptions = services.GetRequiredService<IOptions<KafkaAsyncResponseTransportOptions>>().Value;
+        var workerTopic = ResolveKafkaTopic(kafkaOptions.WorkerTopic, kafkaOptions.TopicPrefix, "worker");
+        var responseTopic = ResolveKafkaTopic(kafkaOptions.ResponseTopic, kafkaOptions.TopicPrefix, "response");
+        kafka = new
+        {
+            workerTopic,
+            workerConsumerGroup = kafkaOptions.WorkerConsumerGroup,
+            responseTopic,
+            responseConsumerGroup = kafkaOptions.ResponseConsumerGroup,
+            deadLetterTopic = kafkaOptions.DeadLetterEnabled
+                ? !string.IsNullOrWhiteSpace(kafkaOptions.DeadLetterTopic)
+                    ? kafkaOptions.DeadLetterTopic
+                    : workerTopic + kafkaOptions.DeadLetterTopicSuffix
+                : null,
+            workerAckMode = kafkaOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = kafkaOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = kafkaOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            workerMaxDeliveryAttempts = kafkaOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            responseAckMode = kafkaOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = kafkaOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = kafkaOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            responseMaxDeliveryAttempts = kafkaOptions.ResponseSubscriber.MaxDeliveryAttempts
         };
     }
 
@@ -523,7 +596,7 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, rabbitmq, redis, nats, postgres });
+    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, kafka, rabbitmq, redis, nats, postgres });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -675,6 +748,59 @@ static void ConfigurePubSubSubscriberAckMode(
     }
 
     if (mode is not GooglePubSubAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigureKafkaShutdownBudget(
+    IConfiguration configuration,
+    KafkaAsyncResponseTransportOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "Kafka:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
+static void ConfigureKafkaSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    KafkaSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:PollTimeoutMs", value => subscriberOptions.PollTimeout = value);
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:BackpressurePollDelayMs", value => subscriberOptions.BackpressurePollDelay = value);
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:HandlerRetryBaseDelayMs", value => subscriberOptions.HandlerRetryBaseDelay = value);
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:HandlerRetryMaxDelayMs", value => subscriberOptions.HandlerRetryMaxDelay = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<KafkaAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<KafkaAckMode>())}.");
+
+    if (mode is KafkaAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = KafkaAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not KafkaAckMode.AckAfterEnqueue)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -863,6 +989,11 @@ static string ResolveRedisStream(string? configured, string keyPrefix, string ro
     => !string.IsNullOrWhiteSpace(configured)
         ? configured
         : $"{keyPrefix}:transport:{role}";
+
+static string ResolveKafkaTopic(string? configured, string topicPrefix, string role)
+    => !string.IsNullOrWhiteSpace(configured)
+        ? configured
+        : $"{topicPrefix}.transport.{role}";
 
 static int ReadRequiredPositiveInt(IConfiguration configuration, string key)
 {
@@ -1334,6 +1465,9 @@ app.MapPost("/emit-response", async (
     if (useAzureServiceBus)
         return await EmitAzureServiceBusResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
+    if (useKafka)
+        return await EmitKafkaResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
     if (useRabbitMq)
         return await EmitRabbitMqResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
@@ -1346,7 +1480,7 @@ app.MapPost("/emit-response", async (
     if (usePostgreSqlTransport)
         return await EmitPostgreSqlResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, RabbitMQ, Redis, NATS, or PostgreSQL.");
+    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, Kafka, RabbitMQ, Redis, NATS, or PostgreSQL.");
 })
 .WithTags("Workers");
 
@@ -1414,6 +1548,44 @@ static async Task<IResult> EmitAzureServiceBusResponseAsync(
     await using var client = new ServiceBusClient(connectionString);
     await using var sender = client.CreateSender(o.ResponseQueue);
     await sender.SendMessageAsync(serviceBusMessage, cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitKafkaResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<KafkaAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("Kafka response ingress requires the Kafka transport.");
+
+    var o = options.Value;
+    if (string.IsNullOrWhiteSpace(o.BootstrapServers))
+        return Results.Conflict("Kafka response ingress requires Kafka:BootstrapServers.");
+
+    var responseTopic = ResolveKafkaTopic(o.ResponseTopic, o.TopicPrefix, "response");
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+
+    var kafkaMessage = new Message<string?, byte[]> { Value = System.Text.Encoding.UTF8.GetBytes(json) };
+    if (useAttribute)
+    {
+        kafkaMessage.Key = correlationId;
+        kafkaMessage.Headers = [];
+        kafkaMessage.Headers.Add(o.CorrelationIdHeader, System.Text.Encoding.UTF8.GetBytes(correlationId));
+    }
+
+    // A one-off producer mirrors how a remote system would feed the response topic; the hosted
+    // response-ingress subscriber (which pre-created the topic) picks the message up from there.
+    var config = new ProducerConfig { BootstrapServers = o.BootstrapServers, Acks = Acks.All };
+    using var producer = new ProducerBuilder<string?, byte[]>(config).Build();
+    await producer.ProduceAsync(responseTopic, kafkaMessage, cancellationToken).ConfigureAwait(false);
 
     return Results.Accepted();
 }
