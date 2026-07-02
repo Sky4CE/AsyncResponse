@@ -43,7 +43,9 @@ recovery when a flow needs it.
 ## Why AsyncResponse
 
 - **Feels local, runs distributed.** One fluent expression replaces the `TaskCompletionSource`
-  registry, the timeout plumbing, and the correlation bookkeeping.
+  registry, the timeout plumbing, and the correlation bookkeeping — and a multi-step flow over
+  a dozen remote services reads as a dozen sequential `await`s: insert, reorder, or parallelize
+  steps like any other C# code, with every step individually durable.
 - **Race-free by construction.** The request is sent by a *trigger* that runs only after the
   subscription and recovery state exist, so the first response can never beat its waiter — and a
   failing trigger tears the registration down. `For<T>()` **requires** a trigger;
@@ -336,14 +338,21 @@ per-commit trends with regression alerting are published to the
 
 - a flow needs the *answer* to a specific request that arrives asynchronously — job results,
   payment confirmations, DAG completions, webhook callbacks;
+- you're **orchestrating a multi-step flow across async services** — write the steps as plain
+  sequential `await`s, one per remote call; inserting, reordering, or parallelizing a step is an
+  ordinary code edit, and every step is individually durable and recoverable;
 - you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
 - waits must survive redeploys, and a late **failure** must never be resumed as a success.
 
 **Reach for something else when**
 
-- you need multi-step orchestration with compensation — that's a workflow engine (Temporal, Durable
-  Task, MassTransit sagas). AsyncResponse deliberately owns one decision: deliver this response to
-  its waiter, or route it to the right recovery callback.
+- you need the engine itself to own your *position inside the flow*: resuming the code mid-flow
+  after a crash by replaying an event log, automatic compensation of already-completed steps,
+  engine-managed timers and workflow versioning — that's a workflow engine (Temporal, Durable
+  Task, MassTransit sagas). AsyncResponse durably recovers **each in-flight wait** and routes it
+  by domain outcome; re-entering the flow at the right step is your resume callback's job (see
+  [re-entrant resumes](docs/recovery.md)). The two compose: plain awaits for flows that don't
+  need replay semantics, a workflow engine for the few that do.
 - you need fire-and-forget pub/sub fan-out with nobody waiting — that's your message bus, and
   AsyncResponse coexists with it happily.
 
@@ -365,6 +374,8 @@ per-commit trends with regression alerting are published to the
   confirmation, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
   scenario.
+- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (Kafka, SQS, SQL
+  Server, …), with priorities and design sketches.
 
 ## License
 
