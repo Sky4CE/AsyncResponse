@@ -105,6 +105,47 @@ flow code want to see it (persist details, decide to retry, throw a rich domain 
 `ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
 somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
 
+## Durable flows
+
+Compose those waits into whole processes. A **durable flow** is a multi-step orchestration written
+as plain sequential C# — the library checkpoints every step, so the flow survives crashes,
+redeploys, and redeliveries mid-step and resumes exactly where it left off:
+
+```csharp
+public sealed class TenantProvisioningFlow(IMigrationService _migrations, INotifier _notifier)
+    : IDurableFlow<ProvisioningInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, ProvisioningInput input)
+    {
+        var ws = await flow.StepAsync("create-workspace",          // local step: runs once,
+            () => _workspaces.CreateAsync(input.TenantId));        // result memoized
+
+        var migration = await flow.AwaitStepAsync<MigrationResult>("run-migration",
+            trigger: cid => _migrations.StartAsync(input.TenantId, cid),   // remote step: durably
+            until: r => r.Status != MigrationStatus.Running);              // awaited, progress-aware
+
+        if (migration.Status == MigrationStatus.Failed)
+            throw new DurableFlowFailedException(migration.Message!);      // terminal, no retry
+
+        await flow.StepAsync("notify", () => _notifier.SendAsync(input.TenantId));
+    }
+}
+
+var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(tenantId));
+```
+
+- **Crash-safe by construction** — completed steps skip, the in-flight wait *re-attaches* (the
+  request is never re-sent), and lost-subscriber recovery callbacks are wired automatically.
+- **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
+  pick up the changes on resume. Hotfix a bug and resume — no replay rules, no version patching.
+- **Zero extra infrastructure** — flow state rides in your channel's recovery store (Redis, NATS,
+  PostgreSQL, SQL Server), or in your own table via one small interface.
+- **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
+  integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
+
+The full guide — rules, failure modes, compensation, testing your flows — is
+[docs/durable-flows.md](docs/durable-flows.md).
+
 ## Pick your channel and transport
 
 A **channel** delivers responses to waiters and persists recovery state. A **transport** moves

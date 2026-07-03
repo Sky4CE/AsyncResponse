@@ -421,6 +421,7 @@ builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 builder.Services.AddSingleton<FlowRecorder>();
 builder.Services.AddSingleton<ISampleFlowService, SampleFlowService>();
 builder.Services.AddSingleton<RemoteWorkSimulator>();
+builder.Services.AddScoped<SampleProvisioningFlow>(); // durable flow: resolved by type name on execute/resume
 
 var app = builder.Build();
 app.Logger.LogInformation("AsyncResponse sample started: channel={Channel}, transport={Transport}.", channel, transport);
@@ -1343,6 +1344,32 @@ app.MapPost("/multi-step", async (
     steps.Add(secondStep);
 
     return Results.Ok(new MultiStepFlowResult(secondStep.Succeeded, secondStep.Succeeded ? null : secondStep.Name, steps));
+})
+.WithTags("Flows");
+
+// 2b-durable) The multi-step idea through the first-class durable-flows API: checkpointed steps,
+//     awaited remote steps with progress, a domain-failure route, and crash-safe resume. Start a
+//     run (optionally with a caller-supplied id for idempotent starts), observe its state, kick it.
+app.MapPost("/durable-flow", async (IDurableFlows flows, string? name, bool? failAtImport, bool? includeAudit, string? flowId) =>
+{
+    var id = await flows.StartAsync<SampleProvisioningFlow, ProvisioningFlowInput>(
+        new ProvisioningFlowInput(name ?? "acme", includeAudit ?? true, failAtImport ?? false),
+        flowId);
+    return Results.Ok(new StartFlowResult(id));
+})
+.WithTags("Flows");
+
+app.MapGet("/durable-flow/{flowId}", async (IDurableFlows flows, string flowId) =>
+{
+    var state = await flows.GetStateAsync(flowId);
+    return state is null ? Results.NotFound() : Results.Ok(state);
+})
+.WithTags("Flows");
+
+app.MapPost("/durable-flow/{flowId}/resume", async (IDurableFlows flows, string flowId) =>
+{
+    await flows.ResumeAsync(flowId);
+    return Results.Ok();
 })
 .WithTags("Flows");
 

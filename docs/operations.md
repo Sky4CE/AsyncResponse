@@ -136,8 +136,10 @@ invariant for Azure Service Bus messages), **race-burst** (subscribe-before-send
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
-`ExecutionContext` under foreign publishers), and
-**watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation). The core concurrency
+`ExecutionContext` under foreign publishers),
+**watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation), and
+**durable-flow-storm** (hundreds of concurrent 5-step checkpointed flows through the real worker
+transport: every flow must end `Succeeded`, every step exactly once). The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
 dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server

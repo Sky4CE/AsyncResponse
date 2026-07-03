@@ -121,6 +121,13 @@ curl -X POST 'http://localhost:5000/multi-step?first=Succeed&second=Fail'    # s
 curl -X POST 'http://localhost:5000/ambient-exception?message=boom'          # SetException from inside the trigger (explicit cid)
 curl -X POST 'http://localhost:5000/shared-correlation-exception?message=boom' # one exception faults two waiters
 curl -X POST 'http://localhost:5000/worker?token=order-42'                  # fire-and-forget background worker job
+
+# Durable flows (the checkpointed multi-step orchestration API):
+curl -X POST 'http://localhost:5000/durable-flow?name=acme'                  # start a 5-step durable flow → {"flowId":"flow-…"}
+curl -X POST 'http://localhost:5000/durable-flow?failAtImport=true'          # a domain failure terminally fails the run
+curl -X POST 'http://localhost:5000/durable-flow?flowId=run-42'              # caller-supplied id → idempotent start
+curl      'http://localhost:5000/durable-flow/<flowId>'                     # observe state: status, step checkpoints, progress
+curl -X POST 'http://localhost:5000/durable-flow/<flowId>/resume'            # kick a run (no-op when already terminal)
 curl -X POST 'http://localhost:5000/emit-response?correlationId=<id>&status=Completed&useAttribute=true' # broker response ingress
 curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
 curl      'http://localhost:5000/alive'                                     # liveness check

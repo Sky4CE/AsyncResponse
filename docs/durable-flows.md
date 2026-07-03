@@ -82,6 +82,42 @@ Everything else — what your `ExecuteAsync` does between steps, conditionals, l
 values — is ordinary C#. Values that must stay stable across resumes (computed dates, generated
 ids) belong inside a `StepAsync<TResult>` so they're memoized rather than recomputed.
 
+## Injecting your own services (SignalR, audit, metrics, …)
+
+A flow is a plain DI class: inject whatever it needs and call it from anywhere — step bodies,
+between steps, or inside `until` predicates. Pushing live progress to a UI is just another
+dependency:
+
+```csharp
+public sealed class ReportFlow(
+    IHubContext<ProgressHub> _hub,          // SignalR — or any service you own
+    IReportJobs _jobs) : IDurableFlow<ReportInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, ReportInput input)
+    {
+        await flow.AwaitStepAsync<JobResult>("build-report",
+            trigger: cid => _jobs.StartAsync(input.ReportId, cid),
+            until: async r =>
+            {
+                if (r.State == JobState.Running)
+                {
+                    await _hub.Clients.Group(input.ReportId).SendAsync("progress", r.Message);
+                    await flow.ReportProgressAsync(r.Message!);   // and persist it on the state
+                    return false;
+                }
+                return true;
+            });
+
+        await _hub.Clients.Group(input.ReportId).SendAsync("done", flow.FlowId);
+    }
+}
+```
+
+One idempotency note: side effects in `until` predicates fire once per *received message*, and
+side effects in step bodies fire once per *step execution* — which, under crash-resume, is
+at-least-once. A duplicate "progress 50%" toast is usually fine; if a side effect must be truly
+once, put it in its own checkpointed `StepAsync`.
+
 ## What happens when things die
 
 The flow body always runs from the top; checkpoints make re-running cheap and safe. That single
@@ -119,6 +155,82 @@ explicit and local: catch the failure in the flow, run compensating steps (guard
 names, awaited through `AwaitStepAsync` if remote), then throw `DurableFlowFailedException` to
 close the run. You author the undo logic next to the steps it undoes; what you don't get is an
 engine deriving the compensation sequence for you.
+
+## Cookbook: patterns from production flows
+
+These are the shapes the API was distilled from — a production system running provisioning
+pipelines of a dozen-plus steps across SQL jobs, orchestrators, and ticketing systems.
+
+**Best-effort step (catch and continue).** A stage that should not sink the pipeline:
+
+```csharp
+try
+{
+    await flow.AwaitStepAsync<DagRunResult>("run-lineage",
+        trigger: cid => _dags.TriggerLineageAsync(cid),
+        until: r => r.State is not DagRunState.Queued and not DagRunState.Running,
+        timeout: TimeSpan.FromMinutes(30));
+}
+catch (Exception ex)
+{
+    await flow.ReportProgressAsync($"lineage failed ({ex.Message}); continuing");
+}
+```
+
+The step is recorded as faulted-not-completed and the flow moves on. If the run is later resumed,
+a faulted awaited step restarts fresh — which is what you want for a best-effort stage.
+
+**Subset runs.** "Only create the ticket this time" is an input flag and an early return — no
+pre-seeded state:
+
+```csharp
+await flow.StepAsync("create-ticket", () => _tickets.CreateAsync(input.TenantId));
+if (input.TicketOnly)
+    return;
+```
+
+**A different payload type per awaited step.** Each `AwaitStepAsync<T>` declares its own response
+type — a SQL-job status here, an Airflow DAG result there — with its own `until` and its own
+`ShouldResumeOnRecovery()` semantics.
+
+**Operator controls.** Expose your own endpoints over `IDurableFlows`: start with a
+caller-supplied `flowId` for idempotent "run it" buttons, `GetStateAsync` for a progress screen
+(status, per-step checkpoints, `LastMessage`), `ResumeAsync` as the "kick it" action. The sample
+app ships exactly this (`/durable-flow`, see [sample.md](sample.md)).
+
+## Testing your flows
+
+Test the real thing: the in-memory channel + transport give you the full engine in-process, so a
+flow test is *start → answer the triggers → assert the state* — no mocks of library internals.
+
+```csharp
+var services = new ServiceCollection();
+services.AddSingleton<FakeNotifier>();          // your fakes, injected like production services
+services.AddScoped<TenantProvisioningFlow>();
+services.AddAsyncResponse().WithInMemoryChannel().WithInMemoryTransport();
+await using var provider = services.BuildServiceProvider();
+
+var flows = provider.GetRequiredService<IDurableFlows>();
+var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+
+var flowId = await flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(7));
+var run = executor.ExecuteAsync(flowId);                    // drive directly in unit tests
+await publisher.SetResponse(new MigrationResult { … }, capturedCorrelationId);
+await run;
+
+Assert.Equal(FlowRunStatus.Succeeded, (await flows.GetStateAsync(flowId))!.Status);
+```
+
+Crash-resume is testable deterministically: throw from a step (or seed a
+`PendingCorrelationId` breadcrumb), run the executor again, and assert every step executed
+exactly once. The library's own suites are the reference:
+[`DurableFlowScenarioTests`](../tests/AsyncResponse.Tests/DurableFlowScenarioTests.cs) (a
+production-shaped pipeline with a crash-at-every-checkpoint matrix, subset runs, catch-and-continue,
+and injected notifications), integration tests running the same flow against **every durable
+channel** (Redis, NATS, PostgreSQL, SQL Server) over real infrastructure, and a stress-harness
+storm asserting exactly-once step execution across hundreds of concurrent flows. For pure unit
+tests of flow logic, `IDurableFlowContext` is an interface you can fake outright.
 
 ## Observing runs
 

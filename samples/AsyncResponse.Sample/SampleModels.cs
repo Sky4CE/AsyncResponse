@@ -42,6 +42,9 @@ public sealed record StepOutcome(
 /// <summary>Result returned by the sample's sequential multi-step endpoint.</summary>
 public sealed record MultiStepFlowResult(bool Completed, string? FailedAt, IReadOnlyList<StepOutcome> Steps);
 
+/// <summary>Result returned when a durable flow run is started.</summary>
+public sealed record StartFlowResult(string FlowId);
+
 /// <summary>Result returned when one published exception fans out to multiple waiters.</summary>
 public sealed record SharedExceptionResult(string CorrelationId, IReadOnlyList<string> Failures);
 
