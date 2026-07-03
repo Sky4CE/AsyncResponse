@@ -1,0 +1,576 @@
+using AsyncResponse.Channels.SqlServer;
+using AsyncResponse.Transports.SqlServer;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging.Abstractions;
+using System.Reflection;
+using System.Text.Json;
+using Xunit;
+
+namespace AsyncResponse.Tests;
+
+public sealed class SqlServerOptionsTests
+{
+    private const string TestConnectionString =
+        "Server=localhost;Database=asyncresponse_tests;User ID=sa;Password=unused;TrustServerCertificate=True";
+
+    [Fact]
+    public void ChannelOptions_Validate_PassesForDefaultsWithConnectionString()
+        => ChannelOptions().Validate();
+
+    [Fact]
+    public void ChannelOptions_RejectMissingConnectionString()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(new SqlServerAsyncResponseChannelOptions().Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.ConnectionString), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectInvalidSqlIdentifier()
+    {
+        var options = ChannelOptions();
+        options.MessageTable = "bad-name";
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.MessageTable), ex.Message);
+
+        AssertChannelInvalid(
+            options => options.SchemaName = " ",
+            nameof(SqlServerAsyncResponseChannelOptions.SchemaName));
+        AssertChannelInvalid(
+            options => options.SchemaName = "1bad",
+            nameof(SqlServerAsyncResponseChannelOptions.SchemaName));
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectHeartbeatIntervalAtOrAboveTimeout()
+    {
+        var options = ChannelOptions();
+        options.SubscriberHeartbeatInterval = TimeSpan.FromSeconds(30);
+        options.SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(30);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatInterval), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectNonPositiveRetentionAndConfirmationSettings()
+    {
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.ActivePollInterval = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.ActivePollInterval));
+        AssertChannelInvalid(
+            options => options.IdlePollInterval = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.IdlePollInterval));
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectActivePollIntervalAboveIdlePollInterval()
+    {
+        // The adaptive polling contract: the idle interval is the backed-off sweep, so the active
+        // interval can never legitimately exceed it.
+        var options = ChannelOptions();
+        options.ActivePollInterval = TimeSpan.FromSeconds(5);
+        options.IdlePollInterval = TimeSpan.FromSeconds(1);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.ActivePollInterval), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectInvalidWaiterAndEnvelopeSettings()
+    {
+        AssertChannelInvalid(
+            options => options.DefaultTimeout = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseChannelOptions.DefaultTimeout));
+        AssertChannelInvalid(
+            options => options.MaxRemoteStackTraceLength = -1,
+            nameof(SqlServerAsyncResponseChannelOptions.MaxRemoteStackTraceLength));
+        AssertChannelInvalid(
+            options => options.PendingMessageBatchSize = 0,
+            nameof(SqlServerAsyncResponseChannelOptions.PendingMessageBatchSize));
+        AssertChannelInvalid(
+            options => options.PublishMaxAttempts = 0,
+            nameof(SqlServerAsyncResponseChannelOptions.PublishMaxAttempts));
+    }
+
+    [Fact]
+    public void TransportOptions_ValidateCommon_PassesForDefaultsWithConnectionString()
+        => SqlServerTransportOptionsValidator.ValidateCommon(TransportOptions());
+
+    [Fact]
+    public void TransportOptions_RejectMissingConnectionString()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => SqlServerTransportOptionsValidator.ValidateCommon(new SqlServerAsyncResponseTransportOptions()));
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.ConnectionString), ex.Message);
+    }
+
+    [Fact]
+    public void TransportOptions_RejectInvalidSqlIdentifier()
+    {
+        var options = TransportOptions();
+        options.MessageTable = "bad-table";
+
+        var ex = Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.MessageTable), ex.Message);
+
+        AssertTransportInvalid(
+            options => options.SchemaName = " ",
+            nameof(SqlServerAsyncResponseTransportOptions.SchemaName));
+        AssertTransportInvalid(
+            options => options.SchemaName = "1bad",
+            nameof(SqlServerAsyncResponseTransportOptions.SchemaName));
+    }
+
+    [Fact]
+    public void TransportOptions_RejectQueueNameCollision()
+    {
+        var options = TransportOptions();
+        options.ResponseQueue = "worker";
+
+        var ex = Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.WorkerQueue), ex.Message);
+    }
+
+    [Fact]
+    public void TransportOptions_RejectNonPositiveDeadLetterRetention()
+    {
+        var options = TransportOptions();
+        options.DeadLetterRetention = TimeSpan.FromSeconds(-1);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateCommon(options));
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.DeadLetterRetention), ex.Message);
+    }
+
+    [Fact]
+    public void TransportOptions_RejectNonPositiveAndMisorderedRetrySettings()
+    {
+        AssertTransportInvalid(
+            options => options.LockTimeout = TimeSpan.Zero,
+            nameof(SqlServerAsyncResponseTransportOptions.LockTimeout));
+        AssertTransportInvalid(
+            options => options.PublishMaxAttempts = 0,
+            nameof(SqlServerAsyncResponseTransportOptions.PublishMaxAttempts));
+        AssertTransportInvalid(
+            options => options.PublishRetryBaseDelay = TimeSpan.FromSeconds(2),
+            nameof(SqlServerAsyncResponseTransportOptions.PublishRetryBaseDelay));
+        AssertTransportInvalid(
+            options => options.SubscriberRetryBaseDelay = TimeSpan.FromSeconds(6),
+            nameof(SqlServerAsyncResponseTransportOptions.SubscriberRetryBaseDelay));
+        AssertTransportInvalid(
+            options => options.CorrelationIdHeader = " ",
+            nameof(SqlServerAsyncResponseTransportOptions.CorrelationIdHeader));
+    }
+
+    [Fact]
+    public void TransportSubscriberOptions_ValidateEarlyAckAndFailureSettings()
+    {
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { AckMode = SqlServerAckMode.AckAfterEnqueue },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions
+            {
+                AckMode = SqlServerAckMode.AckAfterEnqueue,
+                BackgroundWorkerCount = 1,
+                BackgroundQueueCapacity = 0
+            },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { BatchSize = 0 },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { MaxDeliveryAttempts = -1 },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { RedeliveryDelay = TimeSpan.Zero },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { EmptyPollDelay = TimeSpan.Zero },
+            "Worker"));
+        Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateSubscriber(
+            new SqlServerSubscriberOptions { AckMode = (SqlServerAckMode)999 },
+            "Worker"));
+
+        var subscriber = new SqlServerSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(3));
+        SqlServerTransportOptionsValidator.ValidateSubscriber(subscriber, "Worker");
+        Assert.Equal(SqlServerAckMode.AckAfterEnqueue, subscriber.AckMode);
+        Assert.Equal(2, subscriber.BackgroundWorkerCount);
+        Assert.Equal(8, subscriber.BackgroundQueueCapacity);
+        Assert.Equal(TimeSpan.FromSeconds(3), subscriber.BackgroundDrainTimeout);
+    }
+
+    [Fact]
+    public void UseAckAfterEnqueue_RejectsInvalidArguments()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SqlServerSubscriberOptions().UseAckAfterEnqueue(0, 8));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SqlServerSubscriberOptions().UseAckAfterEnqueue(2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SqlServerSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.Zero));
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectPublishBaseDelayAboveMax()
+    {
+        var options = ChannelOptions();
+        options.PublishRetryBaseDelay = TimeSpan.FromSeconds(2);
+        options.PublishRetryMaxDelay = TimeSpan.FromSeconds(1);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.PublishRetryBaseDelay), ex.Message);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectNegativePruneInterval()
+    {
+        var options = ChannelOptions();
+        options.PruneInterval = TimeSpan.FromSeconds(-1);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(SqlServerAsyncResponseChannelOptions.PruneInterval), ex.Message);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_UsesDefaultResponseQueue()
+    {
+        var options = TransportOptions();
+        options.ResponseQueue = "responses";
+        var provider = new SqlServerReplyTargetProvider(Options.Create(options));
+
+        var target = provider.GetReplyTarget();
+
+        Assert.Equal(SqlServerAsyncResponseTransportOptions.TransportName, target.Transport);
+        Assert.Equal("responses", target.Address);
+        Assert.Equal("responses", target.Properties["queue"]);
+        Assert.Equal("asyncresponse_transport_messages", target.Properties["table"]);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_ResolvesNamedTargetAndCopiesProperties()
+    {
+        var options = TransportOptions();
+        options.SchemaName = "orders";
+        options.AddReplyTarget("regional", "regional_responses");
+        options.ReplyTargets["regional"].Properties["tenant"] = "acme";
+        var provider = new SqlServerReplyTargetProvider(Options.Create(options));
+
+        var target = provider.GetReplyTarget("regional");
+
+        Assert.Equal("regional", target.Name);
+        Assert.Equal("regional_responses", target.Address);
+        Assert.Equal("regional_responses", target.Properties["queue"]);
+        Assert.Equal("orders", target.Properties["schema"]);
+        Assert.Equal("acme", target.Properties["tenant"]);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_UnknownName_Throws()
+    {
+        var provider = new SqlServerReplyTargetProvider(Options.Create(TransportOptions()));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("missing"));
+
+        Assert.Contains("missing", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReadsHeaderBeforeJsonBody()
+    {
+        var options = TransportOptions();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [options.CorrelationIdHeader] = "from-header"
+        };
+
+        var correlationId = SqlServerCorrelationIdExtractor.Extract(
+            headers,
+            """{"CorrelationId":"from-body"}""",
+            options);
+
+        Assert.Equal("from-header", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReadsNestedJsonStringAndIsCaseInsensitive()
+    {
+        var options = TransportOptions();
+        options.CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"];
+
+        var correlationId = SqlServerCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"customparameters":"{\"correlationid\":\"from-nested-json-string\"}"}""",
+            options);
+
+        Assert.Equal("from-nested-json-string", correlationId);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReturnsNullForInvalidJsonBlankPathsOrBlankMessage()
+    {
+        var options = TransportOptions();
+
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(null, "{not-json", options));
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(null, "", options));
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(null, "null", options));
+
+        options.CorrelationIdJsonPaths = [];
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(null, """{"CorrelationId":"ignored"}""", options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_HandlesUnmatchedBlankPrimitiveAndMalformedNestedPaths()
+    {
+        var options = TransportOptions();
+        options.CorrelationIdJsonPaths =
+        [
+            "",
+            "Missing.Value",
+            "CustomParameters.CorrelationId",
+            "CorrelationId"
+        ];
+
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(
+            null,
+            """{"CustomParameters":42,"Other":"x"}""",
+            options));
+
+        Assert.Null(SqlServerCorrelationIdExtractor.Extract(
+            null,
+            """{"CustomParameters":"{not-json"}""",
+            options));
+
+        Assert.Equal("42", SqlServerCorrelationIdExtractor.Extract(
+            null,
+            """{"CorrelationId":42}""",
+            options));
+    }
+
+    [Fact]
+    public void SchemaLockResource_AgreesAcrossChannelAndTransport()
+    {
+        // Channel and transport must take the SAME application lock for a shared schema, otherwise they
+        // still race each other on CREATE SCHEMA. The resources are computed independently in each
+        // package, so this guards against the two implementations drifting apart.
+        foreach (var schema in new[] { "dbo", "async_response", "Tenant_42" })
+        {
+            Assert.Equal(
+                AsyncResponse.Channels.SqlServer.SqlServerChannelSql.SchemaLockResource(schema),
+                AsyncResponse.Transports.SqlServer.SqlServerTransportStore.SchemaLockResource(schema));
+        }
+
+        // Distinct schemas must map to distinct resources so unrelated deployments don't serialize.
+        Assert.NotEqual(
+            AsyncResponse.Channels.SqlServer.SqlServerChannelSql.SchemaLockResource("dbo"),
+            AsyncResponse.Channels.SqlServer.SqlServerChannelSql.SchemaLockResource("other"));
+    }
+
+    [Fact]
+    public void AddMilliseconds_AgreesAcrossChannelAndTransport_AndStaysOnDatabaseClock()
+    {
+        // Both packages compute row expiries with the same database-clock expression; drift between
+        // them would silently mix clocks for a shared deployment.
+        Assert.Equal(
+            AsyncResponse.Channels.SqlServer.SqlServerChannelSql.AddMilliseconds("@p"),
+            AsyncResponse.Transports.SqlServer.SqlServerTransportStore.AddMilliseconds("@p"));
+        Assert.Contains("SYSUTCDATETIME()", AsyncResponse.Channels.SqlServer.SqlServerChannelSql.AddMilliseconds("@p"), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CorrelationExtractor_ReadsConfiguredJsonPath()
+    {
+        var options = TransportOptions();
+
+        var correlationId = SqlServerCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CustomParameters":{"CorrelationId":"from-json"}}""",
+            options);
+
+        Assert.Equal("from-json", correlationId);
+    }
+
+    [Fact]
+    public void SqlServerRetry_ClassifiesTransientExceptions()
+    {
+        Assert.True(SqlServerTransportRetry.IsTransient(new TimeoutException()));
+        Assert.True(SqlServerChannelSql.IsTransient(new TimeoutException()));
+        Assert.False(SqlServerTransportRetry.IsTransient(new OperationCanceledException()));
+        Assert.False(SqlServerChannelSql.IsTransient(new OperationCanceledException()));
+        Assert.False(SqlServerTransportRetry.IsTransient(new InvalidOperationException()));
+        Assert.False(SqlServerChannelSql.IsTransient(new InvalidOperationException()));
+    }
+
+    [Fact]
+    public void ChannelSql_HelperBoundaries_HandleIdentifierAndIndexName()
+    {
+        Assert.True(InvokeChannelSqlStatic<bool>("IsIdentifier", "valid_1"));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", ""));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", "1bad"));
+        Assert.False(InvokeChannelSqlStatic<bool>("IsIdentifier", "bad-name"));
+
+        // SQL Server identifiers cap at 128 characters (vs PostgreSQL's 63).
+        var indexName = InvokeChannelSqlStatic<string>("IndexName", new string('a', 130), "expires");
+        Assert.Equal(128, indexName.Length);
+    }
+
+    [Fact]
+    public void ChannelSql_ShouldPrune_ThrottlesByConfiguredInterval()
+    {
+        var options = ChannelOptions();
+        options.PruneInterval = TimeSpan.FromMinutes(10);
+        var sql = new SqlServerChannelSql(Options.Create(options));
+        var lastTicks = 0L;
+
+        Assert.True(InvokeShouldPrune(sql, ref lastTicks));
+        Assert.NotEqual(0L, lastTicks);
+        Assert.False(InvokeShouldPrune(sql, ref lastTicks));
+
+        options.PruneInterval = TimeSpan.Zero;
+        Assert.True(InvokeShouldPrune(sql, ref lastTicks));
+    }
+
+    [Fact]
+    public async Task RecoveryStateStore_SaveAsync_RejectsNonPositiveTtlBeforeSql()
+    {
+        var store = CreateRecoveryStateStore();
+
+        var ex = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            store.SaveAsync("corr", new RecoveryState(), TimeSpan.Zero));
+
+        Assert.Equal("ttl", ex.ParamName);
+    }
+
+    [Fact]
+    public void RecoveryStateStore_DeserializeState_FiltersUnreadableJsonAndFillsLegacyCorrelationId()
+    {
+        var store = CreateRecoveryStateStore();
+
+        Assert.Null(InvokeDeserializeState(store, "null", "fallback"));
+        Assert.Null(InvokeDeserializeState(store, "{not-json", "fallback"));
+        Assert.Null(InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState
+            {
+                SchemaVersion = RecoveryStateSchema.Current + 1,
+                CorrelationId = "future"
+            }),
+            "fallback"));
+
+        var state = InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState { RegistrationId = Guid.NewGuid() }),
+            "fallback");
+
+        Assert.NotNull(state);
+        Assert.Equal("fallback", state.CorrelationId);
+    }
+
+    [Fact]
+    public async Task SqlServerRetry_RetriesTransientTimeouts()
+    {
+        var attempts = 0;
+
+        var result = await SqlServerTransportRetry.ExecuteAsync(
+            _ =>
+            {
+                attempts++;
+                return attempts < 3
+                    ? throw new TimeoutException("try again")
+                    : Task.FromResult("ok");
+            },
+            maxAttempts: 3,
+            baseDelay: TimeSpan.FromMilliseconds(1),
+            maxDelay: TimeSpan.FromMilliseconds(1),
+            CancellationToken.None);
+
+        Assert.Equal("ok", result);
+        Assert.Equal(3, attempts);
+    }
+
+    [Fact]
+    public async Task SqlServerRetry_DoesNotRetryCancellation()
+    {
+        var attempts = 0;
+
+        Task<int> Action(CancellationToken _)
+        {
+            attempts++;
+            throw new OperationCanceledException();
+        }
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => SqlServerTransportRetry.ExecuteAsync(
+            Action,
+            maxAttempts: 3,
+            baseDelay: TimeSpan.FromMilliseconds(1),
+            maxDelay: TimeSpan.FromMilliseconds(1),
+            CancellationToken.None));
+
+        Assert.Equal(1, attempts);
+    }
+
+    private static void AssertChannelInvalid(
+        Action<SqlServerAsyncResponseChannelOptions> configure,
+        string expectedMessageFragment)
+    {
+        var options = ChannelOptions();
+        configure(options);
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    private static void AssertTransportInvalid(
+        Action<SqlServerAsyncResponseTransportOptions> configure,
+        string expectedMessageFragment)
+    {
+        var options = TransportOptions();
+        configure(options);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => SqlServerTransportOptionsValidator.ValidateCommon(options));
+
+        Assert.Contains(expectedMessageFragment, ex.Message, StringComparison.Ordinal);
+    }
+
+    private static SqlServerAsyncResponseChannelOptions ChannelOptions()
+        => new() { ConnectionString = TestConnectionString };
+
+    private static SqlServerAsyncResponseTransportOptions TransportOptions()
+        => new() { ConnectionString = TestConnectionString };
+
+    private static SqlServerRecoveryStateStore CreateRecoveryStateStore()
+    {
+        var sql = new SqlServerChannelSql(Options.Create(ChannelOptions()));
+        return new SqlServerRecoveryStateStore(sql, NullLogger<SqlServerRecoveryStateStore>.Instance);
+    }
+
+    private static T InvokeChannelSqlStatic<T>(string name, params object?[] args)
+        => (T)typeof(SqlServerChannelSql)
+            .GetMethod(name, BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, args)!;
+
+    private static bool InvokeShouldPrune(SqlServerChannelSql sql, ref long lastTicks)
+    {
+        object?[] args = [lastTicks];
+        var result = (bool)typeof(SqlServerChannelSql)
+            .GetMethod("ShouldPrune", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(sql, args)!;
+        lastTicks = (long)args[0]!;
+        return result;
+    }
+
+    private static RecoveryState? InvokeDeserializeState(
+        SqlServerRecoveryStateStore store,
+        string json,
+        string? correlationId)
+        => (RecoveryState?)typeof(SqlServerRecoveryStateStore)
+            .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(store, [json, correlationId]);
+}

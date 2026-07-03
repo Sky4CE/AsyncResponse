@@ -16,8 +16,8 @@ facts were re-verified July 2026 (sources at the end).
 
 | Axis | Shipped | Coverage gap |
 |---|---|---|
-| **Channels** | In-memory, Redis, NATS, PostgreSQL | SQL Server shops; teams standardized on a Redis *fork* wanting an explicit compatibility statement |
-| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka | **all of AWS**, broker-free durable execution (Hangfire-style) |
+| **Channels** | In-memory, Redis, NATS, PostgreSQL, SQL Server | teams standardized on a Redis *fork* wanting an explicit compatibility statement |
+| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server | **all of AWS**, broker-free durable execution (Hangfire-style) |
 
 Three of the original #14/#17 top picks — Azure Service Bus, the NATS pair, and the PostgreSQL
 pair — have shipped since that investigation was written. This roadmap re-baselines on what
@@ -147,10 +147,11 @@ Effort: days, not weeks. Marketing value exceeds the code cost.
 
 ### 🟠 SHOULD — release train 2
 
-#### 3.4 SQL Server channel + transport — `AsyncResponse.Channels.SqlServer` / `AsyncResponse.Transports.SqlServer`
+#### 3.4 SQL Server channel + transport — `AsyncResponse.Channels.SqlServer` / `AsyncResponse.Transports.SqlServer` 🟢 shipped
 
 The largest remaining enterprise-.NET audience (#17's #2). Mirrors the PostgreSQL pair, which
-de-risks the design — most decisions are already made and battle-tested:
+de-risked the design — most decisions were already made and battle-tested. Shipped as designed
+below (adaptive polling wake; Service Broker deferred); see [sqlserver.md](sqlserver.md):
 
 - **Transport**: queue table claimed with `UPDLOCK, ROWLOCK, READPAST` (SQL Server's
   `SKIP LOCKED` equivalent), fenced acks via `lock_id`, idempotent publish
@@ -242,7 +243,7 @@ documentation work. Schedule alongside train 2.
 | Train | Items | Rationale |
 |---|---|---|
 | **1** | Kafka transport · SQS transport · Valkey/Garnet validation (+ NATS/PG receive-span gap fix) | Closes the two loudest gaps (Kafka, AWS) plus a near-free compatibility claim; README matrix gets its biggest wins |
-| **2** | SQL Server transport → SQL Server channel · store-mixing enabler | Largest build; transport half ships value early; store-mixing lands with a second consumer (SQL Server recovery store) to prove it |
+| **2** | SQL Server transport → SQL Server channel 🟢 · store-mixing enabler | Largest build (shipped); store-mixing lands with a second consumer (SQL Server recovery store) to prove it |
 | **3** | Hangfire transport · MassTransit-v8 recipe or bridge | Broker-free durable execution + opportunistic positioning during the v9 exodus |
 | **Watch** | librdkafka share-group support (H2 2026) → add Kafka `ShareGroup` mode · Mongo/MQTT/Cosmos per demand | Share groups remove Kafka's head-of-line caveat; revisit COULD tier quarterly |
 

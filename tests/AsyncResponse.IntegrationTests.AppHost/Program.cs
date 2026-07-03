@@ -49,6 +49,16 @@ const string PostgreSqlDeadLetterQueue = "deadletter";
 const string PostgreSqlEarlyAckWorkerQueue = "worker_earlyack";
 const string PostgreSqlEarlyAckResponseQueue = "response_earlyack";
 const string PostgreSqlEarlyAckDeadLetterQueue = "deadletter_earlyack";
+const string SqlServerWorkerQueue = "worker";
+const string SqlServerResponseQueue = "response";
+const string SqlServerDeadLetterQueue = "deadletter";
+const string SqlServerEarlyAckWorkerQueue = "worker_earlyack";
+const string SqlServerEarlyAckResponseQueue = "response_earlyack";
+const string SqlServerEarlyAckDeadLetterQueue = "deadletter_earlyack";
+// The two SQL Server app variants share one server and database; they isolate through distinct
+// schemas (each package creates its own tables inside the configured schema).
+const string SqlServerSchema = "itest";
+const string SqlServerEarlyAckSchema = "itest_earlyack";
 
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
@@ -86,6 +96,15 @@ var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
     .WithEnvironment("POSTGRES_PASSWORD", "postgres")
     .WithArgs("-c", "max_connections=400")
     .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
+
+// Dedicated SQL Server for the SqlServer channel + transport SUTs (separate from the one backing the
+// Azure Service Bus emulator, so the two suites cannot interfere). Both SqlServer app variants share
+// it; the sample app provisions the database and each variant isolates through its own schema.
+var sqlServerPassword = Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345");
+var sqlserver = builder.AddContainer("sqlserver", "mcr.microsoft.com/mssql/server", "2022-latest")
+    .WithEnvironment("ACCEPT_EULA", "Y")
+    .WithEnvironment("MSSQL_SA_PASSWORD", sqlServerPassword)
+    .WithEndpoint(targetPort: 1433, scheme: "tcp", name: "sqlserver");
 
 var serviceBusSqlPassword = Env("ASYNCRESPONSE_ITEST_SERVICEBUS_SQL_PASSWORD", "P@ssword12345");
 var serviceBusSql = builder.AddContainer("servicebus-sql", "mcr.microsoft.com/mssql/server", "2022-latest")
@@ -128,6 +147,13 @@ var postgresEndpoint = postgres.GetEndpoint("postgres");
 // dedicated long-lived connections, so skipping reset on the pooled query connections is safe.
 var postgresConnectionString = ReferenceExpression.Create(
     $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");
+
+// Cap each app's SqlClient pool (2 apps x 120 = 240) well under SQL Server's default connection
+// ceiling, mirroring the PostgreSQL budget above. TrustServerCertificate accepts the container's
+// self-signed certificate.
+var sqlServerEndpoint = sqlserver.GetEndpoint("sqlserver");
+var sqlServerConnectionString = ReferenceExpression.Create(
+    $"Server={sqlServerEndpoint.Property(EndpointProperty.Host)},{sqlServerEndpoint.Property(EndpointProperty.Port)};User ID=sa;Password={sqlServerPassword};Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=120");
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
@@ -359,6 +385,35 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql", launch
     .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlDeadLetterQueue)
     .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
     .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqlserver", launchProfileName: null)
+    .WaitFor(sqlserver)
+    .WithEnvironment("ConnectionStrings:SqlServer", sqlServerConnectionString)
+    .WithEnvironment("SqlServer:SchemaName", SqlServerSchema)
+    .WithEnvironment("SqlServer:WorkerQueue", SqlServerWorkerQueue)
+    .WithEnvironment("SqlServer:ResponseQueue", SqlServerResponseQueue)
+    .WithEnvironment("SqlServer:DeadLetterQueue", SqlServerDeadLetterQueue)
+    .WithEnvironment("AsyncResponse:Channel", "SqlServer")
+    .WithEnvironment("AsyncResponse:Transport", "SqlServer")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqlserver-early-ack", launchProfileName: null)
+    .WaitFor(sqlserver)
+    .WithEnvironment("ConnectionStrings:SqlServer", sqlServerConnectionString)
+    .WithEnvironment("SqlServer:SchemaName", SqlServerEarlyAckSchema)
+    .WithEnvironment("SqlServer:WorkerQueue", SqlServerEarlyAckWorkerQueue)
+    .WithEnvironment("SqlServer:ResponseQueue", SqlServerEarlyAckResponseQueue)
+    .WithEnvironment("SqlServer:DeadLetterQueue", SqlServerEarlyAckDeadLetterQueue)
+    .WithEnvironment("SqlServer:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_SQLSERVER_WORKER_ACK_MODE", "AckAfterEnqueue"))
+    .WithEnvironment("SqlServer:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_SQLSERVER_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("SqlServer:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_SQLSERVER_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("SqlServer:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_SQLSERVER_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("SqlServer:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:Channel", "SqlServer")
+    .WithEnvironment("AsyncResponse:Transport", "SqlServer")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

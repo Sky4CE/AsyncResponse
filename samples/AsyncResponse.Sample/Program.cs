@@ -2,6 +2,7 @@ using AsyncResponse;
 using AsyncResponse.Channels.NATS;
 using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Channels.Redis;
+using AsyncResponse.Channels.SqlServer;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
@@ -10,6 +11,7 @@ using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
+using AsyncResponse.Transports.SqlServer;
 using Confluent.Kafka;
 using NATS.Client.Core;
 using Google.Api.Gax;
@@ -32,12 +34,13 @@ builder.Services.AddOpenApi();
 // Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
-var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL
+var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL | SqlServer
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL | SqlServer
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
 var usePostgreSql = string.Equals(channel, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
+var useSqlServer = string.Equals(channel, "SqlServer", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useAzureServiceBus = string.Equals(transport, "AzureServiceBus", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
@@ -46,6 +49,7 @@ var useRabbitMq = string.Equals(transport, "RabbitMQ", StringComparison.OrdinalI
 var useRedisTransport = string.Equals(transport, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNatsTransport = string.Equals(transport, "NATS", StringComparison.OrdinalIgnoreCase);
 var usePostgreSqlTransport = string.Equals(transport, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
+var useSqlServerTransport = string.Equals(transport, "SqlServer", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis || useRedisTransport)
 {
@@ -75,6 +79,14 @@ if (usePostgreSql || usePostgreSqlTransport)
     if (postgresBuilder.MaxAutoPrepare == 0)
         postgresBuilder.MaxAutoPrepare = 20;
     builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(postgresBuilder.ConnectionString));
+}
+
+if (useSqlServer || useSqlServerTransport)
+{
+    // Create the target database on startup if it does not exist (dev/container convenience). The
+    // AsyncResponse SQL Server packages create their own schema and tables, but cannot connect to a
+    // missing database. Registered before the AsyncResponse wiring so it runs before any subscriber.
+    builder.Services.AddHostedService<SqlServerDatabaseProvisioner>();
 }
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start
@@ -107,6 +119,10 @@ else if (useRedisTransport)
 else if (usePostgreSqlTransport)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "PostgreSQL");
+}
+else if (useSqlServerTransport)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "SqlServer");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -148,6 +164,22 @@ else if (usePostgreSql)
         ApplyOptionalTimeout(builder.Configuration, "PostgreSQL:ChannelDeliveryConfirmationTimeoutSeconds", value => options.DeliveryConfirmationTimeout = value);
     });
 }
+else if (useSqlServer)
+{
+    asyncResponse.WithSqlServerChannel(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer")
+            ?? builder.Configuration["SqlServer:ConnectionString"];
+        options.SchemaName = builder.Configuration["SqlServer:SchemaName"] ?? options.SchemaName;
+        options.RecoveryStateTable = builder.Configuration["SqlServer:RecoveryStateTable"] ?? options.RecoveryStateTable;
+        options.MessageTable = builder.Configuration["SqlServer:ChannelMessageTable"] ?? options.MessageTable;
+        options.SubscriberTable = builder.Configuration["SqlServer:SubscriberTable"] ?? options.SubscriberTable;
+        options.DefaultTimeout = TimeSpan.FromSeconds(30);
+        ApplyOptionalTimeout(builder.Configuration, "SqlServer:ChannelDeliveryConfirmationTimeoutSeconds", value => options.DeliveryConfirmationTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:ChannelActivePollIntervalMs", value => options.ActivePollInterval = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:ChannelIdlePollIntervalMs", value => options.IdlePollInterval = value);
+    });
+}
 else if (useInMemoryChannel)
 {
     asyncResponse.WithInMemoryChannel();
@@ -155,7 +187,7 @@ else if (useInMemoryChannel)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', 'NATS', or 'PostgreSQL'.");
+        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', 'NATS', 'PostgreSQL', or 'SqlServer'.");
 }
 
 // Exactly one worker transport (enforced at host startup).
@@ -341,6 +373,34 @@ else if (usePostgreSqlTransport)
         ConfigurePostgreSqlSubscriber(builder.Configuration, "PostgreSQL:Response", options.ResponseSubscriber);
     });
 }
+else if (useSqlServerTransport)
+{
+    asyncResponse.WithSqlServerTransport(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer")
+            ?? builder.Configuration["SqlServer:ConnectionString"];
+        options.SchemaName = builder.Configuration["SqlServer:SchemaName"] ?? options.SchemaName;
+        options.MessageTable = builder.Configuration["SqlServer:TransportMessageTable"] ?? options.MessageTable;
+        options.WorkerQueue = builder.Configuration["SqlServer:WorkerQueue"] ?? options.WorkerQueue;
+        options.ResponseQueue = builder.Configuration["SqlServer:ResponseQueue"] ?? options.ResponseQueue;
+        options.DeadLetterQueue = builder.Configuration["SqlServer:DeadLetterQueue"] ?? options.DeadLetterQueue;
+        options.CorrelationIdHeader = builder.Configuration["SqlServer:CorrelationIdHeader"] ?? options.CorrelationIdHeader;
+
+        if (bool.TryParse(builder.Configuration["SqlServer:DeadLetterEnabled"], out var deadLetterEnabled))
+            options.DeadLetterEnabled = deadLetterEnabled;
+        if (int.TryParse(builder.Configuration["SqlServer:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "SqlServer:LockTimeoutSeconds", value => options.LockTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+
+        ConfigureSqlServerSubscriber(builder.Configuration, "SqlServer:Worker", options.WorkerSubscriber);
+        ConfigureSqlServerSubscriber(builder.Configuration, "SqlServer:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -348,7 +408,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', or 'PostgreSQL'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', 'PostgreSQL', or 'SqlServer'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -400,6 +460,7 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? redis = null;
     object? nats = null;
     object? postgres = null;
+    object? sqlserver = null;
     object? azureServiceBus = null;
     if (useAzureServiceBus)
     {
@@ -596,7 +657,56 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, kafka, rabbitmq, redis, nats, postgres });
+    if (useSqlServer || useSqlServerTransport)
+    {
+        string? schemaName = null;
+        string? recoveryStateTable = null;
+        string? channelMessageTable = null;
+        string? transportMessageTable = null;
+        string? workerQueue = null;
+        string? responseQueue = null;
+        var workerAckMode = "n/a";
+        var responseAckMode = "n/a";
+        var workerBackgroundWorkerCount = 0;
+        var workerBackgroundQueueCapacity = 0;
+
+        if (useSqlServer)
+        {
+            var channelOptions = services.GetRequiredService<IOptions<SqlServerAsyncResponseChannelOptions>>().Value;
+            schemaName = channelOptions.SchemaName;
+            recoveryStateTable = channelOptions.RecoveryStateTable;
+            channelMessageTable = channelOptions.MessageTable;
+        }
+
+        if (useSqlServerTransport)
+        {
+            var transportOptions = services.GetRequiredService<IOptions<SqlServerAsyncResponseTransportOptions>>().Value;
+            schemaName ??= transportOptions.SchemaName;
+            transportMessageTable = transportOptions.MessageTable;
+            workerQueue = transportOptions.WorkerQueue;
+            responseQueue = transportOptions.ResponseQueue;
+            workerAckMode = transportOptions.WorkerSubscriber.AckMode.ToString();
+            workerBackgroundWorkerCount = transportOptions.WorkerSubscriber.BackgroundWorkerCount;
+            workerBackgroundQueueCapacity = transportOptions.WorkerSubscriber.BackgroundQueueCapacity;
+            responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
+        }
+
+        sqlserver = new
+        {
+            schemaName,
+            recoveryStateTable,
+            channelMessageTable,
+            transportMessageTable,
+            workerQueue,
+            responseQueue,
+            workerAckMode,
+            workerBackgroundWorkerCount,
+            workerBackgroundQueueCapacity,
+            responseAckMode
+        };
+    }
+
+    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -940,6 +1050,49 @@ static void ConfigureNatsSubscriber(
     }
 
     subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigureSqlServerSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    SqlServerSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:BatchSize"], out var batchSize))
+        subscriberOptions.BatchSize = batchSize;
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:EmptyPollDelayMs", value => subscriberOptions.EmptyPollDelay = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<SqlServerAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<SqlServerAckMode>())}.");
+
+    if (mode is SqlServerAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = SqlServerAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not SqlServerAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigurePostgreSqlSubscriber(
@@ -1321,11 +1474,20 @@ app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancel
     if (multiplexer is null)
     {
         var postgres = services.GetService<PostgreSqlAsyncResponseChannel>();
-        if (postgres is null)
-            return Results.Conflict("Crash simulation requires a durable channel such as Redis or PostgreSQL.");
+        if (postgres is not null)
+        {
+            await postgres.DropLocalSubscriptionsAsync(cancellationToken);
+            return Results.Ok();
+        }
 
-        await postgres.DropLocalSubscriptionsAsync(cancellationToken);
-        return Results.Ok();
+        var sqlServer = services.GetService<SqlServerAsyncResponseChannel>();
+        if (sqlServer is not null)
+        {
+            await sqlServer.DropLocalSubscriptionsAsync(cancellationToken);
+            return Results.Ok();
+        }
+
+        return Results.Conflict("Crash simulation requires a durable channel such as Redis, PostgreSQL, or SQL Server.");
     }
 
     multiplexer.GetSubscriber().UnsubscribeAll();
@@ -1443,6 +1605,14 @@ static async Task<bool> DropLocalSubscriptionAsync(
         return true;
     }
 
+    var sqlServer = services.GetService<SqlServerAsyncResponseChannel>();
+    if (sqlServer is not null)
+    {
+        await sqlServer.DropLocalSubscriptionsAsync(cancellationToken).ConfigureAwait(false);
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     return false;
 }
 
@@ -1480,7 +1650,10 @@ app.MapPost("/emit-response", async (
     if (usePostgreSqlTransport)
         return await EmitPostgreSqlResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, Kafka, RabbitMQ, Redis, NATS, or PostgreSQL.");
+    if (useSqlServerTransport)
+        return await EmitSqlServerResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, or SqlServer.");
 })
 .WithTags("Workers");
 
@@ -1735,6 +1908,33 @@ static async Task<IResult> EmitPostgreSqlResponseAsync(
     var store = services.GetService<PostgreSqlTransportStore>();
     if (store is null)
         return Results.Conflict("PostgreSQL response ingress requires the transport store.");
+
+    var o = options.Value;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+    var headers = useAttribute
+        ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
+        : null;
+
+    await store.PublishAsync(Guid.NewGuid(), o.ResponseQueue, json, headers, cancellationToken).ConfigureAwait(false);
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitSqlServerResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<SqlServerAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("SQL Server response ingress requires the SQL Server transport.");
+    var store = services.GetService<SqlServerTransportStore>();
+    if (store is null)
+        return Results.Conflict("SQL Server response ingress requires the transport store.");
 
     var o = options.Value;
     var json = useAttribute

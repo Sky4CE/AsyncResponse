@@ -9,12 +9,14 @@
     <InternalsVisibleTo Include="AsyncResponse.Channels.NATS" />
     <InternalsVisibleTo Include="AsyncResponse.Channels.PostgreSQL" />
     <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.SqlServer" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.AzureServiceBus" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.GooglePubSub" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.Kafka" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.NATS" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.PostgreSQL" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.RabbitMQ" />
+    <InternalsVisibleTo Include="AsyncResponse.Transports.SqlServer" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />
     <InternalsVisibleTo Include="AsyncResponse.IntegrationTests" />

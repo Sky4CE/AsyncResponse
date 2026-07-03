@@ -3,11 +3,12 @@
 [← Back to README](../README.md)
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
-exactly one channel (`.WithInMemoryChannel()`, `.WithRedisChannel()`, `.WithNatsChannel()`, or
-`.WithPostgreSqlChannel(...)`) and exactly one transport (`.WithInMemoryTransport()`,
-`.WithRedisTransport(...)`, `.WithAzureServiceBusTransport(...)`, `.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`,
-`.WithNatsTransport(...)`, `.WithPostgreSqlTransport(...)`, or another full AsyncResponse transport
-package). An app that starts without either one fails fast at host startup with setup guidance, so a
+exactly one channel (`.WithInMemoryChannel()`, `.WithRedisChannel()`, `.WithNatsChannel()`,
+`.WithPostgreSqlChannel(...)`, or `.WithSqlServerChannel(...)`) and exactly one transport
+(`.WithInMemoryTransport()`, `.WithRedisTransport(...)`, `.WithAzureServiceBusTransport(...)`,
+`.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, `.WithNatsTransport(...)`,
+`.WithPostgreSqlTransport(...)`, `.WithSqlServerTransport(...)`, or another full AsyncResponse
+transport package). An app that starts without either one fails fast at host startup with setup guidance, so a
 misconfiguration can never silently hang every waiter or drop worker dispatch. The recovery watchdog
 is part of the engine and runs by default for whichever channel you choose.
 
@@ -47,29 +48,31 @@ See [recovery.md](recovery.md) for the watchdog in context, and [security.md](se
 
 Channel options are common where noted and channel-specific otherwise. They are set through the
 channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsChannel(options => …)`,
-`.WithPostgreSqlChannel(options => …)`).
+`.WithPostgreSqlChannel(options => …)`, `.WithSqlServerChannel(options => …)`).
 
 | Option | Channels | Default | Purpose |
 |---|---|---|---|
 | `KeyPrefix` | Redis | — | Isolate apps/environments sharing one Redis. **Persisted — treat as a deployment contract.** |
 | `SubjectPrefix` | NATS | `asyncresponse` | Response subjects: `{prefix}.response.{cid}`. |
 | `RecoveryBucket` | NATS | `asyncresponse-recovery` | JetStream KV bucket for recovery state. |
-| `SchemaName` | PostgreSQL | `public` | Schema that contains PostgreSQL channel tables. |
-| `RecoveryStateTable` | PostgreSQL | `asyncresponse_recovery_state` | Durable lost-subscriber recovery registrations, one row per waiter. |
-| `MessageTable` | PostgreSQL | `asyncresponse_channel_messages` | Stored response envelopes loaded after `LISTEN/NOTIFY` wakeups. |
-| `SubscriberTable` | PostgreSQL | `asyncresponse_channel_subscribers` | Live waiter heartbeat rows used for subscriber counts and delivery confirmation. |
+| `SchemaName` | PostgreSQL, SQL Server | `public` / `dbo` | Schema that contains the channel tables. |
+| `ConnectionString` | SQL Server | — | SQL Server connection string; must point at an existing database (the package creates schema/tables, never the database). |
+| `RecoveryStateTable` | PostgreSQL, SQL Server | `asyncresponse_recovery_state` | Durable lost-subscriber recovery registrations, one row per waiter. |
+| `MessageTable` | PostgreSQL, SQL Server | `asyncresponse_channel_messages` | Stored response envelopes loaded after `LISTEN/NOTIFY` wakeups (PostgreSQL) or by the adaptive polling sweep (SQL Server). |
+| `SubscriberTable` | PostgreSQL, SQL Server | `asyncresponse_channel_subscribers` | Live waiter heartbeat rows used for subscriber counts and delivery confirmation. |
 | `NotificationChannel` | PostgreSQL | `asyncresponse_channel_notify` | PostgreSQL `LISTEN/NOTIFY` channel; must be a simple identifier. |
-| `AutoCreateSchema` | PostgreSQL | `true` | Create schema/tables/indexes on first use; set `false` when migrations own DDL. |
-| `MessageRetention` | PostgreSQL | 1 hour | How long response envelope rows remain available for missed notification recovery. |
-| `DeliveryConfirmationTimeout` | PostgreSQL | 5 seconds | How long a publisher waits for live waiter confirmation before routing to lost-subscriber recovery. |
-| `DeliveryConfirmationPollInterval` | PostgreSQL | 50 ms | Poll cadence for cross-process delivery confirmation. |
+| `AutoCreateSchema` | PostgreSQL, SQL Server | `true` | Create schema/tables/indexes on first use; set `false` when migrations own DDL. |
+| `MessageRetention` | PostgreSQL, SQL Server | 1 hour | How long response envelope rows remain available for missed notification / cross-process sweep recovery. |
+| `DeliveryConfirmationTimeout` | PostgreSQL, SQL Server | 5 seconds | How long a publisher waits for live waiter confirmation before routing to lost-subscriber recovery. |
+| `DeliveryConfirmationPollInterval` | PostgreSQL, SQL Server | 50 ms | Poll cadence for cross-process delivery confirmation. |
 | `ListenerPollInterval` | PostgreSQL | 250 ms | Missed-notification safety scan interval. |
-| `PendingMessageBatchSize` | PostgreSQL | 64 | Rows loaded per subscribed correlation id per listener pass. |
-| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL | 10s / 30s | Heartbeat cadence and liveness window for active waiters. |
-| `RecoveryStateExpiry` | Redis, NATS, PostgreSQL | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
+| `ActivePollInterval` / `IdlePollInterval` | SQL Server | 250 ms / 2 s | Adaptive polling wake (SQL Server has no `LISTEN/NOTIFY`): sweep cadence while waiters are subscribed, and the backed-off cadence while idle. Same-process deliveries never wait for the sweep. |
+| `PendingMessageBatchSize` | PostgreSQL, SQL Server | 64 | Rows loaded per subscribed correlation id per listener/sweep pass. |
+| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server | 10s / 30s | Heartbeat cadence and liveness window for active waiters. |
+| `RecoveryStateExpiry` | Redis, NATS, PostgreSQL, SQL Server | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
 | `DefaultTimeout` | all | `RecoveryStateExpiry` | Default per-waiter timeout when a flow doesn't call `WithTimeout`. |
-| `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
-| `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
+| `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
+| `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
 
 ## Transport options
 
@@ -79,8 +82,9 @@ its own option type; the common shapes are summarized here. See the transport se
 
 | Option | Transports | Purpose |
 |---|---|---|
-| `KeyPrefix` / `SubjectPrefix` / `SchemaName` / `TopicPrefix` | Redis / NATS / PostgreSQL / Kafka | Namespace for worker and response streams/subjects/tables/topics. |
+| `KeyPrefix` / `SubjectPrefix` / `SchemaName` / `TopicPrefix` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Namespace for worker and response streams/subjects/tables/topics. |
 | `ConnectionString` | Azure Service Bus | Service Bus namespace connection string. Omit when you register your own singleton `ServiceBusClient`. |
+| `ConnectionString` | SQL Server | SQL Server connection string; must point at an existing database (the package creates schema/table/indexes, never the database). |
 | `BootstrapServers` | Kafka | Comma-separated broker list. The package speaks the Kafka protocol via `Confluent.Kafka`, so Redpanda, Amazon MSK, WarpStream, Aiven, and Confluent Cloud all work. |
 | `WorkerTopic` / `ResponseTopic` + `WorkerConsumerGroup` / `ResponseConsumerGroup` | Kafka | Topics for worker jobs and response ingress (default `{TopicPrefix}.transport.worker` / `.response`) and the consumer group per role. |
 | `CreateTopics` / `TopicNumPartitions` / `TopicReplicationFactor` | Kafka | Provision missing topics on subscriber startup. Partitions are the unit of consumer parallelism and ordering; `-1` uses broker defaults. |
@@ -88,10 +92,10 @@ its own option type; the common shapes are summarized here. See the transport se
 | `DeadLetterTopic` / `DeadLetterTopicSuffix` | Kafka | Explicit dead-letter topic, or the suffix appended per source topic (default `.deadletter` → `{topic}.deadletter`). |
 | `ConfigureProducer` / `ConfigureConsumer` / `ConfigureAdminClient` | Kafka | Last-chance hooks over the Confluent client configs (security, compression, fetch tuning, `max.poll.interval.ms`, …). |
 | `WorkerQueue` / `ResponseQueue` | Azure Service Bus | Service Bus queues used for worker jobs and response ingress; they must be distinct. |
-| `MessageTable` | PostgreSQL | Single queue table containing worker, response-ingress, and dead-letter rows. |
-| `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL | Logical queue names stored in the PostgreSQL queue table. They must be distinct. |
-| `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. |
-| `LockTimeout` | PostgreSQL | How long a claimed row stays locked before another subscriber may retry it. |
+| `MessageTable` | PostgreSQL, SQL Server | Single queue table containing worker, response-ingress, and dead-letter rows. |
+| `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL, SQL Server | Logical queue names stored in the queue table. They must be distinct. |
+| `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. SQL Server has no equivalent: same-process publishes wake subscribers through an in-process signal, and cross-process rows are picked up within `EmptyPollDelay`. |
+| `LockTimeout` | PostgreSQL, SQL Server | How long a claimed row stays locked before another subscriber may retry it. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus | Receive-loop batch size and long-poll timeout for queue subscribers. |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub | Redeliveries before dead-lettering. Google Pub/Sub performs redelivery itself — bound attempts with the subscription's `DeadLetterPolicy`. On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
@@ -99,9 +103,9 @@ its own option type; the common shapes are summarized here. See the transport se
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
-| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / Kafka / NATS / PostgreSQL / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition. |
-| `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL also unwraps nested JSON strings at those paths. |
-| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / Kafka | Whether poison messages are preserved and, for PostgreSQL, how long dead-letter rows are retained. |
+| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition. |
+| `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL and SQL Server also unwrap nested JSON strings at those paths. |
+| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Whether poison messages are preserved and, for PostgreSQL and SQL Server, how long dead-letter rows are retained. |
 
 A worker handler failure propagates out of the ingress to the transport dispatcher, which owns the
 retry decision: in `AckAfterHandlerCompletes` the delivery is NACKed/abandoned and redelivered up
@@ -133,4 +137,5 @@ bounded in-process queue is full; later handler failures are retried in-process,
 that exhausts its attempts is always dead-lettered *and committed* so the partition keeps moving.
 
 See [postgresql.md](postgresql.md) for PostgreSQL table layout, delivery-confirmation details, and
-connection-string tuning.
+connection-string tuning, and [sqlserver.md](sqlserver.md) for the SQL Server pair (adaptive polling
+wake, `UPDLOCK/READPAST` claims, application-lock DDL, and operational notes).

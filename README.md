@@ -56,9 +56,10 @@ recovery when a flow needs it.
 - **Recovery that understands your domain.** A response that arrives after its waiter died is
   classified by the payload's `ShouldResumeOnRecovery()` and routed to a durable resume or failure
   callback. A failed response is **never** blindly resumed.
-- **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL. Worker
-  transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS
-  JetStream, PostgreSQL. Every combination works; your flow code never changes.
+- **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL,
+  SQL Server. Worker transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google
+  Pub/Sub, Kafka, NATS JetStream, PostgreSQL, SQL Server. Every combination works; your flow code
+  never changes.
 - **One contract everywhere.** Schema-versioned wire envelopes, capped remote stack traces,
   ambient-context restoration into foreign callback threads, and identical `Until`/recovery
   semantics on every channel — switching infrastructure is a DI change, not a rewrite.
@@ -117,6 +118,7 @@ with any transport.
 | Redis | pub/sub push, zero polling | TTL'd Redis keys |
 | NATS | core request/reply — "no responders" is a positive lost-waiter signal | JetStream Key-Value |
 | PostgreSQL | `LISTEN/NOTIFY` wake + table rows — notifications carry only ids, so payload size is unbounded | row per waiter registration, database-clock TTLs |
+| SQL Server | adaptive polling sweep (tight while waiters exist, backed off while idle) + table rows — same-process deliveries skip the sweep entirely | row per waiter registration, database-clock TTLs |
 
 **Transports** (`AsyncResponse.Transports.*`) — exactly one required:
 
@@ -130,6 +132,7 @@ with any transport.
 | Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
+| SQL Server | queue table claimed with `UPDLOCK, ROWLOCK, READPAST` (the `SKIP LOCKED` equivalent), idempotent publish, dead-lettering |
 
 Every transport ships hosted subscribers for worker jobs and response ingress with two ACK modes:
 the default acknowledges only after your handler completes; opt-in **early ACK** trades that
@@ -146,10 +149,10 @@ payloads or flows.
 dotnet add package AsyncResponse.Core
 
 # exactly one channel (skip for in-memory):
-dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL
+dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL / .SqlServer
 
 # exactly one transport (skip for in-memory):
-dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL
+dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL / .SqlServer
 ```
 
 Targets .NET 8 and .NET 10.
@@ -278,12 +281,36 @@ when migrations own the schema). Table names, delivery-confirmation mechanics, a
 connection-string settings worth tuning under load (`No Reset On Close`, `Max Auto Prepare`) are in
 [docs/postgresql.md](docs/postgresql.md).
 
+### Everything on SQL Server
+
+The same recipe for SQL Server shops: durable waits, recovery, and a worker queue on the database
+you already run, with no broker to add.
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithSqlServerChannel(options =>          // adaptive-polling channel + row-per-waiter recovery
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer"))
+    .WithSqlServerTransport(options =>        // queue table, UPDLOCK/ROWLOCK/READPAST claims
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
+        options.WorkerSubscriber.UseAckAfterEnqueue(
+            backgroundWorkerCount: 4,
+            backgroundQueueCapacity: 256);
+    });
+```
+
+SQL Server has no `LISTEN/NOTIFY`, so the channel wakes waiters with an adaptive polling sweep:
+tight (250 ms) while waiters are subscribed, backed off (2 s) while idle — and same-process
+deliveries skip the sweep entirely, so the common path never polls. Schema creation is serialized
+across instances with `sp_getapplock`; the packages create their schema and tables but never the
+database itself. Details in [docs/sqlserver.md](docs/sqlserver.md).
+
 ### The other combinations
 
-Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithRedisTransport()`,
-`.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`, `.WithKafkaTransport()`,
-`.WithNatsTransport()` — every channel, transport, and option is documented in
-[docs/configuration.md](docs/configuration.md).
+Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithSqlServerChannel()`,
+`.WithRedisTransport()`, `.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`,
+`.WithKafkaTransport()`, `.WithNatsTransport()`, `.WithSqlServerTransport()` — every channel,
+transport, and option is documented in [docs/configuration.md](docs/configuration.md).
 
 ## Define a payload and await it
 
@@ -351,10 +378,10 @@ per-commit trends with regression alerting are published to the
 
 - **2000+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **97 integration tests** drive the shipped sample app black-box over HTTP against **real
-  brokers** — Redis, NATS, PostgreSQL, RabbitMQ, Kafka containers plus the official Azure Service Bus and
-  Google Pub/Sub emulators — orchestrated by .NET Aspire, with a dedicated early-ACK app instance
-  per transport.
+- **110+ integration tests** drive the shipped sample app black-box over HTTP against **real
+  brokers** — Redis, NATS, PostgreSQL, SQL Server, RabbitMQ, Kafka containers plus the official
+  Azure Service Bus and Google Pub/Sub emulators — orchestrated by .NET Aspire, with a dedicated
+  early-ACK app instance per transport.
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,
   duplicated, or leaked responses) and fails CI on violation; NBomber load profiles include a
   destructive recovery scenario.
@@ -401,10 +428,12 @@ per-commit trends with regression alerting are published to the
   load testing.
 - **[PostgreSQL](docs/postgresql.md)** — channel/transport architecture, schema, delivery
   confirmation, ACK modes, and operational tuning.
+- **[SQL Server](docs/sqlserver.md)** — channel/transport architecture, adaptive polling wake,
+  `UPDLOCK/READPAST` claims, schema, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
   scenario.
-- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (Kafka, SQS, SQL
-  Server, …), with priorities and design sketches.
+- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (SQS, Hangfire, …),
+  with priorities and design sketches.
 
 ## License
 

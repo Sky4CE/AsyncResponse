@@ -36,6 +36,9 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient PostgreSqlClient { get; private set; } = null!;
     public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
     public string PostgreSqlConnectionString { get; private set; } = null!;
+    public HttpClient SqlServerClient { get; private set; } = null!;
+    public HttpClient SqlServerEarlyAckClient { get; private set; } = null!;
+    public string SqlServerConnectionString { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -87,6 +90,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-postgresql-early-ack")
             .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-sqlserver")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-sqlserver-early-ack")
+            .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
@@ -102,11 +111,23 @@ public sealed class IntegrationFixture : IAsyncLifetime
         NatsEarlyAckClient = _app.CreateHttpClient("itest-app-nats-early-ack");
         PostgreSqlClient = _app.CreateHttpClient("itest-app-postgresql");
         PostgreSqlEarlyAckClient = _app.CreateHttpClient("itest-app-postgresql-early-ack");
+        SqlServerClient = _app.CreateHttpClient("itest-app-sqlserver");
+        SqlServerEarlyAckClient = _app.CreateHttpClient("itest-app-sqlserver-early-ack");
 
         var postgresEndpoint = _app.GetEndpoint("postgres", "postgres");
         PostgreSqlConnectionString =
             $"Host={postgresEndpoint.Host};Port={postgresEndpoint.Port};Username=postgres;Password=postgres;Database=asyncresponse;" +
             "Maximum Pool Size=40;No Reset On Close=true;Max Auto Prepare=20";
+
+        // The SUT apps have already provisioned the asyncresponse database by the time they report
+        // healthy, so direct tests can connect straight to it.
+        var sqlServerEndpoint = _app.GetEndpoint("sqlserver", "sqlserver");
+        var sqlServerPassword = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD") is { Length: > 0 } configured
+            ? configured
+            : "P@ssword12345";
+        SqlServerConnectionString =
+            $"Server={sqlServerEndpoint.Host},{sqlServerEndpoint.Port};User ID=sa;Password={sqlServerPassword};" +
+            "Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=40";
 
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
@@ -122,6 +143,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await ResetTestStateAsync(NatsEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(PostgreSqlClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(PostgreSqlEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(SqlServerClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(SqlServerEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -140,6 +163,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         NatsEarlyAckClient?.Dispose();
         PostgreSqlClient?.Dispose();
         PostgreSqlEarlyAckClient?.Dispose();
+        SqlServerClient?.Dispose();
+        SqlServerEarlyAckClient?.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }

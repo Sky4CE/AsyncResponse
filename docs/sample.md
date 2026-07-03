@@ -21,8 +21,9 @@ Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported contai
 such as Docker or Podman for the Redis resource.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
-`PostgreSQL`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` | `GooglePubSub` |
-`RabbitMQ` | `Redis` | `NATS` | `PostgreSQL`) select the providers,
+`PostgreSQL` | `SqlServer`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` |
+`GooglePubSub` | `Kafka` | `RabbitMQ` | `Redis` | `NATS` | `PostgreSQL` | `SqlServer`) select the
+providers,
 defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
@@ -90,6 +91,21 @@ ConnectionStrings__PostgreSQL='Host=localhost;Port=5432;Username=postgres;Passwo
 dotnet run --project samples/AsyncResponse.Sample
 ```
 
+To run the standalone sample on Microsoft SQL Server for both the durable response channel and the
+worker/ingress transport (the sample creates the `asyncresponse` database on first start):
+
+```bash
+docker run -d --rm --name asyncresponse-sqlserver -p 1433:1433 \
+  -e ACCEPT_EULA=Y \
+  -e MSSQL_SA_PASSWORD='P@ssword12345' \
+  mcr.microsoft.com/mssql/server:2022-latest
+
+AsyncResponse__Channel=SqlServer \
+AsyncResponse__Transport=SqlServer \
+ConnectionStrings__SqlServer='Server=localhost,1433;User ID=sa;Password=P@ssword12345;Database=asyncresponse;TrustServerCertificate=True' \
+dotnet run --project samples/AsyncResponse.Sample
+```
+
 ## Walking the scenarios
 
 Then walk the scenarios (the same HTTP endpoints the integration tests drive):
@@ -109,7 +125,7 @@ curl -X POST 'http://localhost:5000/emit-response?correlationId=<id>&status=Comp
 curl      'http://localhost:5000/healthz'                                   # recovery watchdog findings
 curl      'http://localhost:5000/alive'                                     # liveness check
 
-# Recovery after a "redeploy" (needs a durable channel such as Redis or PostgreSQL):
+# Recovery after a "redeploy" (needs a durable channel such as Redis, PostgreSQL, or SQL Server):
 curl -X POST 'http://localhost:5000/arm'                                          # returns a correlationId
 curl -X POST 'http://localhost:5000/crash'                                        # drops every subscription
 curl -X POST 'http://localhost:5000/publish?correlationId=<id>&status=Completed'  # → resume callback
@@ -126,13 +142,13 @@ For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and re
 `/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
 callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical
 failure path through `IAsyncResponsePublisher.SetException`. (`/arm`, `/crash`, `/publish`, and
-`/lost-subscriber-flow` require a durable channel — run with `AsyncResponse__Channel=Redis` or
-`AsyncResponse__Channel=PostgreSQL`.)
+`/lost-subscriber-flow` require a durable channel — run with `AsyncResponse__Channel=Redis`,
+`AsyncResponse__Channel=PostgreSQL`, or `AsyncResponse__Channel=SqlServer`.)
 `/crash` is intentionally a blunt manual demo that drops all local durable-channel subscriptions. For
 Redis, `/lost-subscriber-flow` drops only the correlation id it just armed so load tests can run many
-recovery flows concurrently without disturbing each other; for PostgreSQL, it uses the channel's local
-subscription-drop hook to simulate the same lost-subscriber condition before publishing the late
-response.
+recovery flows concurrently without disturbing each other; for PostgreSQL and SQL Server, it uses the
+channel's local subscription-drop hook to simulate the same lost-subscriber condition before
+publishing the late response.
 
 `/shared-correlation-exception` demonstrates fan-out: two waiters attach to the same correlation
 id, then one `SetException` faults both. This works with the in-memory and Redis channels; Redis may

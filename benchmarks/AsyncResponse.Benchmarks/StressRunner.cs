@@ -62,6 +62,7 @@ internal static class StressRunner
         failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await SqlServerAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await KafkaAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
@@ -585,6 +586,94 @@ internal static class StressRunner
         metrics.Emit("postgresql-ack-after-receive-dispatch-storm");
         return Check(
             "postgresql-ack-after-receive-dispatch-storm",
+            ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
+            ("naks", Volatile.Read(ref naks)),
+            ("deadLetters", Volatile.Read(ref deadLetters)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3f2) SQL Server ACK-after-enqueue dispatch storm. This bypasses a live SQL Server and
+    //      hammers the queue-row callback dispatcher directly: every ACKed row must be processed once.
+    private static async Task<int> SqlServerAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var options = new AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions
+        {
+            ConnectionString = "Server=localhost;Database=asyncresponse_stress;User ID=sa;Password=unused;TrustServerCertificate=True"
+        };
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var acks = 0;
+        var naks = 0;
+        var deadLetters = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = new AsyncResponse.Transports.SqlServer.SqlServerMessageDispatcher(
+            (delivery, _) =>
+            {
+                var separator = delivery.Payload.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Payload[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            options,
+            new AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            AsyncResponse.Transports.SqlServer.SqlServerSubscriberRole.Worker);
+
+        var metrics = await Measure("sqlserver-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery(
+                Guid.NewGuid(),
+                "stress-worker-queue",
+                $"{i}:{{}}",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [options.CorrelationIdHeader] = $"stress-{i}"
+                },
+                Attempt: 1,
+                () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
+                _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("sqlserver-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "sqlserver-ack-after-enqueue-dispatch-storm",
             ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
             ("naks", Volatile.Read(ref naks)),
             ("deadLetters", Volatile.Read(ref deadLetters)),
