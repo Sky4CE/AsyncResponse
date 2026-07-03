@@ -396,19 +396,21 @@ per-commit trends with regression alerting are published to the
   payment confirmations, DAG completions, webhook callbacks;
 - you're **orchestrating a multi-step flow across async services** — write the steps as plain
   sequential `await`s, one per remote call; inserting, reordering, or parallelizing a step is an
-  ordinary code edit, and every step is individually durable and recoverable;
+  ordinary code edit, and every step is individually durable and recoverable. With a small
+  persisted step ledger the whole flow becomes crash-resumable — the
+  [checkpointed-flow pattern](docs/durable-flows.md) is the production-proven recipe;
 - you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
 - waits must survive redeploys, and a late **failure** must never be resumed as a success.
 
 **Reach for something else when**
 
-- you need the engine itself to own your *position inside the flow*: resuming the code mid-flow
-  after a crash by replaying an event log, automatic compensation of already-completed steps,
-  engine-managed timers and workflow versioning — that's a workflow engine (Temporal, Durable
-  Task, MassTransit sagas). AsyncResponse durably recovers **each in-flight wait** and routes it
-  by domain outcome; re-entering the flow at the right step is your resume callback's job (see
-  [re-entrant resumes](docs/recovery.md)). The two compose: plain awaits for flows that don't
-  need replay semantics, a workflow engine for the few that do.
+- you need **engine-owned** flow semantics: automatic compensation graphs, durable timers
+  measured in weeks, human-approval tasks, replayable audit histories of every decision. With
+  idempotent steps and a persisted ledger, AsyncResponse runs crash-resumable multi-step flows
+  end to end — including explicit compensation — as
+  [durable flows](docs/durable-flows.md) shows, and it does so without replay-determinism rules
+  or workflow-version patching. Choose Temporal/Durable Task when you want the *engine* to own
+  the ledger and derive compensation automatically, and accept those constraints in exchange.
 - you need fire-and-forget pub/sub fan-out with nobody waiting — that's your message bus, and
   AsyncResponse coexists with it happily.
 
@@ -419,6 +421,9 @@ per-commit trends with regression alerting are published to the
 - **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `ShouldResumeOnRecovery`, the
   watchdog and health check, recovery-state durability, wire/schema versioning, and the
   shared-correlation recovery limitation.
+- **[Durable flows](docs/durable-flows.md)** — the checkpointed-flow pattern: multi-step
+  orchestration as plain sequential `await`s with crash-resume, progress streaming, subset
+  runs, explicit compensation, and an honest comparison with workflow engines.
 - **[Observability](docs/observability.md)** — tracing (`ActivitySource`) and metrics
   (`System.Diagnostics.Metrics`) for the `"AsyncResponse"` source/meter.
 - **[Security & hardening](docs/security.md)** — callback authorization allowlist, securing the

@@ -110,6 +110,10 @@ distributed claim step in front of the callback — resume must already be re-at
 extra store round-trip per recovery would buy nothing. Treat both callbacks as idempotent: key side
 effects on the correlation id, not on the invocation.
 
+The complete multi-step recipe built on these rules — a persisted step ledger, re-attach via the
+pending correlation id, subset runs, and compensation — is documented in
+[durable-flows.md](durable-flows.md).
+
 ## Why recovery routing and `Until` stay separate
 
 `ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
