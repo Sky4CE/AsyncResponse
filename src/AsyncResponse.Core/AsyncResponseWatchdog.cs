@@ -249,6 +249,12 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 if (entry is null)
                     continue;
 
+                // Durable-flow ledgers ride in the recovery store under a sentinel payload type;
+                // they are run state, not waiter registrations — a long-running flow would
+                // otherwise read as a stale entry and produce false stuck-flow warnings.
+                if (RecoveryBackedFlowStateStore.IsFlowLedger(entry))
+                    continue;
+
                 if (!string.IsNullOrEmpty(entry.CorrelationId)
                     && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
                 {

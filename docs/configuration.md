@@ -39,8 +39,11 @@ Configured through the `AddAsyncResponse(options => …)` callback.
 | `Watchdog.Interval` | (see watchdog) | How often the watchdog scans persisted recovery state. |
 | `Watchdog.StaleAfter` | (see watchdog) | Age at which an entry with no live waiter is reported stale. |
 | `Watchdog.StartupDelay` | (see watchdog) | Delay before the first scan after host start. |
+| `DurableFlows.StateExpiry` | 7 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. |
+| `DurableFlows.DefaultStepTimeout` | `null` (channel default) | Default timeout for `AwaitStepAsync` steps that don't pass one explicitly. |
 
-See [recovery.md](recovery.md) for the watchdog in context, and [security.md](security.md) for
+See [durable-flows.md](durable-flows.md) for the flow API these options govern,
+[recovery.md](recovery.md) for the watchdog in context, and [security.md](security.md) for
 `.AuthorizeCallbacks(...)` and type-resolution registration, which are also chained off
 `AddAsyncResponse()`.
 

@@ -60,8 +60,11 @@ internal static class ReflectionExtensions
 
             // 1b) Opt-in authorization: when an IAsyncResponseCallbackAuthorizer is registered, only
             // allowed (service, method) pairs may be invoked — defense-in-depth even if the recovery
-            // store or worker transport is compromised. No authorizer registered ⇒ allow all.
-            if (provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
+            // store or worker transport is compromised. No authorizer registered ⇒ allow all. The
+            // built-in flow executor is implicitly allowed: durable flows register it as their
+            // resume/failure target, and its methods accept only a flow id (and an exception).
+            if (dto.ServiceInterfaceFullName != typeof(IDurableFlowExecutor).FullName
+                && provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
                 && !authorizer.IsAllowed(dto.ServiceInterfaceFullName, dto.MethodName))
             {
                 throw new InvalidOperationException(
@@ -96,7 +99,9 @@ internal static class ReflectionExtensions
     private static async Task AwaitSlow(ValueTask pending)
         => await pending.ConfigureAwait(false);
 
-    private static Type? ResolveServiceType(string serviceInterfaceFullName)
+    // Internal: the durable-flow executor resolves persisted flow/input type names through the
+    // same default-ALC scan + custom-resolver chain as persisted callback targets.
+    internal static Type? ResolveServiceType(string serviceInterfaceFullName)
     {
         if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
         {

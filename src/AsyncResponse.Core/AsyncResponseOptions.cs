@@ -16,4 +16,10 @@ public sealed class AsyncResponseOptions
     /// durable store, to avoid duplicate scans and warnings.
     /// </summary>
     public AsyncResponseWatchdogOptions Watchdog { get; set; } = new();
+
+    /// <summary>
+    /// Settings for durable flows (<see cref="IDurableFlows"/>): flow-state expiry and the
+    /// default awaited-step timeout.
+    /// </summary>
+    public DurableFlowOptions DurableFlows { get; set; } = new();
 }

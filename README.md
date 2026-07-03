@@ -43,9 +43,10 @@ recovery when a flow needs it.
 ## Why AsyncResponse
 
 - **Feels local, runs distributed.** One fluent expression replaces the `TaskCompletionSource`
-  registry, the timeout plumbing, and the correlation bookkeeping — and a multi-step flow over
-  a dozen remote services reads as a dozen sequential `await`s: insert, reorder, or parallelize
-  steps like any other C# code, with every step individually durable.
+  registry, the timeout plumbing, and the correlation bookkeeping — and with **durable flows**
+  a multi-step process over a dozen remote services reads as a dozen sequential `await`s.
+  Steps checkpoint automatically, in-flight waits re-attach after a redeploy, and inserting or
+  reordering a step is an ordinary code edit ([durable flows](docs/durable-flows.md)).
 - **Race-free by construction.** The request is sent by a *trigger* that runs only after the
   subscription and recovery state exist, so the first response can never beat its waiter — and a
   failing trigger tears the registration down. `For<T>()` **requires** a trigger;
@@ -394,11 +395,11 @@ per-commit trends with regression alerting are published to the
 
 - a flow needs the *answer* to a specific request that arrives asynchronously — job results,
   payment confirmations, DAG completions, webhook callbacks;
-- you're **orchestrating a multi-step flow across async services** — write the steps as plain
-  sequential `await`s, one per remote call; inserting, reordering, or parallelizing a step is an
-  ordinary code edit, and every step is individually durable and recoverable. With a small
-  persisted step ledger the whole flow becomes crash-resumable — the
-  [checkpointed-flow pattern](docs/durable-flows.md) is the production-proven recipe;
+- you're **orchestrating a multi-step flow across async services** — implement
+  `IDurableFlow<TInput>` and write the steps as plain sequential `await`s
+  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints every step,
+  re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks —
+  [durable flows](docs/durable-flows.md);
 - you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
 - waits must survive redeploys, and a late **failure** must never be resumed as a success.
 
@@ -421,9 +422,10 @@ per-commit trends with regression alerting are published to the
 - **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `ShouldResumeOnRecovery`, the
   watchdog and health check, recovery-state durability, wire/schema versioning, and the
   shared-correlation recovery limitation.
-- **[Durable flows](docs/durable-flows.md)** — the checkpointed-flow pattern: multi-step
-  orchestration as plain sequential `await`s with crash-resume, progress streaming, subset
-  runs, explicit compensation, and an honest comparison with workflow engines.
+- **[Durable flows](docs/durable-flows.md)** — first-class multi-step orchestration:
+  `IDurableFlow<TInput>` with automatically checkpointed steps, crash-resume and re-attach,
+  progress streaming, pluggable flow-state storage, explicit compensation, and an honest
+  comparison with workflow engines.
 - **[Observability](docs/observability.md)** — tracing (`ActivitySource`) and metrics
   (`System.Diagnostics.Metrics`) for the `"AsyncResponse"` source/meter.
 - **[Security & hardening](docs/security.md)** — callback authorization allowlist, securing the

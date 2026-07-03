@@ -48,6 +48,27 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.TryAddSingleton<AsyncResponseWatchdogState>();
         services.AddHostedService<AsyncResponseWatchdog>();
 
+        // Durable flows (the checkpointed-flow pattern as a first-class API). Flow state rides in
+        // the configured channel's recovery store by default; TryAdd lets applications register a
+        // custom IFlowStateStore (e.g. their own tables) before or after AddAsyncResponse.
+        services.TryAddSingleton<IFlowStateStore>(provider => new RecoveryBackedFlowStateStore(
+            provider.GetRequiredService<IRecoveryStateStore>()));
+        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<IFlowStateStore>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<IAsyncResponseSubscriber>(),
+            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
+        services.TryAddSingleton<IDurableFlows>(provider => new DurableFlows(
+            provider.GetRequiredService<IFlowStateStore>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlows>>()));
+
         return new AsyncResponseRegistrationBuilder(services);
     }
 
