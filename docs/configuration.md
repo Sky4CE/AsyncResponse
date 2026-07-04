@@ -87,6 +87,7 @@ its own option type; the common shapes are summarized here. See the transport se
 |---|---|---|
 | `KeyPrefix` / `SubjectPrefix` / `SchemaName` / `TopicPrefix` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Namespace for worker and response streams/subjects/tables/topics. |
 | `ConnectionString` | Azure Service Bus | Service Bus namespace connection string. Omit when you register your own singleton `ServiceBusClient`. |
+| `ServiceUrl` / `Region` / `AccessKey` / `SecretKey` | SQS | Endpoint and credentials. All optional: omit everything to use the AWS SDK default chain, set `ServiceUrl` for LocalStack or a proxy, or register your own singleton `Amazon.SQS.IAmazonSQS` (e.g. via `AWSSDK.Extensions.NETCore.Setup`) and the package reuses it. |
 | `ConnectionString` | SQL Server | SQL Server connection string; must point at an existing database (the package creates schema/table/indexes, never the database). |
 | `BootstrapServers` | Kafka | Comma-separated broker list. The package speaks the Kafka protocol via `Confluent.Kafka`, so Redpanda, Amazon MSK, WarpStream, Aiven, and Confluent Cloud all work. |
 | `WorkerTopic` / `ResponseTopic` + `WorkerConsumerGroup` / `ResponseConsumerGroup` | Kafka | Topics for worker jobs and response ingress (default `{TopicPrefix}.transport.worker` / `.response`) and the consumer group per role. |
@@ -95,18 +96,21 @@ its own option type; the common shapes are summarized here. See the transport se
 | `DeadLetterTopic` / `DeadLetterTopicSuffix` | Kafka | Explicit dead-letter topic, or the suffix appended per source topic (default `.deadletter` → `{topic}.deadletter`). |
 | `ConfigureProducer` / `ConfigureConsumer` / `ConfigureAdminClient` | Kafka | Last-chance hooks over the Confluent client configs (security, compression, fetch tuning, `max.poll.interval.ms`, …). |
 | `WorkerQueue` / `ResponseQueue` | Azure Service Bus | Service Bus queues used for worker jobs and response ingress; they must be distinct. |
+| `WorkerQueue` / `ResponseQueue` | SQS | Queues for worker jobs and response ingress (distinct); each accepts a queue name (resolved once via `GetQueueUrl`) or a full queue URL. A name/URL ending in `.fifo` opts into FIFO publishing: the correlation id becomes the `MessageGroupId` (one flow's jobs stay ordered) and every message carries a unique `MessageDeduplicationId`. |
+| `CreateQueues` / `DeadLetterQueueSuffix` / `MaxReceiveCount` | SQS | Provision the queues on startup, each with a native dead-letter queue (`{queue}-dlq`) wired through a redrive policy: SQS counts receives (`ApproximateReceiveCount`) and moves a message to the DLQ after `MaxReceiveCount`. Off by default — point at existing queues in production. |
+| `WorkerSubscriber.VisibilityTimeout` / `RedeliveryDelay` | SQS | Per-receive visibility timeout (`null` uses the queue's setting) and the optional shortened invisibility applied via `ChangeMessageVisibility` when a handler fails; `null` lets the visibility timeout expire naturally. |
 | `MessageTable` | PostgreSQL, SQL Server | Single queue table containing worker, response-ingress, and dead-letter rows. |
 | `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL, SQL Server | Logical queue names stored in the queue table. They must be distinct. |
 | `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. SQL Server has no equivalent: same-process publishes wake subscribers through an in-process signal, and cross-process rows are picked up within `EmptyPollDelay`. |
 | `LockTimeout` | PostgreSQL, SQL Server | How long a claimed row stays locked before another subscriber may retry it. |
-| `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus | Receive-loop batch size and long-poll timeout for queue subscribers. |
+| `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
-| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub | Redeliveries before dead-lettering. Google Pub/Sub performs redelivery itself — bound attempts with the subscription's `DeadLetterPolicy`. On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
-| `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub | Bounded backoff for restarting a failed hosted subscriber (streaming-pull fault, transient auth/startup errors). |
+| `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub and SQS | Redeliveries before dead-lettering. Google Pub/Sub and SQS perform redelivery natively — bound attempts with the subscription's `DeadLetterPolicy` (Pub/Sub) or the queue's redrive policy `maxReceiveCount` (SQS, provisioned by `CreateQueues` or your infra). On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
+| `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub, SQS | Bounded backoff for restarting a failed hosted subscriber (streaming-pull/long-poll fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
-| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition. |
+| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / SQS / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition; on FIFO SQS queues it becomes the `MessageGroupId` with the same per-flow ordering effect. |
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL and SQL Server also unwrap nested JSON strings at those paths. |
 | `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Whether poison messages are preserved and, for PostgreSQL and SQL Server, how long dead-letter rows are retained. |
 
@@ -126,6 +130,20 @@ budget: a receive batch is processed sequentially, so the last message in a batc
 `MaxMessagesPerReceive × handler latency` before settlement — keep that product well under the
 queue's lock duration (or lower `MaxMessagesPerReceive`) to avoid `MessageLockLostException`
 redeliveries of already-processed messages.
+
+AWS SQS uses visibility-timeout settlement with long-poll `ReceiveMessage` (up to 10 messages and
+20 seconds per call). In `AckAfterHandlerCompletes`, a successful handler deletes the message;
+failures leave it invisible until the visibility timeout expires (or shorten the wait with
+`RedeliveryDelay` via `ChangeMessageVisibility`), SQS redelivers it with an incremented
+`ApproximateReceiveCount`, and the queue's redrive policy dead-letters it after `maxReceiveCount`
+receives — redelivery accounting and the DLQ are fully native, so there is no app-level
+`MaxDeliveryAttempts`. In `AckAfterEnqueue`, the message is deleted as soon as it enters the bounded
+background queue; later handler failures cannot be redelivered because the message is gone, so use
+`OnBackgroundFailure` for metrics, alerts, or a custom durable failure path. Mind the visibility
+budget the same way as the Service Bus lock budget: a receive batch is processed sequentially, so
+keep `MaxMessagesPerReceive × handler latency` under the queue's visibility timeout (or set
+`WorkerSubscriber.VisibilityTimeout` higher / `MaxMessagesPerReceive` lower) to avoid duplicate
+executions of already-processed messages. FIFO queues are opt-in by naming the queue `*.fifo`.
 
 Kafka is built on classic consumer groups with manual offset management (`enable.auto.commit=true` +
 `enable.auto.offset.store=false`; an offset is stored only once its message is fully resolved). Two

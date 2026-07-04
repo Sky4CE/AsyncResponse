@@ -57,6 +57,7 @@ jobs:
           dotnet pack src/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -o ./artifacts
 
       - name: Upload packages as build artifacts
         uses: actions/upload-artifact@v4
@@ -88,7 +89,8 @@ jobs:
 
       - name: Test (integration)
         # The integration fixture boots the Aspire AppHost, which starts Redis, the Google Pub/Sub
-        # emulator, Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL, SQL Server, Kafka, and SUT apps.
+        # emulator, Azure Service Bus emulator, LocalStack (SQS), RabbitMQ, NATS, PostgreSQL,
+        # SQL Server, Kafka, and SUT apps.
         run: |
           dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
             --configuration Release --no-build \

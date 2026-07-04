@@ -8,6 +8,7 @@ using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
+using AsyncResponse.Transports.SQS;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.Extensions.DependencyInjection;
@@ -128,6 +129,7 @@ internal static class StressRunner
         failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await SqlServerAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await SqsAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await KafkaAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
         failures += await RawIngressStorm(concurrency, count);
@@ -1345,6 +1347,94 @@ internal static class StressRunner
                     await store.TryDeleteAsync(state.CorrelationId).ConfigureAwait(false);
             }
         }
+    }
+
+    // SQS ACK-after-enqueue dispatch storm: every delivery must be deleted exactly once (the early
+    // ACK), never released back via ChangeMessageVisibility, and every handler must run exactly
+    // once with no duplicates — delete/visibility drift is an at-least-once accounting bug.
+    private static async Task<int> SqsAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var options = new SqsAsyncResponseOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
+        };
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var deletes = 0;
+        var visibilityReleases = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (delivery, _) =>
+            {
+                var separator = delivery.Body.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Body[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            options,
+            new SqsSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            "stress-worker-queue",
+            SqsSubscriberRole.Worker);
+
+        var metrics = await Measure("sqs-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new SqsTransportDelivery(
+                "https://sqs.stress.local/000000000000/stress-worker-queue",
+                $"{i}:{{}}",
+                $"stress-{i}",
+                $"receipt-{i}",
+                ReceiveCount: 1,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [options.CorrelationIdAttribute] = $"stress-{i}"
+                },
+                () => { Interlocked.Increment(ref deletes); return ValueTask.CompletedTask; },
+                _ => { Interlocked.Increment(ref visibilityReleases); return ValueTask.CompletedTask; }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("sqs-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "sqs-ack-after-enqueue-dispatch-storm",
+            ("deleteMismatch", Math.Abs(count - Volatile.Read(ref deletes))),
+            ("visibilityReleases", Volatile.Read(ref visibilityReleases)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
     }
 
     // -- infrastructure --------------------------------------------------------------------------

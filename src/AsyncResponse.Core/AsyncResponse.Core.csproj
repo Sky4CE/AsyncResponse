@@ -17,6 +17,7 @@
     <InternalsVisibleTo Include="AsyncResponse.Transports.PostgreSQL" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.RabbitMQ" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.SqlServer" />
+    <InternalsVisibleTo Include="AsyncResponse.Transports.SQS" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.Redis" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" />
     <InternalsVisibleTo Include="AsyncResponse.IntegrationTests" />

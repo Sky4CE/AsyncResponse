@@ -17,7 +17,7 @@ facts were re-verified July 2026 (sources at the end).
 | Axis | Shipped | Coverage gap |
 |---|---|---|
 | **Channels** | In-memory, Redis, NATS, PostgreSQL, SQL Server | teams standardized on a Redis *fork* wanting an explicit compatibility statement |
-| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server | **all of AWS**, broker-free durable execution (Hangfire-style) |
+| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server, AWS SQS | broker-free durable execution (Hangfire-style) |
 
 Three of the original #14/#17 top picks — Azure Service Bus, the NATS pair, and the PostgreSQL
 pair — have shipped since that investigation was written. This roadmap re-baselines on what
@@ -106,10 +106,11 @@ provides no targeted wake and no per-key TTL; rejected.
 Integration tests: single-broker KRaft container (and it doubles as a Redpanda compatibility
 check). Effort: ~RabbitMQ + 30% (retry/DLQ machinery is on us, as it was for Redis Streams).
 
-#### 3.2 AWS SQS transport — `AsyncResponse.Transports.SQS`
+#### 3.2 AWS SQS transport — `AsyncResponse.Transports.SQS` 🟢 shipped
 
-The only whole-cloud gap: Azure and GCP are covered, AWS is not (313M `AWSSDK.SQS` downloads).
-SQS is the cleanest conceptual fit of any managed queue:
+Closed the last whole-cloud gap: Azure and GCP were covered, AWS was not (313M `AWSSDK.SQS`
+downloads). SQS is the cleanest conceptual fit of any managed queue, and the shipped package
+follows this mapping exactly:
 
 | AsyncResponse contract | SQS mechanics |
 |---|---|
@@ -122,12 +123,12 @@ SQS is the cleanest conceptual fit of any managed queue:
 | FIFO queues | Supported via options (`MessageGroupId` = correlation id); documented as opt-in |
 
 SNS is *not* needed for the core model (fan-out is not our shape) — defer any SNS ingress to
-demand. Document the **AWS recipe** in the README alongside the package: SQS transport + Redis
-channel on ElastiCache/MemoryDB *or* PostgreSQL channel on RDS/Aurora — full AWS-native stack
-with zero new package work on the channel side.
+demand. The **AWS recipe** is documented in the README alongside the package: SQS transport +
+Redis channel on ElastiCache/MemoryDB *or* PostgreSQL channel on RDS/Aurora — full AWS-native
+stack with zero new package work on the channel side.
 
-Integration tests: LocalStack container. Effort: ~Google Pub/Sub (the SDK does the heavy
-lifting).
+Integration tests run against a LocalStack container (queues provisioned by the transport's
+`CreateQueues` option), including durable-flow execution and resume over the SQS worker queue.
 
 #### 3.3 Valkey / Garnet / Dragonfly compatibility validation (no new package)
 

@@ -12,6 +12,7 @@ using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
 using AsyncResponse.Transports.Redis;
 using AsyncResponse.Transports.SqlServer;
+using AsyncResponse.Transports.SQS;
 using Confluent.Kafka;
 using NATS.Client.Core;
 using Google.Api.Gax;
@@ -35,7 +36,7 @@ builder.Services.AddOpenApi();
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL | SqlServer
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL | SqlServer
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL | SqlServer | SQS
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
@@ -50,6 +51,7 @@ var useRedisTransport = string.Equals(transport, "Redis", StringComparison.Ordin
 var useNatsTransport = string.Equals(transport, "NATS", StringComparison.OrdinalIgnoreCase);
 var usePostgreSqlTransport = string.Equals(transport, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 var useSqlServerTransport = string.Equals(transport, "SqlServer", StringComparison.OrdinalIgnoreCase);
+var useSqs = string.Equals(transport, "SQS", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis || useRedisTransport)
 {
@@ -123,6 +125,10 @@ else if (usePostgreSqlTransport)
 else if (useSqlServerTransport)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "SqlServer");
+}
+else if (useSqs)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "SQS");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -401,6 +407,38 @@ else if (useSqlServerTransport)
         ConfigureSqlServerSubscriber(builder.Configuration, "SqlServer:Response", options.ResponseSubscriber);
     });
 }
+else if (useSqs)
+{
+    asyncResponse.WithSqsTransport(options =>
+    {
+        options.ServiceUrl = builder.Configuration["SQS:ServiceUrl"] ?? options.ServiceUrl;
+        options.Region = builder.Configuration["SQS:Region"] ?? options.Region;
+        options.AccessKey = builder.Configuration["SQS:AccessKey"] ?? options.AccessKey;
+        options.SecretKey = builder.Configuration["SQS:SecretKey"] ?? options.SecretKey;
+        options.WorkerQueue = builder.Configuration["SQS:WorkerQueue"] ?? options.WorkerQueue;
+        options.ResponseQueue = builder.Configuration["SQS:ResponseQueue"] ?? options.ResponseQueue;
+        options.CorrelationIdAttribute = builder.Configuration["SQS:CorrelationIdAttribute"] ?? options.CorrelationIdAttribute;
+        options.DeadLetterQueueSuffix = builder.Configuration["SQS:DeadLetterQueueSuffix"] ?? options.DeadLetterQueueSuffix;
+
+        if (bool.TryParse(builder.Configuration["SQS:CreateQueues"], out var createQueues))
+            options.CreateQueues = createQueues;
+        if (int.TryParse(builder.Configuration["SQS:MaxReceiveCount"], out var maxReceiveCount))
+            options.MaxReceiveCount = maxReceiveCount;
+        if (int.TryParse(builder.Configuration["SQS:MaxMessagesPerReceive"], out var maxMessagesPerReceive))
+            options.MaxMessagesPerReceive = maxMessagesPerReceive;
+        if (int.TryParse(builder.Configuration["SQS:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "SQS:ReceiveWaitTimeSeconds", value => options.ReceiveWaitTime = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SQS:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SQS:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SQS:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "SQS:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+        ConfigureSqsShutdownBudget(builder.Configuration, options);
+        ConfigureSqsSubscriber(builder.Configuration, "SQS:Worker", options.WorkerSubscriber);
+        ConfigureSqsSubscriber(builder.Configuration, "SQS:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -408,7 +446,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', 'PostgreSQL', or 'SqlServer'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', 'PostgreSQL', 'SqlServer', or 'SQS'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -463,6 +501,25 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? postgres = null;
     object? sqlserver = null;
     object? azureServiceBus = null;
+    object? sqs = null;
+    if (useSqs)
+    {
+        var sqsOptions = services.GetRequiredService<IOptions<SqsAsyncResponseOptions>>().Value;
+        sqs = new
+        {
+            workerQueue = sqsOptions.WorkerQueue,
+            responseQueue = sqsOptions.ResponseQueue,
+            createQueues = sqsOptions.CreateQueues,
+            maxReceiveCount = sqsOptions.MaxReceiveCount,
+            workerAckMode = sqsOptions.WorkerSubscriber.AckMode.ToString(),
+            workerBackgroundWorkerCount = sqsOptions.WorkerSubscriber.BackgroundWorkerCount,
+            workerBackgroundQueueCapacity = sqsOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            responseAckMode = sqsOptions.ResponseSubscriber.AckMode.ToString(),
+            responseBackgroundWorkerCount = sqsOptions.ResponseSubscriber.BackgroundWorkerCount,
+            responseBackgroundQueueCapacity = sqsOptions.ResponseSubscriber.BackgroundQueueCapacity
+        };
+    }
+
     if (useAzureServiceBus)
     {
         var serviceBusOptions = services.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value;
@@ -707,7 +764,7 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, azureServiceBus, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver });
+    return Results.Ok(new { channel, transport, azureServiceBus, sqs, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -754,6 +811,15 @@ static void ConfigureAzureServiceBusShutdownBudget(
     AzureServiceBusAsyncResponseOptions options)
 {
     var timeout = ReadOptionalPositiveTimeout(configuration, "AzureServiceBus:HostShutdownTimeoutSeconds");
+    if (timeout is not null)
+        options.HostShutdownTimeout = timeout.Value;
+}
+
+static void ConfigureSqsShutdownBudget(
+    IConfiguration configuration,
+    SqsAsyncResponseOptions options)
+{
+    var timeout = ReadOptionalPositiveTimeout(configuration, "SQS:HostShutdownTimeoutSeconds");
     if (timeout is not null)
         options.HostShutdownTimeout = timeout.Value;
 }
@@ -838,6 +904,45 @@ static void ConfigureAzureServiceBusSubscriber(
     }
 
     subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+}
+
+static void ConfigureSqsSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    SqsSubscriberOptions subscriberOptions)
+{
+    ApplyOptionalTimeout(configuration, $"{prefix}:VisibilityTimeoutSeconds", value => subscriberOptions.VisibilityTimeout = value);
+    ApplyOptionalTimeout(configuration, $"{prefix}:RedeliveryDelaySeconds", value => subscriberOptions.RedeliveryDelay = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<SqsAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<SqsAckMode>())}.");
+
+    if (mode is SqsAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = SqsAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not SqsAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigurePubSubSubscriberAckMode(
@@ -1662,6 +1767,9 @@ app.MapPost("/emit-response", async (
     if (useAzureServiceBus)
         return await EmitAzureServiceBusResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
+    if (useSqs)
+        return await EmitSqsResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
     if (useKafka)
         return await EmitKafkaResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
@@ -1680,9 +1788,64 @@ app.MapPost("/emit-response", async (
     if (useSqlServerTransport)
         return await EmitSqlServerResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, or SqlServer.");
+    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, SQS, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, or SqlServer.");
 })
 .WithTags("Workers");
+
+static async Task<IResult> EmitSqsResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<SqsAsyncResponseOptions>>();
+    if (options is null)
+        return Results.Conflict("SQS response ingress requires the SQS transport.");
+
+    var o = options.Value;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+
+    // A one-off client mirrors how a remote system would feed the response queue; the hosted
+    // response-ingress subscriber picks the message up from there.
+    var config = new Amazon.SQS.AmazonSQSConfig();
+    if (!string.IsNullOrWhiteSpace(o.ServiceUrl))
+    {
+        config.ServiceURL = o.ServiceUrl;
+        config.AuthenticationRegion = o.Region ?? "us-east-1";
+    }
+    else if (!string.IsNullOrWhiteSpace(o.Region))
+    {
+        config.RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(o.Region);
+    }
+
+    using var client = !string.IsNullOrWhiteSpace(o.AccessKey) && !string.IsNullOrWhiteSpace(o.SecretKey)
+        ? new Amazon.SQS.AmazonSQSClient(new Amazon.Runtime.BasicAWSCredentials(o.AccessKey, o.SecretKey), config)
+        : new Amazon.SQS.AmazonSQSClient(config);
+
+    var queueUrl = o.ResponseQueue.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+        ? o.ResponseQueue
+        : (await client.GetQueueUrlAsync(o.ResponseQueue, cancellationToken).ConfigureAwait(false)).QueueUrl;
+
+    var request = new Amazon.SQS.Model.SendMessageRequest
+    {
+        QueueUrl = queueUrl,
+        MessageBody = json
+    };
+    if (useAttribute)
+    {
+        request.MessageAttributes = new Dictionary<string, Amazon.SQS.Model.MessageAttributeValue>
+        {
+            [o.CorrelationIdAttribute] = new() { DataType = "String", StringValue = correlationId }
+        };
+    }
+
+    await client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+    return Results.Accepted();
+}
 
 static async Task<IResult> EmitPubSubResponseAsync(
     IServiceProvider services,

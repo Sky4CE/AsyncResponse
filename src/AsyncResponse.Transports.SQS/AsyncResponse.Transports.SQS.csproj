@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.Transports.SQS</PackageId>
+    <Description>AWS SQS transport for AsyncResponse: publish worker jobs to SQS queues with long-poll consumption, feed response queues into the transport-neutral AsyncResponse ingress, and lean on native redrive policies for bounded redelivery and dead-lettering.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Tests" />
+    <InternalsVisibleTo Include="AsyncResponse.IntegrationTests" />
+    <InternalsVisibleTo Include="AsyncResponse.Benchmarks" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.SQS" Version="4.0.100.2" />
+  </ItemGroup>
+
+</Project>

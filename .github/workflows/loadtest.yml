@@ -3,7 +3,7 @@ name: Load test
 # End-to-end HTTP load test (NBomber) against the real Redis + broker transport stack. Runs the broad
 # non-destructive profile on every push to main and publishes throughput/latency to the same gh-pages
 # dashboard as the benchmarks workflow; manual runs can select focused azure-servicebus/pubsub/
-# rabbitmq/redis/nats/postgresql/sqlserver/kafka/recovery profiles. Extra CLI args and AppHost env
+# rabbitmq/redis/nats/postgresql/sqlserver/kafka/sqs/recovery profiles. Extra CLI args and AppHost env
 # overrides keep workflow_dispatch below GitHub's 25-input limit as new transports/channels are added.
 # It is Docker-backed, so it shares a concurrency group with the benchmarks workflow to avoid racing
 # on the gh-pages history.
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Scenario profile: broad, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, sqlserver, kafka, recovery'
+        description: 'Scenario profile: broad, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, sqlserver, kafka, sqs, recovery'
         default: 'broad'
       rate:
         description: 'Requests per second, per scenario'
@@ -61,9 +61,9 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      # Boots Redis + a Pub/Sub emulator + Azure Service Bus emulator + RabbitMQ + NATS + PostgreSQL +
-      # SQL Server + Kafka sample SUTs via Aspire, drives them with NBomber, and emits
-      # github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
+      # Boots Redis + a Pub/Sub emulator + Azure Service Bus emulator + LocalStack (SQS) + RabbitMQ +
+      # NATS + PostgreSQL + SQL Server + Kafka sample SUTs via Aspire, drives them with NBomber, and
+      # emits github-action-benchmark JSON. Exits non-zero (failing the job) if any request failed.
       - name: Run NBomber load test
         env:
           LOADTEST_PROFILE: ${{ github.event.inputs.profile || 'broad' }}

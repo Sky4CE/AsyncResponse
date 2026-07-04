@@ -33,6 +33,12 @@ const string AzureServiceBusWorkerQueue = "asyncresponse-itest-asb-worker";
 const string AzureServiceBusResponseQueue = "asyncresponse-itest-asb-response";
 const string AzureServiceBusEarlyAckWorkerQueue = "asyncresponse-itest-asb-worker-earlyack";
 const string AzureServiceBusEarlyAckResponseQueue = "asyncresponse-itest-asb-response-earlyack";
+const string SqsRedisKeyPrefix = "itest-sqs";
+const string SqsEarlyAckRedisKeyPrefix = "itest-sqs-early-ack";
+const string SqsWorkerQueue = "asyncresponse-itest-sqs-worker";
+const string SqsResponseQueue = "asyncresponse-itest-sqs-response";
+const string SqsEarlyAckWorkerQueue = "asyncresponse-itest-sqs-worker-earlyack";
+const string SqsEarlyAckResponseQueue = "asyncresponse-itest-sqs-response-earlyack";
 const string RedisTransportKeyPrefix = "itest-redistransport";
 const string RedisTransportEarlyAckKeyPrefix = "itest-redistransport-early-ack";
 const string NatsSubjectPrefix = "itest-nats";
@@ -123,6 +129,15 @@ var serviceBus = builder.AddContainer("servicebus", "mcr.microsoft.com/azure-mes
     .WaitFor(serviceBusSql)
     .WithHttpHealthCheck("/health", endpointName: "management");
 
+// LocalStack emulates AWS SQS for the SQS transport SUTs. Only the SQS service is enabled; the
+// sample app provisions its queues (and redrive-policy dead-letter queues) through the transport's
+// CreateQueues option, so no config file or init script is needed.
+var localstack = builder.AddContainer("localstack", "localstack/localstack", "3")
+    .WithEnvironment("SERVICES", "sqs")
+    .WithEnvironment("EAGER_SERVICE_LOADING", "1")
+    .WithEndpoint(targetPort: 4566, scheme: "http", name: "edge")
+    .WithHttpHealthCheck("/_localstack/health", endpointName: "edge");
+
 var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
 var emulatorHost = ReferenceExpression.Create(
     $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
@@ -132,6 +147,9 @@ var rabbitMqConnectionString = ReferenceExpression.Create(
 var serviceBusEndpoint = serviceBus.GetEndpoint("amqp");
 var serviceBusConnectionString = ReferenceExpression.Create(
     $"Endpoint=sb://{serviceBusEndpoint.Property(EndpointProperty.Host)}:{serviceBusEndpoint.Property(EndpointProperty.Port)};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;");
+var localstackEndpoint = localstack.GetEndpoint("edge");
+var localstackServiceUrl = ReferenceExpression.Create(
+    $"http://{localstackEndpoint.Property(EndpointProperty.Host)}:{localstackEndpoint.Property(EndpointProperty.Port)}");
 var natsEndpoint = nats.GetEndpoint("nats");
 var natsConnectionString = ReferenceExpression.Create(
     $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
@@ -262,6 +280,47 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus-ea
     .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WaitFor(localstack)
+    .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
+    .WithEnvironment("SQS:Region", "us-east-1")
+    .WithEnvironment("SQS:AccessKey", "test")
+    .WithEnvironment("SQS:SecretKey", "test")
+    .WithEnvironment("SQS:WorkerQueue", SqsWorkerQueue)
+    .WithEnvironment("SQS:ResponseQueue", SqsResponseQueue)
+    .WithEnvironment("SQS:CreateQueues", "true")
+    .WithEnvironment("SQS:ReceiveWaitTimeSeconds", Env("ASYNCRESPONSE_ITEST_SQS_RECEIVE_WAIT_SECONDS", "2"))
+    .WithEnvironment("AsyncResponse:KeyPrefix", SqsRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "SQS")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs-early-ack", launchProfileName: null)
+    .WithReference(redis)
+    .WaitFor(redis)
+    .WaitFor(localstack)
+    .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
+    .WithEnvironment("SQS:Region", "us-east-1")
+    .WithEnvironment("SQS:AccessKey", "test")
+    .WithEnvironment("SQS:SecretKey", "test")
+    .WithEnvironment("SQS:WorkerQueue", SqsEarlyAckWorkerQueue)
+    .WithEnvironment("SQS:ResponseQueue", SqsEarlyAckResponseQueue)
+    .WithEnvironment("SQS:CreateQueues", "true")
+    .WithEnvironment("SQS:ReceiveWaitTimeSeconds", Env("ASYNCRESPONSE_ITEST_SQS_RECEIVE_WAIT_SECONDS", "2"))
+    .WithEnvironment("SQS:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_SQS_WORKER_ACK_MODE", "AckAfterEnqueue"))
+    .WithEnvironment("SQS:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_SQS_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("SQS:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_SQS_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("SQS:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_SQS_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("SQS:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:KeyPrefix", SqsEarlyAckRedisKeyPrefix)
+    .WithEnvironment("AsyncResponse:Channel", "Redis")
+    .WithEnvironment("AsyncResponse:Transport", "SQS")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

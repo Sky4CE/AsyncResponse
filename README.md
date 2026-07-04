@@ -171,6 +171,7 @@ with any transport.
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |
+| AWS SQS | long-poll `ReceiveMessage` (up to 10/batch), visibility-timeout redelivery, native dead-letter via redrive policies (provisionable with `CreateQueues`), opt-in FIFO ordering per flow; reuses your own `IAmazonSQS` if registered |
 | Kafka | classic consumer groups, manual offset management, in-process bounded retry, `{topic}.deadletter` topics; also covers Redpanda / Amazon MSK / WarpStream / Aiven / Confluent Cloud |
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
@@ -194,7 +195,7 @@ dotnet add package AsyncResponse.Core
 dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL / .SqlServer
 
 # exactly one transport (skip for in-memory):
-dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .NATS / .PostgreSQL / .SqlServer
+dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .SQS / .NATS / .PostgreSQL / .SqlServer
 ```
 
 Targets .NET 8 and .NET 10.
@@ -347,12 +348,38 @@ deliveries skip the sweep entirely, so the common path never polls. Schema creat
 across instances with `sp_getapplock`; the packages create their schema and tables but never the
 database itself. Details in [docs/sqlserver.md](docs/sqlserver.md).
 
+### AWS-native stack — SQS transport + Redis or PostgreSQL channel
+
+The full AWS recipe with zero self-managed brokers: SQS carries worker jobs and response ingress,
+and the channel rides ElastiCache/MemoryDB (Redis) or RDS/Aurora (PostgreSQL) for the waiter side
+and recovery state. Redelivery and dead-lettering stay native to SQS via queue redrive policies.
+
+```csharp
+builder.Services
+    .AddAsyncResponse()
+    .WithRedisChannel(options => options.KeyPrefix = "orders")   // ElastiCache / MemoryDB
+    // …or .WithPostgreSqlChannel(...) on RDS / Aurora
+    .WithSqsTransport(options =>
+    {
+        options.Region = "us-east-1";                 // omit to use the SDK default chain
+        options.WorkerQueue = "orders-worker";        // queue name or full queue URL
+        options.ResponseQueue = "orders-response";
+        options.CreateQueues = true;                  // + redrive-policy DLQs (dev/test; own your
+        options.MaxReceiveCount = 5;                  //   queues via infra code in production)
+    });
+```
+
+Name the queues `*.fifo` to opt into FIFO ordering — the correlation id becomes the
+`MessageGroupId`, so one flow's jobs stay ordered while distinct flows fan out. An
+application-registered `IAmazonSQS` (for example from `AWSSDK.Extensions.NETCore.Setup` with IAM
+roles) is reused automatically.
+
 ### The other combinations
 
 Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithSqlServerChannel()`,
 `.WithRedisTransport()`, `.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`,
-`.WithKafkaTransport()`, `.WithNatsTransport()`, `.WithSqlServerTransport()` — every channel,
-transport, and option is documented in [docs/configuration.md](docs/configuration.md).
+`.WithKafkaTransport()`, `.WithNatsTransport()`, `.WithSqlServerTransport()`, `.WithSqsTransport()` —
+every channel, transport, and option is documented in [docs/configuration.md](docs/configuration.md).
 
 ## Define a payload and await it
 
@@ -480,7 +507,7 @@ per-commit trends with regression alerting are published to the
   `UPDLOCK/READPAST` claims, schema, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
   scenario.
-- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (SQS, Hangfire, …),
+- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (Hangfire, …),
   with priorities and design sketches.
 
 ## License

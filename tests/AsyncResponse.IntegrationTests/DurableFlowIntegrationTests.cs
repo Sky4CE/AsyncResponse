@@ -7,10 +7,11 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>
 /// Durable flows end-to-end over the full Aspire stack, against every durable channel: the
-/// default app (Redis channel), NATS, PostgreSQL, and SQL Server. Each run exercises start →
-/// worker-transport execution → checkpointed local steps → awaited remote steps (progress +
-/// terminal via the simulator) → state observation over HTTP — i.e. the flow state round-trips
-/// through the real recovery store of each channel.
+/// default app (Redis channel), NATS, PostgreSQL, and SQL Server — plus the Redis channel paired
+/// with the SQS transport, so flow execution and resume kicks ride an SQS worker queue. Each run
+/// exercises start → worker-transport execution → checkpointed local steps → awaited remote steps
+/// (progress + terminal via the simulator) → state observation over HTTP — i.e. the flow state
+/// round-trips through the real recovery store of each channel.
 /// </summary>
 [Collection(IntegrationCollection.Name)]
 public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
@@ -20,7 +21,8 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         "redis",      // the default app: Redis channel
         "nats",       // NATS channel + JetStream transport
         "postgresql", // PostgreSQL channel + transport
-        "sqlserver"   // SQL Server channel + transport
+        "sqlserver",  // SQL Server channel + transport
+        "sqs"         // Redis channel + AWS SQS transport (LocalStack)
     };
 
     private HttpClient ClientFor(string variant) => variant switch
@@ -29,6 +31,7 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         "nats" => Fixture.NatsClient,
         "postgresql" => Fixture.PostgreSqlClient,
         "sqlserver" => Fixture.SqlServerClient,
+        "sqs" => Fixture.SqsClient,
         _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, null)
     };
 
@@ -109,6 +112,54 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         var state = await Client.GetFromJsonAsync<FlowStateDto>($"/durable-flow/{flowId}");
         Assert.Equal((int)FlowRunStatus.Succeeded, state!.Status);
         Assert.Contains("itest", state.InputJson); // the original input won; "other" did not overwrite
+    }
+
+    [Fact]
+    public async Task DurableFlow_OverSqs_ResumeKickAfterCompletionKeepsCheckpointsTerminal()
+    {
+        // The flow executes over the SQS worker queue (Redis channel holds the checkpoints). A
+        // resume kick is the exact path a crash-recovery scan takes: it re-enqueues the flow
+        // through the SQS transport, and the re-execution must replay from checkpoints — the
+        // succeeded run stays succeeded, no step loses its checkpoint, nothing re-executes into a
+        // pending state.
+        var flowId = NewId("itest-sqs-flow");
+        var start = await Fixture.SqsClient.PostAsync($"/durable-flow?name=itest-sqs&flowId={flowId}", content: null);
+        start.EnsureSuccessStatusCode();
+
+        var done = await WaitForCallAsync(Fixture.SqsClient, $"flow-done:{flowId}");
+        Assert.Equal("flow-done", done.Kind);
+
+        var resume = await Fixture.SqsClient.PostAsync($"/durable-flow/{flowId}/resume", content: null);
+        resume.EnsureSuccessStatusCode();
+        await Task.Delay(500);
+
+        var state = await PollAsync(
+            () => Fixture.SqsClient.GetFromJsonAsync<FlowStateDto>($"/durable-flow/{flowId}"),
+            s => s!.Status == (int)FlowRunStatus.Succeeded,
+            DefaultTimeout);
+        Assert.Equal((int)FlowRunStatus.Succeeded, state!.Status);
+        foreach (var step in new[] { "create-workspace", "run-migration", "import-data", "audit", "notify" })
+        {
+            Assert.True(state.Steps!.TryGetValue(step, out var checkpoint), $"step '{step}' missing from state");
+            Assert.True(checkpoint!.Completed, $"step '{step}' lost its checkpoint after the resume kick");
+            Assert.Null(checkpoint.PendingCorrelationId);
+        }
+    }
+
+    [Fact]
+    public async Task DurableFlow_OverSqs_DomainFailure_MarksRunTerminallyFailed()
+    {
+        var start = await Fixture.SqsClient.PostAsync("/durable-flow?name=itest-sqs&failAtImport=true", content: null);
+        start.EnsureSuccessStatusCode();
+        var flowId = (await start.Content.ReadFromJsonAsync<StartFlowResult>())!.FlowId;
+
+        var state = await PollAsync(
+            () => Fixture.SqsClient.GetFromJsonAsync<FlowStateDto>($"/durable-flow/{flowId}"),
+            s => s!.Status == (int)FlowRunStatus.Failed,
+            DefaultTimeout);
+
+        Assert.Equal((int)FlowRunStatus.Failed, state!.Status);
+        Assert.Contains("import failed", state.LastMessage);
     }
 
     [Fact]

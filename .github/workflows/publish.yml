@@ -64,6 +64,7 @@ jobs:
           dotnet pack src/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
           dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+          dotnet pack src/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
 
       - name: Push to nuget.org
         run: >

@@ -25,6 +25,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient EarlyAckClient { get; private set; } = null!;
     public HttpClient AzureServiceBusClient { get; private set; } = null!;
     public HttpClient AzureServiceBusEarlyAckClient { get; private set; } = null!;
+    public HttpClient SqsClient { get; private set; } = null!;
+    public HttpClient SqsEarlyAckClient { get; private set; } = null!;
     public HttpClient RabbitMqClient { get; private set; } = null!;
     public HttpClient RabbitMqEarlyAckClient { get; private set; } = null!;
     public HttpClient KafkaClient { get; private set; } = null!;
@@ -59,6 +61,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
             .WaitAsync(StartupTimeout);
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-azure-servicebus-early-ack")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-sqs")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-sqs-early-ack")
             .WaitAsync(StartupTimeout);
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-rabbitmq")
@@ -101,6 +109,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
         AzureServiceBusClient = _app.CreateHttpClient("itest-app-azure-servicebus");
         AzureServiceBusEarlyAckClient = _app.CreateHttpClient("itest-app-azure-servicebus-early-ack");
+        SqsClient = _app.CreateHttpClient("itest-app-sqs");
+        SqsEarlyAckClient = _app.CreateHttpClient("itest-app-sqs-early-ack");
         RabbitMqClient = _app.CreateHttpClient("itest-app-rabbitmq");
         RabbitMqEarlyAckClient = _app.CreateHttpClient("itest-app-rabbitmq-early-ack");
         KafkaClient = _app.CreateHttpClient("itest-app-kafka");
@@ -133,6 +143,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(AzureServiceBusClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(AzureServiceBusEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(SqsClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(SqsEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(RabbitMqEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(KafkaClient).WaitAsync(StartupTimeout);
@@ -153,6 +165,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         EarlyAckClient?.Dispose();
         AzureServiceBusClient?.Dispose();
         AzureServiceBusEarlyAckClient?.Dispose();
+        SqsClient?.Dispose();
+        SqsEarlyAckClient?.Dispose();
         RabbitMqClient?.Dispose();
         RabbitMqEarlyAckClient?.Dispose();
         KafkaClient?.Dispose();
