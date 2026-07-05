@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Transports.NATS;
@@ -82,12 +83,39 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
 
         try
         {
-            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+            await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             await delivery.AckAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    // Single choke point for handler execution so both ACK modes emit the consumer receive span.
+    private async Task ExecuteHandlerAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.nats.receive",
+            ActivityKind.Consumer);
+        activity?.SetTag("asyncresponse.transport", "nats");
+        activity?.SetTag("asyncresponse.nats.role", _role.ToString());
+        activity?.SetTag("asyncresponse.nats.ack_mode", _subscriberOptions.AckMode.ToString());
+        activity?.SetTag("messaging.system", "nats");
+        activity?.SetTag("messaging.destination.name", delivery.Subject);
+        activity?.SetTag("messaging.nats.num_delivered", delivery.NumDelivered);
+
+        if (delivery.Headers.TryGetValue(_options.CorrelationIdHeader, out var correlationId))
+            AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        try
+        {
+            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
         }
     }
 
@@ -114,7 +142,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             {
                 try
                 {
-                    await _handler(delivery, cancellationToken).ConfigureAwait(false);
+                    await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {

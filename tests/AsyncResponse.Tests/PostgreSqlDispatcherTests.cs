@@ -1,5 +1,6 @@
 using AsyncResponse.Transports.PostgreSQL;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -28,6 +29,59 @@ public sealed class PostgreSqlDispatcherTests
         Assert.Equal(1, calls.Ack);
         Assert.Equal(0, calls.Nak);
         Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task HandlerExecution_EmitsPostgreSqlReceiveSpanWithMessagingTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var options = new PostgreSqlAsyncResponseTransportOptions();
+        var id = Guid.NewGuid();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [options.CorrelationIdHeader] = "corr-pg" };
+        var delivery = new PostgreSqlTransportDelivery(
+            id,
+            "worker",
+            "{}",
+            headers,
+            1,
+            () => ValueTask.CompletedTask,
+            _ => ValueTask.CompletedTask,
+            (_, _, _) => ValueTask.FromResult(true));
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) => Task.CompletedTask,
+            options,
+            new PostgreSqlSubscriberOptions(),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(delivery, CancellationToken.None);
+
+        var activity = collector.Single("asyncresponse.postgresql.receive", "asyncresponse.transport", "postgresql");
+        Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.role"));
+        Assert.Equal(nameof(PostgreSqlAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.ack_mode"));
+        Assert.Equal("postgresql", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal("worker", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal(id.ToString(), AsyncResponseActivityCollector.Tag(activity, "messaging.message.id"));
+        Assert.Equal("corr-pg", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task HandlerFailure_MarksPostgreSqlReceiveSpanError()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var calls = new Calls();
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, attempt: 1), CancellationToken.None);
+
+        var activity = collector.Single("asyncresponse.postgresql.receive", "asyncresponse.transport", "postgresql");
+        Assert.Equal(typeof(InvalidOperationException).FullName, AsyncResponseActivityCollector.Tag(activity, "error.type"));
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
     }
 
     [Fact]

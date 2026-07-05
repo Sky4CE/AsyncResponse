@@ -1,5 +1,6 @@
 using AsyncResponse.Transports.NATS;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -38,6 +39,41 @@ public class NatsMessageDispatcherTests
         Assert.Empty(rec.Naks);
         Assert.Equal(0, rec.Terms);
         Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task HandlerExecution_EmitsNatsReceiveSpanWithMessagingTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var rec = new RecordingDelivery();
+        var options = new NatsAsyncResponseTransportOptions();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [options.CorrelationIdHeader] = "corr-nats" };
+        await using var dispatcher = CreateDispatcher((_, _) => Task.CompletedTask, new NatsSubscriberOptions(), options);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1, headers: headers), CancellationToken.None);
+
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.role"));
+        Assert.Equal(nameof(NatsAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.ack_mode"));
+        Assert.Equal("nats", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal("asyncresponse.transport.worker", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal(1L, AsyncResponseActivityCollector.Tag(activity, "messaging.nats.num_delivered"));
+        Assert.Equal("corr-nats", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task HandlerFailure_MarksNatsReceiveSpanError()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var rec = new RecordingDelivery();
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("boom"), subscriber);
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal(typeof(InvalidOperationException).FullName, AsyncResponseActivityCollector.Tag(activity, "error.type"));
+        Assert.Equal(ActivityStatusCode.Error, activity.Status);
     }
 
     [Fact]

@@ -16,6 +16,8 @@ public class RedisStreamDatabaseAdapterTests
         var pending = new[] { Pending("1-0", "consumer-a", 123, 4) };
         var claimed = new[] { RedisTransportTests.Entry("1-0", ("payload", "claimed")) };
         var database = new Mock<IDatabase>(MockBehavior.Strict);
+        // The default (ServerDefault) trim strategy forwards to the classic overload — no Redis 8
+        // trim-mode token — so `XADD … MAXLEN ~ N` runs on Valkey/Dragonfly as well as Redis 8+.
         database
             .Setup(db => db.StreamAddAsync(
                 "stream",
@@ -23,8 +25,6 @@ public class RedisStreamDatabaseAdapterTests
                 (RedisValue?)null,
                 123,
                 true,
-                (long?)null,
-                StreamTrimMode.KeepReferences,
                 CommandFlags.None))
             .ReturnsAsync("42-0");
         database
@@ -85,6 +85,32 @@ public class RedisStreamDatabaseAdapterTests
     }
 
     [Fact]
+    public async Task StreamAdd_UsesTokenlessOverload_ForPortabilityAcrossRespServers()
+    {
+        // Publishing must emit `XADD … MAXLEN ~ N` with no Redis 8 trim-mode token so it runs on
+        // Valkey and Dragonfly as well as Redis 8+. The adapter proves this by calling the classic
+        // overload (int? maxLength, no StreamTrimMode parameter); the strict mock only accepts that
+        // shape, so a regression to the trim-mode overload fails the test.
+        var values = new[] { new NameValueEntry("payload", "{}") };
+        var database = new Mock<IDatabase>(MockBehavior.Strict);
+        database
+            .Setup(db => db.StreamAddAsync(
+                "stream",
+                values,
+                (RedisValue?)null,
+                int.MaxValue,
+                true,
+                CommandFlags.None))
+            .ReturnsAsync("77-0");
+
+        var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromSeconds(5));
+
+        // A long maxLength above int range clamps into the classic overload rather than overflowing.
+        Assert.Equal("77-0", await adapter.StreamAddAsync("stream", values, long.MaxValue, true, CancellationToken.None));
+        database.VerifyAll();
+    }
+
+    [Fact]
     public async Task StreamMethods_HonorCallerCancellationWhileRedisCommandIsPending()
     {
         var never = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -114,10 +140,8 @@ public class RedisStreamDatabaseAdapterTests
                 It.IsAny<RedisKey>(),
                 It.IsAny<NameValueEntry[]>(),
                 It.IsAny<RedisValue?>(),
-                It.IsAny<long?>(),
+                It.IsAny<int?>(),
                 It.IsAny<bool>(),
-                It.IsAny<long?>(),
-                It.IsAny<StreamTrimMode>(),
                 It.IsAny<CommandFlags>()))
             .Returns(never.Task);
         var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromMilliseconds(10));

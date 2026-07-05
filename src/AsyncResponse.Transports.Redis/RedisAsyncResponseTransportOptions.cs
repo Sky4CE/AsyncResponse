@@ -1,8 +1,11 @@
 namespace AsyncResponse.Transports.Redis;
 
 /// <summary>
-/// Options for the Redis Streams AsyncResponse transport. Requires a Redis 8+ server (stream trimming
-/// uses Redis 8 KEEPREF semantics).
+/// Options for the Redis Streams AsyncResponse transport. Runs against Redis 5+ and any RESP-compatible
+/// server that implements Redis Streams and consumer groups — validated on Redis 8, Valkey, and
+/// Dragonfly. (Garnet does not implement stream commands, so it works as a <em>channel</em> but not as
+/// this transport.) Publish-time trimming uses plain <c>XADD … MAXLEN ~ N</c> (no Redis 8 trim-mode
+/// token), so it stays portable across all of these servers.
 /// </summary>
 public sealed class RedisAsyncResponseTransportOptions
 {

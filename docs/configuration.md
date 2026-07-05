@@ -157,6 +157,68 @@ bounded in-process queue is full; later handler failures are retried in-process,
 `OnBackgroundFailure` and produced to the dead-letter topic with failure-detail headers. The message
 that exhausts its attempts is always dead-lettered *and committed* so the partition keeps moving.
 
-See [postgresql.md](postgresql.md) for PostgreSQL table layout, delivery-confirmation details, and
-connection-string tuning, and [sqlserver.md](sqlserver.md) for the SQL Server pair (adaptive polling
-wake, `UPDLOCK/READPAST` claims, application-lock DDL, and operational notes).
+Redis Streams uses consumer groups. Each subscriber reads new entries with `XREADGROUP`; an entry
+stays in the group's pending-entries list until the handler acknowledges it with `XACK`. A separate
+reclaim loop takes over entries idle longer than `PendingMessageMinIdleTime` (`XPENDING` + `XCLAIM`),
+so a crashed consumer's in-flight work is retried by a peer rather than stranded. `MaxDeliveryAttempts`
+is counted from the stream delivery count; on exhaustion the entry is written to the dead-letter stream
+and ACKed off the source. `AckAfterEnqueue` ACKs at enqueue time and reports later handler failures
+through `OnBackgroundFailure`. Streams are trimmed with plain `XADD … MAXLEN ~ N` (no Redis 8 trim-mode
+token), which keeps the transport portable across Redis-compatible servers (see below).
+
+RabbitMQ uses publisher confirms and mandatory routing on publish, and per-message `basic.ack` /
+`basic.nack` on consume, with a dead-letter exchange for poison messages. Because the broker does not
+count plain `basic.nack`-requeues, a `WorkerSubscriber.MaxDeliveryAttempts` above 2 requires a
+TTL-retry dead-letter cycle (declared when `DeclareTopology` is on); values above 2 without that cycle
+log a startup warning. `AckAfterEnqueue` ACKs after the bounded enqueue and routes later failures to
+`OnBackgroundFailure`.
+
+Google Pub/Sub uses streaming pull with the client library extending the ack deadline while a handler
+runs. Redelivery and dead-lettering are **native**, like SQS: bound them with the subscription's
+`DeadLetterPolicy` and `maxDeliveryAttempts` rather than an app-level `MaxDeliveryAttempts`. A failed
+handler NACKs the message for Pub/Sub to redeliver; `AckAfterEnqueue` ACKs after enqueue and reports
+later failures through `OnBackgroundFailure`.
+
+NATS JetStream uses explicit acknowledgement. A successful handler `ACK`s; a failure `NAK`s with a
+delay so JetStream redelivers after a backoff, and a message that reaches `MaxDeliveryAttempts` is
+written to the dead-letter stream. Consumers are durable, so a restarted subscriber resumes from its
+last acknowledged position. `AckAfterReceive` ACKs as soon as the message enters the bounded queue.
+
+The PostgreSQL and SQL Server transports are table-backed queues: a publish is an idempotent
+`INSERT`, and each subscriber claims a batch of rows atomically — PostgreSQL with
+`FOR UPDATE SKIP LOCKED`, SQL Server with `UPDLOCK, ROWLOCK, READPAST` (the same skip-locked effect) —
+so competing subscribers never claim the same row. PostgreSQL wakes subscribers with `LISTEN/NOTIFY`;
+SQL Server has no equivalent, so it wakes same-process subscribers through an in-process signal and
+picks up cross-process rows within its adaptive poll interval. A claimed row stays locked for
+`LockTimeout` before another subscriber may retry it, and a row that reaches `MaxDeliveryAttempts` is
+moved to the dead-letter queue (rows in the same table). See [postgresql.md](postgresql.md) for the
+PostgreSQL table layout, delivery-confirmation details, and connection-string tuning, and
+[sqlserver.md](sqlserver.md) for the SQL Server pair (adaptive polling wake, `UPDLOCK/READPAST`
+claims, application-lock DDL, and operational notes).
+
+### Redis-compatible servers
+
+The Redis channel (`AsyncResponse.Channels.Redis`) and Redis Streams transport
+(`AsyncResponse.Transports.Redis`) talk RESP through `StackExchange.Redis` and use only widely
+implemented commands, so they run unchanged on Redis-compatible servers. The command surface is:
+
+| Component | Commands used | Portability |
+|---|---|---|
+| Channel | `SUBSCRIBE`/`PUBLISH` + `PUBSUB NUMSUB` (the "is anyone listening?" lost-subscriber probe), `GET`/`SET EX`/`DEL`, `SCAN`, and `WATCH`/`MULTI`/`EXEC` for the recovery-state CAS | pub/sub, strings, `SCAN`, transactions — universally supported |
+| Transport | Streams: `XADD` (with `MAXLEN ~` approximate trim, no Redis 8 trim-mode token), `XGROUP CREATE`, `XREADGROUP`, `XPENDING`, `XCLAIM`, `XACK` | requires Redis Streams + consumer groups (Redis 5+) |
+
+| Server | Channel | Transport | Notes |
+|---|---|---|---|
+| **Redis** 5+/8 | ✅ | ✅ | reference implementation |
+| **Valkey** 7.2 / 8 | ✅ | ✅ | drop-in; the full Redis-backed integration suite passes against it end-to-end in CI |
+| **Dragonfly** | ✅ | ✅ | RESP-compatible (channel + Streams transport commands validated against a live server); connect directly |
+| **Garnet** 1.0 | ✅ | ❌ | implements pub/sub, strings, and `SCAN`, so it works as a **channel**, but has no stream commands, so it cannot back the Streams **transport** |
+| **ElastiCache / MemoryDB / Azure Managed Redis** | ✅ | ✅ | managed Redis/Valkey — same command surface |
+
+No configuration change is needed — point `IConnectionMultiplexer` at the server. A scheduled CI
+matrix reruns the whole Redis-backed integration suite against **Valkey** to hold this claim; Valkey
+is a true drop-in for the Aspire test harness (it shares the redis container launch contract).
+**Dragonfly** is RESP-compatible and validated by running the real channel + transport against a live
+server, but its container entrypoint differs from the redis image, so it is not exercised through that
+Aspire harness — connect to it the same way you would any Redis. **Garnet** is validated as a channel
+only; pairing it with the Redis transport fails fast because the stream commands are absent.

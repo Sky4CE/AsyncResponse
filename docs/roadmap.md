@@ -16,7 +16,7 @@ facts were re-verified July 2026 (sources at the end).
 
 | Axis | Shipped | Coverage gap |
 |---|---|---|
-| **Channels** | In-memory, Redis, NATS, PostgreSQL, SQL Server | teams standardized on a Redis *fork* wanting an explicit compatibility statement |
+| **Channels** | In-memory, Redis (+ Valkey / Dragonfly / Garnet), NATS, PostgreSQL, SQL Server | — Redis-fork compatibility now stated (§3.3) |
 | **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server, AWS SQS | broker-free durable execution (Hangfire-style) |
 
 Three of the original #14/#17 top picks — Azure Service Bus, the NATS pair, and the PostgreSQL
@@ -57,9 +57,8 @@ For each new package:
 - **Bounded redelivery + dead-lettering**, or an explicit, documented delegation (as Google
   Pub/Sub delegates to its subscription's `DeadLetterPolicy`).
 - **Correlation id** carried in broker metadata with `CorrelationIdJsonPaths` fallback.
-- **Observability**: publish *and receive* spans with OTel messaging attributes (the NATS and
-  PostgreSQL transports currently lack receive spans — new packages should not repeat that; fix
-  those two while at it).
+- **Observability**: publish *and receive* spans with OTel messaging attributes (every shipped
+  transport now emits both).
 - **Wire contract untouched**: schema-versioned envelopes pass through opaquely.
 - **Docs**: options in `configuration.md`, row in the README matrix, a stress-harness scenario,
   and an NBomber load-test profile.
@@ -130,21 +129,31 @@ stack with zero new package work on the channel side.
 Integration tests run against a LocalStack container (queues provisioned by the transport's
 `CreateQueues` option), including durable-flow execution and resume over the SQS worker queue.
 
-#### 3.3 Valkey / Garnet / Dragonfly compatibility validation (no new package)
+#### 3.3 Valkey / Garnet / Dragonfly compatibility validation (no new package) 🟢 shipped
 
 Near-free, strategically timely after the 2024 Redis relicensing. The existing Redis channel
 and transport speak RESP via `StackExchange.Redis`, which these servers target.
 
-Work item: run the existing Redis unit-relevant integration suites against **Valkey** and
-**Garnet** containers (Dragonfly best-effort), fix or document any divergence (Garnet's
-pub/sub and `SCAN`/keyspace behavior are the risk areas; the transport also needs stream
-commands — verify `XADD`/`XREADGROUP`/`XAUTOCLAIM` parity per server), then:
+Validated by probing the actual command surface and running the real channel + transport code
+against each server. Findings:
 
-- add a CI matrix job (Redis + Valkey at minimum),
-- state supported servers in the README and `configuration.md`,
-- mention ElastiCache/MemoryDB explicitly for the AWS story.
+| Server | Channel (pub/sub + `SCAN` + strings + txns) | Transport (Redis Streams) |
+|---|---|---|
+| **Valkey** 7.2/8 | ✅ | ✅ (full integration suite passes end-to-end) |
+| **Dragonfly** | ✅ | ✅ |
+| **Garnet** 1.0 | ✅ | ❌ — no stream commands (`XADD`/`XREADGROUP`/… return `unknown command`) |
 
-Effort: days, not weeks. Marketing value exceeds the code cost.
+The one divergence risk — Redis 8 stream trim modes — turned out to be a non-issue:
+`StackExchange.Redis` only sends the `DELREF`/`ACKED` tokens explicitly and folds `KEEPREF` into
+the plain `XADD … MAXLEN ~ N` the older servers already accept. The adapter now calls the
+token-less overload unconditionally so the portability holds by construction, independent of the
+client version. Garnet is a **channel-only** server (documented as such); it cannot back the
+streams transport.
+
+Shipped: portability fix + token-less trim, a scheduled CI matrix job (Valkey reruns the full
+Redis-backed integration suite; Valkey is a true drop-in for the Aspire harness, Dragonfly is
+validated by direct connection since its container entrypoint differs), supported servers stated in
+the README and `configuration.md`, and ElastiCache / MemoryDB called out for the AWS story.
 
 ### 🟠 SHOULD — release train 2
 

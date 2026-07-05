@@ -59,19 +59,27 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         long? maxLength,
         bool useApproximateMaxLength,
         CancellationToken cancellationToken)
+        // Call the classic overload (int? maxLength, no trim-mode parameter) so publishing emits plain
+        // `XADD … MAXLEN ~ N` with no Redis 8 KEEPREF/DELREF/ACKED token. That keeps the transport
+        // portable across Redis 8+, Valkey, and Dragonfly by construction — independent of whether the
+        // StackExchange.Redis version would otherwise fold KEEPREF into the wire form. On Redis 8+ the
+        // server default is KEEPREF, so an entry trimmed while still pending becomes a tombstone on claim
+        // and the subscriber dead-letters it via DiscardUnprocessableAsync rather than wedging; the older
+        // trim behavior on pre-8 servers is equivalent for that path.
         => WithCancellation(
             _database.StreamAddAsync(
                 stream,
                 values,
-                messageId: null,
-                maxLength: maxLength,
+                messageId: (RedisValue?)null,
+                maxLength: ToInt32MaxLength(maxLength),
                 useApproximateMaxLength: useApproximateMaxLength,
-                limit: null,
-                // KEEPREF (Redis 8+): trim by MAXLEN without rewriting consumer-group PELs. An entry that
-                // is trimmed while still pending becomes a tombstone on claim; the subscriber dead-letters
-                // those via DiscardUnprocessableAsync rather than wedging. Requires a Redis 8+ server.
-                trimMode: StreamTrimMode.KeepReferences),
+                flags: CommandFlags.None),
             cancellationToken);
+
+    // Redis caps a stream's MAXLEN well below int.MaxValue in practice; clamp so the classic overload
+    // (int? maxLength) is always reachable without overflow.
+    private static int? ToInt32MaxLength(long? maxLength)
+        => maxLength is null ? null : (int?)Math.Min(maxLength.Value, int.MaxValue);
 
     /// <summary>Runs the StreamCreateConsumerGroupAsync operation.</summary>
     public Task<bool> StreamCreateConsumerGroupAsync(

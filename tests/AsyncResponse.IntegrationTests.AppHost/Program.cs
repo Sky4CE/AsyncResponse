@@ -73,7 +73,19 @@ var builder = DistributedApplication.CreateBuilder(args);
 builder.Services.Configure<LoggerFilterOptions>(options =>
     options.AddFilter("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.Critical));
 
+// The Redis channel + transport speak RESP via StackExchange.Redis, so they run unchanged on
+// Redis-compatible servers. The CI compatibility matrix overrides the image via these env vars to run
+// the whole Redis-backed suite against Valkey; the default is the official Redis. Only servers that
+// share the redis docker-entrypoint.sh + *-server launch contract work through this override — Valkey
+// does. Dragonfly (different container entrypoint) and Garnet (no stream commands) are not drop-ins for
+// this harness and are validated separately (see docs/configuration.md#redis-compatible-servers).
 var redis = builder.AddRedis("redis");
+if (Env("ASYNCRESPONSE_ITEST_REDIS_IMAGE", "") is { Length: > 0 } redisImage)
+{
+    if (Env("ASYNCRESPONSE_ITEST_REDIS_REGISTRY", "") is { Length: > 0 } redisRegistry)
+        redis = redis.WithImageRegistry(redisRegistry);
+    redis = redis.WithImage(redisImage, Env("ASYNCRESPONSE_ITEST_REDIS_TAG", "latest"));
+}
 var rabbitmq = builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
     .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
     .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");

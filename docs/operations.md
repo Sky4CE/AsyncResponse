@@ -108,6 +108,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter 
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*NatsAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*PostgreSqlAckDispatch*'
 dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*SqlServerAckDispatch*'
+dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- --filter '*SqsAckDispatch*'
 ```
 
 **Load / stress** — high-concurrency scenarios that *assert* correctness under contention (no
@@ -132,7 +133,9 @@ same bounded early-ACK invariant for Redis stream entries), **nats-ack-after-rec
 **postgresql-ack-after-receive-dispatch-storm** (the same bounded early-ACK invariant for PostgreSQL
 queue rows), **sqlserver-ack-after-enqueue-dispatch-storm** (the same bounded early-ACK invariant for
 SQL Server queue rows), **azure-servicebus-ack-after-receive-dispatch-storm** (the same bounded early-ACK
-invariant for Azure Service Bus messages), **race-burst** (subscribe-before-send under contention),
+invariant for Azure Service Bus messages), **sqs-ack-after-enqueue-dispatch-storm** (the same bounded
+early-ACK invariant for AWS SQS deliveries: every message deleted exactly once, never released back via
+`ChangeMessageVisibility`), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
@@ -142,22 +145,23 @@ invariant for Azure Service Bus messages), **race-burst** (subscribe-before-send
 transport: every flow must end `Succeeded`, every step exactly once). The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
-dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server
+dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server
 servers while exercising the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](../benchmarks/AsyncResponse.LoadTests)
 drives the sample app's HTTP endpoints with [NBomber v4](https://nbomber.com) over the **real** stack —
 durable channels + broker/table transports — reporting throughput, latency percentiles, and failures
 per scenario. By default it boots Redis + a Pub/Sub emulator + the Azure Service Bus emulator +
-RabbitMQ + NATS + PostgreSQL + SQL Server + Kafka + the SUT fleet via Aspire (Docker required):
-default/early-ACK Pub/Sub apps, Azure Service Bus apps, RabbitMQ apps, Redis Streams apps, NATS apps,
-PostgreSQL apps, SQL Server apps, and Kafka apps. Pass
+LocalStack (SQS) + RabbitMQ + NATS + PostgreSQL + SQL Server + Kafka + the SUT fleet via Aspire
+(Docker required): default/early-ACK Pub/Sub apps, Azure Service Bus apps, SQS apps, RabbitMQ apps,
+Redis Streams apps, NATS apps, PostgreSQL apps, SQL Server apps, and Kafka apps. Pass
 `--url` to load an already-running default instance, `--early-ack-url` for the Pub/Sub early-ACK
 target, `--azure-servicebus-url` / `--azure-servicebus-early-ack-url` for Azure Service Bus targets, `--rabbitmq-url` /
 `--rabbitmq-early-ack-url` for RabbitMQ targets, `--redis-url` / `--redis-early-ack-url` for Redis
 transport targets, `--nats-url` / `--nats-early-ack-url` for NATS targets, `--postgresql-url` /
-`--postgresql-early-ack-url` for PostgreSQL targets, or `--sqlserver-url` /
-`--sqlserver-early-ack-url` for SQL Server targets. Profiles let you choose the scenario set:
+`--postgresql-early-ack-url` for PostgreSQL targets, `--sqlserver-url` /
+`--sqlserver-early-ack-url` for SQL Server targets, or `--sqs-url` / `--sqs-early-ack-url` for SQS
+targets. Profiles let you choose the scenario set:
 `broad` (default, non-destructive request/response, attach, observed worker, multi-step, ambient
 exception, shared exception, reply target, plus RabbitMQ worker/response/reply-target throughput when
 a RabbitMQ target is available), `pubsub` (default worker dispatch, response-topic ingress
@@ -171,7 +175,9 @@ dispatch when an early target is available), `nats` (request/response, worker di
 response-subject ingress, reply target, and early-ACK worker dispatch), `postgresql`
 (request/response, worker dispatch, response-table ingress through header/body correlation ids, reply
 target, and early-ACK worker dispatch), `sqlserver` (the same request/response, worker dispatch,
-response-table ingress, reply-target, and early-ACK worker scenarios over the SQL Server pair), or `recovery`
+response-table ingress, reply-target, and early-ACK worker scenarios over the SQL Server pair), `sqs`
+(request/response, worker dispatch, response-queue ingress with attribute/body correlation ids, reply
+target, a durable-flow-over-SQS scenario, and early-ACK worker dispatch), or `recovery`
 (lost-subscriber resume/failure/exception and stale health). Run the
 recovery profile separately because it intentionally simulates subscriber loss:
 
@@ -184,6 +190,7 @@ dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile 
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile nats --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile postgresql --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile sqlserver --rate 10 --duration 60
+dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile sqs --rate 10 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery --rate 5 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis --rate 20 --duration 60
 dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed --rate 10 --duration 60

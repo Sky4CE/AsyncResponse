@@ -35,8 +35,18 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.azure_service_bus.receive` | Azure Service Bus subscriber message handling |
 | `asyncresponse.pubsub.receive` | Google Pub/Sub subscriber message handling |
 | `asyncresponse.rabbitmq.receive` | RabbitMQ subscriber message handling |
+| `asyncresponse.kafka.receive` | Kafka consumer message handling |
+| `asyncresponse.sqs.receive` | AWS SQS subscriber message handling |
+| `asyncresponse.nats.receive` | NATS JetStream subscriber message handling |
+| `asyncresponse.postgresql.receive` | PostgreSQL transport subscriber message handling |
+| `asyncresponse.worker.receive`, `asyncresponse.response.receive` | SQL Server transport subscriber message handling (named by role) |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
 | `asyncresponse.watchdog.scan` | recovery watchdog scans |
+
+Every transport emits an `asyncresponse.worker.publish` producer span on publish and a consumer
+receive span on consume (for both ACK modes). Each receive span carries the standard messaging
+attributes (`messaging.system`, `messaging.destination.name`, and `messaging.message.id` where the
+broker exposes one) plus the transport, role, ACK mode, and the AsyncResponse correlation id.
 
 Common tags include `asyncresponse.correlation_id`, `asyncresponse.channel`,
 `asyncresponse.transport`, `asyncresponse.payload_type`, `asyncresponse.subscribers`,

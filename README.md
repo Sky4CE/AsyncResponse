@@ -59,7 +59,8 @@ recovery when a flow needs it.
   callback. A failed response is **never** blindly resumed.
 - **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL,
   SQL Server. Worker transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google
-  Pub/Sub, Kafka, NATS JetStream, PostgreSQL, SQL Server. Every combination works; your flow code
+  Pub/Sub, AWS SQS, Kafka, NATS JetStream, PostgreSQL, SQL Server. The Redis channel and transport
+  also run on Valkey and Dragonfly (Garnet as a channel). Every combination works; your flow code
   never changes.
 - **One contract everywhere.** Schema-versioned wire envelopes, capped remote stack traces,
   ambient-context restoration into foreign callback threads, and identical `Until`/recovery
@@ -182,6 +183,13 @@ the default acknowledges only after your handler completes; opt-in **early ACK**
 guarantee for throughput, with an explicitly bounded in-process queue, a drain budget validated
 against host shutdown, and post-ACK failures surfaced through `OnBackgroundFailure`. Per-transport
 semantics: [docs/configuration.md](docs/configuration.md).
+
+**Redis-compatible servers.** The Redis channel and transport speak RESP through
+`StackExchange.Redis`, so they run unchanged on Redis-compatible servers. **Valkey** and
+**Dragonfly** are validated end-to-end as both channel and transport; **Garnet** implements the
+pub/sub + string + `SCAN` surface the channel needs but has no stream commands, so it works as a
+channel but not as this transport. That covers the managed options too — Amazon ElastiCache /
+MemoryDB and Azure Managed Redis. Details in [docs/configuration.md](docs/configuration.md#redis-compatible-servers).
 
 `AsyncResponse.Abstractions` holds contracts only — reference it from class libraries that define
 payloads or flows.
@@ -445,12 +453,14 @@ per-commit trends with regression alerting are published to the
 
 ## How it's tested
 
-- **2000+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+- **2200+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **110+ integration tests** drive the shipped sample app black-box over HTTP against **real
+- **130+ integration tests** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, RabbitMQ, Kafka containers plus the official
-  Azure Service Bus and Google Pub/Sub emulators — orchestrated by .NET Aspire, with a dedicated
-  early-ACK app instance per transport.
+  Azure Service Bus and Google Pub/Sub emulators and LocalStack for AWS SQS — orchestrated by .NET
+  Aspire, with a dedicated early-ACK app instance per transport. A scheduled CI matrix reruns the
+  Redis-backed suite against Valkey to hold the Redis-compatible-server claim (Dragonfly is validated
+  by running the real channel + transport against a live server).
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,
   duplicated, or leaked responses) and fails CI on violation; NBomber load profiles include a
   destructive recovery scenario.

@@ -22,8 +22,8 @@ such as Docker or Podman for the Redis resource.
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
 `PostgreSQL` | `SqlServer`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` |
-`GooglePubSub` | `Kafka` | `RabbitMQ` | `Redis` | `NATS` | `PostgreSQL` | `SqlServer`) select the
-providers,
+`GooglePubSub` | `SQS` | `Kafka` | `RabbitMQ` | `Redis` | `NATS` | `PostgreSQL` | `SqlServer`) select
+the providers,
 defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash

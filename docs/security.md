@@ -15,10 +15,14 @@ name a service interface and method that the receiving process will resolve from
 invoke. Anyone who can write to the recovery store or worker stream can therefore ask a consuming
 process to invoke any registered (service, method) pair with attacker-influenced arguments.
 
-- Authenticate and authorize access to Redis / NATS / PostgreSQL / Azure Service Bus / your broker; isolate it from untrusted
-  networks.
-- Use a dedicated `KeyPrefix`, subject prefix, Service Bus queue pair, or PostgreSQL schema/table set per app so
-  tenants/environments can't read or write each other's recovery state and jobs.
+- Authenticate and authorize access to your channel store and transport broker — Redis (or Valkey /
+  Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, Azure Service Bus, AWS SQS, Google Pub/Sub,
+  RabbitMQ, Kafka — and isolate it from untrusted networks. On the managed clouds prefer IAM/managed
+  identity (SQS IAM roles, Azure Service Bus Azure AD, Pub/Sub service accounts) over static keys.
+- Use a dedicated namespace per app/tenant/environment so they can't read or write each other's
+  recovery state and jobs: a `KeyPrefix` (Redis), subject prefix (NATS), schema/table set (PostgreSQL /
+  SQL Server), distinct queues (Azure Service Bus, SQS, RabbitMQ), or topic/consumer-group names (Kafka,
+  Google Pub/Sub).
 - Enable transport-level TLS and credentials end to end.
 
 The callback authorizer below is a second layer on top of this — not a replacement for it.
@@ -65,7 +69,7 @@ reaches the store, only an explicitly allowlisted surface can be driven.
 
 When a remote side fails technically (`SetException`), the exception's stack trace can travel on the
 wire and is surfaced on the receiving side via `Exception.Data["RemoteStackTrace"]`. Two channel
-options (Redis & NATS) bound this:
+options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server) bound this:
 
 | Option | Default | Effect |
 |---|---|---|

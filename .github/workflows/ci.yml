@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The Redis-compatible-server matrix (Valkey / Dragonfly) reruns the whole Docker-backed suite per
+  # server, so it runs weekly and on demand rather than on every push.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -103,3 +108,65 @@ jobs:
         with:
           name: integration-test-results
           path: ${{ github.workspace }}/TestResults/Integration
+
+  redis-compat:
+    # Validates that the Redis channel + transport (RESP via StackExchange.Redis) run unchanged on
+    # Redis-compatible servers. Overrides the AppHost "redis" container image and reruns the full
+    # integration suite against Valkey — most SUTs use the Redis channel, and itest-app-redis exercises
+    # the Redis Streams transport, so a single swap covers both roles.
+    #
+    # Only true drop-ins go here — servers whose image shares the redis `docker-entrypoint.sh` +
+    # `*-server` launch contract that the Aspire Redis integration drives. Valkey qualifies. Dragonfly
+    # and Garnet do NOT and are validated separately (see docs/configuration.md#redis-compatible-servers):
+    # Dragonfly's RESP is compatible but its container entrypoint differs, so it is validated by direct
+    # connection; Garnet has no stream commands, so it is a channel-only server.
+    # Gated to schedule/manual so it does not multiply per-push CI time.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - server: valkey
+            image: valkey/valkey
+            tag: '8'
+            registry: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Verify Docker
+        run: docker version
+
+      - name: Restore
+        run: dotnet restore tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj
+
+      - name: Build
+        run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
+
+      - name: Test (integration on ${{ matrix.server }})
+        # The AppHost reads these to swap its "redis" resource image; every Redis-backed SUT then runs
+        # against ${{ matrix.server }} instead of the official Redis image.
+        env:
+          ASYNCRESPONSE_ITEST_REDIS_IMAGE: ${{ matrix.image }}
+          ASYNCRESPONSE_ITEST_REDIS_TAG: ${{ matrix.tag }}
+          ASYNCRESPONSE_ITEST_REDIS_REGISTRY: ${{ matrix.registry }}
+        run: |
+          dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
+            --configuration Release --no-build \
+            --report-trx \
+            --results-directory "${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}"
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results-${{ matrix.server }}
+          path: ${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}
