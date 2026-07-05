@@ -18,7 +18,6 @@ with optional durable, domain-aware recovery when your process dies mid-wait.
 ```csharp
 OrderResult result = await asyncResponse
     .For<OrderResult>()                                       // correlation id generated for you
-    .WithTimeout(TimeSpan.FromMinutes(10))                    // waits are never infinite
     .Until(r => r.Status != OrderStatus.Processing)           // consume progress messages
     .WaitAsync(context =>                                     // looks sync, is fully async
         paymentGateway.StartAsync(orderId, context.CorrelationId)); // sent only AFTER subscribing

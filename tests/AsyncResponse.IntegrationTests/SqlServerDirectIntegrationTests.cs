@@ -255,11 +255,17 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
         {
             provider = BuildProvider(schema, options =>
             {
-                options.DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(20);
-                // A deliberately glacial sweep: local deliveries must complete through the
-                // same-process fast path without ever waiting for the polling loop.
-                options.ActivePollInterval = TimeSpan.FromSeconds(10);
-                options.IdlePollInterval = TimeSpan.FromSeconds(10);
+                // A deliberately glacial sweep (30s): local deliveries must complete through the
+                // same-process fast path without ever waiting for the polling loop. The assertion
+                // window (20s) stays below the sweep so a pass can only mean in-process delivery.
+                // DeliveryConfirmationTimeout is generous (5s) on purpose: it is the budget after which
+                // the publisher gives a response up to recovery, so it must comfortably exceed a claim
+                // round-trip under a loaded CI database. A too-tight value (the previous 20ms is below a
+                // CI round-trip) makes the publisher steal a live-but-slow local delivery to recovery,
+                // starving the waiter — which is exactly what flaked under the heavier integration fixture.
+                options.DeliveryConfirmationTimeout = TimeSpan.FromSeconds(5);
+                options.ActivePollInterval = TimeSpan.FromSeconds(30);
+                options.IdlePollInterval = TimeSpan.FromSeconds(30);
             });
             var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
             var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
@@ -271,14 +277,14 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             foreach (var correlationId in correlationIds)
                 waiters.Add(await subscriber.CreateResponseWaiter<OperationResult>(
                     correlationId,
-                    timeout: TimeSpan.FromSeconds(5)));
+                    timeout: TimeSpan.FromSeconds(20)));
 
             await Task.WhenAll(correlationIds.Select(correlationId =>
                 publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId)))
-                .WaitAsync(TimeSpan.FromSeconds(5));
+                .WaitAsync(TimeSpan.FromSeconds(20));
 
             var results = await Task.WhenAll(waiters.Select(waiter => waiter.ResponseTask))
-                .WaitAsync(TimeSpan.FromSeconds(5));
+                .WaitAsync(TimeSpan.FromSeconds(20));
             Assert.All(results, result => Assert.Equal(OperationStatus.Completed, result.Status));
         }
         finally
