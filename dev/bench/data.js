@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783282312187,
+  "lastUpdate": 1783282326216,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -24067,6 +24067,135 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2417.041807668829,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "bef5c6822a7c91b6abbbfe8a206e7681f5ffce63",
+          "message": "fix tests for CI",
+          "timestamp": "2026-07-05T21:57:06+02:00",
+          "tree_id": "6eea941b0ab974b25ac4a62b66b53d0bf9ac0f7e",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/bef5c6822a7c91b6abbbfe8a206e7681f5ffce63"
+        },
+        "date": 1783282325863,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 161654.61908675486,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 115402.54716502102,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 94766.1058787585,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 240977.79148673656,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 284540.3535129352,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 256068.8313018539,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 246014.5640621925,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 271229.1017977065,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 261618.47654328737,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 214285.1020425656,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 305511.4261273372,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 407630.8495026903,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 278980.1823637656,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 122119.028929021,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 81936.26538435319,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 31892.815645747873,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4845.743038968982,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 258788.45596455634,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 130808.55383295224,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1101576.3557650999,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2824.5753420447754,
             "unit": "flows/s"
           }
         ]
