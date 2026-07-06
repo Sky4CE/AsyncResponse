@@ -96,6 +96,20 @@ if (useSqlServer || useSqlServerTransport)
 if (useAzureServiceBus)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "AzureServiceBus");
+
+    // Share one warm ServiceBusClient (and a cached sender for the response queue) between the
+    // transport and the /emit-response helper. The helper previously opened a fresh client + sender —
+    // and therefore a fresh AMQP connection/link — on every call; under load-test rates against the
+    // emulator that link churn produces transient 500s. A cached client keeps the connection warm and
+    // lets the SDK's retry policy absorb hiccups. The transport is explicitly designed to reuse an
+    // app-registered ServiceBusClient, so this is one connection for both roles. The factories read
+    // the connection string/queue from options (configured by WithAzureServiceBusTransport) and run
+    // lazily, so registration order does not matter.
+    builder.Services.AddSingleton(sp =>
+        new ServiceBusClient(sp.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value.ConnectionString));
+    builder.Services.AddSingleton(sp =>
+        sp.GetRequiredService<ServiceBusClient>().CreateSender(
+            sp.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value.ResponseQueue));
 }
 else if (useGooglePubSub)
 {
@@ -1908,8 +1922,9 @@ static async Task<IResult> EmitAzureServiceBusResponseAsync(
         serviceBusMessage.ApplicationProperties[o.CorrelationIdProperty] = correlationId;
     }
 
-    await using var client = new ServiceBusClient(connectionString);
-    await using var sender = client.CreateSender(o.ResponseQueue);
+    // Reuse the cached, warm sender registered above rather than opening a fresh client/sender (and a
+    // fresh AMQP link) per request — that churn is what flaked the load test against the emulator.
+    var sender = services.GetRequiredService<ServiceBusSender>();
     await sender.SendMessageAsync(serviceBusMessage, cancellationToken).ConfigureAwait(false);
 
     return Results.Accepted();
