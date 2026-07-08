@@ -2,9 +2,9 @@ namespace AsyncResponse;
 
 /// <summary>
 /// Starts and manages durable flows (<see cref="IDurableFlow{TInput}"/>). Registered by
-/// <c>AddAsyncResponse()</c>; flow state durability follows the configured channel's recovery
-/// store (durable with Redis/NATS/PostgreSQL/SQL Server, process-local with the in-memory
-/// channel) unless a custom <see cref="IFlowStateStore"/> is registered.
+/// <c>AddAsyncResponse()</c>; the default flow-state store uses the configured channel's recovery
+/// store for tests/dev/migration. Production durable flows should register an app-owned
+/// <see cref="IFlowStateStore"/>.
 /// </summary>
 public interface IDurableFlows
 {

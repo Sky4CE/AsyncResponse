@@ -1,12 +1,13 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using System.Text.Json;
 
 namespace AsyncResponse;
 
 /// <summary>
 /// Default <see cref="IFlowStateStore"/>: persists flow state through the configured channel's
-/// <see cref="IRecoveryStateStore"/>, so flow durability automatically matches recovery durability
-/// (durable with Redis/NATS/PostgreSQL/SQL Server, process-local in-memory) with no extra
-/// infrastructure or configuration.
+/// <see cref="IRecoveryStateStore"/>. Useful for tests, development, and migration, but production
+/// durable flows should use application-owned storage via <c>WithDurableFlows&lt;TStore&gt;()</c>.
 /// <para>
 /// Each flow run is stored as one recovery entry under the flow id, with a fixed registration id
 /// (every save replaces the previous checkpoint — the per-registration replace semantics all
@@ -16,8 +17,22 @@ namespace AsyncResponse;
 /// contract — no recovery-state schema change is involved.
 /// </para>
 /// </summary>
-internal sealed class RecoveryBackedFlowStateStore(IRecoveryStateStore _recoveryStore) : IFlowStateStore
+internal sealed class RecoveryBackedFlowStateStore : IFlowStateStore
 {
+    private readonly IRecoveryStateStore _recoveryStore;
+    private readonly ILogger<RecoveryBackedFlowStateStore> _logger;
+    private int _warned;
+
+    /// <summary>Creates the default recovery-backed flow-state store.</summary>
+    public RecoveryBackedFlowStateStore(
+        IRecoveryStateStore recoveryStore,
+        ILogger<RecoveryBackedFlowStateStore>? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(recoveryStore);
+        _recoveryStore = recoveryStore;
+        _logger = logger ?? NullLogger<RecoveryBackedFlowStateStore>.Instance;
+    }
+
     /// <summary>Sentinel payload-type marker identifying a recovery entry as a durable-flow ledger.</summary>
     internal const string LedgerPayloadTypeMarker = "asyncresponse/durable-flow-state";
 
@@ -35,6 +50,7 @@ internal sealed class RecoveryBackedFlowStateStore(IRecoveryStateStore _recovery
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         ArgumentNullException.ThrowIfNull(state);
+        WarnOnce(ttl);
 
         var entry = new RecoveryState
         {
@@ -80,5 +96,15 @@ internal sealed class RecoveryBackedFlowStateStore(IRecoveryStateStore _recovery
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         return _recoveryStore.TryDeleteAsync(flowId, LedgerRegistrationId, cancellationToken);
+    }
+
+    private void WarnOnce(TimeSpan ttl)
+    {
+        if (Interlocked.Exchange(ref _warned, 1) != 0)
+            return;
+
+        _logger.LogWarning(
+            "Durable flows are using the default RecoveryBackedFlowStateStore. It stores flow state in the configured channel recovery store with idle TTL {StateTtl}. This is useful for tests, development, and migration, but production flows should use app-owned durable storage via AddAsyncResponse().WithDurableFlows<TFlowStateStore>().",
+            ttl);
     }
 }

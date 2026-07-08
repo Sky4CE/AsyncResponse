@@ -4,10 +4,10 @@ namespace AsyncResponse;
 /// Persists durable-flow run state (<see cref="FlowState"/>).
 /// <para>
 /// The default implementation in <c>AsyncResponse.Core</c> stores flow state through the
-/// configured channel's <see cref="IRecoveryStateStore"/>, so flows are durable wherever recovery
-/// is — with no extra infrastructure. Register a custom implementation to keep flow state in your
-/// own tables instead (e.g. next to the domain entities the flow operates on); the library calls
-/// only these three members.
+/// configured channel's <see cref="IRecoveryStateStore"/> for tests, development, and migration.
+/// Production durable flows should register an app-owned implementation with
+/// <c>AddAsyncResponse().WithDurableFlows&lt;TStore&gt;()</c>; the library calls only these three
+/// members.
 /// </para>
 /// </summary>
 public interface IFlowStateStore

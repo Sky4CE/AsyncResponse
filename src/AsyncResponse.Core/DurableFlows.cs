@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
@@ -7,7 +8,7 @@ namespace AsyncResponse;
 /// <inheritdoc cref="IDurableFlows" />
 internal sealed class DurableFlows : IDurableFlows
 {
-    private readonly IFlowStateStore _store;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly IAsyncResponseBuilder _builder;
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
@@ -15,13 +16,13 @@ internal sealed class DurableFlows : IDurableFlows
 
     /// <summary>Creates the durable-flows starter.</summary>
     public DurableFlows(
-        IFlowStateStore store,
+        IServiceScopeFactory scopeFactory,
         IAsyncResponseBuilder builder,
         AsyncResponseContextPropagation propagation,
         IOptions<AsyncResponseOptions> options,
         ILogger<DurableFlows> logger)
     {
-        _store = store;
+        _scopeFactory = scopeFactory;
         _builder = builder;
         _propagation = propagation;
         _options = options.Value.DurableFlows;
@@ -40,7 +41,10 @@ internal sealed class DurableFlows : IDurableFlows
             ? $"flow-{AsyncResponseContext.GenerateCorrelationId()}"
             : flowId;
 
-        var existing = await _store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+        var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
         if (existing is null)
         {
             var now = DateTime.UtcNow;
@@ -57,7 +61,7 @@ internal sealed class DurableFlows : IDurableFlows
                 Context = _propagation.Capture()
             };
 
-            await _store.SaveAsync(flowId, state, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+            await store.SaveAsync(flowId, state, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
             _logger.LogInformation("Started durable flow {FlowId} ({FlowType}).", flowId, typeof(TFlow).Name);
         }
         else
@@ -77,7 +81,10 @@ internal sealed class DurableFlows : IDurableFlows
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
-        var state = await _store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false)
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+        var state = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException($"No flow state found for '{flowId}' (unknown, expired, or unreadable).");
 
         if (state.Status != FlowRunStatus.Running)
@@ -91,9 +98,12 @@ internal sealed class DurableFlows : IDurableFlows
     }
 
     /// <inheritdoc />
-    public Task<FlowState?> GetStateAsync(string flowId, CancellationToken cancellationToken = default)
+    public async Task<FlowState?> GetStateAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        return _store.LoadAsync(flowId, cancellationToken);
+
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+        return await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
     }
 }

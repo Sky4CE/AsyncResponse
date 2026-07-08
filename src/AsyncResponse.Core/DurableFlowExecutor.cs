@@ -37,7 +37,6 @@ public interface IDurableFlowExecutor
 internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 {
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly IFlowStateStore _store;
     private readonly IAsyncResponseBuilder _builder;
     private readonly IAsyncResponseSubscriber _subscriber;
     private readonly IRecoverableAsyncResponseSubscriber? _recoverableSubscriber;
@@ -48,7 +47,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// <summary>Creates the flow executor.</summary>
     public DurableFlowExecutor(
         IServiceScopeFactory scopeFactory,
-        IFlowStateStore store,
         IAsyncResponseBuilder builder,
         IAsyncResponseSubscriber subscriber,
         IRecoverableAsyncResponseSubscriber? recoverableSubscriber,
@@ -57,7 +55,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         ILogger<DurableFlowExecutor> logger)
     {
         _scopeFactory = scopeFactory;
-        _store = store;
         _builder = builder;
         _subscriber = subscriber;
         _recoverableSubscriber = recoverableSubscriber;
@@ -71,7 +68,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
-        var state = await _store.LoadAsync(flowId).ConfigureAwait(false);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+        var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
         {
             _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
@@ -90,7 +90,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         state.Attempts++;
         state.UpdatedAtUtc = DateTime.UtcNow;
-        await _store.SaveAsync(flowId, state, _options.StateExpiry).ConfigureAwait(false);
+        await store.SaveAsync(flowId, state, _options.StateExpiry).ConfigureAwait(false);
 
         // The run may be resumed by a different deployment than the one that started it: restore
         // the ambient context captured at start before any flow code runs.
@@ -98,11 +98,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         try
         {
-            await InvokeFlowAsync(state).ConfigureAwait(false);
+            await InvokeFlowAsync(scope.ServiceProvider, store, state).ConfigureAwait(false);
 
             state.Status = FlowRunStatus.Succeeded;
             state.LastMessage = "Flow completed.";
-            await SaveAsync(state).ConfigureAwait(false);
+            await SaveAsync(store, state).ConfigureAwait(false);
 
             _logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", flowId, state.Attempts);
         }
@@ -111,7 +111,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // Terminal by declaration: mark failed and swallow so the transport acks the job.
             state.Status = FlowRunStatus.Failed;
             state.LastMessage = ex.Message;
-            await SaveAsync(state).ConfigureAwait(false);
+            await SaveAsync(store, state).ConfigureAwait(false);
 
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);
@@ -119,7 +119,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         catch (Exception ex)
         {
             state.LastMessage = ex.Message;
-            await SaveAsync(state).ConfigureAwait(false);
+            await SaveAsync(store, state).ConfigureAwait(false);
 
             AsyncResponseDiagnostics.SetError(activity, ex);
 
@@ -134,7 +134,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
-        var state = await _store.LoadAsync(flowId).ConfigureAwait(false);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+        var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
         {
             _logger.LogWarning("Durable flow {FlowId} cannot resume: no state (unknown, expired, or unreadable).", flowId);
@@ -157,7 +160,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         ArgumentNullException.ThrowIfNull(exception);
 
-        var state = await _store.LoadAsync(flowId).ConfigureAwait(false);
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+        var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
         {
             _logger.LogWarning("Durable flow {FlowId} cannot be failed: no state (unknown, expired, or unreadable).", flowId);
@@ -172,12 +178,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         state.Status = FlowRunStatus.Failed;
         state.LastMessage = exception.Message;
-        await SaveAsync(state).ConfigureAwait(false);
+        await SaveAsync(store, state).ConfigureAwait(false);
 
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }
 
-    private async Task InvokeFlowAsync(FlowState state)
+    private async Task InvokeFlowAsync(IServiceProvider serviceProvider, IFlowStateStore store, FlowState state)
     {
         var flowType = ResolveType(state.FlowTypeName, "flow");
         var inputType = ResolveType(state.InputTypeName, "input");
@@ -185,11 +191,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         var contract = typeof(IDurableFlow<>).MakeGenericType(inputType);
 
-        await using var scope = _scopeFactory.CreateAsyncScope();
         object flow;
         try
         {
-            flow = scope.ServiceProvider.GetRequiredService(flowType);
+            flow = serviceProvider.GetRequiredService(flowType);
         }
         catch (InvalidOperationException ex)
         {
@@ -205,7 +210,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 "matching the persisted input type; the flow state was written by an incompatible flow definition.");
         }
 
-        var context = new DurableFlowContext(state, _store, _options, _subscriber, _recoverableSubscriber, _logger);
+        var context = new DurableFlowContext(state, store, _options, _subscriber, _recoverableSubscriber, _logger);
         var execute = contract.GetMethod(nameof(IDurableFlow<object>.ExecuteAsync))!;
         try
         {
@@ -230,9 +235,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 $"via {nameof(AsyncResponseTypeResolution)}.{nameof(AsyncResponseTypeResolution.RegisterAssembly)}.");
     }
 
-    private Task SaveAsync(FlowState state)
+    private Task SaveAsync(IFlowStateStore store, FlowState state)
     {
         state.UpdatedAtUtc = DateTime.UtcNow;
-        return _store.SaveAsync(state.FlowId!, state, _options.StateExpiry);
+        return store.SaveAsync(state.FlowId!, state, _options.StateExpiry);
     }
 }

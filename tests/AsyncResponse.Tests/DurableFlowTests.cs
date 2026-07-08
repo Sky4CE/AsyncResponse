@@ -123,6 +123,26 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task WithDurableFlows_UsesScopedCustomStore()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddScoped<ScopedStoreDependency>();
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithDurableFlows<ScopedNullFlowStateStore>();
+
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+
+        var flows = provider.GetRequiredService<IDurableFlows>();
+        var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+
+        Assert.Null(await flows.GetStateAsync("missing-flow"));
+        await executor.ResumeAsync("missing-flow");
+    }
+
+    [Fact]
     public async Task Flow_RetriableFailure_KeepsRunning_AndSecondRunSkipsCompletedSteps()
     {
         await using var provider = CreateProvider();
@@ -335,6 +355,27 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task RecoveryBackedStore_LogsWarningOnce_WhenUsed()
+    {
+        var logger = new CapturingLogger<RecoveryBackedFlowStateStore>();
+        var store = new RecoveryBackedFlowStateStore(new InMemoryRecoveryStateStore(), logger);
+        var state = new FlowState
+        {
+            FlowId = "flow-warn",
+            FlowTypeName = "X",
+            Status = FlowRunStatus.Running,
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        await store.SaveAsync("flow-warn", state, TimeSpan.FromDays(7));
+        await store.SaveAsync("flow-warn", state, TimeSpan.FromDays(7));
+
+        Assert.Single(logger.Entries, entry =>
+            entry.Level == LogLevel.Warning &&
+            entry.Message.Contains("WithDurableFlows", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task FlowExecutorCallbacks_AreImplicitlyAuthorized_EvenWithDenyAllAllowlist()
     {
         await using var provider = CreateProvider(services => services.AddSingleton<IAsyncResponseCallbackAuthorizer>(
@@ -357,5 +398,38 @@ public class DurableFlowTests
     private sealed class DenyAllAuthorizer : IAsyncResponseCallbackAuthorizer
     {
         public bool IsAllowed(string serviceInterfaceFullName, string methodName) => false;
+    }
+
+    private sealed class ScopedStoreDependency;
+
+    private sealed class ScopedNullFlowStateStore : IFlowStateStore
+    {
+        public ScopedNullFlowStateStore(ScopedStoreDependency dependency)
+            => ArgumentNullException.ThrowIfNull(dependency);
+
+        public Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => Task.FromResult<FlowState?>(null);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => Task.FromResult(false);
+    }
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+            => Entries.Add((logLevel, formatter(state, exception)));
     }
 }

@@ -138,13 +138,14 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
   request is never re-sent), and lost-subscriber recovery callbacks are wired automatically.
 - **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
   pick up the changes on resume. Hotfix a bug and resume — no replay rules, no version patching.
-- **Zero extra infrastructure** — flow state rides in your channel's recovery store (Redis, NATS,
-  PostgreSQL, SQL Server), or in your own table via one small interface.
+- **Storage is explicit when it matters** — the default flow-state store rides in your channel's
+  recovery store for tests/dev/migration; production flows should use
+  `.WithDurableFlows<MyFlowStateStore>()` to keep run ledgers in app-owned durable storage.
 - **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
   integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
 
-The full guide — rules, failure modes, compensation, testing your flows — is
-[docs/durable-flows.md](docs/durable-flows.md).
+The full guide — rules, failure modes, compensation, testing your flows, and app-owned state
+stores — is [docs/durable-flows.md](docs/durable-flows.md).
 
 ## Pick your channel and transport
 

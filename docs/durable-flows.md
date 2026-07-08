@@ -62,10 +62,17 @@ FlowState? state = await _flows.GetStateAsync(flowId);
 await _flows.ResumeAsync(flowId);
 ```
 
-`IDurableFlows`, `IDurableFlowContext`, and `IFlowStateStore` are registered by
-`AddAsyncResponse()` — nothing extra to configure. Flow state is persisted through the
-configured channel's recovery store, so durability follows your channel: durable with
-Redis/NATS/PostgreSQL/SQL Server, process-local with the in-memory channel.
+`IDurableFlows` and `IDurableFlowContext` are registered by `AddAsyncResponse()`. The default
+`IFlowStateStore` stores flow ledgers in the channel recovery store, which is handy for tests,
+development, and migration. For production durable flows, keep state in application-owned storage:
+
+```csharp
+builder.Services
+    .AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(...)
+    .WithDurableFlows<MyFlowStateStore>();
+```
 
 ## The rules (there are only three)
 
@@ -243,10 +250,10 @@ tests of flow logic, `IDurableFlowContext` is an interface you can fake outright
 ## Storage: where flow state lives
 
 By default, flow state rides in the channel's `IRecoveryStateStore` (one entry per run under a
-sentinel marker; the watchdog knows to skip them). This means zero new infrastructure and
-durability identical to your recovery state, with `AsyncResponseOptions.DurableFlows.StateExpiry`
-(default 7 days) as the idle TTL — it refreshes on every checkpoint, so it bounds the gap
-*between* checkpoints, not total run duration.
+sentinel marker; the watchdog knows to skip them). This keeps tests, development, and migrations
+simple, but recovery stores are often cache-shaped: Redis keys expire, NATS KV buckets may have
+limits, and `AsyncResponseOptions.DurableFlows.StateExpiry` defaults to 7 days. That TTL refreshes
+on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration.
 
 To keep flow state in your own storage instead (e.g. a table next to the domain entities the
 flow operates on, where your dashboards already look), register your own store — the library
@@ -260,8 +267,19 @@ public interface IFlowStateStore
     Task<bool> TryDeleteAsync(string flowId, CancellationToken ct = default);
 }
 
-builder.Services.AddSingleton<IFlowStateStore, MyDatabaseFlowStateStore>();
+builder.Services
+    .AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(...)
+    .WithDurableFlows<MyDatabaseFlowStateStore>();
 ```
+
+`WithDurableFlows<TStore>()` registers the store as scoped, so EF Core `DbContext`,
+`NpgsqlDataSource`, `IMongoDatabase`, or similar dependencies can be used normally. The default
+recovery-backed store logs a warning the first time it persists flow state, pointing production
+apps at this override.
+
+Implementation guide: [durable-flow-state-stores.md](durable-flow-state-stores.md).
 
 ## Under the hood (for the curious — you don't need this to use flows)
 

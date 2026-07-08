@@ -49,13 +49,13 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.AddHostedService<AsyncResponseWatchdog>();
 
         // Durable flows (the checkpointed-flow pattern as a first-class API). Flow state rides in
-        // the configured channel's recovery store by default; TryAdd lets applications register a
-        // custom IFlowStateStore (e.g. their own tables) before or after AddAsyncResponse.
+        // the configured channel's recovery store by default for tests/dev/migration. Production
+        // apps should call WithDurableFlows<TStore>() to keep state in app-owned durable storage.
         services.TryAddSingleton<IFlowStateStore>(provider => new RecoveryBackedFlowStateStore(
-            provider.GetRequiredService<IRecoveryStateStore>()));
+            provider.GetRequiredService<IRecoveryStateStore>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RecoveryBackedFlowStateStore>>()));
         services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
             provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IFlowStateStore>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
             provider.GetRequiredService<IAsyncResponseSubscriber>(),
             provider.GetService<IRecoverableAsyncResponseSubscriber>(),
@@ -63,13 +63,25 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
             provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlows(
-            provider.GetRequiredService<IFlowStateStore>(),
+            provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
             provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
             provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlows>>()));
 
         return new AsyncResponseRegistrationBuilder(services);
+    }
+
+    /// <summary>
+    /// Uses an application-owned store for durable-flow state. Recommended for production durable
+    /// flows: keep run ledgers in your database/document store instead of the channel recovery
+    /// cache used by the default dev/test store.
+    /// </summary>
+    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore>(this AsyncResponseRegistrationBuilder builder)
+        where TFlowStateStore : class, IFlowStateStore
+    {
+        builder.Services.AddScoped<IFlowStateStore, TFlowStateStore>();
+        return builder;
     }
 
     /// <summary>
