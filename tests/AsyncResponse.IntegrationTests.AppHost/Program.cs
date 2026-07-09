@@ -65,6 +65,7 @@ const string SqlServerEarlyAckDeadLetterQueue = "deadletter_earlyack";
 // schemas (each package creates its own tables inside the configured schema).
 const string SqlServerSchema = "itest";
 const string SqlServerEarlyAckSchema = "itest_earlyack";
+const string OracleAppUser = "asyncresponse";
 
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
@@ -122,6 +123,19 @@ var mysql = builder.AddContainer("mysql", "mysql", "8.4")
 
 var mongodb = builder.AddContainer("mongodb", "mongo", "7")
     .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
+
+var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");
+var oracle = builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
+    .WithEnvironment("ORACLE_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_ADMIN_PASSWORD", "AsyncResponse12345"))
+    .WithEnvironment("APP_USER", OracleAppUser)
+    .WithEnvironment("APP_USER_PASSWORD", oracleAppPassword)
+    .WithEndpoint(targetPort: 1521, scheme: "tcp", name: "oracle");
+
+var cosmos = builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
+    .WithEnvironment("PROTOCOL", "https")
+    .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
+    .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
+    .WithHttpHealthCheck("/ready", endpointName: "health");
 
 // Dedicated SQL Server for the SqlServer channel + transport SUTs (separate from the one backing the
 // Azure Service Bus emulator, so the two suites cannot interfere). Both SqlServer app variants share

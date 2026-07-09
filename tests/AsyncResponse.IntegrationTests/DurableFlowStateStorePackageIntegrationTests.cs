@@ -187,6 +187,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
         if (string.IsNullOrWhiteSpace(connectionString))
             Assert.Skip("Set ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING to run the Oracle durable-flow store contract test.");
 
+        await WaitForOracleAsync(connectionString);
         var table = NewIdentifier("DF_ORACLE", 18).ToUpperInvariant();
         try
         {
@@ -223,7 +224,8 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
             Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
 
         var databaseName = NewIdentifier("df_cosmos", 63);
-        using var client = new CosmosClient(connectionString);
+        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
+        await WaitForCosmosAsync(client);
         try
         {
             var store = new CosmosFlowStateStore(
@@ -262,6 +264,48 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
             using var cursor = await client.ListDatabaseNamesAsync();
             _ = await cursor.AnyAsync();
         });
+
+    private async Task WaitForOracleAsync(string connectionString)
+        => await EventuallyAsync(async () =>
+        {
+            await using var connection = new OracleConnection(connectionString);
+            await connection.OpenAsync();
+        });
+
+    private async Task WaitForCosmosAsync(CosmosClient client)
+        => await EventuallyAsync(async () => _ = await client.ReadAccountAsync());
+
+    private static CosmosClientOptions GetCosmosClientOptions(string connectionString)
+    {
+        var options = new CosmosClientOptions();
+        if (!IsLocalCosmosEndpoint(connectionString))
+            return options;
+
+        options.ConnectionMode = ConnectionMode.Gateway;
+        options.LimitToEndpoint = true;
+        options.HttpClientFactory = () => new HttpClient(new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+        });
+        return options;
+    }
+
+    private static bool IsLocalCosmosEndpoint(string connectionString)
+    {
+        foreach (var segment in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pair = segment.Split('=', 2, StringSplitOptions.TrimEntries);
+            if (pair.Length == 2 &&
+                pair[0].Equals("AccountEndpoint", StringComparison.OrdinalIgnoreCase) &&
+                Uri.TryCreate(pair[1], UriKind.Absolute, out var endpoint))
+            {
+                return endpoint.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                       endpoint.Host is "127.0.0.1" or "::1";
+            }
+        }
+
+        return false;
+    }
 
     private AmazonDynamoDBClient CreateDynamoDbClient()
         => new(

@@ -18,8 +18,13 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public const string RabbitMqResponseRoutingKey = "asyncresponse.itest.response";
 
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromMinutes(3);
+    private const string OracleConnectionStringEnvironmentVariable = "ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING";
+    private const string CosmosConnectionStringEnvironmentVariable = "ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING";
+    private const string CosmosEmulatorAccountKey = "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
 
     private DistributedApplication? _app;
+    private string? _previousOracleConnectionString;
+    private string? _previousCosmosConnectionString;
 
     public HttpClient Client { get; private set; } = null!;
     public HttpClient EarlyAckClient { get; private set; } = null!;
@@ -47,6 +52,9 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
+        _previousOracleConnectionString = Environment.GetEnvironmentVariable(OracleConnectionStringEnvironmentVariable);
+        _previousCosmosConnectionString = Environment.GetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable);
+
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_IntegrationTests_AppHost>();
         _app = await appHost.BuildAsync().WaitAsync(StartupTimeout);
         await _app.StartAsync().WaitAsync(StartupTimeout);
@@ -139,6 +147,16 @@ public sealed class IntegrationFixture : IAsyncLifetime
         var mongoDbEndpoint = _app.GetEndpoint("mongodb", "mongodb");
         MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}";
 
+        var oracleEndpoint = _app.GetEndpoint("oracle", "oracle");
+        Environment.SetEnvironmentVariable(
+            OracleConnectionStringEnvironmentVariable,
+            $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
+
+        var cosmosEndpoint = _app.GetEndpoint("cosmos", "gateway");
+        Environment.SetEnvironmentVariable(
+            CosmosConnectionStringEnvironmentVariable,
+            $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
+
         // The SUT apps have already provisioned the asyncresponse database by the time they report
         // healthy, so direct tests can connect straight to it.
         var sqlServerEndpoint = _app.GetEndpoint("sqlserver", "sqlserver");
@@ -174,27 +192,38 @@ public sealed class IntegrationFixture : IAsyncLifetime
 
     public async ValueTask DisposeAsync()
     {
-        Client?.Dispose();
-        EarlyAckClient?.Dispose();
-        AzureServiceBusClient?.Dispose();
-        AzureServiceBusEarlyAckClient?.Dispose();
-        SqsClient?.Dispose();
-        SqsEarlyAckClient?.Dispose();
-        RabbitMqClient?.Dispose();
-        RabbitMqEarlyAckClient?.Dispose();
-        KafkaClient?.Dispose();
-        KafkaEarlyAckClient?.Dispose();
-        RedisTransportClient?.Dispose();
-        RedisTransportEarlyAckClient?.Dispose();
-        NatsClient?.Dispose();
-        NatsEarlyAckClient?.Dispose();
-        PostgreSqlClient?.Dispose();
-        PostgreSqlEarlyAckClient?.Dispose();
-        SqlServerClient?.Dispose();
-        SqlServerEarlyAckClient?.Dispose();
-        if (_app is not null)
-            await _app.DisposeAsync();
+        try
+        {
+            Client?.Dispose();
+            EarlyAckClient?.Dispose();
+            AzureServiceBusClient?.Dispose();
+            AzureServiceBusEarlyAckClient?.Dispose();
+            SqsClient?.Dispose();
+            SqsEarlyAckClient?.Dispose();
+            RabbitMqClient?.Dispose();
+            RabbitMqEarlyAckClient?.Dispose();
+            KafkaClient?.Dispose();
+            KafkaEarlyAckClient?.Dispose();
+            RedisTransportClient?.Dispose();
+            RedisTransportEarlyAckClient?.Dispose();
+            NatsClient?.Dispose();
+            NatsEarlyAckClient?.Dispose();
+            PostgreSqlClient?.Dispose();
+            PostgreSqlEarlyAckClient?.Dispose();
+            SqlServerClient?.Dispose();
+            SqlServerEarlyAckClient?.Dispose();
+            if (_app is not null)
+                await _app.DisposeAsync();
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(OracleConnectionStringEnvironmentVariable, _previousOracleConnectionString);
+            Environment.SetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable, _previousCosmosConnectionString);
+        }
     }
+
+    private static string Env(string name, string fallback)
+        => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
 
     private static async Task ResetTestStateAsync(HttpClient client)
     {
