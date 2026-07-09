@@ -30,9 +30,9 @@
          Versions are pinned to the MTP 1.9.x line that xUnit.net v3 3.2.x is built against; the
          explicit Microsoft.Testing.Platform pin keeps the whole MTP graph on one (v1) major so the
          shared host assembly stays compatible. -->
-    <PackageReference Include="Microsoft.Testing.Platform" Version="2.2.3" />
-    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="2.2.3" />
-    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.8.0" />
+    <PackageReference Include="Microsoft.Testing.Platform" Version="2.3.1" />
+    <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.1" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.9.0" />
   </ItemGroup>
 
   <ItemGroup>

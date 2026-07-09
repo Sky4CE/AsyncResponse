@@ -471,9 +471,9 @@ per-commit trends with regression alerting are published to the
 
 ## How it's tested
 
-- **2200+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+- **2400+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **130+ integration tests** drive the shipped sample app black-box over HTTP against **real
+- **140+ integration tests** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, RabbitMQ, Kafka containers plus the official
   Azure Service Bus and Google Pub/Sub emulators and LocalStack for AWS SQS — orchestrated by .NET
   Aspire, with a dedicated early-ACK app instance per transport. A scheduled CI matrix reruns the

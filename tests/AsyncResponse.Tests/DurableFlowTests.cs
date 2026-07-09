@@ -299,6 +299,8 @@ public class DurableFlowTests
         var context = new DurableFlowContext(
             new FlowState { FlowId = "flow-x" },
             store.Object,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
             new DurableFlowOptions(),
             Mock.Of<IAsyncResponseSubscriber>(),
             recoverable.Object,

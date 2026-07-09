@@ -89,4 +89,42 @@ public class WireContractSerializationTests
         Assert.Equal("default", restored.ReplyTarget!.Name);
         Assert.Equal("acme", restored.Context!["tenant"]);
     }
+
+    [Fact]
+    public void FlowStateJson_OmitsAbsentChildFlowMetadata_ButKeepsPresentRelationships()
+    {
+        var state = new FlowState
+        {
+            FlowId = "root",
+            FlowTypeName = "Flow",
+            InputTypeName = "Input",
+            InputJson = "{}",
+            Status = FlowRunStatus.Running,
+            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+            {
+                ["local"] = new() { Completed = true }
+            }
+        };
+
+        var json = FlowStateJson.Serialize(state);
+
+        Assert.DoesNotContain("\"ParentFlowId\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"ParentStepName\"", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"ChildFlowId\"", json, StringComparison.Ordinal);
+
+        state.ParentFlowId = "parent";
+        state.ParentStepName = "child-step";
+        state.Steps["local"].ChildFlowId = "child";
+
+        json = FlowStateJson.Serialize(state);
+
+        Assert.Contains("\"ParentFlowId\":\"parent\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"ParentStepName\":\"child-step\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"ChildFlowId\":\"child\"", json, StringComparison.Ordinal);
+
+        var restored = JsonSerializer.Deserialize<FlowState>(json);
+        Assert.Equal("parent", restored!.ParentFlowId);
+        Assert.Equal("child-step", restored.ParentStepName);
+        Assert.Equal("child", restored.Steps!["local"].ChildFlowId);
+    }
 }

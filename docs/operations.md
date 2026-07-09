@@ -142,7 +142,8 @@ early-ACK invariant for AWS SQS deliveries: every message deleted exactly once, 
 `ExecutionContext` under foreign publishers),
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation), and
 **durable-flow-storm** (hundreds of concurrent 5-step checkpointed flows through the real worker
-transport: every flow must end `Succeeded`, every step exactly once). The core concurrency
+transport and default recovery-backed flow-state store: every flow must end `Succeeded`, every step
+exactly once). Durable-flow package stores have separate BenchmarkDotNet baselines. The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
 dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server

@@ -1,9 +1,15 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AsyncResponse.DurableFlows.Internal;
 
 internal static class DurableFlowStoreShared
 {
+    private static readonly JsonSerializerOptions Options = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     public static void ValidateSave(string flowId, FlowState state, TimeSpan ttl)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
@@ -12,7 +18,7 @@ internal static class DurableFlowStoreShared
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
     }
 
-    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state);
+    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, Options);
 
     public static FlowState? Deserialize(string json)
     {

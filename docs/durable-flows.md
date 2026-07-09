@@ -132,6 +132,52 @@ side effects in step bodies fire once per *step execution* — which, under cras
 at-least-once. A duplicate "progress 50%" toast is usually fine; if a side effect must be truly
 once, put it in its own checkpointed `StepAsync`.
 
+## Child flows
+
+Use child flows when a stage is large enough to deserve its own durable ledger, progress screen,
+or retry boundary. The parent starts the child once and then parks: no worker is held while the
+child (or grandchildren) run.
+
+```csharp
+public sealed class TenantProvisioningFlow : IDurableFlow<ProvisioningInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, ProvisioningInput input)
+    {
+        var migration = await flow.AwaitChildFlowAsync<TenantMigrationFlow, MigrationInput>(
+            "migrate-tenant",
+            new MigrationInput(input.TenantId),
+            flowId: $"{flow.FlowId}:migration");
+
+        await flow.SetValueAsync("migration-flow-id", migration.FlowId);
+        await flow.StepAsync("notify", () => _notifier.SendProvisionedAsync(input.TenantId));
+    }
+}
+```
+
+`AwaitChildFlowAsync` checkpoints the parent step with the child id, creates the child `FlowState`
+with `ParentFlowId`/`ParentStepName`, enqueues the child, and suspends the parent run. When the
+child reaches `Succeeded` or `Failed`, the child executor re-enqueues the parent. On resume the
+parent reloads the child state: `Succeeded` completes the parent step; `Failed` completes the step
+with the failed child snapshot and throws `DurableFlowFailedException` by default.
+
+For best-effort child work, keep the failure as data:
+
+```csharp
+var audit = await flow.AwaitChildFlowAsync<AuditFlow, AuditInput>(
+    "audit",
+    new AuditInput(input.TenantId),
+    failOnChildFailure: false);
+
+if (audit.Status == FlowRunStatus.Failed)
+    await flow.ReportProgressAsync($"Audit failed; continuing ({audit.LastMessage})");
+```
+
+Do not hand-roll child waits by combining `AwaitStepAsync` with `IDurableFlows.StartAsync`. That
+keeps the parent worker busy while the child waits in the same worker queue; a single-worker
+transport (including the in-memory transport used in tests) can starve the child. The child-flow
+primitive parks the parent first, so parent → child → grandchild chains are deadlock-free under the
+same worker.
+
 ## What happens when things die
 
 The flow body always runs from the top; checkpoints make re-running cheap and safe. That single
@@ -144,6 +190,7 @@ property makes every failure mode collapse into "run it again":
 | Process is **down** when a progress/success response arrives | The payload's `ShouldResumeOnRecovery() == true` routes to the auto-registered **resume** callback, which re-enqueues the run on the worker transport |
 | Process is down when a **failed** response arrives | `ShouldResumeOnRecovery() == false` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
 | The **terminal** response itself was the lost message | Recovery consumed it, so the re-attached wait has nothing to receive: the step times out and restarts fresh — rule 2 (idempotent steps) is what makes that safe |
+| A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
 | A step keeps failing | The exception propagates; the worker transport redelivers the run with bounded attempts, then **dead-letters it — that's your "run is stuck" alarm** |
 | The flow decides it's hopeless | Throw `DurableFlowFailedException`: the run is marked `Failed` terminally, with no redelivery |
 
@@ -241,15 +288,19 @@ Crash-resume is testable deterministically: throw from a step (or seed a
 exactly once. The library's own suites are the reference:
 [`DurableFlowScenarioTests`](../tests/AsyncResponse.Tests/DurableFlowScenarioTests.cs) (a
 production-shaped pipeline with a crash-at-every-checkpoint matrix, subset runs, catch-and-continue,
-and injected notifications), integration tests running the same flow against **every durable
-channel** (Redis, NATS, PostgreSQL, SQL Server) over real infrastructure, and a stress-harness
-storm asserting exactly-once step execution across hundreds of concurrent flows. For pure unit
-tests of flow logic, `IDurableFlowContext` is an interface you can fake outright.
+and injected notifications), [`DurableChildFlowTests`](../tests/AsyncResponse.Tests/DurableChildFlowTests.cs)
+(single-worker parent → child → grandchild execution plus the old hand-rolled starvation
+regression), integration tests running the same flow against **every durable channel** (Redis,
+NATS, PostgreSQL, SQL Server) over real infrastructure, and a stress-harness storm asserting
+exactly-once step execution across hundreds of concurrent flows. For pure unit tests of flow
+logic, `IDurableFlowContext` is an interface you can fake outright.
 
 ## Observing runs
 
 - `IDurableFlows.GetStateAsync(flowId)` → the full `FlowState` snapshot: status, per-step
   checkpoints, `LastMessage` progress, attempts, the value bag.
+- Child flow relationships are visible in state: the parent step has `ChildFlowId`, and the child
+  run has `ParentFlowId`/`ParentStepName`.
 - `flow.ReportProgressAsync(...)` and `flow.SetValueAsync(key, value)` persist operator-facing
   progress and arbitrary values on the state.
 - Executions emit an `asyncresponse.flow.execute` activity tagged with the flow id and type.

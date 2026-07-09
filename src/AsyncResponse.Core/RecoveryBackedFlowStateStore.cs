@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using System.Text.Json;
 
 namespace AsyncResponse;
 
@@ -61,7 +60,7 @@ internal sealed class RecoveryBackedFlowStateStore : IFlowStateStore
             RegisteredAtUtc = state.CreatedAtUtc ?? DateTime.UtcNow,
             Context = new Dictionary<string, string>(1, StringComparer.Ordinal)
             {
-                [StateContextKey] = JsonSerializer.Serialize(state)
+                [StateContextKey] = FlowStateJson.Serialize(state)
             }
         };
 

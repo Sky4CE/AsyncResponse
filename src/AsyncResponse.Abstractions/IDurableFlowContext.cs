@@ -12,6 +12,9 @@ namespace AsyncResponse;
 /// breadcrumb: a re-run while the operation is still in flight <em>re-attaches</em> to the same
 /// wait instead of re-triggering, and lost-subscriber recovery callbacks are registered
 /// automatically (resume = re-run the flow; failure = fail the run).</item>
+/// <item><see cref="AwaitChildFlowAsync{TFlow, TInput}(string, TInput, string?, bool, CancellationToken)"/>
+/// — start a child durable flow and suspend this run until the child reaches a terminal state,
+/// without occupying a worker while the child runs.</item>
 /// </list>
 /// Step names are persisted — keep them stable and unique within the flow. Inserting, reordering,
 /// or removing steps is an ordinary code edit; in-flight runs pick the changes up on resume.
@@ -74,6 +77,27 @@ public interface IDurableFlowContext
         Func<TResponse, Task<bool>> until,
         TimeSpan? timeout = null,
         CancellationToken cancellationToken = default) where TResponse : IAsyncResponsePayload;
+
+    /// <summary>
+    /// Starts a child durable flow once, then suspends this parent run until the child succeeds or
+    /// fails. The parent worker is released while the child runs; when the child reaches a terminal
+    /// state the executor re-enqueues the parent, which resumes from this checkpoint.
+    /// <para>
+    /// The default child id is <c>{FlowId}:{name}</c>. Pass <paramref name="flowId"/> when the child
+    /// needs a domain-owned idempotency key. On success the child <see cref="FlowState"/> snapshot is
+    /// memoized as this step's result. On failure the step is also memoized, then
+    /// <see cref="DurableFlowFailedException"/> is thrown unless
+    /// <paramref name="failOnChildFailure"/> is <c>false</c>.
+    /// </para>
+    /// </summary>
+    Task<FlowState> AwaitChildFlowAsync<TFlow, TInput>(
+        string name,
+        TInput input,
+        string? flowId = null,
+        bool failOnChildFailure = true,
+        CancellationToken cancellationToken = default)
+        where TFlow : class, IDurableFlow<TInput>
+        => throw new NotSupportedException($"{nameof(AwaitChildFlowAsync)} is implemented by the AsyncResponse durable-flow runtime.");
 
     /// <summary>
     /// Persists an operator-facing progress message on the flow state

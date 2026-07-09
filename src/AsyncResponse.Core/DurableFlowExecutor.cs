@@ -81,6 +81,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (state.Status != FlowRunStatus.Running)
         {
             _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping execution.", flowId, state.Status);
+            await NotifyParentAsync(state).ConfigureAwait(false);
             return;
         }
 
@@ -98,13 +99,27 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         try
         {
-            await InvokeFlowAsync(scope.ServiceProvider, store, state).ConfigureAwait(false);
+            var suspended = await InvokeFlowAsync(scope.ServiceProvider, store, state).ConfigureAwait(false);
+            if (suspended)
+            {
+                await SaveAsync(store, state).ConfigureAwait(false);
+                _logger.LogInformation("Durable flow {FlowId} suspended: {Message}", flowId, state.LastMessage);
+                return;
+            }
 
             state.Status = FlowRunStatus.Succeeded;
             state.LastMessage = "Flow completed.";
             await SaveAsync(store, state).ConfigureAwait(false);
 
             _logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", flowId, state.Attempts);
+        }
+        catch (DurableFlowSuspendedException ex)
+        {
+            state.LastMessage = ex.Message;
+            await SaveAsync(store, state).ConfigureAwait(false);
+
+            _logger.LogInformation("Durable flow {FlowId} suspended: {Message}", flowId, ex.Message);
+            return;
         }
         catch (DurableFlowFailedException ex)
         {
@@ -127,6 +142,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // attempts and dead-letters it when they are exhausted — the "run is stuck" alarm.
             throw;
         }
+
+        await NotifyParentAsync(state).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -173,17 +190,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (state.Status != FlowRunStatus.Running)
         {
             _logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring failure signal.", flowId, state.Status);
+            await NotifyParentAsync(state).ConfigureAwait(false);
             return;
         }
 
         state.Status = FlowRunStatus.Failed;
         state.LastMessage = exception.Message;
         await SaveAsync(store, state).ConfigureAwait(false);
+        await NotifyParentAsync(state).ConfigureAwait(false);
 
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }
 
-    private async Task InvokeFlowAsync(IServiceProvider serviceProvider, IFlowStateStore store, FlowState state)
+    private async Task<bool> InvokeFlowAsync(IServiceProvider serviceProvider, IFlowStateStore store, FlowState state)
     {
         var flowType = ResolveType(state.FlowTypeName, "flow");
         var inputType = ResolveType(state.InputTypeName, "input");
@@ -210,17 +229,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 "matching the persisted input type; the flow state was written by an incompatible flow definition.");
         }
 
-        var context = new DurableFlowContext(state, store, _options, _subscriber, _recoverableSubscriber, _logger);
+        var context = new DurableFlowContext(state, store, _builder, _propagation, _options, _subscriber, _recoverableSubscriber, _logger);
         var execute = contract.GetMethod(nameof(IDurableFlow<object>.ExecuteAsync))!;
         try
         {
             await ((Task)execute.Invoke(flow, [context, input])!).ConfigureAwait(false);
+            return context.IsSuspended;
         }
         catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is not null)
         {
             // A synchronously-thrown flow exception arrives wrapped; unwrap so terminal
             // DurableFlowFailedException handling (and user-visible stack traces) see the real one.
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
         }
     }
 
@@ -239,5 +260,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     {
         state.UpdatedAtUtc = DateTime.UtcNow;
         return store.SaveAsync(state.FlowId!, state, _options.StateExpiry);
+    }
+
+    private Task NotifyParentAsync(FlowState state)
+    {
+        if (string.IsNullOrWhiteSpace(state.ParentFlowId))
+            return Task.CompletedTask;
+
+        var parentFlowId = state.ParentFlowId;
+        _logger.LogInformation(
+            "Durable child flow {FlowId} reached {Status}; resuming parent flow {ParentFlowId} step '{ParentStepName}'.",
+            state.FlowId,
+            state.Status,
+            parentFlowId,
+            state.ParentStepName);
+
+        return _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(parentFlowId));
     }
 }

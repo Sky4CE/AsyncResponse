@@ -65,6 +65,12 @@ public sealed class FlowState
     /// <summary>The flow's user key/value bag (values serialized as JSON).</summary>
     public Dictionary<string, string>? Values { get; set; }
 
+    /// <summary>Parent flow run id when this run was started by <see cref="IDurableFlowContext.AwaitChildFlowAsync{TFlow, TInput}"/>.</summary>
+    public string? ParentFlowId { get; set; }
+
+    /// <summary>Parent step name that is waiting for this child flow, when any.</summary>
+    public string? ParentStepName { get; set; }
+
     /// <summary>
     /// Serialized ambient context captured when the run was started (see
     /// <see cref="IAsyncResponseContextPropagator"/>), restored before every (re-)execution —
@@ -96,6 +102,9 @@ public sealed class FlowStepState
 
     /// <summary>The step's most recent message (progress or failure).</summary>
     public string? Message { get; set; }
+
+    /// <summary>Child flow run id when this checkpoint is waiting for a child flow.</summary>
+    public string? ChildFlowId { get; set; }
 
     /// <summary>UTC timestamp the step completed.</summary>
     public DateTime? CompletedAtUtc { get; set; }

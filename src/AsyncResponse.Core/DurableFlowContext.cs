@@ -18,15 +18,20 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 {
     private readonly FlowState _state;
     private readonly IFlowStateStore _store;
+    private readonly IAsyncResponseBuilder _builder;
+    private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
     private readonly IAsyncResponseSubscriber _subscriber;
     private readonly IRecoverableAsyncResponseSubscriber? _recoverableSubscriber;
     private readonly ILogger _logger;
+    private bool _suspended;
 
     /// <summary>Creates the context for one execution of the given run.</summary>
     public DurableFlowContext(
         FlowState state,
         IFlowStateStore store,
+        IAsyncResponseBuilder builder,
+        AsyncResponseContextPropagation propagation,
         DurableFlowOptions options,
         IAsyncResponseSubscriber subscriber,
         IRecoverableAsyncResponseSubscriber? recoverableSubscriber,
@@ -34,11 +39,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     {
         _state = state;
         _store = store;
+        _builder = builder;
+        _propagation = propagation;
         _options = options;
         _subscriber = subscriber;
         _recoverableSubscriber = recoverableSubscriber;
         _logger = logger;
     }
+
+    internal bool IsSuspended => _suspended;
 
     /// <inheritdoc />
     public string FlowId => _state.FlowId!;
@@ -46,6 +55,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <inheritdoc />
     public async Task StepAsync(string name, Func<Task> step, CancellationToken cancellationToken = default)
     {
+        ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(step);
 
@@ -60,6 +70,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <inheritdoc />
     public async Task<TResult> StepAsync<TResult>(string name, Func<Task<TResult>> step, CancellationToken cancellationToken = default)
     {
+        ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(step);
 
@@ -107,6 +118,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <inheritdoc />
     public Task ReportProgressAsync(string message, CancellationToken cancellationToken = default)
     {
+        ThrowIfSuspended();
         _state.LastMessage = message;
         return SaveAsync(cancellationToken);
     }
@@ -114,6 +126,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <inheritdoc />
     public TValue? GetValue<TValue>(string key)
     {
+        ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         return _state.Values is not null && _state.Values.TryGetValue(key, out var json)
             ? JsonSafety.SafeDeserialize<TValue>(json)
@@ -123,10 +136,70 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// <inheritdoc />
     public Task SetValueAsync<TValue>(string key, TValue value, CancellationToken cancellationToken = default)
     {
+        ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         var values = _state.Values ??= new Dictionary<string, string>(StringComparer.Ordinal);
         values[key] = JsonSerializer.Serialize(value);
         return SaveAsync(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<FlowState> AwaitChildFlowAsync<TFlow, TInput>(
+        string name,
+        TInput input,
+        string? flowId = null,
+        bool failOnChildFailure = true,
+        CancellationToken cancellationToken = default)
+        where TFlow : class, IDurableFlow<TInput>
+    {
+        ThrowIfSuspended();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(input);
+
+        var checkpoint = GetStep(name);
+        if (checkpoint.Completed)
+        {
+            var completedChild = DeserializeResult<FlowState>(checkpoint.ResultJson);
+            ThrowIfChildFailed(completedChild, failOnChildFailure);
+            return completedChild;
+        }
+
+        var childFlowId = checkpoint.ChildFlowId;
+        if (string.IsNullOrWhiteSpace(childFlowId))
+        {
+            childFlowId = string.IsNullOrWhiteSpace(flowId) ? $"{FlowId}:{name}" : flowId;
+            checkpoint.ChildFlowId = childFlowId;
+            checkpoint.Faulted = false;
+            checkpoint.Message = $"Waiting for child flow '{childFlowId}'.";
+            await SaveAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
+        if (child is null)
+        {
+            child = CreateChildState<TFlow, TInput>(childFlowId, name, input);
+            await _store.SaveAsync(childFlowId, child, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
+        }
+
+        switch (child.Status)
+        {
+            case FlowRunStatus.Succeeded:
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.Serialize(child), cancellationToken).ConfigureAwait(false);
+                return child;
+
+            case FlowRunStatus.Failed:
+                checkpoint.Faulted = true;
+                checkpoint.Message = child.LastMessage;
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.Serialize(child), cancellationToken).ConfigureAwait(false);
+                ThrowIfChildFailed(child, failOnChildFailure);
+                return child;
+
+            default:
+                await EnqueueChildAsync(childFlowId).ConfigureAwait(false);
+                Suspend($"Flow {FlowId} suspended waiting for child flow {childFlowId}.");
+                throw new InvalidOperationException("Unreachable.");
+        }
     }
 
     private async Task<TResponse> AwaitStepCoreAsync<TResponse>(
@@ -136,6 +209,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         TimeSpan? timeout,
         CancellationToken cancellationToken) where TResponse : IAsyncResponsePayload
     {
+        ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(trigger);
 
@@ -223,6 +297,50 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             FlowId, stepName);
 
         return await _subscriber.CreateResponseWaiter(correlationId, until, timeout).ConfigureAwait(false);
+    }
+
+    private FlowState CreateChildState<TFlow, TInput>(string flowId, string parentStepName, TInput input)
+    {
+        var now = DateTime.UtcNow;
+        return new FlowState
+        {
+            FlowId = flowId,
+            FlowTypeName = typeof(TFlow).FullName,
+            InputTypeName = typeof(TInput).FullName,
+            InputJson = JsonSerializer.Serialize(input),
+            Status = FlowRunStatus.Running,
+            LastMessage = $"Child flow started by {FlowId}.",
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            ParentFlowId = FlowId,
+            ParentStepName = parentStepName,
+            Context = _propagation.Capture()
+        };
+    }
+
+    private Task EnqueueChildAsync(string childFlowId)
+    {
+        var id = childFlowId;
+        return _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id));
+    }
+
+    private void Suspend(string message)
+    {
+        _suspended = true;
+        _state.LastMessage = message;
+        throw new DurableFlowSuspendedException(message);
+    }
+
+    private void ThrowIfSuspended()
+    {
+        if (_suspended)
+            throw new DurableFlowSuspendedException(_state.LastMessage ?? $"Flow {FlowId} is suspended.");
+    }
+
+    private static void ThrowIfChildFailed(FlowState child, bool failOnChildFailure)
+    {
+        if (failOnChildFailure && child.Status == FlowRunStatus.Failed)
+            throw new DurableFlowFailedException($"Child flow '{child.FlowId}' failed: {child.LastMessage ?? "no message"}");
     }
 
     private FlowStepState GetStep(string name)
