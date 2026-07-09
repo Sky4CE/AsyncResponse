@@ -124,18 +124,23 @@ var mysql = builder.AddContainer("mysql", "mysql", "8.4")
 var mongodb = builder.AddContainer("mongodb", "mongo", "7")
     .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
 
-var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");
-var oracle = builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
-    .WithEnvironment("ORACLE_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_ADMIN_PASSWORD", "AsyncResponse12345"))
-    .WithEnvironment("APP_USER", OracleAppUser)
-    .WithEnvironment("APP_USER_PASSWORD", oracleAppPassword)
-    .WithEndpoint(targetPort: 1521, scheme: "tcp", name: "oracle");
+// Oracle and Cosmos support the opt-in durable-flow store contracts. They are not part of the
+// broker/load-test SUT, so that workflow skips their heavyweight containers via this flag.
+if (!string.Equals(Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"), "true", StringComparison.OrdinalIgnoreCase))
+{
+    var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");
+    var oracle = builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
+        .WithEnvironment("ORACLE_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_ADMIN_PASSWORD", "AsyncResponse12345"))
+        .WithEnvironment("APP_USER", OracleAppUser)
+        .WithEnvironment("APP_USER_PASSWORD", oracleAppPassword)
+        .WithEndpoint(targetPort: 1521, scheme: "tcp", name: "oracle");
 
-var cosmos = builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
-    .WithEnvironment("PROTOCOL", "https")
-    .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
-    .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
-    .WithHttpHealthCheck("/ready", endpointName: "health");
+    var cosmos = builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
+        .WithEnvironment("PROTOCOL", "https")
+        .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
+        .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
+        .WithHttpHealthCheck("/ready", endpointName: "health");
+}
 
 // Dedicated SQL Server for the SqlServer channel + transport SUTs (separate from the one backing the
 // Azure Service Bus emulator, so the two suites cannot interfere). Both SqlServer app variants share

@@ -71,6 +71,7 @@ jobs:
           LOADTEST_DURATION: ${{ github.event.inputs.duration || '30' }}
           LOADTEST_EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
           LOADTEST_APPHOST_ENV: ${{ github.event.inputs.apphost_env || '' }}
+          ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: 'true'
         run: |
           python3 - <<'PY' > "$RUNNER_TEMP/loadtest-env"
           import os
