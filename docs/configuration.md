@@ -47,6 +47,26 @@ See [durable-flows.md](durable-flows.md) for the flow API these options govern,
 `.AuthorizeCallbacks(...)` and type-resolution registration, which are also chained off
 `AddAsyncResponse()`.
 
+## Durable-flow state store package options
+
+Production durable flows should use an `AsyncResponse.DurableFlows.*` package or
+`WithCustomDurableFlows<TStore>()`; the default recovery-backed store is for tests, development,
+and migration.
+
+| Package | Key options |
+|---|---|
+| `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema` |
+| `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema` |
+| `MySql` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
+| `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
+| `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
+| `MongoDB` | `ConnectionString` or registered `IMongoDatabase`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
+| `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer` |
+| `DynamoDB` | registered/default `IAmazonDynamoDB`, `TableName`, `AutoCreateTable`, `EnableTimeToLive`, `TimeToLiveAttributeName` |
+
+See [durable-flow-state-stores.md](durable-flow-state-stores.md) for package examples and schema
+ownership guidance.
+
 ## Channel options
 
 Channel options are common where noted and channel-specific otherwise. They are set through the

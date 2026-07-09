@@ -71,8 +71,15 @@ builder.Services
     .AddAsyncResponse()
     .WithRedisChannel()
     .WithRabbitMqTransport(...)
-    .WithDurableFlows<MyFlowStateStore>();
+    .WithSqlServerDurableFlows(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
+    });
 ```
+
+Built-in store packages are available for SQL Server, PostgreSQL, MySQL/MariaDB, SQLite, Oracle,
+MongoDB, Azure Cosmos DB, and DynamoDB. Use `WithCustomDurableFlows<TStore>()` only when those
+packages do not match your storage model.
 
 ## The rules (there are only three)
 
@@ -255,9 +262,36 @@ simple, but recovery stores are often cache-shaped: Redis keys expire, NATS KV b
 limits, and `AsyncResponseOptions.DurableFlows.StateExpiry` defaults to 7 days. That TTL refreshes
 on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration.
 
-To keep flow state in your own storage instead (e.g. a table next to the domain entities the
-flow operates on, where your dashboards already look), register your own store — the library
-calls exactly three members:
+To keep flow state in durable app-owned storage (e.g. a table next to the domain entities the
+flow operates on, where your dashboards already look), use a store package:
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel()
+    .WithRabbitMqTransport(...)
+    .WithPostgreSqlDurableFlows(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("PostgreSQL");
+        options.SchemaName = "public";
+        options.TableName = "asyncresponse_flow_state";
+    });
+```
+
+Supported packages:
+
+| Store | Package registration |
+|---|---|
+| SQL Server | `WithSqlServerDurableFlows(...)` |
+| PostgreSQL | `WithPostgreSqlDurableFlows(...)` |
+| MySQL / MariaDB | `WithMySqlDurableFlows(...)` |
+| SQLite | `WithSqliteDurableFlows(...)` |
+| Oracle | `WithOracleDurableFlows(...)` |
+| MongoDB | `WithMongoDbDurableFlows(...)` |
+| Azure Cosmos DB | `WithCosmosDurableFlows(...)` |
+| DynamoDB | `WithDynamoDbDurableFlows(...)` |
+
+If your application already has a different persistence abstraction, register your own store. The
+library calls exactly three members:
 
 ```csharp
 public interface IFlowStateStore
@@ -271,13 +305,13 @@ builder.Services
     .AddAsyncResponse()
     .WithRedisChannel()
     .WithRabbitMqTransport(...)
-    .WithDurableFlows<MyDatabaseFlowStateStore>();
+    .WithCustomDurableFlows<MyDatabaseFlowStateStore>();
 ```
 
-`WithDurableFlows<TStore>()` registers the store as scoped, so EF Core `DbContext`,
-`NpgsqlDataSource`, `IMongoDatabase`, or similar dependencies can be used normally. The default
-recovery-backed store logs a warning the first time it persists flow state, pointing production
-apps at this override.
+Store packages and `WithCustomDurableFlows<TStore>()` register the store as scoped, so EF Core
+`DbContext`, `NpgsqlDataSource`, `IMongoDatabase`, or similar dependencies can be used normally.
+The default recovery-backed store logs a warning the first time it persists flow state, pointing
+production apps at the package/custom-store path.
 
 Implementation guide: [durable-flow-state-stores.md](durable-flow-state-stores.md).
 

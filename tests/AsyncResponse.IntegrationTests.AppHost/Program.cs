@@ -115,6 +115,14 @@ var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
     .WithArgs("-c", "max_connections=400")
     .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
 
+var mysql = builder.AddContainer("mysql", "mysql", "8.4")
+    .WithEnvironment("MYSQL_DATABASE", "asyncresponse")
+    .WithEnvironment("MYSQL_ROOT_PASSWORD", "mysql")
+    .WithEndpoint(targetPort: 3306, scheme: "tcp", name: "mysql");
+
+var mongodb = builder.AddContainer("mongodb", "mongo", "7")
+    .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
+
 // Dedicated SQL Server for the SqlServer channel + transport SUTs (separate from the one backing the
 // Azure Service Bus emulator, so the two suites cannot interfere). Both SqlServer app variants share
 // it; the sample app provisions the database and each variant isolates through its own schema.
@@ -145,7 +153,7 @@ var serviceBus = builder.AddContainer("servicebus", "mcr.microsoft.com/azure-mes
 // sample app provisions its queues (and redrive-policy dead-letter queues) through the transport's
 // CreateQueues option, so no config file or init script is needed.
 var localstack = builder.AddContainer("localstack", "localstack/localstack", "3")
-    .WithEnvironment("SERVICES", "sqs")
+    .WithEnvironment("SERVICES", "sqs,dynamodb")
     .WithEnvironment("EAGER_SERVICE_LOADING", "1")
     .WithEndpoint(targetPort: 4566, scheme: "http", name: "edge")
     .WithHttpHealthCheck("/_localstack/health", endpointName: "edge");

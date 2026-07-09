@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.DurableFlows.Cosmos</PackageId>
+    <Description>Azure Cosmos DB durable-flow state store for AsyncResponse. Persists durable-flow ledgers in an application-owned Cosmos container instead of the response-channel recovery cache.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\AsyncResponse.DurableFlows.Shared\DurableFlowStoreShared.cs" Link="DurableFlowStoreShared.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Tests" />
+    <InternalsVisibleTo Include="AsyncResponse.IntegrationTests" />
+    <InternalsVisibleTo Include="AsyncResponse.Benchmarks" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.61.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.9" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+
+</Project>

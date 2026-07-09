@@ -6,21 +6,21 @@ using System.Text.Json;
 namespace AsyncResponse;
 
 /// <inheritdoc cref="IDurableFlows" />
-internal sealed class DurableFlows : IDurableFlows
+internal sealed class DurableFlowService : IDurableFlows
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IAsyncResponseBuilder _builder;
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
-    private readonly ILogger<DurableFlows> _logger;
+    private readonly ILogger<DurableFlowService> _logger;
 
     /// <summary>Creates the durable-flows starter.</summary>
-    public DurableFlows(
+    public DurableFlowService(
         IServiceScopeFactory scopeFactory,
         IAsyncResponseBuilder builder,
         AsyncResponseContextPropagation propagation,
         IOptions<AsyncResponseOptions> options,
-        ILogger<DurableFlows> logger)
+        ILogger<DurableFlowService> logger)
     {
         _scopeFactory = scopeFactory;
         _builder = builder;

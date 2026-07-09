@@ -1,8 +1,20 @@
-using Microsoft.Data.Sqlite;
+using Amazon.DynamoDBv2;
+using AsyncResponse.DurableFlows.Cosmos;
+using AsyncResponse.DurableFlows.DynamoDB;
+using AsyncResponse.DurableFlows.MongoDB;
+using AsyncResponse.DurableFlows.MySql;
+using AsyncResponse.DurableFlows.Oracle;
+using AsyncResponse.DurableFlows.PostgreSQL;
+using AsyncResponse.DurableFlows.Sqlite;
+using AsyncResponse.DurableFlows.SqlServer;
+using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using System.Data.Common;
+using Microsoft.Extensions.Options;
+using Moq;
+using Npgsql;
+using System.Security.Cryptography;
 using System.Text.Json;
 using Xunit;
 
@@ -11,48 +23,153 @@ namespace AsyncResponse.Tests;
 public sealed class DurableFlowStateStoreExampleTests
 {
     [Fact]
-    public async Task RelationalStore_RoundTrips_Expires_Deletes()
+    public async Task SqlitePackageStore_RoundTrips_Expires_Deletes()
     {
-        await using var database = await SqliteFlowStateDatabase.CreateAsync();
-        var store = new RelationalFlowStateStore(database.OpenConnectionAsync);
+        await using var database = new TempSqliteDatabase();
+        var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
+        {
+            ConnectionString = database.ConnectionString
+        }));
 
         await AssertStoreContractAsync(store);
     }
 
     [Fact]
-    public async Task DocumentStore_RoundTrips_Expires_Deletes()
-        => await AssertStoreContractAsync(new DocumentFlowStateStore(new InMemoryFlowStateDocuments()));
-
-    [Fact]
-    public async Task KeyValueStore_RoundTrips_Expires_Deletes()
-        => await AssertStoreContractAsync(new KeyValueFlowStateStore(new InMemoryFlowStateKeyValueTable()));
-
-    [Fact]
-    public async Task RelationalStore_RunsDurableFlowEndToEnd()
+    public async Task SqlitePackageStore_RunsDurableFlowEndToEnd()
     {
-        await using var database = await SqliteFlowStateDatabase.CreateAsync();
-        await RunFlowWithStoreAsync(builder =>
+        await using var database = new TempSqliteDatabase();
+        await RunFlowWithStoreAsync(builder => builder.WithSqliteDurableFlows(options =>
         {
-            builder.Services.AddSingleton<Func<CancellationToken, ValueTask<DbConnection>>>(database.OpenConnectionAsync);
-            builder.WithDurableFlows<RelationalFlowStateStore>();
-        });
+            options.ConnectionString = database.ConnectionString;
+        }));
     }
 
     [Fact]
-    public async Task DocumentStore_RunsDurableFlowEndToEnd()
-        => await RunFlowWithStoreAsync(builder =>
+    public async Task SqlitePackageStore_ConcurrentSaveLoadDeleteStorm()
+    {
+        await using var database = new TempSqliteDatabase();
+        var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
         {
-            builder.Services.AddSingleton<IFlowStateDocuments, InMemoryFlowStateDocuments>();
-            builder.WithDurableFlows<DocumentFlowStateStore>();
-        });
+            ConnectionString = database.ConnectionString + ";Default Timeout=10"
+        }));
 
-    [Fact]
-    public async Task KeyValueStore_RunsDurableFlowEndToEnd()
-        => await RunFlowWithStoreAsync(builder =>
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, 200),
+            new ParallelOptions { MaxDegreeOfParallelism = 8 },
+            async (i, _) =>
+            {
+                var flowId = $"flow-storm-{i}";
+                await store.SaveAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
+                Assert.NotNull(await store.LoadAsync(flowId));
+                Assert.True(await store.TryDeleteAsync(flowId));
+                Assert.Null(await store.LoadAsync(flowId));
+            });
+    }
+
+    [Theory]
+    [MemberData(nameof(PackageRegistrations))]
+    public void DurableFlowPackages_RegisterScopedFlowStateStore(
+        string packageName,
+        Type storeType,
+        Action<IServiceCollection, AsyncResponseRegistrationBuilder> configure)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+
+        var builder = services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport();
+        configure(services, builder);
+
+        using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        using var scope = provider.CreateScope();
+
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+        Assert.IsType(storeType, store);
+        Assert.NotNull(packageName);
+    }
+
+    public static TheoryData<string, Type, Action<IServiceCollection, AsyncResponseRegistrationBuilder>> PackageRegistrations()
+        => new()
         {
-            builder.Services.AddSingleton<IFlowStateKeyValueTable, InMemoryFlowStateKeyValueTable>();
-            builder.WithDurableFlows<KeyValueFlowStateStore>();
-        });
+            {
+                "AsyncResponse.DurableFlows.SqlServer",
+                typeof(SqlServerFlowStateStore),
+                (_, builder) => builder.WithSqlServerDurableFlows(options =>
+                {
+                    options.ConnectionString = "Server=localhost;Database=asyncresponse_tests;User ID=sa;Password=unused;TrustServerCertificate=True";
+                    options.AutoCreateSchema = false;
+                })
+            },
+            {
+                "AsyncResponse.DurableFlows.PostgreSQL",
+                typeof(PostgreSqlFlowStateStore),
+                (services, builder) =>
+                {
+                    services.AddSingleton(_ => NpgsqlDataSource.Create("Host=localhost;Username=postgres;Password=postgres;Database=asyncresponse_tests;Pooling=false"));
+                    builder.WithPostgreSqlDurableFlows(options => options.AutoCreateSchema = false);
+                }
+            },
+            {
+                "AsyncResponse.DurableFlows.MySql",
+                typeof(MySqlFlowStateStore),
+                (_, builder) => builder.WithMySqlDurableFlows(options =>
+                {
+                    options.ConnectionString = "Server=localhost;Database=asyncresponse_tests;User ID=root;Password=unused;";
+                    options.AutoCreateSchema = false;
+                })
+            },
+            {
+                "AsyncResponse.DurableFlows.Sqlite",
+                typeof(SqliteFlowStateStore),
+                (_, builder) => builder.WithSqliteDurableFlows(options =>
+                {
+                    options.ConnectionString = "Data Source=:memory:";
+                    options.AutoCreateSchema = false;
+                })
+            },
+            {
+                "AsyncResponse.DurableFlows.Oracle",
+                typeof(OracleFlowStateStore),
+                (_, builder) => builder.WithOracleDurableFlows(options =>
+                {
+                    options.ConnectionString = "User Id=asyncresponse;Password=unused;Data Source=localhost/XEPDB1";
+                    options.AutoCreateSchema = false;
+                })
+            },
+            {
+                "AsyncResponse.DurableFlows.MongoDB",
+                typeof(MongoDbFlowStateStore),
+                (_, builder) => builder.WithMongoDbDurableFlows(options =>
+                {
+                    options.ConnectionString = "mongodb://localhost:27017";
+                    options.DatabaseName = "asyncresponse_tests";
+                    options.AutoCreateIndexes = false;
+                })
+            },
+            {
+                "AsyncResponse.DurableFlows.Cosmos",
+                typeof(CosmosFlowStateStore),
+                (services, builder) =>
+                {
+                    services.AddSingleton(_ => new CosmosClient("https://localhost:8081/", Convert.ToBase64String(RandomNumberGenerator.GetBytes(64))));
+                    builder.WithCosmosDurableFlows(options =>
+                    {
+                        options.DatabaseName = "asyncresponse_tests";
+                        options.AutoCreateContainer = false;
+                    });
+                }
+            },
+            {
+                "AsyncResponse.DurableFlows.DynamoDB",
+                typeof(DynamoDbFlowStateStore),
+                (services, builder) =>
+                {
+                    services.AddSingleton(Mock.Of<IAmazonDynamoDB>());
+                    builder.WithDynamoDbDurableFlows(options => options.AutoCreateTable = false);
+                }
+            }
+        };
 
     private static async Task AssertStoreContractAsync(IFlowStateStore store)
     {
@@ -72,7 +189,7 @@ public sealed class DurableFlowStateStoreExampleTests
         Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(state.FlowId!))!.Status);
 
         await store.SaveAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1));
-        await Task.Delay(20);
+        await Task.Delay(30);
         Assert.Null(await store.LoadAsync("expired-flow"));
 
         Assert.True(await store.TryDeleteAsync(state.FlowId!));
@@ -138,254 +255,16 @@ public sealed class DurableFlowStateStoreExampleTests
             }
         };
 
-    private sealed class SqliteFlowStateDatabase : IAsyncDisposable
+    private sealed class TempSqliteDatabase : IAsyncDisposable
     {
-        private readonly string _path;
+        private readonly string _path = Path.Combine(Path.GetTempPath(), $"ar-flow-state-{Guid.NewGuid():N}.db");
 
-        private SqliteFlowStateDatabase(string path) => _path = path;
-
-        public static async Task<SqliteFlowStateDatabase> CreateAsync()
-        {
-            var database = new SqliteFlowStateDatabase(Path.Combine(Path.GetTempPath(), $"ar-flow-state-{Guid.NewGuid():N}.db"));
-            await using var connection = await database.OpenConnectionAsync();
-            await using var command = connection.CreateCommand();
-            command.CommandText = """
-                CREATE TABLE async_response_flow_state (
-                    flow_id TEXT NOT NULL PRIMARY KEY,
-                    state_json TEXT NOT NULL,
-                    expires_at_utc TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL
-                );
-
-                CREATE INDEX ix_async_response_flow_state_expires_at_utc
-                    ON async_response_flow_state (expires_at_utc);
-                """;
-            await command.ExecuteNonQueryAsync();
-            return database;
-        }
-
-        public async ValueTask<DbConnection> OpenConnectionAsync(CancellationToken cancellationToken = default)
-        {
-            var connection = new SqliteConnection($"Data Source={_path}");
-            await connection.OpenAsync(cancellationToken);
-            return connection;
-        }
+        public string ConnectionString => $"Data Source={_path}";
 
         public ValueTask DisposeAsync()
         {
             File.Delete(_path);
             return ValueTask.CompletedTask;
         }
-    }
-
-    private sealed class RelationalFlowStateStore(Func<CancellationToken, ValueTask<DbConnection>> openConnection) : IFlowStateStore
-    {
-        public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-            ArgumentNullException.ThrowIfNull(state);
-
-            var now = DateTime.UtcNow;
-            var json = JsonSerializer.Serialize(state);
-            var expires = now.Add(ttl);
-
-            await using var connection = await openConnection(cancellationToken);
-            var updated = await ExecuteAsync(
-                connection,
-                """
-                UPDATE async_response_flow_state
-                   SET state_json = @state_json,
-                       expires_at_utc = @expires_at_utc,
-                       updated_at_utc = @updated_at_utc
-                 WHERE flow_id = @flow_id
-                """,
-                cancellationToken,
-                ("flow_id", flowId),
-                ("state_json", json),
-                ("expires_at_utc", expires),
-                ("updated_at_utc", now));
-
-            if (updated != 0)
-                return;
-
-            await ExecuteAsync(
-                connection,
-                """
-                INSERT INTO async_response_flow_state
-                    (flow_id, state_json, expires_at_utc, updated_at_utc)
-                VALUES
-                    (@flow_id, @state_json, @expires_at_utc, @updated_at_utc)
-                """,
-                cancellationToken,
-                ("flow_id", flowId),
-                ("state_json", json),
-                ("expires_at_utc", expires),
-                ("updated_at_utc", now));
-        }
-
-        public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-
-            await using var connection = await openConnection(cancellationToken);
-            await using var command = CreateCommand(
-                connection,
-                """
-                SELECT state_json
-                  FROM async_response_flow_state
-                 WHERE flow_id = @flow_id
-                   AND expires_at_utc > @now_utc
-                """,
-                ("flow_id", flowId),
-                ("now_utc", DateTime.UtcNow));
-
-            var json = await command.ExecuteScalarAsync(cancellationToken) as string;
-            if (json is null)
-                return null;
-
-            var state = JsonSerializer.Deserialize<FlowState>(json);
-            return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
-        }
-
-        public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-
-            await using var connection = await openConnection(cancellationToken);
-            return await ExecuteAsync(
-                connection,
-                "DELETE FROM async_response_flow_state WHERE flow_id = @flow_id",
-                cancellationToken,
-                ("flow_id", flowId)) > 0;
-        }
-
-        private static async Task<int> ExecuteAsync(
-            DbConnection connection,
-            string sql,
-            CancellationToken cancellationToken,
-            params (string Name, object Value)[] parameters)
-        {
-            await using var command = CreateCommand(connection, sql, parameters);
-            return await command.ExecuteNonQueryAsync(cancellationToken);
-        }
-
-        private static DbCommand CreateCommand(
-            DbConnection connection,
-            string sql,
-            params (string Name, object Value)[] parameters)
-        {
-            var command = connection.CreateCommand();
-            command.CommandText = sql;
-            foreach (var (name, value) in parameters)
-            {
-                var parameter = command.CreateParameter();
-                parameter.ParameterName = "@" + name;
-                parameter.Value = value;
-                command.Parameters.Add(parameter);
-            }
-
-            return command;
-        }
-    }
-
-    private sealed record FlowStateDocument(
-        string FlowId,
-        string StateJson,
-        DateTime ExpiresAtUtc,
-        DateTime UpdatedAtUtc);
-
-    private interface IFlowStateDocuments
-    {
-        Task UpsertAsync(FlowStateDocument document, CancellationToken cancellationToken);
-        Task<FlowStateDocument?> FindAsync(string flowId, DateTime nowUtc, CancellationToken cancellationToken);
-        Task<bool> DeleteAsync(string flowId, CancellationToken cancellationToken);
-    }
-
-    private sealed class DocumentFlowStateStore(IFlowStateDocuments documents) : IFlowStateStore
-    {
-        public Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-        {
-            var now = DateTime.UtcNow;
-            return documents.UpsertAsync(
-                new FlowStateDocument(flowId, JsonSerializer.Serialize(state), now.Add(ttl), now),
-                cancellationToken);
-        }
-
-        public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-        {
-            var document = await documents.FindAsync(flowId, DateTime.UtcNow, cancellationToken);
-            if (document is null)
-                return null;
-
-            var state = JsonSerializer.Deserialize<FlowState>(document.StateJson);
-            return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
-        }
-
-        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
-            => documents.DeleteAsync(flowId, cancellationToken);
-    }
-
-    private sealed class InMemoryFlowStateDocuments : IFlowStateDocuments
-    {
-        private readonly Dictionary<string, FlowStateDocument> _documents = new(StringComparer.Ordinal);
-
-        public Task UpsertAsync(FlowStateDocument document, CancellationToken cancellationToken)
-        {
-            _documents[document.FlowId] = document;
-            return Task.CompletedTask;
-        }
-
-        public Task<FlowStateDocument?> FindAsync(string flowId, DateTime nowUtc, CancellationToken cancellationToken)
-            => Task.FromResult(_documents.TryGetValue(flowId, out var document) && document.ExpiresAtUtc > nowUtc
-                ? document
-                : null);
-
-        public Task<bool> DeleteAsync(string flowId, CancellationToken cancellationToken)
-            => Task.FromResult(_documents.Remove(flowId));
-    }
-
-    private interface IFlowStateKeyValueTable
-    {
-        Task PutAsync(string key, string json, DateTime expiresAtUtc, CancellationToken cancellationToken);
-        Task<(string Json, DateTime ExpiresAtUtc)?> GetAsync(string key, DateTime nowUtc, CancellationToken cancellationToken);
-        Task<bool> DeleteAsync(string key, CancellationToken cancellationToken);
-    }
-
-    private sealed class KeyValueFlowStateStore(IFlowStateKeyValueTable table) : IFlowStateStore
-    {
-        public Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-            => table.PutAsync(flowId, JsonSerializer.Serialize(state), DateTime.UtcNow.Add(ttl), cancellationToken);
-
-        public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-        {
-            var item = await table.GetAsync(flowId, DateTime.UtcNow, cancellationToken);
-            if (item is null)
-                return null;
-
-            var state = JsonSerializer.Deserialize<FlowState>(item.Value.Json);
-            return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
-        }
-
-        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
-            => table.DeleteAsync(flowId, cancellationToken);
-    }
-
-    private sealed class InMemoryFlowStateKeyValueTable : IFlowStateKeyValueTable
-    {
-        private readonly Dictionary<string, (string Json, DateTime ExpiresAtUtc)> _items = new(StringComparer.Ordinal);
-
-        public Task PutAsync(string key, string json, DateTime expiresAtUtc, CancellationToken cancellationToken)
-        {
-            _items[key] = (json, expiresAtUtc);
-            return Task.CompletedTask;
-        }
-
-        public Task<(string Json, DateTime ExpiresAtUtc)?> GetAsync(string key, DateTime nowUtc, CancellationToken cancellationToken)
-            => Task.FromResult(_items.TryGetValue(key, out var item) && item.ExpiresAtUtc > nowUtc
-                ? item
-                : ((string Json, DateTime ExpiresAtUtc)?)null);
-
-        public Task<bool> DeleteAsync(string key, CancellationToken cancellationToken)
-            => Task.FromResult(_items.Remove(key));
     }
 }

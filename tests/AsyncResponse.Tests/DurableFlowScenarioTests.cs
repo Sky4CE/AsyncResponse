@@ -283,7 +283,7 @@ public class DurableFlowScenarioTests
 
         // The memoized stamp and the value bag agree.
         Assert.Contains("stamp-", state.Values!["final-stamp"]);
-        Assert.Contains("stamp-", state.Steps["compute-final-stamp"].ResultJson);
+        Assert.Contains("stamp-", state.Steps!["compute-final-stamp"].ResultJson!);
     }
 
     [Fact]

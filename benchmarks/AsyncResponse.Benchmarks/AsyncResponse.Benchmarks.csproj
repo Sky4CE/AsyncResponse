@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />

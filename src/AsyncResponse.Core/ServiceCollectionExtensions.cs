@@ -50,7 +50,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
 
         // Durable flows (the checkpointed-flow pattern as a first-class API). Flow state rides in
         // the configured channel's recovery store by default for tests/dev/migration. Production
-        // apps should call WithDurableFlows<TStore>() to keep state in app-owned durable storage.
+        // apps should use a DurableFlows.* package or call WithCustomDurableFlows<TStore>() to keep
+        // state in app-owned durable storage.
         services.TryAddSingleton<IFlowStateStore>(provider => new RecoveryBackedFlowStateStore(
             provider.GetRequiredService<IRecoveryStateStore>(),
             provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RecoveryBackedFlowStateStore>>()));
@@ -62,12 +63,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
             provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
             provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
-        services.TryAddSingleton<IDurableFlows>(provider => new DurableFlows(
+        services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
             provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlows>>()));
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowService>>()));
 
         return new AsyncResponseRegistrationBuilder(services);
     }
@@ -77,7 +78,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// flows: keep run ledgers in your database/document store instead of the channel recovery
     /// cache used by the default dev/test store.
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore>(this AsyncResponseRegistrationBuilder builder)
+    public static AsyncResponseRegistrationBuilder WithCustomDurableFlows<TFlowStateStore>(this AsyncResponseRegistrationBuilder builder)
         where TFlowStateStore : class, IFlowStateStore
     {
         builder.Services.AddScoped<IFlowStateStore, TFlowStateStore>();

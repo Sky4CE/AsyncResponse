@@ -139,13 +139,31 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
 - **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
   pick up the changes on resume. Hotfix a bug and resume — no replay rules, no version patching.
 - **Storage is explicit when it matters** — the default flow-state store rides in your channel's
-  recovery store for tests/dev/migration; production flows should use
-  `.WithDurableFlows<MyFlowStateStore>()` to keep run ledgers in app-owned durable storage.
+  recovery store for tests/dev/migration; production flows should use an
+  `AsyncResponse.DurableFlows.*` package such as `.WithSqlServerDurableFlows(...)`, or
+  `.WithCustomDurableFlows<MyFlowStateStore>()` when your storage model is custom.
 - **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
   integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
 
 The full guide — rules, failure modes, compensation, testing your flows, and app-owned state
 stores — is [docs/durable-flows.md](docs/durable-flows.md).
+
+**Durable-flow state stores** (`AsyncResponse.DurableFlows.*`) — optional but recommended for
+production durable flows:
+
+| Store package | Registration |
+|---|---|
+| SQL Server | `.WithSqlServerDurableFlows(...)` |
+| PostgreSQL | `.WithPostgreSqlDurableFlows(...)` |
+| MySQL / MariaDB | `.WithMySqlDurableFlows(...)` |
+| SQLite | `.WithSqliteDurableFlows(...)` |
+| Oracle | `.WithOracleDurableFlows(...)` |
+| MongoDB | `.WithMongoDbDurableFlows(...)` |
+| Azure Cosmos DB | `.WithCosmosDurableFlows(...)` |
+| DynamoDB | `.WithDynamoDbDurableFlows(...)` |
+
+See [durable-flow state stores](docs/durable-flow-state-stores.md) for options, schema ownership,
+and custom `IFlowStateStore` examples.
 
 ## Pick your channel and transport
 

@@ -1461,88 +1461,98 @@ internal static class StressRunner
     //     are checkpointing bugs.
     private static async Task<int> DurableFlowStorm(int concurrency, int count)
     {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"ar-stress-flow-state-{Guid.NewGuid():N}.db");
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton<FlowStormRig>();
         services.AddScoped<StressFlow>();
         services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
             .WithInMemoryChannel()
-            .WithInMemoryTransport();
+            .WithInMemoryTransport()
+            .WithSqliteDurableFlows(options => options.ConnectionString = $"Data Source={databasePath}");
+
         using var provider = services.BuildServiceProvider();
-
-        var flows = provider.GetRequiredService<IDurableFlows>();
-        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
-        var rig = provider.GetRequiredService<FlowStormRig>();
-        rig.Prepare.Reset(count);
-        rig.Transform.Reset(count);
-        rig.Finalize.Reset(count);
-
-        var hosted = provider.GetServices<IHostedService>().ToArray();
-        foreach (var hostedService in hosted)
-            await hostedService.StartAsync(CancellationToken.None);
-
-        using var responderCts = new CancellationTokenSource();
-        var responders = Enumerable.Range(0, Math.Max(2, Environment.ProcessorCount / 2)).Select(_ => Task.Run(async () =>
-        {
-            await foreach (var correlationId in rig.Triggers.ReadAllAsync(responderCts.Token))
-            {
-                await publisher.SetResponse(new FlowStormPayload { Done = false }, correlationId); // progress
-                await publisher.SetResponse(new FlowStormPayload { Done = true }, correlationId);  // terminal
-            }
-        })).ToArray();
 
         try
         {
-            var allocBefore = GC.GetTotalAllocatedBytes();
-            var sw = Stopwatch.StartNew();
+            var flows = provider.GetRequiredService<IDurableFlows>();
+            var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+            var rig = provider.GetRequiredService<FlowStormRig>();
+            rig.Prepare.Reset(count);
+            rig.Transform.Reset(count);
+            rig.Finalize.Reset(count);
 
-            var flowIds = new string[count];
-            await ForEachAsync(count, concurrency, async i =>
-                flowIds[i] = await flows.StartAsync<StressFlow, FlowStormInput>(new FlowStormInput(i)));
-            var drained = await rig.Finalize.WaitAllAsync(TimeSpan.FromSeconds(240));
+            var hosted = provider.GetServices<IHostedService>().ToArray();
+            foreach (var hostedService in hosted)
+                await hostedService.StartAsync(CancellationToken.None);
 
-            sw.Stop();
-            var alloc = GC.GetTotalAllocatedBytes() - allocBefore;
-
-            // Finalize-step execution is necessary but not sufficient — sweep the terminal states.
-            var notSucceeded = 0;
-            for (var i = 0; i < count; i++)
+            using var responderCts = new CancellationTokenSource();
+            var responders = Enumerable.Range(0, Math.Max(2, Environment.ProcessorCount / 2)).Select(_ => Task.Run(async () =>
             {
-                var state = flowIds[i] is null ? null : await flows.GetStateAsync(flowIds[i]);
-                if (state?.Status != FlowRunStatus.Succeeded)
-                    notSucceeded++;
+                await foreach (var correlationId in rig.Triggers.ReadAllAsync(responderCts.Token))
+                {
+                    await publisher.SetResponse(new FlowStormPayload { Done = false }, correlationId); // progress
+                    await publisher.SetResponse(new FlowStormPayload { Done = true }, correlationId);  // terminal
+                }
+            })).ToArray();
+
+            try
+            {
+                var allocBefore = GC.GetTotalAllocatedBytes();
+                var sw = Stopwatch.StartNew();
+
+                var flowIds = new string[count];
+                await ForEachAsync(count, concurrency, async i =>
+                    flowIds[i] = await flows.StartAsync<StressFlow, FlowStormInput>(new FlowStormInput(i)));
+                var drained = await rig.Finalize.WaitAllAsync(TimeSpan.FromSeconds(240));
+
+                sw.Stop();
+                var alloc = GC.GetTotalAllocatedBytes() - allocBefore;
+
+                // Finalize-step execution is necessary but not sufficient — sweep the terminal states.
+                var notSucceeded = 0;
+                for (var i = 0; i < count; i++)
+                {
+                    var state = flowIds[i] is null ? null : await flows.GetStateAsync(flowIds[i]);
+                    if (state?.Status != FlowRunStatus.Succeeded)
+                        notSucceeded++;
+                }
+
+                var duplicates = rig.Prepare.Duplicates + rig.Transform.Duplicates + rig.Finalize.Duplicates;
+
+                Console.WriteLine("  durable-flow-storm (SQLite durable-flow state store, 5-step checkpointed flows, exactly-once steps)");
+                Console.WriteLine($"    flows={count:N0}  elapsed={sw.Elapsed.TotalMilliseconds:N0}ms  throughput={count / sw.Elapsed.TotalSeconds:N0} flows/s");
+                Console.WriteLine($"    finalized={rig.Finalize.Executed:N0}  duplicates={duplicates}  notSucceeded={notSucceeded}  alloc={alloc / 1024.0 / 1024.0:N1}MB ({alloc / (double)count:N0} B/flow)");
+
+                Series.Add(new GhMetric("durable-flow-storm throughput", "flows/s", count / sw.Elapsed.TotalSeconds, BiggerIsBetter: true));
+                Series.Add(new GhMetric("durable-flow-storm allocations", "B/flow", alloc / (double)count, BiggerIsBetter: false));
+
+                return Check("durable-flow-storm",
+                    ("notDrained", drained ? 0 : 1),
+                    ("missingPrepare", count - rig.Prepare.Executed),
+                    ("missingTransform", count - rig.Transform.Executed),
+                    ("missingFinalize", count - rig.Finalize.Executed),
+                    ("duplicates", duplicates),
+                    ("notSucceeded", notSucceeded));
             }
+            finally
+            {
+                responderCts.Cancel();
+                try
+                {
+                    await Task.WhenAll(responders);
+                }
+                catch (OperationCanceledException)
+                {
+                }
 
-            var duplicates = rig.Prepare.Duplicates + rig.Transform.Duplicates + rig.Finalize.Duplicates;
-
-            Console.WriteLine("  durable-flow-storm (5-step checkpointed flows, exactly-once steps)");
-            Console.WriteLine($"    flows={count:N0}  elapsed={sw.Elapsed.TotalMilliseconds:N0}ms  throughput={count / sw.Elapsed.TotalSeconds:N0} flows/s");
-            Console.WriteLine($"    finalized={rig.Finalize.Executed:N0}  duplicates={duplicates}  notSucceeded={notSucceeded}  alloc={alloc / 1024.0 / 1024.0:N1}MB ({alloc / (double)count:N0} B/flow)");
-
-            Series.Add(new GhMetric("durable-flow-storm throughput", "flows/s", count / sw.Elapsed.TotalSeconds, BiggerIsBetter: true));
-            Series.Add(new GhMetric("durable-flow-storm allocations", "B/flow", alloc / (double)count, BiggerIsBetter: false));
-
-            return Check("durable-flow-storm",
-                ("notDrained", drained ? 0 : 1),
-                ("missingPrepare", count - rig.Prepare.Executed),
-                ("missingTransform", count - rig.Transform.Executed),
-                ("missingFinalize", count - rig.Finalize.Executed),
-                ("duplicates", duplicates),
-                ("notSucceeded", notSucceeded));
+                foreach (var hostedService in hosted)
+                    await hostedService.StopAsync(CancellationToken.None);
+            }
         }
         finally
         {
-            responderCts.Cancel();
-            try
-            {
-                await Task.WhenAll(responders);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-
-            foreach (var hostedService in hosted)
-                await hostedService.StopAsync(CancellationToken.None);
+            File.Delete(databasePath);
         }
     }
 

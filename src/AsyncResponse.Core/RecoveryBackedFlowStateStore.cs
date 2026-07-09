@@ -7,7 +7,8 @@ namespace AsyncResponse;
 /// <summary>
 /// Default <see cref="IFlowStateStore"/>: persists flow state through the configured channel's
 /// <see cref="IRecoveryStateStore"/>. Useful for tests, development, and migration, but production
-/// durable flows should use application-owned storage via <c>WithDurableFlows&lt;TStore&gt;()</c>.
+/// durable flows should use a DurableFlows.* package or application-owned storage via
+/// <c>WithCustomDurableFlows&lt;TStore&gt;()</c>.
 /// <para>
 /// Each flow run is stored as one recovery entry under the flow id, with a fixed registration id
 /// (every save replaces the previous checkpoint — the per-registration replace semantics all
@@ -104,7 +105,7 @@ internal sealed class RecoveryBackedFlowStateStore : IFlowStateStore
             return;
 
         _logger.LogWarning(
-            "Durable flows are using the default RecoveryBackedFlowStateStore. It stores flow state in the configured channel recovery store with idle TTL {StateTtl}. This is useful for tests, development, and migration, but production flows should use app-owned durable storage via AddAsyncResponse().WithDurableFlows<TFlowStateStore>().",
+            "Durable flows are using the default RecoveryBackedFlowStateStore. It stores flow state in the configured channel recovery store with idle TTL {StateTtl}. This is useful for tests, development, and migration, but production flows should use an AsyncResponse.DurableFlows.* package or app-owned durable storage via AddAsyncResponse().WithCustomDurableFlows<TFlowStateStore>().",
             ttl);
     }
 }

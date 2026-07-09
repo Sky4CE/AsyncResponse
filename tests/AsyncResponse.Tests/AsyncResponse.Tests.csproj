@@ -40,6 +40,14 @@
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Channels.SqlServer\AsyncResponse.Channels.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.Cosmos\AsyncResponse.DurableFlows.Cosmos.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.DynamoDB\AsyncResponse.DurableFlows.DynamoDB.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.MongoDB\AsyncResponse.DurableFlows.MongoDB.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.MySql\AsyncResponse.DurableFlows.MySql.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.Oracle\AsyncResponse.DurableFlows.Oracle.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.PostgreSQL\AsyncResponse.DurableFlows.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.SqlServer\AsyncResponse.DurableFlows.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
     <ProjectReference Include="..\..\src\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />

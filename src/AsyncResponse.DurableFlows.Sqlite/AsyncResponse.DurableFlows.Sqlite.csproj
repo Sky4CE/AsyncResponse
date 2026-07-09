@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.DurableFlows.Sqlite</PackageId>
+    <Description>SQLite durable-flow state store for AsyncResponse. Persists durable-flow ledgers in an application-owned SQLite table instead of the response-channel recovery cache.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\AsyncResponse.DurableFlows.Shared\DurableFlowStoreShared.cs" Link="DurableFlowStoreShared.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Tests" />
+    <InternalsVisibleTo Include="AsyncResponse.IntegrationTests" />
+    <InternalsVisibleTo Include="AsyncResponse.Benchmarks" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.9" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
+  </ItemGroup>
+
+</Project>

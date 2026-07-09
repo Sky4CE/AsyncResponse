@@ -123,7 +123,7 @@ public class DurableFlowTests
     }
 
     [Fact]
-    public async Task WithDurableFlows_UsesScopedCustomStore()
+    public async Task WithCustomDurableFlows_UsesScopedCustomStore()
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
@@ -131,7 +131,7 @@ public class DurableFlowTests
         services.AddAsyncResponse()
             .WithInMemoryChannel()
             .WithInMemoryTransport()
-            .WithDurableFlows<ScopedNullFlowStateStore>();
+            .WithCustomDurableFlows<ScopedNullFlowStateStore>();
 
         await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
 
@@ -372,7 +372,7 @@ public class DurableFlowTests
 
         Assert.Single(logger.Entries, entry =>
             entry.Level == LogLevel.Warning &&
-            entry.Message.Contains("WithDurableFlows", StringComparison.Ordinal));
+            entry.Message.Contains("WithCustomDurableFlows", StringComparison.Ordinal));
     }
 
     [Fact]

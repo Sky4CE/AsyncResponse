@@ -38,9 +38,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient PostgreSqlClient { get; private set; } = null!;
     public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
     public string PostgreSqlConnectionString { get; private set; } = null!;
+    public string MySqlConnectionString { get; private set; } = null!;
+    public string MongoDbConnectionString { get; private set; } = null!;
     public HttpClient SqlServerClient { get; private set; } = null!;
     public HttpClient SqlServerEarlyAckClient { get; private set; } = null!;
     public string SqlServerConnectionString { get; private set; } = null!;
+    public string LocalStackServiceUrl { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
@@ -129,6 +132,13 @@ public sealed class IntegrationFixture : IAsyncLifetime
             $"Host={postgresEndpoint.Host};Port={postgresEndpoint.Port};Username=postgres;Password=postgres;Database=asyncresponse;" +
             "Maximum Pool Size=40;No Reset On Close=true;Max Auto Prepare=20";
 
+        var mysqlEndpoint = _app.GetEndpoint("mysql", "mysql");
+        MySqlConnectionString =
+            $"Server={mysqlEndpoint.Host};Port={mysqlEndpoint.Port};User ID=root;Password=mysql;Database=asyncresponse;Connection Timeout=30;";
+
+        var mongoDbEndpoint = _app.GetEndpoint("mongodb", "mongodb");
+        MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}";
+
         // The SUT apps have already provisioned the asyncresponse database by the time they report
         // healthy, so direct tests can connect straight to it.
         var sqlServerEndpoint = _app.GetEndpoint("sqlserver", "sqlserver");
@@ -138,6 +148,9 @@ public sealed class IntegrationFixture : IAsyncLifetime
         SqlServerConnectionString =
             $"Server={sqlServerEndpoint.Host},{sqlServerEndpoint.Port};User ID=sa;Password={sqlServerPassword};" +
             "Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=40";
+
+        var localStackEndpoint = _app.GetEndpoint("localstack", "edge");
+        LocalStackServiceUrl = $"http://{localStackEndpoint.Host}:{localStackEndpoint.Port}";
 
         await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
