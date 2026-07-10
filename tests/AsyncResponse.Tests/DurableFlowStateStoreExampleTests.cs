@@ -8,6 +8,7 @@ using AsyncResponse.DurableFlows.PostgreSQL;
 using AsyncResponse.DurableFlows.Sqlite;
 using AsyncResponse.DurableFlows.SqlServer;
 using Microsoft.Azure.Cosmos;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -66,9 +67,34 @@ public sealed class DurableFlowStateStoreExampleTests
             });
     }
 
+    [Fact]
+    public async Task SqlitePackageStore_PhysicallyPrunesExpiredRows()
+    {
+        await using var database = new TempSqliteDatabase();
+        var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
+        {
+            ConnectionString = database.ConnectionString,
+            PruneInterval = TimeSpan.Zero // prune on every save
+        }));
+
+        await store.SaveAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1));
+        await Task.Delay(30);
+        await store.SaveAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5));
+
+        // Regression guard: expired rows must be physically deleted by the opportunistic prune,
+        // not merely filtered out on load — otherwise the table grows forever.
+        await using var connection = new SqliteConnection(database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"asyncresponse_flow_state\" WHERE flow_id = 'expired-flow';";
+        Assert.Equal(0L, (long)(await command.ExecuteScalarAsync())!);
+
+        Assert.NotNull(await store.LoadAsync("live-flow"));
+    }
+
     [Theory]
     [MemberData(nameof(PackageRegistrations))]
-    public void DurableFlowPackages_RegisterScopedFlowStateStore(
+    public async Task DurableFlowPackages_RegisterSingletonFlowStateStore(
         string packageName,
         Type storeType,
         Action<IServiceCollection, AsyncResponseRegistrationBuilder> configure)
@@ -81,12 +107,19 @@ public sealed class DurableFlowStateStoreExampleTests
             .WithInMemoryTransport();
         configure(services, builder);
 
-        using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
         using var scope = provider.CreateScope();
+        using var otherScope = provider.CreateScope();
 
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
         Assert.IsType(storeType, store);
         Assert.NotNull(packageName);
+
+        // Regression guard: package stores must be process-wide singletons. The executor resolves
+        // the store from a fresh scope per flow execution, so a scoped store would re-run schema
+        // provisioning (DDL / Cosmos metadata / DynamoDB control-plane calls) on every single run.
+        Assert.Same(store, otherScope.ServiceProvider.GetRequiredService<IFlowStateStore>());
+        Assert.Same(store, scope.ServiceProvider.GetRequiredService(storeType));
     }
 
     public static TheoryData<string, Type, Action<IServiceCollection, AsyncResponseRegistrationBuilder>> PackageRegistrations()

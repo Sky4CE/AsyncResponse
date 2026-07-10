@@ -81,3 +81,37 @@ public sealed class SampleProvisioningFlow(
         });
     }
 }
+
+/// <summary>Input for the parent/child durable-flow demo (persisted with the flow state).</summary>
+public sealed record OnboardingFlowInput(string Tenant);
+
+/// <summary>
+/// Child durable flow for the composition demo: a single checkpointed step, running as its own
+/// flow with its own ledger, started and awaited by <see cref="SampleOnboardingFlow"/>.
+/// </summary>
+public sealed class SampleSeedDataFlow : IDurableFlow<string>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, string tenant)
+    {
+        await flow.StepAsync("seed", () => Task.FromResult($"seeded-{tenant}"));
+    }
+}
+
+/// <summary>
+/// Parent flow for the child-flow demo: a local step, then
+/// <see cref="IDurableFlowContext.AwaitChildFlowAsync{TFlow, TInput}"/> starts
+/// <see cref="SampleSeedDataFlow"/> (child id defaults to <c>{FlowId}:seed-data</c>) and suspends
+/// this run — the worker is released — until the child reaches a terminal state. The child's
+/// <see cref="FlowState"/> snapshot is memoized as the step result.
+/// </summary>
+public sealed class SampleOnboardingFlow : IDurableFlow<OnboardingFlowInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, OnboardingFlowInput input)
+    {
+        var tenant = await flow.StepAsync("register-tenant", () => Task.FromResult(input.Tenant));
+
+        var child = await flow.AwaitChildFlowAsync<SampleSeedDataFlow, string>("seed-data", tenant);
+
+        await flow.SetValueAsync("seed-status", child.Status.ToString());
+    }
+}

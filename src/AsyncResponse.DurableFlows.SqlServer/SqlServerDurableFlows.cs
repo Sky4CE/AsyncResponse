@@ -19,7 +19,10 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddScoped<SqlServerFlowStateStore>();
+            // Singleton on purpose: schema provisioning is cached per store instance, and the
+            // executor resolves the store from a fresh scope per flow execution — a scoped store
+            // would re-run EnsureCreated's DDL round-trip on every run.
+            builder.Services.TryAddSingleton<SqlServerFlowStateStore>();
             return builder.WithCustomDurableFlows<SqlServerFlowStateStore>();
         }
     }
@@ -42,6 +45,13 @@ public sealed class SqlServerDurableFlowOptions
     /// <summary>Creates the schema, table, and expiry index on first use.</summary>
     public bool AutoCreateSchema { get; set; } = true;
 
+    /// <summary>
+    /// How often <see cref="SqlServerFlowStateStore.SaveAsync"/> opportunistically deletes expired
+    /// rows (loads already treat expired state as absent; pruning bounds table growth). Zero or
+    /// negative prunes on every save. Default: 5 minutes.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -58,6 +68,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 {
     private readonly SqlServerDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private long _lastPruneTicks;
     private bool _created;
 
     public SqlServerFlowStateStore(IOptions<SqlServerDurableFlowOptions> options)
@@ -70,6 +81,8 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -121,6 +134,15 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
+    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= @now_utc;";
+        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
         if (_created || !_options.AutoCreateSchema)
@@ -133,7 +155,33 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
+            // Serialize schema creation across processes. The IF-NOT-EXISTS guards are not atomic
+            // against a concurrent create of the same object (catalog errors 2714/2627). The
+            // transaction-scoped application lock (keyed by schema, shared with the channel/transport
+            // packages) lets one instance build the schema while the rest wait and then find it
+            // already present.
+            await using (var lockCommand = connection.CreateCommand())
+            {
+                lockCommand.Transaction = transaction;
+                lockCommand.CommandText =
+                    """
+                    DECLARE @lock_result int;
+                    EXEC @lock_result = sp_getapplock
+                        @Resource = @lock_resource,
+                        @LockMode = 'Exclusive',
+                        @LockOwner = 'Transaction',
+                        @LockTimeout = 60000;
+                    IF @lock_result < 0
+                        THROW 51000, N'Failed to acquire the AsyncResponse DDL application lock.', 1;
+                    """;
+                lockCommand.Parameters.AddWithValue("@lock_resource", DurableFlowStoreShared.SchemaLockResource(_options.SchemaName));
+                await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText =
                 $"""
                 IF SCHEMA_ID(N'{_options.SchemaName}') IS NULL
@@ -151,6 +199,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                     CREATE INDEX {Quote(IndexName)} ON {Table} (expires_at_utc);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally

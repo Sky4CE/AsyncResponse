@@ -203,10 +203,11 @@ against host shutdown, and post-ACK failures surfaced through `OnBackgroundFailu
 semantics: [docs/configuration.md](docs/configuration.md).
 
 **Redis-compatible servers.** The Redis channel and transport speak RESP through
-`StackExchange.Redis`, so they run unchanged on Redis-compatible servers. **Valkey** and
-**Dragonfly** are validated end-to-end as both channel and transport; **Garnet** implements the
-pub/sub + string + `SCAN` surface the channel needs but has no stream commands, so it works as a
-channel but not as this transport. That covers the managed options too — Amazon ElastiCache /
+`StackExchange.Redis`, so they run unchanged on Redis-compatible servers. **Valkey** is validated
+end-to-end as both channel and transport, rechecked by a weekly CI matrix; **Dragonfly** is
+validated as both against a live server (its container entrypoint differs from the redis image, so
+it runs outside the Aspire CI harness); **Garnet** implements the pub/sub + string + `SCAN` surface
+the channel needs but has no stream commands, so it works as a channel but not as this transport. That covers the managed options too — Amazon ElastiCache /
 MemoryDB and Azure Managed Redis. Details in [docs/configuration.md](docs/configuration.md#redis-compatible-servers).
 
 `AsyncResponse.Abstractions` holds contracts only — reference it from class libraries that define
@@ -512,6 +513,9 @@ per-commit trends with regression alerting are published to the
   AsyncResponse coexists with it happily.
 
 ## Documentation
+
+Looking for something specific? The **[docs index](docs/README.md)** maps "I want to…" tasks to
+the right page. The pages:
 
 - **[Configuration](docs/configuration.md)** — `AddAsyncResponse` wiring and a consolidated options
   reference (engine, channel, and transport options).

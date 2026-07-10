@@ -127,4 +127,47 @@ public class WireContractSerializationTests
         Assert.Equal("child-step", restored.ParentStepName);
         Assert.Equal("child", restored.Steps!["local"].ChildFlowId);
     }
+
+    [Fact]
+    public void FlowState_PinnedLegacyPayload_WithoutChildFlowFields_Deserializes()
+    {
+        // Pinned raw v1 ledger JSON written BEFORE child flows existed (no ParentFlowId /
+        // ParentStepName / ChildFlowId). This literal must keep deserializing forever — it guards
+        // against anyone making the child-flow fields required or giving them throwing setters.
+        const string legacyJson =
+            """
+            {
+              "SchemaVersion": 1,
+              "FlowId": "legacy-1",
+              "FlowTypeName": "Flow",
+              "InputTypeName": "Input",
+              "InputJson": "{}",
+              "Status": 0,
+              "Attempts": 2,
+              "LastMessage": "Step 'remote-op' completed.",
+              "CreatedAtUtc": "2026-05-01T08:00:00Z",
+              "UpdatedAtUtc": "2026-05-01T08:00:05Z",
+              "Steps": {
+                "remote-op": {
+                  "Completed": true,
+                  "ResultJson": "{\"Status\":2}",
+                  "CompletedAtUtc": "2026-05-01T08:00:05Z"
+                }
+              },
+              "Values": { "tenant": "7" }
+            }
+            """;
+
+        var state = JsonSerializer.Deserialize<FlowState>(legacyJson);
+
+        Assert.NotNull(state);
+        Assert.Equal("legacy-1", state!.FlowId);
+        Assert.Equal(FlowRunStatus.Running, state.Status);
+        Assert.Equal(2, state.Attempts);
+        Assert.True(state.Steps!["remote-op"].Completed);
+        Assert.Equal("7", state.Values!["tenant"]);
+        Assert.Null(state.ParentFlowId);
+        Assert.Null(state.ParentStepName);
+        Assert.Null(state.Steps["remote-op"].ChildFlowId);
+    }
 }

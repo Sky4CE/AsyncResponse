@@ -41,6 +41,12 @@ internal sealed class AsyncResponseActivityCollector : IDisposable
             return Assert.Single(_activities, activity => activity.OperationName == name && Equals(Tag(activity, tagKey), tagValue));
     }
 
+    public int Count(string name)
+    {
+        lock (_gate)
+            return _activities.Count(activity => activity.OperationName == name);
+    }
+
     public static object? Tag(Activity activity, string key)
         => activity.TagObjects.FirstOrDefault(tag => tag.Key == key).Value;
 

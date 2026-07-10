@@ -468,12 +468,27 @@ asyncResponse
     .WithContextPropagator<SampleTracePropagator>()
     .WithContextPropagator<SampleTenantPropagator>();
 
+// Durable-flow state store (opt-in). By default durable flows checkpoint through the channel's
+// recovery store — fine for dev/test, but production flows should use a DurableFlows.* package.
+// Set AsyncResponse:DurableFlowStore=sqlite (or the ASYNCRESPONSE_SAMPLE_DURABLE_STORE env var) to
+// persist flow ledgers with the AsyncResponse.DurableFlows.Sqlite package instead: flow state then
+// survives restarts independently of the channel.
+var durableFlowStore = builder.Configuration["AsyncResponse:DurableFlowStore"]
+    ?? Environment.GetEnvironmentVariable("ASYNCRESPONSE_SAMPLE_DURABLE_STORE");
+if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase))
+{
+    var flowDatabasePath = Path.Combine(Path.GetTempPath(), "asyncresponse-sample-flow-state.db");
+    asyncResponse.WithSqliteDurableFlows(options => options.ConnectionString = $"Data Source={flowDatabasePath}");
+}
+
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 
 builder.Services.AddSingleton<FlowRecorder>();
 builder.Services.AddSingleton<ISampleFlowService, SampleFlowService>();
 builder.Services.AddSingleton<RemoteWorkSimulator>();
 builder.Services.AddScoped<SampleProvisioningFlow>(); // durable flow: resolved by type name on execute/resume
+builder.Services.AddScoped<SampleOnboardingFlow>();   // parent durable flow for the child-flow demo
+builder.Services.AddScoped<SampleSeedDataFlow>();     // child durable flow awaited by SampleOnboardingFlow
 
 var app = builder.Build();
 app.Logger.LogInformation("AsyncResponse sample started: channel={Channel}, transport={Transport}.", channel, transport);
@@ -1489,6 +1504,19 @@ app.MapPost("/durable-flow/{flowId}/resume", async (IDurableFlows flows, string 
 {
     await flows.ResumeAsync(flowId);
     return Results.Ok();
+})
+.WithTags("Flows");
+
+// 2b-child) Flow composition: the parent runs a local step, then AwaitChildFlowAsync starts a
+//     child durable flow and suspends the parent (worker released) until the child reaches a
+//     terminal state. Observe both runs via GET /durable-flow/{flowId} — the child id defaults
+//     to {parentId}:seed-data.
+app.MapPost("/durable-flow-child", async (IDurableFlows flows, string? tenant, string? flowId) =>
+{
+    var id = await flows.StartAsync<SampleOnboardingFlow, OnboardingFlowInput>(
+        new OnboardingFlowInput(tenant ?? "acme"),
+        flowId);
+    return Results.Ok(new StartFlowResult(id));
 })
 .WithTags("Flows");
 

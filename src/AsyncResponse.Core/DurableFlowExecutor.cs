@@ -102,7 +102,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             var suspended = await InvokeFlowAsync(scope.ServiceProvider, store, state).ConfigureAwait(false);
             if (suspended)
             {
-                await SaveAsync(store, state).ConfigureAwait(false);
+                // The context persisted the suspended state BEFORE enqueueing the child; saving here
+                // could overwrite newer checkpoints written by a parent re-execution the child has
+                // already triggered on another worker.
                 _logger.LogInformation("Durable flow {FlowId} suspended: {Message}", flowId, state.LastMessage);
                 return;
             }
@@ -115,9 +117,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         }
         catch (DurableFlowSuspendedException ex)
         {
-            state.LastMessage = ex.Message;
-            await SaveAsync(store, state).ConfigureAwait(false);
-
+            // Same as the IsSuspended return above: the suspended state is already persisted, and a
+            // save here races the child-triggered parent re-execution.
             _logger.LogInformation("Durable flow {FlowId} suspended: {Message}", flowId, ex.Message);
             return;
         }

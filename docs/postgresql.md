@@ -1,4 +1,4 @@
-# PostgreSQL Channel And Transport
+# PostgreSQL channel and transport
 
 [← Back to README](../README.md)
 
@@ -8,7 +8,7 @@ They are separate NuGet packages because apps often want only one side: for exam
 recovery but an external broker for worker dispatch, or Redis/NATS for responses but PostgreSQL for a
 simple durable worker queue.
 
-## Channel Architecture
+## Channel architecture
 
 The channel keeps large payloads out of `NOTIFY`. Publishing writes the serialized response envelope
 to `asyncresponse_channel_messages`, then sends a notification whose payload is only the correlation
@@ -28,7 +28,7 @@ exist, the publisher inserts a message row and waits for delivery confirmation:
 That last claim is the race guard: a slow live waiter and the recovery callback cannot both own the
 same response.
 
-## Recovery State
+## Recovery state
 
 `asyncresponse_recovery_state` stores one row per waiter registration, keyed by correlation id and
 registration id. Shared-correlation waits therefore survive redeploys correctly: if several waiters
@@ -38,7 +38,7 @@ The Core watchdog scans the same table through `IRecoveryStateScanner` and check
 `IActiveSubscriberProbe`, so `AddAsyncResponseRecoveryCheck()` works with PostgreSQL exactly like Redis
 or NATS.
 
-## Transport Architecture
+## Transport architecture
 
 The transport uses one queue table, `asyncresponse_transport_messages`, with a logical `queue` column:
 
@@ -57,7 +57,7 @@ dispatcher writes a dead-letter row and invokes `OnBackgroundFailure`.
 Response ingress reads the correlation id from `CorrelationIdHeader` first, then from configured JSON
 paths such as `CorrelationId`, `CustomParameters.CorrelationId`, and nested JSON strings.
 
-## Schema Creation
+## Schema creation
 
 Both packages can create their tables on startup (`AutoCreateSchema = true`). Channel and transport
 take the same transaction-scoped advisory lock for the configured schema before DDL runs. This matters
@@ -67,7 +67,7 @@ processes start together.
 Set `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
 distinct even when they share the same schema.
 
-## Configuration Checklist
+## Configuration checklist
 
 ```csharp
 builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(
@@ -102,7 +102,7 @@ Recommended Npgsql connection-string settings:
 | `Max Auto Prepare=20` | Keeps the recurring table queries prepared across reuse, reducing parse/plan CPU under load. |
 | `Maximum Pool Size` | Size deliberately for all app instances sharing the same server; early-ACK load tests can otherwise exhaust PostgreSQL's `max_connections`. |
 
-## Operational Notes
+## Operational notes
 
 - Use simple PostgreSQL identifiers for schema/table/notification names: letters, digits, and
   underscores, not starting with a digit.

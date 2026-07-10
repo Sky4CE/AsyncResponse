@@ -147,15 +147,28 @@ public sealed class IntegrationFixture : IAsyncLifetime
         var mongoDbEndpoint = _app.GetEndpoint("mongodb", "mongodb");
         MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}";
 
-        var oracleEndpoint = _app.GetEndpoint("oracle", "oracle");
-        Environment.SetEnvironmentVariable(
-            OracleConnectionStringEnvironmentVariable,
-            $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
+        // The AppHost omits the Oracle and Cosmos containers when ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS
+        // is set (their endpoints then don't exist), and a user-supplied connection string always wins
+        // over the container-derived one. When neither var ends up set, the opt-in durable-flow store
+        // contract tests Assert.Skip.
+        var skipOracleCosmos = string.Equals(
+            Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"), "true", StringComparison.OrdinalIgnoreCase);
 
-        var cosmosEndpoint = _app.GetEndpoint("cosmos", "gateway");
-        Environment.SetEnvironmentVariable(
-            CosmosConnectionStringEnvironmentVariable,
-            $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
+        if (!skipOracleCosmos && string.IsNullOrEmpty(_previousOracleConnectionString))
+        {
+            var oracleEndpoint = _app.GetEndpoint("oracle", "oracle");
+            Environment.SetEnvironmentVariable(
+                OracleConnectionStringEnvironmentVariable,
+                $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
+        }
+
+        if (!skipOracleCosmos && string.IsNullOrEmpty(_previousCosmosConnectionString))
+        {
+            var cosmosEndpoint = _app.GetEndpoint("cosmos", "gateway");
+            Environment.SetEnvironmentVariable(
+                CosmosConnectionStringEnvironmentVariable,
+                $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
+        }
 
         // The SUT apps have already provisioned the asyncresponse database by the time they report
         // healthy, so direct tests can connect straight to it.

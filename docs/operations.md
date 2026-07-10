@@ -2,6 +2,11 @@
 
 [← Back to README](../README.md)
 
+This page covers running AsyncResponse well in production and in development: the operational best
+practices distilled from the rest of the docs, how to build and run the test suites, and how to
+benchmark and load-test the library (micro-benchmarks, the stress harness, and the NBomber
+end-to-end profiles).
+
 - [Best practices](#best-practices)
 - [Building and testing](#building-and-testing)
 - [Benchmarking and load testing](#benchmarking-and-load-testing)
@@ -143,7 +148,8 @@ early-ACK invariant for AWS SQS deliveries: every message deleted exactly once, 
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation), and
 **durable-flow-storm** (hundreds of concurrent 5-step checkpointed flows through the real worker
 transport and default recovery-backed flow-state store: every flow must end `Succeeded`, every step
-exactly once). Durable-flow package stores have separate BenchmarkDotNet baselines. The core concurrency
+exactly once). A separate BenchmarkDotNet baseline compares the SQLite durable-flow package store
+against the default recovery-backed store. The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
 dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server

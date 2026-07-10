@@ -42,11 +42,15 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.worker.receive`, `asyncresponse.response.receive` | SQL Server transport subscriber message handling (named by role) |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
 | `asyncresponse.watchdog.scan` | recovery watchdog scans |
+| `asyncresponse.flow.execute` | one durable-flow run execution, tagged `asyncresponse.flow_id` and `asyncresponse.flow_type` (see [durable-flows.md](durable-flows.md)) |
 
 Every transport emits an `asyncresponse.worker.publish` producer span on publish and a consumer
 receive span on consume (for both ACK modes). Each receive span carries the standard messaging
 attributes (`messaging.system`, `messaging.destination.name`, and `messaging.message.id` where the
 broker exposes one) plus the transport, role, ACK mode, and the AsyncResponse correlation id.
+Transports that count delivery attempts also tag them on the receive span: PostgreSQL and
+SQL Server use the standard `messaging.message.delivery_attempt`, Redis uses
+`asyncresponse.redis.delivery_attempt`, and Kafka uses `asyncresponse.kafka.delivery_attempt`.
 
 Common tags include `asyncresponse.correlation_id`, `asyncresponse.channel`,
 `asyncresponse.transport`, `asyncresponse.payload_type`, `asyncresponse.subscribers`,

@@ -19,7 +19,10 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddScoped<MySqlFlowStateStore>();
+            // Singleton on purpose: schema provisioning is cached per store instance, and the
+            // executor resolves the store from a fresh scope per flow execution — a scoped store
+            // would re-run EnsureCreated's DDL round-trip on every run.
+            builder.Services.TryAddSingleton<MySqlFlowStateStore>();
             return builder.WithCustomDurableFlows<MySqlFlowStateStore>();
         }
     }
@@ -39,6 +42,13 @@ public sealed class MySqlDurableFlowOptions
     /// <summary>Creates the table and expiry index on first use.</summary>
     public bool AutoCreateSchema { get; set; } = true;
 
+    /// <summary>
+    /// How often <see cref="MySqlFlowStateStore.SaveAsync"/> opportunistically deletes expired rows
+    /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
+    /// prunes on every save. Default: 5 minutes.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -54,6 +64,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 {
     private readonly MySqlDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private long _lastPruneTicks;
     private bool _created;
 
     public MySqlFlowStateStore(IOptions<MySqlDurableFlowOptions> options)
@@ -66,9 +77,13 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // VALUES() in ON DUPLICATE KEY UPDATE is deprecated by MySQL 8.0.20+ in favor of row
+        // aliases, but it is the only syntax MariaDB supports — kept deliberately for MariaDB compat.
         command.CommandText =
             $"""
             INSERT INTO {Table} (flow_id, state_json, expires_at_utc, updated_at_utc)
@@ -111,6 +126,15 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         command.CommandText = $"DELETE FROM {Table} WHERE flow_id = @flow_id;";
         command.Parameters.AddWithValue("@flow_id", flowId);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= @now_utc;";
+        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

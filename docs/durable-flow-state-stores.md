@@ -1,5 +1,21 @@
 # Durable flow state stores
 
+This page covers where durable-flow ledgers (`FlowState`) live in production: the eight built-in
+store packages, how they register and provision themselves, how expired state is cleaned up per
+backend, and how to implement a custom `IFlowStateStore` when none of them fits. The flow API
+itself is documented in [durable-flows.md](durable-flows.md); the per-package option lists are
+summarized in [configuration.md](configuration.md#durable-flow-state-store-package-options).
+
+**On this page**
+
+- [Supported packages](#supported-packages)
+- [Registration and lifetimes](#registration-and-lifetimes)
+- [Package examples](#package-examples)
+- [Schema ownership](#schema-ownership)
+- [Expired-state cleanup](#expired-state-cleanup)
+- [Provider notes](#provider-notes)
+- [Custom stores](#custom-stores)
+
 Production durable flows should keep `FlowState` in storage owned by your application. The
 recommended path is one of the built-in durable-flow store packages:
 
@@ -33,12 +49,35 @@ TTL/cache-shaped, so the default logs a warning the first time it persists flow 
 | `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | Azure Cosmos DB container |
 | `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | DynamoDB table |
 
-All packages register `IFlowStateStore` as scoped through `WithCustomDurableFlows<TStore>()`
-internally, so scoped database dependencies work normally. Package tests cover registration for
-every store, real SQLite contract/end-to-end/concurrency runs, live SQL Server, PostgreSQL, MySQL,
-MongoDB, and DynamoDB contract tests through the integration fixture, and opt-in Oracle/Cosmos DB
-contract tests via `ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING` and
-`ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING`.
+All eight stores run their contract tests against real servers in the default CI integration
+suite — the fixture provisions live SQL Server, PostgreSQL, MySQL, MongoDB, and DynamoDB
+(LocalStack) containers plus `gvenzl/oracle-free` and the Azure Cosmos DB emulator. Set
+`ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS=true` to skip the two heavyweight Oracle/Cosmos containers
+(the store tests then skip cleanly); SQLite additionally has in-repo contract, end-to-end, and
+concurrency-storm unit tests.
+
+## Registration and lifetimes
+
+Every package registers its store as a **singleton**: schema, index, container, or table
+provisioning is cached per store instance and runs once per process, and control-plane calls
+(Cosmos metadata operations, DynamoDB `DescribeTable`/`CreateTable`) are not re-issued per flow
+execution. The `IFlowStateStore` interface is forwarded to that concrete singleton, so resolving
+either yields the same instance.
+
+Client ownership follows one rule — **no package registers a bare client service**
+(`NpgsqlDataSource`, `IMongoClient`/`IMongoDatabase`, `CosmosClient`, `IAmazonDynamoDB`), so
+unrelated resolutions of those types are never answered, or broken, by a store package:
+
+- If the host has already registered the client, the store reuses it.
+- Otherwise the store creates one from its options (or, for DynamoDB, the default AWS
+  credential/region chain) and owns it — the client is disposed with the container.
+
+`WithCustomDurableFlows<TStore>()` is the one deliberately **scoped** registration: your own store
+can depend on scoped services (an EF Core `DbContext`, a per-request unit of work) and is resolved
+from a fresh scope per flow execution. It `TryAdd`s the concrete `TStore` as scoped and forwards
+`IFlowStateStore` to it — which is exactly how the packages layer on top of it: they pre-register
+the concrete store as a singleton (so the scoped `TryAdd` is a no-op), then call
+`WithCustomDurableFlows<TStore>()` for the interface forwarding.
 
 ## Package examples
 
@@ -178,6 +217,19 @@ That is convenient for development and tests. For production environments that u
 infrastructure-as-code, set the package's `AutoCreate...` option to `false` and provision the
 same shape yourself.
 
+Concurrent first-use provisioning is safe across processes:
+
+- **PostgreSQL / SQL Server** serialize DDL with the same transaction-scoped advisory lock /
+  `sp_getapplock` (resource `asyncresponse:ddl:{SchemaName}`) as the channel and transport
+  packages, so flow-store DDL also serializes with any channel/transport DDL running against the
+  same schema. `CREATE ... IF NOT EXISTS` alone is not atomic against a concurrent create — the
+  lock is what prevents the catalog collision.
+- **DynamoDB** tolerates a concurrent `CreateTable` (`ResourceInUseException` means another
+  process won the race), waits for the table to become `ACTIVE`, and checks the TTL status before
+  enabling it rather than blind-enabling and swallowing the error.
+- **Oracle** ignores `ORA-00955` (object already exists) on `CREATE TABLE`/`CREATE INDEX`.
+- **MongoDB / Cosmos** use natively idempotent create-if-not-exists index/container calls.
+
 Relational table shape:
 
 ```sql
@@ -208,6 +260,33 @@ state_json S
 expires_at N  Unix seconds, optional DynamoDB TTL attribute
 updated_at N  Unix seconds
 ```
+
+## Expired-state cleanup
+
+Loads always treat expired state as absent — the expiry filter on read is the correctness
+mechanism. Cleanup of the expired rows/documents themselves differs per family:
+
+| Store family | Cleanup mechanism |
+|---|---|
+| SQL stores (PostgreSQL, SQL Server, MySQL, SQLite, Oracle) | **Opportunistic prune on save**: `SaveAsync` deletes expired rows, throttled by the `PruneInterval` option (default 5 minutes; zero or negative prunes on every save). Pruning only bounds table growth — it never affects correctness. |
+| MongoDB | **Native TTL index** (`expireAfterSeconds = 0` on `expires_at_utc`): MongoDB reaps expired ledgers itself. A pre-existing plain (non-TTL) index with the same name, e.g. from an earlier package version, is replaced in place. Loads still filter on expiry because the TTL monitor runs only periodically (~60 s). |
+| Cosmos DB | **Container TTL + per-item `ttl`**: auto-create enables `DefaultTimeToLive = -1` (per-item TTL without a container-wide default) and each save writes a per-item `ttl`; a pre-existing container without TTL enabled is upgraded in place. |
+| DynamoDB | **Native TTL** on the expiry attribute (`expires_at`, Unix seconds). The expiry epoch is rounded **up** to whole seconds so the effective TTL is never shorter than requested. |
+
+## Provider notes
+
+- **Oracle** — the default index name (`{TableName}_EXPIRES_IDX` on the default
+  `ASYNCRESPONSE_FLOW_STATE` table) exceeds the 30-character identifier limit of Oracle ≤ 12.1,
+  so the default table name requires **Oracle 12.2+**. On older servers, shorten `TableName`.
+- **Oracle** — `SaveAsync` retries once on `ORA-00001`: Oracle's `MERGE` has no `HOLDLOCK`
+  equivalent, so two concurrent saves for the same *new* flow id can both take the
+  `WHEN NOT MATCHED` branch; the retry takes the `MATCHED` branch — ordinary last-writer-wins,
+  matching the other stores' atomic upserts.
+- **MySQL / MariaDB** — the upsert uses `VALUES()` in `ON DUPLICATE KEY UPDATE` deliberately:
+  MySQL 8.0.20+ deprecates it in favor of row aliases, but `VALUES()` is the only syntax MariaDB
+  supports.
+- **SQL Server** — the upsert is `MERGE ... WITH (HOLDLOCK)`, making concurrent saves for one
+  flow id atomic.
 
 ## Custom stores
 

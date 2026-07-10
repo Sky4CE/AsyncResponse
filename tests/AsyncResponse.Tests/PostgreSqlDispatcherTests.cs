@@ -57,12 +57,43 @@ public sealed class PostgreSqlDispatcherTests
         await dispatcher.HandleAsync(delivery, CancellationToken.None);
 
         var activity = collector.Single("asyncresponse.postgresql.receive", "asyncresponse.transport", "postgresql");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
         Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.role"));
         Assert.Equal(nameof(PostgreSqlAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.ack_mode"));
         Assert.Equal("postgresql", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
         Assert.Equal("worker", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
         Assert.Equal(id.ToString(), AsyncResponseActivityCollector.Tag(activity, "messaging.message.id"));
+        Assert.Equal(1, AsyncResponseActivityCollector.Tag(activity, "messaging.message.delivery_attempt"));
         Assert.Equal("corr-pg", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task AckAfterReceive_BackgroundHandlerStillEmitsReceiveSpan()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var calls = new Calls();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.SetResult();
+                return Task.CompletedTask;
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Regression guard for the "both ACK modes emit the span" claim: the early-ACK path runs the
+        // handler on a background worker, and a refactor that splits it from ExecuteHandlerAsync
+        // would lose the span silently.
+        await WaitUntilAsync(() => collector.Count("asyncresponse.postgresql.receive") == 1);
+        var activity = collector.Single("asyncresponse.postgresql.receive", "asyncresponse.transport", "postgresql");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
+        Assert.Equal(nameof(PostgreSqlAckMode.AckAfterReceive), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.ack_mode"));
     }
 
     [Fact]

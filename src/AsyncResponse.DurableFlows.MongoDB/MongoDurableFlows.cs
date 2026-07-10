@@ -23,22 +23,33 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddSingleton<IMongoClient>(provider =>
-            {
-                var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>().Value;
-                if (string.IsNullOrWhiteSpace(options.ConnectionString))
-                    throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase is registered.");
-                return new MongoClient(options.ConnectionString);
-            });
+            // Singleton on purpose: index provisioning is cached per store instance, and the
+            // executor resolves the store from a fresh scope per flow execution. Host-registered
+            // IMongoDatabase / IMongoClient services are reused when present; otherwise the store
+            // creates and owns a client from the options. Nothing is registered as a bare
+            // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are
+            // never answered — or broken — by this package.
             builder.Services.TryAddSingleton(provider =>
             {
-                var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>().Value;
-                if (string.IsNullOrWhiteSpace(options.DatabaseName))
-                    throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
-                return provider.GetRequiredService<IMongoClient>().GetDatabase(options.DatabaseName);
-            });
+                var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>();
 
-            builder.Services.TryAddScoped<MongoDbFlowStateStore>();
+                var database = provider.GetService<IMongoDatabase>();
+                if (database is not null)
+                    return new MongoDbFlowStateStore(database, options);
+
+                if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
+                    throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
+
+                var sharedClient = provider.GetService<IMongoClient>();
+                if (sharedClient is not null)
+                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options);
+
+                if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
+                    throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
+
+                var ownedClient = new MongoClient(options.Value.ConnectionString);
+                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient);
+            });
             return builder.WithCustomDurableFlows<MongoDbFlowStateStore>();
         }
     }
@@ -70,18 +81,20 @@ public sealed class MongoDbDurableFlowOptions
 }
 
 /// <summary>MongoDB implementation of <see cref="IFlowStateStore"/>.</summary>
-public sealed class MongoDbFlowStateStore : IFlowStateStore
+public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 {
     private readonly IMongoCollection<MongoFlowStateDocument> _collection;
     private readonly MongoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly IMongoClient? _ownedClient;
     private bool _created;
 
-    public MongoDbFlowStateStore(IMongoDatabase database, IOptions<MongoDbDurableFlowOptions> options)
+    public MongoDbFlowStateStore(IMongoDatabase database, IOptions<MongoDbDurableFlowOptions> options, IMongoClient? ownedClient = null)
     {
         _options = options.Value;
         _options.Validate();
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
+        _ownedClient = ownedClient;
     }
 
     public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
@@ -138,16 +151,37 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore
             if (_created)
                 return;
 
+            // A TTL index (expireAfterSeconds = 0 on the expiry timestamp) makes MongoDB itself
+            // reap expired ledgers — no application-side pruning needed. Loads still filter on
+            // ExpiresAtUtc because the TTL monitor only runs periodically (~60s).
+            var indexName = $"{_options.CollectionName}_expires_idx";
             var model = new CreateIndexModel<MongoFlowStateDocument>(
                 Builders<MongoFlowStateDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
-                new CreateIndexOptions { Name = $"{_options.CollectionName}_expires_idx" });
-            await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+                new CreateIndexOptions { Name = indexName, ExpireAfter = TimeSpan.Zero });
+            try
+            {
+                await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+            catch (MongoCommandException ex) when (ex.Code is 85 or 86)
+            {
+                // IndexOptionsConflict/IndexKeySpecsConflict: an earlier package version created the
+                // same-named index without the TTL option. Replace it in place.
+                await _collection.Indexes.DropOneAsync(indexName, cancellationToken).ConfigureAwait(false);
+                await _collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
             _created = true;
         }
         finally
         {
             _ensureGate.Release();
         }
+    }
+
+    /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>
+    public void Dispose()
+    {
+        _ensureGate.Dispose();
+        (_ownedClient as IDisposable)?.Dispose();
     }
 }
 

@@ -124,8 +124,9 @@ var mysql = builder.AddContainer("mysql", "mysql", "8.4")
 var mongodb = builder.AddContainer("mongodb", "mongo", "7")
     .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
 
-// Oracle and Cosmos support the opt-in durable-flow store contracts. They are not part of the
-// broker/load-test SUT, so that workflow skips their heavyweight containers via this flag.
+// Oracle and Cosmos back the durable-flow store contract tests, which run in default CI. They are
+// not part of the broker/load-test SUT, so workflows that don't need them (load tests, the weekly
+// redis-compat matrix) skip their heavyweight containers via this flag.
 if (!string.Equals(Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"), "true", StringComparison.OrdinalIgnoreCase))
 {
     var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");

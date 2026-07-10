@@ -13,6 +13,16 @@ at compile time; switch to a durable channel (`.WithRedisChannel()` / `.WithNats
 `.WithPostgreSqlChannel(...)`) and inject `IRecoverableAsyncResponseBuilder` for durable recovery
 flows.
 
+**On this page**
+
+- [`ShouldResumeOnRecovery()`](#shouldresumeonrecovery)
+- [Registering recovery callbacks](#registering-recovery-callbacks)
+- [Why recovery routing and `Until` stay separate](#why-recovery-routing-and-until-stay-separate)
+- [The recovery watchdog + health check](#the-recovery-watchdog--health-check)
+- [Recovery-state durability](#recovery-state-durability)
+- [Wire/schema versioning](#wireschema-versioning)
+- [Shared-correlation recovery](#shared-correlation-recovery)
+
 ## `ShouldResumeOnRecovery()`
 
 Override `ShouldResumeOnRecovery()` only when a payload can carry a *domain failure* and you use

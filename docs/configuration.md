@@ -12,6 +12,17 @@ transport package). An app that starts without either one fails fast at host sta
 misconfiguration can never silently hang every waiter or drop worker dispatch. The recovery watchdog
 is part of the engine and runs by default for whichever channel you choose.
 
+This page is the consolidated options reference: engine options, durable-flow store package
+options, channel options, transport options, and the per-transport delivery semantics behind them.
+
+**On this page**
+
+- [Engine options (`AsyncResponseOptions`)](#engine-options-asyncresponseoptions)
+- [Durable-flow state store package options](#durable-flow-state-store-package-options)
+- [Channel options](#channel-options)
+- [Transport options](#transport-options) — including per-transport ACK/redelivery semantics
+- [Redis-compatible servers](#redis-compatible-servers)
+
 ```csharp
 builder.Services.AddAsyncResponse(options =>
 {
@@ -55,17 +66,20 @@ and migration.
 
 | Package | Key options |
 |---|---|
-| `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema` |
-| `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema` |
-| `MySql` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
-| `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
-| `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema` |
-| `MongoDB` | `ConnectionString` or registered `IMongoDatabase`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
-| `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer` |
+| `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `MySql` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `Sqlite` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `Oracle` | `ConnectionString`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
+| `MongoDB` | `ConnectionString` or registered `IMongoDatabase`/`IMongoClient`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
+| `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer`, `Throughput` |
 | `DynamoDB` | registered/default `IAmazonDynamoDB`, `TableName`, `AutoCreateTable`, `EnableTimeToLive`, `TimeToLiveAttributeName` |
 
-See [durable-flow-state-stores.md](durable-flow-state-stores.md) for package examples and schema
-ownership guidance.
+The SQL stores prune expired rows opportunistically on save, throttled by `PruneInterval`
+(default 5 minutes; zero or negative prunes on every save); MongoDB, Cosmos, and DynamoDB use
+native TTL instead. All packages register their store as a singleton and reuse a host-registered
+client when one exists. See [durable-flow-state-stores.md](durable-flow-state-stores.md) for
+package examples, lifetimes, cleanup mechanics, and schema ownership guidance.
 
 ## Channel options
 

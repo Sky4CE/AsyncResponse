@@ -81,7 +81,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     public static AsyncResponseRegistrationBuilder WithCustomDurableFlows<TFlowStateStore>(this AsyncResponseRegistrationBuilder builder)
         where TFlowStateStore : class, IFlowStateStore
     {
-        builder.Services.AddScoped<IFlowStateStore, TFlowStateStore>();
+        // Forward the interface to the concrete registration so resolving either yields the same
+        // instance within a scope. TryAdd lets callers (and the DurableFlows.* packages) pre-register
+        // the concrete type with a different lifetime — e.g. singleton for stores whose dependencies
+        // are all singletons — without this scoped default overriding it.
+        builder.Services.TryAddScoped<TFlowStateStore>();
+        builder.Services.AddScoped<IFlowStateStore>(provider => provider.GetRequiredService<TFlowStateStore>());
         return builder;
     }
 

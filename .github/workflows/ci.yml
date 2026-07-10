@@ -4,14 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The Redis-compatible-server matrix (Valkey / Dragonfly) reruns the whole Docker-backed suite per
-  # server, so it runs weekly and on demand rather than on every push.
+  # The Redis-compatible-server matrix (currently Valkey; Dragonfly and Garnet are validated outside
+  # this harness — see the redis-compat job) reruns the whole Docker-backed suite per server, so it
+  # runs weekly and on demand rather than on every push.
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
+# CI only builds, tests, and uploads artifacts — the default token never needs write access.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
+    # The weekly schedule exists only for the redis-compat matrix; skip the per-push jobs on it.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +78,8 @@ jobs:
           path: ./artifacts/*.nupkg
 
   integration-tests:
+    # The weekly schedule exists only for the redis-compat matrix; skip the per-push jobs on it.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -124,6 +133,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Oracle + Cosmos back the opt-in durable-flow store contract tests only — nothing Redis-related —
+      # so the weekly matrix skips their (heavy) containers; the store tests then Assert.Skip cleanly.
+      ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: 'true'
     strategy:
       fail-fast: false
       matrix:

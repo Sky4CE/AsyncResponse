@@ -24,8 +24,20 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddSingleton<IAmazonDynamoDB>(_ => new AmazonDynamoDBClient());
-            builder.Services.TryAddScoped<DynamoDbFlowStateStore>();
+            // Singleton on purpose: table/TTL provisioning is cached per store instance and DynamoDB
+            // control-plane calls are throttled account-wide — a scoped store would re-issue them on
+            // every flow execution. A host-registered IAmazonDynamoDB is reused when present;
+            // otherwise the store creates and owns a client from the default AWS credential/region
+            // chain. Nothing is registered as a bare IAmazonDynamoDB service, so unrelated
+            // resolutions of that type are never answered — or broken — by this package.
+            builder.Services.TryAddSingleton(provider =>
+            {
+                var options = provider.GetRequiredService<IOptions<DynamoDbDurableFlowOptions>>();
+                var shared = provider.GetService<IAmazonDynamoDB>();
+                return shared is not null
+                    ? new DynamoDbFlowStateStore(shared, options)
+                    : new DynamoDbFlowStateStore(new AmazonDynamoDBClient(), options, ownsClient: true);
+            });
             return builder.WithCustomDurableFlows<DynamoDbFlowStateStore>();
         }
     }
@@ -59,7 +71,7 @@ public sealed class DynamoDbDurableFlowOptions
 }
 
 /// <summary>DynamoDB implementation of <see cref="IFlowStateStore"/>.</summary>
-public sealed class DynamoDbFlowStateStore : IFlowStateStore
+public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 {
     private const string FlowIdAttribute = "flow_id";
     private const string StateJsonAttribute = "state_json";
@@ -68,13 +80,15 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore
     private readonly IAmazonDynamoDB _client;
     private readonly DynamoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly bool _ownsClient;
     private bool _created;
 
-    public DynamoDbFlowStateStore(IAmazonDynamoDB client, IOptions<DynamoDbDurableFlowOptions> options)
+    public DynamoDbFlowStateStore(IAmazonDynamoDB client, IOptions<DynamoDbDurableFlowOptions> options, bool ownsClient = false)
     {
         _client = client;
         _options = options.Value;
         _options.Validate();
+        _ownsClient = ownsClient;
     }
 
     public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
@@ -90,7 +104,9 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore
             {
                 [FlowIdAttribute] = new() { S = flowId },
                 [StateJsonAttribute] = new() { S = DurableFlowStoreShared.Serialize(state) },
-                [_options.TimeToLiveAttributeName] = new() { N = UnixSeconds(now.Add(ttl)) },
+                // Ceiling, not floor: DynamoDB TTL has whole-second granularity, and rounding down
+                // would make the effective TTL up to a second SHORTER than requested.
+                [_options.TimeToLiveAttributeName] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
                 [UpdatedAtAttribute] = new() { N = UnixSeconds(now) }
             }
         }, cancellationToken).ConfigureAwait(false);
@@ -145,45 +161,74 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore
             if (_created)
                 return;
 
+            TableDescription? table = null;
             try
             {
-                await _client.DescribeTableAsync(_options.TableName, cancellationToken).ConfigureAwait(false);
+                var described = await _client.DescribeTableAsync(_options.TableName, cancellationToken).ConfigureAwait(false);
+                table = described.Table;
             }
             catch (ResourceNotFoundException)
             {
-                await _client.CreateTableAsync(new CreateTableRequest
-                {
-                    TableName = _options.TableName,
-                    BillingMode = BillingMode.PAY_PER_REQUEST,
-                    AttributeDefinitions =
-                    [
-                        new AttributeDefinition(FlowIdAttribute, ScalarAttributeType.S)
-                    ],
-                    KeySchema =
-                    [
-                        new KeySchemaElement(FlowIdAttribute, KeyType.HASH)
-                    ]
-                }, cancellationToken).ConfigureAwait(false);
             }
 
-            await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
-
-            if (_options.EnableTimeToLive)
+            if (table is null)
             {
                 try
                 {
-                    await _client.UpdateTimeToLiveAsync(new UpdateTimeToLiveRequest
+                    await _client.CreateTableAsync(new CreateTableRequest
                     {
                         TableName = _options.TableName,
-                        TimeToLiveSpecification = new TimeToLiveSpecification
-                        {
-                            AttributeName = _options.TimeToLiveAttributeName,
-                            Enabled = true
-                        }
+                        BillingMode = BillingMode.PAY_PER_REQUEST,
+                        AttributeDefinitions =
+                        [
+                            new AttributeDefinition(FlowIdAttribute, ScalarAttributeType.S)
+                        ],
+                        KeySchema =
+                        [
+                            new KeySchemaElement(FlowIdAttribute, KeyType.HASH)
+                        ]
                     }, cancellationToken).ConfigureAwait(false);
                 }
-                catch (AmazonDynamoDBException ex) when (string.Equals(ex.ErrorCode, "ValidationException", StringComparison.Ordinal))
+                catch (ResourceInUseException)
                 {
+                    // Another process won the create race; fall through and wait for ACTIVE.
+                }
+
+                await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else if (table.TableStatus != TableStatus.ACTIVE)
+            {
+                await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (_options.EnableTimeToLive)
+            {
+                // Check the TTL status instead of blind-enabling: UpdateTimeToLive throws when TTL
+                // is already enabled, and relying on a swallowed exception per provisioning is noise.
+                var ttlStatus = await _client.DescribeTimeToLiveAsync(new DescribeTimeToLiveRequest
+                {
+                    TableName = _options.TableName
+                }, cancellationToken).ConfigureAwait(false);
+
+                var status = ttlStatus.TimeToLiveDescription?.TimeToLiveStatus;
+                if (status != TimeToLiveStatus.ENABLED && status != TimeToLiveStatus.ENABLING)
+                {
+                    try
+                    {
+                        await _client.UpdateTimeToLiveAsync(new UpdateTimeToLiveRequest
+                        {
+                            TableName = _options.TableName,
+                            TimeToLiveSpecification = new TimeToLiveSpecification
+                            {
+                                AttributeName = _options.TimeToLiveAttributeName,
+                                Enabled = true
+                            }
+                        }, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (AmazonDynamoDBException ex) when (string.Equals(ex.ErrorCode, "ValidationException", StringComparison.Ordinal))
+                    {
+                        // A concurrent process enabled TTL between the describe and the update.
+                    }
                 }
             }
 
@@ -215,5 +260,16 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore
 
     private static string UnixSeconds(DateTimeOffset value)
         => value.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+
+    private static string UnixSecondsCeiling(DateTimeOffset value)
+        => ((long)Math.Ceiling(value.ToUnixTimeMilliseconds() / 1000.0)).ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>Disposes the DynamoDB client when the store created (and therefore owns) it.</summary>
+    public void Dispose()
+    {
+        _ensureGate.Dispose();
+        if (_ownsClient)
+            _client.Dispose();
+    }
 }
 }

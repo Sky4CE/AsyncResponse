@@ -2,7 +2,18 @@
 
 [← Back to README](../README.md)
 
-A complete testbed lives in [`samples/AsyncResponse.Sample`](../samples/AsyncResponse.Sample):
+A complete testbed lives in [`samples/AsyncResponse.Sample`](../samples/AsyncResponse.Sample) —
+one configuration-driven app that runs fully in-memory with zero dependencies, or against any
+channel/transport pair, and exposes an HTTP endpoint per scenario (the same endpoints the
+integration tests drive).
+
+**On this page**
+
+- [Run with Aspire](#run-with-aspire)
+- [Run standalone](#run-standalone) — in-memory by default, or per-provider recipes
+- [Walking the scenarios](#walking-the-scenarios)
+
+## Run with Aspire
 
 Run it as an Aspire playground when you want the dashboard, managed Redis, logs, traces, metrics,
 resource environment, and health checks in one place:
@@ -19,6 +30,8 @@ service-default endpoints at `/health` and `/alive`.
 
 Prerequisites: .NET 10 SDK, `dotnet` available on `PATH`, and a supported container runtime
 such as Docker or Podman for the Redis resource.
+
+## Run standalone
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
 `PostgreSQL` | `SqlServer`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` |

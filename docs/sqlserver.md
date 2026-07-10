@@ -1,4 +1,4 @@
-# SQL Server Channel And Transport
+# SQL Server channel and transport
 
 [← Back to README](../README.md)
 
@@ -10,7 +10,7 @@ SQL Server for a simple durable worker queue. The design mirrors the PostgreSQL 
 ([postgresql.md](postgresql.md)); the differences below come from what SQL Server does and does not
 provide.
 
-## Channel Architecture
+## Channel architecture
 
 SQL Server has no `LISTEN/NOTIFY`, so the channel wakes active waiters with an **adaptive polling
 sweep** instead of a server push (Service Broker/`SqlDependency` are deliberately not used — they
@@ -41,7 +41,7 @@ same response. Row expiries (`expires_at`) are always computed on the **database
 (`SYSUTCDATETIME()`), as is the waiter's delivery watermark, so app-side clock skew cannot drop or
 resurrect messages.
 
-## Recovery State
+## Recovery state
 
 `asyncresponse_recovery_state` stores one row per waiter registration, keyed by correlation id and
 registration id. Shared-correlation waits therefore survive redeploys correctly: if several waiters
@@ -51,7 +51,7 @@ The Core watchdog scans the same table through `IRecoveryStateScanner` and check
 `IActiveSubscriberProbe`, so `AddAsyncResponseRecoveryCheck()` works with SQL Server exactly like
 Redis, NATS, or PostgreSQL.
 
-## Transport Architecture
+## Transport architecture
 
 The transport uses one queue table, `asyncresponse_transport_messages`, with a logical `queue` column:
 
@@ -80,7 +80,7 @@ paths such as `CorrelationId`, `CustomParameters.CorrelationId`, and nested JSON
 publish and receive paths emit OpenTelemetry spans with standard messaging attributes
 (`messaging.system = sqlserver`, destination, delivery attempt).
 
-## Schema Creation
+## Schema creation
 
 Both packages can create their schema, tables, and indexes on startup (`AutoCreateSchema = true`).
 Channel and transport take the same transaction-scoped application lock
@@ -94,7 +94,7 @@ The packages do **not** create the database itself: point `ConnectionString` at 
 distinct even when they share the same schema. Correlation ids are stored as `nvarchar(400)` key
 columns — keep ids at or under 400 characters (generated ids are far shorter).
 
-## Configuration Checklist
+## Configuration checklist
 
 ```csharp
 builder.Services.AddAsyncResponse()
@@ -128,7 +128,7 @@ Connection-string notes:
 | `TrustServerCertificate=True` | Needed against dev/CI containers with self-signed certificates; use a real certificate in production instead. |
 | `Database=...` | Must name an existing database — the packages create schema/tables, never the database. |
 
-## Operational Notes
+## Operational notes
 
 - Use simple SQL Server identifiers for schema/table names: letters, digits, and underscores, not
   starting with a digit.

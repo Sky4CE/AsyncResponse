@@ -160,6 +160,9 @@ public class DurableChildFlowTests
             Assert.Equal(FlowRunStatus.Failed, child!.Status);
             Assert.Contains("Child flow 'root-failed-child:child-1' failed", root.LastMessage);
             Assert.True(root.Steps!["child-1"].Completed);
+            // The memoized failed child keeps the step's Faulted marker so operators can spot the
+            // failure on the step itself instead of digging through ResultJson.
+            Assert.True(root.Steps["child-1"].Faulted);
             Assert.Equal("root-failed-child:child-1", root.Steps["child-1"].ChildFlowId);
         }
         finally

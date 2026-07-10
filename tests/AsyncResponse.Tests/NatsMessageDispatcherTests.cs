@@ -53,12 +53,44 @@ public class NatsMessageDispatcherTests
         await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1, headers: headers), CancellationToken.None);
 
         var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
         Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.role"));
         Assert.Equal(nameof(NatsAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.ack_mode"));
         Assert.Equal("nats", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
         Assert.Equal("asyncresponse.transport.worker", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
         Assert.Equal(1L, AsyncResponseActivityCollector.Tag(activity, "messaging.nats.num_delivered"));
         Assert.Equal("corr-nats", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task EarlyAck_BackgroundHandlerStillEmitsReceiveSpan()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var processed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4);
+        await using var dispatcher = CreateDispatcher((_, _) => { processed.TrySetResult(); return Task.CompletedTask; }, subscriber);
+
+        var rec = new RecordingDelivery();
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+        await processed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // Regression guard for the "both ACK modes emit the span" claim: the early-ACK path runs the
+        // handler on a background worker, and a refactor that splits it from the shared handler
+        // execution path would lose the span silently.
+        await WaitUntilAsync(() => collector.Count("asyncresponse.nats.receive") == 1);
+        var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
+        Assert.Equal(nameof(NatsAckMode.AckAfterReceive), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.ack_mode"));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            await Task.Delay(20, cts.Token);
+        }
     }
 
     [Fact]

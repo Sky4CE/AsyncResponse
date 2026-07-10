@@ -20,7 +20,10 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddScoped<OracleFlowStateStore>();
+            // Singleton on purpose: schema provisioning is cached per store instance, and the
+            // executor resolves the store from a fresh scope per flow execution — a scoped store
+            // would re-run EnsureCreated's DDL round-trip on every run.
+            builder.Services.TryAddSingleton<OracleFlowStateStore>();
             return builder.WithCustomDurableFlows<OracleFlowStateStore>();
         }
     }
@@ -40,6 +43,13 @@ public sealed class OracleDurableFlowOptions
     /// <summary>Creates the table and expiry index on first use.</summary>
     public bool AutoCreateSchema { get; set; } = true;
 
+    /// <summary>
+    /// How often <see cref="OracleFlowStateStore.SaveAsync"/> opportunistically deletes expired rows
+    /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
+    /// prunes on every save. Default: 5 minutes.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -54,9 +64,11 @@ public sealed class OracleDurableFlowOptions
 public sealed class OracleFlowStateStore : IFlowStateStore
 {
     private const int ObjectAlreadyExists = 955;
+    private const int UniqueConstraintViolated = 1;
 
     private readonly OracleDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private long _lastPruneTicks;
     private bool _created;
 
     public OracleFlowStateStore(IOptions<OracleDurableFlowOptions> options)
@@ -69,8 +81,26 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await MergeAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OracleException ex) when (ex.Number == UniqueConstraintViolated)
+        {
+            // Oracle MERGE has no HOLDLOCK equivalent: two concurrent saves for the same NEW flow
+            // id can both take WHEN NOT MATCHED, and the loser dies with ORA-00001. The row exists
+            // now, so one retry takes the MATCHED branch — ordinary last-writer-wins, matching the
+            // other stores' atomic upserts.
+            await MergeAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task MergeAsync(OracleConnection connection, string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken)
+    {
         await using var command = connection.CreateCommand();
         command.BindByName = true;
         command.CommandText =
@@ -107,12 +137,16 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         command.Parameters.Add(new OracleParameter("now_utc", DateTime.UtcNow));
 
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return result switch
+        switch (result)
         {
-            string json => DurableFlowStoreShared.Deserialize(json),
-            OracleClob clob => DurableFlowStoreShared.Deserialize(clob.Value),
-            _ => null
-        };
+            case string json:
+                return DurableFlowStoreShared.Deserialize(json);
+            case OracleClob clob:
+                using (clob)
+                    return DurableFlowStoreShared.Deserialize(clob.Value);
+            default:
+                return null;
+        }
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -126,6 +160,16 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         command.CommandText = $"DELETE FROM {Table} WHERE flow_id = :flow_id";
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= :now_utc";
+        command.Parameters.Add(new OracleParameter("now_utc", DateTime.UtcNow));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

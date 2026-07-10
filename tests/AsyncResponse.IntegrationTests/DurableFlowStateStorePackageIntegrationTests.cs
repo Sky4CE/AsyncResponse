@@ -166,7 +166,10 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                     TableName = table
                 }));
 
-            await AssertStoreContractAsync(store, TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(1200));
+            // DynamoDB TTL has whole-second granularity and the store now rounds the expiry epoch
+            // UP (never shorter than requested), so the read-filter can consider a 1s-TTL item live
+            // for up to ~2s after the save — wait past that worst case.
+            await AssertStoreContractAsync(store, TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(2500));
         }
         finally
         {

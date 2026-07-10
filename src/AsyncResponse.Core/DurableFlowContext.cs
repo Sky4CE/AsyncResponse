@@ -164,40 +164,59 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return completedChild;
         }
 
-        var childFlowId = checkpoint.ChildFlowId;
-        if (string.IsNullOrWhiteSpace(childFlowId))
+        var breadcrumb = checkpoint.ChildFlowId;
+        var childFlowId = breadcrumb ?? (string.IsNullOrWhiteSpace(flowId) ? $"{FlowId}:{name}" : flowId);
+
+        var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
+        if (child is null)
         {
-            childFlowId = string.IsNullOrWhiteSpace(flowId) ? $"{FlowId}:{name}" : flowId;
+            if (breadcrumb is not null)
+            {
+                // The breadcrumb is persisted only after the child state exists, so a missing child
+                // here means its ledger expired (StateExpiry) or was deleted while this parent was
+                // suspended. Its outcome is unknowable; re-running it blind would re-execute side
+                // effects of a possibly-completed run. Fail deterministically instead.
+                throw new DurableFlowFailedException(
+                    $"Child flow '{childFlowId}' has no state (expired or deleted) while parent flow '{FlowId}' was waiting on step '{name}'. " +
+                    "Its outcome is unknown, so it is not re-run automatically. Size DurableFlowOptions.StateExpiry beyond the longest child idle time, " +
+                    "or start a new parent run to re-execute the work.");
+            }
+
+            // Create the child BEFORE persisting the breadcrumb: "breadcrumb exists" must always
+            // imply "child state existed", which keeps the expired-child check above sound. A crash
+            // between the two writes is safe — the child id is deterministic, so the re-delivered
+            // parent execution loads this child instead of re-creating it.
+            child = CreateChildState<TFlow, TInput>(childFlowId, name, input);
+            await _store.SaveAsync(childFlowId, child, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
+        }
+        else
+        {
+            ThrowIfChildMismatched<TFlow>(child, childFlowId, name);
+        }
+
+        if (breadcrumb is null)
+        {
             checkpoint.ChildFlowId = childFlowId;
             checkpoint.Faulted = false;
             checkpoint.Message = $"Waiting for child flow '{childFlowId}'.";
             await SaveAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
-        if (child is null)
-        {
-            child = CreateChildState<TFlow, TInput>(childFlowId, name, input);
-            await _store.SaveAsync(childFlowId, child, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
-        }
-
         switch (child.Status)
         {
             case FlowRunStatus.Succeeded:
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.Serialize(child), cancellationToken).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken).ConfigureAwait(false);
                 return child;
 
             case FlowRunStatus.Failed:
-                checkpoint.Faulted = true;
                 checkpoint.Message = child.LastMessage;
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.Serialize(child), cancellationToken).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, faulted: true).ConfigureAwait(false);
                 ThrowIfChildFailed(child, failOnChildFailure);
                 return child;
 
             default:
-                await EnqueueChildAsync(childFlowId).ConfigureAwait(false);
-                Suspend($"Flow {FlowId} suspended waiting for child flow {childFlowId}.");
+                await SuspendForChildAsync(childFlowId, cancellationToken).ConfigureAwait(false);
                 throw new InvalidOperationException("Unreachable.");
         }
     }
@@ -324,11 +343,17 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id));
     }
 
-    private void Suspend(string message)
+    private async Task SuspendForChildAsync(string childFlowId, CancellationToken cancellationToken)
     {
+        // Persist the suspension BEFORE the child becomes runnable: once the child is enqueued it
+        // can complete and re-execute this parent on another worker at any moment, and a save after
+        // that point would clobber the re-execution's newer checkpoints with this stale snapshot.
+        // The executor therefore does NOT save again on the suspension path.
         _suspended = true;
-        _state.LastMessage = message;
-        throw new DurableFlowSuspendedException(message);
+        _state.LastMessage = $"Flow {FlowId} suspended waiting for child flow {childFlowId}.";
+        await SaveAsync(cancellationToken).ConfigureAwait(false);
+        await EnqueueChildAsync(childFlowId).ConfigureAwait(false);
+        throw new DurableFlowSuspendedException(_state.LastMessage);
     }
 
     private void ThrowIfSuspended()
@@ -343,6 +368,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             throw new DurableFlowFailedException($"Child flow '{child.FlowId}' failed: {child.LastMessage ?? "no message"}");
     }
 
+    private void ThrowIfChildMismatched<TFlow>(FlowState child, string childFlowId, string stepName)
+    {
+        // A child id is owned by exactly one parent: the notification that resumes a suspended
+        // parent follows the child's single ParentFlowId, so a second parent awaiting the same id
+        // would suspend and never wake. Reject collisions loudly instead of parking forever.
+        if (!string.Equals(child.ParentFlowId, FlowId, StringComparison.Ordinal))
+        {
+            var owner = child.ParentFlowId is null ? "a run not started by AwaitChildFlowAsync" : $"parent flow '{child.ParentFlowId}'";
+            throw new DurableFlowFailedException(
+                $"Step '{stepName}' of flow '{FlowId}' awaits child flow id '{childFlowId}', but that id belongs to {owner}. " +
+                "Child flow ids are exclusive to the parent that started them — pass a flowId that is unique per parent run " +
+                "(the default '{parentFlowId}:{stepName}' id is always safe).");
+        }
+
+        if (!string.Equals(child.FlowTypeName, typeof(TFlow).FullName, StringComparison.Ordinal))
+        {
+            throw new DurableFlowFailedException(
+                $"Step '{stepName}' of flow '{FlowId}' awaits child flow id '{childFlowId}' as {typeof(TFlow).FullName}, " +
+                $"but the persisted run is {child.FlowTypeName}. The flowId collides with a different flow — use a unique child id.");
+        }
+    }
+
     private FlowStepState GetStep(string name)
     {
         var steps = _state.Steps ??= new Dictionary<string, FlowStepState>(StringComparer.Ordinal);
@@ -355,14 +402,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return step;
     }
 
-    private async Task CompleteStepAsync(string name, FlowStepState step, string? resultJson, CancellationToken cancellationToken)
+    private async Task CompleteStepAsync(string name, FlowStepState step, string? resultJson, CancellationToken cancellationToken, bool faulted = false)
     {
         step.Completed = true;
         step.ResultJson = resultJson;
         step.PendingCorrelationId = null;
-        step.Faulted = false;
+        // A memoized failed child keeps Faulted = true so operators can spot the failure on the
+        // step itself instead of digging through ResultJson.
+        step.Faulted = faulted;
         step.CompletedAtUtc = DateTime.UtcNow;
-        _state.LastMessage = $"Step '{name}' completed.";
+        _state.LastMessage = faulted ? $"Step '{name}' completed (child flow failed)." : $"Step '{name}' completed.";
         await SaveAsync(cancellationToken).ConfigureAwait(false);
 
         if (_logger.IsEnabled(LogLevel.Information))

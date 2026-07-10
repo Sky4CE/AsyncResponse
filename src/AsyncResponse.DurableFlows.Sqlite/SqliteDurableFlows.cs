@@ -19,7 +19,10 @@ namespace Microsoft.Extensions.DependencyInjection
             if (configure is not null)
                 builder.Services.Configure(configure);
 
-            builder.Services.TryAddScoped<SqliteFlowStateStore>();
+            // Singleton on purpose: schema provisioning is cached per store instance, and the
+            // executor resolves the store from a fresh scope per flow execution — a scoped store
+            // would re-run EnsureCreated's DDL round-trip on every run.
+            builder.Services.TryAddSingleton<SqliteFlowStateStore>();
             return builder.WithCustomDurableFlows<SqliteFlowStateStore>();
         }
     }
@@ -39,6 +42,13 @@ public sealed class SqliteDurableFlowOptions
     /// <summary>Creates the table and expiry index on first use.</summary>
     public bool AutoCreateSchema { get; set; } = true;
 
+    /// <summary>
+    /// How often <see cref="SqliteFlowStateStore.SaveAsync"/> opportunistically deletes expired rows
+    /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
+    /// prunes on every save. Default: 5 minutes.
+    /// </summary>
+    public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -54,6 +64,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
 {
     private readonly SqliteDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private long _lastPruneTicks;
     private bool _created;
 
     public SqliteFlowStateStore(IOptions<SqliteDurableFlowOptions> options)
@@ -66,6 +77,8 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     {
         DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
@@ -116,6 +129,16 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.CommandText = $"DELETE FROM {Table} WHERE flow_id = $flow_id;";
         command.Parameters.AddWithValue("$flow_id", flowId);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    private async Task PruneExpiredAsync(CancellationToken cancellationToken)
+    {
+        // Timestamps are stored as ISO-8601 TEXT, which compares correctly lexicographically.
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= $now_utc;";
+        command.Parameters.AddWithValue("$now_utc", DateTime.UtcNow);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)

@@ -10,6 +10,14 @@ facts were re-verified July 2026 (sources at the end).
 **Status legend:** 🟢 shipped · 🔴 MUST (next release train) · 🟠 SHOULD · 🟡 COULD
 (demand-driven) · ⚫ WON'T for now (revisit on demand).
 
+**On this page**
+
+- [1. Where we are](#1-where-we-are)
+- [2. The bar for admission (definition of done)](#2-the-bar-for-admission-definition-of-done)
+- [3. Priority ladder](#3-priority-ladder) — MUST / SHOULD / COULD / WON'T
+- [4. Architectural enabler: first-class store-mixing](#4-architectural-enabler-first-class-store-mixing)
+- [5. Suggested sequence](#5-suggested-sequence)
+
 ---
 
 ## 1. Where we are

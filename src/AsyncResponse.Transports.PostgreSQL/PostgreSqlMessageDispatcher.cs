@@ -81,6 +81,7 @@ internal sealed class PostgreSqlMessageDispatcher : IAsyncDisposable
         activity?.SetTag("messaging.system", "postgresql");
         activity?.SetTag("messaging.destination.name", delivery.Queue);
         activity?.SetTag("messaging.message.id", delivery.Id.ToString());
+        activity?.SetTag("messaging.message.delivery_attempt", delivery.Attempt);
 
         if (delivery.Headers.TryGetValue(_options.CorrelationIdHeader, out var correlationId))
             AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
