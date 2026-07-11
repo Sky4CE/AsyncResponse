@@ -70,6 +70,15 @@ jobs:
           dotnet pack src/Transports/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/Transports/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/Transports/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.SqlServer/AsyncResponse.DurableFlows.SqlServer.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.PostgreSQL/AsyncResponse.DurableFlows.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.MySql/AsyncResponse.DurableFlows.MySql.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Sqlite/AsyncResponse.DurableFlows.Sqlite.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Oracle/AsyncResponse.DurableFlows.Oracle.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.MongoDB/AsyncResponse.DurableFlows.MongoDB.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Cosmos/AsyncResponse.DurableFlows.Cosmos.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.DynamoDB/AsyncResponse.DurableFlows.DynamoDB.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.EFCore/AsyncResponse.DurableFlows.EFCore.csproj --configuration Release --no-build -o ./artifacts
 
       - name: Upload packages as build artifacts
         uses: actions/upload-artifact@v4

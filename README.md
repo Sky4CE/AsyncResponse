@@ -473,7 +473,7 @@ per-commit trends with regression alerting are published to the
 
 ## How it's tested
 
-- **2200+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+- **2300+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
 - **140+ integration tests** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, RabbitMQ, Kafka containers plus the official
