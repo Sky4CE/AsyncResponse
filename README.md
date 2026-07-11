@@ -161,6 +161,7 @@ production durable flows:
 | MongoDB | `.WithMongoDbDurableFlows(...)` |
 | Azure Cosmos DB | `.WithCosmosDurableFlows(...)` |
 | DynamoDB | `.WithDynamoDbDurableFlows(...)` |
+| Entity Framework Core (any relational provider) | `.WithEFCoreDurableFlows<TDbContext>(...)` |
 
 See [durable-flow state stores](docs/durable-flow-state-stores.md) for options, schema ownership,
 and custom `IFlowStateStore` examples.

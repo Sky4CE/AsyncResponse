@@ -48,13 +48,16 @@ TTL/cache-shaped, so the default logs a warning the first time it persists flow 
 | `AsyncResponse.DurableFlows.MongoDB` | `WithMongoDbDurableFlows(...)` | MongoDB collection |
 | `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | Azure Cosmos DB container |
 | `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | DynamoDB table |
+| `AsyncResponse.DurableFlows.EFCore` | `WithEFCoreDurableFlows<TDbContext>(...)` | A table in your own `DbContext` (any EF Core relational provider) |
 
-All eight stores run their contract tests against real servers in the default CI integration
+All nine stores run their contract tests against real servers in the default CI integration
 suite — the fixture provisions live SQL Server, PostgreSQL, MySQL, MongoDB, and DynamoDB
 (LocalStack) containers plus `gvenzl/oracle-free` and the Azure Cosmos DB emulator. Set
 `ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS=true` to skip the two heavyweight Oracle/Cosmos containers
-(the store tests then skip cleanly); SQLite additionally has in-repo contract, end-to-end, and
-concurrency-storm unit tests.
+(the store tests then skip cleanly); the EF Core store rides the SQL Server container through the
+`Microsoft.EntityFrameworkCore.SqlServer` provider. SQLite additionally has in-repo contract,
+end-to-end, and concurrency-storm unit tests, and the EF Core store repeats that unit suite over
+the EF SQLite provider in both context-resolution modes.
 
 ## Registration and lifetimes
 
@@ -210,12 +213,46 @@ builder.Services.AddAsyncResponse()
     });
 ```
 
+Entity Framework Core — the ledger table lives inside your own `DbContext`, so it works with any
+EF Core relational provider and rides your existing migration pipeline:
+
+```csharp
+using AsyncResponse.DurableFlows.EFCore;
+
+public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Maps DurableFlowStateRecord; add a normal migration afterwards.
+        modelBuilder.ConfigureAsyncResponseDurableFlows();
+    }
+}
+
+builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString));
+// or AddDbContextFactory<AppDbContext>(...) — the store prefers the factory when one is registered.
+
+builder.Services.AddAsyncResponse()
+    .WithPostgreSqlChannel(...)
+    .WithPostgreSqlTransport(...)
+    .WithEFCoreDurableFlows<AppDbContext>();
+```
+
+Every operation leases a fresh context (from `IDbContextFactory<TContext>` when registered,
+otherwise the scoped `TContext` from a new scope), so parallel flow executions never share a
+`DbContext`. Reads are no-tracking; deletes and pruning use `ExecuteDeleteAsync`, updates use
+`ExecuteUpdateAsync`. Column names match the other relational packages, so the table is
+interchangeable with the ones the SQL Server/PostgreSQL/MySQL/SQLite packages create.
+
 ## Schema ownership
 
 Every package can create its table, collection index, container, or DynamoDB table on first use.
 That is convenient for development and tests. For production environments that use migrations or
 infrastructure-as-code, set the package's `AutoCreate...` option to `false` and provision the
 same shape yourself.
+
+The one exception is `AsyncResponse.DurableFlows.EFCore`: it never runs DDL. The table is part of
+your `DbContext` model (via `ConfigureAsyncResponseDurableFlows()`), so it is created by whatever
+already creates the rest of your schema — EF migrations, `EnsureCreated`, or your own scripts.
 
 Concurrent first-use provisioning is safe across processes:
 

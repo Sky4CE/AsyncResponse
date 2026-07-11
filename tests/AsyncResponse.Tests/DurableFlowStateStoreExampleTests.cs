@@ -1,6 +1,7 @@
 using Amazon.DynamoDBv2;
 using AsyncResponse.DurableFlows.Cosmos;
 using AsyncResponse.DurableFlows.DynamoDB;
+using AsyncResponse.DurableFlows.EFCore;
 using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.DurableFlows.MySql;
 using AsyncResponse.DurableFlows.Oracle;
@@ -9,6 +10,7 @@ using AsyncResponse.DurableFlows.Sqlite;
 using AsyncResponse.DurableFlows.SqlServer;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Data.Sqlite;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -200,6 +202,15 @@ public sealed class DurableFlowStateStoreExampleTests
                 {
                     services.AddSingleton(Mock.Of<IAmazonDynamoDB>());
                     builder.WithDynamoDbDurableFlows(options => options.AutoCreateTable = false);
+                }
+            },
+            {
+                "AsyncResponse.DurableFlows.EFCore",
+                typeof(EFCoreFlowStateStore<TestFlowDbContext>),
+                (services, builder) =>
+                {
+                    services.AddDbContext<TestFlowDbContext>(options => options.UseSqlite("Data Source=:memory:"));
+                    builder.WithEFCoreDurableFlows<TestFlowDbContext>();
                 }
             }
         };

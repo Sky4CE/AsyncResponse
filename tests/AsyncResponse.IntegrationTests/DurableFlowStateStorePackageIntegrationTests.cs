@@ -3,6 +3,7 @@ using Amazon.DynamoDBv2.Model;
 using Amazon.Runtime;
 using AsyncResponse.DurableFlows.Cosmos;
 using AsyncResponse.DurableFlows.DynamoDB;
+using AsyncResponse.DurableFlows.EFCore;
 using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.DurableFlows.MySql;
 using AsyncResponse.DurableFlows.Oracle;
@@ -11,6 +12,10 @@ using AsyncResponse.DurableFlows.SqlServer;
 using AsyncResponse.DurableFlows.Sqlite;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using MySqlConnector;
@@ -101,6 +106,68 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 """;
             await command.ExecuteNonQueryAsync();
         }
+    }
+
+    [Fact]
+    public async Task EFCorePackageStore_RoundTrips_Expires_Deletes_AndSurvivesStorm()
+    {
+        var schema = NewIdentifier("df_ef", 32);
+        var services = new ServiceCollection();
+        services.AddSingleton(new EFCoreFlowSchema(schema));
+        services.AddDbContextFactory<EFCoreFlowDbContext>(options => options.UseSqlServer(Fixture.SqlServerConnectionString));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+
+        try
+        {
+            // The store never runs DDL: create the table exactly the way an application migration
+            // would — from the ConfigureAsyncResponseDurableFlows model mapping.
+            var factory = provider.GetRequiredService<IDbContextFactory<EFCoreFlowDbContext>>();
+            await using (var context = await factory.CreateDbContextAsync())
+                await context.GetService<IRelationalDatabaseCreator>().CreateTablesAsync();
+
+            var store = new EFCoreFlowStateStore<EFCoreFlowDbContext>(
+                provider.GetRequiredService<IServiceScopeFactory>(),
+                Options.Create(new EFCoreDurableFlowOptions()));
+
+            await AssertStoreContractAsync(store);
+
+            // Concurrency storm: parallel save/load/delete against the real database must never
+            // share a DbContext (the store leases one per operation).
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, 64),
+                new ParallelOptions { MaxDegreeOfParallelism = 8 },
+                async (i, _) =>
+                {
+                    var flowId = $"flow-storm-{i}";
+                    await store.SaveAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
+                    Assert.NotNull(await store.LoadAsync(flowId));
+                    Assert.True(await store.TryDeleteAsync(flowId));
+                    Assert.Null(await store.LoadAsync(flowId));
+                });
+        }
+        finally
+        {
+            await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                IF OBJECT_ID(N'{schema}.asyncresponse_flow_state', N'U') IS NOT NULL
+                    DROP TABLE [{schema}].[asyncresponse_flow_state];
+                IF SCHEMA_ID(N'{schema}') IS NOT NULL
+                    EXEC(N'DROP SCHEMA [{schema}]');
+                """;
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    private sealed record EFCoreFlowSchema(string Name);
+
+    private sealed class EFCoreFlowDbContext(DbContextOptions<EFCoreFlowDbContext> options, EFCoreFlowSchema schema)
+        : DbContext(options)
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+            => modelBuilder.ConfigureAsyncResponseDurableFlows(schema: schema.Name);
     }
 
     [Fact]

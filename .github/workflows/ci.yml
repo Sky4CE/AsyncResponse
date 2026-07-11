@@ -57,19 +57,19 @@ jobs:
         run: |
           dotnet pack src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj --configuration Release --no-build -o ./artifacts
           dotnet pack src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Channels.NATS/AsyncResponse.Channels.NATS.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Channels.SqlServer/AsyncResponse.Channels.SqlServer.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
-          dotnet pack src/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Channels/AsyncResponse.Channels.NATS/AsyncResponse.Channels.NATS.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Channels/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Channels/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Channels/AsyncResponse.Channels.SqlServer/AsyncResponse.Channels.SqlServer.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -o ./artifacts
+          dotnet pack src/Transports/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -o ./artifacts
 
       - name: Upload packages as build artifacts
         uses: actions/upload-artifact@v4

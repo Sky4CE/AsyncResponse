@@ -9,7 +9,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Abstractions"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Core", "src\AsyncResponse.Core\AsyncResponse.Core.csproj", "{4D02F64C-28C8-42BA-8085-8A6F22602646}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.Redis", "src\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj", "{88884076-C424-41DF-A603-4E8444E44F0D}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.Redis", "src\Channels\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj", "{88884076-C424-41DF-A603-4E8444E44F0D}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
 EndProject
@@ -19,7 +19,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "samples", "samples", "{5D20
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Sample", "samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj", "{B468B781-2033-4D2C-8A85-E679902F3599}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.GooglePubSub", "src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj", "{CAC5848E-FE27-46C3-9D25-AEE0A5C173F5}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.GooglePubSub", "src\Transports\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj", "{CAC5848E-FE27-46C3-9D25-AEE0A5C173F5}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.AppHost", "samples\AsyncResponse.AppHost\AsyncResponse.AppHost.csproj", "{2D5D80E3-9339-4507-8761-F95BC15C6BA5}"
 EndProject
@@ -33,43 +33,45 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Benchmarks", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.LoadTests", "benchmarks\AsyncResponse.LoadTests\AsyncResponse.LoadTests.csproj", "{5C685573-7900-4FAE-8AD1-A15A535B5454}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.RabbitMQ", "src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj", "{F94A51B3-E5F6-4B60-80D9-DDA1309814C8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.RabbitMQ", "src\Transports\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj", "{F94A51B3-E5F6-4B60-80D9-DDA1309814C8}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.Redis", "src\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj", "{6D8F0646-4EB6-4ED8-B026-A4FBBC7C0C4D}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.Redis", "src\Transports\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj", "{6D8F0646-4EB6-4ED8-B026-A4FBBC7C0C4D}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.NATS", "src\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj", "{F1FA358E-AFA4-4FE4-A0C6-8588D33B30F4}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.NATS", "src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj", "{F1FA358E-AFA4-4FE4-A0C6-8588D33B30F4}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.NATS", "src\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj", "{3BE05289-31FB-445B-8FA3-AA59235E0759}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.NATS", "src\Transports\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj", "{3BE05289-31FB-445B-8FA3-AA59235E0759}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.PostgreSQL", "src\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj", "{09B1683D-D97F-4BA6-8DA3-59D69DA57B8A}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.PostgreSQL", "src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj", "{09B1683D-D97F-4BA6-8DA3-59D69DA57B8A}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.PostgreSQL", "src\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj", "{3559C5CF-DBE4-44B5-884F-D1BCE2826886}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.PostgreSQL", "src\Transports\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj", "{3559C5CF-DBE4-44B5-884F-D1BCE2826886}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.AzureServiceBus", "src\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj", "{E6764D9A-8B89-4C5B-A590-2ACEB21C1B65}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.AzureServiceBus", "src\Transports\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj", "{E6764D9A-8B89-4C5B-A590-2ACEB21C1B65}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.Kafka", "src\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj", "{C2B92AE7-7008-4DE4-8B6A-99829D4546C9}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.Kafka", "src\Transports\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj", "{C2B92AE7-7008-4DE4-8B6A-99829D4546C9}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.SqlServer", "src\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj", "{691DA81B-C7F5-4428-82ED-6889FC375B20}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.SqlServer", "src\Transports\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj", "{691DA81B-C7F5-4428-82ED-6889FC375B20}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.SqlServer", "src\AsyncResponse.Channels.SqlServer\AsyncResponse.Channels.SqlServer.csproj", "{9BD34B3C-4E0F-48D9-95DF-9AD468759064}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Channels.SqlServer", "src\Channels\AsyncResponse.Channels.SqlServer\AsyncResponse.Channels.SqlServer.csproj", "{9BD34B3C-4E0F-48D9-95DF-9AD468759064}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.SQS", "src\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj", "{1B9E218C-B433-46B1-9AB1-D0522DE99F78}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.Transports.SQS", "src\Transports\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj", "{1B9E218C-B433-46B1-9AB1-D0522DE99F78}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.SqlServer", "src\AsyncResponse.DurableFlows.SqlServer\AsyncResponse.DurableFlows.SqlServer.csproj", "{74ED204D-C567-4A2A-BBF4-379FD6649161}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.SqlServer", "src\DurableFlows\AsyncResponse.DurableFlows.SqlServer\AsyncResponse.DurableFlows.SqlServer.csproj", "{74ED204D-C567-4A2A-BBF4-379FD6649161}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.PostgreSQL", "src\AsyncResponse.DurableFlows.PostgreSQL\AsyncResponse.DurableFlows.PostgreSQL.csproj", "{87EE073D-8097-4E2B-A7DD-E92F0CB53D92}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.PostgreSQL", "src\DurableFlows\AsyncResponse.DurableFlows.PostgreSQL\AsyncResponse.DurableFlows.PostgreSQL.csproj", "{87EE073D-8097-4E2B-A7DD-E92F0CB53D92}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.MySql", "src\AsyncResponse.DurableFlows.MySql\AsyncResponse.DurableFlows.MySql.csproj", "{04DD7B2A-BCCE-4F95-B14B-27EFB4C5278E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.MySql", "src\DurableFlows\AsyncResponse.DurableFlows.MySql\AsyncResponse.DurableFlows.MySql.csproj", "{04DD7B2A-BCCE-4F95-B14B-27EFB4C5278E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Sqlite", "src\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj", "{9198FB19-EAB1-4F88-B704-538F036471F5}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Sqlite", "src\DurableFlows\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj", "{9198FB19-EAB1-4F88-B704-538F036471F5}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Oracle", "src\AsyncResponse.DurableFlows.Oracle\AsyncResponse.DurableFlows.Oracle.csproj", "{5488ABD9-F91A-4234-96F8-7AEA2CC77B0E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Oracle", "src\DurableFlows\AsyncResponse.DurableFlows.Oracle\AsyncResponse.DurableFlows.Oracle.csproj", "{5488ABD9-F91A-4234-96F8-7AEA2CC77B0E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.MongoDB", "src\AsyncResponse.DurableFlows.MongoDB\AsyncResponse.DurableFlows.MongoDB.csproj", "{E7F858C0-C716-4DDB-A797-CF80FE663F67}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.MongoDB", "src\DurableFlows\AsyncResponse.DurableFlows.MongoDB\AsyncResponse.DurableFlows.MongoDB.csproj", "{E7F858C0-C716-4DDB-A797-CF80FE663F67}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Cosmos", "src\AsyncResponse.DurableFlows.Cosmos\AsyncResponse.DurableFlows.Cosmos.csproj", "{9A4C5A46-55BB-4A3C-969A-1BF1322D6657}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.Cosmos", "src\DurableFlows\AsyncResponse.DurableFlows.Cosmos\AsyncResponse.DurableFlows.Cosmos.csproj", "{9A4C5A46-55BB-4A3C-969A-1BF1322D6657}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.DynamoDB", "src\AsyncResponse.DurableFlows.DynamoDB\AsyncResponse.DurableFlows.DynamoDB.csproj", "{D8B51C7C-018B-4A98-908D-3FDE7051C9AE}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.DynamoDB", "src\DurableFlows\AsyncResponse.DurableFlows.DynamoDB\AsyncResponse.DurableFlows.DynamoDB.csproj", "{D8B51C7C-018B-4A98-908D-3FDE7051C9AE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AsyncResponse.DurableFlows.EFCore", "src\DurableFlows\AsyncResponse.DurableFlows.EFCore\AsyncResponse.DurableFlows.EFCore.csproj", "{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -441,6 +443,18 @@ Global
 		{D8B51C7C-018B-4A98-908D-3FDE7051C9AE}.Release|x64.Build.0 = Release|Any CPU
 		{D8B51C7C-018B-4A98-908D-3FDE7051C9AE}.Release|x86.ActiveCfg = Release|Any CPU
 		{D8B51C7C-018B-4A98-908D-3FDE7051C9AE}.Release|x86.Build.0 = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|x64.Build.0 = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Debug|x86.Build.0 = Debug|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|x64.ActiveCfg = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|x64.Build.0 = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|x86.ActiveCfg = Release|Any CPU
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -476,5 +490,6 @@ Global
 		{E7F858C0-C716-4DDB-A797-CF80FE663F67} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{9A4C5A46-55BB-4A3C-969A-1BF1322D6657} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{D8B51C7C-018B-4A98-908D-3FDE7051C9AE} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{AB07D2C9-95AE-4D1F-8BC1-D7F7D120D73F} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

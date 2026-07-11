@@ -379,6 +379,7 @@ Supported packages:
 | MongoDB | `WithMongoDbDurableFlows(...)` |
 | Azure Cosmos DB | `WithCosmosDurableFlows(...)` |
 | DynamoDB | `WithDynamoDbDurableFlows(...)` |
+| Entity Framework Core (any relational provider) | `WithEFCoreDurableFlows<TDbContext>(...)` |
 
 If your application already has a different persistence abstraction, register your own store. The
 library calls exactly three members:

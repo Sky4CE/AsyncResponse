@@ -15,16 +15,16 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AsyncResponse.Core\AsyncResponse.Core.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj" />
-    <ProjectReference Include="..\..\src\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj" />
+    <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj" />
   </ItemGroup>
 
 </Project>
