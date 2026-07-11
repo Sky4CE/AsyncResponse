@@ -57,10 +57,10 @@ recovery when a flow needs it.
   classified by the payload's `ShouldResumeOnRecovery()` and routed to a durable resume or failure
   callback. A failed response is **never** blindly resumed.
 - **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL,
-  SQL Server. Worker transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google
-  Pub/Sub, AWS SQS, Kafka, NATS JetStream, PostgreSQL, SQL Server. The Redis channel and transport
-  also run on Valkey and Dragonfly (Garnet as a channel). Every combination works; your flow code
-  never changes.
+  SQL Server, MongoDB. Worker transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus,
+  Google Pub/Sub, AWS SQS, Kafka, NATS JetStream, PostgreSQL, SQL Server, MongoDB. The Redis channel
+  and transport also run on Valkey and Dragonfly (Garnet as a channel). Every combination works;
+  your flow code never changes.
 - **One contract everywhere.** Schema-versioned wire envelopes, capped remote stack traces,
   ambient-context restoration into foreign callback threads, and identical `Until`/recovery
   semantics on every channel — switching infrastructure is a DI change, not a rewrite.
@@ -181,6 +181,7 @@ with any transport.
 | NATS | core request/reply — "no responders" is a positive lost-waiter signal | JetStream Key-Value |
 | PostgreSQL | `LISTEN/NOTIFY` wake + table rows — notifications carry only ids, so payload size is unbounded | row per waiter registration, database-clock TTLs |
 | SQL Server | adaptive polling sweep (tight while waiters exist, backed off while idle) + table rows — same-process deliveries skip the sweep entirely | row per waiter registration, database-clock TTLs |
+| MongoDB | change-stream wake + collection documents — requires a replica set (single-node is enough); degrades to polling on standalone servers | document per waiter registration, native TTL indexes |
 
 **Transports** (`AsyncResponse.Transports.*`) — exactly one required:
 
@@ -196,6 +197,7 @@ with any transport.
 | NATS | JetStream explicit ACKs, NAK-with-delay redelivery, dead-lettering |
 | PostgreSQL | queue table claimed with `FOR UPDATE SKIP LOCKED`, idempotent publish, dead-lettering |
 | SQL Server | queue table claimed with `UPDLOCK, ROWLOCK, READPAST` (the `SKIP LOCKED` equivalent), idempotent publish, dead-lettering |
+| MongoDB | queue collection claimed atomically with `findOneAndUpdate` (server-clock leases, `lock_id` fences), idempotent publish, deterministic dead-letter ids; change-stream wake on replica sets |
 
 Every transport ships hosted subscribers for worker jobs and response ingress with two ACK modes:
 the default acknowledges only after your handler completes; opt-in **early ACK** trades that
@@ -220,10 +222,10 @@ payloads or flows.
 dotnet add package AsyncResponse.Core
 
 # exactly one channel (skip for in-memory):
-dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL / .SqlServer
+dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL / .SqlServer / .MongoDB
 
 # exactly one transport (skip for in-memory):
-dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .SQS / .NATS / .PostgreSQL / .SqlServer
+dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .SQS / .NATS / .PostgreSQL / .SqlServer / .MongoDB
 ```
 
 Targets .NET 8 and .NET 10.
@@ -473,12 +475,12 @@ per-commit trends with regression alerting are published to the
 
 ## How it's tested
 
-- **2300+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
+- **2400+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
   parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **140+ integration tests** drive the shipped sample app black-box over HTTP against **real
-  brokers** — Redis, NATS, PostgreSQL, SQL Server, RabbitMQ, Kafka containers plus the official
-  Azure Service Bus and Google Pub/Sub emulators and LocalStack for AWS SQS — orchestrated by .NET
-  Aspire, with a dedicated early-ACK app instance per transport. A scheduled CI matrix reruns the
+- **160+ integration tests** drive the shipped sample app black-box over HTTP against **real
+  brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
+  Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
+  for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport. A scheduled CI matrix reruns the
   Redis-backed suite against Valkey to hold the Redis-compatible-server claim (Dragonfly is validated
   by running the real channel + transport against a live server).
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,

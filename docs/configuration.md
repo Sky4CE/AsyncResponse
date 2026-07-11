@@ -4,10 +4,11 @@
 
 `AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
 exactly one channel (`.WithInMemoryChannel()`, `.WithRedisChannel()`, `.WithNatsChannel()`,
-`.WithPostgreSqlChannel(...)`, or `.WithSqlServerChannel(...)`) and exactly one transport
-(`.WithInMemoryTransport()`, `.WithRedisTransport(...)`, `.WithAzureServiceBusTransport(...)`,
-`.WithGooglePubSubTransport(...)`, `.WithRabbitMqTransport(...)`, `.WithNatsTransport(...)`,
-`.WithPostgreSqlTransport(...)`, `.WithSqlServerTransport(...)`, or another full AsyncResponse
+`.WithPostgreSqlChannel(...)`, `.WithSqlServerChannel(...)`, or `.WithMongoDbChannel(...)`) and
+exactly one transport (`.WithInMemoryTransport()`, `.WithRedisTransport(...)`,
+`.WithAzureServiceBusTransport(...)`, `.WithGooglePubSubTransport(...)`,
+`.WithRabbitMqTransport(...)`, `.WithNatsTransport(...)`, `.WithPostgreSqlTransport(...)`,
+`.WithSqlServerTransport(...)`, `.WithMongoDbTransport(...)`, or another full AsyncResponse
 transport package). An app that starts without either one fails fast at host startup with setup guidance, so a
 misconfiguration can never silently hang every waiter or drop worker dispatch. The recovery watchdog
 is part of the engine and runs by default for whichever channel you choose.
@@ -85,7 +86,8 @@ package examples, lifetimes, cleanup mechanics, and schema ownership guidance.
 
 Channel options are common where noted and channel-specific otherwise. They are set through the
 channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsChannel(options => …)`,
-`.WithPostgreSqlChannel(options => …)`, `.WithSqlServerChannel(options => …)`).
+`.WithPostgreSqlChannel(options => …)`, `.WithSqlServerChannel(options => …)`,
+`.WithMongoDbChannel(options => …)`).
 
 | Option | Channels | Default | Purpose |
 |---|---|---|---|
@@ -93,23 +95,25 @@ channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsCh
 | `SubjectPrefix` | NATS | `asyncresponse` | Response subjects: `{prefix}.response.{cid}`. |
 | `RecoveryBucket` | NATS | `asyncresponse-recovery` | JetStream KV bucket for recovery state. |
 | `SchemaName` | PostgreSQL, SQL Server | `public` / `dbo` | Schema that contains the channel tables. |
-| `ConnectionString` | SQL Server | — | SQL Server connection string; must point at an existing database (the package creates schema/tables, never the database). |
-| `RecoveryStateTable` | PostgreSQL, SQL Server | `asyncresponse_recovery_state` | Durable lost-subscriber recovery registrations, one row per waiter. |
-| `MessageTable` | PostgreSQL, SQL Server | `asyncresponse_channel_messages` | Stored response envelopes loaded after `LISTEN/NOTIFY` wakeups (PostgreSQL) or by the adaptive polling sweep (SQL Server). |
-| `SubscriberTable` | PostgreSQL, SQL Server | `asyncresponse_channel_subscribers` | Live waiter heartbeat rows used for subscriber counts and delivery confirmation. |
+| `ConnectionString` | SQL Server, MongoDB | — | SQL Server: connection string; must point at an existing database (the package creates schema/tables, never the database). MongoDB: optional — the package prefers a host-registered `IMongoDatabase` (or `IMongoClient` + `DatabaseName`); against a single-node replica set include `directConnection=true`. |
+| `DatabaseName` | MongoDB | — | Database used when no `IMongoDatabase` is registered. |
+| `RecoveryStateTable` / `RecoveryStateCollection` | PostgreSQL, SQL Server, MongoDB | `asyncresponse_recovery_state` | Durable lost-subscriber recovery registrations, one row/document per waiter. MongoDB expires them natively via a TTL index. |
+| `MessageTable` / `MessageCollection` | PostgreSQL, SQL Server, MongoDB | `asyncresponse_channel_messages` | Stored response envelopes loaded after `LISTEN/NOTIFY` wakeups (PostgreSQL), by the adaptive polling sweep (SQL Server), or after change-stream wakeups (MongoDB). |
+| `SubscriberTable` / `SubscriberCollection` | PostgreSQL, SQL Server, MongoDB | `asyncresponse_channel_subscribers` | Live waiter heartbeat rows/documents used for subscriber counts and delivery confirmation. |
 | `NotificationChannel` | PostgreSQL | `asyncresponse_channel_notify` | PostgreSQL `LISTEN/NOTIFY` channel; must be a simple identifier. |
-| `AutoCreateSchema` | PostgreSQL, SQL Server | `true` | Create schema/tables/indexes on first use; set `false` when migrations own DDL. |
-| `MessageRetention` | PostgreSQL, SQL Server | 1 hour | How long response envelope rows remain available for missed notification / cross-process sweep recovery. |
-| `DeliveryConfirmationTimeout` | PostgreSQL, SQL Server | 5 seconds | How long a publisher waits for live waiter confirmation before routing to lost-subscriber recovery. |
-| `DeliveryConfirmationPollInterval` | PostgreSQL, SQL Server | 50 ms | Poll cadence for cross-process delivery confirmation. |
-| `ListenerPollInterval` | PostgreSQL | 250 ms | Missed-notification safety scan interval. |
+| `AutoCreateSchema` / `AutoCreateIndexes` | PostgreSQL, SQL Server, MongoDB | `true` | Create schema/tables/indexes (or TTL + lookup indexes on MongoDB) on first use; set `false` when migrations/provisioning own DDL. |
+| `UseChangeStreams` | MongoDB | `true` | Wake waiters with a change stream on the message collection (requires a replica set; single-node is sufficient). When disabled — or when the server is standalone — waiters fall back to `ListenerPollInterval` polling. |
+| `MessageRetention` | PostgreSQL, SQL Server, MongoDB | 1 hour | How long response envelope rows/documents remain available for missed notification / cross-process sweep recovery. MongoDB reaps them natively via a TTL index. |
+| `DeliveryConfirmationTimeout` | PostgreSQL, SQL Server, MongoDB | 5 seconds | How long a publisher waits for live waiter confirmation before routing to lost-subscriber recovery. |
+| `DeliveryConfirmationPollInterval` | PostgreSQL, SQL Server, MongoDB | 50 ms | Poll cadence for cross-process delivery confirmation. |
+| `ListenerPollInterval` | PostgreSQL, MongoDB | 250 ms | Missed-notification safety scan interval (and the wake cadence when MongoDB change streams are unavailable). |
 | `ActivePollInterval` / `IdlePollInterval` | SQL Server | 250 ms / 2 s | Adaptive polling wake (SQL Server has no `LISTEN/NOTIFY`): sweep cadence while waiters are subscribed, and the backed-off cadence while idle. Same-process deliveries never wait for the sweep. |
-| `PendingMessageBatchSize` | PostgreSQL, SQL Server | 64 | Rows loaded per subscribed correlation id per listener/sweep pass. |
-| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server | 10s / 30s | Heartbeat cadence and liveness window for active waiters. |
-| `RecoveryStateExpiry` | Redis, NATS, PostgreSQL, SQL Server | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
+| `PendingMessageBatchSize` | PostgreSQL, SQL Server, MongoDB | 64 | Rows/documents loaded per subscribed correlation id per listener/sweep pass. |
+| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server, MongoDB | 10s / 30s | Heartbeat cadence and liveness window for active waiters. |
+| `RecoveryStateExpiry` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
 | `DefaultTimeout` | all | `RecoveryStateExpiry` | Default per-waiter timeout when a flow doesn't call `WithTimeout`. |
-| `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
-| `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
+| `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
+| `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
 
 ## Transport options
 
@@ -133,10 +137,12 @@ its own option type; the common shapes are summarized here. See the transport se
 | `WorkerQueue` / `ResponseQueue` | SQS | Queues for worker jobs and response ingress (distinct); each accepts a queue name (resolved once via `GetQueueUrl`) or a full queue URL. A name/URL ending in `.fifo` opts into FIFO publishing: the correlation id becomes the `MessageGroupId` (one flow's jobs stay ordered) and every message carries a unique `MessageDeduplicationId`. |
 | `CreateQueues` / `DeadLetterQueueSuffix` / `MaxReceiveCount` | SQS | Provision the queues on startup, each with a native dead-letter queue (`{queue}-dlq`) wired through a redrive policy: SQS counts receives (`ApproximateReceiveCount`) and moves a message to the DLQ after `MaxReceiveCount`. Off by default — point at existing queues in production. |
 | `WorkerSubscriber.VisibilityTimeout` / `RedeliveryDelay` | SQS | Per-receive visibility timeout (`null` uses the queue's setting) and the optional shortened invisibility applied via `ChangeMessageVisibility` when a handler fails; `null` lets the visibility timeout expire naturally. |
-| `MessageTable` | PostgreSQL, SQL Server | Single queue table containing worker, response-ingress, and dead-letter rows. |
-| `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL, SQL Server | Logical queue names stored in the queue table. They must be distinct. |
+| `MessageTable` / `MessageCollection` | PostgreSQL, SQL Server, MongoDB | Single queue table/collection containing worker, response-ingress, and dead-letter rows/documents. |
+| `ConnectionString` / `DatabaseName` | MongoDB | Optional — the package prefers a host-registered `IMongoDatabase` (or `IMongoClient` + `DatabaseName`). Against a single-node replica set include `directConnection=true`. |
+| `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL, SQL Server, MongoDB | Logical queue names stored in the queue table/collection. They must be distinct. |
 | `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. SQL Server has no equivalent: same-process publishes wake subscribers through an in-process signal, and cross-process rows are picked up within `EmptyPollDelay`. |
-| `LockTimeout` | PostgreSQL, SQL Server | How long a claimed row stays locked before another subscriber may retry it. |
+| `UseChangeStreamWake` | MongoDB | Wake idle subscribers with a change stream on the queue collection (requires a replica set). When disabled — or when the server is standalone — subscribers fall back to `EmptyPollDelay` polling. |
+| `LockTimeout` | PostgreSQL, SQL Server, MongoDB | How long a claimed row/document stays locked (leased) before another subscriber may retry it. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub and SQS | Redeliveries before dead-lettering. Google Pub/Sub and SQS perform redelivery natively — bound attempts with the subscription's `DeadLetterPolicy` (Pub/Sub) or the queue's redrive policy `maxReceiveCount` (SQS, provisioned by `CreateQueues` or your infra). On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
@@ -144,9 +150,9 @@ its own option type; the common shapes are summarized here. See the transport se
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
 | `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
-| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / SQS / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition; on FIFO SQS queues it becomes the `MessageGroupId` with the same per-flow ordering effect. |
-| `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL and SQL Server also unwrap nested JSON strings at those paths. |
-| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Whether poison messages are preserved and, for PostgreSQL and SQL Server, how long dead-letter rows are retained. |
+| `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / SQS / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / MongoDB / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition; on FIFO SQS queues it becomes the `MessageGroupId` with the same per-flow ordering effect. |
+| `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL, SQL Server, and MongoDB also unwrap nested JSON strings at those paths. |
+| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / MongoDB / Kafka | Whether poison messages are preserved and, for PostgreSQL, SQL Server, and MongoDB, how long dead-letter rows/documents are retained. |
 
 A worker handler failure propagates out of the ingress to the transport dispatcher, which owns the
 retry decision: in `AckAfterHandlerCompletes` the delivery is NACKed/abandoned and redelivered up
@@ -229,6 +235,20 @@ moved to the dead-letter queue (rows in the same table). See [postgresql.md](pos
 PostgreSQL table layout, delivery-confirmation details, and connection-string tuning, and
 [sqlserver.md](sqlserver.md) for the SQL Server pair (adaptive polling wake, `UPDLOCK/READPAST`
 claims, application-lock DDL, and operational notes).
+
+MongoDB is the document analogue of that design: a publish is an idempotent insert (a retried
+publish with the same id collides on `_id` and is treated as success), and competing subscribers
+claim documents atomically with `findOneAndUpdate` — the claim increments the attempt count and
+stamps a `lock_id` fence plus a `locked_until` lease evaluated against the server clock (`$$NOW`),
+so publisher/consumer clock skew never fences messages in or out. Acks and NAKs are fenced by the
+`lock_id`, and a document that reaches `MaxDeliveryAttempts` is moved to the dead-letter queue
+(documents in the same collection) under an id derived deterministically from the source message,
+so a crash between the dead-letter insert and the original delete cannot duplicate the DLQ entry.
+Subscribers are woken by a change stream on the queue collection when the server is a replica set
+(single-node is sufficient — the same requirement the MongoDB channel has for its response wake);
+on a standalone server both degrade gracefully to interval polling. The channel stores response
+envelopes, recovery registrations, and waiter heartbeats in TTL-indexed collections, so MongoDB
+itself reaps expired documents — there is no application-side pruning.
 
 ### Redis-compatible servers
 

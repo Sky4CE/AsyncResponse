@@ -65,6 +65,16 @@ const string SqlServerEarlyAckDeadLetterQueue = "deadletter_earlyack";
 // schemas (each package creates its own tables inside the configured schema).
 const string SqlServerSchema = "itest";
 const string SqlServerEarlyAckSchema = "itest_earlyack";
+const string MongoDbWorkerQueue = "worker";
+const string MongoDbResponseQueue = "response";
+const string MongoDbDeadLetterQueue = "deadletter";
+const string MongoDbEarlyAckWorkerQueue = "worker_earlyack";
+const string MongoDbEarlyAckResponseQueue = "response_earlyack";
+const string MongoDbEarlyAckDeadLetterQueue = "deadletter_earlyack";
+// The two MongoDB app variants share one server; they isolate through distinct databases (each
+// package creates its own collections inside the configured database).
+const string MongoDbDatabase = "asyncresponse_itest";
+const string MongoDbEarlyAckDatabase = "asyncresponse_itest_earlyack";
 const string OracleAppUser = "asyncresponse";
 
 static string Env(string name, string fallback)
@@ -121,7 +131,17 @@ var mysql = builder.AddContainer("mysql", "mysql", "8.4")
     .WithEnvironment("MYSQL_ROOT_PASSWORD", "mysql")
     .WithEndpoint(targetPort: 3306, scheme: "tcp", name: "mysql");
 
+// Single-node replica set: change streams — the MongoDB channel's waiter wake and the transport's
+// subscriber wake — require one. The entrypoint wrapper starts mongod with --replSet and initiates
+// the set as soon as the server answers; clients connect with directConnection=true so they never
+// chase the replica-set-advertised container hostname, which is unreachable from the host network.
 var mongodb = builder.AddContainer("mongodb", "mongo", "7")
+    .WithEntrypoint("bash")
+    .WithArgs(
+        "-c",
+        "mongod --replSet rs0 --bind_ip_all & MONGOD_PID=$!; " +
+        "until mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate().ok }' >/dev/null 2>&1; do sleep 0.5; done; " +
+        "wait $MONGOD_PID")
     .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
 
 // Oracle and Cosmos back the durable-flow store contract tests, which run in default CI. They are
@@ -205,6 +225,10 @@ var postgresEndpoint = postgres.GetEndpoint("postgres");
 // dedicated long-lived connections, so skipping reset on the pooled query connections is safe.
 var postgresConnectionString = ReferenceExpression.Create(
     $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");
+
+var mongoDbEndpoint = mongodb.GetEndpoint("mongodb");
+var mongoDbConnectionString = ReferenceExpression.Create(
+    $"mongodb://{mongoDbEndpoint.Property(EndpointProperty.Host)}:{mongoDbEndpoint.Property(EndpointProperty.Port)}/?directConnection=true");
 
 // Cap each app's SqlClient pool (2 apps x 120 = 240) well under SQL Server's default connection
 // ceiling, mirroring the PostgreSQL budget above. TrustServerCertificate accepts the container's
@@ -529,6 +553,39 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql-early-ac
     .WithEnvironment("PostgreSQL:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
     .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+// MongoDB channel + transport on one shared client. The default variant also persists durable-flow
+// ledgers through the AsyncResponse.DurableFlows.MongoDB package, so flow checkpoints, resumes, and
+// state reads ride the same replica set as the channel and the worker queue.
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb", launchProfileName: null)
+    .WaitFor(mongodb)
+    .WithEnvironment("ConnectionStrings:MongoDB", mongoDbConnectionString)
+    .WithEnvironment("MongoDB:DatabaseName", MongoDbDatabase)
+    .WithEnvironment("MongoDB:WorkerQueue", MongoDbWorkerQueue)
+    .WithEnvironment("MongoDB:ResponseQueue", MongoDbResponseQueue)
+    .WithEnvironment("MongoDB:DeadLetterQueue", MongoDbDeadLetterQueue)
+    .WithEnvironment("AsyncResponse:DurableFlowStore", "mongodb")
+    .WithEnvironment("AsyncResponse:Channel", "MongoDB")
+    .WithEnvironment("AsyncResponse:Transport", "MongoDB")
+    .WithHttpEndpoint()
+    .WithHttpHealthCheck("/alive");
+
+builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb-early-ack", launchProfileName: null)
+    .WaitFor(mongodb)
+    .WithEnvironment("ConnectionStrings:MongoDB", mongoDbConnectionString)
+    .WithEnvironment("MongoDB:DatabaseName", MongoDbEarlyAckDatabase)
+    .WithEnvironment("MongoDB:WorkerQueue", MongoDbEarlyAckWorkerQueue)
+    .WithEnvironment("MongoDB:ResponseQueue", MongoDbEarlyAckResponseQueue)
+    .WithEnvironment("MongoDB:DeadLetterQueue", MongoDbEarlyAckDeadLetterQueue)
+    .WithEnvironment("MongoDB:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_MONGODB_WORKER_ACK_MODE", "AckAfterEnqueue"))
+    .WithEnvironment("MongoDB:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_MONGODB_WORKER_BACKGROUND_WORKERS", "4"))
+    .WithEnvironment("MongoDB:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_MONGODB_WORKER_QUEUE_CAPACITY", "256"))
+    .WithEnvironment("MongoDB:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_MONGODB_WORKER_DRAIN_SECONDS", "10"))
+    .WithEnvironment("MongoDB:HostShutdownTimeoutSeconds", "30")
+    .WithEnvironment("AsyncResponse:Channel", "MongoDB")
+    .WithEnvironment("AsyncResponse:Transport", "MongoDB")
     .WithHttpEndpoint()
     .WithHttpHealthCheck("/alive");
 

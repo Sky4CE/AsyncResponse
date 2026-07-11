@@ -1,0 +1,497 @@
+using Microsoft.Extensions.Options;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+using MongoDB.Driver;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+
+namespace AsyncResponse.Channels.MongoDB;
+
+internal readonly record struct MongoDbChannelMessage(Guid Id, string CorrelationId, string EnvelopeJson);
+
+/// <summary>Document adapter for the MongoDB channel collections and change-stream wake.</summary>
+internal sealed class MongoDbChannelStore : IDisposable
+{
+    private readonly IMongoCollection<MongoRecoveryStateDocument> _recovery;
+    private readonly IMongoCollection<MongoChannelMessageDocument> _messages;
+    private readonly IMongoCollection<MongoChannelSubscriberDocument> _subscribers;
+    private readonly IMongoDatabase _database;
+    private readonly MongoDbAsyncResponseChannelOptions _options;
+    private readonly SemaphoreSlim _ensureGate = new(1, 1);
+    private readonly IMongoClient? _ownedClient;
+    private bool _created;
+
+    public MongoDbChannelStore(
+        IMongoDatabase database,
+        IOptions<MongoDbAsyncResponseChannelOptions> options,
+        IMongoClient? ownedClient = null)
+    {
+        _options = options.Value;
+        _options.Validate();
+        _database = database;
+        _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
+        _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
+        _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection);
+        _ownedClient = ownedClient;
+    }
+
+    public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
+    {
+        if (_created || !_options.AutoCreateIndexes)
+            return;
+
+        await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_created)
+                return;
+
+            // TTL indexes (expireAfterSeconds = 0 on the expiry timestamp) make MongoDB itself reap
+            // expired documents — no application-side pruning needed. Reads still filter on the
+            // expiry because the TTL monitor only runs periodically (~60s).
+            await CreateTtlIndexAsync(
+                _recovery,
+                Builders<MongoRecoveryStateDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
+                $"{_options.RecoveryStateCollection}_expires_idx",
+                cancellationToken).ConfigureAwait(false);
+            await _recovery.Indexes.CreateOneAsync(
+                new CreateIndexModel<MongoRecoveryStateDocument>(
+                    Builders<MongoRecoveryStateDocument>.IndexKeys
+                        .Ascending(item => item.CorrelationId)
+                        .Ascending(item => item.RegisteredAtUtc),
+                    new CreateIndexOptions { Name = $"{_options.RecoveryStateCollection}_correlation_idx" }),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            await CreateTtlIndexAsync(
+                _messages,
+                Builders<MongoChannelMessageDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
+                $"{_options.MessageCollection}_expires_idx",
+                cancellationToken).ConfigureAwait(false);
+            await _messages.Indexes.CreateOneAsync(
+                new CreateIndexModel<MongoChannelMessageDocument>(
+                    Builders<MongoChannelMessageDocument>.IndexKeys
+                        .Ascending(item => item.CorrelationId)
+                        .Ascending(item => item.CreatedAtUtc),
+                    new CreateIndexOptions { Name = $"{_options.MessageCollection}_correlation_created_idx" }),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            await CreateTtlIndexAsync(
+                _subscribers,
+                Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.ExpiresAtUtc),
+                $"{_options.SubscriberCollection}_expires_idx",
+                cancellationToken).ConfigureAwait(false);
+            await _subscribers.Indexes.CreateOneAsync(
+                new CreateIndexModel<MongoChannelSubscriberDocument>(
+                    Builders<MongoChannelSubscriberDocument>.IndexKeys.Ascending(item => item.CorrelationId),
+                    new CreateIndexOptions { Name = $"{_options.SubscriberCollection}_correlation_idx" }),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            _created = true;
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+    }
+
+    private static async Task CreateTtlIndexAsync<TDocument>(
+        IMongoCollection<TDocument> collection,
+        IndexKeysDefinition<TDocument> keys,
+        string indexName,
+        CancellationToken cancellationToken)
+    {
+        var model = new CreateIndexModel<TDocument>(
+            keys,
+            new CreateIndexOptions { Name = indexName, ExpireAfter = TimeSpan.Zero });
+        try
+        {
+            await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (MongoCommandException ex) when (ex.Code is 85 or 86)
+        {
+            // IndexOptionsConflict/IndexKeySpecsConflict: an earlier deployment created the
+            // same-named index with different options. Replace it in place.
+            await collection.Indexes.DropOneAsync(indexName, cancellationToken).ConfigureAwait(false);
+            await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public async Task SaveRecoveryStateAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTime.UtcNow;
+        var document = new MongoRecoveryStateDocument
+        {
+            Id = RegistrationKey(correlationId, state.RegistrationId),
+            CorrelationId = correlationId,
+            RegistrationId = state.RegistrationId,
+            StateJson = JsonSerializer.Serialize(state),
+            ExpiresAtUtc = now.Add(ttl),
+            RegisteredAtUtc = now
+        };
+        await _recovery.ReplaceOneAsync(
+            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, document.Id),
+            document,
+            new ReplaceOptions { IsUpsert = true },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<IReadOnlyList<string>> LoadRecoveryStatesAsync(string correlationId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
+                     & Builders<MongoRecoveryStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        var documents = await _recovery.Find(filter)
+            .SortBy(item => item.RegisteredAtUtc)
+            .Project(item => item.StateJson)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        return documents;
+    }
+
+    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid? registrationId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (registrationId is null)
+        {
+            var result = await _recovery.DeleteManyAsync(
+                Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId),
+                cancellationToken).ConfigureAwait(false);
+            return result.DeletedCount > 0;
+        }
+
+        var single = await _recovery.DeleteOneAsync(
+            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId.Value)),
+            cancellationToken).ConfigureAwait(false);
+        return single.DeletedCount > 0;
+    }
+
+    public async IAsyncEnumerable<string> ScanRecoveryStateJsonAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoRecoveryStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        using var cursor = await _recovery.Find(filter)
+            .SortBy(item => item.RegisteredAtUtc)
+            .Project(item => item.StateJson)
+            .ToCursorAsync(cancellationToken).ConfigureAwait(false);
+        while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var json in cursor.Current)
+                yield return json;
+        }
+    }
+
+    /// <summary>
+    /// Inserts a response envelope document. The caller supplies the message id and the write is an
+    /// upsert that preserves an existing document, so a retried publish is idempotent rather than
+    /// duplicating the response. Timestamps are stamped with the server clock (<c>$$NOW</c>) so
+    /// dispatch watermarks never mix client and server clocks. The insert itself is the wake signal:
+    /// every process's change stream observes it.
+    /// </summary>
+    public Task InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+        => AsyncResponseRetry.ExecuteAsync(
+            token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
+            IsTransient,
+            _options.PublishMaxAttempts,
+            _options.PublishRetryBaseDelay,
+            _options.PublishRetryMaxDelay,
+            cancellationToken);
+
+    private async Task<bool> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await _messages.UpdateOneAsync(
+            Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
+            BuildInsertMessagePipeline(correlationId, envelopeJson, retention),
+            new UpdateOptions { IsUpsert = true },
+            cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Upsert pipeline for a response envelope: <c>$ifNull</c> keeps the original server-stamped
+    /// timestamps and claim flags when a publish retry finds the document already present.
+    /// </summary>
+    internal static UpdateDefinition<MongoChannelMessageDocument> BuildInsertMessagePipeline(
+        string correlationId,
+        string envelopeJson,
+        TimeSpan retention)
+        => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["correlation_id"] = correlationId,
+                ["envelope_json"] = envelopeJson,
+                ["created_at"] = new BsonDocument("$ifNull", new BsonArray { "$created_at", "$$NOW" }),
+                ["expires_at"] = new BsonDocument("$ifNull", new BsonArray
+                {
+                    "$expires_at",
+                    new BsonDocument("$add", new BsonArray { "$$NOW", retention.TotalMilliseconds })
+                }),
+                ["acked_at"] = new BsonDocument("$ifNull", new BsonArray { "$acked_at", BsonNull.Value }),
+                ["recovery_claimed"] = new BsonDocument("$ifNull", new BsonArray { "$recovery_claimed", false })
+            })
+        });
+
+    public async Task<IReadOnlyList<MongoDbChannelMessage>> LoadMessagesAsync(
+        string correlationId,
+        DateTimeOffset sinceUtc,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
+                     & Builders<MongoChannelMessageDocument>.Filter.Gte(item => item.CreatedAtUtc, sinceUtc.UtcDateTime)
+                     & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        var documents = await _messages.Find(filter)
+            .SortBy(item => item.CreatedAtUtc)
+            .Limit(batchSize)
+            .ToListAsync(cancellationToken).ConfigureAwait(false);
+        var messages = new List<MongoDbChannelMessage>(documents.Count);
+        foreach (var document in documents)
+            messages.Add(new MongoDbChannelMessage(document.Id, document.CorrelationId, document.EnvelopeJson));
+        return messages;
+    }
+
+    /// <summary>
+    /// Atomically claims a message for live delivery via <c>findOneAndUpdate</c>: sets
+    /// <c>acked_at</c> unless the publisher has already routed it to the lost-subscriber path
+    /// (<c>recovery_claimed</c>). Returns <c>false</c> when recovery owns the message, so a
+    /// slow-but-live waiter does not deliver a response the recovery callback already handled.
+    /// Multiple processes may each win this claim, preserving cross-process fan-out, because it
+    /// gates only on <c>recovery_claimed</c>, not on <c>acked_at</c>.
+    /// </summary>
+    public async Task<bool> TryClaimForDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var claimed = await _messages.FindOneAndUpdateAsync(
+            BuildDeliveryClaimFilter(messageId),
+            BuildDeliveryClaimUpdate(),
+            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
+            cancellationToken).ConfigureAwait(false);
+        return claimed is not null;
+    }
+
+    internal static FilterDefinition<MongoChannelMessageDocument> BuildDeliveryClaimFilter(Guid messageId)
+        => Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
+           & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
+           & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+
+    internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate()
+        => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument(
+                "acked_at",
+                new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" })))
+        });
+
+    /// <summary>
+    /// Atomically claims a message for the lost-subscriber path: sets <c>recovery_claimed</c> only
+    /// while no waiter has delivered (<c>acked_at</c> is still null). Returns <c>true</c> when
+    /// recovery wins; <c>false</c> means a live waiter already took the message, so the publisher
+    /// must not also fire the recovery callback. Document-level atomicity of
+    /// <c>findOneAndUpdate</c> serializes this against <see cref="TryClaimForDeliveryAsync"/>.
+    /// </summary>
+    public async Task<bool> TryClaimForRecoveryAsync(Guid messageId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var claimed = await _messages.FindOneAndUpdateAsync(
+            BuildRecoveryClaimFilter(messageId),
+            Builders<MongoChannelMessageDocument>.Update.Set(item => item.RecoveryClaimed, true),
+            new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
+            cancellationToken).ConfigureAwait(false);
+        return claimed is not null;
+    }
+
+    internal static FilterDefinition<MongoChannelMessageDocument> BuildRecoveryClaimFilter(Guid messageId)
+        => Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
+           & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.AckedAtUtc, null);
+
+    /// <summary>Returns the server's current UTC time, used as a clock-safe delivery watermark.</summary>
+    public async Task<DateTimeOffset> GetServerTimeUtcAsync(CancellationToken cancellationToken)
+    {
+        var reply = await _database.RunCommandAsync<BsonDocument>(
+            new BsonDocument("hello", 1),
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        return reply.TryGetValue("localTime", out var localTime) && localTime is BsonDateTime serverTime
+            ? new DateTimeOffset(serverTime.ToUniversalTime(), TimeSpan.Zero)
+            : DateTimeOffset.UtcNow;
+    }
+
+    public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
+                     & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        var document = await _messages.Find(filter)
+            .Project(item => new { item.AckedAtUtc })
+            .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        return document?.AckedAtUtc is not null;
+    }
+
+    public async Task UpsertSubscriberAsync(string correlationId, Guid registrationId, string instanceId, TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var document = new MongoChannelSubscriberDocument
+        {
+            Id = RegistrationKey(correlationId, registrationId),
+            CorrelationId = correlationId,
+            RegistrationId = registrationId,
+            InstanceId = instanceId,
+            ExpiresAtUtc = DateTime.UtcNow.Add(ttl)
+        };
+        await _subscribers.ReplaceOneAsync(
+            Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.Id, document.Id),
+            document,
+            new ReplaceOptions { IsUpsert = true },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task DeleteSubscriberAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await _subscribers.DeleteOneAsync(
+            Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId)),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
+                     & Builders<MongoChannelSubscriberDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        return await _subscribers.CountDocumentsAsync(filter, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Watches the message collection with a change stream and invokes
+    /// <paramref name="onNotification"/> with the correlation id of every inserted response. One
+    /// stream serves every local waiter — the caller routes the id to the right subscription — so
+    /// waiter count never multiplies server-side cursors. Runs until cancellation or a stream error.
+    /// </summary>
+    public async Task WatchMessagesAsync(Func<string?, Task> onNotification, CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        using var cursor = await _messages.WatchAsync(
+            BuildMessageWatchPipeline(),
+            new ChangeStreamOptions { FullDocument = ChangeStreamFullDocumentOption.UpdateLookup },
+            cancellationToken).ConfigureAwait(false);
+        while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var change in cursor.Current)
+                await onNotification(change.FullDocument?.CorrelationId).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Change-stream pipeline for response wakes: a <c>$match</c> on insert events. The correlation
+    /// id travels in the event's full document, letting the dispatcher scan only the signaled
+    /// correlation id — the targeted-wake contract.
+    /// </summary>
+    internal static PipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>, ChangeStreamDocument<MongoChannelMessageDocument>> BuildMessageWatchPipeline()
+        => new EmptyPipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>>()
+            .Match(change => change.OperationType == ChangeStreamOperationType.Insert);
+
+    /// <summary>Returns <c>true</c> when the server rejected the change stream itself (not a transient cursor error).</summary>
+    internal static bool IsChangeStreamUnsupported(Exception exception)
+        => exception is MongoCommandException commandException
+           && (commandException.Code == 40573
+               || commandException.Message.Contains("only supported on replica sets", StringComparison.OrdinalIgnoreCase));
+
+    internal static string RegistrationKey(string correlationId, Guid registrationId)
+        => $"{correlationId}:{registrationId:N}";
+
+    internal static bool IsTransient(Exception exception)
+        => exception is not OperationCanceledException
+           && (exception is MongoConnectionException
+               or MongoNotPrimaryException
+               or MongoNodeIsRecoveringException
+               or MongoExecutionTimeoutException
+               or TimeoutException
+               || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
+
+    /// <summary>Validates a MongoDB collection name coming from options.</summary>
+    public static void ValidateCollectionName(string? value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} must be configured.");
+        if (value.Contains('$') || value.Contains('\0') || value.StartsWith("system.", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in the system namespace).");
+    }
+
+    /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>
+    public void Dispose()
+    {
+        _ensureGate.Dispose();
+        (_ownedClient as IDisposable)?.Dispose();
+    }
+}
+
+internal sealed class MongoRecoveryStateDocument
+{
+    [BsonId]
+    [BsonElement("_id")]
+    public string Id { get; set; } = "";
+
+    [BsonElement("correlation_id")]
+    public string CorrelationId { get; set; } = "";
+
+    [BsonElement("registration_id")]
+    [BsonGuidRepresentation(GuidRepresentation.Standard)]
+    public Guid RegistrationId { get; set; }
+
+    [BsonElement("state_json")]
+    public string StateJson { get; set; } = "";
+
+    [BsonElement("expires_at")]
+    public DateTime ExpiresAtUtc { get; set; }
+
+    [BsonElement("registered_at")]
+    public DateTime RegisteredAtUtc { get; set; }
+}
+
+internal sealed class MongoChannelMessageDocument
+{
+    [BsonId]
+    [BsonElement("_id")]
+    [BsonGuidRepresentation(GuidRepresentation.Standard)]
+    public Guid Id { get; set; }
+
+    [BsonElement("correlation_id")]
+    public string CorrelationId { get; set; } = "";
+
+    [BsonElement("envelope_json")]
+    public string EnvelopeJson { get; set; } = "";
+
+    [BsonElement("created_at")]
+    public DateTime CreatedAtUtc { get; set; }
+
+    [BsonElement("expires_at")]
+    public DateTime ExpiresAtUtc { get; set; }
+
+    [BsonElement("acked_at")]
+    public DateTime? AckedAtUtc { get; set; }
+
+    [BsonElement("recovery_claimed")]
+    public bool RecoveryClaimed { get; set; }
+}
+
+internal sealed class MongoChannelSubscriberDocument
+{
+    [BsonId]
+    [BsonElement("_id")]
+    public string Id { get; set; } = "";
+
+    [BsonElement("correlation_id")]
+    public string CorrelationId { get; set; } = "";
+
+    [BsonElement("registration_id")]
+    [BsonGuidRepresentation(GuidRepresentation.Standard)]
+    public Guid RegistrationId { get; set; }
+
+    [BsonElement("instance_id")]
+    public string InstanceId { get; set; } = "";
+
+    [BsonElement("expires_at")]
+    public DateTime ExpiresAtUtc { get; set; }
+}

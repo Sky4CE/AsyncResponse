@@ -45,6 +45,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
@@ -61,6 +62,7 @@
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.MongoDB\AsyncResponse.Transports.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />

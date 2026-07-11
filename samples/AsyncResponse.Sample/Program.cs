@@ -1,4 +1,5 @@
 using AsyncResponse;
+using AsyncResponse.Channels.MongoDB;
 using AsyncResponse.Channels.NATS;
 using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Channels.Redis;
@@ -7,6 +8,7 @@ using AsyncResponse.Sample;
 using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.Kafka;
+using AsyncResponse.Transports.MongoDB;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
@@ -21,6 +23,7 @@ using Google.Protobuf;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using RabbitMQ.Client;
+using MongoDB.Driver;
 using System.Text;
 using StackExchange.Redis;
 using System.Text.Json;
@@ -35,13 +38,14 @@ builder.Services.AddOpenApi();
 // Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
-var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL | SqlServer
-var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL | SqlServer | SQS
+var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL | SqlServer | MongoDB
+var transport = builder.Configuration["AsyncResponse:Transport"] ?? "InMemory";  // InMemory | AzureServiceBus | GooglePubSub | Kafka | RabbitMQ | Redis | NATS | PostgreSQL | SqlServer | SQS | MongoDB
 var useInMemoryChannel = string.Equals(channel, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useRedis = string.Equals(channel, "Redis", StringComparison.OrdinalIgnoreCase);
 var useNats = string.Equals(channel, "NATS", StringComparison.OrdinalIgnoreCase);
 var usePostgreSql = string.Equals(channel, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 var useSqlServer = string.Equals(channel, "SqlServer", StringComparison.OrdinalIgnoreCase);
+var useMongoDb = string.Equals(channel, "MongoDB", StringComparison.OrdinalIgnoreCase);
 var useInMemoryTransport = string.Equals(transport, "InMemory", StringComparison.OrdinalIgnoreCase);
 var useAzureServiceBus = string.Equals(transport, "AzureServiceBus", StringComparison.OrdinalIgnoreCase);
 var useGooglePubSub = string.Equals(transport, "GooglePubSub", StringComparison.OrdinalIgnoreCase);
@@ -52,6 +56,7 @@ var useNatsTransport = string.Equals(transport, "NATS", StringComparison.Ordinal
 var usePostgreSqlTransport = string.Equals(transport, "PostgreSQL", StringComparison.OrdinalIgnoreCase);
 var useSqlServerTransport = string.Equals(transport, "SqlServer", StringComparison.OrdinalIgnoreCase);
 var useSqs = string.Equals(transport, "SQS", StringComparison.OrdinalIgnoreCase);
+var useMongoDbTransport = string.Equals(transport, "MongoDB", StringComparison.OrdinalIgnoreCase);
 
 if (useRedis || useRedisTransport)
 {
@@ -89,6 +94,20 @@ if (useSqlServer || useSqlServerTransport)
     // AsyncResponse SQL Server packages create their own schema and tables, but cannot connect to a
     // missing database. Registered before the AsyncResponse wiring so it runs before any subscriber.
     builder.Services.AddHostedService<SqlServerDatabaseProvisioner>();
+}
+
+if (useMongoDb || useMongoDbTransport)
+{
+    // One shared client/database backs the MongoDB channel, the MongoDB transport, and (opt-in) the
+    // MongoDB durable-flow store. directConnection matters for the single-node replica set the
+    // integration harness runs: without it the driver would chase the replica-set-advertised
+    // container hostname, which is unreachable from outside the container network.
+    var mongoConnectionString = builder.Configuration.GetConnectionString("MongoDB")
+        ?? builder.Configuration["MongoDB:ConnectionString"]
+        ?? "mongodb://localhost:27017/?directConnection=true";
+    var mongoDatabaseName = builder.Configuration["MongoDB:DatabaseName"] ?? "asyncresponse";
+    builder.Services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoConnectionString));
+    builder.Services.AddSingleton(provider => provider.GetRequiredService<IMongoClient>().GetDatabase(mongoDatabaseName));
 }
 
 // Provision the emulator's topics/subscriptions before the transport's subscribers start
@@ -143,6 +162,10 @@ else if (useSqlServerTransport)
 else if (useSqs)
 {
     ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "SQS");
+}
+else if (useMongoDbTransport)
+{
+    ConfigureHostShutdownBudget(builder.Configuration, builder.Services, "MongoDB");
 }
 
 var asyncResponse = builder.Services.AddAsyncResponse(options =>
@@ -200,6 +223,20 @@ else if (useSqlServer)
         ApplyOptionalMilliseconds(builder.Configuration, "SqlServer:ChannelIdlePollIntervalMs", value => options.IdlePollInterval = value);
     });
 }
+else if (useMongoDb)
+{
+    asyncResponse.WithMongoDbChannel(options =>
+    {
+        options.RecoveryStateCollection = builder.Configuration["MongoDB:RecoveryStateCollection"] ?? options.RecoveryStateCollection;
+        options.MessageCollection = builder.Configuration["MongoDB:ChannelMessageCollection"] ?? options.MessageCollection;
+        options.SubscriberCollection = builder.Configuration["MongoDB:SubscriberCollection"] ?? options.SubscriberCollection;
+        options.DefaultTimeout = TimeSpan.FromSeconds(30);
+        if (bool.TryParse(builder.Configuration["MongoDB:UseChangeStreams"], out var useChangeStreams))
+            options.UseChangeStreams = useChangeStreams;
+        ApplyOptionalTimeout(builder.Configuration, "MongoDB:ChannelDeliveryConfirmationTimeoutSeconds", value => options.DeliveryConfirmationTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "MongoDB:ChannelListenerPollIntervalMs", value => options.ListenerPollInterval = value);
+    });
+}
 else if (useInMemoryChannel)
 {
     asyncResponse.WithInMemoryChannel();
@@ -207,7 +244,7 @@ else if (useInMemoryChannel)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', 'NATS', 'PostgreSQL', or 'SqlServer'.");
+        "Unsupported AsyncResponse:Channel value. Use 'InMemory', 'Redis', 'NATS', 'PostgreSQL', 'SqlServer', or 'MongoDB'.");
 }
 
 // Exactly one worker transport (enforced at host startup).
@@ -453,6 +490,33 @@ else if (useSqs)
         ConfigureSqsSubscriber(builder.Configuration, "SQS:Response", options.ResponseSubscriber);
     });
 }
+else if (useMongoDbTransport)
+{
+    asyncResponse.WithMongoDbTransport(options =>
+    {
+        options.MessageCollection = builder.Configuration["MongoDB:TransportMessageCollection"] ?? options.MessageCollection;
+        options.WorkerQueue = builder.Configuration["MongoDB:WorkerQueue"] ?? options.WorkerQueue;
+        options.ResponseQueue = builder.Configuration["MongoDB:ResponseQueue"] ?? options.ResponseQueue;
+        options.DeadLetterQueue = builder.Configuration["MongoDB:DeadLetterQueue"] ?? options.DeadLetterQueue;
+        options.CorrelationIdHeader = builder.Configuration["MongoDB:CorrelationIdHeader"] ?? options.CorrelationIdHeader;
+
+        if (bool.TryParse(builder.Configuration["MongoDB:DeadLetterEnabled"], out var deadLetterEnabled))
+            options.DeadLetterEnabled = deadLetterEnabled;
+        if (bool.TryParse(builder.Configuration["MongoDB:UseChangeStreamWake"], out var useChangeStreamWake))
+            options.UseChangeStreamWake = useChangeStreamWake;
+        if (int.TryParse(builder.Configuration["MongoDB:PublishMaxAttempts"], out var publishMaxAttempts))
+            options.PublishMaxAttempts = publishMaxAttempts;
+
+        ApplyOptionalTimeout(builder.Configuration, "MongoDB:LockTimeoutSeconds", value => options.LockTimeout = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "MongoDB:PublishRetryBaseDelayMs", value => options.PublishRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "MongoDB:PublishRetryMaxDelayMs", value => options.PublishRetryMaxDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "MongoDB:SubscriberRetryBaseDelayMs", value => options.SubscriberRetryBaseDelay = value);
+        ApplyOptionalMilliseconds(builder.Configuration, "MongoDB:SubscriberRetryMaxDelayMs", value => options.SubscriberRetryMaxDelay = value);
+
+        ConfigureMongoDbSubscriber(builder.Configuration, "MongoDB:Worker", options.WorkerSubscriber);
+        ConfigureMongoDbSubscriber(builder.Configuration, "MongoDB:Response", options.ResponseSubscriber);
+    });
+}
 else if (useInMemoryTransport)
 {
     asyncResponse.WithInMemoryTransport();
@@ -460,7 +524,7 @@ else if (useInMemoryTransport)
 else
 {
     throw new InvalidOperationException(
-        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', 'PostgreSQL', 'SqlServer', or 'SQS'.");
+        "Unsupported AsyncResponse:Transport value. Use 'InMemory', 'AzureServiceBus', 'GooglePubSub', 'Kafka', 'RabbitMQ', 'Redis', 'NATS', 'PostgreSQL', 'SqlServer', 'SQS', or 'MongoDB'.");
 }
 
 // Ambient-context propagators — trace and tenant compose, each carrying its own key across hops.
@@ -479,6 +543,13 @@ if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase
 {
     var flowDatabasePath = Path.Combine(Path.GetTempPath(), "asyncresponse-sample-flow-state.db");
     asyncResponse.WithSqliteDurableFlows(options => options.ConnectionString = $"Data Source={flowDatabasePath}");
+}
+else if (string.Equals(durableFlowStore, "mongodb", StringComparison.OrdinalIgnoreCase))
+{
+    // Persists flow ledgers with the AsyncResponse.DurableFlows.MongoDB package, reusing the shared
+    // IMongoDatabase registered above — the same server backs channel, transport, and flow state.
+    asyncResponse.WithMongoDbDurableFlows(options =>
+        options.CollectionName = builder.Configuration["MongoDB:FlowStateCollection"] ?? options.CollectionName);
 }
 
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
@@ -529,6 +600,7 @@ app.MapGet("/config", (IServiceProvider services) =>
     object? nats = null;
     object? postgres = null;
     object? sqlserver = null;
+    object? mongodb = null;
     object? azureServiceBus = null;
     object? sqs = null;
     if (useSqs)
@@ -793,7 +865,55 @@ app.MapGet("/config", (IServiceProvider services) =>
         };
     }
 
-    return Results.Ok(new { channel, transport, azureServiceBus, sqs, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver });
+    if (useMongoDb || useMongoDbTransport)
+    {
+        string? recoveryStateCollection = null;
+        string? channelMessageCollection = null;
+        string? subscriberCollection = null;
+        string? transportMessageCollection = null;
+        string? workerQueue = null;
+        string? responseQueue = null;
+        var workerAckMode = "n/a";
+        var responseAckMode = "n/a";
+        var workerBackgroundWorkerCount = 0;
+        var workerBackgroundQueueCapacity = 0;
+
+        if (useMongoDb)
+        {
+            var channelOptions = services.GetRequiredService<IOptions<MongoDbAsyncResponseChannelOptions>>().Value;
+            recoveryStateCollection = channelOptions.RecoveryStateCollection;
+            channelMessageCollection = channelOptions.MessageCollection;
+            subscriberCollection = channelOptions.SubscriberCollection;
+        }
+
+        if (useMongoDbTransport)
+        {
+            var transportOptions = services.GetRequiredService<IOptions<MongoDbAsyncResponseTransportOptions>>().Value;
+            transportMessageCollection = transportOptions.MessageCollection;
+            workerQueue = transportOptions.WorkerQueue;
+            responseQueue = transportOptions.ResponseQueue;
+            workerAckMode = transportOptions.WorkerSubscriber.AckMode.ToString();
+            workerBackgroundWorkerCount = transportOptions.WorkerSubscriber.BackgroundWorkerCount;
+            workerBackgroundQueueCapacity = transportOptions.WorkerSubscriber.BackgroundQueueCapacity;
+            responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
+        }
+
+        mongodb = new
+        {
+            recoveryStateCollection,
+            channelMessageCollection,
+            subscriberCollection,
+            transportMessageCollection,
+            workerQueue,
+            responseQueue,
+            workerAckMode,
+            workerBackgroundWorkerCount,
+            workerBackgroundQueueCapacity,
+            responseAckMode
+        };
+    }
+
+    return Results.Ok(new { channel, transport, azureServiceBus, sqs, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver, mongodb });
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -1273,6 +1393,49 @@ static void ConfigurePostgreSqlSubscriber(
     subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
 }
 
+static void ConfigureMongoDbSubscriber(
+    IConfiguration configuration,
+    string prefix,
+    MongoDbSubscriberOptions subscriberOptions)
+{
+    if (int.TryParse(configuration[$"{prefix}:BatchSize"], out var batchSize))
+        subscriberOptions.BatchSize = batchSize;
+    if (int.TryParse(configuration[$"{prefix}:MaxDeliveryAttempts"], out var maxDeliveryAttempts))
+        subscriberOptions.MaxDeliveryAttempts = maxDeliveryAttempts;
+
+    ApplyOptionalMilliseconds(configuration, $"{prefix}:EmptyPollDelayMs", value => subscriberOptions.EmptyPollDelay = value);
+
+    var rawMode = configuration[$"{prefix}:AckMode"];
+    if (string.IsNullOrWhiteSpace(rawMode))
+        return;
+
+    if (!Enum.TryParse<MongoDbAckMode>(rawMode, ignoreCase: true, out var mode))
+        throw new InvalidOperationException($"{prefix}:AckMode must be one of: {string.Join(", ", Enum.GetNames<MongoDbAckMode>())}.");
+
+    if (mode is MongoDbAckMode.AckAfterHandlerCompletes)
+    {
+        subscriberOptions.AckMode = MongoDbAckMode.AckAfterHandlerCompletes;
+        return;
+    }
+
+    if (mode is not MongoDbAckMode.AckAfterEnqueue)
+        throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
+
+    var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
+    var queueCapacity = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundQueueCapacity");
+    var drainTimeoutSeconds = configuration[$"{prefix}:BackgroundDrainTimeoutSeconds"];
+    TimeSpan? drainTimeout = null;
+    if (!string.IsNullOrWhiteSpace(drainTimeoutSeconds))
+    {
+        if (!int.TryParse(drainTimeoutSeconds, out var seconds) || seconds <= 0)
+            throw new InvalidOperationException($"{prefix}:BackgroundDrainTimeoutSeconds must be a positive integer when set.");
+
+        drainTimeout = TimeSpan.FromSeconds(seconds);
+    }
+
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
+}
+
 static string ResolveRedisStream(string? configured, string keyPrefix, string role)
     => !string.IsNullOrWhiteSpace(configured)
         ? configured
@@ -1661,7 +1824,14 @@ app.MapPost("/crash", async (IServiceProvider services, CancellationToken cancel
             return Results.Ok();
         }
 
-        return Results.Conflict("Crash simulation requires a durable channel such as Redis, PostgreSQL, or SQL Server.");
+        var mongo = services.GetService<MongoDbAsyncResponseChannel>();
+        if (mongo is not null)
+        {
+            await mongo.DropLocalSubscriptionsAsync(cancellationToken);
+            return Results.Ok();
+        }
+
+        return Results.Conflict("Crash simulation requires a durable channel such as Redis, PostgreSQL, SQL Server, or MongoDB.");
     }
 
     multiplexer.GetSubscriber().UnsubscribeAll();
@@ -1787,6 +1957,14 @@ static async Task<bool> DropLocalSubscriptionAsync(
         return true;
     }
 
+    var mongo = services.GetService<MongoDbAsyncResponseChannel>();
+    if (mongo is not null)
+    {
+        await mongo.DropLocalSubscriptionsAsync(cancellationToken).ConfigureAwait(false);
+        await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     return false;
 }
 
@@ -1830,7 +2008,10 @@ app.MapPost("/emit-response", async (
     if (useSqlServerTransport)
         return await EmitSqlServerResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
 
-    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, SQS, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, or SqlServer.");
+    if (useMongoDbTransport)
+        return await EmitMongoDbResponseAsync(services, correlationId, parsedStatus, useAttribute, message, cancellationToken).ConfigureAwait(false);
+
+    return Results.Conflict("Raw response ingress requires a transport such as AzureServiceBus, GooglePubSub, SQS, Kafka, RabbitMQ, Redis, NATS, PostgreSQL, SqlServer, or MongoDB.");
 })
 .WithTags("Workers");
 
@@ -1886,6 +2067,33 @@ static async Task<IResult> EmitSqsResponseAsync(
     }
 
     await client.SendMessageAsync(request, cancellationToken).ConfigureAwait(false);
+    return Results.Accepted();
+}
+
+static async Task<IResult> EmitMongoDbResponseAsync(
+    IServiceProvider services,
+    string correlationId,
+    OperationStatus status,
+    bool useAttribute,
+    string? message,
+    CancellationToken cancellationToken)
+{
+    var options = services.GetService<IOptions<MongoDbAsyncResponseTransportOptions>>();
+    if (options is null)
+        return Results.Conflict("MongoDB response ingress requires the MongoDB transport.");
+    var store = services.GetService<MongoDbTransportStore>();
+    if (store is null)
+        return Results.Conflict("MongoDB response ingress requires the transport store.");
+
+    var o = options.Value;
+    var json = useAttribute
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
+        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+    var headers = useAttribute
+        ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
+        : null;
+
+    await store.PublishAsync(Guid.NewGuid(), o.ResponseQueue, json, headers, cancellationToken).ConfigureAwait(false);
     return Results.Accepted();
 }
 

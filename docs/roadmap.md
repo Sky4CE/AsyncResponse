@@ -24,8 +24,8 @@ facts were re-verified July 2026 (sources at the end).
 
 | Axis | Shipped | Coverage gap |
 |---|---|---|
-| **Channels** | In-memory, Redis (+ Valkey / Dragonfly / Garnet), NATS, PostgreSQL, SQL Server | — Redis-fork compatibility now stated (§3.3) |
-| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server, AWS SQS | broker-free durable execution (Hangfire-style) |
+| **Channels** | In-memory, Redis (+ Valkey / Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, MongoDB | — Redis-fork compatibility now stated (§3.3) |
+| **Transports** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server, AWS SQS, MongoDB | broker-free durable execution (Hangfire-style) |
 
 Three of the original #14/#17 top picks — Azure Service Bus, the NATS pair, and the PostgreSQL
 pair — have shipped since that investigation was written. This roadmap re-baselines on what
@@ -205,7 +205,7 @@ final failures to `OnBackgroundFailure` + a failed-jobs convention).
 
 | Candidate | Shape | Why it waits | Trigger to promote |
 |---|---|---|---|
-| **MongoDB** channel (+transport) | Change streams (targeted `$match` on cid) for wake; collections for recovery; `findOneAndUpdate` claim loop as a queue | Change streams require a replica set; .NET+Mongo demand is real but a tier below SQL Server | Issue traffic / sponsor |
+| **MongoDB** channel (+transport) 🟢 shipped | Change streams for wake (one stream per process, `$match` on inserts, cid-targeted dispatch); TTL-indexed collections for recovery; `findOneAndUpdate` claim loop as a queue (server-clock leases, `lock_id` fences, deterministic dead-letter ids). Single-node replica set in the Aspire harness; degrades to polling on standalone servers. Pairs with `AsyncResponse.DurableFlows.MongoDB` for an all-Mongo stack. | — | — |
 | **MassTransit v8 bridge** | `IWorkerTransport` over `IPublishEndpoint` + an `IConsumer` feeding ingress | v8 is Apache-2.0 but frozen (v9 went commercial, ~$400–1,200/mo); building on a sunsetting base. The positioning win ("durable awaits without sagas, no v9 license") may exceed the adapter's value — a docs/blog recipe might suffice | MassTransit-refugee demand |
 | **Azure Storage Queues** transport | Visibility-timeout queue, `DequeueCount` for attempts | ASB already covers Azure; Storage Queues only win on cost/simplicity | User ask |
 | **Cosmos DB / DynamoDB recovery stores** | Durable KV+TTL (native TTL on both) behind `IRecoveryStateStore` | Their change feeds/streams are shard-polled, **not** targeted wakes — they're stores, not channels. Blocked on the store-mixing enabler (§4) | Store-mixing ships |
@@ -263,7 +263,7 @@ documentation work. Schedule alongside train 2.
 | **1** | Kafka transport · SQS transport · Valkey/Garnet validation (+ NATS/PG receive-span gap fix) | Closes the two loudest gaps (Kafka, AWS) plus a near-free compatibility claim; README matrix gets its biggest wins |
 | **2** | SQL Server transport → SQL Server channel 🟢 · store-mixing enabler | Largest build (shipped); store-mixing lands with a second consumer (SQL Server recovery store) to prove it |
 | **3** | Hangfire transport · MassTransit-v8 recipe or bridge | Broker-free durable execution + opportunistic positioning during the v9 exodus |
-| **Watch** | librdkafka share-group support (H2 2026) → add Kafka `ShareGroup` mode · Mongo/MQTT/Cosmos per demand | Share groups remove Kafka's head-of-line caveat; revisit COULD tier quarterly |
+| **Watch** | librdkafka share-group support (H2 2026) → add Kafka `ShareGroup` mode · MQTT/Cosmos per demand (Mongo shipped) | Share groups remove Kafka's head-of-line caveat; revisit COULD tier quarterly |
 
 Every item ships against the §2 definition of done; nothing ships without an emulator/container
 integration suite and an early-ACK variant.

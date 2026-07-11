@@ -4,6 +4,7 @@ using System.Threading.Channels;
 using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
 using AsyncResponse.Transports.Kafka;
+using AsyncResponse.Transports.MongoDB;
 using AsyncResponse.Transports.NATS;
 using AsyncResponse.Transports.PostgreSQL;
 using AsyncResponse.Transports.RabbitMQ;
@@ -128,6 +129,7 @@ internal static class StressRunner
         failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await SqlServerAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await MongoDbAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await SqsAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await KafkaAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
@@ -741,6 +743,92 @@ internal static class StressRunner
         metrics.Emit("sqlserver-ack-after-enqueue-dispatch-storm");
         return Check(
             "sqlserver-ack-after-enqueue-dispatch-storm",
+            ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
+            ("naks", Volatile.Read(ref naks)),
+            ("deadLetters", Volatile.Read(ref deadLetters)),
+            ("duplicates", duplicates),
+            ("outOfRange", outOfRange),
+            ("notDrained", drained ? 0 : 1),
+            ("missing", count - Volatile.Read(ref processed)));
+    }
+
+    // 3f3) MongoDB ACK-after-enqueue dispatch storm. This bypasses a live MongoDB server and
+    //      hammers the queue-document callback dispatcher directly: every ACKed document must be
+    //      processed once.
+    private static async Task<int> MongoDbAckAfterEnqueueDispatchStorm(int concurrency, int count)
+    {
+        var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
+        var options = new MongoDbAsyncResponseTransportOptions();
+        var seen = new int[count];
+        var processed = 0;
+        var duplicates = 0;
+        var outOfRange = 0;
+        var acks = 0;
+        var naks = 0;
+        var deadLetters = 0;
+        var allProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var dispatcher = new MongoDbMessageDispatcher(
+            (delivery, _) =>
+            {
+                var separator = delivery.Payload.IndexOf(':', StringComparison.Ordinal);
+                var index = separator >= 0 && int.TryParse(delivery.Payload[..separator], out var parsed)
+                    ? parsed
+                    : -1;
+                if ((uint)index >= (uint)seen.Length)
+                {
+                    Interlocked.Increment(ref outOfRange);
+                }
+                else if (Interlocked.Exchange(ref seen[index], 1) == 1)
+                {
+                    Interlocked.Increment(ref duplicates);
+                }
+                else if (Interlocked.Increment(ref processed) == count)
+                {
+                    allProcessed.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            },
+            options,
+            new MongoDbSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: workerCount,
+                backgroundQueueCapacity: Math.Max(count, concurrency),
+                backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        var metrics = await Measure("mongodb-ack-after-enqueue-dispatch-storm", count, concurrency, async i =>
+        {
+            await dispatcher.HandleAsync(new MongoDbTransportDelivery(
+                Guid.NewGuid(),
+                "stress-worker-queue",
+                $"{i}:{{}}",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [options.CorrelationIdHeader] = $"stress-{i}"
+                },
+                Attempt: 1,
+                () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
+                _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                CancellationToken.None).ConfigureAwait(false);
+        });
+
+        var drained = false;
+        try
+        {
+            await allProcessed.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            drained = true;
+        }
+        catch (TimeoutException)
+        {
+        }
+
+        metrics.Print();
+        metrics.Emit("mongodb-ack-after-enqueue-dispatch-storm");
+        return Check(
+            "mongodb-ack-after-enqueue-dispatch-storm",
             ("ackMismatch", Math.Abs(count - Volatile.Read(ref acks))),
             ("naks", Volatile.Read(ref naks)),
             ("deadLetters", Volatile.Read(ref deadLetters)),

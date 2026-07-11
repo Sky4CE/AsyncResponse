@@ -48,6 +48,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient SqlServerClient { get; private set; } = null!;
     public HttpClient SqlServerEarlyAckClient { get; private set; } = null!;
     public string SqlServerConnectionString { get; private set; } = null!;
+    public HttpClient MongoDbClient { get; private set; } = null!;
+    public HttpClient MongoDbEarlyAckClient { get; private set; } = null!;
     public string LocalStackServiceUrl { get; private set; } = null!;
 
     public async ValueTask InitializeAsync()
@@ -115,6 +117,12 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await _app.ResourceNotifications
             .WaitForResourceHealthyAsync("itest-app-sqlserver-early-ack")
             .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-mongodb")
+            .WaitAsync(StartupTimeout);
+        await _app.ResourceNotifications
+            .WaitForResourceHealthyAsync("itest-app-mongodb-early-ack")
+            .WaitAsync(StartupTimeout);
 
         Client = _app.CreateHttpClient("itest-app");
         EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
@@ -134,6 +142,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         PostgreSqlEarlyAckClient = _app.CreateHttpClient("itest-app-postgresql-early-ack");
         SqlServerClient = _app.CreateHttpClient("itest-app-sqlserver");
         SqlServerEarlyAckClient = _app.CreateHttpClient("itest-app-sqlserver-early-ack");
+        MongoDbClient = _app.CreateHttpClient("itest-app-mongodb");
+        MongoDbEarlyAckClient = _app.CreateHttpClient("itest-app-mongodb-early-ack");
 
         var postgresEndpoint = _app.GetEndpoint("postgres", "postgres");
         PostgreSqlConnectionString =
@@ -144,8 +154,10 @@ public sealed class IntegrationFixture : IAsyncLifetime
         MySqlConnectionString =
             $"Server={mysqlEndpoint.Host};Port={mysqlEndpoint.Port};User ID=root;Password=mysql;Database=asyncresponse;Connection Timeout=30;";
 
+        // directConnection: the container is a single-node replica set (change streams need one), and
+        // without it the driver would chase the replica-set-advertised container hostname.
         var mongoDbEndpoint = _app.GetEndpoint("mongodb", "mongodb");
-        MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}";
+        MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}/?directConnection=true";
 
         // The AppHost omits the Oracle and Cosmos containers when ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS
         // is set (their endpoints then don't exist), and a user-supplied connection string always wins
@@ -201,6 +213,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
         await ResetTestStateAsync(PostgreSqlEarlyAckClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(SqlServerClient).WaitAsync(StartupTimeout);
         await ResetTestStateAsync(SqlServerEarlyAckClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(MongoDbClient).WaitAsync(StartupTimeout);
+        await ResetTestStateAsync(MongoDbEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -225,6 +239,8 @@ public sealed class IntegrationFixture : IAsyncLifetime
             PostgreSqlEarlyAckClient?.Dispose();
             SqlServerClient?.Dispose();
             SqlServerEarlyAckClient?.Dispose();
+            MongoDbClient?.Dispose();
+            MongoDbEarlyAckClient?.Dispose();
             if (_app is not null)
                 await _app.DisposeAsync();
         }

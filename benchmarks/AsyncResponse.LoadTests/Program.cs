@@ -20,6 +20,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile postgresql
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile sqlserver
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile sqs
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile mongodb
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile recovery
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario request_response_success_redis
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --profile broad --scenario rabbitmq_worker_default_ack_observed,rabbitmq_worker_ack_after_enqueue_observed
@@ -32,6 +33,7 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --postgresql-url http://localhost:5008 --postgresql-early-ack-url http://localhost:5009 --profile postgresql
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --sqlserver-url http://localhost:5014 --sqlserver-early-ack-url http://localhost:5015 --profile sqlserver
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --sqs-url http://localhost:5016 --sqs-early-ack-url http://localhost:5017 --profile sqs
+//   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --mongodb-url http://localhost:5018 --mongodb-early-ack-url http://localhost:5019 --profile mongodb
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
 // The process exits non-zero if any scenario records failed requests.
@@ -58,6 +60,8 @@ var existingKafkaUrl = GetString("--kafka-url");
 var existingKafkaEarlyAckUrl = GetString("--kafka-early-ack-url");
 var existingSqlServerUrl = GetString("--sqlserver-url");
 var existingSqlServerEarlyAckUrl = GetString("--sqlserver-early-ack-url");
+var existingMongoDbUrl = GetString("--mongodb-url");
+var existingMongoDbEarlyAckUrl = GetString("--mongodb-early-ack-url");
 var ghJsonPrefix = GetString("--gh-json");
 
 DistributedApplication? app = null;
@@ -79,10 +83,12 @@ Uri? kafkaBaseAddress = null;
 Uri? kafkaEarlyAckBaseAddress = null;
 Uri? sqlServerBaseAddress = null;
 Uri? sqlServerEarlyAckBaseAddress = null;
+Uri? mongoDbBaseAddress = null;
+Uri? mongoDbEarlyAckBaseAddress = null;
 
-if (existingUrl is not null || existingAzureServiceBusUrl is not null || existingSqsUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null || existingPostgreSqlUrl is not null || existingKafkaUrl is not null || existingSqlServerUrl is not null)
+if (existingUrl is not null || existingAzureServiceBusUrl is not null || existingSqsUrl is not null || existingRabbitMqUrl is not null || existingRedisUrl is not null || existingNatsUrl is not null || existingPostgreSqlUrl is not null || existingKafkaUrl is not null || existingSqlServerUrl is not null || existingMongoDbUrl is not null)
 {
-    baseAddress = new Uri(existingUrl ?? existingAzureServiceBusUrl ?? existingSqsUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl ?? existingSqlServerUrl!);
+    baseAddress = new Uri(existingUrl ?? existingAzureServiceBusUrl ?? existingSqsUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl ?? existingSqlServerUrl ?? existingMongoDbUrl!);
     Console.WriteLine($"Load testing existing instance at {baseAddress}.");
     if (existingEarlyAckUrl is not null)
     {
@@ -159,6 +165,14 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
         sqlServerEarlyAckBaseAddress = new Uri(existingSqlServerEarlyAckUrl);
         Console.WriteLine($"Load testing existing SQL Server ACK-after-enqueue instance at {sqlServerEarlyAckBaseAddress}.");
     }
+
+    mongoDbBaseAddress = new Uri(existingMongoDbUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingKafkaUrl ?? existingSqlServerUrl!);
+    Console.WriteLine($"Load testing existing MongoDB instance at {mongoDbBaseAddress}.");
+    if (existingMongoDbEarlyAckUrl is not null)
+    {
+        mongoDbEarlyAckBaseAddress = new Uri(existingMongoDbEarlyAckUrl);
+        Console.WriteLine($"Load testing existing MongoDB ACK-after-enqueue instance at {mongoDbEarlyAckBaseAddress}.");
+    }
 }
 else
 {
@@ -184,6 +198,8 @@ else
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-kafka-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-sqlserver").WaitAsync(TimeSpan.FromMinutes(5));
     await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-sqlserver-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-mongodb").WaitAsync(TimeSpan.FromMinutes(5));
+    await app.ResourceNotifications.WaitForResourceHealthyAsync("itest-app-mongodb-early-ack").WaitAsync(TimeSpan.FromMinutes(5));
 
     using (var probe = app.CreateHttpClient("itest-app"))
         baseAddress = probe.BaseAddress!;
@@ -221,6 +237,10 @@ else
         sqlServerBaseAddress = probe.BaseAddress!;
     using (var probe = app.CreateHttpClient("itest-app-sqlserver-early-ack"))
         sqlServerEarlyAckBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-mongodb"))
+        mongoDbBaseAddress = probe.BaseAddress!;
+    using (var probe = app.CreateHttpClient("itest-app-mongodb-early-ack"))
+        mongoDbEarlyAckBaseAddress = probe.BaseAddress!;
 
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
@@ -240,6 +260,8 @@ else
     Console.WriteLine($"Kafka ACK-after-enqueue SUT at {kafkaEarlyAckBaseAddress}.");
     Console.WriteLine($"SQL Server SUT at {sqlServerBaseAddress}.");
     Console.WriteLine($"SQL Server ACK-after-enqueue SUT at {sqlServerEarlyAckBaseAddress}.");
+    Console.WriteLine($"MongoDB SUT at {mongoDbBaseAddress}.");
+    Console.WriteLine($"MongoDB ACK-after-enqueue SUT at {mongoDbEarlyAckBaseAddress}.");
 }
 
 var hadFailures = false;
@@ -335,6 +357,16 @@ try
         BaseAddress = sqlServerEarlyAckBaseAddress ?? sqlServerBaseAddress ?? baseAddress,
         Timeout = TimeSpan.FromSeconds(120)
     };
+    using var mongoDbHttpClient = new HttpClient
+    {
+        BaseAddress = mongoDbBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
+    using var mongoDbEarlyAckHttpClient = new HttpClient
+    {
+        BaseAddress = mongoDbEarlyAckBaseAddress ?? mongoDbBaseAddress ?? baseAddress,
+        Timeout = TimeSpan.FromSeconds(120)
+    };
 
     await TryResetAsync(httpClient);
     if (earlyAckBaseAddress is not null)
@@ -371,6 +403,10 @@ try
         await TryResetAsync(sqlServerHttpClient);
     if (sqlServerEarlyAckBaseAddress is not null)
         await TryResetAsync(sqlServerEarlyAckHttpClient);
+    if (mongoDbBaseAddress is not null)
+        await TryResetAsync(mongoDbHttpClient);
+    if (mongoDbEarlyAckBaseAddress is not null)
+        await TryResetAsync(mongoDbEarlyAckHttpClient);
 
     var definitions = FilterScenarios(SelectScenarios(
         profile,
@@ -390,7 +426,9 @@ try
         includeKafkaTarget: app is not null || existingKafkaUrl is not null,
         includeKafkaEarlyAckTarget: kafkaEarlyAckBaseAddress is not null,
         includeSqlServerTarget: app is not null || existingSqlServerUrl is not null,
-        includeSqlServerEarlyAckTarget: sqlServerEarlyAckBaseAddress is not null), scenarioFilter);
+        includeSqlServerEarlyAckTarget: sqlServerEarlyAckBaseAddress is not null,
+        includeMongoDbTarget: app is not null || existingMongoDbUrl is not null,
+        includeMongoDbEarlyAckTarget: mongoDbEarlyAckBaseAddress is not null), scenarioFilter);
     Console.WriteLine($"NBomber profile={profile}; scenarios={definitions.Length}; rate={rate}/s per scenario; duration={duration.TotalSeconds:N0}s; warmup={warmup.TotalSeconds:N0}s.");
     foreach (var definition in definitions)
         Console.WriteLine($"  - {definition.Name}");
@@ -416,6 +454,8 @@ try
             sqlServerEarlyAckHttpClient,
             sqsHttpClient,
             sqsEarlyAckHttpClient,
+            mongoDbHttpClient,
+            mongoDbEarlyAckHttpClient,
             rate,
             duration,
             warmup))
@@ -481,6 +521,8 @@ static ScenarioProps BuildScenario(
     HttpClient sqlServerEarlyAckHttpClient,
     HttpClient sqsHttpClient,
     HttpClient sqsEarlyAckHttpClient,
+    HttpClient mongoDbHttpClient,
+    HttpClient mongoDbEarlyAckHttpClient,
     int rate,
     TimeSpan duration,
     TimeSpan warmup)
@@ -502,7 +544,9 @@ static ScenarioProps BuildScenario(
         sqlServerHttpClient,
         sqlServerEarlyAckHttpClient,
         sqsHttpClient,
-        sqsEarlyAckHttpClient)))
+        sqsEarlyAckHttpClient,
+        mongoDbHttpClient,
+        mongoDbEarlyAckHttpClient)))
         .WithWarmUpDuration(warmup)
         .WithLoadSimulations(Simulation.Inject(rate, TimeSpan.FromSeconds(1), duration));
 
@@ -524,7 +568,9 @@ static ScenarioDefinition[] SelectScenarios(
     bool includeKafkaTarget,
     bool includeKafkaEarlyAckTarget,
     bool includeSqlServerTarget,
-    bool includeSqlServerEarlyAckTarget)
+    bool includeSqlServerEarlyAckTarget,
+    bool includeMongoDbTarget,
+    bool includeMongoDbEarlyAckTarget)
 {
     var broad = new[]
     {
@@ -586,11 +632,11 @@ static ScenarioDefinition[] SelectScenarios(
         broad =
         [
             .. broad,
-            new ScenarioDefinition("sqs_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => RequestResponseSuccessAsync(sqsHttp)),
-            new ScenarioDefinition("sqs_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => WorkerObservedAsync(sqsHttp)),
-            new ScenarioDefinition("sqs_response_ingress_attribute", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ResponseIngressAsync(sqsHttp, useAttribute: true)),
-            new ScenarioDefinition("sqs_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ResponseIngressAsync(sqsHttp, useAttribute: false)),
-            new ScenarioDefinition("sqs_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ReplyTargetAsync(sqsHttp))
+            new ScenarioDefinition("sqs_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => RequestResponseSuccessAsync(sqsHttp)),
+            new ScenarioDefinition("sqs_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => WorkerObservedAsync(sqsHttp)),
+            new ScenarioDefinition("sqs_response_ingress_attribute", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ResponseIngressAsync(sqsHttp, useAttribute: true)),
+            new ScenarioDefinition("sqs_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ResponseIngressAsync(sqsHttp, useAttribute: false)),
+            new ScenarioDefinition("sqs_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ReplyTargetAsync(sqsHttp))
         ];
 
         if (includeSqsEarlyAckTarget)
@@ -598,7 +644,7 @@ static ScenarioDefinition[] SelectScenarios(
             broad =
             [
                 .. broad,
-                new ScenarioDefinition("sqs_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsEarlyAckHttp) => WorkerObservedAsync(sqsEarlyAckHttp))
+                new ScenarioDefinition("sqs_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsEarlyAckHttp, _, _) => WorkerObservedAsync(sqsEarlyAckHttp))
             ];
         }
     }
@@ -707,6 +753,28 @@ static ScenarioDefinition[] SelectScenarios(
             [
                 .. broad,
                 new ScenarioDefinition("sqlserver_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqlServerEarlyAckHttp) => WorkerObservedAsync(sqlServerEarlyAckHttp))
+            ];
+        }
+    }
+
+    if (includeMongoDbTarget)
+    {
+        broad =
+        [
+            .. broad,
+            new ScenarioDefinition("mongodb_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => RequestResponseSuccessAsync(mongoHttp)),
+            new ScenarioDefinition("mongodb_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => WorkerObservedAsync(mongoHttp)),
+            new ScenarioDefinition("mongodb_response_ingress_header", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ResponseIngressAsync(mongoHttp, useAttribute: true)),
+            new ScenarioDefinition("mongodb_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ResponseIngressAsync(mongoHttp, useAttribute: false)),
+            new ScenarioDefinition("mongodb_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ReplyTargetAsync(mongoHttp))
+        ];
+
+        if (includeMongoDbEarlyAckTarget)
+        {
+            broad =
+            [
+                .. broad,
+                new ScenarioDefinition("mongodb_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoEarlyAckHttp) => WorkerObservedAsync(mongoEarlyAckHttp))
             ];
         }
     }
@@ -850,22 +918,44 @@ static ScenarioDefinition[] SelectScenarios(
 
     var sqs = new[]
     {
-        new ScenarioDefinition("sqs_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => RequestResponseSuccessAsync(sqsHttp)),
-        new ScenarioDefinition("sqs_request_response_domain_failure", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => RequestResponseDomainFailureAsync(sqsHttp)),
-        new ScenarioDefinition("sqs_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => WorkerObservedAsync(sqsHttp)),
-        new ScenarioDefinition("sqs_response_ingress_attribute", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ResponseIngressAsync(sqsHttp, useAttribute: true)),
-        new ScenarioDefinition("sqs_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ResponseIngressAsync(sqsHttp, useAttribute: false)),
-        new ScenarioDefinition("sqs_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => ReplyTargetAsync(sqsHttp)),
+        new ScenarioDefinition("sqs_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => RequestResponseSuccessAsync(sqsHttp)),
+        new ScenarioDefinition("sqs_request_response_domain_failure", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => RequestResponseDomainFailureAsync(sqsHttp)),
+        new ScenarioDefinition("sqs_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => WorkerObservedAsync(sqsHttp)),
+        new ScenarioDefinition("sqs_response_ingress_attribute", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ResponseIngressAsync(sqsHttp, useAttribute: true)),
+        new ScenarioDefinition("sqs_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ResponseIngressAsync(sqsHttp, useAttribute: false)),
+        new ScenarioDefinition("sqs_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => ReplyTargetAsync(sqsHttp)),
         // Durable flow end-to-end over the SQS worker queue: start → checkpointed steps → awaited
         // remote steps → flow-done observation via the recorder.
-        new ScenarioDefinition("sqs_durable_flow", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _) => DurableFlowObservedAsync(sqsHttp))
+        new ScenarioDefinition("sqs_durable_flow", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsHttp, _, _, _) => DurableFlowObservedAsync(sqsHttp))
     };
     if (includeSqsEarlyAckTarget)
     {
         sqs =
         [
             .. sqs,
-            new ScenarioDefinition("sqs_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsEarlyAckHttp) => WorkerObservedAsync(sqsEarlyAckHttp))
+            new ScenarioDefinition("sqs_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, sqsEarlyAckHttp, _, _) => WorkerObservedAsync(sqsEarlyAckHttp))
+        ];
+    }
+
+    var mongodb = new[]
+    {
+        new ScenarioDefinition("mongodb_request_response_success", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => RequestResponseSuccessAsync(mongoHttp)),
+        new ScenarioDefinition("mongodb_request_response_domain_failure", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => RequestResponseDomainFailureAsync(mongoHttp)),
+        new ScenarioDefinition("mongodb_worker_default_ack_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => WorkerObservedAsync(mongoHttp)),
+        new ScenarioDefinition("mongodb_response_ingress_header", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ResponseIngressAsync(mongoHttp, useAttribute: true)),
+        new ScenarioDefinition("mongodb_response_ingress_body", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ResponseIngressAsync(mongoHttp, useAttribute: false)),
+        new ScenarioDefinition("mongodb_reply_target", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => ReplyTargetAsync(mongoHttp)),
+        // Durable flow end-to-end over the MongoDB worker queue with flow ledgers in the
+        // DurableFlows.MongoDB store: start → checkpointed steps → awaited remote steps →
+        // flow-done observation via the recorder.
+        new ScenarioDefinition("mongodb_durable_flow", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoHttp, _) => DurableFlowObservedAsync(mongoHttp))
+    };
+    if (includeMongoDbEarlyAckTarget)
+    {
+        mongodb =
+        [
+            .. mongodb,
+            new ScenarioDefinition("mongodb_worker_ack_after_enqueue_observed", (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, mongoEarlyAckHttp) => WorkerObservedAsync(mongoEarlyAckHttp))
         ];
     }
 
@@ -889,9 +979,10 @@ static ScenarioDefinition[] SelectScenarios(
         "sqlserver" or "sql-server" or "mssql" => sqlserver,
         "kafka" => kafka,
         "sqs" or "amazon-sqs" or "aws-sqs" => sqs,
+        "mongodb" or "mongo" => mongodb,
         "recovery" => recovery,
         _ => throw new ArgumentException(
-            $"Unknown --profile '{profile}'. Use one of: broad, core, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, sqlserver, kafka, sqs, recovery.")
+            $"Unknown --profile '{profile}'. Use one of: broad, core, azure-servicebus, pubsub, rabbitmq, redis, nats, postgresql, sqlserver, kafka, sqs, mongodb, recovery.")
     };
 }
 
@@ -1062,7 +1153,7 @@ static string? GetString(string name)
 
 static string Trace() => $"trace-{Guid.NewGuid():N}";
 
-// Func<> tops out at 16 parameters, so the full client fan-out (9 transports x default/early-ack)
+// Func<> tops out at 16 parameters, so the full client fan-out (10 transports x default/early-ack)
 // needs a named delegate.
 internal delegate Task ScenarioRunAsync(
     HttpClient http,
@@ -1082,54 +1173,56 @@ internal delegate Task ScenarioRunAsync(
     HttpClient sqlServerHttp,
     HttpClient sqlServerEarlyAckHttp,
     HttpClient sqsHttp,
-    HttpClient sqsEarlyAckHttp);
+    HttpClient sqsEarlyAckHttp,
+    HttpClient mongoDbHttp,
+    HttpClient mongoDbEarlyAckHttp);
 
 internal sealed record ScenarioDefinition(
     string Name,
     ScenarioRunAsync RunAsync)
 {
     public ScenarioDefinition(string name, Func<HttpClient, Task> runAsync)
-        : this(name, (http, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http))
+        : this(name, (http, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
+        : this(name, (http, earlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => runAsync(http, earlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _, _, _, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, _, _, _, _, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, _, _, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, _, _, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, _, _, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _, _, _, _, _) =>
+        : this(name, (http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, _, _, _, _, _, _, _, _) =>
             runAsync(http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp))
     {
     }
 
     public ScenarioDefinition(string name, Func<HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, HttpClient, Task> runAsync)
-        : this(name, (http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, kafkaHttp, kafkaEarlyAckHttp, sqlServerHttp, sqlServerEarlyAckHttp, _, _) =>
+        : this(name, (http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, kafkaHttp, kafkaEarlyAckHttp, sqlServerHttp, sqlServerEarlyAckHttp, _, _, _, _) =>
             runAsync(http, earlyAckHttp, azureServiceBusHttp, azureServiceBusEarlyAckHttp, rabbitMqHttp, rabbitMqEarlyAckHttp, redisHttp, redisEarlyAckHttp, natsHttp, natsEarlyAckHttp, postgreSqlHttp, postgreSqlEarlyAckHttp, kafkaHttp, kafkaEarlyAckHttp, sqlServerHttp, sqlServerEarlyAckHttp))
     {
     }

@@ -22,7 +22,8 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         "nats",       // NATS channel + JetStream transport
         "postgresql", // PostgreSQL channel + transport
         "sqlserver",  // SQL Server channel + transport
-        "sqs"         // Redis channel + AWS SQS transport (LocalStack)
+        "sqs",        // Redis channel + AWS SQS transport (LocalStack)
+        "mongodb"     // MongoDB channel + transport, flow ledgers in the DurableFlows.MongoDB store
     };
 
     private HttpClient ClientFor(string variant) => variant switch
@@ -32,6 +33,7 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         "postgresql" => Fixture.PostgreSqlClient,
         "sqlserver" => Fixture.SqlServerClient,
         "sqs" => Fixture.SqsClient,
+        "mongodb" => Fixture.MongoDbClient,
         _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, null)
     };
 
