@@ -401,6 +401,41 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task ClientAdapter_ReceiveDefaultsMalformedOptionalMessageMetadata()
+    {
+        var sdkClient = new Mock<IAmazonSQS>();
+        sdkClient
+            .Setup(c => c.ReceiveMessageAsync(It.IsAny<ReceiveMessageRequest>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new ReceiveMessageResponse
+            {
+                Messages =
+                [
+                    new Message
+                    {
+                        Attributes = new Dictionary<string, string>
+                        {
+                            [MessageSystemAttributeName.ApproximateReceiveCount] = "not-a-number"
+                        },
+                        MessageAttributes = new Dictionary<string, MessageAttributeValue>
+                        {
+                            ["missing"] = null!,
+                            ["binary"] = new() { DataType = "Binary" }
+                        }
+                    }
+                ]
+            });
+        var adapter = new SqsClientAdapter(sdkClient.Object, ownsClient: false);
+
+        var delivery = Assert.Single(await adapter.ReceiveMessagesAsync(new SqsReceiveRequest(
+            "queue-url", 1, TimeSpan.Zero, null)));
+
+        Assert.Equal(1, delivery.ReceiveCount);
+        Assert.Equal(string.Empty, delivery.Body);
+        Assert.Equal(string.Empty, delivery.MessageId);
+        Assert.Empty(delivery.MessageAttributes);
+    }
+
+    [Fact]
     public async Task ClientAdapter_ProvisioningCallsMapToSdkRequests()
     {
         var sdkClient = new Mock<IAmazonSQS>();

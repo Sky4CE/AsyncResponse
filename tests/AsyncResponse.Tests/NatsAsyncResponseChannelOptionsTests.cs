@@ -6,6 +6,10 @@ namespace AsyncResponse.Tests;
 public class NatsAsyncResponseChannelOptionsTests
 {
     [Fact]
+    public void RecoveryKey_InvalidBase64Length_FallsBackToVerbatimKey()
+        => Assert.Equal("a", NatsSubjectSchema.CorrelationIdFromRecoveryKey("a"));
+
+    [Fact]
     public void Validate_Passes_ForDefaults() => new NatsAsyncResponseChannelOptions().Validate();
 
     [Fact]

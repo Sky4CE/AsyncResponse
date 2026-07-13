@@ -451,10 +451,11 @@ internal sealed class PostgreSqlAsyncResponseChannel :
             if (_listenerCts is not null)
                 return;
 
-            _listenerCts = new CancellationTokenSource();
-            _listenTask = Task.Run(() => ListenLoopAsync(_listenerCts.Token));
-            _dispatchTask = Task.Run(() => DispatchLoopAsync(_listenerCts.Token));
-            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_listenerCts.Token));
+            var listenerCts = new CancellationTokenSource();
+            _listenerCts = listenerCts;
+            _listenTask = Task.Run(() => ListenLoopAsync(listenerCts.Token));
+            _dispatchTask = Task.Run(() => DispatchLoopAsync(listenerCts.Token));
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(listenerCts.Token));
         }
     }
 

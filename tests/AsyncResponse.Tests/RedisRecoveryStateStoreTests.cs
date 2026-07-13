@@ -194,6 +194,48 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task GetAllAsync_RejectsNullMissingRegistrationAndMismatchedCorrelationEntries()
+    {
+        var valid = new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-a",
+            PayloadTypeFullName = "valid"
+        };
+        RecoveryState?[] stored =
+        [
+            null,
+            new RecoveryState { CorrelationId = "corr-a", PayloadTypeFullName = "missing-id" },
+            new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "different", PayloadTypeFullName = "mismatch" },
+            valid
+        ];
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(stored));
+
+        Assert.Equal(valid.PayloadTypeFullName, Assert.Single(await _store.GetAllAsync("corr-a")).PayloadTypeFullName);
+    }
+
+    [Fact]
+    public async Task SaveAsync_GeneratesRegistrationIdAndRejectsCorrelationMismatch()
+    {
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:generated", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        SetupTransactions(true);
+        var state = new RecoveryState { CorrelationId = "generated" };
+
+        await _store.SaveAsync("generated", state, TimeSpan.FromMinutes(1));
+
+        Assert.NotEqual(Guid.Empty, state.RegistrationId);
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            _store.SaveAsync(
+                "expected",
+                new RecoveryState { CorrelationId = "different" },
+                TimeSpan.FromMinutes(1)));
+    }
+
+    [Fact]
     public async Task TryDeleteAsync_DeletesSpecificRegistration()
     {
         var registrationId = Guid.NewGuid();

@@ -351,6 +351,23 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
                 subscriber.CreateResponseWaiter<OperationResult>(NewId("bad-timeout"), timeout: TimeSpan.Zero));
 
+            var recoveryClaimedCorrelationId = NewId("recovery-claimed-before-waiter");
+            var recoveryClaimedMessageId = Guid.NewGuid();
+            await sql.InsertMessageAsync(
+                recoveryClaimedMessageId,
+                recoveryClaimedCorrelationId,
+                SuccessEnvelope("already-recovered"),
+                TimeSpan.FromSeconds(30),
+                CancellationToken.None);
+            Assert.True(await sql.TryClaimForRecoveryAsync(recoveryClaimedMessageId, CancellationToken.None));
+            await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+                recoveryClaimedCorrelationId,
+                timeout: TimeSpan.FromSeconds(1)))
+            {
+                await Assert.ThrowsAsync<TimeoutException>(() =>
+                    waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(3)));
+            }
+
             var malformedCorrelationId = NewId("malformed");
             await using (var waiter = await subscriber.CreateResponseWaiter<OperationResult>(malformedCorrelationId, timeout: TimeSpan.FromSeconds(5)))
             {

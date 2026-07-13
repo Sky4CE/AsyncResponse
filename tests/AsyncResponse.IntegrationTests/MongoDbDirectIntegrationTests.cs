@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using System.Text.Json;
 using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
@@ -326,7 +327,113 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         }
     }
 
-    private ServiceProvider BuildChannelProvider(string databaseName)
+    [Fact]
+    public async Task Channel_PublisherFallsBackWhenAStoredSubscriberNeverAcknowledges()
+    {
+        var databaseName = NewDatabaseName("channel-unacked");
+        var provider = BuildChannelProvider(databaseName, TimeSpan.FromMilliseconds(50));
+        try
+        {
+            var store = provider.GetRequiredService<MongoDbChannelStore>();
+            var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+            var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+
+            foreach (var correlationId in new[] { "unacked-response", "unacked-raw", "unacked-exception" })
+            {
+                await store.UpsertSubscriberAsync(
+                    correlationId,
+                    Guid.NewGuid(),
+                    "missing-process",
+                    TimeSpan.FromMinutes(1),
+                    CancellationToken.None);
+            }
+
+            await publisher.SetResponse(
+                new OperationResult { Status = OperationStatus.Completed, Message = "unacked" },
+                "unacked-response");
+            await rawPublisher.SetRawResponseJson(
+                """{"Status":2,"Message":"unacked raw"}""",
+                "unacked-raw",
+                CancellationToken.None);
+            await publisher.SetException(new InvalidOperationException("unacked error"), "unacked-exception");
+        }
+        finally
+        {
+            await provider.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Channel_DispatchesPagedMessagesAndRejectsUnreadableEnvelopes()
+    {
+        var databaseName = NewDatabaseName("channel-envelope-edges");
+        var provider = BuildChannelProvider(
+            databaseName,
+            TimeSpan.FromMilliseconds(250),
+            options =>
+            {
+                options.UseChangeStreams = false;
+                options.PendingMessageBatchSize = 1;
+                options.ListenerPollInterval = TimeSpan.FromMilliseconds(25);
+            });
+        try
+        {
+            var store = provider.GetRequiredService<MongoDbChannelStore>();
+            var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+            var recoverableSubscriber = provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+
+            var pagedCorrelation = NewId("mongo-paged-dispatch");
+            await using (var waiter = await recoverableSubscriber.CreateRecoverableResponseWaiter<OperationResult>(
+                pagedCorrelation,
+                completionPredicate: payload => new ValueTask<bool>(payload.Status == OperationStatus.Completed),
+                timeout: TimeSpan.FromSeconds(10)))
+            {
+                await store.InsertMessageAsync(
+                    Guid.NewGuid(),
+                    pagedCorrelation,
+                    """{"SchemaVersion":1,"Success":true,"Payload":{"Status":1,"Message":"progress one"}}""",
+                    TimeSpan.FromMinutes(1),
+                    CancellationToken.None);
+                await store.InsertMessageAsync(
+                    Guid.NewGuid(),
+                    pagedCorrelation,
+                    """{"SchemaVersion":1,"Success":true,"Payload":{"Status":1,"Message":"progress two"}}""",
+                    TimeSpan.FromMinutes(1),
+                    CancellationToken.None);
+                await store.InsertMessageAsync(
+                    Guid.NewGuid(),
+                    pagedCorrelation,
+                    """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"complete"}}""",
+                    TimeSpan.FromMinutes(1),
+                    CancellationToken.None);
+
+                Assert.Equal("complete", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10))).Message);
+            }
+
+            await AssertUnreadableEnvelopeAsync(subscriber, store, "null", typeof(JsonException));
+            await AssertUnreadableEnvelopeAsync(
+                subscriber,
+                store,
+                """{"SchemaVersion":999,"Success":true,"Payload":{"Status":2}}""",
+                typeof(InvalidOperationException));
+            await AssertUnreadableEnvelopeAsync(subscriber, store, "{not-json", typeof(JsonException));
+            await AssertUnreadableEnvelopeAsync(
+                subscriber,
+                store,
+                """{"SchemaVersion":1,"Success":false,"ExceptionMessage":"remote boom","ExceptionStackTrace":"remote stack"}""",
+                typeof(Exception),
+                expectedRemoteStack: "remote stack");
+        }
+        finally
+        {
+            await provider.DisposeAsync();
+        }
+    }
+
+    private ServiceProvider BuildChannelProvider(
+        string databaseName,
+        TimeSpan? deliveryConfirmationTimeout = null,
+        Action<MongoDbAsyncResponseChannelOptions>? configure = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
@@ -337,13 +444,39 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
             options.DefaultTimeout = TimeSpan.FromSeconds(15);
             options.RecoveryStateExpiry = TimeSpan.FromSeconds(30);
             options.MessageRetention = TimeSpan.FromSeconds(30);
-            options.DeliveryConfirmationTimeout = TimeSpan.FromSeconds(2);
+            options.DeliveryConfirmationTimeout = deliveryConfirmationTimeout ?? TimeSpan.FromSeconds(2);
             options.DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(10);
             options.ListenerPollInterval = TimeSpan.FromMilliseconds(50);
             options.SubscriberHeartbeatInterval = TimeSpan.FromMilliseconds(100);
             options.SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(2);
+            configure?.Invoke(options);
         });
         return services.BuildServiceProvider();
+    }
+
+    private static async Task AssertUnreadableEnvelopeAsync(
+        IAsyncResponseSubscriber subscriber,
+        MongoDbChannelStore store,
+        string envelopeJson,
+        Type expectedExceptionType,
+        string? expectedRemoteStack = null)
+    {
+        var correlationId = $"mongo-unreadable-{Guid.NewGuid():N}";
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(10));
+        await store.InsertMessageAsync(
+            Guid.NewGuid(),
+            correlationId,
+            envelopeJson,
+            TimeSpan.FromMinutes(1),
+            CancellationToken.None);
+
+        var exception = await Assert.ThrowsAnyAsync<Exception>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.IsAssignableFrom(expectedExceptionType, exception);
+        if (expectedRemoteStack is not null)
+            Assert.Equal(expectedRemoteStack, exception.Data["RemoteStackTrace"]);
     }
 
     private (IMongoDatabase Database, MongoDbAsyncResponseChannelOptions Options) NewChannelDatabase(string prefix)

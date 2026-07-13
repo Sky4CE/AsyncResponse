@@ -69,6 +69,58 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_WithoutExecutionContext_UsesRecoveryExpiryTimeoutFallback()
+    {
+        Task<IAsyncResponseWaiter<OperationResult>> waiterTask;
+        using (ExecutionContext.SuppressFlow())
+        {
+            waiterTask = CreateChannel(useRecoveryExpiry: true)
+                .CreateResponseWaiter<OperationResult>("no-context");
+        }
+
+        await using var waiter = await waiterTask;
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Status);
+    }
+
+    [Fact]
+    public async Task DuplicateTerminalMessages_DoNotReplaceFirstCompletion()
+    {
+        var channel = CreateChannel();
+        await using var success = await channel.CreateResponseWaiter<OperationResult>("duplicate");
+        var successJson = JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "first" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        _client.Push(successJson);
+        _client.Push(successJson);
+
+        Assert.Equal("first", (await success.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("{not-json")]
+    [InlineData("{\"SchemaVersion\":999,\"Success\":true,\"Payload\":{\"Status\":2}}")]
+    [InlineData("{\"SchemaVersion\":1,\"Success\":false,\"ExceptionMessage\":\"remote\"}")]
+    public async Task DuplicateFaultMessages_KeepFirstFailure(string payload)
+    {
+        var channel = CreateChannel();
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("duplicate-fault");
+
+        _client.Push(payload);
+        _client.Push(payload);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_CompletionPredicateWaitsForLaterMessages()
     {
         var channel = CreateChannel();
@@ -460,13 +512,13 @@ public class NatsAsyncResponseChannelTests
         Assert.Equal("ok", result.Message);
     }
 
-    private NatsAsyncResponseChannel CreateChannel() => new(
+    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,
         _store.Object,
         Options.Create(new NatsAsyncResponseChannelOptions
         {
-            DefaultTimeout = TimeSpan.FromSeconds(5),
+            DefaultTimeout = useRecoveryExpiry ? null : TimeSpan.FromSeconds(5),
             RecoveryStateExpiry = TimeSpan.FromMinutes(5)
         }),
         new AsyncResponseContextPropagation([]),

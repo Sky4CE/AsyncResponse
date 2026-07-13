@@ -308,4 +308,17 @@ public class NatsMessageDispatcherTests
         Assert.IsAssignableFrom<OperationCanceledException>(context.Exception);
         Assert.Contains(_jetStream.Published, p => p.Subject == DeadLetterSubject);
     }
+
+    [Fact]
+    public async Task DisposeAsync_DisposesCancellationSourceWhenWorkerAggregationFaults()
+    {
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(1, 4, TimeSpan.FromSeconds(1));
+        var dispatcher = CreateDispatcher((_, _) => Task.CompletedTask, subscriber);
+        var workersField = typeof(NatsMessageDispatcher)
+            .GetField("_backgroundWorkers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        var workers = (Task[])workersField.GetValue(dispatcher)!;
+        workersField.SetValue(dispatcher, workers.Append(Task.FromException(new InvalidOperationException("worker"))).ToArray());
+
+        await dispatcher.DisposeAsync();
+    }
 }

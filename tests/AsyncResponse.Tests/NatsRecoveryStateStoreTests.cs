@@ -252,6 +252,50 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task GetAllAndScan_FilterSchemaMismatchCorrelationMismatchAndEmptyStateLists()
+    {
+        var key = NatsSubjectSchema.RecoveryKey("mixed-complete");
+        _kv.Entries[key] = JsonSerializer.Serialize(new NatsRecoveryStateStore.StoredRecoveryState
+        {
+            States =
+            [
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = "mixed-complete",
+                    SchemaVersion = RecoveryStateSchema.Current + 1
+                },
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = "different"
+                },
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = "mixed-complete",
+                    PayloadTypeFullName = "valid"
+                }
+            ],
+            ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
+        });
+        _kv.Entries[NatsSubjectSchema.RecoveryKey("empty")] = JsonSerializer.Serialize(
+            new NatsRecoveryStateStore.StoredRecoveryState
+            {
+                States = null,
+                ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
+            });
+
+        Assert.Equal("valid", Assert.Single(await _store.GetAllAsync("mixed-complete")).PayloadTypeFullName);
+        Assert.Empty(await _store.GetAllAsync("empty"));
+
+        var scanned = new List<RecoveryState>();
+        await foreach (var state in _store.ScanAsync())
+            scanned.Add(state);
+        Assert.Equal("valid", Assert.Single(scanned).PayloadTypeFullName);
+    }
+
+    [Fact]
     public async Task ExpiredRead_SwallowsBestEffortDeleteFailure()
     {
         await _store.SaveAsync("expired", new RecoveryState { CorrelationId = "expired" }, TimeSpan.FromMinutes(1));

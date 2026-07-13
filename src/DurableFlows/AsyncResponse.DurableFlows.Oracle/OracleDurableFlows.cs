@@ -4,7 +4,6 @@ using AsyncResponse.DurableFlows.Oracle;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using Oracle.ManagedDataAccess.Client;
-using Oracle.ManagedDataAccess.Types;
 
 namespace Microsoft.Extensions.DependencyInjection
 {
@@ -89,20 +88,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        FlowState? state;
-        switch (reader.GetValue(0))
-        {
-            case string json:
-                state = DurableFlowStoreShared.Deserialize(json);
-                break;
-            case OracleClob clob:
-                using (clob)
-                    state = DurableFlowStoreShared.Deserialize(clob.Value);
-                break;
-            default:
-                return null;
-        }
-
+        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
         return state?.Revision == reader.GetInt64(1) ? state : null;
     }
 

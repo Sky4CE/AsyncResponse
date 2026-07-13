@@ -4,6 +4,11 @@ using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Clusters;
+using MongoDB.Driver.Core.Connections;
+using MongoDB.Driver.Core.Servers;
+using System.Net;
+using System.Reflection;
 using Moq;
 using Xunit;
 
@@ -241,6 +246,31 @@ public sealed class MongoDbStoreQueryTests
     {
         Assert.False(MongoDbChannelStore.IsChangeStreamUnsupported(new TimeoutException()));
         Assert.False(MongoDbTransportStore.IsChangeStreamUnsupported(new InvalidOperationException("only supported on replica sets")));
+
+        var connectionId = new ConnectionId(
+            new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+        var codeFailure = new MongoCommandException(
+            connectionId,
+            "command",
+            new BsonDocument(),
+            new BsonDocument { ["ok"] = 0, ["code"] = 40573, ["errmsg"] = "unsupported" });
+        var messageFailure = new MongoCommandException(
+            connectionId,
+            "command",
+            new BsonDocument(),
+            new BsonDocument
+            {
+                ["ok"] = 0,
+                ["code"] = 1,
+                ["errmsg"] = "only supported on replica sets"
+            });
+        typeof(Exception).GetField("_message", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(messageFailure, "only supported on replica sets");
+
+        Assert.True(MongoDbChannelStore.IsChangeStreamUnsupported(codeFailure));
+        Assert.True(MongoDbTransportStore.IsChangeStreamUnsupported(codeFailure));
+        Assert.True(MongoDbChannelStore.IsChangeStreamUnsupported(messageFailure));
+        Assert.True(MongoDbTransportStore.IsChangeStreamUnsupported(messageFailure));
     }
 
     private static MongoDbTransportStore CreateTransportStore(IMongoCollection<MongoTransportMessageDocument> collection)

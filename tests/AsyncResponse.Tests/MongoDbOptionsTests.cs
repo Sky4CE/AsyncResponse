@@ -2,7 +2,12 @@ using AsyncResponse.Channels.MongoDB;
 using AsyncResponse.Transports.MongoDB;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
+using MongoDB.Driver.Core.Clusters;
+using MongoDB.Driver.Core.Connections;
+using MongoDB.Driver.Core.Servers;
+using System.Net;
 using System.Reflection;
 using System.Text.Json;
 using Xunit;
@@ -337,6 +342,32 @@ public sealed class MongoDbOptionsTests
         Assert.False(MongoDbChannelStore.IsTransient(new OperationCanceledException()));
         Assert.False(MongoDbTransportRetry.IsTransient(new InvalidOperationException()));
         Assert.False(MongoDbChannelStore.IsTransient(new InvalidOperationException()));
+    }
+
+    [Fact]
+    public void MongoDbRetry_ClassifiesDriverExceptionsAndRetryableLabels()
+    {
+        var connectionId = new ConnectionId(
+            new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
+        var labeled = new MongoException("retryable");
+        labeled.AddErrorLabel("RetryableWriteError");
+        Exception[] transient =
+        [
+            new MongoConnectionException(connectionId, "connection"),
+            new MongoExecutionTimeoutException(connectionId, "timeout"),
+            new MongoNotPrimaryException(connectionId, new BsonDocument(), new BsonDocument()),
+            new MongoNodeIsRecoveringException(connectionId, new BsonDocument(), new BsonDocument()),
+            labeled
+        ];
+
+        foreach (var exception in transient)
+        {
+            Assert.True(MongoDbTransportRetry.IsTransient(exception));
+            Assert.True(MongoDbChannelStore.IsTransient(exception));
+        }
+
+        Assert.False(MongoDbTransportRetry.IsTransient(new MongoException("permanent")));
+        Assert.False(MongoDbChannelStore.IsTransient(new MongoException("permanent")));
     }
 
     [Fact]

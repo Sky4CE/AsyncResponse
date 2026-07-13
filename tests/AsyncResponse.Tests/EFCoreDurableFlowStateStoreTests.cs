@@ -172,6 +172,8 @@ public sealed class EFCoreDurableFlowStateStoreTests
 
         await store.ReleaseLeaseAsync(state.FlowId!, "owner-a");
         Assert.True(await store.TryAcquireLeaseAsync(state.FlowId!, "owner-b", TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            store.TryAcquireLeaseAsync(state.FlowId!, "owner-b", TimeSpan.Zero));
     }
 
     [Fact]
@@ -225,6 +227,20 @@ public sealed class EFCoreDurableFlowStateStoreTests
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("flow-any"));
         Assert.Contains(nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows), exception.Message);
+    }
+
+    [Fact]
+    public async Task EFCoreStore_DisposesFactoryContext_WhenModelDoesNotMapTheStateTable()
+    {
+        await using var database = new TempSqliteDatabase();
+        var services = new ServiceCollection();
+        services.AddDbContextFactory<UnmappedFlowDbContext>(options => options.UseSqlite(database.ConnectionString));
+        await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+        var store = new EFCoreFlowStateStore<UnmappedFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions()));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("flow-any"));
     }
 
     private static ServiceProvider BuildScopedContextProvider(string connectionString)

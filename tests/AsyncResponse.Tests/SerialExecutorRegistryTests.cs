@@ -57,6 +57,28 @@ public class SerialExecutorRegistryTests
     }
 
     [Fact]
+    public async Task ConcurrentRemovers_ShareOneRetirement()
+    {
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var first = registry.RemoveAsync("cid").AsTask();
+        var second = registry.RemoveAsync("cid").AsTask();
+        Assert.False(first.IsCompleted);
+        Assert.False(second.IsCompleted);
+
+        release.TrySetResult();
+        await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(2));
+    }
+
+    [Fact]
     public async Task EnqueueAfterRemove_CreatesFreshExecutorAndRuns()
     {
         var registry = new SerialExecutorRegistry(NullLogger.Instance);

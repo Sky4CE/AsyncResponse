@@ -48,25 +48,21 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
     {
         AzureServiceBusOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
 
-        return subscriberOptions.AckMode switch
-        {
-            AzureServiceBusAckMode.AckAfterHandlerCompletes => new AwaitingAzureServiceBusMessageDispatcher(
+        return subscriberOptions.AckMode == AzureServiceBusAckMode.AckAfterHandlerCompletes
+            ? new AwaitingAzureServiceBusMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            AzureServiceBusAckMode.AckAfterReceive => new QueuedAzureServiceBusMessageDispatcher(
+                role)
+            : new QueuedAzureServiceBusMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            _ => throw new InvalidOperationException(
-                $"Unsupported Azure Service Bus ACK mode '{subscriberOptions.AckMode}'.")
-        };
+                role);
     }
 
     /// <summary>Validates the supplied subscriber options.</summary>

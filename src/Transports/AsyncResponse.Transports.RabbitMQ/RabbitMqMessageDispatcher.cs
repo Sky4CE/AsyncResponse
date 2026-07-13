@@ -95,25 +95,21 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
     {
         ValidateOptions(transportOptions, subscriberOptions, role);
 
-        return subscriberOptions.AckMode switch
-        {
-            RabbitMqAckMode.AckAfterHandlerCompletes => new AwaitingRabbitMqMessageDispatcher(
+        return subscriberOptions.AckMode == RabbitMqAckMode.AckAfterHandlerCompletes
+            ? new AwaitingRabbitMqMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            RabbitMqAckMode.AckAfterEnqueue => new QueuedRabbitMqMessageDispatcher(
+                role)
+            : new QueuedRabbitMqMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            _ => throw new InvalidOperationException(
-                $"Unsupported RabbitMQ ACK mode '{subscriberOptions.AckMode}'.")
-        };
+                role);
     }
 
     /// <summary>Validates the supplied options.</summary>

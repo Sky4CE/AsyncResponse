@@ -164,6 +164,39 @@ public class ContextPropagationAggregatorTests
         Assert.Null(ex);                       // a misbehaving scope must not surface
         Assert.Equal(["p1:dispose"], events);  // and must not prevent the others from disposing
     }
+
+    [Fact]
+    public void Constructor_EnumeratesNonListInput_AndFourScopesContainDisposeFailures()
+    {
+        var events = new List<string>();
+        var propagators = Enumerable.Range(1, 4).Select(index =>
+            index == 3
+                ? (IAsyncResponseContextPropagator)new ThrowingScopePropagator($"k{index}", $"v{index}")
+                : new RecordingPropagator($"p{index}", $"k{index}", $"v{index}", events));
+        var propagation = new AsyncResponseContextPropagation(propagators);
+
+        var scope = propagation.Restore(new Dictionary<string, string> { ["present"] = "yes" });
+
+        Assert.Null(Record.Exception(scope.Dispose));
+        Assert.Null(Record.Exception(scope.Dispose));
+        Assert.Equal(
+            ["p1:restore", "p2:restore", "p4:restore", "p4:dispose", "p2:dispose", "p1:dispose"],
+            events);
+    }
+
+    [Fact]
+    public void Restore_WithTwoThrowingScopes_SwallowsBothFailuresAndDisposesOnlyOnce()
+    {
+        var propagation = new AsyncResponseContextPropagation(
+        [
+            new ThrowingScopePropagator("first", "1"),
+            new ThrowingScopePropagator("second", "2")
+        ]);
+        var scope = propagation.Restore(new Dictionary<string, string> { ["present"] = "yes" });
+
+        Assert.Null(Record.Exception(scope.Dispose));
+        Assert.Null(Record.Exception(scope.Dispose));
+    }
 }
 
 /// <summary>Exercises the capture carrier through the public dictionary contract.</summary>

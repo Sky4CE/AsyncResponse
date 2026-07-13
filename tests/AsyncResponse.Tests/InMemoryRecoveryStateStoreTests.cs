@@ -229,6 +229,55 @@ public class InMemoryRecoveryStateStoreTests
         Assert.Equal(["first", "second"], states.Select(state => state.PayloadTypeFullName).OrderBy(value => value));
     }
 
+    [Fact]
+    public async Task SaveAndRead_CoverGeneratedIdsMismatchesMissingEntriesAndUnreadableStates()
+    {
+        var store = new InMemoryRecoveryStateStore();
+        var generated = new RecoveryState { CorrelationId = "generated" };
+
+        await store.SaveAsync("generated", generated, TimeSpan.FromMinutes(1));
+
+        Assert.NotEqual(Guid.Empty, generated.RegistrationId);
+        Assert.False(await store.TryDeleteAsync("missing", Guid.NewGuid()));
+        Assert.Empty(await store.GetAllAsync("missing"));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.SaveAsync(
+                "expected",
+                new RecoveryState { CorrelationId = "different" },
+                TimeSpan.FromMinutes(1)));
+
+        generated.SchemaVersion = RecoveryStateSchema.Current + 1;
+        Assert.Empty(await store.GetAllAsync("generated"));
+
+        var scanned = new List<RecoveryState>();
+        await foreach (var state in store.ScanAsync())
+            scanned.Add(state);
+        Assert.Empty(scanned);
+
+        using var canceled = new CancellationTokenSource();
+        await canceled.CancelAsync();
+        await Assert.ThrowsAsync<OperationCanceledException>(() =>
+            store.TryDeleteAsync("generated", generated.RegistrationId, canceled.Token));
+    }
+
+    [Fact]
+    public async Task Reads_FilterUnreadableEntriesFromManyBucket()
+    {
+        var store = new InMemoryRecoveryStateStore();
+        var unreadable = State(Guid.NewGuid(), "unreadable");
+        var readable = State(Guid.NewGuid(), "readable");
+        await store.SaveAsync("corr-a", unreadable, TimeSpan.FromMinutes(1));
+        await store.SaveAsync("corr-a", readable, TimeSpan.FromMinutes(1));
+        unreadable.SchemaVersion = RecoveryStateSchema.Current + 1;
+
+        Assert.Same(readable, Assert.Single(await store.GetAllAsync("corr-a")));
+
+        var scanned = new List<RecoveryState>();
+        await foreach (var state in store.ScanAsync())
+            scanned.Add(state);
+        Assert.Same(readable, Assert.Single(scanned));
+    }
+
     private static RecoveryState State(Guid registrationId, string payloadType)
         => new()
         {

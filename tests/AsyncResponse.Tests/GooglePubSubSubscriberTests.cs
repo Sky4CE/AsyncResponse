@@ -396,6 +396,44 @@ public class GooglePubSubSubscriberTests
         Assert.Equal(2, Volatile.Read(ref calls));
     }
 
+    [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_ReturnsNackWhenQueueAccessFails()
+    {
+        var workerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = Assert.IsType<QueuedGooglePubSubMessageDispatcher>(
+            GooglePubSubMessageDispatcher.Create(
+                (_, _) =>
+                {
+                    workerStarted.TrySetResult();
+                    return Task.CompletedTask;
+                },
+                new GooglePubSubAsyncResponseOptions(),
+                new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(1)),
+                NullLogger.Instance,
+                "subscription",
+                GooglePubSubSubscriberRole.Worker));
+        var queueField = typeof(QueuedGooglePubSubMessageDispatcher)
+            .GetField("_queue", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var queue = queueField.GetValue(dispatcher);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("prime-worker"), CancellationToken.None));
+        await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        try
+        {
+            queueField.SetValue(dispatcher, null);
+            var reply = await dispatcher.HandleAsync(Message("queue-failure"), CancellationToken.None);
+
+            Assert.Equal(SubscriberClient.Reply.Nack, reply);
+            Assert.Equal(0, dispatcher.PendingCount);
+        }
+        finally
+        {
+            queueField.SetValue(dispatcher, queue);
+            await dispatcher.DisposeAsync();
+        }
+    }
+
     [Theory]
     [MemberData(nameof(InvalidDispatcherOptions))]
     public void DispatcherValidateOptions_RejectsInvalidOptions(

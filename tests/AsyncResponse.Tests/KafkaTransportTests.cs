@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using System.Text.Json;
 using System.Text;
+using System.Reflection;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -233,6 +234,24 @@ public class KafkaTransportTests
     }
 
     [Fact]
+    public void ProducerAdapter_BuildsAndDisposesNativeProducerWithoutConnecting()
+    {
+        var options = KafkaTestData.NewOptions();
+        var configured = false;
+        options.OperationTimeout = TimeSpan.FromMilliseconds(100);
+        options.ConfigureProducer = _ => configured = true;
+        var adapter = new KafkaProducerClientAdapter(options);
+        var lazy = (Lazy<IProducer<string?, byte[]>>)typeof(KafkaProducerClientAdapter)
+            .GetField("_producer", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(adapter)!;
+
+        _ = lazy.Value;
+        adapter.Dispose();
+
+        Assert.True(configured);
+    }
+
+    [Fact]
     public void ConsumerFactory_ConfiguresRoleSpecificConsumer()
     {
         var options = KafkaTestData.NewOptions();
@@ -258,6 +277,19 @@ public class KafkaTransportTests
         Assert.Throws<InvalidOperationException>(() => factory.Create(KafkaSubscriberRole.Worker));
         Assert.Throws<InvalidOperationException>(() => factory.Create(KafkaSubscriberRole.ResponseIngress));
         Assert.Equal(["worker-group", "response-group"], groups);
+    }
+
+    [Fact]
+    public void ConsumerFactory_BuildsAndDisposesNativeConsumerWithoutConnecting()
+    {
+        var options = KafkaTestData.NewOptions();
+        var configured = false;
+        options.ConfigureConsumer = _ => configured = true;
+        var factory = new KafkaConsumerClientFactory(options);
+
+        using var consumer = factory.Create(KafkaSubscriberRole.Worker);
+
+        Assert.True(configured);
     }
 
     [Fact]

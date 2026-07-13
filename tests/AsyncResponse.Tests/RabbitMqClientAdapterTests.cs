@@ -2,6 +2,7 @@ using AsyncResponse.Transports.RabbitMQ;
 using Moq;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using System.Reflection;
 using System.Text;
 using Xunit;
 
@@ -41,6 +42,42 @@ public class RabbitMqClientAdapterTests
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => factory.CreateConnectionAsync());
         Assert.Contains(nameof(RabbitMqAsyncResponseOptions.UserName), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ConnectionFactory_MapsUriAndIndividualConnectionSettings()
+    {
+        var create = typeof(RabbitMqConnectionFactoryAdapter)
+            .GetMethod("CreateFactory", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var fromUri = Assert.IsType<ConnectionFactory>(create.Invoke(null,
+        [
+            new RabbitMqAsyncResponseOptions
+            {
+                ConnectionString = "amqp://user:password@localhost:5673/vhost",
+                ClientProvidedName = "uri-client"
+            }
+        ]));
+        var fromSettings = Assert.IsType<ConnectionFactory>(create.Invoke(null,
+        [
+            new RabbitMqAsyncResponseOptions
+            {
+                HostName = "rabbit",
+                Port = 5673,
+                VirtualHost = "/orders",
+                UserName = "worker",
+                Password = "secret",
+                ClientProvidedName = "settings-client"
+            }
+        ]));
+
+        Assert.Equal("localhost", fromUri.HostName);
+        Assert.Equal(5673, fromUri.Port);
+        Assert.Equal("uri-client", fromUri.ClientProvidedName);
+        Assert.Equal("rabbit", fromSettings.HostName);
+        Assert.Equal(5673, fromSettings.Port);
+        Assert.Equal("/orders", fromSettings.VirtualHost);
+        Assert.Equal("worker", fromSettings.UserName);
+        Assert.Equal("secret", fromSettings.Password);
     }
 
     // ---------- RabbitMqConnectionAdapter ----------

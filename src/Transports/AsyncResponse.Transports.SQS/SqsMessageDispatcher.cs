@@ -48,25 +48,21 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
     {
         SqsOptionsValidator.ValidateSubscriber(transportOptions, subscriberOptions, role);
 
-        return subscriberOptions.AckMode switch
-        {
-            SqsAckMode.AckAfterHandlerCompletes => new AwaitingSqsMessageDispatcher(
+        return subscriberOptions.AckMode == SqsAckMode.AckAfterHandlerCompletes
+            ? new AwaitingSqsMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            SqsAckMode.AckAfterEnqueue => new QueuedSqsMessageDispatcher(
+                role)
+            : new QueuedSqsMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 queue,
-                role),
-            _ => throw new InvalidOperationException(
-                $"Unsupported SQS ACK mode '{subscriberOptions.AckMode}'.")
-        };
+                role);
     }
 
     /// <summary>Validates the supplied subscriber options.</summary>

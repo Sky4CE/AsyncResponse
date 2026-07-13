@@ -520,6 +520,29 @@ public sealed class SqsTransportTests
         registeredClient.Verify(c => c.Dispose(), Times.Never);
     }
 
+    [Fact]
+    public async Task ClientFactory_MapsRegionWithoutExplicitCredentials()
+    {
+        var client = SqsClientFactory.Create(new SqsAsyncResponseOptions { Region = "us-east-1" });
+
+        Assert.IsType<SqsClientAdapter>(client);
+        await client.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PublicWorkerTransportConstructor_OwnsItsConfiguredClient()
+    {
+        var transport = new SqsWorkerTransport(Options.Create(new SqsAsyncResponseOptions
+        {
+            ServiceUrl = "http://localhost:4566",
+            AccessKey = "test",
+            SecretKey = "test"
+        }));
+
+        await transport.DisposeAsync();
+        await transport.DisposeAsync();
+    }
+
     private static void AssertInvalidCommon(
         Action<SqsAsyncResponseOptions> configure,
         string expectedOptionName)

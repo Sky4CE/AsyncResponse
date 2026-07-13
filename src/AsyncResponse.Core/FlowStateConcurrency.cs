@@ -212,14 +212,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             return;
 
         _stop.Cancel();
-        try
-        {
-            await _renewal.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected shutdown.
-        }
+        await _renewal.ConfigureAwait(false);
 
         try
         {

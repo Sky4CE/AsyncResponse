@@ -453,9 +453,10 @@ internal sealed class SqlServerAsyncResponseChannel :
             if (_dispatcherCts is not null)
                 return;
 
-            _dispatcherCts = new CancellationTokenSource();
-            _dispatchTask = Task.Run(() => DispatchLoopAsync(_dispatcherCts.Token));
-            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_dispatcherCts.Token));
+            var dispatcherCts = new CancellationTokenSource();
+            _dispatcherCts = dispatcherCts;
+            _dispatchTask = Task.Run(() => DispatchLoopAsync(dispatcherCts.Token));
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(dispatcherCts.Token));
         }
     }
 

@@ -355,8 +355,11 @@ public sealed class PostgreSqlOptionsTests
     [Fact]
     public void PostgreSqlRetry_ClassifiesTransientExceptions()
     {
+        var transientDriverFailure = new NpgsqlException("network", new TimeoutException());
         Assert.True(PostgreSqlTransportRetry.IsTransient(new TimeoutException()));
         Assert.True(PostgreSqlChannelSql.IsTransient(new TimeoutException()));
+        Assert.True(PostgreSqlTransportRetry.IsTransient(transientDriverFailure));
+        Assert.True(PostgreSqlChannelSql.IsTransient(transientDriverFailure));
         Assert.False(PostgreSqlTransportRetry.IsTransient(new OperationCanceledException()));
         Assert.False(PostgreSqlChannelSql.IsTransient(new OperationCanceledException()));
         Assert.False(PostgreSqlTransportRetry.IsTransient(new InvalidOperationException()));

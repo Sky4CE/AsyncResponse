@@ -49,25 +49,21 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
     {
         ValidateOptions(transportOptions, subscriberOptions, role);
 
-        return subscriberOptions.AckMode switch
-        {
-            GooglePubSubAckMode.AckAfterHandlerCompletes => new AwaitingGooglePubSubMessageDispatcher(
+        return subscriberOptions.AckMode == GooglePubSubAckMode.AckAfterHandlerCompletes
+            ? new AwaitingGooglePubSubMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 subscriptionId,
-                role),
-            GooglePubSubAckMode.AckAfterEnqueue => new QueuedGooglePubSubMessageDispatcher(
+                role)
+            : new QueuedGooglePubSubMessageDispatcher(
                 handler,
                 transportOptions,
                 subscriberOptions,
                 logger,
                 subscriptionId,
-                role),
-            _ => throw new InvalidOperationException(
-                $"Unsupported Google Pub/Sub ACK mode '{subscriberOptions.AckMode}'.")
-        };
+                role);
     }
 
     /// <summary>Validates the supplied options.</summary>

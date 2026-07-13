@@ -215,6 +215,16 @@ public class NatsKvStoreAdapterTests
     }
 
     [Fact]
+    public async Task GetAsync_NullEntryValue_ReturnsNull()
+    {
+        _store.Setup(s => s.GetEntryAsync<string>("null", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsKVEntry<string>("bucket", "null") { Value = null });
+        var adapter = CreateAdapter();
+
+        Assert.Null(await adapter.GetAsync("null", CancellationToken.None));
+    }
+
+    [Fact]
     public async Task TryCreateAndTryUpdate_ReturnStoreSuccess()
     {
         _store.Setup(s => s.TryCreateAsync("new", "v", It.IsAny<INatsSerialize<string>>(), It.IsAny<CancellationToken>()))
@@ -296,6 +306,18 @@ public class NatsKvStoreAdapterTests
         var adapter = CreateAdapter();
 
         Assert.False(await adapter.DeleteAsync("raced", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task DeleteAsync_ReturnsFalseWhenKeyDisappearsAfterRead()
+    {
+        _store.Setup(s => s.GetEntryAsync<string>("raced-missing", It.IsAny<ulong>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NatsKVEntry<string>("bucket", "raced-missing") { Value = "v" });
+        _store.Setup(s => s.DeleteAsync("raced-missing", It.IsAny<NatsKVDeleteOpts>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NatsKVKeyNotFoundException());
+        var adapter = CreateAdapter();
+
+        Assert.False(await adapter.DeleteAsync("raced-missing", CancellationToken.None));
     }
 
     [Fact]

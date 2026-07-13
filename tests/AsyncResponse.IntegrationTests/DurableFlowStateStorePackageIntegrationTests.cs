@@ -342,6 +342,31 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 }));
 
             await AssertStoreContractAsync(store);
+
+            // A second process can provision against an already-created schema. Oracle reports
+            // both CREATE statements as "already exists"; the store must treat that as success.
+            var secondStore = new OracleFlowStateStore(
+                Options.Create(new OracleDurableFlowOptions
+                {
+                    ConnectionString = connectionString,
+                    TableName = table
+                }));
+            Assert.Null(await secondStore.LoadAsync($"missing-{Guid.NewGuid():N}"));
+
+            var mismatchedRevisionFlowId = $"revision-{Guid.NewGuid():N}";
+            Assert.True(await store.TryCreateAsync(
+                mismatchedRevisionFlowId,
+                CreateState(mismatchedRevisionFlowId),
+                TimeSpan.FromMinutes(1)));
+
+            await using var revisionConnection = new OracleConnection(connectionString);
+            await revisionConnection.OpenAsync();
+            await using var revisionCommand = revisionConnection.CreateCommand();
+            revisionCommand.BindByName = true;
+            revisionCommand.CommandText = $"UPDATE {table} SET revision = revision + 1 WHERE flow_id = :flow_id";
+            revisionCommand.Parameters.Add(new OracleParameter("flow_id", mismatchedRevisionFlowId));
+            Assert.Equal(1, await revisionCommand.ExecuteNonQueryAsync());
+            Assert.Null(await store.LoadAsync(mismatchedRevisionFlowId));
         }
         finally
         {

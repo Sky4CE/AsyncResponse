@@ -44,6 +44,27 @@ public class NatsTransportOptionsAndSchemaTests
     }
 
     [Fact]
+    public void EarlyAckAndOptionalLimits_CoverValidAndInvalidBoundaries()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new NatsSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.Zero));
+        Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(
+            new NatsSubscriberOptions
+            {
+                AckMode = NatsAckMode.AckAfterReceive,
+                BackgroundWorkerCount = 1,
+                BackgroundQueueCapacity = 0
+            },
+            "Worker"));
+
+        NatsTransportOptionsValidator.ValidateCommon(new NatsAsyncResponseTransportOptions
+        {
+            StreamMaxMessages = 1,
+            DeadLetterStreamMaxMessages = 1
+        });
+    }
+
+    [Fact]
     public void ValidateSubscriber_Throws_ForNonPositiveBatchSize()
         => Assert.Throws<InvalidOperationException>(() =>
             NatsTransportOptionsValidator.ValidateSubscriber(new NatsSubscriberOptions { BatchSize = 0 }, "Worker"));
@@ -172,6 +193,28 @@ public class NatsCorrelationIdExtractorTests
     {
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["AR-Correlation-Id"] = "from-header" };
         Assert.Equal("from-header", NatsCorrelationIdExtractor.Extract(headers, """{"CorrelationId":"from-body"}""", _options));
+    }
+
+    [Fact]
+    public void Extract_BlankHeaderFallsBackAndNonObjectPathReturnsNull()
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["AR-Correlation-Id"] = " "
+        };
+        Assert.Equal("from-body", NatsCorrelationIdExtractor.Extract(
+            headers, """{"CorrelationId":"from-body"}""", _options));
+        Assert.Null(NatsCorrelationIdExtractor.Extract(
+            null,
+            """{"CustomParameters":42}""",
+            new NatsAsyncResponseTransportOptions
+            {
+                CorrelationIdJsonPaths = ["CustomParameters.CorrelationId"]
+            }));
+        Assert.Null(NatsCorrelationIdExtractor.Extract(
+            null,
+            "{}",
+            new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = null! }));
     }
 
     [Fact]

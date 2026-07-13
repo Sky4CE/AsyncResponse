@@ -21,23 +21,20 @@ public static class AsyncResponsePayloadReflection
     {
         ArgumentNullException.ThrowIfNull(payloadType);
 
-        return OverrideCache.GetOrAdd(payloadType, static type =>
-        {
-            if (type.IsInterface || !typeof(IAsyncResponsePayload).IsAssignableFrom(type))
-                return false;
+        return OverrideCache.GetOrAdd(payloadType, DetectOverride);
+    }
 
-            var map = type.GetInterfaceMap(typeof(IAsyncResponsePayload));
-            for (var i = 0; i < map.InterfaceMethods.Length; i++)
-            {
-                if (map.InterfaceMethods[i].Name != nameof(IAsyncResponsePayload.ShouldResumeOnRecovery))
-                    continue;
-
-                // When the type does not implement the method, the interface map points the target
-                // back at the interface's own default implementation.
-                return map.TargetMethods[i].DeclaringType != typeof(IAsyncResponsePayload);
-            }
-
+    private static bool DetectOverride(Type type)
+    {
+        if (type.IsInterface || !typeof(IAsyncResponsePayload).IsAssignableFrom(type))
             return false;
-        });
+
+        var map = type.GetInterfaceMap(typeof(IAsyncResponsePayload));
+        var interfaceMethod = typeof(IAsyncResponsePayload).GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery))!;
+        var index = Array.IndexOf(map.InterfaceMethods, interfaceMethod);
+
+        // When the type does not implement the method, the interface map points the target
+        // back at the interface's own default implementation.
+        return map.TargetMethods[index].DeclaringType != typeof(IAsyncResponsePayload);
     }
 }

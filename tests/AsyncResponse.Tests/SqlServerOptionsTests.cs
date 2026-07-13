@@ -2,7 +2,9 @@ using AsyncResponse.Channels.SqlServer;
 using AsyncResponse.Transports.SqlServer;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Data.SqlClient;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Xunit;
 
@@ -408,6 +410,21 @@ public sealed class SqlServerOptionsTests
     }
 
     [Fact]
+    public void SqlServerRetry_ClassifiesSqlErrorNumbersAndSeverity()
+    {
+        var transientNumber = CreateSqlException(1205, severity: 10);
+        var transientSeverity = CreateSqlException(50000, severity: 20);
+        var permanent = CreateSqlException(50000, severity: 10);
+
+        Assert.True(SqlServerTransportRetry.IsTransient(transientNumber));
+        Assert.True(SqlServerChannelSql.IsTransient(transientNumber));
+        Assert.True(SqlServerTransportRetry.IsTransient(transientSeverity));
+        Assert.True(SqlServerChannelSql.IsTransient(transientSeverity));
+        Assert.False(SqlServerTransportRetry.IsTransient(permanent));
+        Assert.False(SqlServerChannelSql.IsTransient(permanent));
+    }
+
+    [Fact]
     public void ChannelSql_HelperBoundaries_HandleIdentifierAndIndexName()
     {
         Assert.True(InvokeChannelSqlStatic<bool>("IsIdentifier", "valid_1"));
@@ -597,4 +614,25 @@ public sealed class SqlServerOptionsTests
         => (RecoveryState?)typeof(SqlServerRecoveryStateStore)
             .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(store, [json, correlationId]);
+
+    private static SqlException CreateSqlException(int number, byte severity)
+    {
+        var error = (SqlError)RuntimeHelpers.GetUninitializedObject(typeof(SqlError));
+        typeof(SqlError).GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+            .Single(field => field.Name.Equals("_number", StringComparison.OrdinalIgnoreCase))
+            .SetValue(error, number);
+        typeof(SqlError).GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+            .Single(field => field.Name.Equals("_errorClass", StringComparison.OrdinalIgnoreCase))
+            .SetValue(error, severity);
+
+        var errors = (SqlErrorCollection)Activator.CreateInstance(typeof(SqlErrorCollection), nonPublic: true)!;
+        typeof(SqlErrorCollection).GetMethod("Add", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(errors, [error]);
+
+        var exception = (SqlException)RuntimeHelpers.GetUninitializedObject(typeof(SqlException));
+        typeof(SqlException).GetFields(BindingFlags.NonPublic | BindingFlags.Instance)
+            .Single(field => field.FieldType == typeof(SqlErrorCollection))
+            .SetValue(exception, errors);
+        return exception;
+    }
 }

@@ -5,6 +5,11 @@ namespace AsyncResponse.Tests;
 public class ChannelSerialExecutorTests
 {
     [Fact]
+    public void Constructor_RejectsNonPositiveCapacity()
+        => Assert.Throws<ArgumentOutOfRangeException>(
+            () => new ChannelSerialExecutor(new TestLogger(), "responses", capacity: 0));
+
+    [Fact]
     public async Task Executor_RunsQueuedWorkSeriallySwallowsFailuresAndRejectsAfterDispose()
     {
         var executor = new ChannelSerialExecutor(new TestLogger(), "responses");
@@ -40,6 +45,38 @@ public class ChannelSerialExecutorTests
 
         Assert.True(task.IsCanceled);
         await Assert.ThrowsAsync<TaskCanceledException>(() => task);
+    }
+
+    [Fact]
+    public async Task EnqueueAfterDispose_ReturnsFalse()
+    {
+        var executor = new ChannelSerialExecutor(new TestLogger(), "responses");
+        await executor.DisposeAsync();
+
+        Assert.False(await executor.Enqueue(() => Task.CompletedTask));
+    }
+
+    [Fact]
+    public async Task CancellationWhileWaitingForCapacity_PropagatesAndLeavesExecutorUsable()
+    {
+        var executor = new ChannelSerialExecutor(new TestLogger(), "responses", capacity: 1);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(await executor.Enqueue(async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        }));
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(await executor.Enqueue(() => Task.CompletedTask));
+        using var cancellation = new CancellationTokenSource();
+        var blocked = executor.Enqueue(() => Task.CompletedTask, cancellation.Token);
+        await Task.Delay(20);
+        await cancellation.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => blocked);
+        release.TrySetResult();
+        await executor.DisposeAsync();
     }
 
     [Fact]

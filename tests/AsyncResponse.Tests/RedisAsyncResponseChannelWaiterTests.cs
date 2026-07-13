@@ -77,6 +77,64 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_ValidatesCorrelationAndUsesRecoveryExpiryAsTimeoutFallback()
+    {
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = null,
+            RecoveryStateExpiry = TimeSpan.FromMinutes(1)
+        });
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            channel.CreateResponseWaiter<OperationResult>(" "));
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("fallback-timeout");
+
+        Assert.False(waiter.ResponseTask.IsCompleted);
+    }
+
+    [Fact]
+    public async Task DuplicateTerminalMessages_DoNotReplaceFirstCompletion()
+    {
+        var channel = CreateChannel();
+
+        await using (var success = await channel.CreateResponseWaiter<OperationResult>("duplicate-success"))
+        {
+            var handler = _handler!;
+            var subscribed = _subscribedChannel;
+            var json = JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed, Message = "first" }
+            }, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+            handler(subscribed, json);
+            handler(subscribed, json);
+            Assert.Equal("first", (await success.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        }
+
+        await DuplicateFaultAsync(channel, "duplicate-null", "null", typeof(JsonException));
+        await DuplicateFaultAsync(
+            channel,
+            "duplicate-schema",
+            JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+            {
+                SchemaVersion = AsyncResponseEnvelopeSchema.Current + 1,
+                Success = true,
+                Payload = new OperationResult()
+            }, AsyncResponseEnvelopeOptions<OperationResult>.Instance),
+            typeof(InvalidOperationException));
+        await DuplicateFaultAsync(
+            channel,
+            "duplicate-remote",
+            JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = false,
+                ExceptionMessage = "remote"
+            }, AsyncResponseEnvelopeOptions<OperationResult>.Instance),
+            typeof(Exception));
+        await DuplicateFaultAsync(channel, "duplicate-malformed", "{not-json", typeof(JsonException));
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_CompletionPredicateCanWaitForLaterMessages()
     {
         var channel = CreateChannel();
@@ -485,6 +543,23 @@ public class RedisAsyncResponseChannelWaiterTests
     {
         var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
         _handler!.Invoke(_subscribedChannel, json);
+    }
+
+    private async Task DuplicateFaultAsync(
+        RedisAsyncResponseChannel channel,
+        string correlationId,
+        RedisValue message,
+        Type exceptionType)
+    {
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(correlationId);
+        var handler = _handler!;
+        var subscribed = _subscribedChannel;
+        handler(subscribed, message);
+        handler(subscribed, message);
+
+        var exception = await Assert.ThrowsAnyAsync<Exception>(() =>
+            waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.True(exceptionType.IsAssignableFrom(exception.GetType()));
     }
 
     private static async Task Eventually(Func<bool> condition)

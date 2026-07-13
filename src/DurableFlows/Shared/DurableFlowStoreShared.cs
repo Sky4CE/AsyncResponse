@@ -86,7 +86,7 @@ internal static class DurableFlowStoreShared
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{optionName} must be configured.");
 
-        if (value.Length == 0 || !(char.IsAsciiLetter(value[0]) || value[0] == '_'))
+        if (!(char.IsAsciiLetter(value[0]) || value[0] == '_'))
             throw new InvalidOperationException($"{optionName} '{value}' must be a simple {providerName} identifier (letters, digits, and underscores; not starting with a digit).");
 
         foreach (var c in value)

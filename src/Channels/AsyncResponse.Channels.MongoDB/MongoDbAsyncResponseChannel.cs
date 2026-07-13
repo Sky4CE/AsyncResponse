@@ -453,12 +453,13 @@ internal sealed class MongoDbAsyncResponseChannel :
             if (_listenerCts is not null)
                 return;
 
-            _listenerCts = new CancellationTokenSource();
+            var listenerCts = new CancellationTokenSource();
+            _listenerCts = listenerCts;
             _listenTask = _options.UseChangeStreams
-                ? Task.Run(() => ListenLoopAsync(_listenerCts.Token))
+                ? Task.Run(() => ListenLoopAsync(listenerCts.Token))
                 : Task.CompletedTask;
-            _dispatchTask = Task.Run(() => DispatchLoopAsync(_listenerCts.Token));
-            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_listenerCts.Token));
+            _dispatchTask = Task.Run(() => DispatchLoopAsync(listenerCts.Token));
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(listenerCts.Token));
         }
     }
 
