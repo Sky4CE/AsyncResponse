@@ -216,9 +216,11 @@ public sealed class CoreCoverageTests
         await Assert.ThrowsAsync<ArgumentException>(() => store.TryCreateAsync("other", State("mismatch"), TimeSpan.FromMinutes(1)));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => store.TryCreateAsync("ttl", State("ttl"), TimeSpan.Zero));
 
+        Assert.True(await store.TryCreateAsync("existing", State("existing"), TimeSpan.FromMinutes(1)));
+        Assert.False(await store.TryCreateAsync("existing", State("existing"), TimeSpan.FromMinutes(1)));
+
         var expiring = State("expiring");
         Assert.True(await store.TryCreateAsync("expiring", expiring, TimeSpan.FromMilliseconds(5)));
-        Assert.False(await store.TryCreateAsync("expiring", State("expiring"), TimeSpan.FromMinutes(1)));
         await Task.Delay(20);
         Assert.Null(await store.LoadAsync("expiring"));
         Assert.True(await store.TryCreateAsync("expiring", State("expiring"), TimeSpan.FromMinutes(1)));
