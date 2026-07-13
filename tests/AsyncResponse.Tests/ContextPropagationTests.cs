@@ -342,9 +342,8 @@ public class ContextPropagationTests
         });
         await armed.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        var state = await store.GetAsync(correlationId!);
-        Assert.NotNull(state);
-        Assert.Equal("hello", state!.Context?[BaggagePropagator.Key]);
+        var state = Assert.Single(await store.GetAllAsync(correlationId!));
+        Assert.Equal("hello", state.Context?[BaggagePropagator.Key]);
     }
 
     [Fact]

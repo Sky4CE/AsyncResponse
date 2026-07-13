@@ -3,7 +3,6 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
-using System.Collections.Concurrent;
 using System.Linq.Expressions;
 using System.Text.Json;
 using Xunit;
@@ -17,6 +16,8 @@ namespace AsyncResponse.Tests;
 /// </summary>
 public class DurableChildFlowRegressionTests
 {
+    private static readonly TimeSpan CrashTestLeaseDuration = TimeSpan.FromMilliseconds(500);
+
     public sealed record GatedParentInput(int Value);
 
     /// <summary>Per-provider gate: when blocked, the child flow parks inside its step.</summary>
@@ -60,25 +61,6 @@ public class DurableChildFlowRegressionTests
             => await flow.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("collide", new TestFlowInput(1), flowId: input.ChildId);
     }
 
-    /// <summary>
-    /// Serializing map-backed store shared across providers, so a second provider models a process
-    /// restart that carries over only persisted state.
-    /// </summary>
-    public sealed class SharedMapFlowStateStore(ConcurrentDictionary<string, string> _map) : IFlowStateStore
-    {
-        public Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-        {
-            _map[flowId] = FlowStateJson.Serialize(state);
-            return Task.CompletedTask;
-        }
-
-        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-            => Task.FromResult(_map.TryGetValue(flowId, out var json) ? JsonSerializer.Deserialize<FlowState>(json) : null);
-
-        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
-            => Task.FromResult(_map.TryRemove(flowId, out _));
-    }
-
     [Fact]
     public async Task SuspendedParent_DuplicateDelivery_CompletesStepsExactlyOnce()
     {
@@ -118,10 +100,11 @@ public class DurableChildFlowRegressionTests
     [Fact]
     public async Task SuspendedParent_ResumesAfterRestart_FromPersistedStateOnly()
     {
-        var map = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        var sharedStore = new InMemoryFlowStateStore();
+        var crashedStore = new CrashableFlowStateStore(sharedStore);
 
         // First "process": the child parks mid-step, then the process dies (no graceful stop).
-        var crashed = CreateProvider(blockChild: true, sharedStore: map);
+        var crashed = CreateProvider(blockChild: true, crashedStore);
         await StartHostedServicesAsync(crashed);
         var crashedProbe = crashed.GetRequiredService<ChildFlowProbe>();
         var flowsA = crashed.GetRequiredService<IDurableFlows>();
@@ -133,12 +116,16 @@ public class DurableChildFlowRegressionTests
         Assert.Equal(FlowRunStatus.Running, suspended!.Status);
         Assert.Contains("suspended waiting for child flow", suspended.LastMessage);
 
+        crashedStore.Crash();
         await crashed.DisposeAsync(); // crash: in-memory queue and in-flight child are gone
+        await Task.Delay(CrashTestLeaseDuration + TimeSpan.FromMilliseconds(250));
 
         // Second "process": only the shared store carries over. Re-delivering the parent job (the
         // documented recovery lever — transport redelivery or ResumeAsync) must re-enqueue the
         // child from the breadcrumb and run the whole tree to completion.
-        await using var restarted = CreateProvider(blockChild: false, sharedStore: map);
+        await using var restarted = CreateProvider(
+            blockChild: false,
+            new CrashableFlowStateStore(sharedStore));
         var hosted = await StartHostedServicesAsync(restarted);
         try
         {
@@ -172,7 +159,7 @@ public class DurableChildFlowRegressionTests
             var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
             // A top-level run (no ParentFlowId) already owns the id the parent wants to await.
-            await store.SaveAsync("shared-id", new FlowState
+            Assert.True(await store.TryCreateAsync("shared-id", new FlowState
             {
                 FlowId = "shared-id",
                 FlowTypeName = typeof(GatedChildFlow).FullName,
@@ -181,7 +168,7 @@ public class DurableChildFlowRegressionTests
                 Status = FlowRunStatus.Running,
                 CreatedAtUtc = DateTime.UtcNow,
                 UpdatedAtUtc = DateTime.UtcNow
-            }, TimeSpan.FromMinutes(5));
+            }, TimeSpan.FromMinutes(5)));
 
             var parentId = await flows.StartAsync<CollidingParentFlow, CollisionInput>(new CollisionInput("shared-id"), flowId: "collision-owner-root");
 
@@ -206,7 +193,7 @@ public class DurableChildFlowRegressionTests
             var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
             // Right parent, wrong flow type under the awaited id.
-            await store.SaveAsync("typed-id", new FlowState
+            Assert.True(await store.TryCreateAsync("typed-id", new FlowState
             {
                 FlowId = "typed-id",
                 FlowTypeName = typeof(RecursiveChildFlow).FullName,
@@ -217,7 +204,7 @@ public class DurableChildFlowRegressionTests
                 ParentStepName = "collide",
                 CreatedAtUtc = DateTime.UtcNow,
                 UpdatedAtUtc = DateTime.UtcNow
-            }, TimeSpan.FromMinutes(5));
+            }, TimeSpan.FromMinutes(5)));
 
             var parentId = await flows.StartAsync<CollidingParentFlow, CollisionInput>(new CollisionInput("typed-id"), flowId: "collision-type-root");
 
@@ -228,6 +215,130 @@ public class DurableChildFlowRegressionTests
         {
             await StopHostedServicesAsync(hosted);
         }
+    }
+
+    [Theory]
+    [InlineData("parent-step")]
+    [InlineData("input-type")]
+    [InlineData("input-value")]
+    public async Task AwaitChildFlow_ChildIdWithDifferentPersistedContract_FailsParent(string mismatch)
+    {
+        await using var provider = CreateProvider(blockChild: false);
+        var hosted = await StartHostedServicesAsync(provider);
+        try
+        {
+            var flows = provider.GetRequiredService<IDurableFlows>();
+            using var scope = provider.CreateScope();
+            var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+
+            Assert.True(await store.TryCreateAsync("contract-id", new FlowState
+            {
+                FlowId = "contract-id",
+                FlowTypeName = typeof(GatedChildFlow).FullName,
+                InputTypeName = mismatch == "input-type" ? typeof(RecursiveChildInput).FullName : typeof(TestFlowInput).FullName,
+                InputJson = JsonSerializer.Serialize(mismatch == "input-value" ? new TestFlowInput(2) : new TestFlowInput(1)),
+                Status = FlowRunStatus.Running,
+                ParentFlowId = "collision-contract-root",
+                ParentStepName = mismatch == "parent-step" ? "another-step" : "collide",
+                CreatedAtUtc = DateTime.UtcNow,
+                UpdatedAtUtc = DateTime.UtcNow
+            }, TimeSpan.FromMinutes(5)));
+
+            var parentId = await flows.StartAsync<CollidingParentFlow, CollisionInput>(
+                new CollisionInput("contract-id"),
+                flowId: "collision-contract-root");
+
+            var root = await WaitForStateAsync(flows, parentId, FlowRunStatus.Failed);
+            Assert.Contains("different", root.LastMessage, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await StopHostedServicesAsync(hosted);
+        }
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_CompletedCheckpoint_WithChangedInput_FailsInsteadOfReturningStaleChild()
+    {
+        var store = new InMemoryFlowStateStore();
+        var child = new FlowState
+        {
+            FlowId = "completed-root:child",
+            FlowTypeName = typeof(GatedChildFlow).FullName,
+            InputTypeName = typeof(TestFlowInput).FullName,
+            InputJson = JsonSerializer.Serialize(new TestFlowInput(1)),
+            Status = FlowRunStatus.Succeeded,
+            ParentFlowId = "completed-root",
+            ParentStepName = "child",
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+        var parent = new FlowState
+        {
+            FlowId = "completed-root",
+            FlowTypeName = typeof(GatedParentFlow).FullName,
+            Status = FlowRunStatus.Running,
+            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+            {
+                ["child"] = new()
+                {
+                    Completed = true,
+                    ChildFlowId = child.FlowId,
+                    ResultJson = FlowStateJson.SerializeSnapshot(child)
+                }
+            },
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            parent.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        Assert.NotNull(lease);
+
+        var context = CreateContext(parent, store, lease!);
+        var error = await Assert.ThrowsAsync<DurableFlowFailedException>(() =>
+            context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child", new TestFlowInput(2)));
+
+        Assert.Contains("semantically identical child input", error.Message);
+    }
+
+    [Fact]
+    public async Task AwaitChildFlow_ReplayWithChangedExplicitChildId_FailsFast()
+    {
+        var store = new InMemoryFlowStateStore();
+        var parent = new FlowState
+        {
+            FlowId = "replay-root",
+            FlowTypeName = typeof(GatedParentFlow).FullName,
+            Status = FlowRunStatus.Running,
+            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+            {
+                ["child"] = new() { ChildFlowId = "original-child-id" }
+            },
+            CreatedAtUtc = DateTime.UtcNow,
+            UpdatedAtUtc = DateTime.UtcNow
+        };
+
+        Assert.True(await store.TryCreateAsync(parent.FlowId!, parent, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            parent.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        Assert.NotNull(lease);
+
+        var context = CreateContext(parent, store, lease!);
+        var error = await Assert.ThrowsAsync<DurableFlowFailedException>(() =>
+            context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>(
+                "child",
+                new TestFlowInput(1),
+                flowId: "changed-child-id"));
+
+        Assert.Contains("already bound", error.Message);
     }
 
     [Fact]
@@ -272,8 +383,7 @@ public class DurableChildFlowRegressionTests
         // the parent on another worker at any moment, so the suspended parent state (breadcrumb +
         // suspension message) must already be durable at enqueue time. A save after enqueue could
         // clobber the re-execution's newer checkpoints with a stale snapshot.
-        var map = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
-        var store = new SharedMapFlowStateStore(map);
+        var store = new InMemoryFlowStateStore();
         var state = new FlowState
         {
             FlowId = "ordering-root",
@@ -283,11 +393,19 @@ public class DurableChildFlowRegressionTests
             UpdatedAtUtc = DateTime.UtcNow
         };
 
-        string? parentJsonAtEnqueue = null;
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            state.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        Assert.NotNull(lease);
+
+        FlowState? parentStateAtEnqueue = null;
         var builder = new Mock<IAsyncResponseBuilder>();
         builder
             .Setup(b => b.EnqueueWorkerAsync(It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>()))
-            .Callback(() => map.TryGetValue("ordering-root", out parentJsonAtEnqueue))
+            .Callback(() => parentStateAtEnqueue = store.LoadAsync("ordering-root").GetAwaiter().GetResult())
             .Returns(Task.CompletedTask);
 
         var context = new DurableFlowContext(
@@ -298,18 +416,19 @@ public class DurableChildFlowRegressionTests
             new DurableFlowOptions(),
             Mock.Of<IAsyncResponseSubscriber>(),
             recoverableSubscriber: null,
-            NullLogger.Instance);
+            NullLogger.Instance,
+            lease!);
 
         await Assert.ThrowsAsync<DurableFlowSuspendedException>(
             () => context.AwaitChildFlowAsync<GatedChildFlow, TestFlowInput>("child-step", new TestFlowInput(1)));
 
-        Assert.NotNull(parentJsonAtEnqueue);
-        var persisted = JsonSerializer.Deserialize<FlowState>(parentJsonAtEnqueue!)!;
+        var persisted = Assert.IsType<FlowState>(parentStateAtEnqueue);
         Assert.Contains("suspended waiting for child flow", persisted.LastMessage);
         Assert.Equal("ordering-root:child-step", persisted.Steps!["child-step"].ChildFlowId);
 
         // The child state itself must exist before the breadcrumb ("breadcrumb implies child").
-        var child = JsonSerializer.Deserialize<FlowState>(map["ordering-root:child-step"])!;
+        var child = await store.LoadAsync("ordering-root:child-step");
+        Assert.NotNull(child);
         Assert.Equal("ordering-root", child.ParentFlowId);
         Assert.Equal("child-step", child.ParentStepName);
     }
@@ -331,7 +450,7 @@ public class DurableChildFlowRegressionTests
         Assert.Equal("42", state.Context!["tenant"]);
     }
 
-    private static ServiceProvider CreateProvider(bool blockChild, ConcurrentDictionary<string, string>? sharedStore = null)
+    private static ServiceProvider CreateProvider(bool blockChild, CrashableFlowStateStore? flowStore = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
@@ -341,17 +460,102 @@ public class DurableChildFlowRegressionTests
         services.AddScoped<GatedParentFlow>();
         services.AddScoped<CollidingParentFlow>();
         services.AddScoped<RecursiveChildFlow>();
-        var builder = services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
+        var builder = services.AddAsyncResponse(options =>
+            {
+                options.Watchdog.Enabled = false;
+            })
             .WithInMemoryChannel()
             .WithInMemoryTransport();
 
-        if (sharedStore is not null)
+        if (flowStore is not null)
         {
-            services.AddSingleton(sharedStore);
-            builder.WithCustomDurableFlows<SharedMapFlowStateStore>();
+            services.AddSingleton(flowStore);
+            builder.WithDurableFlows<CrashableFlowStateStore>(options =>
+            {
+                options.ExecutionLeaseDuration = CrashTestLeaseDuration;
+                options.ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(100);
+            });
+        }
+        else
+        {
+            builder.WithInMemoryDurableFlows();
         }
 
         return services.BuildServiceProvider();
+    }
+
+    private static DurableFlowContext CreateContext(
+        FlowState state,
+        IFlowStateStore store,
+        FlowExecutionLease lease)
+        => new(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            Mock.Of<IAsyncResponseSubscriber>(),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+    /// <summary>
+    /// Gives each simulated process its own store client while sharing persisted state. Once a
+    /// client crashes it can no longer renew or release leases, exactly like a dead replica; the
+    /// next client takes over after the persisted lease expires.
+    /// </summary>
+    private sealed class CrashableFlowStateStore(InMemoryFlowStateStore inner) : IFlowStateStore
+    {
+        private bool _available = true;
+
+        public void Crash() => Volatile.Write(ref _available, false);
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => Available().TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => Available().LoadAsync(flowId, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(
+            string flowId,
+            FlowState state,
+            long expectedRevision,
+            TimeSpan ttl,
+            string? leaseId = null,
+            CancellationToken cancellationToken = default)
+            => Available().TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+
+        public Task<bool> TryAcquireLeaseAsync(
+            string flowId,
+            string leaseId,
+            TimeSpan leaseDuration,
+            CancellationToken cancellationToken = default)
+            => Available().TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(
+            string flowId,
+            string leaseId,
+            TimeSpan leaseDuration,
+            CancellationToken cancellationToken = default)
+            => Volatile.Read(ref _available)
+                ? inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken)
+                : Task.FromResult(false);
+
+        public Task ReleaseLeaseAsync(
+            string flowId,
+            string leaseId,
+            CancellationToken cancellationToken = default)
+            => Volatile.Read(ref _available)
+                ? inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken)
+                : Task.CompletedTask;
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => Available().TryDeleteAsync(flowId, cancellationToken);
+
+        private InMemoryFlowStateStore Available()
+            => Volatile.Read(ref _available)
+                ? inner
+                : throw new InvalidOperationException("The simulated process has crashed.");
     }
 
     private static async Task<FlowState> WaitForStateAsync(IDurableFlows flows, string flowId, FlowRunStatus status)

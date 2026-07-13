@@ -5,7 +5,8 @@ AsyncResponse's headline use is awaiting one response. Its most powerful use is 
 that survives crashes, redeploys, and redeliveries mid-step and resumes exactly where it left
 off. Durable flows are a first-class API in `AsyncResponse.Core` — the library owns the
 checkpointing, the crash-recovery bookkeeping, and the recovery callbacks, so your flow is just
-the steps.
+the steps. Built-in flow stores also fence duplicate deliveries across application replicas with
+atomic creation, optimistic revisions, and a renewable execution lease.
 
 **On this page**
 
@@ -74,24 +75,27 @@ FlowState? state = await _flows.GetStateAsync(flowId);
 await _flows.ResumeAsync(flowId);
 ```
 
-`IDurableFlows` and `IDurableFlowContext` are registered by `AddAsyncResponse()`. The default
-`IFlowStateStore` stores flow ledgers in the channel recovery store, which is handy for tests,
-development, and migration. For production durable flows, keep state in application-owned storage:
+Every AsyncResponse registration explicitly chooses a state store. Applications that only await
+individual responses use `.WithInMemoryDurableFlows()` as the zero-infrastructure choice; no ledger
+is created until a flow starts. For restart-safe production flows, select a provider-backed atomic
+store:
 
 ```csharp
-builder.Services
-    .AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+var connectionString = builder.Configuration.GetConnectionString("SqlServer")
+    ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
+
+builder.Services.AddAsyncResponse()
+    .WithSqlServerChannel(options =>
+        options.ConnectionString = connectionString)
+    .WithSqlServerTransport(options =>
+        options.ConnectionString = connectionString)
     .WithSqlServerDurableFlows(options =>
-    {
-        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
-    });
+        options.ConnectionString = connectionString);
 ```
 
 Built-in store packages are available for SQL Server, PostgreSQL, MySQL/MariaDB, SQLite, Oracle,
-MongoDB, Azure Cosmos DB, and DynamoDB. Use `WithCustomDurableFlows<TStore>()` only when those
-packages do not match your storage model.
+MongoDB, Azure Cosmos DB, DynamoDB, and EF Core. Use `.WithInMemoryDurableFlows()` for tests or one
+process, and `.WithDurableFlows<TStore>()` only when those packages do not match your storage model.
 
 ## The rules (there are only three)
 
@@ -174,14 +178,16 @@ with the failed child snapshot and throws `DurableFlowFailedException` by defaul
 step keeps its `Faulted = true` marker even after memoization, so operators see the failure on the
 step itself instead of digging through the memoized child snapshot.
 
-**The child id contract.** A child flow id is **exclusive to the parent that started it**. The
+**The child id contract.** A child flow id is **exclusive to one step of the parent that started
+it**. The
 notification that resumes a suspended parent follows the child's single `ParentFlowId`, so if a
 step awaits an id that belongs to another parent — or to a top-level run started via
 `IDurableFlows.StartAsync` — the parent would park forever. The library rejects that loudly
-instead: awaiting a foreign id throws `DurableFlowFailedException`, and the persisted
-`FlowTypeName` is validated on adoption too, so an id collision with a *different flow type* also
-fails fast. The default id, `{parentFlowId}:{stepName}`, is always safe; pass a custom `flowId`
-only when it is unique per parent run.
+instead: awaiting a foreign id throws `DurableFlowFailedException`. The persisted parent step,
+flow type, input type, and semantic JSON input value are validated both while waiting and when a
+completed checkpoint is replayed, so changed arguments can never silently adopt a stale child.
+The default id, `{parentFlowId}:{stepName}`, is always safe; pass a custom nonblank `flowId` only
+when it is unique per parent step, and keep that id and input stable on every replay.
 
 **No timeout on a child wait — deliberately.** A suspended parent holds no worker, so there is
 nothing to time out cheaply; the child is bounded by its own step timeouts and by the worker
@@ -220,9 +226,10 @@ property makes every failure mode collapse into "run it again":
 |---|---|
 | Process crashes **before** a step | Worker redelivery re-runs the flow; completed steps skip; the step runs normally |
 | Process crashes **while awaiting** a remote step | The re-run **re-attaches** to the in-flight wait via the persisted correlation-id breadcrumb — the request is *not* re-sent; progress keeps streaming |
-| Process is **down** when a progress/success response arrives | The payload's `ShouldResumeOnRecovery() == true` routes to the auto-registered **resume** callback, which re-enqueues the run on the worker transport |
+| Process is **down** when a progress/success response arrives | The payload's `ShouldResumeOnRecovery() == true` routes to the auto-registered recovery callback. It finds the step by correlation id, checkpoints the actual payload, clears the pending wait, and re-enqueues the run |
 | Process is down when a **failed** response arrives | `ShouldResumeOnRecovery() == false` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
-| The **terminal** response itself was the lost message | Recovery consumed it, so the re-attached wait has nothing to receive: the step times out and restarts fresh — rule 2 (idempotent steps) is what makes that safe |
+| The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
+| The same flow job is delivered to two replicas | Atomic start preserves the first input, and the execution lease lets one worker run. The duplicate delivery returns without entering flow code; if the owner disappears, the lease expires and another worker resumes from the last compare-and-swap checkpoint |
 | A child flow is running | The parent run is parked as `Running`; the child terminal state re-enqueues the parent, which reloads the child state and continues |
 | A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
 | The **child's ledger expired** while the parent was suspended | The parent step fails terminally with `DurableFlowFailedException` (`"has no state (expired or deleted)"`) instead of silently re-running the child's side effects — the child's outcome is unknowable. Size `DurableFlowOptions.StateExpiry` beyond the longest child idle time; the TTL refreshes on every checkpoint |
@@ -302,9 +309,15 @@ flow test is *start → answer the triggers → assert the state* — no mocks o
 
 ```csharp
 var services = new ServiceCollection();
-services.AddSingleton<FakeNotifier>();          // your fakes, injected like production services
+services.AddSingleton<IWorkspaceService, FakeWorkspaceService>();
+services.AddSingleton<IMigrationService, FakeMigrationService>();
+services.AddSingleton<IImportService, FakeImportService>();
+services.AddSingleton<INotifier, FakeNotifier>(); // ordinary DI: fakes replace production services
 services.AddScoped<TenantProvisioningFlow>();
-services.AddAsyncResponse().WithInMemoryChannel().WithInMemoryTransport();
+services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows();
 await using var provider = services.BuildServiceProvider();
 
 var flows = provider.GetRequiredService<IDurableFlows>();
@@ -327,7 +340,7 @@ production-shaped pipeline with a crash-at-every-checkpoint matrix, subset runs,
 and injected notifications), [`DurableChildFlowTests`](../tests/AsyncResponse.Tests/DurableChildFlowTests.cs)
 (single-worker parent → child → grandchild execution plus the old hand-rolled starvation
 regression), integration tests running the same flow against **every durable channel** (Redis,
-NATS, PostgreSQL, SQL Server) over real infrastructure, and a stress-harness storm asserting
+NATS, PostgreSQL, SQL Server, MongoDB) over real infrastructure, and a stress-harness storm asserting
 exactly-once step execution across hundreds of concurrent flows. For pure unit tests of flow
 logic, `IDurableFlowContext` is an interface you can fake outright.
 
@@ -340,28 +353,31 @@ logic, `IDurableFlowContext` is an interface you can fake outright.
   for three children will legitimately show four-plus attempts on a fully successful run.
 - Child flow relationships are visible in state: the parent step has `ChildFlowId`, and the child
   run has `ParentFlowId`/`ParentStepName`.
-- `flow.ReportProgressAsync(...)` and `flow.SetValueAsync(key, value)` persist operator-facing
-  progress and arbitrary values on the state.
+- `flow.SetValueAsync(key, value)` checkpoints arbitrary values immediately.
+  `flow.ReportProgressAsync(...)` updates operator-facing progress; by default rapid reports within
+  one second are coalesced into the next checkpoint or outcome to avoid rewriting the whole ledger
+  for every tick. Set `ProgressPersistenceInterval = TimeSpan.Zero` in the selected
+  `With*DurableFlows(...)` callback to write every report immediately.
 - Executions emit an `asyncresponse.flow.execute` activity tagged with the flow id and type.
 
 ## Storage: where flow state lives
 
-By default, flow state rides in the channel's `IRecoveryStateStore` (one entry per run under a
-sentinel marker; the watchdog knows to skip them). This keeps tests, development, and migrations
-simple, but recovery stores are often cache-shaped: Redis keys expire, NATS KV buckets may have
-limits, and `AsyncResponseOptions.DurableFlows.StateExpiry` defaults to 7 days. That TTL refreshes
-on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration.
-
-To keep flow state in durable app-owned storage (e.g. a table next to the domain entities the
-flow operates on, where your dashboards already look), use a store package:
+Flow state is explicit and separate from channel recovery metadata. Choose exactly one store in
+every registration. A common production setup keeps the ledger beside the application's domain data:
 
 ```csharp
+using Npgsql;
+
+var connectionString = builder.Configuration.GetConnectionString("PostgreSQL")
+    ?? throw new InvalidOperationException("ConnectionStrings:PostgreSQL is required.");
+
+builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
+
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithPostgreSqlChannel(options => options.SchemaName = "public")
+    .WithPostgreSqlTransport(options => options.SchemaName = "public")
     .WithPostgreSqlDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("PostgreSQL");
         options.SchemaName = "public";
         options.TableName = "asyncresponse_flow_state";
     });
@@ -381,35 +397,49 @@ Supported packages:
 | DynamoDB | `WithDynamoDbDurableFlows(...)` |
 | Entity Framework Core (any relational provider) | `WithEFCoreDurableFlows<TDbContext>(...)` |
 
-If your application already has a different persistence abstraction, register your own store. The
-library calls exactly three members:
+For tests, development, or a deliberately one-process application:
 
 ```csharp
-public interface IFlowStateStore
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows();
+```
+
+For application-owned storage, implement the single atomic `IFlowStateStore` contract and register
+it explicitly:
+
+```csharp
+public sealed class MyDatabaseFlowStateStore : IFlowStateStore
 {
-    Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken ct = default);
-    Task<FlowState?> LoadAsync(string flowId, CancellationToken ct = default);
-    Task<bool> TryDeleteAsync(string flowId, CancellationToken ct = default);
+    // Atomic create, revision-checked update, lease acquire/renew/release,
+    // TTL-filtered load, and delete are all required.
 }
 
 builder.Services
     .AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
-    .WithCustomDurableFlows<MyDatabaseFlowStateStore>();
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithDurableFlows<MyDatabaseFlowStateStore>();
 ```
+
+There is no weaker three-method or local-lock compatibility mode. Every store must atomically
+create a run, compare-and-swap revisions, and fence execution with renewable leases. Built-in
+providers implement the full contract; the in-memory store implements it within one process.
 
 The store packages register their stores as **singletons** — schema/index/container provisioning
 runs once per process, and a host-registered client (`NpgsqlDataSource`, `IMongoDatabase`,
-`CosmosClient`, `IAmazonDynamoDB`) is reused when present. `WithCustomDurableFlows<TStore>()`
+`CosmosClient`, `IAmazonDynamoDB`) is reused when present. `WithDurableFlows<TStore>()`
 registers *your* store as **scoped**, so EF Core `DbContext`-style dependencies work normally.
-The default recovery-backed store logs a warning the first time it persists flow state, pointing
-production apps at the package/custom-store path.
 
-Implementation guide, lifetimes, and expired-state cleanup:
+`StateExpiry` defaults to 7 days and refreshes on every checkpoint, so it limits the maximum idle
+gap between checkpoints rather than total run duration. Expired, malformed, identity-mismatched,
+revision-mismatched, or unsupported-schema ledgers load as absent instead of entering execution.
+
+Full contract, package lifetimes, schema requirements, and expired-state cleanup:
 [durable-flow-state-stores.md](durable-flow-state-stores.md). `StateExpiry` and
-`DefaultStepTimeout` live on the engine options — see
-[configuration.md](configuration.md#engine-options-asyncresponseoptions).
+`DefaultStepTimeout` live on the selected store options — see
+[configuration.md](configuration.md#common-durable-flow-options).
 
 ## Under the hood
 
@@ -423,14 +453,18 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   **breadcrumb**, then runs your trigger. That ordering is the whole trick: "breadcrumb exists"
   implies "someone is listening", so a crash on either side of the send re-attaches or safely
   restarts — never a lost run, never a double-send.
-- On durable channels, every awaited step auto-registers the flow executor's resume/failure
-  methods as lost-subscriber callbacks — the same recovery machinery as
+- On durable channels, every awaited step auto-registers the flow executor's payload-recovery and
+  failure methods as lost-subscriber callbacks — the same recovery machinery as
   [recovery.md](recovery.md), with its at-least-once, idempotency-required contract. (On the
   in-memory channel these callbacks don't exist; flows still checkpoint and re-attach, with
   process-lifetime durability.)
 - Starting a flow enqueues a worker job carrying only the flow id; resume, redelivery, and
   operator kicks all re-enqueue that same job. `StartAsync` with a caller-supplied `flowId` is
-  idempotent — an existing run is re-enqueued, never duplicated.
+  atomically idempotent for the same flow type and semantically identical input. Conflicting reuse
+  is rejected; an existing run is never replaced silently.
+- Built-in stores persist a monotonic `FlowState.Revision`. Every execution owns a renewable lease
+  and every checkpoint requires both the expected revision and that lease, so a stale worker cannot
+  overwrite recovery state written by a newer execution.
 
 ## Honest comparison with a dedicated workflow engine
 

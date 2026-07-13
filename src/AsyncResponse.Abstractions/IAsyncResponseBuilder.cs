@@ -44,16 +44,16 @@ public interface IAsyncResponseBuilder
     IAsyncResponseTriggeredBuilder<T> For<T>() where T : IAsyncResponsePayload;
 
     /// <summary>Publishes a work descriptor to the configured <see cref="IWorkerTransport"/>.</summary>
-    Task EnqueueWorkerAsync(ReflectionCallDto work);
+    Task EnqueueWorkerAsync(ReflectionCallDto work, CancellationToken cancellationToken = default);
 
     /// <summary>Enqueues a synchronous worker operation expressed as a lambda: <c>svc => svc.DoWork(args)</c>.</summary>
-    Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work);
+    Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work, CancellationToken cancellationToken = default);
 
     /// <summary>Enqueues an asynchronous worker operation expressed as a lambda: <c>svc => svc.DoWorkAsync(args)</c>.</summary>
-    Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work);
+    Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work, CancellationToken cancellationToken = default);
 
     /// <summary>Enqueues an asynchronous worker operation returning <see cref="ValueTask"/>.</summary>
-    Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work);
+    Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

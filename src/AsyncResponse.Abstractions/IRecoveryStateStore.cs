@@ -18,39 +18,17 @@ public interface IRecoveryStateStore
         TimeSpan ttl,
         CancellationToken cancellationToken = default);
 
-    /// <summary>Loads recovery state for <paramref name="correlationId"/>, or <c>null</c> when absent or expired.</summary>
-    Task<RecoveryState?> GetAsync(
+    /// <summary>Loads every live recovery registration for <paramref name="correlationId"/>.</summary>
+    Task<IReadOnlyList<RecoveryState>> GetAllAsync(
         string correlationId,
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Loads every recovery registration for <paramref name="correlationId"/>. The default keeps
-    /// custom stores source-compatible by exposing their existing single-entry behavior as a
-    /// one-element list.
-    /// </summary>
-    async Task<IReadOnlyList<RecoveryState>> GetAllAsync(
-        string correlationId,
-        CancellationToken cancellationToken = default)
-    {
-        var state = await GetAsync(correlationId, cancellationToken).ConfigureAwait(false);
-        return state is null ? [] : [state];
-    }
-
-    /// <summary>
-    /// Deletes recovery state for <paramref name="correlationId"/>.
-    /// Returns <c>true</c> when a state entry was removed, or <c>false</c> when it was already gone.
-    /// </summary>
-    Task<bool> TryDeleteAsync(
-        string correlationId,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Deletes one recovery registration for <paramref name="correlationId"/>. The default preserves
-    /// the pre-list behavior for custom stores by deleting the whole correlation-id entry.
+    /// Atomically deletes one recovery registration without affecting other waiters that share the
+    /// same <paramref name="correlationId"/>. <paramref name="registrationId"/> must be non-empty.
     /// </summary>
     Task<bool> TryDeleteAsync(
         string correlationId,
         Guid registrationId,
-        CancellationToken cancellationToken = default)
-        => TryDeleteAsync(correlationId, cancellationToken);
+        CancellationToken cancellationToken = default);
 }

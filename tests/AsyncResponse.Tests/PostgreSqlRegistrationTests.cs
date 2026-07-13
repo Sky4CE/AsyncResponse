@@ -105,10 +105,14 @@ public sealed class PostgreSqlRegistrationTests
     [Fact]
     public async Task PostgreSqlChannelAndTransport_RegisterExactlyOneMarkerEach()
     {
-        var provider = Build(builder => builder.WithPostgreSqlChannel().WithPostgreSqlTransport(_ => { }));
+        var provider = Build(builder => builder
+            .WithPostgreSqlChannel()
+            .WithPostgreSqlTransport(_ => { })
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         await validator.StartAsync(CancellationToken.None);
         await validator.StopAsync(CancellationToken.None);

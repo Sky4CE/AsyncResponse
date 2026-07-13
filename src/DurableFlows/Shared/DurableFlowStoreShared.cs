@@ -11,12 +11,20 @@ internal static class DurableFlowStoreShared
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static void ValidateSave(string flowId, FlowState state, TimeSpan ttl)
+    public static void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentNullException.ThrowIfNull(state);
-        if (ttl <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
+        ValidateWrite(flowId, state, ttl);
+        if (state.Revision != 0)
+            throw new ArgumentException("A new flow ledger must start at revision zero.", nameof(state));
+    }
+
+    public static void ValidateUpdate(string flowId, FlowState state, long expectedRevision, TimeSpan ttl)
+    {
+        ValidateWrite(flowId, state, ttl);
+        if (expectedRevision < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedRevision), "The expected revision cannot be negative.");
+        if (state.Revision != checked(expectedRevision + 1))
+            throw new ArgumentException("The new flow-state revision must increment the expected revision by one.", nameof(state));
     }
 
     public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, Options);
@@ -86,5 +94,17 @@ internal static class DurableFlowStoreShared
             if (!(char.IsAsciiLetterOrDigit(c) || c == '_'))
                 throw new InvalidOperationException($"{optionName} '{value}' must be a simple {providerName} identifier (letters, digits, and underscores; not starting with a digit).");
         }
+    }
+
+    private static void ValidateWrite(string flowId, FlowState state, TimeSpan ttl)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentNullException.ThrowIfNull(state);
+        if (!string.Equals(state.FlowId, flowId, StringComparison.Ordinal))
+            throw new ArgumentException("The flow state id must match the store key.", nameof(state));
+        if (state.SchemaVersion != FlowStateSchema.Current)
+            throw new ArgumentException("The flow state must use the current schema version.", nameof(state));
+        if (ttl <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
     }
 }

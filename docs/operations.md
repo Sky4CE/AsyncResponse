@@ -49,6 +49,18 @@ end-to-end profiles).
     deliberately waits before progress and terminal messages, so broad HTTP load-test latency mostly
     reflects sample workflow timing. Use the micro-benchmarks, stress harness, and NBomber
     `--scenario` filter to separate library overhead from demo behavior.
+13. **Choose exactly one atomic flow store.** `AddAsyncResponse()` does not select one implicitly,
+    and startup rejects a missing or duplicate choice. Every built-in `AsyncResponse.DurableFlows.*` store and
+    every custom `IFlowStateStore` must provide atomic start, revision-checked checkpoints, and a
+    renewable execution lease. Use `.WithInMemoryDurableFlows()` only when process-local state is
+    intentional.
+14. **Treat queue capacity as backpressure, not an error.** In-memory workers and internal
+    per-correlation dispatch queues are bounded and publishers wait asynchronously when full. Size
+    `InMemoryWorkerTransportOptions.QueueCapacity` for the burst you accept and raise `WorkerCount`
+    only when jobs are safe to run concurrently.
+15. **Keep durable-flow hosts time-synchronized.** Execution leases use absolute UTC expiry. Run
+    NTP (or the platform equivalent), and keep `ExecutionLeaseDuration` comfortably above expected
+    clock skew and renewal jitter so a fast replica cannot take over a healthy owner's lease early.
 
 ## Building and testing
 
@@ -147,9 +159,9 @@ early-ACK invariant for AWS SQS deliveries: every message deleted exactly once, 
 `ExecutionContext` under foreign publishers),
 **watchdog-scan-storm** (scanner + active-subscriber probe + stale evaluation), and
 **durable-flow-storm** (hundreds of concurrent 5-step checkpointed flows through the real worker
-transport and default recovery-backed flow-state store: every flow must end `Succeeded`, every step
+transport and explicit atomic in-memory flow store: every flow must end `Succeeded`, every step
 exactly once). A separate BenchmarkDotNet baseline compares the SQLite durable-flow package store
-against the default recovery-backed store. The core concurrency
+against the explicit in-memory store. The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
 dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server

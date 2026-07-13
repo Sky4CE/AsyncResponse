@@ -7,56 +7,39 @@ namespace AsyncResponse.Tests;
 
 /// <summary>
 /// Wire/recovery-state schema versioning (P5): every persisted or queued shape carries a version,
-/// and a reader rejects anything stamped newer than it understands rather than silently
-/// misinterpreting it after a mixed-version deploy.
+/// and a reader rejects missing or unsupported stamps rather than silently misinterpreting a
+/// payload after a mixed-version deploy.
 /// </summary>
 public class SchemaVersioningTests
 {
     [Fact]
-    public void Schemas_RejectNewerVersions_AcceptCurrentAndOlder()
+    public void Schemas_AcceptOnlyCurrentVersion()
     {
         Assert.True(RecoveryStateSchema.IsReadable(RecoveryStateSchema.Current));
-        Assert.True(RecoveryStateSchema.IsReadable(0));
+        Assert.False(RecoveryStateSchema.IsReadable(0));
         Assert.False(RecoveryStateSchema.IsReadable(RecoveryStateSchema.Current + 1));
 
         Assert.True(WorkerJobEnvelopeSchema.IsReadable(WorkerJobEnvelopeSchema.Current));
+        Assert.False(WorkerJobEnvelopeSchema.IsReadable(0));
         Assert.False(WorkerJobEnvelopeSchema.IsReadable(WorkerJobEnvelopeSchema.Current + 1));
 
         Assert.True(AsyncResponseEnvelopeSchema.IsReadable(AsyncResponseEnvelopeSchema.Current));
+        Assert.False(AsyncResponseEnvelopeSchema.IsReadable(0));
         Assert.False(AsyncResponseEnvelopeSchema.IsReadable(AsyncResponseEnvelopeSchema.Current + 1));
+
+        Assert.True(FlowStateSchema.IsReadable(FlowStateSchema.Current));
+        Assert.False(FlowStateSchema.IsReadable(0));
+        Assert.False(FlowStateSchema.IsReadable(FlowStateSchema.Current + 1));
     }
 
     [Fact]
-    public async Task InMemoryStore_GetAsync_RejectsNewerSchemaVersion()
+    public async Task InMemoryStore_RejectsUnrecognizedSchemaVersionOnWrite()
     {
         var store = new InMemoryRecoveryStateStore();
-        await store.SaveAsync(
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SaveAsync(
             "cid",
             new RecoveryState { CorrelationId = "cid", SchemaVersion = RecoveryStateSchema.Current + 1 },
-            TimeSpan.FromMinutes(5));
-
-        Assert.Null(await store.GetAsync("cid"));
-    }
-
-    [Fact]
-    public async Task InMemoryStore_ScanAsync_SkipsNewerSchemaVersion()
-    {
-        var store = new InMemoryRecoveryStateStore();
-        await store.SaveAsync(
-            "cid-new",
-            new RecoveryState { CorrelationId = "cid-new", SchemaVersion = RecoveryStateSchema.Current + 1 },
-            TimeSpan.FromMinutes(5));
-        await store.SaveAsync(
-            "cid-ok",
-            new RecoveryState { CorrelationId = "cid-ok", SchemaVersion = RecoveryStateSchema.Current },
-            TimeSpan.FromMinutes(5));
-
-        var scanned = new List<RecoveryState>();
-        await foreach (var state in store.ScanAsync())
-            scanned.Add(state);
-
-        Assert.Single(scanned);
-        Assert.Equal("cid-ok", scanned[0].CorrelationId);
+            TimeSpan.FromMinutes(5)));
     }
 
     [Fact]
@@ -94,17 +77,26 @@ public class SchemaVersioningTests
     }
 
     [Fact]
-    public void Envelope_MissingSchemaVersion_ReadsAsCurrent()
+    public void PersistedContracts_MissingSchemaVersion_AreRejected()
     {
-        // A legacy envelope written before the field existed must still be accepted.
-        const string legacyJson = """{"Success":true,"Payload":{"Status":2},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<RecoveryState>("{}"));
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<FlowState>("{}"));
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<WorkerJobEnvelope>("{}"));
 
-        var envelope = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
-            legacyJson, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+        const string envelopeJson = """{"Success":true,"Payload":{"Status":2},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            envelopeJson,
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+    }
 
-        Assert.NotNull(envelope);
-        Assert.Equal(AsyncResponseEnvelopeSchema.Current, envelope!.SchemaVersion);
-        Assert.True(AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion));
+    [Fact]
+    public void Envelope_NullSchemaVersion_IsRejected()
+    {
+        const string json = """{"SchemaVersion":null,"Success":true,"Payload":{"Status":2}}""";
+
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json,
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
     }
 
     [Fact]

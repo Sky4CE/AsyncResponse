@@ -12,10 +12,11 @@ namespace AsyncResponse.Transports.MongoDB;
 internal abstract class MongoDbSubscriberService : BackgroundService
 {
     private readonly MongoDbTransportStore _store;
-    private readonly Channel<bool> _signals = Channel.CreateUnbounded<bool>(new UnboundedChannelOptions
+    private readonly Channel<bool> _signals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
-        SingleWriter = false
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.DropWrite
     });
 
     protected MongoDbSubscriberService(

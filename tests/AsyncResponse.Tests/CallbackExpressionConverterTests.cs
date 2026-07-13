@@ -42,6 +42,17 @@ public class CallbackExpressionConverterTests
     }
 
     [Fact]
+    public void ValueChangingConversion_IsPreserved()
+    {
+        var value = 42;
+
+        var call = CallbackExpressionConverter.ToReflectionCall<IFlowCallbacks>(
+            flow => flow.AcceptLongAsync((long)value));
+
+        Assert.Equal(42L, Assert.Single(call.Params).Value);
+    }
+
+    [Fact]
     public void MethodCallArguments_AreRejected()
         => Assert.Throws<NotSupportedException>(() =>
             CallbackExpressionConverter.ToReflectionCall<IRecoverySpy>(spy => spy.OnWorkerJob(int.Parse("42"))));
@@ -70,6 +81,7 @@ public class CallbackExpressionConverterTests
     {
         string FlowName { get; }
         Task ResumeAsync(string flowName, OperationResult payload, string correlationId);
+        Task AcceptLongAsync(long value);
     }
 
     private static Task StaticResumeAsync() => Task.CompletedTask;

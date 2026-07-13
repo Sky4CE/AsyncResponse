@@ -1,21 +1,22 @@
 using AsyncResponse.DurableFlows.Sqlite;
 using BenchmarkDotNet.Attributes;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
 
 namespace AsyncResponse.Benchmarks;
 
 /// <summary>
-/// Durable-flow state-store baseline: save, load, and delete one ledger row through the SQLite
-/// package store and, for comparison, through the default <see cref="RecoveryBackedFlowStateStore"/>
-/// (backed by the in-memory recovery store) — quantifying the default-vs-package trade-off.
+/// Durable-flow state-store baseline: create, load, and delete one ledger through SQLite and the
+/// explicit process-local store.
 /// </summary>
 [MemoryDiagnoser]
 public class DurableFlowStateStoreBenchmarks
 {
     private string _databasePath = "";
     private SqliteFlowStateStore _store = null!;
-    private RecoveryBackedFlowStateStore _recoveryStore = null!;
+    private ServiceProvider _serviceProvider = null!;
+    private IFlowStateStore _memoryStore = null!;
     private FlowState _state = null!;
     private int _sequence;
 
@@ -27,21 +28,33 @@ public class DurableFlowStateStoreBenchmarks
         {
             ConnectionString = $"Data Source={_databasePath}"
         }));
-        _recoveryStore = new RecoveryBackedFlowStateStore(new InMemoryRecoveryStateStore());
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
+        _serviceProvider = services.BuildServiceProvider();
+        _memoryStore = _serviceProvider.GetRequiredService<IFlowStateStore>();
         _state = CreateState("bench-load");
-        await _store.SaveAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
-        await _recoveryStore.SaveAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
+        await _store.TryCreateAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
+        await _memoryStore.TryCreateAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
     }
 
     [GlobalCleanup]
-    public void Cleanup() => File.Delete(_databasePath);
+    public async Task Cleanup()
+    {
+        await _serviceProvider.DisposeAsync();
+        File.Delete(_databasePath);
+    }
 
     [Benchmark]
-    public Task SaveAsync()
+    public Task<bool> CreateAsync()
     {
         var id = "bench-save-" + Interlocked.Increment(ref _sequence).ToString("D8");
         _state.FlowId = id;
-        return _store.SaveAsync(id, _state, TimeSpan.FromMinutes(30));
+        _state.Revision = 0;
+        return _store.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
     }
 
     [Benchmark]
@@ -52,30 +65,33 @@ public class DurableFlowStateStoreBenchmarks
     {
         var id = "bench-roundtrip-" + Interlocked.Increment(ref _sequence).ToString("D8");
         _state.FlowId = id;
-        await _store.SaveAsync(id, _state, TimeSpan.FromMinutes(30));
+        _state.Revision = 0;
+        await _store.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
         _ = await _store.LoadAsync(id);
         await _store.TryDeleteAsync(id);
     }
 
     [Benchmark]
-    public Task RecoveryBackedSaveAsync()
+    public Task<bool> InMemoryCreateAsync()
     {
         var id = "bench-save-" + Interlocked.Increment(ref _sequence).ToString("D8");
         _state.FlowId = id;
-        return _recoveryStore.SaveAsync(id, _state, TimeSpan.FromMinutes(30));
+        _state.Revision = 0;
+        return _memoryStore.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
     }
 
     [Benchmark]
-    public Task<FlowState?> RecoveryBackedLoadAsync() => _recoveryStore.LoadAsync("bench-load");
+    public Task<FlowState?> InMemoryLoadAsync() => _memoryStore.LoadAsync("bench-load");
 
     [Benchmark]
-    public async Task RecoveryBackedSaveLoadDeleteAsync()
+    public async Task InMemoryCreateLoadDeleteAsync()
     {
         var id = "bench-roundtrip-" + Interlocked.Increment(ref _sequence).ToString("D8");
         _state.FlowId = id;
-        await _recoveryStore.SaveAsync(id, _state, TimeSpan.FromMinutes(30));
-        _ = await _recoveryStore.LoadAsync(id);
-        await _recoveryStore.TryDeleteAsync(id);
+        _state.Revision = 0;
+        await _memoryStore.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
+        _ = await _memoryStore.LoadAsync(id);
+        await _memoryStore.TryDeleteAsync(id);
     }
 
     private static FlowState CreateState(string flowId)

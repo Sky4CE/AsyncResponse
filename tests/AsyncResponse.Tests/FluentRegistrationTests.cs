@@ -7,16 +7,22 @@ using Xunit;
 namespace AsyncResponse.Tests;
 
 /// <summary>
-/// The fluent registration surface: a channel and transport are mandatory and enforced at host
-/// startup, and the in-memory channel/store satisfy the engine's recovery-state scanner and
-/// active-subscriber probe that the (channel-agnostic) watchdog runs on.
+/// The fluent registration surface: a channel, transport, and durable-flow store are mandatory
+/// and enforced at host startup, and the in-memory channel/store satisfy the engine's
+/// recovery-state scanner and active-subscriber probe that the (channel-agnostic) watchdog runs on.
 /// </summary>
 public class FluentRegistrationTests
 {
     [Fact]
+    public void AsyncResponseOptions_ContainsOnlyGlobalConfiguration()
+        => Assert.Null(typeof(AsyncResponseOptions).GetProperty("DurableFlows"));
+
+    [Fact]
     public async Task StartupValidator_NoChannel_ThrowsWithGuidance()
     {
-        var provider = Build(_ => { /* AddAsyncResponse only — no channel chained */ });
+        var provider = Build(builder => builder
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
         var validator = StartupValidator(provider);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
@@ -26,7 +32,9 @@ public class FluentRegistrationTests
     [Fact]
     public async Task StartupValidator_NoTransport_ThrowsWithGuidance()
     {
-        var provider = Build(builder => builder.WithInMemoryChannel());
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryDurableFlows());
         var validator = StartupValidator(provider);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
@@ -34,9 +42,22 @@ public class FluentRegistrationTests
     }
 
     [Fact]
-    public async Task StartupValidator_WithChannelAndTransport_Succeeds()
+    public async Task StartupValidator_NoDurableFlowStore_ThrowsWithGuidance()
     {
         var provider = Build(builder => builder.WithInMemoryChannel().WithInMemoryTransport());
+        var validator = StartupValidator(provider);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains("WithInMemoryDurableFlows", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StartupValidator_WithAllRequiredComponents_Succeeds()
+    {
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
         var validator = StartupValidator(provider);
 
         await validator.StartAsync(CancellationToken.None); // must not throw

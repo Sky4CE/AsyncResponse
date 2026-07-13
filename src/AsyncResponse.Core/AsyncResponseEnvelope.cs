@@ -12,9 +12,8 @@ internal sealed class AsyncResponseEnvelope<T>
 {
     /// <summary>
     /// Wire schema version, stamped with <see cref="AsyncResponseEnvelopeSchema.Current"/> when the
-    /// envelope is created. A waiter rejects an envelope whose version is newer than it supports
-    /// rather than risk misreading it. An envelope written before this field existed carries no
-    /// version on the wire and is read as the current version (and therefore accepted).
+    /// envelope is created. The property is required on the wire; a waiter rejects a missing or
+    /// unrecognized version rather than risk misreading it.
     /// </summary>
     public int SchemaVersion { get; set; } = AsyncResponseEnvelopeSchema.Current;
     public bool Success { get; set; }
@@ -25,8 +24,8 @@ internal sealed class AsyncResponseEnvelope<T>
 
 /// <summary>
 /// Wire-schema version stamp for <see cref="AsyncResponseEnvelope{T}"/>. New envelopes are stamped
-/// with <see cref="Current"/>; a waiter rejects an envelope whose version is greater than
-/// <see cref="Current"/> so a newer publisher cannot feed an incompatible shape to an older waiter.
+/// with <see cref="Current"/>; a waiter rejects any unrecognized version so a publisher cannot feed
+/// an incompatible shape to a waiter.
 /// </summary>
 internal static class AsyncResponseEnvelopeSchema
 {
@@ -34,7 +33,7 @@ internal static class AsyncResponseEnvelopeSchema
     public const int Current = 1;
 
     /// <summary>Returns <c>true</c> when an envelope with <paramref name="entryVersion"/> is safe to read on this build.</summary>
-    public static bool IsReadable(int entryVersion) => entryVersion <= Current;
+    public static bool IsReadable(int entryVersion) => entryVersion == Current;
 }
 
 /// <summary>
@@ -73,7 +72,8 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
             throw new JsonException();
         }
 
-        int schemaVersion = AsyncResponseEnvelopeSchema.Current;
+        int schemaVersion = default;
+        bool hasSchemaVersion = false;
         bool success = false;
         T? payload = default;
         string? exceptionMessage = null;
@@ -91,7 +91,9 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
                 if (property == EnvelopeProperty.SchemaVersion)
                 {
-                    schemaVersion = reader.TokenType == JsonTokenType.Null ? AsyncResponseEnvelopeSchema.Current : reader.GetInt32();
+                    if (reader.TokenType != JsonTokenType.Number || !reader.TryGetInt32(out schemaVersion))
+                        throw new JsonException("SchemaVersion must be an integer.");
+                    hasSchemaVersion = true;
                 }
                 else if (property == EnvelopeProperty.Success)
                 {
@@ -116,6 +118,9 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 }
             }
         }
+
+        if (!hasSchemaVersion)
+            throw new JsonException("SchemaVersion is required.");
 
         return new AsyncResponseEnvelope<T>
         {

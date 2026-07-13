@@ -8,8 +8,9 @@ recipes; come back here to go deeper.
 
 | I want to… | Read |
 |---|---|
-| Understand what the library does and whether it fits my problem | [Main README](../README.md) — [the problem](../README.md#the-problem), [when to use it](../README.md#when-to-use-it--and-when-not) |
-| Wire up a channel + transport and await my first response | [Quick start](../README.md#quick-start), then [configuration.md](configuration.md) |
+| Understand what the library does and whether it fits my problem | [Main README](../README.md) — [the problem](../README.md#the-problem-it-solves), [when to use it](../README.md#when-to-use-it--and-when-not) |
+| Wire up a channel + transport + flow store and await my first response | [Install and run](../README.md#install-and-run), then [provider-examples.md](provider-examples.md) |
+| Copy a setup for a specific channel, transport, or durable-flow store | [provider-examples.md](provider-examples.md) |
 | Run a complete example app and poke every scenario over HTTP | [sample.md](sample.md) |
 
 ## Guides
@@ -19,7 +20,7 @@ recipes; come back here to go deeper.
 | Orchestrate a multi-step flow that survives crashes and redeploys | [durable-flows.md](durable-flows.md) |
 | Compose flows from child flows, and know every failure mode | [Child flows](durable-flows.md#child-flows) and [What happens when things die](durable-flows.md#what-happens-when-things-die) |
 | Route late responses after a redeploy (resume vs. fail) | [recovery.md](recovery.md) |
-| Keep flow ledgers in my own database (or write a custom store) | [durable-flow-state-stores.md](durable-flow-state-stores.md) |
+| Keep flow ledgers in my own database (or write a custom store) | [durable-flow-state-stores.md](durable-flow-state-stores.md), with one example per provider |
 | Lock down persisted callbacks, stack traces, and type resolution | [security.md](security.md) |
 
 ## Reference
@@ -27,6 +28,7 @@ recipes; come back here to go deeper.
 | I want to… | Read |
 |---|---|
 | Look up any option: engine, flow-store, channel, or transport | [configuration.md](configuration.md) |
+| Compare and copy every provider registration | [provider-examples.md](provider-examples.md) |
 | Understand a transport's ACK, redelivery, and dead-letter semantics | [Transport options](configuration.md#transport-options) |
 | Run the Redis pair on Valkey / Dragonfly / Garnet or managed Redis | [Redis-compatible servers](configuration.md#redis-compatible-servers) |
 | Connect traces and metrics (span names, instruments, tags) | [observability.md](observability.md) |

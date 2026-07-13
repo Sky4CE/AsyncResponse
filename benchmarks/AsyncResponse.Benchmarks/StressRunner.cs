@@ -1124,7 +1124,7 @@ internal static class StressRunner
             }
 
             if (await probe.CountActiveSubscribersAsync(correlationId).ConfigureAwait(false) != 0
-                || await store.GetAsync(correlationId).ConfigureAwait(false) is not null)
+                || (await store.GetAllAsync(correlationId).ConfigureAwait(false)).Count != 0)
             {
                 Interlocked.Increment(ref cleanupLeaks);
             }
@@ -1225,7 +1225,7 @@ internal static class StressRunner
             }
 
             if (await probe.CountActiveSubscribersAsync(correlationId).ConfigureAwait(false) != 0
-                || await store.GetAsync(correlationId).ConfigureAwait(false) is not null)
+                || (await store.GetAllAsync(correlationId).ConfigureAwait(false)).Count != 0)
             {
                 Interlocked.Increment(ref cleanupLeaks);
             }
@@ -1258,7 +1258,7 @@ internal static class StressRunner
                 await waiter.DisposeAsync().ConfigureAwait(false);
 
                 if (await probe.CountActiveSubscribersAsync(correlationId).ConfigureAwait(false) != 0
-                    || await store.GetAsync(correlationId).ConfigureAwait(false) is not null)
+                    || (await store.GetAllAsync(correlationId).ConfigureAwait(false)).Count != 0)
                 {
                     Interlocked.Increment(ref cleanupLeaks);
                 }
@@ -1432,7 +1432,7 @@ internal static class StressRunner
             await foreach (var state in scanner.ScanAsync().ConfigureAwait(false))
             {
                 if (!string.IsNullOrWhiteSpace(state.CorrelationId))
-                    await store.TryDeleteAsync(state.CorrelationId).ConfigureAwait(false);
+                    await store.TryDeleteAsync(state.CorrelationId, state.RegistrationId).ConfigureAwait(false);
             }
         }
     }
@@ -1531,7 +1531,9 @@ internal static class StressRunner
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
-        var builder = services.AddAsyncResponse(options => options.Watchdog.Enabled = false).WithInMemoryChannel();
+        var builder = services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
+            .WithInMemoryChannel()
+            .WithInMemoryDurableFlows();
         if (withWorker)
         {
             builder.WithInMemoryTransport();
@@ -1555,7 +1557,8 @@ internal static class StressRunner
         services.AddScoped<StressFlow>();
         services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
             .WithInMemoryChannel()
-            .WithInMemoryTransport();
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
 
         using var provider = services.BuildServiceProvider();
 

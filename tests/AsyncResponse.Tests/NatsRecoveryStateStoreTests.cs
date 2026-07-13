@@ -36,7 +36,6 @@ public class NatsRecoveryStateStoreTests
         var key = NatsSubjectSchema.RecoveryKey("corr-a");
         Assert.True(_kv.Entries.ContainsKey(key));
         using var doc = JsonDocument.Parse(_kv.Entries[key]);
-        Assert.Equal("corr-a", doc.RootElement.GetProperty("State").GetProperty("CorrelationId").GetString());
         Assert.Equal("corr-a", doc.RootElement.GetProperty("States")[0].GetProperty("CorrelationId").GetString());
         Assert.NotEqual(Guid.Empty, doc.RootElement.GetProperty("States")[0].GetProperty("RegistrationId").GetGuid());
         Assert.Equal(
@@ -46,6 +45,15 @@ public class NatsRecoveryStateStoreTests
         await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(" ", state, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentNullException>(() => _store.SaveAsync("corr-a", null!, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.SaveAsync("corr-a", state, TimeSpan.Zero));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync("corr-a", Guid.Empty));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(
+            "corr-a",
+            new RecoveryState
+            {
+                CorrelationId = "corr-a",
+                SchemaVersion = RecoveryStateSchema.Current + 1
+            },
+            TimeSpan.FromSeconds(1)));
 
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
@@ -89,15 +97,16 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task SaveAsync_WhenCasKeepsFailing_FallsBackToPut()
+    public async Task SaveAsync_WhenCasKeepsFailing_ThrowsWithoutOverwriting()
     {
         _kv.ForcedCreateConflicts = 4;
         var state = new RecoveryState { CorrelationId = "corr-fallback", RegistrationId = Guid.NewGuid() };
 
-        await _store.SaveAsync("corr-fallback", state, TimeSpan.FromMinutes(5));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _store.SaveAsync("corr-fallback", state, TimeSpan.FromMinutes(5)));
 
-        Assert.Equal(1, _kv.PutCount);
-        Assert.Single(await _store.GetAllAsync("corr-fallback"));
+        Assert.Equal(0, _kv.PutCount);
+        Assert.Empty(await _store.GetAllAsync("corr-fallback"));
     }
 
     [Fact]
@@ -130,19 +139,16 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAsync_ReturnsState_AndBackfillsCorrelationIdFromKey()
+    public async Task SaveAsync_RejectsStateWhoseCorrelationIdDoesNotMatchKey()
     {
-        await _store.SaveAsync("corr-a", new RecoveryState { PayloadTypeFullName = typeof(OperationResult).FullName }, TimeSpan.FromMinutes(5));
-
-        var loaded = await _store.GetAsync("corr-a");
-
-        Assert.NotNull(loaded);
-        Assert.Equal("corr-a", loaded!.CorrelationId);
-        Assert.Equal(typeof(OperationResult).FullName, loaded.PayloadTypeFullName);
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(
+            "corr-a",
+            new RecoveryState { PayloadTypeFullName = typeof(OperationResult).FullName },
+            TimeSpan.FromMinutes(5)));
     }
 
     [Fact]
-    public async Task GetAllAsync_ReturnsAllRegistrations_AndLegacySingleState()
+    public async Task GetAllAsync_ReturnsAllRegistrations()
     {
         var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
         var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
@@ -150,41 +156,37 @@ public class NatsRecoveryStateStoreTests
         await _store.SaveAsync("corr-a", second, TimeSpan.FromMinutes(5));
 
         Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
-
-        _kv.Entries[NatsSubjectSchema.RecoveryKey("legacy")] = JsonSerializer.Serialize(new NatsRecoveryStateStore.StoredRecoveryState
-        {
-            State = new RecoveryState { CorrelationId = "legacy" },
-            ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
-        });
-
-        Assert.Single(await _store.GetAllAsync("legacy"));
     }
 
     [Fact]
-    public async Task GetAsync_ReturnsNull_ForMissingMalformedAndExpired()
+    public async Task GetAllAsync_ReturnsEmpty_ForMissingMalformedAndExpired()
     {
-        Assert.Null(await _store.GetAsync("missing"));
+        Assert.Empty(await _store.GetAllAsync("missing"));
 
         _kv.Entries[NatsSubjectSchema.RecoveryKey("broken")] = "{not-json";
-        Assert.Null(await _store.GetAsync("broken"));
+        Assert.Empty(await _store.GetAllAsync("broken"));
 
         await _store.SaveAsync("expired", new RecoveryState { CorrelationId = "expired" }, TimeSpan.FromMinutes(1));
         _time.Advance(TimeSpan.FromMinutes(2));
-        Assert.Null(await _store.GetAsync("expired"));
+        Assert.Empty(await _store.GetAllAsync("expired"));
         // Expired entries are deleted on read so they never resurface.
         Assert.False(_kv.Entries.ContainsKey(NatsSubjectSchema.RecoveryKey("expired")));
 
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.GetAsync(" "));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.GetAllAsync(" "));
     }
 
     [Fact]
-    public async Task TryDeleteAsync_ReportsWhetherEntryExisted()
+    public async Task TryDeleteAsync_ReportsWhetherRegistrationExisted()
     {
-        await _store.SaveAsync("corr-a", new RecoveryState { CorrelationId = "corr-a" }, TimeSpan.FromMinutes(5));
+        var registrationId = Guid.NewGuid();
+        await _store.SaveAsync(
+            "corr-a",
+            new RecoveryState { RegistrationId = registrationId, CorrelationId = "corr-a" },
+            TimeSpan.FromMinutes(5));
 
-        Assert.True(await _store.TryDeleteAsync("corr-a"));
-        Assert.False(await _store.TryDeleteAsync("corr-a"));
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync(" "));
+        Assert.True(await _store.TryDeleteAsync("corr-a", registrationId));
+        Assert.False(await _store.TryDeleteAsync("corr-a", registrationId));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync(" ", registrationId));
     }
 
     [Fact]
@@ -234,7 +236,7 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAllAsync_FiltersUnreadableSchemaAndBackfillsCorrelationId()
+    public async Task GetAllAsync_RejectsUnreadableSchemaAndMissingCorrelationId()
     {
         _kv.Entries[NatsSubjectSchema.RecoveryKey("mixed")] = JsonSerializer.Serialize(new NatsRecoveryStateStore.StoredRecoveryState
         {
@@ -246,9 +248,7 @@ public class NatsRecoveryStateStoreTests
             ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
         });
 
-        var state = Assert.Single(await _store.GetAllAsync("mixed"));
-        Assert.Equal("mixed", state.CorrelationId);
-        Assert.Equal("old", state.PayloadTypeFullName);
+        Assert.Empty(await _store.GetAllAsync("mixed"));
     }
 
     [Fact]
@@ -262,9 +262,9 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task ScanAsync_YieldsLiveEntries_SkipsExpired_AndBackfillsCorrelationId()
+    public async Task ScanAsync_YieldsLiveEntries_AndSkipsExpired()
     {
-        await _store.SaveAsync("corr-live", new RecoveryState { PayloadTypeFullName = typeof(OperationResult).FullName }, TimeSpan.FromMinutes(10));
+        await _store.SaveAsync("corr-live", new RecoveryState { CorrelationId = "corr-live", PayloadTypeFullName = typeof(OperationResult).FullName }, TimeSpan.FromMinutes(10));
         await _store.SaveAsync("corr-expired", new RecoveryState { CorrelationId = "corr-expired" }, TimeSpan.FromMinutes(1));
         _kv.Entries[NatsSubjectSchema.RecoveryKey("corr-broken")] = "{not-json";
 

@@ -2,19 +2,23 @@
 
 [← Back to README](../README.md)
 
-`AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
+`AddAsyncResponse()` registers the channel-agnostic engine but **selects no channel, transport, or
+durable-flow store** — chain
 exactly one channel (`.WithInMemoryChannel()`, `.WithRedisChannel()`, `.WithNatsChannel()`,
 `.WithPostgreSqlChannel(...)`, `.WithSqlServerChannel(...)`, or `.WithMongoDbChannel(...)`) and
 exactly one transport (`.WithInMemoryTransport()`, `.WithRedisTransport(...)`,
 `.WithAzureServiceBusTransport(...)`, `.WithGooglePubSubTransport(...)`,
-`.WithRabbitMqTransport(...)`, `.WithNatsTransport(...)`, `.WithPostgreSqlTransport(...)`,
-`.WithSqlServerTransport(...)`, `.WithMongoDbTransport(...)`, or another full AsyncResponse
-transport package). An app that starts without either one fails fast at host startup with setup guidance, so a
-misconfiguration can never silently hang every waiter or drop worker dispatch. The recovery watchdog
-is part of the engine and runs by default for whichever channel you choose.
+`.WithRabbitMqTransport(...)`, `.WithSqsTransport(...)`, `.WithKafkaTransport(...)`,
+`.WithNatsTransport(...)`, `.WithPostgreSqlTransport(...)`, `.WithSqlServerTransport(...)`, or
+`.WithMongoDbTransport(...)`), and exactly one flow store (`.WithInMemoryDurableFlows()`, a
+`.With*DurableFlows(...)` provider, or `.WithDurableFlows<TStore>()`). An app that starts without any
+one of the three fails fast with setup guidance. The recovery watchdog is part of the engine and
+runs by default for whichever channel you choose.
 
 This page is the consolidated options reference: engine options, durable-flow store package
 options, channel options, transport options, and the per-transport delivery semantics behind them.
+For setup code rather than option lookup, use the
+[channel, transport, and flow-store examples](provider-examples.md).
 
 **On this page**
 
@@ -38,7 +42,13 @@ builder.Services.AddAsyncResponse(options =>
     options.RecoveryStateExpiry = TimeSpan.FromDays(7);     // how long recovery survives
     options.DefaultTimeout = TimeSpan.FromHours(12);        // default per-waiter timeout
 })
-.WithInMemoryTransport();                                   // or .WithAzureServiceBusTransport(...) / .WithRabbitMqTransport(...)
+.WithInMemoryTransport()                                    // or .WithAzureServiceBusTransport(...) / .WithRabbitMqTransport(...)
+.WithInMemoryDurableFlows(options =>
+{
+    options.StateExpiry = TimeSpan.FromDays(14);             // idle TTL, refreshed at checkpoints
+    options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
+    options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);
+});
 ```
 
 ## Engine options (`AsyncResponseOptions`)
@@ -51,21 +61,44 @@ Configured through the `AddAsyncResponse(options => …)` callback.
 | `Watchdog.Interval` | (see watchdog) | How often the watchdog scans persisted recovery state. |
 | `Watchdog.StaleAfter` | (see watchdog) | Age at which an entry with no live waiter is reported stale. |
 | `Watchdog.StartupDelay` | (see watchdog) | Delay before the first scan after host start. |
-| `DurableFlows.StateExpiry` | 7 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. |
-| `DurableFlows.DefaultStepTimeout` | `null` (channel default) | Default timeout for `AwaitStepAsync` steps that don't pass one explicitly. |
 
-See [durable-flows.md](durable-flows.md) for the flow API these options govern,
-[recovery.md](recovery.md) for the watchdog in context, and [security.md](security.md) for
+See [recovery.md](recovery.md) for the watchdog in context and [security.md](security.md) for
 `.AuthorizeCallbacks(...)` and type-resolution registration, which are also chained off
 `AddAsyncResponse()`.
 
 ## Durable-flow state store package options
 
-Production durable flows should use an `AsyncResponse.DurableFlows.*` package or
-`WithCustomDurableFlows<TStore>()`; the default recovery-backed store is for tests, development,
-and migration.
+`AddAsyncResponse()` does not choose a flow store. Complete registration with exactly one
+`AsyncResponse.DurableFlows.*` provider, `.WithInMemoryDurableFlows()` for a process-local setup, or
+`.WithDurableFlows<TStore>()` for an application-owned atomic store. Every variant accepts the
+common flow-engine options in its own callback; provider variants add store-specific properties to
+that same options object.
 
-| Package | Key options |
+### Common durable-flow options
+
+| Option | Default | Purpose |
+|---|---|---|
+| `StateExpiry` | 7 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. |
+| `DefaultStepTimeout` | `null` (channel default) | Default timeout for `AwaitStepAsync` steps that don't pass one explicitly. |
+| `ExecutionLeaseDuration` | 1 minute | How long one store lease owns a flow execution before another replica may take over after owner loss. |
+| `ExecutionLeaseRenewInterval` | 20 seconds | Renewal cadence; must be positive and shorter than `ExecutionLeaseDuration`. |
+| `ProgressPersistenceInterval` | 1 second | Minimum interval between writes caused only by progress reports. Faster updates are coalesced into the next checkpoint/outcome; zero writes every report. |
+
+Configure these on the selected store, for example:
+
+```csharp
+.WithPostgreSqlDurableFlows(options =>
+{
+    options.StateExpiry = TimeSpan.FromDays(14);             // common engine option
+    options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1); // common engine option
+    options.ConnectionString = connectionString;              // PostgreSQL store option
+    options.SchemaName = "public";
+});
+```
+
+### Provider-specific options
+
+| Package | Provider-specific options (in addition to the common options above) |
 |---|---|
 | `SqlServer` | `ConnectionString`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
 | `PostgreSQL` | `ConnectionString` or registered `NpgsqlDataSource`, `SchemaName`, `TableName`, `AutoCreateSchema`, `PruneInterval` |
@@ -75,8 +108,9 @@ and migration.
 | `MongoDB` | `ConnectionString` or registered `IMongoDatabase`/`IMongoClient`, `DatabaseName`, `CollectionName`, `AutoCreateIndexes` |
 | `Cosmos` | `ConnectionString` or registered `CosmosClient`, `DatabaseName`, `ContainerName`, `PartitionKeyPath`, `AutoCreateContainer`, `Throughput` |
 | `DynamoDB` | registered/default `IAmazonDynamoDB`, `TableName`, `AutoCreateTable`, `EnableTimeToLive`, `TimeToLiveAttributeName` |
+| `EFCore` | application `DbContext` mapping via `ConfigureAsyncResponseDurableFlows(...)`; schema changes are owned by your EF migrations |
 
-The SQL stores prune expired rows opportunistically on save, throttled by `PruneInterval`
+The SQL stores prune expired rows opportunistically on flow creation, throttled by `PruneInterval`
 (default 5 minutes; zero or negative prunes on every save); MongoDB, Cosmos, and DynamoDB use
 native TTL instead. All packages register their store as a singleton and reuse a host-registered
 client when one exists. See [durable-flow-state-stores.md](durable-flow-state-stores.md) for
@@ -88,6 +122,8 @@ Channel options are common where noted and channel-specific otherwise. They are 
 channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsChannel(options => …)`,
 `.WithPostgreSqlChannel(options => …)`, `.WithSqlServerChannel(options => …)`,
 `.WithMongoDbChannel(options => …)`).
+
+Every channel has a complete registration in [provider-examples.md](provider-examples.md#channel-examples).
 
 | Option | Channels | Default | Purpose |
 |---|---|---|---|
@@ -108,8 +144,8 @@ channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsCh
 | `DeliveryConfirmationPollInterval` | PostgreSQL, SQL Server, MongoDB | 50 ms | Poll cadence for cross-process delivery confirmation. |
 | `ListenerPollInterval` | PostgreSQL, MongoDB | 250 ms | Missed-notification safety scan interval (and the wake cadence when MongoDB change streams are unavailable). |
 | `ActivePollInterval` / `IdlePollInterval` | SQL Server | 250 ms / 2 s | Adaptive polling wake (SQL Server has no `LISTEN/NOTIFY`): sweep cadence while waiters are subscribed, and the backed-off cadence while idle. Same-process deliveries never wait for the sweep. |
-| `PendingMessageBatchSize` | PostgreSQL, SQL Server, MongoDB | 64 | Rows/documents loaded per subscribed correlation id per listener/sweep pass. |
-| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server, MongoDB | 10s / 30s | Heartbeat cadence and liveness window for active waiters. |
+| `PendingMessageBatchSize` | PostgreSQL, SQL Server, MongoDB | 64 | Keyset-page size for one subscribed correlation id. A listener/sweep continues through all pages; this tunes query/memory shape, not a delivery cap. |
+| `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server, MongoDB | 10s / 30s | Heartbeat cadence and liveness window. One channel-level loop batches the process's current active registrations per interval; abandoned rows/documents are not renewed. |
 | `RecoveryStateExpiry` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
 | `DefaultTimeout` | all | `RecoveryStateExpiry` | Default per-waiter timeout when a flow doesn't call `WithTimeout`. |
 | `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
@@ -118,8 +154,19 @@ channel registration callback (`.WithRedisChannel(options => …)`, `.WithNatsCh
 ## Transport options
 
 Transport options are set through the transport registration callback. Each transport package owns
-its own option type; the common shapes are summarized here. See the transport sections in
-[the README's Quick start](../README.md#quick-start) for full examples.
+its own option type; the common shapes are summarized here. See
+[Install and run](../README.md#install-and-run) for the local minimum and
+[transport examples](provider-examples.md#transport-examples) for every provider.
+
+The in-memory transport is configured directly on registration:
+
+```csharp
+.WithInMemoryTransport(options =>
+{
+    options.QueueCapacity = 1_024; // default; PublishAsync waits when full
+    options.WorkerCount = 1;       // default; increase for independent parallel jobs
+})
+```
 
 | Option | Transports | Purpose |
 |---|---|---|

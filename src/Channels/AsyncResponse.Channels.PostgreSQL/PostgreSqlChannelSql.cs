@@ -5,7 +5,11 @@ using System.Text.Json;
 
 namespace AsyncResponse.Channels.PostgreSQL;
 
-internal readonly record struct PostgreSqlChannelMessage(Guid Id, string CorrelationId, string EnvelopeJson);
+internal readonly record struct PostgreSqlChannelMessage(
+    Guid Id,
+    string CorrelationId,
+    string EnvelopeJson,
+    DateTimeOffset CreatedAtUtc);
 
 /// <summary>SQL helper for the PostgreSQL channel tables and notification channel.</summary>
 internal sealed class PostgreSqlChannelSql
@@ -166,17 +170,14 @@ internal sealed class PostgreSqlChannelSql
         return states;
     }
 
-    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid? registrationId, CancellationToken cancellationToken)
+    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = registrationId is null
-            ? $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id;"
-            : $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
+        command.CommandText = $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
         command.Parameters.AddWithValue("correlation_id", correlationId);
-        if (registrationId is not null)
-            command.Parameters.AddWithValue("registration_id", registrationId.Value);
+        command.Parameters.AddWithValue("registration_id", registrationId);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -242,6 +243,8 @@ internal sealed class PostgreSqlChannelSql
         string correlationId,
         DateTimeOffset sinceUtc,
         int batchSize,
+        DateTimeOffset? afterCreatedAtUtc,
+        Guid? afterId,
         CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
@@ -249,22 +252,28 @@ internal sealed class PostgreSqlChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json::text
+            SELECT id, correlation_id, envelope_json::text, created_at
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
               AND expires_at > now()
-            ORDER BY created_at
+              {(afterCreatedAtUtc is null ? "" : "AND (created_at > @after_created_at OR (created_at = @after_created_at AND id > @after_id))")}
+            ORDER BY created_at, id
             LIMIT @limit;
             """;
         command.Parameters.AddWithValue("correlation_id", correlationId);
         command.Parameters.AddWithValue("since", sinceUtc);
         command.Parameters.AddWithValue("limit", batchSize);
+        if (afterCreatedAtUtc is not null)
+        {
+            command.Parameters.AddWithValue("after_created_at", afterCreatedAtUtc.Value);
+            command.Parameters.AddWithValue("after_id", afterId ?? throw new ArgumentNullException(nameof(afterId)));
+        }
 
-        var messages = new List<PostgreSqlChannelMessage>();
+        var messages = new List<PostgreSqlChannelMessage>(batchSize);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            messages.Add(new PostgreSqlChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2)));
+            messages.Add(new PostgreSqlChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2), reader.GetFieldValue<DateTimeOffset>(3)));
         return messages;
     }
 
@@ -361,6 +370,26 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.AddWithValue("correlation_id", correlationId);
         command.Parameters.AddWithValue("registration_id", registrationId);
         command.Parameters.AddWithValue("instance_id", instanceId);
+        command.Parameters.AddWithValue("ttl", ttl);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task HeartbeatSubscribersAsync(
+        string instanceId,
+        IReadOnlyCollection<Guid> registrationIds,
+        TimeSpan ttl,
+        CancellationToken cancellationToken)
+    {
+        if (registrationIds.Count == 0)
+            return;
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"UPDATE {SubscriberTable} SET expires_at = now() + @ttl WHERE instance_id = @instance_id AND registration_id = ANY(@registration_ids);";
+        command.Parameters.AddWithValue("instance_id", instanceId);
+        command.Parameters.AddWithValue("registration_ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid, registrationIds.ToArray());
         command.Parameters.AddWithValue("ttl", ttl);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

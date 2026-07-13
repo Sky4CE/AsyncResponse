@@ -17,6 +17,7 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using MySqlConnector;
 using Npgsql;
@@ -66,6 +67,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 }));
 
             await AssertStoreContractAsync(store);
+
         }
         finally
         {
@@ -139,7 +141,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 async (i, _) =>
                 {
                     var flowId = $"flow-storm-{i}";
-                    await store.SaveAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
+                    Assert.True(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
                     Assert.NotNull(await store.LoadAsync(flowId));
                     Assert.True(await store.TryDeleteAsync(flowId));
                     Assert.Null(await store.LoadAsync(flowId));
@@ -197,6 +199,50 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
     }
 
     [Fact]
+    public async Task MySqlPackageStore_RejectsIncompleteExistingSchema()
+    {
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_legacy", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        INDEX `{table}_expires_idx` (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table
+                }));
+
+            await Assert.ThrowsAsync<MySqlException>(
+                () => store.TryCreateAsync("incomplete", CreateState("incomplete"), TimeSpan.FromMinutes(5)));
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task MongoDbPackageStore_RoundTrips_Expires_Deletes()
     {
         await WaitForMongoDbAsync();
@@ -212,6 +258,17 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 }));
 
             await AssertStoreContractAsync(store);
+
+            var legacyFlowId = "legacy-mongo-flow";
+            await client.GetDatabase(databaseName).GetCollection<BsonDocument>("flow_state").InsertOneAsync(new BsonDocument
+            {
+                ["_id"] = legacyFlowId,
+                ["state_json"] = JsonSerializer.Serialize(CreateState(legacyFlowId)),
+                ["expires_at_utc"] = DateTime.UtcNow.AddMinutes(5),
+                ["updated_at_utc"] = DateTime.UtcNow
+            });
+            Assert.Null(await store.LoadAsync(legacyFlowId));
+            Assert.False(await store.TryAcquireLeaseAsync(legacyFlowId, "owner", TimeSpan.FromMinutes(1)));
         }
         finally
         {
@@ -237,6 +294,22 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
             // UP (never shorter than requested), so the read-filter can consider a 1s-TTL item live
             // for up to ~2s after the save — wait past that worst case.
             await AssertStoreContractAsync(store, TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(2500));
+
+            var legacyFlowId = "legacy-dynamo-flow";
+            var now = DateTimeOffset.UtcNow;
+            await client.PutItemAsync(new PutItemRequest
+            {
+                TableName = table,
+                Item = new Dictionary<string, AttributeValue>
+                {
+                    ["flow_id"] = new() { S = legacyFlowId },
+                    ["state_json"] = new() { S = JsonSerializer.Serialize(CreateState(legacyFlowId)) },
+                    ["expires_at"] = new() { N = now.AddMinutes(5).ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) },
+                    ["updated_at"] = new() { N = now.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) }
+                }
+            });
+            Assert.Null(await store.LoadAsync(legacyFlowId));
+            Assert.False(await store.TryAcquireLeaseAsync(legacyFlowId, "owner", TimeSpan.FromMinutes(1)));
         }
         finally
         {
@@ -307,6 +380,20 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 }));
 
             await AssertStoreContractAsync(store);
+
+            await client.GetDatabase(databaseName).CreateContainerAsync(
+                new ContainerProperties("flow_state_without_ttl", "/flowId"));
+            var manualStore = new CosmosFlowStateStore(
+                client,
+                Options.Create(new CosmosDurableFlowOptions
+                {
+                    DatabaseName = databaseName,
+                    ContainerName = "flow_state_without_ttl",
+                    AutoCreateContainer = false
+                }));
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => manualStore.LoadAsync("flow"));
+            Assert.Contains("TTL", exception.Message, StringComparison.Ordinal);
         }
         finally
         {
@@ -414,7 +501,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
     {
         var state = CreateState("flow-itest");
 
-        await store.SaveAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
         var loaded = await store.LoadAsync(state.FlowId!);
         Assert.NotNull(loaded);
         Assert.Equal(FlowRunStatus.Running, loaded!.Status);
@@ -422,12 +509,84 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
 
         state.Status = FlowRunStatus.Succeeded;
         state.LastMessage = "done";
-        await store.SaveAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        state.Revision = 1;
+        Assert.True(await store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5)));
         Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(state.FlowId!))!.Status);
 
-        await store.SaveAsync("expired-flow", CreateState("expired-flow"), expiryTtl ?? TimeSpan.FromMilliseconds(1));
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), expiryTtl ?? TimeSpan.FromMilliseconds(1)));
         await Task.Delay(expiryDelay ?? TimeSpan.FromMilliseconds(30));
         Assert.Null(await store.LoadAsync("expired-flow"));
+
+        var concurrent = store;
+        var replacement = CreateState("expired-flow");
+        Assert.True(await concurrent.TryCreateAsync("expired-flow", replacement, TimeSpan.FromMinutes(5)));
+        Assert.NotNull(await store.LoadAsync("expired-flow"));
+        Assert.True(await store.TryDeleteAsync("expired-flow"));
+
+        var concurrentFlowId = $"flow-concurrency-{Guid.NewGuid():N}";
+        var createResults = await Task.WhenAll(
+            Enumerable.Range(0, 16)
+                .Select(_ => concurrent.TryCreateAsync(
+                    concurrentFlowId,
+                    CreateState(concurrentFlowId),
+                    TimeSpan.FromMinutes(5))));
+        Assert.Single(createResults, static created => created);
+
+        var concurrentState = await store.LoadAsync(concurrentFlowId);
+        Assert.NotNull(concurrentState);
+        Assert.Equal(0, concurrentState!.Revision);
+
+        Assert.True(await concurrent.TryAcquireLeaseAsync(
+            concurrentFlowId,
+            "owner-a",
+            TimeSpan.FromMinutes(1)));
+        Assert.False(await concurrent.TryAcquireLeaseAsync(
+            concurrentFlowId,
+            "owner-b",
+            TimeSpan.FromMinutes(1)));
+
+        concurrentState.Status = FlowRunStatus.Succeeded;
+        concurrentState.Revision = 1;
+        Assert.False(await concurrent.TryUpdateAsync(
+            concurrentFlowId,
+            concurrentState,
+            expectedRevision: 0,
+            TimeSpan.FromMinutes(5),
+            leaseId: "owner-b"));
+        Assert.True(await concurrent.TryUpdateAsync(
+            concurrentFlowId,
+            concurrentState,
+            expectedRevision: 0,
+            TimeSpan.FromMinutes(5),
+            leaseId: "owner-a"));
+        Assert.False(await concurrent.TryUpdateAsync(
+            concurrentFlowId,
+            concurrentState,
+            expectedRevision: 0,
+            TimeSpan.FromMinutes(5),
+            leaseId: "owner-a"));
+        Assert.Equal(1, (await store.LoadAsync(concurrentFlowId))!.Revision);
+
+        Assert.False(await concurrent.TryRenewLeaseAsync(
+            concurrentFlowId,
+            "owner-b",
+            TimeSpan.FromMinutes(1)));
+        Assert.True(await concurrent.TryRenewLeaseAsync(
+            concurrentFlowId,
+            "owner-a",
+            TimeSpan.FromMinutes(1)));
+        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-b");
+        Assert.False(await concurrent.TryAcquireLeaseAsync(
+            concurrentFlowId,
+            "owner-b",
+            TimeSpan.FromMinutes(1)));
+        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-a");
+        Assert.True(await concurrent.TryAcquireLeaseAsync(
+            concurrentFlowId,
+            "owner-b",
+            TimeSpan.FromMinutes(1)));
+        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-b");
+        Assert.True(await store.TryDeleteAsync(concurrentFlowId));
 
         Assert.True(await store.TryDeleteAsync(state.FlowId!));
         Assert.Null(await store.LoadAsync(state.FlowId!));

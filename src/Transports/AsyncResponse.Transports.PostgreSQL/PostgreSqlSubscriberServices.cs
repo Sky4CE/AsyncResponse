@@ -12,10 +12,11 @@ namespace AsyncResponse.Transports.PostgreSQL;
 internal abstract class PostgreSqlSubscriberService : BackgroundService
 {
     private readonly PostgreSqlTransportStore _store;
-    private readonly Channel<bool> _signals = Channel.CreateUnbounded<bool>(new UnboundedChannelOptions
+    private readonly Channel<bool> _signals = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
     {
         SingleReader = true,
-        SingleWriter = false
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.DropWrite
     });
 
     protected PostgreSqlSubscriberService(

@@ -436,6 +436,23 @@ public class AsyncResponseBuilderTests
     }
 
     [Fact]
+    public async Task EnqueueWorker_PassesCancellationToTransport()
+    {
+        var transport = new Mock<IWorkerTransport>();
+        CancellationToken observed = default;
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Callback<WorkerJobEnvelope, CancellationToken>((_, token) => observed = token)
+            .Returns(Task.CompletedTask);
+        using var source = new CancellationTokenSource();
+        var builder = new AsyncResponseBuilder(_subscriber.Object, transport.Object);
+
+        await builder.EnqueueWorkerAsync<IRecoverySpy>(spy => spy.OnWorkerJob(7), source.Token);
+
+        Assert.Equal(source.Token, observed);
+    }
+
+    [Fact]
     public void WithTimeout_RejectsNonPositiveTimeout()
     {
         var builder = new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-1");

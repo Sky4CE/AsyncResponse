@@ -20,10 +20,6 @@ namespace Microsoft.Extensions.DependencyInjection
             this AsyncResponseRegistrationBuilder builder,
             Action<DynamoDbDurableFlowOptions>? configure = null)
         {
-            builder.Services.AddOptions();
-            if (configure is not null)
-                builder.Services.Configure(configure);
-
             // Singleton on purpose: table/TTL provisioning is cached per store instance and DynamoDB
             // control-plane calls are throttled account-wide — a scoped store would re-issue them on
             // every flow execution. A host-registered IAmazonDynamoDB is reused when present;
@@ -38,7 +34,7 @@ namespace Microsoft.Extensions.DependencyInjection
                     ? new DynamoDbFlowStateStore(shared, options)
                     : new DynamoDbFlowStateStore(new AmazonDynamoDBClient(), options, ownsClient: true);
             });
-            return builder.WithCustomDurableFlows<DynamoDbFlowStateStore>();
+            return builder.WithDurableFlows<DynamoDbFlowStateStore, DynamoDbDurableFlowOptions>(configure);
         }
     }
 }
@@ -46,7 +42,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.DynamoDB
 {
 /// <summary>Options for the DynamoDB durable-flow state store.</summary>
-public sealed class DynamoDbDurableFlowOptions
+public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>Table storing one durable-flow ledger item per flow id.</summary>
     public string TableName { get; set; } = "AsyncResponseFlowState";
@@ -76,6 +72,9 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
     private const string FlowIdAttribute = "flow_id";
     private const string StateJsonAttribute = "state_json";
     private const string UpdatedAtAttribute = "updated_at";
+    private const string RevisionAttribute = "revision";
+    private const string LeaseIdAttribute = "lease_id";
+    private const string LeaseExpiresAtAttribute = "lease_expires_at_ms";
 
     private readonly IAmazonDynamoDB _client;
     private readonly DynamoDbDurableFlowOptions _options;
@@ -89,27 +88,6 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         _options = options.Value;
         _options.Validate();
         _ownsClient = ownsClient;
-    }
-
-    public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-    {
-        DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
-        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-
-        var now = DateTimeOffset.UtcNow;
-        await _client.PutItemAsync(new PutItemRequest
-        {
-            TableName = _options.TableName,
-            Item = new Dictionary<string, AttributeValue>
-            {
-                [FlowIdAttribute] = new() { S = flowId },
-                [StateJsonAttribute] = new() { S = DurableFlowStoreShared.Serialize(state) },
-                // Ceiling, not floor: DynamoDB TTL has whole-second granularity, and rounding down
-                // would make the effective TTL up to a second SHORTER than requested.
-                [_options.TimeToLiveAttributeName] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
-                [UpdatedAtAttribute] = new() { N = UnixSeconds(now) }
-            }
-        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -133,7 +111,133 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         if (!response.Item.TryGetValue(StateJsonAttribute, out var json) || string.IsNullOrEmpty(json.S))
             return null;
 
-        return DurableFlowStoreShared.Deserialize(json.S);
+        if (!response.Item.TryGetValue(RevisionAttribute, out var revision)
+            || !long.TryParse(revision.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            return null;
+
+        var state = DurableFlowStoreShared.Deserialize(json.S);
+        return state?.Revision == value ? state : null;
+    }
+
+    public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        var now = DateTimeOffset.UtcNow;
+        try
+        {
+            await _client.PutItemAsync(new PutItemRequest
+            {
+                TableName = _options.TableName,
+                Item = CreateItem(flowId, state, ttl, now),
+                ConditionExpression = "attribute_not_exists(#flow_id) OR #expires <= :now",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#flow_id"] = FlowIdAttribute,
+                    ["#expires"] = _options.TimeToLiveAttributeName
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":now"] = new() { N = UnixSeconds(now) }
+                }
+            }, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            return false;
+        }
+    }
+
+    public async Task<bool> TryUpdateAsync(
+        string flowId,
+        FlowState state,
+        long expectedRevision,
+        TimeSpan ttl,
+        string? leaseId = null,
+        CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        var now = DateTimeOffset.UtcNow;
+        var names = new Dictionary<string, string>
+        {
+            ["#state"] = StateJsonAttribute,
+            ["#expires"] = _options.TimeToLiveAttributeName,
+            ["#updated"] = UpdatedAtAttribute,
+            ["#revision"] = RevisionAttribute
+        };
+        var values = new Dictionary<string, AttributeValue>
+        {
+            [":state"] = new() { S = DurableFlowStoreShared.Serialize(state) },
+            [":expires"] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
+            [":updated"] = new() { N = UnixSeconds(now) },
+            [":expected_revision"] = new() { N = expectedRevision.ToString(CultureInfo.InvariantCulture) },
+            [":new_revision"] = new() { N = state.Revision.ToString(CultureInfo.InvariantCulture) },
+            [":now"] = new() { N = UnixSeconds(now) }
+        };
+        var condition = "#revision = :expected_revision AND #expires > :now";
+        if (leaseId is not null)
+        {
+            condition += " AND #lease_id = :lease_id AND #lease_expires > :now_ms";
+            names["#lease_id"] = LeaseIdAttribute;
+            names["#lease_expires"] = LeaseExpiresAtAttribute;
+            values[":lease_id"] = new AttributeValue { S = leaseId };
+            values[":now_ms"] = new AttributeValue { N = UnixMilliseconds(now) };
+        }
+
+        try
+        {
+            await _client.UpdateItemAsync(new UpdateItemRequest
+            {
+                TableName = _options.TableName,
+                Key = Key(flowId),
+                UpdateExpression = "SET #state = :state, #expires = :expires, #updated = :updated, #revision = :new_revision",
+                ConditionExpression = condition,
+                ExpressionAttributeNames = names,
+                ExpressionAttributeValues = values
+            }, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            return false;
+        }
+    }
+
+    public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: true, cancellationToken);
+
+    public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: false, cancellationToken);
+
+    public async Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _client.UpdateItemAsync(new UpdateItemRequest
+            {
+                TableName = _options.TableName,
+                Key = Key(flowId),
+                UpdateExpression = "REMOVE #lease_id, #lease_expires",
+                ConditionExpression = "#lease_id = :lease_id",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#lease_id"] = LeaseIdAttribute,
+                    ["#lease_expires"] = LeaseExpiresAtAttribute
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":lease_id"] = new() { S = leaseId }
+                }
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ConditionalCheckFailedException)
+        {
+        }
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -152,7 +256,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateTable)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -173,6 +277,10 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 
             if (table is null)
             {
+                if (!_options.AutoCreateTable)
+                    throw new InvalidOperationException(
+                        $"DynamoDB table '{_options.TableName}' does not exist and {nameof(DynamoDbDurableFlowOptions.AutoCreateTable)} is disabled.");
+
                 try
                 {
                     await _client.CreateTableAsync(new CreateTableRequest
@@ -194,12 +302,14 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
                     // Another process won the create race; fall through and wait for ACTIVE.
                 }
 
-                await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
+                table = await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
             }
             else if (table.TableStatus != TableStatus.ACTIVE)
             {
-                await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
+                table = await WaitForTableActiveAsync(cancellationToken).ConfigureAwait(false);
             }
+
+            ValidateTableSchema(table);
 
             if (_options.EnableTimeToLive)
             {
@@ -210,9 +320,25 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
                     TableName = _options.TableName
                 }, cancellationToken).ConfigureAwait(false);
 
-                var status = ttlStatus.TimeToLiveDescription?.TimeToLiveStatus;
+                var description = ttlStatus.TimeToLiveDescription;
+                var status = description?.TimeToLiveStatus;
+                if ((status == TimeToLiveStatus.ENABLED || status == TimeToLiveStatus.ENABLING)
+                    && !string.Equals(description?.AttributeName, _options.TimeToLiveAttributeName, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"DynamoDB table '{_options.TableName}' has TTL configured on attribute '{description?.AttributeName}', " +
+                        $"but '{_options.TimeToLiveAttributeName}' is required.");
+                }
+
                 if (status != TimeToLiveStatus.ENABLED && status != TimeToLiveStatus.ENABLING)
                 {
+                    if (!_options.AutoCreateTable)
+                    {
+                        throw new InvalidOperationException(
+                            $"DynamoDB table '{_options.TableName}' does not have TTL enabled on " +
+                            $"'{_options.TimeToLiveAttributeName}'. Enable it in infrastructure before using the table.");
+                    }
+
                     try
                     {
                         await _client.UpdateTimeToLiveAsync(new UpdateTimeToLiveRequest
@@ -227,7 +353,20 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
                     }
                     catch (AmazonDynamoDBException ex) when (string.Equals(ex.ErrorCode, "ValidationException", StringComparison.Ordinal))
                     {
-                        // A concurrent process enabled TTL between the describe and the update.
+                        // Accept only the one safe race: another process enabled the expected TTL
+                        // attribute between our describe and update. Do not swallow unrelated
+                        // validation failures.
+                        var raced = await _client.DescribeTimeToLiveAsync(new DescribeTimeToLiveRequest
+                        {
+                            TableName = _options.TableName
+                        }, cancellationToken).ConfigureAwait(false);
+                        var racedDescription = raced.TimeToLiveDescription;
+                        if ((racedDescription?.TimeToLiveStatus != TimeToLiveStatus.ENABLED
+                                && racedDescription?.TimeToLiveStatus != TimeToLiveStatus.ENABLING)
+                            || !string.Equals(racedDescription.AttributeName, _options.TimeToLiveAttributeName, StringComparison.Ordinal))
+                        {
+                            throw;
+                        }
                     }
                 }
             }
@@ -240,20 +379,91 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         }
     }
 
-    private async Task WaitForTableActiveAsync(CancellationToken cancellationToken)
+    private async Task<TableDescription> WaitForTableActiveAsync(CancellationToken cancellationToken)
     {
         var deadline = DateTime.UtcNow.AddSeconds(30);
         while (true)
         {
             var response = await _client.DescribeTableAsync(_options.TableName, cancellationToken).ConfigureAwait(false);
             if (response.Table.TableStatus == TableStatus.ACTIVE)
-                return;
+                return response.Table;
             if (DateTime.UtcNow >= deadline)
                 throw new TimeoutException($"DynamoDB table '{_options.TableName}' did not become ACTIVE within 30 seconds.");
 
             await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private void ValidateTableSchema(TableDescription table)
+    {
+        var hashKey = table.KeySchema?.SingleOrDefault(key => key.KeyType == KeyType.HASH);
+        var keyDefinition = table.AttributeDefinitions?
+            .SingleOrDefault(attribute => string.Equals(attribute.AttributeName, FlowIdAttribute, StringComparison.Ordinal));
+        if (table.KeySchema?.Count != 1
+            || !string.Equals(hashKey?.AttributeName, FlowIdAttribute, StringComparison.Ordinal)
+            || keyDefinition?.AttributeType != ScalarAttributeType.S)
+        {
+            throw new InvalidOperationException(
+                $"DynamoDB table '{_options.TableName}' must use one string partition key named '{FlowIdAttribute}' and no sort key.");
+        }
+    }
+
+    private async Task<bool> UpdateLeaseAsync(
+        string flowId,
+        string leaseId,
+        TimeSpan leaseDuration,
+        bool acquire,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        if (leaseDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTimeOffset.UtcNow;
+        try
+        {
+            await _client.UpdateItemAsync(new UpdateItemRequest
+            {
+                TableName = _options.TableName,
+                Key = Key(flowId),
+                UpdateExpression = "SET #lease_id = :lease_id, #lease_expires = :lease_expires",
+                ConditionExpression = acquire
+                    ? "#expires > :now AND attribute_exists(#revision) AND (attribute_not_exists(#lease_id) OR #lease_expires <= :now_ms OR #lease_id = :lease_id)"
+                    : "#expires > :now AND attribute_exists(#revision) AND #lease_id = :lease_id AND #lease_expires > :now_ms",
+                ExpressionAttributeNames = new Dictionary<string, string>
+                {
+                    ["#expires"] = _options.TimeToLiveAttributeName,
+                    ["#revision"] = RevisionAttribute,
+                    ["#lease_id"] = LeaseIdAttribute,
+                    ["#lease_expires"] = LeaseExpiresAtAttribute
+                },
+                ExpressionAttributeValues = new Dictionary<string, AttributeValue>
+                {
+                    [":now"] = new() { N = UnixSeconds(now) },
+                    [":now_ms"] = new() { N = UnixMilliseconds(now) },
+                    [":lease_id"] = new() { S = leaseId },
+                    [":lease_expires"] = new() { N = UnixMilliseconds(now.Add(leaseDuration)) }
+                }
+            }, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (ConditionalCheckFailedException)
+        {
+            return false;
+        }
+    }
+
+    private Dictionary<string, AttributeValue> CreateItem(string flowId, FlowState state, TimeSpan ttl, DateTimeOffset now)
+        => new(StringComparer.Ordinal)
+        {
+            [FlowIdAttribute] = new() { S = flowId },
+            [StateJsonAttribute] = new() { S = DurableFlowStoreShared.Serialize(state) },
+            [_options.TimeToLiveAttributeName] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
+            [UpdatedAtAttribute] = new() { N = UnixSeconds(now) },
+            [RevisionAttribute] = new() { N = state.Revision.ToString(CultureInfo.InvariantCulture) }
+        };
 
     private static Dictionary<string, AttributeValue> Key(string flowId)
         => new(StringComparer.Ordinal) { [FlowIdAttribute] = new AttributeValue { S = flowId } };
@@ -263,6 +473,9 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 
     private static string UnixSecondsCeiling(DateTimeOffset value)
         => ((long)Math.Ceiling(value.ToUnixTimeMilliseconds() / 1000.0)).ToString(CultureInfo.InvariantCulture);
+
+    private static string UnixMilliseconds(DateTimeOffset value)
+        => value.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
 
     /// <summary>Disposes the DynamoDB client when the store created (and therefore owns) it.</summary>
     public void Dispose()

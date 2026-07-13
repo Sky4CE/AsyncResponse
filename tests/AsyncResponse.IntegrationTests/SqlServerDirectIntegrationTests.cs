@@ -45,7 +45,6 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             var stored = Assert.Single(await store.GetAllAsync(correlationId));
             Assert.Equal(correlationId, stored.CorrelationId);
             Assert.Equal(state.RegistrationId, stored.RegistrationId);
-            Assert.Equal(stored.RegistrationId, (await store.GetAsync(correlationId))!.RegistrationId);
 
             var scanned = new List<RecoveryState>();
             await foreach (var scannedState in store.ScanAsync())
@@ -69,8 +68,9 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             Assert.True(await store.TryDeleteAsync(correlationId, state.RegistrationId));
             Assert.Empty(await store.GetAllAsync(correlationId));
 
-            await store.SaveAsync(correlationId, new RecoveryState { CorrelationId = correlationId }, TimeSpan.FromSeconds(30));
-            Assert.True(await store.TryDeleteAsync(correlationId));
+            var deleteState = new RecoveryState { CorrelationId = correlationId };
+            await store.SaveAsync(correlationId, deleteState, TimeSpan.FromSeconds(30));
+            Assert.True(await store.TryDeleteAsync(correlationId, deleteState.RegistrationId));
             Assert.Empty(await store.GetAllAsync(correlationId));
 
             await store.SaveAsync("expired-state", new RecoveryState { CorrelationId = "expired-state" }, TimeSpan.FromMilliseconds(1));
@@ -86,12 +86,25 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             await sql.DeleteSubscriberAsync("subscribed", subscriberId, CancellationToken.None);
             Assert.Equal(0, await sql.CountActiveSubscribersAsync("subscribed", CancellationToken.None));
 
+            var heartbeatA = Guid.NewGuid();
+            var heartbeatB = Guid.NewGuid();
+            var staleHeartbeat = Guid.NewGuid();
+            await sql.UpsertSubscriberAsync("heartbeat-a", heartbeatA, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+            await sql.UpsertSubscriberAsync("heartbeat-b", heartbeatB, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+            await sql.UpsertSubscriberAsync("heartbeat-stale", staleHeartbeat, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+            await Task.Delay(50);
+            await sql.HeartbeatSubscribersAsync("heartbeat-instance", [heartbeatA, heartbeatB], TimeSpan.FromSeconds(2), CancellationToken.None);
+            await Task.Delay(100);
+            Assert.Equal(1, await sql.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
+            Assert.Equal(1, await sql.CountActiveSubscribersAsync("heartbeat-b", CancellationToken.None));
+            Assert.Equal(0, await sql.CountActiveSubscribersAsync("heartbeat-stale", CancellationToken.None));
+
             var startedAt = await sql.GetServerTimeUtcAsync(CancellationToken.None);
             var messageId = Guid.NewGuid();
             await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
             await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("duplicate"), TimeSpan.FromSeconds(30), CancellationToken.None);
 
-            var messages = await sql.LoadMessagesAsync("message-correlation", startedAt.AddSeconds(-5), 10, CancellationToken.None);
+            var messages = await sql.LoadMessagesAsync("message-correlation", startedAt.AddSeconds(-5), 10, null, null, CancellationToken.None);
             var message = Assert.Single(messages);
             Assert.Equal(messageId, message.Id);
             Assert.Equal("message-correlation", message.CorrelationId);
@@ -108,7 +121,26 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             await sql.InsertMessageAsync(Guid.NewGuid(), "expired-message", SuccessEnvelope("old"), TimeSpan.FromMilliseconds(1), CancellationToken.None);
             await Task.Delay(40);
             await sql.InsertMessageAsync(Guid.NewGuid(), "fresh-message", SuccessEnvelope("new"), TimeSpan.FromSeconds(30), CancellationToken.None);
-            Assert.Empty(await sql.LoadMessagesAsync("expired-message", startedAt.AddSeconds(-5), 10, CancellationToken.None));
+            Assert.Empty(await sql.LoadMessagesAsync("expired-message", startedAt.AddSeconds(-5), 10, null, null, CancellationToken.None));
+
+            const int pagedCount = 70;
+            var pagedCorrelation = NewId("paged-messages");
+            for (var index = 0; index < pagedCount; index++)
+                await sql.InsertMessageAsync(Guid.NewGuid(), pagedCorrelation, SuccessEnvelope($"page-{index}"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            var paged = new List<SqlServerChannelMessage>();
+            DateTimeOffset? afterCreatedAtUtc = null;
+            Guid? afterId = null;
+            while (true)
+            {
+                var page = await sql.LoadMessagesAsync(pagedCorrelation, startedAt.AddSeconds(-5), 16, afterCreatedAtUtc, afterId, CancellationToken.None);
+                paged.AddRange(page);
+                if (page.Count < 16)
+                    break;
+                afterCreatedAtUtc = page[^1].CreatedAtUtc;
+                afterId = page[^1].Id;
+            }
+            Assert.Equal(pagedCount, paged.Count);
+            Assert.Equal(pagedCount, paged.Select(item => item.Id).Distinct().Count());
         });
     }
 

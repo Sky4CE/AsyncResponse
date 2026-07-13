@@ -44,7 +44,6 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         var stored = Assert.Single(await recovery.GetAllAsync(correlationId));
         Assert.Equal(correlationId, stored.CorrelationId);
         Assert.Equal(state.RegistrationId, stored.RegistrationId);
-        Assert.Equal(stored.RegistrationId, (await recovery.GetAsync(correlationId))!.RegistrationId);
 
         var scanned = new List<RecoveryState>();
         await foreach (var scannedState in recovery.ScanAsync())
@@ -80,8 +79,9 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         Assert.True(await recovery.TryDeleteAsync(correlationId, state.RegistrationId));
         Assert.Empty(await recovery.GetAllAsync(correlationId));
 
-        await recovery.SaveAsync(correlationId, new RecoveryState { CorrelationId = correlationId }, TimeSpan.FromSeconds(30));
-        Assert.True(await recovery.TryDeleteAsync(correlationId));
+        var deleteState = new RecoveryState { CorrelationId = correlationId };
+        await recovery.SaveAsync(correlationId, deleteState, TimeSpan.FromSeconds(30));
+        Assert.True(await recovery.TryDeleteAsync(correlationId, deleteState.RegistrationId));
         Assert.Empty(await recovery.GetAllAsync(correlationId));
 
         // Expiry: the read filter hides expired entries even before the TTL monitor reaps them.
@@ -97,6 +97,19 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         await store.DeleteSubscriberAsync(subscriberCorrelation, registrationId, CancellationToken.None);
         Assert.Equal(0, await store.CountActiveSubscribersAsync(subscriberCorrelation, CancellationToken.None));
 
+        var heartbeatA = Guid.NewGuid();
+        var heartbeatB = Guid.NewGuid();
+        var staleHeartbeat = Guid.NewGuid();
+        await store.UpsertSubscriberAsync("heartbeat-a", heartbeatA, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+        await store.UpsertSubscriberAsync("heartbeat-b", heartbeatB, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+        await store.UpsertSubscriberAsync("heartbeat-stale", staleHeartbeat, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
+        await Task.Delay(50);
+        await store.HeartbeatSubscribersAsync("heartbeat-instance", [heartbeatA, heartbeatB], TimeSpan.FromSeconds(2), CancellationToken.None);
+        await Task.Delay(100);
+        Assert.Equal(1, await store.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
+        Assert.Equal(1, await store.CountActiveSubscribersAsync("heartbeat-b", CancellationToken.None));
+        Assert.Equal(0, await store.CountActiveSubscribersAsync("heartbeat-stale", CancellationToken.None));
+
         // Messages: idempotent insert, server-stamped watermark ordering, and claim arbitration.
         var messageCorrelation = NewId("direct-message");
         var since = await store.GetServerTimeUtcAsync(CancellationToken.None);
@@ -105,7 +118,7 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         var messageId = Guid.NewGuid();
         await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
         await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
-        var messages = await store.LoadMessagesAsync(messageCorrelation, since.AddSeconds(-1), 16, CancellationToken.None);
+        var messages = await store.LoadMessagesAsync(messageCorrelation, since.AddSeconds(-1), 16, null, null, CancellationToken.None);
         var message = Assert.Single(messages);
         Assert.Equal(messageId, message.Id);
 
@@ -119,6 +132,25 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         await store.InsertMessageAsync(recoveryMessageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
         Assert.True(await store.TryClaimForRecoveryAsync(recoveryMessageId, CancellationToken.None));
         Assert.False(await store.TryClaimForDeliveryAsync(recoveryMessageId, CancellationToken.None));
+
+        const int pagedCount = 70;
+        var pagedCorrelation = NewId("paged-messages");
+        for (var index = 0; index < pagedCount; index++)
+            await store.InsertMessageAsync(Guid.NewGuid(), pagedCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+        var paged = new List<MongoDbChannelMessage>();
+        DateTimeOffset? afterCreatedAtUtc = null;
+        Guid? afterId = null;
+        while (true)
+        {
+            var page = await store.LoadMessagesAsync(pagedCorrelation, since.AddSeconds(-1), 16, afterCreatedAtUtc, afterId, CancellationToken.None);
+            paged.AddRange(page);
+            if (page.Count < 16)
+                break;
+            afterCreatedAtUtc = page[^1].CreatedAtUtc;
+            afterId = page[^1].Id;
+        }
+        Assert.Equal(pagedCount, paged.Count);
+        Assert.Equal(pagedCount, paged.Select(item => item.Id).Distinct().Count());
 
         // The change stream observes inserts and surfaces the correlation id — the targeted wake.
         using var watchCts = new CancellationTokenSource();

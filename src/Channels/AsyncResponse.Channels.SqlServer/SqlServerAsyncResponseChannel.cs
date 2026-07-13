@@ -28,10 +28,11 @@ internal sealed class SqlServerAsyncResponseChannel :
 
     // A signal carries the correlation id to scan (targeted), or null to scan every subscribed
     // correlation id (the periodic sweep safety net).
-    private readonly Channel<string?> _signals = Channel.CreateUnbounded<string?>(new UnboundedChannelOptions
+    private readonly Channel<string?> _signals = Channel.CreateBounded<string?>(new BoundedChannelOptions(1024)
     {
         SingleReader = true,
-        SingleWriter = false
+        SingleWriter = false,
+        FullMode = BoundedChannelFullMode.DropOldest
     });
 
     // Maps a just-published message id to a completion the local dispatch loop trips the instant it
@@ -51,6 +52,7 @@ internal sealed class SqlServerAsyncResponseChannel :
     private readonly object _dispatcherGate = new();
     private CancellationTokenSource? _dispatcherCts;
     private Task? _dispatchTask;
+    private Task? _heartbeatTask;
     private bool _disposed;
 
     /// <summary>Creates a SQL Server-backed async-response channel.</summary>
@@ -186,12 +188,11 @@ internal sealed class SqlServerAsyncResponseChannel :
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
             await _sql.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
 
-            subscription.StartHeartbeat();
             timeoutCts.CancelAfter(timeout.Value);
             armed = true;
 
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Waiting for SQL Server response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Waiting for SQL Server response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
         }
         catch (Exception ex)
         {
@@ -454,7 +455,52 @@ internal sealed class SqlServerAsyncResponseChannel :
 
             _dispatcherCts = new CancellationTokenSource();
             _dispatchTask = Task.Run(() => DispatchLoopAsync(_dispatcherCts.Token));
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_dispatcherCts.Token));
         }
+    }
+
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
+    private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(_options.SubscriberHeartbeatInterval, cancellationToken).ConfigureAwait(false);
+                var registrationIds = SnapshotActiveRegistrationIds();
+                if (registrationIds.Count > 0)
+                {
+                    await _sql.HeartbeatSubscribersAsync(
+                        _instanceId,
+                        registrationIds,
+                        _options.SubscriberHeartbeatTimeout,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "SQL Server subscriber heartbeat failed; retrying for all local waiters.");
+            }
+        }
+    }
+
+    private List<Guid> SnapshotActiveRegistrationIds()
+    {
+        var registrationIds = new List<Guid>();
+        foreach (var group in _subscriptions.Values)
+        {
+            foreach (var subscription in group.Values)
+            {
+                if (!subscription.Dropped)
+                    registrationIds.Add(subscription.Id);
+            }
+        }
+
+        return registrationIds;
     }
 
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
@@ -518,22 +564,50 @@ internal sealed class SqlServerAsyncResponseChannel :
 
     private async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)
     {
-        foreach (var (correlationId, group) in _subscriptions.ToArray())
+        foreach (var (correlationId, group) in _subscriptions)
         {
             if (scope is not null && !scope.Contains(correlationId))
                 continue;
 
-            var subscriptions = group.Values.Where(static s => !s.Dropped).ToArray();
-            if (subscriptions.Length == 0)
+            var subscriptions = new List<ISqlServerSubscription>(group.Count);
+            foreach (var subscription in group.Values)
+            {
+                if (!subscription.Dropped)
+                    subscriptions.Add(subscription);
+            }
+            if (subscriptions.Count == 0)
                 continue;
 
             var since = subscriptions.Min(static s => s.StartedAtUtc).AddSeconds(-1);
-            var messages = await _sql.LoadMessagesAsync(correlationId, since, _options.PendingMessageBatchSize, cancellationToken).ConfigureAwait(false);
-            foreach (var message in messages)
+            var seenCutoff = DateTimeOffset.UtcNow - _options.MessageRetention - TimeSpan.FromMinutes(1);
+            foreach (var subscription in subscriptions)
+                subscription.PruneSeen(seenCutoff);
+
+            DateTimeOffset? afterCreatedAtUtc = null;
+            Guid? afterId = null;
+            while (true)
             {
-                _executors.Enqueue(
-                    ChannelName(correlationId),
-                    () => DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken));
+                var messages = await _sql.LoadMessagesAsync(
+                    correlationId,
+                    since,
+                    _options.PendingMessageBatchSize,
+                    afterCreatedAtUtc,
+                    afterId,
+                    cancellationToken).ConfigureAwait(false);
+                foreach (var message in messages)
+                {
+                    await _executors.EnqueueAsync(
+                        ChannelName(correlationId),
+                        () => DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken),
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                if (messages.Count < _options.PendingMessageBatchSize)
+                    break;
+
+                var last = messages[^1];
+                afterCreatedAtUtc = last.CreatedAtUtc;
+                afterId = last.Id;
             }
         }
     }
@@ -547,7 +621,7 @@ internal sealed class SqlServerAsyncResponseChannel :
         await _sql.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
             .ConfigureAwait(false);
         await TryDispatchLocalSubscribersAsync(
-            new SqlServerChannelMessage(messageId, correlationId, envelopeJson),
+            new SqlServerChannelMessage(messageId, correlationId, envelopeJson, DateTimeOffset.UtcNow),
             cancellationToken).ConfigureAwait(false);
         SignalDispatcher(correlationId);
     }
@@ -559,21 +633,36 @@ internal sealed class SqlServerAsyncResponseChannel :
     {
         // Only subscriptions that are still live and have not already processed this message. Skipping
         // when there is nothing to deliver also avoids a redundant claim on every re-sweep.
-        var targets = subscriptions.Where(s => !s.Dropped && !s.HasSeen(message.Id)).ToArray();
-        if (targets.Length == 0)
+        var hasTargets = false;
+        foreach (var subscription in subscriptions)
+        {
+            if (!subscription.Dropped && !subscription.HasSeen(message.Id))
+            {
+                hasTargets = true;
+                break;
+            }
+        }
+        if (!hasTargets)
             return;
 
         // Take the message for live delivery. The claim sets acked_at unless the publisher already
         // routed it to recovery (recovery_claimed); losing the claim means recovery owns it, so it is
         // not delivered to the waiter and handled a second time.
         if (!await _sql.TryClaimForDeliveryAsync(message.Id, cancellationToken).ConfigureAwait(false))
+        {
+            foreach (var subscription in subscriptions)
+            {
+                if (!subscription.Dropped)
+                    subscription.MarkSeen(message.Id);
+            }
             return;
+        }
 
         // Wake the publisher immediately if it is waiting in this process — no acked_at polling needed.
         if (_pendingConfirmations.TryGetValue(message.Id, out var confirmation))
             confirmation.TrySetResult(true);
 
-        foreach (var subscription in targets)
+        foreach (var subscription in subscriptions)
         {
             if (subscription.Dropped || !subscription.MarkSeen(message.Id))
                 continue;
@@ -583,24 +672,29 @@ internal sealed class SqlServerAsyncResponseChannel :
     }
 
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
-    private Task TryDispatchLocalSubscribersAsync(SqlServerChannelMessage message, CancellationToken cancellationToken)
+    private async Task TryDispatchLocalSubscribersAsync(SqlServerChannelMessage message, CancellationToken cancellationToken)
     {
         if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
-            return Task.CompletedTask;
+            return;
 
-        var subscriptions = group.Values.Where(static s => !s.Dropped).ToArray();
-        if (subscriptions.Length == 0)
-            return Task.CompletedTask;
+        var subscriptions = new List<ISqlServerSubscription>(group.Count);
+        foreach (var subscription in group.Values)
+        {
+            if (!subscription.Dropped)
+                subscriptions.Add(subscription);
+        }
+        if (subscriptions.Count == 0)
+            return;
 
         // Same-process fast path: skips the sweep latency but still runs on the per-correlation
         // serial executor — completion predicates are guaranteed serial, in-order invocation on every
         // channel, and a direct dispatch here could otherwise run concurrently with a sweep-enqueued
         // dispatch of a different message for the same subscription. MarkSeen keeps the sweep from
         // double-processing this message.
-        _executors.Enqueue(
+        await _executors.EnqueueAsync(
             ChannelName(message.CorrelationId),
-            new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync);
-        return Task.CompletedTask;
+            new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync,
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -743,12 +837,15 @@ internal sealed class SqlServerAsyncResponseChannel :
         _disposed = true;
         CancellationTokenSource? cts;
         Task? dispatchTask;
+        Task? heartbeatTask;
         lock (_dispatcherGate)
         {
             cts = _dispatcherCts;
             dispatchTask = _dispatchTask;
+            heartbeatTask = _heartbeatTask;
             _dispatcherCts = null;
             _dispatchTask = null;
+            _heartbeatTask = null;
         }
 
         if (cts is not null)
@@ -756,8 +853,7 @@ internal sealed class SqlServerAsyncResponseChannel :
             await cts.CancelAsync().ConfigureAwait(false);
             try
             {
-                if (dispatchTask is not null)
-                    await dispatchTask.ConfigureAwait(false);
+                await Task.WhenAll(new[] { dispatchTask, heartbeatTask }.OfType<Task>()).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -792,6 +888,7 @@ internal sealed class SqlServerAsyncResponseChannel :
         Func<SqlServerChannelMessage, Task> ProcessUnderContextAsync { get; set; }
         bool HasSeen(Guid messageId);
         bool MarkSeen(Guid messageId);
+        void PruneSeen(DateTimeOffset cutoffUtc);
         Task ProcessAsync(SqlServerChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
         ValueTask DropLocalAsync(CancellationToken cancellationToken);
@@ -805,8 +902,8 @@ internal sealed class SqlServerAsyncResponseChannel :
         private readonly TaskCompletionSource<T> _tcs;
         private readonly Activity? _activity;
         private readonly HashSet<Guid> _seen = [];
+        private readonly Queue<(Guid Id, DateTimeOffset SeenAtUtc)> _seenOrder = [];
         private readonly object _seenGate = new();
-        private readonly CancellationTokenSource _heartbeatCts = new();
         private int _cleanupStarted;
         private volatile bool _dropped;
 
@@ -849,38 +946,24 @@ internal sealed class SqlServerAsyncResponseChannel :
         {
             lock (_seenGate)
             {
-                return _seen.Add(messageId);
+                if (!_seen.Add(messageId))
+                    return false;
+
+                // Use the local observation time, not the database creation time. This keeps the
+                // pruning queue monotonic and avoids immediate eviction when app and DB clocks differ.
+                _seenOrder.Enqueue((messageId, DateTimeOffset.UtcNow));
+                return true;
             }
         }
 
-        public void StartHeartbeat()
-            => _ = Task.Run(HeartbeatLoopAsync);
-
-        [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
-        private async Task HeartbeatLoopAsync()
+        public void PruneSeen(DateTimeOffset cutoffUtc)
         {
-            while (!_heartbeatCts.IsCancellationRequested)
+            lock (_seenGate)
             {
-                try
+                while (_seenOrder.TryPeek(out var entry) && entry.SeenAtUtc < cutoffUtc)
                 {
-                    await Task.Delay(_owner._options.SubscriberHeartbeatInterval, _heartbeatCts.Token).ConfigureAwait(false);
-                    await _owner._sql.UpsertSubscriberAsync(
-                        _correlationId,
-                        Id,
-                        _owner._instanceId,
-                        _owner._options.SubscriberHeartbeatTimeout,
-                        _heartbeatCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    // A transient upsert failure must not end the loop: once the heartbeat row
-                    // expires, publishers treat this live waiter as gone and route its responses
-                    // to lost-subscriber recovery. Retry on the next interval instead.
-                    _owner._logger.LogWarning(ex, "SQL Server subscriber heartbeat failed for correlationId {CorrelationId}; retrying.", _correlationId);
+                    _seenOrder.Dequeue();
+                    _seen.Remove(entry.Id);
                 }
             }
         }
@@ -906,7 +989,7 @@ internal sealed class SqlServerAsyncResponseChannel :
                     finished = true;
                     var error = new InvalidOperationException(
                         $"Response envelope for correlationId {_correlationId} has schema version {envelope.SchemaVersion}, " +
-                        $"newer than this build supports ({AsyncResponseEnvelopeSchema.Current}); it was produced by a newer deployment.");
+                        $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
                     AsyncResponseDiagnostics.SetError(_activity, "schema_mismatch", error.Message);
                     _tcs.TrySetException(error);
                 }
@@ -948,7 +1031,6 @@ internal sealed class SqlServerAsyncResponseChannel :
             try
             {
                 _dropped = true;
-                await _heartbeatCts.CancelAsync().ConfigureAwait(false);
                 _owner.RemoveSubscription(_correlationId, Id);
                 await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
                 if (deleteRecoveryState)
@@ -969,7 +1051,6 @@ internal sealed class SqlServerAsyncResponseChannel :
                 if (TimeoutRegistration is not null)
                     await TimeoutRegistration().ConfigureAwait(false);
                 TimeoutCancellation?.Dispose();
-                _heartbeatCts.Dispose();
                 _activity?.Dispose();
             }
         }
@@ -977,7 +1058,6 @@ internal sealed class SqlServerAsyncResponseChannel :
         public async ValueTask DropLocalAsync(CancellationToken cancellationToken)
         {
             _dropped = true;
-            await _heartbeatCts.CancelAsync().ConfigureAwait(false);
             await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, cancellationToken).ConfigureAwait(false);
         }
     }

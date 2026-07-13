@@ -1,12 +1,13 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace AsyncResponse;
 
 /// <summary>
-/// An in-memory <see cref="IWorkerTransport"/> backed by an unbounded
+/// An in-memory <see cref="IWorkerTransport"/> backed by a bounded
 /// <see cref="Channel{T}"/>, registered by <c>AddAsyncResponse().WithInMemoryTransport()</c>.
 /// Jobs run in the current process and survive only as long as it does — use a broker-backed
 /// transport for durability. Intended for development, tests, and single-node deployments.
@@ -19,10 +20,30 @@ namespace AsyncResponse;
 /// </summary>
 public sealed class InMemoryWorkerTransport : IWorkerTransport
 {
-    private readonly Channel<QueuedJob> _queue = Channel.CreateUnbounded<QueuedJob>(
-        new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<QueuedJob> _queue;
+
+    /// <summary>Creates a transport with default bounded-queue options.</summary>
+    public InMemoryWorkerTransport()
+        : this(Microsoft.Extensions.Options.Options.Create(new InMemoryWorkerTransportOptions()))
+    {
+    }
+
+    /// <summary>Creates a transport with configured capacity and worker concurrency.</summary>
+    public InMemoryWorkerTransport(IOptions<InMemoryWorkerTransportOptions> options)
+    {
+        Options = options.Value;
+        Options.Validate();
+        _queue = Channel.CreateBounded<QueuedJob>(new BoundedChannelOptions(Options.QueueCapacity)
+        {
+            SingleReader = Options.WorkerCount == 1,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false
+        });
+    }
 
     internal ChannelReader<QueuedJob> Reader => _queue.Reader;
+    internal InMemoryWorkerTransportOptions Options { get; }
 
     /// <inheritdoc/>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
@@ -52,6 +73,24 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     internal readonly record struct QueuedJob(WorkerJobEnvelope Job, ExecutionContext? Context);
 }
 
+/// <summary>Capacity and concurrency options for the process-local worker transport.</summary>
+public sealed class InMemoryWorkerTransportOptions
+{
+    /// <summary>Maximum queued jobs before publishers asynchronously wait. Default: 1024.</summary>
+    public int QueueCapacity { get; set; } = 1024;
+
+    /// <summary>Number of jobs that may execute concurrently. Default: 1.</summary>
+    public int WorkerCount { get; set; } = 1;
+
+    internal void Validate()
+    {
+        if (QueueCapacity <= 0)
+            throw new InvalidOperationException($"{nameof(QueueCapacity)} must be positive.");
+        if (WorkerCount <= 0)
+            throw new InvalidOperationException($"{nameof(WorkerCount)} must be positive.");
+    }
+}
+
 /// <summary>
 /// Background consumer for <see cref="InMemoryWorkerTransport"/>: drains the queue and executes
 /// each job via <see cref="WorkerJobExecutor"/>, under the enqueuer's captured
@@ -68,21 +107,29 @@ internal sealed class InMemoryWorkerHost(
     {
         try
         {
-            await foreach (var queued in _transport.Reader.ReadAllAsync(stoppingToken).ConfigureAwait(false))
-            {
-                try
-                {
-                    await RunAsync(queued).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
-                }
-            }
+            var workers = new Task[_transport.Options.WorkerCount];
+            for (var index = 0; index < workers.Length; index++)
+                workers[index] = RunWorkerAsync(stoppingToken);
+            await Task.WhenAll(workers).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             // Host shutdown.
+        }
+    }
+
+    private async Task RunWorkerAsync(CancellationToken stoppingToken)
+    {
+        await foreach (var queued in _transport.Reader.ReadAllAsync(stoppingToken).ConfigureAwait(false))
+        {
+            try
+            {
+                await RunAsync(queued).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+            }
         }
     }
 

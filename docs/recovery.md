@@ -189,14 +189,14 @@ atomically so a slow live waiter and a recovery callback cannot both process the
 ## Wire/schema versioning
 
 `RecoveryState`, `WorkerJobEnvelope`, and the response envelope each carry a **`SchemaVersion`**. A
-reader **rejects anything stamped with a version newer than it understands**, so a mixed-version
-deploy (an old host reading data written by a newer one) fails safe instead of misinterpreting
-fields. Data written *without* the field — produced by an older build before versioning existed — is
-read as the current version and accepted.
+reader accepts only versions explicitly supported by that build. Today that is the current version;
+arbitrary lower numbers are not guessed to be compatible. The schema property is mandatory;
+missing, null, and unsupported values are rejected rather than inferred. Add historical versions
+only alongside a tested migration path.
 
-Practically: rolling a newer build forward is fine (newer readers understand older data); rolling a
-*newer* writer's data back into an *older* reader is the case versioning protects against — the older
-reader refuses the payload rather than guessing.
+Keep all hosts that share recovery or worker storage on the same wire schema during deployment.
+An incompatible writer fails safe—the reader refuses the payload instead of invoking a callback or
+worker with a shape it does not understand.
 
 ## Shared-correlation recovery
 

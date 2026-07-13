@@ -99,7 +99,7 @@ public sealed class InMemorySetExceptionTests
 
         var failure = Assert.Single(spy.Failures);
         Assert.Same(expected, failure);
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -121,7 +121,7 @@ public sealed class InMemorySetExceptionTests
 
         await publisher.SetException(new InvalidOperationException("late technical error"), correlationId);
 
-        Assert.NotNull(await store.GetAsync(correlationId));
+        Assert.NotEmpty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]

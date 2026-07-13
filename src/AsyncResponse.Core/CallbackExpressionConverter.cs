@@ -44,6 +44,13 @@ internal static class CallbackExpressionConverter
 
     private static CallbackParam ConvertArgument(Expression expression, ParameterExpression svcParam)
     {
+        // A generic payload passed to an object parameter is wrapped in an implicit Convert node.
+        // Strip only that harmless boxing/reference conversion so the marker remains top-level.
+        if (expression is UnaryExpression { NodeType: ExpressionType.Convert or ExpressionType.ConvertChecked } conversion
+            && conversion.Method is null
+            && conversion.Type.IsAssignableFrom(conversion.Operand.Type))
+            expression = conversion.Operand;
+
         // Placeholder.Payload<T>() / Placeholder.Exception() / Placeholder.CorrelationId()
         // used directly as an argument become runtime placeholders.
         if (expression is MethodCallExpression marker && marker.Method.DeclaringType == typeof(Placeholder))

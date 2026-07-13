@@ -5,8 +5,8 @@
 </p>
 
 <p align="center"><b>
-Await responses from message brokers, webhooks, and background workers as if they were local async calls —
-with optional durable, domain-aware recovery when your process dies mid-wait.
+Turn correlated messages into ordinary .NET <code>await</code>s — with progress handling,
+subscribe-before-send safety, and optional crash recovery and checkpointed flows.
 </b></p>
 
 <p align="center">
@@ -23,9 +23,104 @@ OrderResult result = await asyncResponse
         paymentGateway.StartAsync(orderId, context.CorrelationId)); // sent only AFTER subscribing
 ```
 
+AsyncResponse is the correlation and recovery layer between your application and asynchronous
+infrastructure. It does not replace your broker, webhook, or worker system; it removes the waiter
+registry, polling loop, timeout plumbing, and recovery routing that applications otherwise build
+around them.
+
 ---
 
-## The problem
+## Why teams choose AsyncResponse
+
+- **The API closes the response race.** `For<T>()` requires a trigger and runs it only after the
+  waiter is registered. `For<T>(correlationId)` attaches to work started elsewhere and forbids a
+  trigger. The compiler keeps those two cases separate.
+- **Progress is part of the wait.** `Until(...)` consumes intermediate messages and completes on
+  the terminal payload without another queue or state machine.
+- **Late responses are domain-aware.** When a waiter disappeared during a restart,
+  `ShouldResumeOnRecovery()` routes the payload to a resume or failure callback instead of blindly
+  treating every response as success.
+- **Infrastructure is replaceable.** Choose one response channel, one worker transport, and one
+  flow-state store independently. Move any axis from in-memory to Redis, NATS, a database, Kafka,
+  RabbitMQ, or a cloud service through DI while application and flow code stay the same.
+- **Multi-step work can stay plain C#.** Durable flows checkpoint named steps, re-attach
+  in-flight waits, and preserve terminal payloads received during a restart—without
+  replay-determinism rules or a generated workflow DSL.
+- **Duplicate work is fenced across replicas.** Built-in flow stores combine atomic idempotent
+  start, optimistic revisions, and renewable execution leases, so duplicate worker deliveries do
+  not run the same flow concurrently.
+- **It is built to be operated.** OpenTelemetry-compatible traces and metrics, readiness health
+  checks, recovery scans, bounded early-ACK queues, dead-letter support, and callback authorization
+  are first-class features.
+- **The local hot path is small.** The checked-in BenchmarkDotNet suite measures the complete
+  subscribe → publish → complete cycle, while the stress harness checks isolation, cleanup,
+  fan-out, timeouts, context propagation, transport dispatch, and durable flows.
+
+## Pick the smallest setup that fits
+
+Channel, transport, and flow-state storage are independent choices, and every app selects one of
+each:
+
+| You need | Response channel | Worker transport | Durable-flow store |
+|---|---|---|---|
+| Local development, tests, or one process | In-memory | In-memory | In-memory |
+| Waiter recovery across restarts | Redis, NATS, PostgreSQL, SQL Server, or MongoDB | Any | In-memory, unless flow ledgers must also survive |
+| Jobs on an existing broker or cloud queue | Any | Redis, RabbitMQ, Azure Service Bus, Google Pub/Sub, SQS, Kafka, NATS, PostgreSQL, SQL Server, or MongoDB | In-memory or a provider-backed store |
+| Checkpointed multi-step orchestration | Prefer a durable channel | Any | SQL Server, PostgreSQL, MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, EF Core, or custom |
+
+Use in-memory for the shortest path. Add a durable channel when waiter recovery state must outlive
+the process, and choose a provider-backed flow store when flow ledgers must outlive it. Selecting a
+store completes registration; no ledger or flow execution is created until the application calls
+`IDurableFlows`.
+
+## Install and run
+
+```bash
+dotnet add package AsyncResponse.Core
+
+# Add exactly one channel when in-memory is not enough:
+dotnet add package AsyncResponse.Channels.Redis
+
+# Add exactly one transport when jobs use a broker or queue:
+dotnet add package AsyncResponse.Transports.RabbitMQ
+
+# Add exactly one provider-backed flow store when ledgers must survive restarts:
+dotnet add package AsyncResponse.DurableFlows.PostgreSQL
+```
+
+Packages target .NET 8 and .NET 10. `AsyncResponse.Abstractions` contains contracts only and is the
+package to reference from class libraries that define payloads or flows.
+The [provider examples](docs/provider-examples.md) page lists the exact package and a copy/paste
+registration for every channel, transport, and flow store.
+
+The complete process-local setup selects all three components in one chain:
+
+```csharp
+using AsyncResponse;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services
+    .AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport(options =>
+    {
+        options.QueueCapacity = 1_024; // publishers wait asynchronously when full
+        options.WorkerCount = 1;       // raise for independent jobs that may run concurrently
+    })
+    .WithInMemoryDurableFlows();
+```
+
+`AddAsyncResponse()` deliberately selects no channel, transport, or durable-flow store. Startup
+validation fails fast if the application omits any one of them, so incomplete wiring cannot silently
+strand waiters, worker jobs, or flow state. `.WithInMemoryDurableFlows()` is the zero-infrastructure
+choice when durable flows are unused or process-local state is intentional. The values above are the
+in-memory transport defaults; the bounded queue keeps a local load spike from becoming an unbounded
+allocation spike. For production combinations, jump to
+[Pick your channel, transport, and flow store](#pick-your-channel-transport-and-flow-store)
+and [Production setup](#production-setup).
+
+## The problem it solves
 
 You call a remote system (another service, an Airflow DAG, a payment gateway, a long-running job)
 and the answer comes back **later, on a different channel** — a broker topic, a webhook, a callback
@@ -36,40 +131,8 @@ And then the hard part: **your service redeploys while it's waiting.** The in-me
 The response arrives anyway. Drop it and the flow hangs "in progress" forever; blindly resume it and
 you just resumed the **happy path on a failed response**.
 
-AsyncResponse solves the correlation problem with zero infrastructure, and lets you add durable
-recovery when a flow needs it.
-
-## Why AsyncResponse
-
-- **Feels local, runs distributed.** One fluent expression replaces the `TaskCompletionSource`
-  registry, the timeout plumbing, and the correlation bookkeeping — and with **durable flows**
-  a multi-step process over a dozen remote services reads as a dozen sequential `await`s.
-  Steps checkpoint automatically, in-flight waits re-attach after a redeploy, and inserting or
-  reordering a step is an ordinary code edit ([durable flows](docs/durable-flows.md)).
-- **Race-free by construction.** The request is sent by a *trigger* that runs only after the
-  subscription and recovery state exist, so the first response can never beat its waiter — and a
-  failing trigger tears the registration down. `For<T>()` **requires** a trigger;
-  `For<T>(correlationId)` (attaching to an operation started elsewhere) **forbids** one. The
-  compiler enforces the difference.
-- **Progress-aware waits.** `Until(...)` consumes progress messages and completes only on the
-  terminal one — no extra queues, no hand-rolled state machine.
-- **Recovery that understands your domain.** A response that arrives after its waiter died is
-  classified by the payload's `ShouldResumeOnRecovery()` and routed to a durable resume or failure
-  callback. A failed response is **never** blindly resumed.
-- **Any channel × any transport.** Response channels: in-memory, Redis, NATS, PostgreSQL,
-  SQL Server, MongoDB. Worker transports: in-memory, Redis Streams, RabbitMQ, Azure Service Bus,
-  Google Pub/Sub, AWS SQS, Kafka, NATS JetStream, PostgreSQL, SQL Server, MongoDB. The Redis channel
-  and transport also run on Valkey and Dragonfly (Garnet as a channel). Every combination works;
-  your flow code never changes.
-- **One contract everywhere.** Schema-versioned wire envelopes, capped remote stack traces,
-  ambient-context restoration into foreign callback threads, and identical `Until`/recovery
-  semantics on every channel — switching infrastructure is a DI change, not a rewrite.
-- **Built to operate.** Recovery watchdog + readiness health check, `ActivitySource` tracing and
-  `System.Diagnostics.Metrics` under the `"AsyncResponse"` source/meter, OpenTelemetry messaging
-  attributes on the transports, and an opt-in callback authorization allowlist.
-- **Fast where it counts.** Benchmark-tuned hot path — a complete in-memory round trip
-  (subscribe → publish → complete) runs in well under a microsecond; broker channels deliver by
-  push, not polling. See [Performance](#performance).
+AsyncResponse makes the simple case process-local and adds infrastructure only when the required
+durability or transport semantics demand it.
 
 ## How it works
 
@@ -105,20 +168,40 @@ flow code want to see it (persist details, decide to retry, throw a rich domain 
 `ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
 somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
 
+### Guarantees and boundaries
+
+- For a generated correlation id, the waiter and its recovery state exist before the trigger runs.
+- One terminal outcome wins a waiter; timeout, disposal, trigger failure, and completion all clean
+  up the registration.
+- Completion predicates for one waiter never run concurrently. Internal overload is backpressured through
+  bounded in-process queues instead of growing an unbounded delegate or job backlog.
+- PostgreSQL, SQL Server, and MongoDB treat notifications and change streams as wake hints:
+  retained messages are keyset-paged to exhaustion, so a terminal response cannot be stranded
+  behind one full progress batch. Subscriber heartbeats are batched by channel instance and
+  interval instead of scheduling one timer and write per waiter.
+- A durable channel persists waiter recovery metadata. It does **not** make every response path
+  exactly-once: Redis pub/sub is at-most-once, while broker and queue transports can redeliver.
+- Handlers, worker jobs, durable-flow steps, and outbound triggers should therefore be idempotent.
+  Provider-specific ACK, retry, ordering, and dead-letter behavior is documented in
+  [configuration](docs/configuration.md) and [operations](docs/operations.md).
+
 ## Durable flows
 
 Compose those waits into whole processes. A **durable flow** is a multi-step orchestration written
-as plain sequential C# — the library checkpoints every step, so the flow survives crashes,
-redeploys, and redeliveries mid-step and resumes exactly where it left off:
+as plain sequential C#. The library checkpoints named step results and pending waits so completed
+work can be skipped and an interrupted flow can continue after a crash or redeploy:
 
 ```csharp
-public sealed class TenantProvisioningFlow(IMigrationService _migrations, INotifier _notifier)
+public sealed class TenantProvisioningFlow(
+    IWorkspaceService _workspaces,
+    IMigrationService _migrations,
+    INotifier _notifier)
     : IDurableFlow<ProvisioningInput>
 {
     public async Task ExecuteAsync(IDurableFlowContext flow, ProvisioningInput input)
     {
-        var ws = await flow.StepAsync("create-workspace",          // local step: runs once,
-            () => _workspaces.CreateAsync(input.TenantId));        // result memoized
+        var ws = await flow.StepAsync("create-workspace",          // local step: result is
+            () => _workspaces.CreateAsync(input.TenantId));        // checkpointed after success
 
         var migration = await flow.AwaitStepAsync<MigrationResult>("run-migration",
             trigger: cid => _migrations.StartAsync(input.TenantId, cid),   // remote step: durably
@@ -131,25 +214,76 @@ public sealed class TenantProvisioningFlow(IMigrationService _migrations, INotif
     }
 }
 
+// Durable flows are explicit: register the flow class and exactly one atomic state store.
+var sqlServerConnectionString = builder.Configuration.GetConnectionString("SqlServer")
+    ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
+
+builder.Services.AddScoped<TenantProvisioningFlow>();
+builder.Services.AddAsyncResponse()
+    .WithSqlServerChannel(options =>
+        options.ConnectionString = sqlServerConnectionString)
+    .WithSqlServerTransport(options =>
+        options.ConnectionString = sqlServerConnectionString)
+    .WithSqlServerDurableFlows(options =>
+        options.ConnectionString = sqlServerConnectionString);
+
 var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(tenantId));
 ```
 
-- **Crash-safe by construction** — completed steps skip, the in-flight wait *re-attaches* (the
-  request is never re-sent), and lost-subscriber recovery callbacks are wired automatically.
+- **Checkpointed resume** — completed steps are skipped, pending waits re-attach before retry
+  rules run, and lost-subscriber recovery callbacks are wired automatically. A terminal payload
+  received while the process is down is checkpointed directly into its pending step before the run
+  resumes; it is not discarded and then waited for again.
+- **Replica-safe execution** — a caller-supplied flow id is created atomically, every checkpoint is
+  compare-and-swap protected, and one renewable lease owns execution. Duplicate deliveries become
+  cheap no-ops while a worker is active; an expired lease lets another replica take over. Retrying
+  `StartAsync` is idempotent only for the same flow and input; conflicting id reuse fails fast.
 - **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
-  pick up the changes on resume. Hotfix a bug and resume — no replay rules, no version patching.
-- **Storage is explicit when it matters** — the default flow-state store rides in your channel's
-  recovery store for tests/dev/migration; production flows should use an
-  `AsyncResponse.DurableFlows.*` package such as `.WithSqlServerDurableFlows(...)`, or
-  `.WithCustomDurableFlows<MyFlowStateStore>()` when your storage model is custom.
+  pick up compatible changes on resume. Stable step keys preserve existing checkpoints; changing
+  a key intentionally creates a new step.
+- **Storage is explicit** — `AddAsyncResponse()` never hides flow ledgers in the channel cache.
+  Complete every registration with `.WithInMemoryDurableFlows()` for one process, an
+  `AsyncResponse.DurableFlows.*` provider such as `.WithSqlServerDurableFlows(...)`, or
+  `.WithDurableFlows<MyFlowStateStore>()` for an application-owned implementation.
 - **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
   integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
+
+> [!IMPORTANT]
+> Durable flows provide **checkpointed, at-least-once execution**, not distributed exactly-once
+> side effects. A crash after an external side effect but before its checkpoint can repeat that
+> side effect, so step operations and triggers must be idempotent. Built-in state-store packages
+> prevent concurrent execution with atomic creation, optimistic revisions, and renewable leases;
+> those fences cannot make an external API call and the following state write one transaction.
+
+Common flow-engine settings live beside the selected store's settings in the same callback:
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows(options =>
+    {
+        options.StateExpiry = TimeSpan.FromDays(14);
+        options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
+        options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);
+        options.ProgressPersistenceInterval = TimeSpan.FromSeconds(1);
+    });
+```
+
+Rapid `ReportProgressAsync` calls are coalesced until the next checkpoint or terminal outcome to avoid
+rewriting the whole flow ledger for every progress tick; set
+`ProgressPersistenceInterval = TimeSpan.Zero` when every report must be written immediately.
+
+There is one atomic `IFlowStateStore` contract for every store: insert-if-absent start,
+revision-checked checkpoints, and acquire/renew/release execution leases. Custom stores do not get
+an unsafe local-lock fallback. This keeps the correctness model identical from development through
+multi-replica production; only the explicit in-memory store is process-local.
 
 The full guide — rules, failure modes, compensation, testing your flows, and app-owned state
 stores — is [docs/durable-flows.md](docs/durable-flows.md).
 
-**Durable-flow state stores** (`AsyncResponse.DurableFlows.*`) — optional but recommended for
-production durable flows:
+**Durable-flow state stores** — exactly one required; use the in-memory store from
+`AsyncResponse.Core` or a provider package for restart-safe ledgers:
 
 | Store package | Registration |
 |---|---|
@@ -163,14 +297,15 @@ production durable flows:
 | DynamoDB | `.WithDynamoDbDurableFlows(...)` |
 | Entity Framework Core (any relational provider) | `.WithEFCoreDurableFlows<TDbContext>(...)` |
 
-See [durable-flow state stores](docs/durable-flow-state-stores.md) for options, schema ownership,
-and custom `IFlowStateStore` examples.
+See [durable-flow state stores](docs/durable-flow-state-stores.md) for a copy/paste registration for
+every store, plus schema ownership, fail-fast provisioning rules, and the atomic custom-store
+contract.
 
-## Pick your channel and transport
+## Pick your channel, transport, and flow store
 
 A **channel** delivers responses to waiters and persists recovery state. A **transport** moves
-worker jobs and inbound responses through a broker. They are independent axes — pair any channel
-with any transport.
+worker jobs and inbound responses through a broker. A **flow store** owns checkpoint ledgers and
+execution leases. They are independent axes — combine any one of each.
 
 **Channels** (`AsyncResponse.Channels.*`) — exactly one required:
 
@@ -179,15 +314,15 @@ with any transport.
 | In-memory (in `Core`) | in-process | process lifetime |
 | Redis | pub/sub push, zero polling | TTL'd Redis keys |
 | NATS | core request/reply — "no responders" is a positive lost-waiter signal | JetStream Key-Value |
-| PostgreSQL | `LISTEN/NOTIFY` wake + table rows — notifications carry only ids, so payload size is unbounded | row per waiter registration, database-clock TTLs |
-| SQL Server | adaptive polling sweep (tight while waiters exist, backed off while idle) + table rows — same-process deliveries skip the sweep entirely | row per waiter registration, database-clock TTLs |
-| MongoDB | change-stream wake + collection documents — requires a replica set (single-node is enough); degrades to polling on standalone servers | document per waiter registration, native TTL indexes |
+| PostgreSQL | `LISTEN/NOTIFY` wake + keyset-paged table scan—notifications carry only ids, so response size is not constrained by `NOTIFY` | row per waiter registration, database-clock TTLs |
+| SQL Server | adaptive keyset-paged sweep (tight while waiters exist, backed off while idle); same-process deliveries skip the sweep entirely | row per waiter registration, database-clock TTLs |
+| MongoDB | change-stream wake + keyset-paged collection scan—requires a replica set (single-node is enough); degrades to polling on standalone servers | document per waiter registration, native TTL indexes |
 
 **Transports** (`AsyncResponse.Transports.*`) — exactly one required:
 
 | Transport | Broker mechanics |
 |---|---|
-| In-memory (in `Core`) | in-process queue |
+| In-memory (in `Core`) | bounded in-process queue; configurable capacity and worker concurrency |
 | Redis | Redis Streams consumer groups, pending-entry retry, poison-entry discard, dead-lettering |
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
@@ -203,7 +338,8 @@ Every transport ships hosted subscribers for worker jobs and response ingress wi
 the default acknowledges only after your handler completes; opt-in **early ACK** trades that
 guarantee for throughput, with an explicitly bounded in-process queue, a drain budget validated
 against host shutdown, and post-ACK failures surfaced through `OnBackgroundFailure`. Per-transport
-semantics: [docs/configuration.md](docs/configuration.md).
+semantics: [docs/configuration.md](docs/configuration.md). Copy/paste registration for every
+channel and transport: [provider examples](docs/provider-examples.md).
 
 **Redis-compatible servers.** The Redis channel and transport speak RESP through
 `StackExchange.Redis`, so they run unchanged on Redis-compatible servers. **Valkey** is validated
@@ -213,43 +349,12 @@ it runs outside the Aspire CI harness); **Garnet** implements the pub/sub + stri
 the channel needs but has no stream commands, so it works as a channel but not as this transport. That covers the managed options too — Amazon ElastiCache /
 MemoryDB and Azure Managed Redis. Details in [docs/configuration.md](docs/configuration.md#redis-compatible-servers).
 
-`AsyncResponse.Abstractions` holds contracts only — reference it from class libraries that define
-payloads or flows.
+## Production setup
 
-## Installation
-
-```bash
-dotnet add package AsyncResponse.Core
-
-# exactly one channel (skip for in-memory):
-dotnet add package AsyncResponse.Channels.Redis        # or .NATS / .PostgreSQL / .SqlServer / .MongoDB
-
-# exactly one transport (skip for in-memory):
-dotnet add package AsyncResponse.Transports.RabbitMQ   # or .Kafka / .Redis / .AzureServiceBus / .GooglePubSub / .SQS / .NATS / .PostgreSQL / .SqlServer / .MongoDB
-```
-
-Targets .NET 8 and .NET 10.
-
-## Quick start
-
-`AddAsyncResponse()` registers the channel-agnostic engine but **no channel or transport** — chain
-exactly one of each. An app that starts without either fails fast at host startup, so a
-misconfiguration can never silently hang every waiter or drop worker dispatch.
-
-### In-memory — no external dependencies
-
-```csharp
-using AsyncResponse;
-
-var builder = WebApplication.CreateBuilder(args);
-
-builder.Services.AddAsyncResponse()   // engine: fluent builder, ingress, recovery watchdog
-    .WithInMemoryChannel()            // process-local response channel + recovery store
-    .WithInMemoryTransport();         // in-process worker transport
-```
-
-The full programming model, process-local: ideal for single-node apps, prototypes, and tests.
-Waiters and recovery state disappear with the process.
+The registration shape is always the same: engine + one channel + one transport. The examples
+below show complete, representative combinations. The
+[provider examples](docs/provider-examples.md) page has one registration for every channel and
+transport; the [configuration guide](docs/configuration.md) covers every option and default.
 
 ### Durable recovery — Redis channel
 
@@ -264,7 +369,8 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(
 
 builder.Services.AddAsyncResponse()
     .WithRedisChannel()                    // Redis response channel + Redis recovery store
-    .WithInMemoryTransport();
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows();           // required zero-infrastructure flow-store choice
 
 builder.Services.AddHealthChecks()
     .AddAsyncResponseRecoveryCheck();      // optional: surface the watchdog on /readyz
@@ -278,18 +384,23 @@ time. See [docs/recovery.md](docs/recovery.md).
 ### Broker transport — Azure Service Bus
 
 Transports pair with any channel; here Redis holds waiters/recovery while Service Bus queues move
-worker jobs and inbound responses.
+worker jobs and inbound responses. This reuses the Redis connection registration from the previous
+example.
 
 ```csharp
+var serviceBusConnectionString = builder.Configuration.GetConnectionString("AzureServiceBus")
+    ?? throw new InvalidOperationException("ConnectionStrings:AzureServiceBus is required.");
+
 builder.Services.AddAsyncResponse()
     .WithRedisChannel()
     .WithAzureServiceBusTransport(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("AzureServiceBus");
+        options.ConnectionString = serviceBusConnectionString;
         options.WorkerQueue = "orders-worker";
         options.ResponseQueue = "orders-response";
         options.CorrelationIdProperty = "correlationId";
-    });
+    })
+    .WithInMemoryDurableFlows();
 ```
 
 Need more throughput than ack-per-handler? Opt into early ACK with
@@ -299,117 +410,127 @@ reported through `OnBackgroundFailure`.
 
 ### Broker transport — Kafka
 
-One package covers everything that speaks the Kafka protocol: Apache Kafka, Redpanda, Amazon MSK,
-WarpStream, Aiven, Confluent Cloud. Kafka is a transport only, by design — its partitioned log has
-no targeted waiter wake and no per-key TTL store, so pair it with a durable channel.
+One package covers Apache Kafka, Redpanda, Amazon MSK, WarpStream, Aiven, and Confluent Cloud.
+Kafka is a transport only, so this example reuses the durable Redis channel registration above.
 
 ```csharp
+var bootstrapServers = builder.Configuration["Kafka:BootstrapServers"]
+    ?? throw new InvalidOperationException("Kafka:BootstrapServers is required.");
+
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
+    .WithRedisChannel(options => options.KeyPrefix = "orders")
     .WithKafkaTransport(options =>
     {
-        options.BootstrapServers = builder.Configuration["Kafka:BootstrapServers"];
-        options.WorkerTopic = "orders-worker";
-        options.ResponseTopic = "orders-response";
-        options.CorrelationIdHeader = "correlationId";
-    });
+        options.BootstrapServers = bootstrapServers;
+        options.TopicPrefix = "orders";
+        options.TopicNumPartitions = 12;
+        options.CreateTopics = true;
+    })
+    .WithInMemoryDurableFlows();
 ```
 
-The correlation id travels as a message header and doubles as the partition key, so one flow's jobs
-stay ordered within their partition. Honest caveats: consumer parallelism equals the partition
-count (size `TopicNumPartitions` accordingly), and a slow message delays its partition — retries run
-in-process with backoff because offsets cannot NACK a single message; after
-`WorkerSubscriber.MaxDeliveryAttempts` the message is produced to `{topic}.deadletter` with
-failure-detail headers and its offset committed so the partition keeps moving. These trade-offs are
-inherent to classic consumer groups; a KIP-932 share-group consumption mode can slot in behind the
-same options once librdkafka supports it.
+The correlation id is the message key, so one flow's jobs stay ordered within a partition.
+Consumer parallelism is bounded by the partition count, and a slow or retrying message delays its
+partition. After the configured attempts, the message moves to the dead-letter topic and its
+offset is committed so the partition can continue.
 
 ### Everything on PostgreSQL
 
-Use this when PostgreSQL is already your durable infrastructure and you don't want to add a broker
-just for async-response recovery.
+Use this when PostgreSQL is already your durable infrastructure and you do not want a separate
+broker for response recovery or worker dispatch.
 
 ```csharp
-using AsyncResponse;
 using Npgsql;
 
-var builder = WebApplication.CreateBuilder(args);
+var connectionString = builder.Configuration.GetConnectionString("PostgreSQL")
+    ?? throw new InvalidOperationException("ConnectionStrings:PostgreSQL is required.");
 
-builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(
-    builder.Configuration.GetConnectionString("PostgreSQL")!));
+builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
 
 builder.Services.AddAsyncResponse()
-    .WithPostgreSqlChannel()               // LISTEN/NOTIFY channel + row-per-waiter recovery
-    .WithPostgreSqlTransport(options =>    // queue table, FOR UPDATE SKIP LOCKED
+    .WithPostgreSqlChannel(options =>
+        options.SchemaName = "public")
+    .WithPostgreSqlTransport(options =>
     {
+        options.SchemaName = "public";
         options.WorkerSubscriber.UseAckAfterReceive(
             backgroundWorkerCount: 4,
             backgroundQueueCapacity: 256);
-    });
+    })
+    .WithPostgreSqlDurableFlows(options =>
+        options.SchemaName = "public");
 ```
 
-The channel and transport share the `NpgsqlDataSource` but use separate table sets, and schema
-creation is serialized across app instances with an advisory lock (set `AutoCreateSchema = false`
-when migrations own the schema). Table names, delivery-confirmation mechanics, and the
-connection-string settings worth tuning under load (`No Reset On Close`, `Max Auto Prepare`) are in
+The channel, transport, and flow store share one connection pool but use separate tables.
+`LISTEN/NOTIFY` wakes response readers, while workers claim queue rows with
+`FOR UPDATE SKIP LOCKED`. Schema details and connection-pool tuning are in
 [docs/postgresql.md](docs/postgresql.md).
 
 ### Everything on SQL Server
 
-The same recipe for SQL Server shops: durable waits, recovery, and a worker queue on the database
-you already run, with no broker to add.
+The SQL Server providers keep durable waits, worker messages, and flow ledgers in one existing
+database.
 
 ```csharp
+var connectionString = builder.Configuration.GetConnectionString("SqlServer")
+    ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
+
 builder.Services.AddAsyncResponse()
-    .WithSqlServerChannel(options =>          // adaptive-polling channel + row-per-waiter recovery
-        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer"))
-    .WithSqlServerTransport(options =>        // queue table, UPDLOCK/ROWLOCK/READPAST claims
+    .WithSqlServerChannel(options =>
+        options.ConnectionString = connectionString)
+    .WithSqlServerTransport(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
+        options.ConnectionString = connectionString;
         options.WorkerSubscriber.UseAckAfterEnqueue(
             backgroundWorkerCount: 4,
             backgroundQueueCapacity: 256);
-    });
+    })
+    .WithSqlServerDurableFlows(options =>
+        options.ConnectionString = connectionString);
 ```
 
-SQL Server has no `LISTEN/NOTIFY`, so the channel wakes waiters with an adaptive polling sweep:
-tight (250 ms) while waiters are subscribed, backed off (2 s) while idle — and same-process
-deliveries skip the sweep entirely, so the common path never polls. Schema creation is serialized
-across instances with `sp_getapplock`; the packages create their schema and tables but never the
-database itself. Details in [docs/sqlserver.md](docs/sqlserver.md).
+SQL Server has no `LISTEN/NOTIFY`, so its channel polls adaptively and skips the sweep for
+same-process delivery. Workers claim rows with `UPDLOCK`, `ROWLOCK`, and `READPAST`. The packages
+create their schema and tables, but the database must already exist. Details:
+[docs/sqlserver.md](docs/sqlserver.md).
 
-### AWS-native stack — SQS transport + Redis or PostgreSQL channel
+### AWS-native stack — SQS transport + durable channel
 
-The full AWS recipe with zero self-managed brokers: SQS carries worker jobs and response ingress,
-and the channel rides ElastiCache/MemoryDB (Redis) or RDS/Aurora (PostgreSQL) for the waiter side
-and recovery state. Redelivery and dead-lettering stay native to SQS via queue redrive policies.
+SQS carries worker jobs and response ingress; Redis on ElastiCache/MemoryDB or PostgreSQL on
+RDS/Aurora owns waiter recovery.
 
 ```csharp
-builder.Services
-    .AddAsyncResponse()
-    .WithRedisChannel(options => options.KeyPrefix = "orders")   // ElastiCache / MemoryDB
-    // …or .WithPostgreSqlChannel(...) on RDS / Aurora
+builder.Services.AddAsyncResponse()
+    .WithRedisChannel(options => options.KeyPrefix = "orders")
     .WithSqsTransport(options =>
     {
-        options.Region = "us-east-1";                 // omit to use the SDK default chain
-        options.WorkerQueue = "orders-worker";        // queue name or full queue URL
+        options.Region = "eu-central-1";
+        options.WorkerQueue = "orders-worker";
         options.ResponseQueue = "orders-response";
-        options.CreateQueues = true;                  // + redrive-policy DLQs (dev/test; own your
-        options.MaxReceiveCount = 5;                  //   queues via infra code in production)
-    });
+        options.CreateQueues = true; // development; provision queues and DLQs with IaC in production
+        options.MaxReceiveCount = 5;
+    })
+    .WithDynamoDbDurableFlows(options =>
+        options.TableName = "orders-flow-state");
 ```
 
-Name the queues `*.fifo` to opt into FIFO ordering — the correlation id becomes the
-`MessageGroupId`, so one flow's jobs stay ordered while distinct flows fan out. An
-application-registered `IAmazonSQS` (for example from `AWSSDK.Extensions.NETCore.Setup` with IAM
-roles) is reused automatically.
+SQS owns visibility-timeout redelivery and redrive-policy dead letters. Name both queues with a
+`.fifo` suffix to keep each correlation id ordered as one message group. A registered `IAmazonSQS`
+is reused automatically; otherwise the AWS SDK credential and region chain is used.
 
-### The other combinations
+### More deployment combinations
 
-Same pattern everywhere: `.WithNatsChannel()`, `.WithPostgreSqlChannel()`, `.WithSqlServerChannel()`,
-`.WithRedisTransport()`, `.WithRabbitMqTransport()`, `.WithGooglePubSubTransport()`,
-`.WithKafkaTransport()`, `.WithNatsTransport()`, `.WithSqlServerTransport()`, `.WithSqsTransport()` —
-every channel, transport, and option is documented in [docs/configuration.md](docs/configuration.md).
+| Existing infrastructure | Typical registration | Important behavior |
+|---|---|---|
+| Kafka / Redpanda / MSK / Confluent | durable channel + `.WithKafkaTransport(...)` + one flow store | Correlation id is the partition key; partition count bounds consumer parallelism and a retry delays that partition. |
+| PostgreSQL | `.WithPostgreSqlChannel()` + `.WithPostgreSqlTransport(...)` + `.WithPostgreSqlDurableFlows(...)` | `LISTEN/NOTIFY` wakes response readers; workers claim queue rows with `FOR UPDATE SKIP LOCKED`. |
+| SQL Server | `.WithSqlServerChannel(...)` + `.WithSqlServerTransport(...)` + `.WithSqlServerDurableFlows(...)` | Adaptive response polling; workers claim rows with `UPDLOCK, ROWLOCK, READPAST`. |
+| AWS | Redis/PostgreSQL channel + `.WithSqsTransport(...)` + `.WithDynamoDbDurableFlows(...)` | Native visibility-timeout redelivery and redrive-policy dead letters; FIFO queues order by correlation id. |
+| NATS | `.WithNatsChannel(...)` + `.WithNatsTransport(...)` + one flow store | Core request/reply for responses and JetStream explicit ACKs for worker jobs. |
+
+See [configuration](docs/configuration.md) for every registration and option,
+[PostgreSQL](docs/postgresql.md) and [SQL Server](docs/sqlserver.md) for database-specific tuning,
+and [operations](docs/operations.md) for ACK-mode and delivery trade-offs.
 
 ## Define a payload and await it
 
@@ -457,37 +578,47 @@ cancellation, and the watchdog are covered in the [docs](#documentation).
 
 ## Performance
 
-- A complete in-memory round trip — create waiter, publish, complete, clean up — benchmarks at
-  **≈0.7–0.8 µs with ≈1.3–1.6 KB allocated** end-to-end (Apple M4 Pro, .NET 10).
+- A representative .NET 10 short run on an Apple M4 Pro measured the complete in-memory round trip
+  at **0.83 µs / 1.63 KB** through the fluent builder and **0.76 µs / 1.27 KB** through the lower-level
+  subscriber API. That is library overhead only; broker, network, serialization, and store latency
+  depend on the selected providers and environment.
 - Hot paths are allocation-conscious by design: single-subscriber fast paths, cached
   `JsonEncodedText` envelope fields with a hand-rolled `Utf8JsonReader` converter, memoized raw-JSON
-  materialization shared across waiters, and log/trace/metric gating so observability costs nothing
-  when disabled.
-- Broker channels deliver by push (Redis pub/sub, NATS request/reply, PostgreSQL `LISTEN/NOTIFY`) —
-  no polling on the response hot path.
+  materialization shared across waiters, cached reflection invocation plans, and listener-gated
+  traces and metrics.
+- Per-waiter predicates are serialized without allocating on the uncontended synchronous path.
+  Internal work queues are bounded, database wake signals are coalesced, and database-channel
+  heartbeats are batched per process rather than scheduled per waiter.
+- Redis and NATS push responses directly; PostgreSQL uses `LISTEN/NOTIFY`; MongoDB uses change
+  streams when available; SQL Server uses an adaptive polling sweep. Database rows/documents remain
+  the source of truth when wake signals are coalesced or missed, and each scan keyset-pages through
+  every retained message instead of stopping at the first batch.
 - Every wait has a timeout (defaulted when unset) and a single-winner terminal state, so abandoned
   waiters clean themselves up — no leaked registrations under load.
 
-Benchmarks, a 17-scenario stress harness, and NBomber load tests run in CI on every push;
-per-commit trends with regression alerting are published to the
+BenchmarkDotNet, a **22-scenario correctness stress harness**, and NBomber load tests run in CI on
+code pushes to `main`; per-commit trends with regression alerting are published to the
 [live benchmark dashboard](https://sky4ce.github.io/AsyncResponse/dev/bench/). Methodology:
 [docs/operations.md](docs/operations.md).
 
 ## How it's tested
 
-- **2400+ unit tests** across .NET 8 and .NET 10, including real concurrency suites (hundreds of
-  parallel waiters with cross-correlation leak detection, duplicate-execution detection).
-- **160+ integration tests** drive the shipped sample app black-box over HTTP against **real
+- **2500+ unit tests on each target framework** (.NET 8 + .NET 10 executions), including
+  concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
+  duplicate-execution detection.
+- **165 integration test cases** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
   Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
-  for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport. A scheduled CI matrix reruns the
-  Redis-backed suite against Valkey to hold the Redis-compatible-server claim (Dragonfly is validated
-  by running the real channel + transport against a live server).
+  for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport.
+  The same run verifies the atomic durable-flow store contract against SQL Server, PostgreSQL,
+  MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, and EF Core.
+  A scheduled CI matrix reruns the Redis-backed suite against Valkey; Dragonfly is validated by
+  running the real channel and transport against a live server.
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,
   duplicated, or leaked responses) and fails CI on violation; NBomber load profiles include a
   destructive recovery scenario.
-- Docs are kept code-true: option defaults, metric/span names, and behavior claims are verified
-  against the source.
+- Focused tests also cover option validation, ACK-mode dispatch, metric/span emission, callback
+  authorization, unsupported-schema rejection, and recovery cleanup.
 
 ## When to use it — and when not
 
@@ -497,8 +628,9 @@ per-commit trends with regression alerting are published to the
   payment confirmations, DAG completions, webhook callbacks;
 - you're **orchestrating a multi-step flow across async services** — implement
   `IDurableFlow<TInput>` and write the steps as plain sequential `await`s
-  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints every step,
-  re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks —
+  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints successful steps,
+  re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks; external
+  side effects remain at-least-once and must be idempotent —
   [durable flows](docs/durable-flows.md);
 - you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
 - waits must survive redeploys, and a late **failure** must never be resumed as a success.
@@ -522,6 +654,8 @@ the right page. The pages:
 
 - **[Configuration](docs/configuration.md)** — `AddAsyncResponse` wiring and a consolidated options
   reference (engine, channel, and transport options).
+- **[Provider examples](docs/provider-examples.md)** — copy/paste registration for every channel and
+  every worker transport, plus links to every durable-flow store example.
 - **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `ShouldResumeOnRecovery`, the
   watchdog and health check, recovery-state durability, wire/schema versioning, and the
   shared-correlation recovery limitation.
@@ -529,6 +663,8 @@ the right page. The pages:
   `IDurableFlow<TInput>` with automatically checkpointed steps, crash-resume and re-attach,
   progress streaming, pluggable flow-state storage, explicit compensation, and an honest
   comparison with workflow engines.
+- **[Durable-flow state stores](docs/durable-flow-state-stores.md)** — a complete registration for
+  every store provider, the atomic contract, schema ownership, client lifetimes, and expiry.
 - **[Observability](docs/observability.md)** — tracing (`ActivitySource`) and metrics
   (`System.Diagnostics.Metrics`) for the `"AsyncResponse"` source/meter.
 - **[Security & hardening](docs/security.md)** — callback authorization allowlist, securing the

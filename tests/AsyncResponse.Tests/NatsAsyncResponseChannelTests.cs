@@ -20,12 +20,8 @@ public class NatsAsyncResponseChannelTests
     {
         _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _store.Setup(s => s.GetAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((RecoveryState?)null);
         _store.Setup(s => s.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(Array.Empty<RecoveryState>());
-        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
         _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
 
@@ -147,7 +143,7 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task CreateResponseWaiter_NewerEnvelopeSchemaFaultsWaiter()
+    public async Task CreateResponseWaiter_UnsupportedEnvelopeSchemaFaultsWaiter()
     {
         var channel = CreateChannel();
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
@@ -155,7 +151,7 @@ public class NatsAsyncResponseChannelTests
         _client.Push("""{"SchemaVersion":999,"Success":true,"Payload":{"Status":2}}""");
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
-        Assert.Contains("newer than this build supports", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("does not support", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

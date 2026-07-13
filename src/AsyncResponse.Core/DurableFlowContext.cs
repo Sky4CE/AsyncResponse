@@ -24,7 +24,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private readonly IAsyncResponseSubscriber _subscriber;
     private readonly IRecoverableAsyncResponseSubscriber? _recoverableSubscriber;
     private readonly ILogger _logger;
+    private readonly FlowExecutionLease _lease;
     private bool _suspended;
+    private bool _progressDirty;
+    private DateTime _lastPersistenceUtc;
 
     /// <summary>Creates the context for one execution of the given run.</summary>
     public DurableFlowContext(
@@ -35,7 +38,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         DurableFlowOptions options,
         IAsyncResponseSubscriber subscriber,
         IRecoverableAsyncResponseSubscriber? recoverableSubscriber,
-        ILogger logger)
+        ILogger logger,
+        FlowExecutionLease lease)
     {
         _state = state;
         _store = store;
@@ -45,6 +49,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _subscriber = subscriber;
         _recoverableSubscriber = recoverableSubscriber;
         _logger = logger;
+        _lease = lease;
     }
 
     internal bool IsSuspended => _suspended;
@@ -63,7 +68,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (checkpoint.Completed)
             return;
 
+        cancellationToken.ThrowIfCancellationRequested();
         await step().ConfigureAwait(false);
+        _lease.ThrowIfLost();
         await CompleteStepAsync(name, checkpoint, resultJson: null, cancellationToken).ConfigureAwait(false);
     }
 
@@ -78,7 +85,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (checkpoint.Completed)
             return DeserializeResult<TResult>(checkpoint.ResultJson);
 
+        cancellationToken.ThrowIfCancellationRequested();
         var result = await step().ConfigureAwait(false);
+        _lease.ThrowIfLost();
         await CompleteStepAsync(name, checkpoint, JsonSerializer.Serialize(result), cancellationToken).ConfigureAwait(false);
         return result;
     }
@@ -120,7 +129,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     {
         ThrowIfSuspended();
         _state.LastMessage = message;
-        return SaveAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        if (_options.ProgressPersistenceInterval <= TimeSpan.Zero
+            || now - _lastPersistenceUtc >= _options.ProgressPersistenceInterval)
+            return SaveAsync(cancellationToken);
+
+        _progressDirty = true;
+        return Task.CompletedTask;
     }
 
     /// <inheritdoc />
@@ -155,17 +170,30 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(input);
+        if (flowId is not null)
+            ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
         var checkpoint = GetStep(name);
+        var requestedChildFlowId = flowId ?? $"{FlowId}:{name}";
+        var breadcrumb = checkpoint.ChildFlowId;
+        if (breadcrumb is not null && !string.Equals(breadcrumb, requestedChildFlowId, StringComparison.Ordinal))
+        {
+            throw new DurableFlowFailedException(
+                $"Step '{name}' of flow '{FlowId}' is already bound to child flow id '{breadcrumb}', " +
+                $"but this execution requested '{requestedChildFlowId}'. A durable step must keep the same child id on every replay.");
+        }
+
+        var childFlowId = breadcrumb ?? requestedChildFlowId;
+        var inputJson = JsonSerializer.Serialize(input);
         if (checkpoint.Completed)
         {
-            var completedChild = DeserializeResult<FlowState>(checkpoint.ResultJson);
+            var completedChild = DeserializeResult<FlowState>(checkpoint.ResultJson)
+                ?? throw new DurableFlowFailedException(
+                    $"Completed child step '{name}' of flow '{FlowId}' has no child-state snapshot.");
+            ThrowIfChildMismatched<TFlow, TInput>(completedChild, childFlowId, name, inputJson);
             ThrowIfChildFailed(completedChild, failOnChildFailure);
             return completedChild;
         }
-
-        var breadcrumb = checkpoint.ChildFlowId;
-        var childFlowId = breadcrumb ?? (string.IsNullOrWhiteSpace(flowId) ? $"{FlowId}:{name}" : flowId);
 
         var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
         if (child is null)
@@ -186,13 +214,26 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // imply "child state existed", which keeps the expired-child check above sound. A crash
             // between the two writes is safe — the child id is deterministic, so the re-delivered
             // parent execution loads this child instead of re-creating it.
-            child = CreateChildState<TFlow, TInput>(childFlowId, name, input);
-            await _store.SaveAsync(childFlowId, child, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
+            child = CreateChildState<TFlow, TInput>(childFlowId, name, inputJson);
+            if (await FlowStateConcurrency.TryCreateAsync(
+                    _store,
+                    childFlowId,
+                    child,
+                    _options.StateExpiry,
+                    cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogDebug("Flow {FlowId} started child flow {ChildFlowId} for step '{Step}'.", FlowId, childFlowId, name);
+            }
+            else
+            {
+                child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException($"Child flow '{childFlowId}' was created concurrently but could not be loaded.");
+                ThrowIfChildMismatched<TFlow, TInput>(child, childFlowId, name, inputJson);
+            }
         }
         else
         {
-            ThrowIfChildMismatched<TFlow>(child, childFlowId, name);
+            ThrowIfChildMismatched<TFlow, TInput>(child, childFlowId, name, inputJson);
         }
 
         if (breadcrumb is null)
@@ -260,14 +301,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
                 await trigger(correlationId).ConfigureAwait(false);
             }
-            else if (_logger.IsEnabled(LogLevel.Information))
+            else if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "Flow {FlowId} step '{Step}' re-attaching to in-flight correlationId {CorrelationId}.",
                     FlowId, name, correlationId);
             }
 
-            var response = await waiter.ResponseTask.ConfigureAwait(false);
+            var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
             await CompleteStepAsync(name, checkpoint, JsonSerializer.Serialize(response), cancellationToken).ConfigureAwait(false);
@@ -275,6 +316,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (Exception ex)
         {
+            _lease.ThrowIfLost();
             // Timeout, trigger failure, or a faulted wait: record it so the next execution
             // restarts this step fresh instead of re-attaching to a dead correlation id.
             checkpoint.Faulted = true;
@@ -297,10 +339,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (_recoverableSubscriber is not null)
         {
             // The durable safety net: a response landing while no process is executing this flow
-            // re-enqueues the run (resume) or terminally fails it (failure) — the same at-least-once,
-            // idempotency-required contract as hand-registered recovery callbacks.
+            // checkpoints the terminal payload and re-enqueues the run, or terminally fails it —
+            // the same at-least-once, idempotency-required contract as hand-registered callbacks.
             var flowId = FlowId;
-            Expression<Func<IDurableFlowExecutor, Task>> resume = executor => executor.ResumeAsync(flowId);
+            Expression<Func<IDurableFlowExecutor, Task>> resume = executor => executor.RecoverAsync(
+                flowId,
+                Placeholder.Payload<TResponse>()!,
+                Placeholder.CorrelationId());
             Expression<Func<IDurableFlowExecutor, Task>> failure = executor => executor.FailAsync(flowId, Placeholder.Exception());
 
             return await _recoverableSubscriber.CreateRecoverableResponseWaiter(
@@ -318,7 +363,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return await _subscriber.CreateResponseWaiter(correlationId, until, timeout).ConfigureAwait(false);
     }
 
-    private FlowState CreateChildState<TFlow, TInput>(string flowId, string parentStepName, TInput input)
+    private FlowState CreateChildState<TFlow, TInput>(string flowId, string parentStepName, string inputJson)
     {
         var now = DateTime.UtcNow;
         return new FlowState
@@ -326,7 +371,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             FlowId = flowId,
             FlowTypeName = typeof(TFlow).FullName,
             InputTypeName = typeof(TInput).FullName,
-            InputJson = JsonSerializer.Serialize(input),
+            InputJson = inputJson,
             Status = FlowRunStatus.Running,
             LastMessage = $"Child flow started by {FlowId}.",
             CreatedAtUtc = now,
@@ -358,6 +403,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
     private void ThrowIfSuspended()
     {
+        _lease.ThrowIfLost();
         if (_suspended)
             throw new DurableFlowSuspendedException(_state.LastMessage ?? $"Flow {FlowId} is suspended.");
     }
@@ -368,7 +414,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             throw new DurableFlowFailedException($"Child flow '{child.FlowId}' failed: {child.LastMessage ?? "no message"}");
     }
 
-    private void ThrowIfChildMismatched<TFlow>(FlowState child, string childFlowId, string stepName)
+    private void ThrowIfChildMismatched<TFlow, TInput>(
+        FlowState child,
+        string childFlowId,
+        string stepName,
+        string requestedInputJson)
     {
         // A child id is owned by exactly one parent: the notification that resumes a suspended
         // parent follows the child's single ParentFlowId, so a second parent awaiting the same id
@@ -382,11 +432,27 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 "(the default '{parentFlowId}:{stepName}' id is always safe).");
         }
 
+        if (!string.Equals(child.FlowId, childFlowId, StringComparison.Ordinal)
+            || !string.Equals(child.ParentStepName, stepName, StringComparison.Ordinal))
+        {
+            throw new DurableFlowFailedException(
+                $"Child flow id '{childFlowId}' is bound to a different child step than '{stepName}' of parent flow '{FlowId}'. " +
+                "A child id is exclusive to one parent step.");
+        }
+
         if (!string.Equals(child.FlowTypeName, typeof(TFlow).FullName, StringComparison.Ordinal))
         {
             throw new DurableFlowFailedException(
                 $"Step '{stepName}' of flow '{FlowId}' awaits child flow id '{childFlowId}' as {typeof(TFlow).FullName}, " +
                 $"but the persisted run is {child.FlowTypeName}. The flowId collides with a different flow — use a unique child id.");
+        }
+
+        if (!string.Equals(child.InputTypeName, typeof(TInput).FullName, StringComparison.Ordinal)
+            || !FlowStateJson.JsonEquivalent(child.InputJson, requestedInputJson))
+        {
+            throw new DurableFlowFailedException(
+                $"Step '{stepName}' of flow '{FlowId}' requested child flow id '{childFlowId}' with a different input " +
+                "type or value than the persisted child. Replays must use semantically identical child input.");
         }
     }
 
@@ -414,14 +480,29 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _state.LastMessage = faulted ? $"Step '{name}' completed (child flow failed)." : $"Step '{name}' completed.";
         await SaveAsync(cancellationToken).ConfigureAwait(false);
 
-        if (_logger.IsEnabled(LogLevel.Information))
-            _logger.LogInformation("Flow {FlowId} step '{Step}' completed.", FlowId, name);
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Flow {FlowId} step '{Step}' completed.", FlowId, name);
     }
 
-    private Task SaveAsync(CancellationToken cancellationToken)
+    internal Task FlushProgressAsync()
+        => _progressDirty ? SaveAsync(CancellationToken.None) : Task.CompletedTask;
+
+    private async Task SaveAsync(CancellationToken cancellationToken)
     {
         _state.UpdatedAtUtc = DateTime.UtcNow;
-        return _store.SaveAsync(FlowId, _state, _options.StateExpiry, cancellationToken);
+        await _lease.SaveAsync(_state, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+
+        _progressDirty = false;
+        _lastPersistenceUtc = DateTime.UtcNow;
+    }
+
+    private async Task<TResponse> WaitForResponseAsync<TResponse>(Task<TResponse> responseTask, CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+            return await responseTask.WaitAsync(_lease.LostToken).ConfigureAwait(false);
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken);
+        return await responseTask.WaitAsync(linked.Token).ConfigureAwait(false);
     }
 
     private static TResult DeserializeResult<TResult>(string? resultJson)

@@ -25,6 +25,10 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         ArgumentNullException.ThrowIfNull(state);
         if (ttl <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
+        if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            throw new ArgumentException("The recovery-state correlation id must match the store key.", nameof(state));
+        if (state.SchemaVersion != RecoveryStateSchema.Current)
+            throw new ArgumentException("The recovery state must use the current schema version.", nameof(state));
 
         cancellationToken.ThrowIfCancellationRequested();
         if (state.RegistrationId == Guid.Empty)
@@ -46,30 +50,6 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
             if (_entries.TryUpdate(correlationId, next, bucket))
                 return Task.CompletedTask;
         }
-    }
-
-    /// <inheritdoc />
-    public Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
-        cancellationToken.ThrowIfCancellationRequested();
-
-        while (_entries.TryGetValue(correlationId, out var bucket))
-        {
-            var pruned = bucket.PruneExpired(DateTime.UtcNow);
-            if (pruned.IsEmpty)
-            {
-                TryRemove(correlationId, bucket);
-                return Task.FromResult<RecoveryState?>(null);
-            }
-
-            if (!pruned.Equals(bucket) && !_entries.TryUpdate(correlationId, pruned, bucket))
-                continue;
-
-            return Task.FromResult(pruned.FirstReadableState());
-        }
-
-        return Task.FromResult<RecoveryState?>(null);
     }
 
     /// <inheritdoc />
@@ -97,17 +77,11 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     }
 
     /// <inheritdoc />
-    public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(_entries.TryRemove(correlationId, out _));
-    }
-
-    /// <inheritdoc />
     public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        if (registrationId == Guid.Empty)
+            throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
         cancellationToken.ThrowIfCancellationRequested();
 
         while (_entries.TryGetValue(correlationId, out var bucket))
@@ -270,23 +244,6 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
                 Array.Copy(_many, removeIndex + 1, remaining, removeIndex, _many.Length - removeIndex - 1);
 
             return new EntryBucket(null, remaining);
-        }
-
-        public RecoveryState? FirstReadableState()
-        {
-            if (_single is not null)
-                return RecoveryStateSchema.IsReadable(_single.State.SchemaVersion) ? _single.State : null;
-
-            if (_many is null)
-                return null;
-
-            foreach (var entry in _many)
-            {
-                if (RecoveryStateSchema.IsReadable(entry.State.SchemaVersion))
-                    return entry.State;
-            }
-
-            return null;
         }
 
         public IReadOnlyList<RecoveryState> ReadableStates()

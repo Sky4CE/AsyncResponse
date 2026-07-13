@@ -58,7 +58,7 @@ public class AsyncResponseEnvelopeTests
     {
         // The converter assigns default(int) instead of throwing on a JSON null payload.
         var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
-            """{"Success":true,"Payload":null}""",
+            """{"SchemaVersion":1,"Success":true,"Payload":null}""",
             AsyncResponseEnvelopeOptions<int>.Instance);
 
         Assert.NotNull(restored);
@@ -70,7 +70,7 @@ public class AsyncResponseEnvelopeTests
     public void UnknownProperties_AreSkipped()
     {
         var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
-            """{"Success":true,"Payload":{"Status":2},"Unknown":{"nested":true},"Extra":42}""",
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2},"Unknown":{"nested":true},"Extra":42}""",
             AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
         Assert.NotNull(restored);

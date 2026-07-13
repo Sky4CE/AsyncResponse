@@ -105,6 +105,51 @@ public class SerialExecutorRegistryTests
     }
 
     [Fact]
+    public async Task RemoveDuringBackpressure_DrainsBeforeReplacementWithoutOverlap()
+    {
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var order = new ConcurrentQueue<int>();
+        var active = 0;
+        var overlap = 0;
+
+        async Task RecordAsync(int value, Task? gate = null)
+        {
+            if (Interlocked.Increment(ref active) > 1)
+                Interlocked.Exchange(ref overlap, 1);
+            if (value == 1)
+                firstStarted.TrySetResult();
+            if (gate is not null)
+                await gate;
+            order.Enqueue(value);
+            Interlocked.Decrement(ref active);
+        }
+
+        await registry.EnqueueAsync("cid", () => RecordAsync(1, releaseFirst.Task));
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Fill the default bounded queue while the first item is running, then leave one enqueue
+        // waiting for capacity so retirement races the exact admission boundary.
+        for (var index = 0; index < ChannelSerialExecutor.DefaultCapacity; index++)
+            await registry.EnqueueAsync("cid", () => Task.CompletedTask);
+        var beforeRetirement = registry.EnqueueAsync("cid", () => RecordAsync(2)).AsTask();
+        Assert.False(beforeRetirement.IsCompleted);
+
+        var retirement = registry.RemoveAsync("cid").AsTask();
+        var afterRetirement = registry.EnqueueAsync("cid", () => RecordAsync(3)).AsTask();
+        await Task.Delay(30);
+        Assert.False(afterRetirement.IsCompleted);
+
+        releaseFirst.TrySetResult();
+        await Task.WhenAll(beforeRetirement, retirement, afterRetirement).WaitAsync(TimeSpan.FromSeconds(10));
+        await registry.RemoveAsync("cid");
+
+        Assert.Equal(0, overlap);
+        Assert.Equal([1, 2, 3], order.ToArray());
+    }
+
+    [Fact]
     public async Task DifferentChannels_ExecuteInParallel_WhileEachChannelStaysSequential()
     {
         var registry = new SerialExecutorRegistry(NullLogger.Instance);

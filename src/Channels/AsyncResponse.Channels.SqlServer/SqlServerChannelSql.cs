@@ -1,9 +1,14 @@
 using Microsoft.Data.SqlClient;
+using System.Data;
 using System.Text.Json;
 
 namespace AsyncResponse.Channels.SqlServer;
 
-internal readonly record struct SqlServerChannelMessage(Guid Id, string CorrelationId, string EnvelopeJson);
+internal readonly record struct SqlServerChannelMessage(
+    Guid Id,
+    string CorrelationId,
+    string EnvelopeJson,
+    DateTimeOffset CreatedAtUtc);
 
 /// <summary>SQL helper for the SQL Server channel tables.</summary>
 internal sealed class SqlServerChannelSql
@@ -185,17 +190,14 @@ internal sealed class SqlServerChannelSql
         return states;
     }
 
-    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid? registrationId, CancellationToken cancellationToken)
+    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = registrationId is null
-            ? $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id;"
-            : $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
+        command.CommandText = $"DELETE FROM {RecoveryTable} WHERE correlation_id = @correlation_id AND registration_id = @registration_id;";
         command.Parameters.AddWithValue("@correlation_id", correlationId);
-        if (registrationId is not null)
-            command.Parameters.AddWithValue("@registration_id", registrationId.Value);
+        command.Parameters.AddWithValue("@registration_id", registrationId);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -266,6 +268,8 @@ internal sealed class SqlServerChannelSql
         string correlationId,
         DateTimeOffset sinceUtc,
         int batchSize,
+        DateTimeOffset? afterCreatedAtUtc,
+        Guid? afterId,
         CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
@@ -273,21 +277,32 @@ internal sealed class SqlServerChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT TOP (@limit) id, correlation_id, envelope_json
+            SELECT id, correlation_id, envelope_json, created_at
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
               AND expires_at > SYSUTCDATETIME()
-            ORDER BY created_at;
+              {(afterCreatedAtUtc is null ? "" : "AND (created_at > @after_created_at OR (created_at = @after_created_at AND id > @after_id))")}
+            ORDER BY created_at, id
+            OFFSET 0 ROWS FETCH NEXT @limit ROWS ONLY;
             """;
         command.Parameters.AddWithValue("@correlation_id", correlationId);
-        command.Parameters.AddWithValue("@since", sinceUtc.UtcDateTime);
+        var sinceParameter = command.Parameters.Add("@since", SqlDbType.DateTime2);
+        sinceParameter.Scale = 7;
+        sinceParameter.Value = sinceUtc.UtcDateTime;
         command.Parameters.AddWithValue("@limit", batchSize);
+        if (afterCreatedAtUtc is not null)
+        {
+            var cursorParameter = command.Parameters.Add("@after_created_at", SqlDbType.DateTime2);
+            cursorParameter.Scale = 7;
+            cursorParameter.Value = afterCreatedAtUtc.Value.UtcDateTime;
+            command.Parameters.AddWithValue("@after_id", afterId ?? throw new ArgumentNullException(nameof(afterId)));
+        }
 
-        var messages = new List<SqlServerChannelMessage>();
+        var messages = new List<SqlServerChannelMessage>(batchSize);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            messages.Add(new SqlServerChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2)));
+            messages.Add(new SqlServerChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2), new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero)));
         return messages;
     }
 
@@ -395,6 +410,39 @@ internal sealed class SqlServerChannelSql
         command.Parameters.AddWithValue("@instance_id", instanceId);
         command.Parameters.AddWithValue("@ttl_ms", (long)ttl.TotalMilliseconds);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task HeartbeatSubscribersAsync(
+        string instanceId,
+        IReadOnlyList<Guid> registrationIds,
+        TimeSpan ttl,
+        CancellationToken cancellationToken)
+    {
+        if (registrationIds.Count == 0)
+            return;
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        const int batchSize = 1000;
+        for (var offset = 0; offset < registrationIds.Count; offset += batchSize)
+        {
+            var count = Math.Min(batchSize, registrationIds.Count - offset);
+            await using var command = connection.CreateCommand();
+            var parameterNames = new string[count];
+            for (var index = 0; index < count; index++)
+            {
+                var parameterName = $"@registration_id_{index}";
+                parameterNames[index] = parameterName;
+                command.Parameters.AddWithValue(parameterName, registrationIds[offset + index]);
+            }
+
+            command.CommandText =
+                $"UPDATE {SubscriberTable} SET expires_at = {AddMilliseconds("@ttl_ms")} " +
+                $"WHERE instance_id = @instance_id AND registration_id IN ({string.Join(",", parameterNames)});";
+            command.Parameters.AddWithValue("@instance_id", instanceId);
+            command.Parameters.AddWithValue("@ttl_ms", (long)ttl.TotalMilliseconds);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task DeleteSubscriberAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)

@@ -489,7 +489,7 @@ public class LostSubscriberRoutingTests
     private void ArmRecoveryStates(params RecoveryState[] states)
         => _database
             .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(states.Length == 1 ? JsonSerializer.Serialize(states[0]) : JsonSerializer.Serialize(states));
+            .ReturnsAsync(JsonSerializer.Serialize(states));
 
     private static RecoveryState NewRecoveryState(string? payloadTypeFullName = "default", bool includeFailureCallback = true)
     {

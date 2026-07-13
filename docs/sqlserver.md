@@ -26,10 +26,15 @@ mode can be added later behind the same options if demand appears):
   land within one active poll interval; an idle app costs one cheap query every idle interval.
 - A new waiter re-arms the tight interval immediately and triggers a targeted scan of its own
   correlation id, so a response stored before the waiter subscribed is picked up at once.
+- The sweep advances a stable `created_at, id` keyset cursor until every retained row for that
+  correlation id is considered. `PendingMessageBatchSize` controls page shape; it no longer limits
+  one sweep to the oldest batch, so sustained progress cannot starve a later terminal response.
 
-Active waiters write heartbeat rows to `asyncresponse_channel_subscribers`. A publisher first checks
-for live subscribers; if none exist, it routes directly to lost-subscriber recovery. If subscribers
-do exist, the publisher inserts a message row and waits for delivery confirmation:
+Active waiters write rows to `asyncresponse_channel_subscribers`; one channel-level loop snapshots
+the registrations that are still active locally and extends only those rows in bounded SQL batches
+per heartbeat interval. A publisher first checks for live subscribers; if none exist, it routes
+directly to lost-subscriber recovery. If subscribers do exist, the publisher inserts a message row
+and waits for delivery confirmation:
 
 1. Same-process delivery completes an in-memory confirmation immediately.
 2. Cross-process delivery sets `acked_at`, which the publisher polls as a fallback.
@@ -117,6 +122,12 @@ builder.Services.AddAsyncResponse()
         options.ResponseQueue = "response";
         options.DeadLetterQueue = "deadletter";
         options.WorkerSubscriber.UseAckAfterEnqueue(4, 256);
+    })
+    .WithSqlServerDurableFlows(options =>
+    {
+        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
+        options.TableName = "asyncresponse_flow_state";
+        options.StateExpiry = TimeSpan.FromDays(14);
     });
 ```
 
@@ -136,10 +147,12 @@ Connection-string notes:
   load. Same-process deliveries (the common case when the waiter and the publisher share the app)
   never wait for either.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
-  rows to decide whether to wait for live delivery. Heartbeat upserts retry on transient database
-  errors (logged at Warning) — a subscriber row only expires if upserts keep failing for longer
-  than `SubscriberHeartbeatTimeout`, so leave headroom for more than one interval inside the
-  timeout.
+  rows to decide whether to wait for live delivery. Registration writes one row, then each interval
+  updates the process's current active-registration snapshot in bounded batches. Rows no longer in
+  that snapshot are allowed to expire even if cleanup deletion failed. A failed batch is logged and
+  the next interval retries, so leave enough timeout headroom for multiple attempts.
+- `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
+  peak materialization; larger pages reduce round trips under progress-heavy correlations.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery (including
   one cross-process `ActivePollInterval`), but short enough that a truly lost subscriber routes to
   recovery promptly.

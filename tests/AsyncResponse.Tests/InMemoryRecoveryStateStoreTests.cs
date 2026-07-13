@@ -13,6 +13,7 @@ public class InMemoryRecoveryStateStoreTests
         await Assert.ThrowsAsync<ArgumentException>(() => store.SaveAsync(" ", state, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentNullException>(() => store.SaveAsync("corr-a", null!, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => store.SaveAsync("corr-a", state, TimeSpan.Zero));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.TryDeleteAsync("corr-a", Guid.Empty));
 
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
@@ -21,7 +22,7 @@ public class InMemoryRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAsync_RemovesExpiredEntriesAndHonorsCancellation()
+    public async Task GetAllAsync_RemovesExpiredEntriesAndHonorsCancellation()
     {
         var store = new InMemoryRecoveryStateStore();
         await store.SaveAsync(
@@ -30,13 +31,12 @@ public class InMemoryRecoveryStateStoreTests
             TimeSpan.FromMilliseconds(1));
         await Task.Delay(20);
 
-        Assert.Null(await store.GetAsync("corr-a"));
-        Assert.False(await store.TryDeleteAsync("corr-a"));
+        Assert.Empty(await store.GetAllAsync("corr-a"));
 
-        await Assert.ThrowsAsync<ArgumentException>(() => store.GetAsync(" "));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.GetAllAsync(" "));
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => store.GetAsync("corr-a", canceled.Token));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => store.GetAllAsync("corr-a", canceled.Token));
     }
 
     [Fact]
@@ -93,7 +93,7 @@ public class InMemoryRecoveryStateStoreTests
 
         var remaining = Assert.Single(await store.GetAllAsync("corr-a"));
         Assert.Equal(secondId, remaining.RegistrationId);
-        Assert.True(await store.TryDeleteAsync("corr-a"));
+        Assert.True(await store.TryDeleteAsync("corr-a", secondId));
         Assert.Empty(await store.GetAllAsync("corr-a"));
     }
 
@@ -151,55 +151,18 @@ public class InMemoryRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAllAsync_FiltersUnreadableStatesFromMixedBucket()
+    public async Task SaveAsync_RejectsUnrecognizedSchemaVersion()
     {
         var store = new InMemoryRecoveryStateStore();
+        var state = new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-a",
+            SchemaVersion = RecoveryStateSchema.Current + 1
+        };
 
-        await store.SaveAsync("corr-a", State(Guid.NewGuid(), "old"), TimeSpan.FromMinutes(1));
-        await store.SaveAsync(
-            "corr-a",
-            new RecoveryState
-            {
-                RegistrationId = Guid.NewGuid(),
-                CorrelationId = "corr-a",
-                PayloadTypeFullName = "future",
-                SchemaVersion = RecoveryStateSchema.Current + 1
-            },
-            TimeSpan.FromMinutes(1));
-
-        var state = Assert.Single(await store.GetAllAsync("corr-a"));
-        Assert.Equal("old", state.PayloadTypeFullName);
-        Assert.Equal("old", (await store.GetAsync("corr-a"))!.PayloadTypeFullName);
-    }
-
-    [Fact]
-    public async Task GetAsync_AndGetAllAsync_ReturnNullOrEmptyWhenOnlyStateIsUnreadable()
-    {
-        var store = new InMemoryRecoveryStateStore();
-        await store.SaveAsync(
-            "corr-a",
-            new RecoveryState
-            {
-                RegistrationId = Guid.NewGuid(),
-                CorrelationId = "corr-a",
-                PayloadTypeFullName = "future",
-                SchemaVersion = RecoveryStateSchema.Current + 1
-            },
-            TimeSpan.FromMinutes(1));
-
-        Assert.Null(await store.GetAsync("corr-a"));
-        Assert.Empty(await store.GetAllAsync("corr-a"));
-    }
-
-    [Fact]
-    public async Task GetAsync_AndGetAllAsync_ReturnNullOrEmptyWhenManyStatesAreUnreadable()
-    {
-        var store = new InMemoryRecoveryStateStore();
-        await store.SaveAsync("corr-a", UnreadableState("future-1"), TimeSpan.FromMinutes(1));
-        await store.SaveAsync("corr-a", UnreadableState("future-2"), TimeSpan.FromMinutes(1));
-
-        Assert.Null(await store.GetAsync("corr-a"));
-        Assert.Empty(await store.GetAllAsync("corr-a"));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(1)));
     }
 
     [Fact]
@@ -275,13 +238,4 @@ public class InMemoryRecoveryStateStoreTests
             RegisteredAtUtc = DateTime.UtcNow
         };
 
-    private static RecoveryState UnreadableState(string payloadType)
-        => new()
-        {
-            RegistrationId = Guid.NewGuid(),
-            CorrelationId = "corr-a",
-            PayloadTypeFullName = payloadType,
-            SchemaVersion = RecoveryStateSchema.Current + 1,
-            RegisteredAtUtc = DateTime.UtcNow
-        };
 }

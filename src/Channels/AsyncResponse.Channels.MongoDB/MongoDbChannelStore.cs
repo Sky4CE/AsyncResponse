@@ -7,7 +7,11 @@ using System.Text.Json;
 
 namespace AsyncResponse.Channels.MongoDB;
 
-internal readonly record struct MongoDbChannelMessage(Guid Id, string CorrelationId, string EnvelopeJson);
+internal readonly record struct MongoDbChannelMessage(
+    Guid Id,
+    string CorrelationId,
+    string EnvelopeJson,
+    DateTimeOffset CreatedAtUtc);
 
 /// <summary>Document adapter for the MongoDB channel collections and change-stream wake.</summary>
 internal sealed class MongoDbChannelStore : IDisposable
@@ -148,19 +152,11 @@ internal sealed class MongoDbChannelStore : IDisposable
         return documents;
     }
 
-    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid? registrationId, CancellationToken cancellationToken)
+    public async Task<bool> DeleteRecoveryStateAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        if (registrationId is null)
-        {
-            var result = await _recovery.DeleteManyAsync(
-                Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId),
-                cancellationToken).ConfigureAwait(false);
-            return result.DeletedCount > 0;
-        }
-
         var single = await _recovery.DeleteOneAsync(
-            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId.Value)),
+            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId)),
             cancellationToken).ConfigureAwait(false);
         return single.DeletedCount > 0;
     }
@@ -236,19 +232,37 @@ internal sealed class MongoDbChannelStore : IDisposable
         string correlationId,
         DateTimeOffset sinceUtc,
         int batchSize,
+        DateTimeOffset? afterCreatedAtUtc,
+        Guid? afterId,
         CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
                      & Builders<MongoChannelMessageDocument>.Filter.Gte(item => item.CreatedAtUtc, sinceUtc.UtcDateTime)
                      & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        if (afterCreatedAtUtc is not null)
+        {
+            var afterCreated = afterCreatedAtUtc.Value.UtcDateTime;
+            var cursorId = afterId ?? throw new ArgumentNullException(nameof(afterId));
+            filter &= Builders<MongoChannelMessageDocument>.Filter.Or(
+                Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.CreatedAtUtc, afterCreated),
+                Builders<MongoChannelMessageDocument>.Filter.And(
+                    Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CreatedAtUtc, afterCreated),
+                    Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.Id, cursorId)));
+        }
         var documents = await _messages.Find(filter)
-            .SortBy(item => item.CreatedAtUtc)
+            .Sort(Builders<MongoChannelMessageDocument>.Sort
+                .Ascending(item => item.CreatedAtUtc)
+                .Ascending(item => item.Id))
             .Limit(batchSize)
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var messages = new List<MongoDbChannelMessage>(documents.Count);
         foreach (var document in documents)
-            messages.Add(new MongoDbChannelMessage(document.Id, document.CorrelationId, document.EnvelopeJson));
+            messages.Add(new MongoDbChannelMessage(
+                document.Id,
+                document.CorrelationId,
+                document.EnvelopeJson,
+                new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero)));
         return messages;
     }
 
@@ -344,6 +358,24 @@ internal sealed class MongoDbChannelStore : IDisposable
             document,
             new ReplaceOptions { IsUpsert = true },
             cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task HeartbeatSubscribersAsync(
+        string instanceId,
+        IReadOnlyCollection<Guid> registrationIds,
+        TimeSpan ttl,
+        CancellationToken cancellationToken)
+    {
+        if (registrationIds.Count == 0)
+            return;
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        var filter = Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.InstanceId, instanceId)
+                     & Builders<MongoChannelSubscriberDocument>.Filter.In(item => item.RegistrationId, registrationIds);
+        await _subscribers.UpdateManyAsync(
+            filter,
+            Builders<MongoChannelSubscriberDocument>.Update.Set(item => item.ExpiresAtUtc, DateTime.UtcNow.Add(ttl)),
+            cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     public async Task DeleteSubscriberAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)

@@ -1,23 +1,24 @@
 namespace AsyncResponse;
 
 /// <summary>
-/// Starts and manages durable flows (<see cref="IDurableFlow{TInput}"/>). Registered by
-/// <c>AddAsyncResponse()</c>; the default flow-state store uses the configured channel's recovery
-/// store for tests/dev/migration. Production durable flows should register an app-owned
-/// <see cref="IFlowStateStore"/>.
+/// Starts and manages durable flows (<see cref="IDurableFlow{TInput}"/>). Registered only when the
+/// application explicitly selects an atomic flow-state store, for example with
+/// <c>WithInMemoryDurableFlows()</c> or a provider-backed durable-flow package.
 /// </summary>
 public interface IDurableFlows
 {
     /// <summary>
     /// Creates a flow run and enqueues its execution on the worker transport. Returns the flow id.
     /// <para>
-    /// Pass <paramref name="flowId"/> to make the start idempotent: starting an id that already
-    /// exists re-enqueues the existing run (which skips completed steps) instead of creating a
-    /// duplicate — safe for retried API calls and operator "kick" actions.
+    /// Pass a non-empty <paramref name="flowId"/> to make the start idempotent: starting an id that
+    /// already exists with the same flow type and semantically identical input re-enqueues the
+    /// existing run (which skips completed steps). Reusing the id for different work is rejected.
     /// </para>
     /// </summary>
     /// <typeparam name="TFlow">The flow class; must be registered in DI and resolvable by its persisted type name.</typeparam>
     /// <typeparam name="TInput">The flow input, persisted as JSON with the flow state.</typeparam>
+    /// <exception cref="ArgumentException"><paramref name="flowId"/> is empty or whitespace.</exception>
+    /// <exception cref="InvalidOperationException"><paramref name="flowId"/> already belongs to different work.</exception>
     Task<string> StartAsync<TFlow, TInput>(
         TInput input,
         string? flowId = null,

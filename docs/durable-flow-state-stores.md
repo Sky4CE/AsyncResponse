@@ -1,423 +1,480 @@
-# Durable flow state stores
+# Durable-flow state stores
 
-This page covers where durable-flow ledgers (`FlowState`) live in production: the eight built-in
-store packages, how they register and provision themselves, how expired state is cleaned up per
-backend, and how to implement a custom `IFlowStateStore` when none of them fits. The flow API
-itself is documented in [durable-flows.md](durable-flows.md); the per-package option lists are
-summarized in [configuration.md](configuration.md#durable-flow-state-store-package-options).
+[← Back to the documentation index](README.md)
+
+Durable flows keep a small JSON ledger for each run. That ledger is the source of truth for
+completed steps, pending waits, run status, optimistic revision, and execution ownership. Choosing
+the store is therefore a correctness decision, not just a persistence detail.
 
 **On this page**
 
-- [Supported packages](#supported-packages)
-- [Registration and lifetimes](#registration-and-lifetimes)
-- [Package examples](#package-examples)
-- [Schema ownership](#schema-ownership)
-- [Expired-state cleanup](#expired-state-cleanup)
-- [Provider notes](#provider-notes)
-- [Custom stores](#custom-stores)
+- [Choose a store](#choose-a-store)
+- [The safety model](#the-safety-model-is-mandatory)
+- [Registration and client lifetimes](#registration-and-client-lifetimes)
+- [Provider examples](#provider-examples)
+- [Schema ownership and fail-fast behavior](#schema-ownership-and-fail-fast-behavior)
+- [Expiry and cleanup](#expiry-and-cleanup)
+- [Custom-store checklist](#custom-store-checklist)
 
-Production durable flows should keep `FlowState` in storage owned by your application. The
-recommended path is one of the built-in durable-flow store packages:
+`AddAsyncResponse()` does **not** select storage implicitly. Every application chooses exactly one
+store; startup fails fast when the choice is missing. The store callback also owns the common flow
+settings, so engine and provider configuration stay together:
+
+```csharp
+var connectionString = builder.Configuration.GetConnectionString("SqlServer")
+    ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
+
+builder.Services.AddAsyncResponse()
+    .WithSqlServerChannel(options =>
+        options.ConnectionString = connectionString)
+    .WithSqlServerTransport(options =>
+        options.ConnectionString = connectionString)
+    .WithSqlServerDurableFlows(options =>
+    {
+        options.StateExpiry = TimeSpan.FromDays(14);
+        options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
+        options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);
+        options.ConnectionString = connectionString;
+        options.SchemaName = "dbo";
+        options.TableName = "asyncresponse_flow_state";
+    });
+```
+
+For tests, applications not yet starting flows, and deliberately one-process flows, select the
+process-local store:
 
 ```csharp
 builder.Services
     .AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
-    .WithSqlServerDurableFlows(options =>
-    {
-        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
-        options.SchemaName = "dbo";
-        options.TableName = "asyncresponse_flow_state";
-    });
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows();
 ```
 
-The default `RecoveryBackedFlowStateStore` stays available for tests, development, and migration,
-but it stores flow ledgers in the configured channel recovery store. Those stores are often
-TTL/cache-shaped, so the default logs a warning the first time it persists flow state.
+The flow API is covered in [durable-flows.md](durable-flows.md). Package option defaults are in
+[configuration.md](configuration.md#durable-flow-state-store-package-options). Channel and transport
+registrations are in [provider-examples.md](provider-examples.md).
 
-## Supported packages
+## Choose a store
 
-| Package | Fluent registration | Backing store |
-|---|---|---|
-| `AsyncResponse.DurableFlows.SqlServer` | `WithSqlServerDurableFlows(...)` | SQL Server table |
-| `AsyncResponse.DurableFlows.PostgreSQL` | `WithPostgreSqlDurableFlows(...)` | PostgreSQL table |
-| `AsyncResponse.DurableFlows.MySql` | `WithMySqlDurableFlows(...)` | MySQL or MariaDB table |
-| `AsyncResponse.DurableFlows.Sqlite` | `WithSqliteDurableFlows(...)` | SQLite table |
-| `AsyncResponse.DurableFlows.Oracle` | `WithOracleDurableFlows(...)` | Oracle table |
-| `AsyncResponse.DurableFlows.MongoDB` | `WithMongoDbDurableFlows(...)` | MongoDB collection |
-| `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | Azure Cosmos DB container |
-| `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | DynamoDB table |
-| `AsyncResponse.DurableFlows.EFCore` | `WithEFCoreDurableFlows<TDbContext>(...)` | A table in your own `DbContext` (any EF Core relational provider) |
+| Provider | NuGet package | Registration | Best fit |
+|---|---|---|---|
+| In-memory | `AsyncResponse.Core` | `WithInMemoryDurableFlows()` | Tests, development, one process; state is lost on restart |
+| SQL Server | `AsyncResponse.DurableFlows.SqlServer` | `WithSqlServerDurableFlows(...)` | Existing SQL Server applications |
+| PostgreSQL | `AsyncResponse.DurableFlows.PostgreSQL` | `WithPostgreSqlDurableFlows(...)` | Existing PostgreSQL applications |
+| MySQL / MariaDB | `AsyncResponse.DurableFlows.MySql` | `WithMySqlDurableFlows(...)` | Existing MySQL or MariaDB applications |
+| SQLite | `AsyncResponse.DurableFlows.Sqlite` | `WithSqliteDurableFlows(...)` | One-node services that need restart durability |
+| Oracle | `AsyncResponse.DurableFlows.Oracle` | `WithOracleDurableFlows(...)` | Existing Oracle applications |
+| MongoDB | `AsyncResponse.DurableFlows.MongoDB` | `WithMongoDbDurableFlows(...)` | Document-store applications; native TTL cleanup |
+| Azure Cosmos DB | `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | Cosmos-native applications; per-item TTL |
+| DynamoDB | `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | AWS-native applications; conditional writes and native TTL |
+| Entity Framework Core | `AsyncResponse.DurableFlows.EFCore` | `WithEFCoreDurableFlows<TDbContext>()` | Put the ledger in an existing relational `DbContext` and migration pipeline |
+| Application-owned | `AsyncResponse.Core` | `WithDurableFlows<TStore>()` | A storage system not covered above |
 
-All nine stores run their contract tests against real servers in the default CI integration
-suite — the fixture provisions live SQL Server, PostgreSQL, MySQL, MongoDB, and DynamoDB
-(LocalStack) containers plus `gvenzl/oracle-free` and the Azure Cosmos DB emulator. Set
-`ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS=true` to skip the two heavyweight Oracle/Cosmos containers
-(the store tests then skip cleanly); the EF Core store rides the SQL Server container through the
-`Microsoft.EntityFrameworkCore.SqlServer` provider. SQLite additionally has in-repo contract,
-end-to-end, and concurrency-storm unit tests, and the EF Core store repeats that unit suite over
-the EF SQLite provider in both context-resolution modes.
+Prefer the database your application already operates. A separate workflow database is not
+required, and the flow store is independent of the response channel and worker transport.
 
-## Registration and lifetimes
+## The safety model is mandatory
 
-Every package registers its store as a **singleton**: schema, index, container, or table
-provisioning is cached per store instance and runs once per process, and control-plane calls
-(Cosmos metadata operations, DynamoDB `DescribeTable`/`CreateTable`) are not re-issued per flow
-execution. The `IFlowStateStore` interface is forwarded to that concrete singleton, so resolving
-either yields the same instance.
-
-Client ownership follows one rule — **no package registers a bare client service**
-(`NpgsqlDataSource`, `IMongoClient`/`IMongoDatabase`, `CosmosClient`, `IAmazonDynamoDB`), so
-unrelated resolutions of those types are never answered, or broken, by a store package:
-
-- If the host has already registered the client, the store reuses it.
-- Otherwise the store creates one from its options (or, for DynamoDB, the default AWS
-  credential/region chain) and owns it — the client is disposed with the container.
-
-`WithCustomDurableFlows<TStore>()` is the one deliberately **scoped** registration: your own store
-can depend on scoped services (an EF Core `DbContext`, a per-request unit of work) and is resolved
-from a fresh scope per flow execution. It `TryAdd`s the concrete `TStore` as scoped and forwards
-`IFlowStateStore` to it — which is exactly how the packages layer on top of it: they pre-register
-the concrete store as a singleton (so the scoped `TryAdd` is a no-op), then call
-`WithCustomDurableFlows<TStore>()` for the interface forwarding.
-
-## Package examples
-
-SQL Server:
+There is one `IFlowStateStore` contract. Every implementation must provide all of these atomic
+operations:
 
 ```csharp
-using AsyncResponse.DurableFlows.SqlServer;
+public interface IFlowStateStore
+{
+    Task<bool> TryCreateAsync(
+        string flowId, FlowState state, TimeSpan ttl,
+        CancellationToken cancellationToken = default);
+
+    Task<FlowState?> LoadAsync(
+        string flowId,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryUpdateAsync(
+        string flowId, FlowState state, long expectedRevision, TimeSpan ttl,
+        string? leaseId = null,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryAcquireLeaseAsync(
+        string flowId, string leaseId, TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryRenewLeaseAsync(
+        string flowId, string leaseId, TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
+
+    Task ReleaseLeaseAsync(
+        string flowId, string leaseId,
+        CancellationToken cancellationToken = default);
+
+    Task<bool> TryDeleteAsync(
+        string flowId,
+        CancellationToken cancellationToken = default);
+}
+```
+
+The required invariants are:
+
+1. `TryCreateAsync` is insert-if-absent. An expired record may be replaced, but two callers can
+   never both create the same live `flowId`. New ledgers start at revision `0`.
+2. `TryUpdateAsync` is compare-and-swap. It succeeds only when the stored revision equals
+   `expectedRevision`, and the new state revision is exactly `expectedRevision + 1`.
+3. When an update supplies `leaseId`, the same unexpired lease must still own the ledger. A stale
+   executor therefore cannot checkpoint after another replica takes over.
+4. Acquire succeeds only for an unowned or expired lease. Renew succeeds only for the current,
+   unexpired owner. Release never clears another owner's lease.
+5. Loads treat expired, malformed, identity-mismatched, revision-mismatched, and unrecognized-schema
+   records as absent.
+
+There is no weaker compatibility path and no process-local fallback for an incomplete custom
+store. That keeps single-node tests and multi-replica production on the same correctness model.
+The in-memory implementation satisfies the same atomic contract inside one process; it cannot make
+state survive or coordinate a different process.
+
+Durable-flow fencing prevents two healthy workers from checkpointing one run concurrently. It does
+not make an external side effect and the following checkpoint one transaction. Steps and triggers
+must still be idempotent.
+
+## Registration and client lifetimes
+
+Built-in provider packages register their store as a singleton. Provisioning metadata is cached
+once per process, and expensive control-plane calls are not repeated for every flow execution.
+
+Provider packages reuse an application-registered client when present, including
+`NpgsqlDataSource`, `IMongoDatabase`/`IMongoClient`, `CosmosClient`, and `IAmazonDynamoDB`. Otherwise
+they create and own a client from the configured options. They do not expose that internally
+created client as an unrelated bare DI service.
+
+`WithDurableFlows<TStore>()` uses a scoped default for an application-owned store, so it can depend
+on a scoped unit of work. You may pre-register `TStore` with another lifetime; the extension keeps
+that registration and forwards `IFlowStateStore` to it.
+
+Register exactly one durable-flow store. Startup validation rejects both missing and multiple store
+selections.
+
+## Provider examples
+
+Every provider has a complete registration example below. The examples use an in-memory channel and
+transport so the state-store choice is easy to see; in production, replace those two calls with the
+channel and transport that fit your deployment. The flow store is an independent third choice.
+
+### In-memory
+
+No additional package is required. This store implements the full atomic contract, but only inside
+one process and only for that process's lifetime.
+
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithInMemoryDurableFlows();
+```
+
+### SQL Server
+
+```csharp
+var connectionString = builder.Configuration.GetConnectionString("SqlServer")
+    ?? throw new InvalidOperationException("ConnectionStrings:SqlServer is required.");
 
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithSqlServerDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("SqlServer");
+        options.ConnectionString = connectionString;
         options.SchemaName = "dbo";
         options.TableName = "asyncresponse_flow_state";
-        options.AutoCreateSchema = true; // set false when migrations own DDL
+        options.AutoCreateSchema = true; // set false after deploying your own migration
     });
 ```
 
-PostgreSQL, reusing an app-wide `NpgsqlDataSource`:
+The connection string must name an existing database. Automatic provisioning creates the schema,
+table, and expiry index, not the database itself.
+
+### PostgreSQL
+
+The store can build its own data source from `options.ConnectionString`. Reusing one application-wide
+`NpgsqlDataSource` also lets the PostgreSQL channel, transport, and flow store share the same pool:
 
 ```csharp
-using AsyncResponse.DurableFlows.PostgreSQL;
 using Npgsql;
 
-builder.Services.AddSingleton(_ =>
-    NpgsqlDataSource.Create(builder.Configuration.GetConnectionString("PostgreSQL")!));
+var connectionString = builder.Configuration.GetConnectionString("PostgreSQL")
+    ?? throw new InvalidOperationException("ConnectionStrings:PostgreSQL is required.");
+
+builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connectionString));
 
 builder.Services.AddAsyncResponse()
-    .WithPostgreSqlChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithPostgreSqlDurableFlows(options =>
     {
         options.SchemaName = "public";
         options.TableName = "asyncresponse_flow_state";
+        options.AutoCreateSchema = true; // set false after deploying your own migration
     });
 ```
 
-MySQL or MariaDB:
+Without the shared data source, set `options.ConnectionString = connectionString` in
+`WithPostgreSqlDurableFlows(...)` instead.
+
+### MySQL or MariaDB
 
 ```csharp
-using AsyncResponse.DurableFlows.MySql;
+var connectionString = builder.Configuration.GetConnectionString("MySql")
+    ?? throw new InvalidOperationException("ConnectionStrings:MySql is required.");
 
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithMySqlDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("MySql");
+        options.ConnectionString = connectionString;
         options.TableName = "asyncresponse_flow_state";
+        options.AutoCreateSchema = true;
     });
 ```
 
-SQLite:
+### SQLite
+
+SQLite is a useful one-node durable option: the ledger survives restarts without a separate server,
+but the file remains local to one host.
 
 ```csharp
-using AsyncResponse.DurableFlows.Sqlite;
-
 builder.Services.AddAsyncResponse()
     .WithInMemoryChannel()
     .WithInMemoryTransport()
     .WithSqliteDurableFlows(options =>
     {
         options.ConnectionString = "Data Source=asyncresponse-flow-state.db";
+        options.TableName = "asyncresponse_flow_state";
     });
 ```
 
-Oracle:
+### Oracle
 
 ```csharp
-using AsyncResponse.DurableFlows.Oracle;
+var connectionString = builder.Configuration.GetConnectionString("Oracle")
+    ?? throw new InvalidOperationException("ConnectionStrings:Oracle is required.");
 
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithOracleDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("Oracle");
+        options.ConnectionString = connectionString;
         options.TableName = "ASYNCRESPONSE_FLOW_STATE";
+        options.AutoCreateSchema = true;
     });
 ```
 
-MongoDB:
+Oracle 12.1 and earlier have a 30-character identifier limit. If the generated expiry-index name
+would exceed it, shorten `TableName`.
+
+### MongoDB
 
 ```csharp
-using AsyncResponse.DurableFlows.MongoDB;
+var connectionString = builder.Configuration.GetConnectionString("MongoDB")
+    ?? throw new InvalidOperationException("ConnectionStrings:MongoDB is required.");
 
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithMongoDbDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("MongoDB");
-        options.DatabaseName = "app";
+        options.ConnectionString = connectionString;
+        options.DatabaseName = "orders";
         options.CollectionName = "asyncresponse_flow_state";
+        options.AutoCreateIndexes = true;
     });
 ```
 
-Cosmos DB:
+If the application already registers `IMongoDatabase`, the store reuses it and only
+`CollectionName` is needed. With a registered `IMongoClient`, configure `DatabaseName`.
+
+### Azure Cosmos DB
 
 ```csharp
-using AsyncResponse.DurableFlows.Cosmos;
+var connectionString = builder.Configuration.GetConnectionString("Cosmos")
+    ?? throw new InvalidOperationException("ConnectionStrings:Cosmos is required.");
 
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithCosmosDurableFlows(options =>
     {
-        options.ConnectionString = builder.Configuration.GetConnectionString("Cosmos");
-        options.DatabaseName = "app";
+        options.ConnectionString = connectionString;
+        options.DatabaseName = "orders";
         options.ContainerName = "asyncresponse_flow_state";
         options.PartitionKeyPath = "/flowId";
+        options.AutoCreateContainer = true;
     });
 ```
 
-DynamoDB:
+An application-registered `CosmosClient` is reused automatically; omit `ConnectionString` in that
+case. Existing containers must already use the configured partition key and have TTL enabled.
+
+### DynamoDB
+
+The package reuses a registered `IAmazonDynamoDB`; otherwise it uses the normal AWS SDK credential
+and region chain.
 
 ```csharp
-using AsyncResponse.DurableFlows.DynamoDB;
-
 builder.Services.AddAsyncResponse()
-    .WithRedisChannel()
-    .WithSqsTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithDynamoDbDurableFlows(options =>
     {
         options.TableName = "AsyncResponseFlowState";
-        options.AutoCreateTable = true;
+        options.AutoCreateTable = true;       // use infrastructure-as-code in production
         options.EnableTimeToLive = true;
+        options.TimeToLiveAttributeName = "expires_at";
     });
 ```
 
-Entity Framework Core — the ledger table lives inside your own `DbContext`, so it works with any
-EF Core relational provider and rides your existing migration pipeline:
+### Entity Framework Core
+
+The ledger becomes part of the application's own relational model and migration pipeline. The
+store works with any EF Core relational provider.
 
 ```csharp
 using AsyncResponse.DurableFlows.EFCore;
+using Microsoft.EntityFrameworkCore;
 
-public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
+    : DbContext(options)
 {
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        // Maps DurableFlowStateRecord; add a normal migration afterwards.
+        base.OnModelCreating(modelBuilder);
         modelBuilder.ConfigureAsyncResponseDurableFlows();
     }
 }
 
-builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString));
-// or AddDbContextFactory<AppDbContext>(...) — the store prefers the factory when one is registered.
+var connectionString = builder.Configuration.GetConnectionString("PostgreSQL")
+    ?? throw new InvalidOperationException("ConnectionStrings:PostgreSQL is required.");
+
+builder.Services.AddDbContextFactory<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
 
 builder.Services.AddAsyncResponse()
-    .WithPostgreSqlChannel(...)
-    .WithPostgreSqlTransport(...)
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
     .WithEFCoreDurableFlows<AppDbContext>();
 ```
 
-Every operation leases a fresh context (from `IDbContextFactory<TContext>` when registered,
-otherwise the scoped `TContext` from a new scope), so parallel flow executions never share a
-`DbContext`. Reads are no-tracking; deletes and pruning use `ExecuteDeleteAsync`, updates use
-`ExecuteUpdateAsync`. Column names match the other relational packages, so the table is
-interchangeable with the ones the SQL Server/PostgreSQL/MySQL/SQLite packages create.
+The EF Core store prefers `IDbContextFactory<TContext>` when registered; otherwise it creates a
+scope for `TContext`. Parallel flow executions never share a context. Reads are no-tracking and
+conditional updates/deletes execute in the database.
 
-## Schema ownership
+After adding `ConfigureAsyncResponseDurableFlows()`, generate and deploy a normal EF migration.
+The package never creates or alters the schema itself.
 
-Every package can create its table, collection index, container, or DynamoDB table on first use.
-That is convenient for development and tests. For production environments that use migrations or
-infrastructure-as-code, set the package's `AutoCreate...` option to `false` and provision the
-same shape yourself.
+### Application-owned store
 
-The one exception is `AsyncResponse.DurableFlows.EFCore`: it never runs DDL. The table is part of
-your `DbContext` model (via `ConfigureAsyncResponseDurableFlows()`), so it is created by whatever
-already creates the rest of your schema — EF migrations, `EnsureCreated`, or your own scripts.
+Use the custom registration only when none of the provider packages fits. The store must implement
+the complete atomic contract shown above; registration does not add a weaker fallback.
 
-Concurrent first-use provisioning is safe across processes:
+```csharp
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithDurableFlows<MyFlowStateStore>(options =>
+    {
+        options.StateExpiry = TimeSpan.FromDays(14);
+        options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1);
+        options.ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(20);
+    });
+```
 
-- **PostgreSQL / SQL Server** serialize DDL with the same transaction-scoped advisory lock /
-  `sp_getapplock` (resource `asyncresponse:ddl:{SchemaName}`) as the channel and transport
-  packages, so flow-store DDL also serializes with any channel/transport DDL running against the
-  same schema. `CREATE ... IF NOT EXISTS` alone is not atomic against a concurrent create — the
-  lock is what prevents the catalog collision.
-- **DynamoDB** tolerates a concurrent `CreateTable` (`ResourceInUseException` means another
-  process won the race), waits for the table to become `ACTIVE`, and checks the TTL status before
-  enabling it rather than blind-enabling and swallowing the error.
-- **Oracle** ignores `ORA-00955` (object already exists) on `CREATE TABLE`/`CREATE INDEX`.
-- **MongoDB / Cosmos** use natively idempotent create-if-not-exists index/container calls.
+`MyFlowStateStore` is registered as scoped by default, so it may depend on a scoped unit of work.
+Pre-register it before the chain when a different lifetime or factory is required:
 
-Relational table shape:
+```csharp
+builder.Services.AddSingleton<MyFlowStateStore>();
 
-```sql
-flow_id         string primary key
-state_json      large text / json
-expires_at_utc  UTC timestamp
-updated_at_utc  UTC timestamp
+builder.Services.AddAsyncResponse()
+    .WithInMemoryChannel()
+    .WithInMemoryTransport()
+    .WithDurableFlows<MyFlowStateStore>();
+```
+
+## Schema ownership and fail-fast behavior
+
+Provider `AutoCreate...` options are convenient for local development. In production, prefer
+migrations or infrastructure-as-code and disable automatic DDL where available.
+
+The current relational shape is:
+
+```text
+flow_id              string primary key
+state_json           large text / JSON
+expires_at_utc       UTC timestamp
+updated_at_utc       UTC timestamp
+revision             64-bit integer, not null
+lease_id             nullable string(64)
+lease_expires_at_utc nullable UTC timestamp
 index on expires_at_utc
 ```
 
-Document store shape:
+Document stores persist the same fields. DynamoDB uses `flow_id` as the partition key, Unix seconds
+for the TTL attribute, and Unix milliseconds for lease expiry.
 
-```json
-{
-  "id": "flow-id",
-  "flowId": "flow-id",
-  "stateJson": "{... FlowState ...}",
-  "expiresAtUtc": "2026-07-09T12:00:00Z",
-  "updatedAtUtc": "2026-07-09T11:00:00Z"
-}
-```
+The library does not silently upgrade an incomplete concurrency schema:
 
-DynamoDB item shape:
+- SQL packages create the complete table when missing. If a table exists without revision or lease
+  columns, operations fail; deploy the correct migration before the application.
+- MongoDB creates the required TTL index when missing. It does not drop or rewrite a conflicting
+  application-owned index.
+- Cosmos auto-create uses the configured partition key and enables per-item TTL on a new container.
+  An existing container must already use that partition key and have TTL enabled, or first use fails.
+- DynamoDB validates that TTL is enabled or being enabled on the configured attribute. A table with
+  TTL on another attribute fails clearly instead of leaking expired ledgers.
+- EF Core never runs DDL. Generate and deploy an EF migration after adding
+  `ConfigureAsyncResponseDurableFlows()`.
 
-```text
-flow_id    S  partition key
-state_json S
-expires_at N  Unix seconds, optional DynamoDB TTL attribute
-updated_at N  Unix seconds
-```
+Persisted state has two revision copies: the indexed/provider field and the value inside
+`state_json`. Loads require them to match. MongoDB, Cosmos DB, and DynamoDB records without a
+physical revision are rejected. This prevents a malformed or partially migrated record from
+entering execution with a fabricated revision.
 
-## Expired-state cleanup
+## Expiry and cleanup
 
-Loads always treat expired state as absent — the expiry filter on read is the correctness
-mechanism. Cleanup of the expired rows/documents themselves differs per family:
+`StateExpiry`, configured on the selected `With*DurableFlows(...)` variant, is an idle TTL. Every
+successful checkpoint refreshes it, so it limits the maximum gap between checkpoints rather than
+total flow duration. Loads always filter expired
+state; physical cleanup is separate:
 
-| Store family | Cleanup mechanism |
+| Store | Cleanup |
 |---|---|
-| SQL stores (PostgreSQL, SQL Server, MySQL, SQLite, Oracle) | **Opportunistic prune on save**: `SaveAsync` deletes expired rows, throttled by the `PruneInterval` option (default 5 minutes; zero or negative prunes on every save). Pruning only bounds table growth — it never affects correctness. |
-| MongoDB | **Native TTL index** (`expireAfterSeconds = 0` on `expires_at_utc`): MongoDB reaps expired ledgers itself. A pre-existing plain (non-TTL) index with the same name, e.g. from an earlier package version, is replaced in place. Loads still filter on expiry because the TTL monitor runs only periodically (~60 s). |
-| Cosmos DB | **Container TTL + per-item `ttl`**: auto-create enables `DefaultTimeToLive = -1` (per-item TTL without a container-wide default) and each save writes a per-item `ttl`; a pre-existing container without TTL enabled is upgraded in place. |
-| DynamoDB | **Native TTL** on the expiry attribute (`expires_at`, Unix seconds). The expiry epoch is rounded **up** to whole seconds so the effective TTL is never shorter than requested. |
+| PostgreSQL, SQL Server, MySQL, SQLite, Oracle | Opportunistic expired-row prune on flow creation, throttled by `PruneInterval` (default 5 minutes) |
+| EF Core | Provider-side expired-row cleanup through the mapped table |
+| MongoDB | TTL index on `expires_at_utc`; reads still filter because Mongo's TTL monitor is periodic |
+| Cosmos DB | Container TTL plus a per-item `ttl` value |
+| DynamoDB | Native TTL on `TimeToLiveAttributeName`; expiry is rounded up to avoid shortening the requested lifetime |
+| In-memory | Expired entries are removed on access or replacement |
 
-## Provider notes
+Keep `StateExpiry` longer than the longest legitimate period without a checkpoint. Deleting a
+ledger or allowing it to expire while a flow is suspended makes its outcome unknowable.
 
-- **Oracle** — the default index name (`{TableName}_EXPIRES_IDX` on the default
-  `ASYNCRESPONSE_FLOW_STATE` table) exceeds the 30-character identifier limit of Oracle ≤ 12.1,
-  so the default table name requires **Oracle 12.2+**. On older servers, shorten `TableName`.
-- **Oracle** — `SaveAsync` retries once on `ORA-00001`: Oracle's `MERGE` has no `HOLDLOCK`
-  equivalent, so two concurrent saves for the same *new* flow id can both take the
-  `WHEN NOT MATCHED` branch; the retry takes the `MATCHED` branch — ordinary last-writer-wins,
-  matching the other stores' atomic upserts.
-- **MySQL / MariaDB** — the upsert uses `VALUES()` in `ON DUPLICATE KEY UPDATE` deliberately:
-  MySQL 8.0.20+ deprecates it in favor of row aliases, but `VALUES()` is the only syntax MariaDB
-  supports.
-- **SQL Server** — the upsert is `MERGE ... WITH (HOLDLOCK)`, making concurrent saves for one
-  flow id atomic.
+## Custom-store checklist
 
-## Custom stores
+Use `.WithDurableFlows<MyFlowStateStore>()` only when the built-in packages do not fit. Before using
+a custom store in production, test all of these against the real backend:
 
-Use `WithCustomDurableFlows<TStore>()` when a built-in package does not fit your persistence
-model. The library calls only three methods:
+- many concurrent creates for one id produce exactly one winner;
+- stale revision updates return `false` and never overwrite newer JSON;
+- an update carrying the wrong or expired lease returns `false`;
+- a lease cannot be renewed or released by another owner;
+- takeover works after lease expiry;
+- TTL refresh and expired-record replacement are atomic;
+- malformed JSON, wrong `flowId`, missing/mismatched revision, and missing or unsupported schema versions load
+  as `null`;
+- cancellation reaches network/database operations;
+- transient failures do not fall back to unconditional writes.
 
-```csharp
-public interface IFlowStateStore
-{
-    Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken ct = default);
-    Task<FlowState?> LoadAsync(string flowId, CancellationToken ct = default);
-    Task<bool> TryDeleteAsync(string flowId, CancellationToken ct = default);
-}
-```
+Execution leases use absolute UTC expiry. Keep hosts time-synchronized and set
+`ExecutionLeaseDuration` comfortably above clock skew, network jitter, and the renewal interval.
 
-Custom relational adapter (PostgreSQL/SQLite-style upsert shown; use your provider's equivalent
-upsert syntax):
-
-```csharp
-using AsyncResponse;
-using System.Data.Common;
-using System.Text.Json;
-
-public sealed class MyFlowStateStore(
-    Func<CancellationToken, ValueTask<DbConnection>> openConnection) : IFlowStateStore
-{
-    public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken ct = default)
-    {
-        var now = DateTime.UtcNow;
-        await using var connection = await openConnection(ct);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO asyncresponse_flow_state(flow_id, state_json, expires_at_utc, updated_at_utc)
-            VALUES(@flow_id, @state_json, @expires_at_utc, @updated_at_utc)
-            ON CONFLICT(flow_id) DO UPDATE SET
-                state_json = excluded.state_json,
-                expires_at_utc = excluded.expires_at_utc,
-                updated_at_utc = excluded.updated_at_utc
-            """;
-        Add(command, "flow_id", flowId);
-        Add(command, "state_json", JsonSerializer.Serialize(state));
-        Add(command, "expires_at_utc", now.Add(ttl));
-        Add(command, "updated_at_utc", now);
-        await command.ExecuteNonQueryAsync(ct);
-    }
-
-    public async Task<FlowState?> LoadAsync(string flowId, CancellationToken ct = default)
-    {
-        await using var connection = await openConnection(ct);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT state_json
-            FROM asyncresponse_flow_state
-            WHERE flow_id = @flow_id AND expires_at_utc > @now_utc
-            """;
-        Add(command, "flow_id", flowId);
-        Add(command, "now_utc", DateTime.UtcNow);
-
-        var json = await command.ExecuteScalarAsync(ct) as string;
-        if (json is null)
-            return null;
-
-        var state = JsonSerializer.Deserialize<FlowState>(json);
-        return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
-    }
-
-    public async Task<bool> TryDeleteAsync(string flowId, CancellationToken ct = default)
-    {
-        await using var connection = await openConnection(ct);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM asyncresponse_flow_state WHERE flow_id = @flow_id";
-        Add(command, "flow_id", flowId);
-        return await command.ExecuteNonQueryAsync(ct) > 0;
-    }
-
-    private static void Add(DbCommand command, string name, object value)
-    {
-        var parameter = command.CreateParameter();
-        parameter.ParameterName = "@" + name;
-        parameter.Value = value;
-        command.Parameters.Add(parameter);
-    }
-}
-```
-
-Register the custom store:
-
-```csharp
-builder.Services
-    .AddAsyncResponse()
-    .WithRedisChannel()
-    .WithRabbitMqTransport(...)
-    .WithCustomDurableFlows<MyFlowStateStore>();
-```
-
-Document and key-value stores follow the same shape: upsert one JSON document/item keyed by
-`flowId`, filter reads by expiry, reject future `FlowStateSchema` versions, and delete by key.
+The built-in stores run the same atomic create/revision/lease contract suite against their real
+providers in integration tests. Reusing one of them is the shortest path to a replica-safe store.

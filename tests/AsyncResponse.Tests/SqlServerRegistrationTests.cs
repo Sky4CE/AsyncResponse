@@ -116,10 +116,12 @@ public sealed class SqlServerRegistrationTests
     {
         var provider = Build(builder => builder
             .WithSqlServerChannel(options => options.ConnectionString = TestConnectionString)
-            .WithSqlServerTransport(options => options.ConnectionString = TestConnectionString));
+            .WithSqlServerTransport(options => options.ConnectionString = TestConnectionString)
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         await validator.StartAsync(CancellationToken.None);
         await validator.StopAsync(CancellationToken.None);

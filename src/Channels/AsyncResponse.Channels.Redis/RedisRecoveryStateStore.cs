@@ -39,6 +39,10 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         ArgumentNullException.ThrowIfNull(state);
         if (ttl <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
+        if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            throw new ArgumentException("The recovery-state correlation id must match the store key.", nameof(state));
+        if (state.SchemaVersion != RecoveryStateSchema.Current)
+            throw new ArgumentException("The recovery state must use the current schema version.", nameof(state));
 
         cancellationToken.ThrowIfCancellationRequested();
         if (state.RegistrationId == Guid.Empty)
@@ -69,23 +73,9 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 return;
         }
 
-        // Registering recovery must not fail the wait: fall back to last-writer-wins after
-        // sustained contention (pathological for a single correlation id) and say so.
-        _logger.LogWarning(
-            "Recovery-state save for correlationId {CorrelationId} exhausted {Attempts} optimistic attempts; falling back to an unconditional write.",
-            correlationId, MaxCasAttempts);
-        var fallbackStates = await LoadStatesAsync(recoveryKey, correlationId).ConfigureAwait(false);
-        fallbackStates.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
-        fallbackStates.Add(state);
-        await _database.StringSetAsync(
-            recoveryKey,
-            JsonSerializer.Serialize(fallbackStates),
-            ttl).ConfigureAwait(false);
+        throw new InvalidOperationException(
+            $"Recovery-state save for correlationId '{correlationId}' could not commit after {MaxCasAttempts} optimistic attempts.");
     }
-
-    /// <inheritdoc />
-    public async Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
-        => (await GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
@@ -98,17 +88,11 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     }
 
     /// <inheritdoc />
-    public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
-        cancellationToken.ThrowIfCancellationRequested();
-        return _database.KeyDeleteAsync(_keys.RecoveryKey(correlationId));
-    }
-
-    /// <inheritdoc />
     public async Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        if (registrationId == Guid.Empty)
+            throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
         cancellationToken.ThrowIfCancellationRequested();
 
         var recoveryKey = _keys.RecoveryKey(correlationId);
@@ -191,35 +175,36 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     {
         try
         {
-            using var document = JsonDocument.Parse(value.ToString());
-            List<RecoveryState> states;
-            if (document.RootElement.ValueKind == JsonValueKind.Array)
-            {
-                states = JsonSerializer.Deserialize<List<RecoveryState>>(document.RootElement.GetRawText()) ?? [];
-            }
-            else if (JsonSerializer.Deserialize<RecoveryState>(document.RootElement.GetRawText()) is { } state)
-            {
-                states = [state];
-            }
-            else
-            {
-                states = [];
-            }
+            var states = JsonSerializer.Deserialize<List<RecoveryState>>(value.ToString()) ?? [];
 
             for (var i = states.Count - 1; i >= 0; i--)
             {
                 var state = states[i];
+                if (state is null || state.RegistrationId == Guid.Empty)
+                {
+                    _logger.LogWarning(
+                        "Recovery state at {RecoveryKey} has no registration id; rejecting it because it cannot be deleted safely.",
+                        recoveryKey);
+                    states.RemoveAt(i);
+                    continue;
+                }
+
                 if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
                 {
                     _logger.LogWarning(
-                        "Recovery state at {RecoveryKey} has schema version {SchemaVersion}, newer than this build supports ({Current}); rejecting it instead of risking a misinterpreted recovery.",
+                        "Recovery state at {RecoveryKey} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
                         recoveryKey, state.SchemaVersion, RecoveryStateSchema.Current);
                     states.RemoveAt(i);
                     continue;
                 }
 
-                if (string.IsNullOrWhiteSpace(state.CorrelationId))
-                    state.CorrelationId = correlationId;
+                if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+                {
+                    _logger.LogWarning(
+                        "Recovery state at {RecoveryKey} has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
+                        recoveryKey, state.CorrelationId, correlationId);
+                    states.RemoveAt(i);
+                }
             }
 
             return states;

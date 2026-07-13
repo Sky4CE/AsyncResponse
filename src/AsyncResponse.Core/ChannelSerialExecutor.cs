@@ -4,7 +4,7 @@ using System.Threading.Channels;
 namespace AsyncResponse;
 
 /// <summary>
-/// Executes asynchronous work items for a specific channel serially: an unbounded
+/// Executes asynchronous work items for a specific channel serially: a bounded
 /// <see cref="Channel{T}"/> drained by a single reader loop guarantees per-channel ordering, so
 /// progress messages for one correlation id are never processed concurrently or out of order.
 /// <para>
@@ -16,33 +16,36 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class ChannelSerialExecutor : IAsyncDisposable
 {
+    internal const int DefaultCapacity = 1024;
     private readonly Channel<Func<Task>> _queue;
     private readonly Task _readerLoop;
     private readonly ILogger _logger;
     private readonly string _channel;
 
-    // Items accepted into the queue but not yet pulled out for execution. Mirrors the old
-    // ActionBlock.InputCount: the item currently running is no longer "pending".
+    // Items waiting for capacity or accepted into the queue but not yet pulled out for execution.
+    // The item currently running is no longer "pending".
     private int _pending;
 
-    /// <summary>How many work items are currently buffered (waiting to run) in this executor.</summary>
+    /// <summary>How many work items are currently waiting for capacity or waiting to run.</summary>
     private int PendingCount => Volatile.Read(ref _pending);
 
     /// <summary>Runs the ChannelSerialExecutor operation.</summary>
-    public ChannelSerialExecutor(ILogger logger, string channel)
+    public ChannelSerialExecutor(ILogger logger, string channel, int capacity = DefaultCapacity)
     {
+        if (capacity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity));
+
         _logger = logger;
         _channel = channel;
 
-        // Unbounded so enqueue never blocks (matches the old BoundedCapacity.Unbounded). A single
-        // reader loop is the sole consumer; producers (e.g. the broker subscriber callback) may be
-        // multiple, so SingleWriter stays false. Synchronous continuations are disabled so a
-        // completing work item never runs the next producer's continuation inline.
-        _queue = Channel.CreateUnbounded<Func<Task>>(new UnboundedChannelOptions
+        // Waiting writers apply backpressure instead of allowing an overloaded correlation id to
+        // retain an unbounded delegate backlog. One reader preserves strict per-key ordering.
+        _queue = Channel.CreateBounded<Func<Task>>(new BoundedChannelOptions(capacity)
         {
             SingleReader = true,
             SingleWriter = false,
             AllowSynchronousContinuations = false,
+            FullMode = BoundedChannelFullMode.Wait
         });
 
         _readerLoop = Task.Run(DrainAsync);
@@ -93,21 +96,42 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
     /// </summary>
     public Task<bool> Enqueue(Func<Task> work, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(work);
         if (cancellationToken.IsCancellationRequested)
             return Task.FromCanceled<bool>(cancellationToken);
 
-        return Task.FromResult(TryEnqueue(work));
+        return EnqueueCoreAsync(work, cancellationToken);
+    }
+
+    private async Task<bool> EnqueueCoreAsync(Func<Task> work, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _pending);
+        try
+        {
+            await _queue.Writer.WriteAsync(work, cancellationToken).ConfigureAwait(false);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Channel executor enqueued work for {Channel} (pending {PendingCount}).", _channel, PendingCount);
+            return true;
+        }
+        catch (ChannelClosedException)
+        {
+            Interlocked.Decrement(ref _pending);
+            return false;
+        }
+        catch
+        {
+            Interlocked.Decrement(ref _pending);
+            throw;
+        }
     }
 
     /// <summary>
     /// Synchronously queues a work delegate, returning <c>false</c> when the executor is already
-    /// shutting down. The queue is unbounded so this never blocks, which makes it safe to call while
-    /// holding a lock (see <see cref="SerialExecutorRegistry"/>, which relies on that to enqueue and
-    /// retire executors atomically).
+    /// shutting down or full. Use <see cref="Enqueue"/> when the producer can wait for capacity.
     /// </summary>
     public bool TryEnqueue(Func<Task> work)
     {
-        // The queue is unbounded, so a write that is going to succeed succeeds synchronously.
+        ArgumentNullException.ThrowIfNull(work);
         Interlocked.Increment(ref _pending);
         if (_queue.Writer.TryWrite(work))
         {
@@ -117,7 +141,7 @@ internal sealed class ChannelSerialExecutor : IAsyncDisposable
         }
 
         Interlocked.Decrement(ref _pending);
-        _logger.LogWarning("Channel executor failed to enqueue work for {Channel}; channel already completed (pending {PendingCount}).", _channel, PendingCount);
+        _logger.LogWarning("Channel executor could not enqueue work for {Channel}; queue is full or completed (pending {PendingCount}).", _channel, PendingCount);
         return false;
     }
 

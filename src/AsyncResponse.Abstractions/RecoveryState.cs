@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AsyncResponse;
 
 /// <summary>
@@ -19,11 +21,11 @@ public sealed class RecoveryState
 {
     /// <summary>
     /// The wire schema version this entry was written with. New entries are always stamped with
-    /// <see cref="RecoveryStateSchema.Current"/>. Entries written before this field existed carry no
-    /// version on the wire and are read as the current version (and therefore accepted); an entry
-    /// whose version is greater than the reader's current is rejected so a newer writer cannot
-    /// silently misroute an older deployment's recovery path.
+    /// <see cref="RecoveryStateSchema.Current"/>. The property is required on the wire; a missing or
+    /// unsupported version is rejected so an incompatible writer cannot silently misroute a
+    /// recovery path.
     /// </summary>
+    [JsonRequired]
     public int SchemaVersion { get; set; } = RecoveryStateSchema.Current;
 
     /// <summary>
@@ -76,9 +78,8 @@ public sealed class RecoveryState
 /// <summary>
 /// Wire-schema version stamp for <see cref="RecoveryState"/>. New entries are stamped with
 /// <see cref="Current"/>. The loader rejects (returns <c>null</c> rather than handing on a
-/// half-interpreted entry) any persisted entry whose version is greater than <see cref="Current"/>:
-/// a newer writer must never silently misroute an older deployment's recovery path. Entries whose
-/// version is missing or lower are read forward-compatibly — additive schema changes only.
+/// half-interpreted entry) any persisted entry whose version is not explicitly supported. An
+/// unrecognized writer must never silently misroute a recovery path. The JSON property is required.
 /// <para>
 /// Bump <see cref="Current"/> on breaking changes; the only valid new-version policy is "reject".
 /// </para>
@@ -90,10 +91,9 @@ public static class RecoveryStateSchema
 
     /// <summary>
     /// Returns <c>true</c> when an entry with <paramref name="entryVersion"/> is safe to read on
-    /// this build: the current version or an older one (an entry written before the version field
-    /// existed reads as the current version). Returns <c>false</c> for a newer writer so the loader
-    /// can reject it instead of misinterpreting it.
+    /// this build. Historical versions must be listed explicitly when a tested migration path
+    /// exists; arbitrary lower numbers are not assumed compatible.
     /// </summary>
     public static bool IsReadable(int entryVersion)
-        => entryVersion <= Current;
+        => entryVersion == Current;
 }

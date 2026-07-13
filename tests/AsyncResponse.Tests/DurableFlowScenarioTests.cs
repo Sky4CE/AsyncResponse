@@ -214,7 +214,8 @@ public class DurableFlowScenarioTests
                 options.DefaultTimeout = TimeSpan.FromSeconds(10);
                 options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
             })
-            .WithInMemoryTransport();
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
         return services.BuildServiceProvider();
     }
 

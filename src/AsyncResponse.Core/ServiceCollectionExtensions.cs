@@ -6,7 +6,7 @@ namespace Microsoft.Extensions.DependencyInjection;
 /// <summary>
 /// Core registrations for AsyncResponse. Everything is configured through the fluent builder
 /// returned by <see cref="AddAsyncResponse"/>: chain exactly one channel and exactly one worker
-/// transport.
+/// transport, and exactly one durable-flow state store.
 /// </summary>
 public static class AsyncResponseCoreServiceCollectionExtensions
 {
@@ -16,8 +16,9 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// the rest. It deliberately registers <em>no</em> response channel: chain exactly one
     /// (<see cref="WithInMemoryChannel"/> or the Redis channel package's <c>WithRedisChannel</c>) and
     /// exactly one worker transport (<see cref="WithInMemoryTransport"/> or a broker transport
-    /// package such as <c>WithGooglePubSubTransport</c> / <c>WithRabbitMqTransport</c>). An app
-    /// that starts without either one fails fast at host startup.
+    /// package such as <c>WithGooglePubSubTransport</c> / <c>WithRabbitMqTransport</c>), and exactly
+    /// one durable-flow state store (<see cref="WithInMemoryDurableFlows"/> or a provider package).
+    /// An app that starts without any of these choices fails fast at host startup.
     /// </summary>
     public static AsyncResponseRegistrationBuilder AddAsyncResponse(
         this IServiceCollection services,
@@ -39,8 +40,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>()));
 
-        // Fail fast before background services do any real work if the required channel/transport
-        // choices were not made explicitly.
+        // Fail fast before background services do any real work if the required channel,
+        // transport, and durable-flow store choices were not made explicitly.
         services.AddHostedService<AsyncResponseStartupValidator>();
 
         // The recovery watchdog is part of the engine and runs by default for whatever channel is
@@ -48,46 +49,81 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.TryAddSingleton<AsyncResponseWatchdogState>();
         services.AddHostedService<AsyncResponseWatchdog>();
 
-        // Durable flows (the checkpointed-flow pattern as a first-class API). Flow state rides in
-        // the configured channel's recovery store by default for tests/dev/migration. Production
-        // apps should use a DurableFlows.* package or call WithCustomDurableFlows<TStore>() to keep
-        // state in app-owned durable storage.
-        services.TryAddSingleton<IFlowStateStore>(provider => new RecoveryBackedFlowStateStore(
-            provider.GetRequiredService<IRecoveryStateStore>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RecoveryBackedFlowStateStore>>()));
-        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
-            provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IAsyncResponseBuilder>(),
-            provider.GetRequiredService<IAsyncResponseSubscriber>(),
-            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
-        services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
-            provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IAsyncResponseBuilder>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowService>>()));
-
         return new AsyncResponseRegistrationBuilder(services);
     }
 
     /// <summary>
-    /// Uses an application-owned store for durable-flow state. Recommended for production durable
-    /// flows: keep run ledgers in your database/document store instead of the channel recovery
-    /// cache used by the default dev/test store.
+    /// Uses an application-owned store for durable-flow state. The store must implement atomic
+    /// creation, revision-checked updates, and execution leases. Use
+    /// <see cref="WithInMemoryDurableFlows"/> explicitly for a process-local development or test
+    /// store; <see cref="AddAsyncResponse"/> does not select one implicitly.
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithCustomDurableFlows<TFlowStateStore>(this AsyncResponseRegistrationBuilder builder)
+    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore>(
+        this AsyncResponseRegistrationBuilder builder,
+        Action<DurableFlowOptions>? configure = null)
         where TFlowStateStore : class, IFlowStateStore
+        => builder.WithDurableFlows<TFlowStateStore, DurableFlowOptions>(configure);
+
+    /// <summary>
+    /// Registers an application or provider-owned durable-flow store whose options combine the
+    /// common <see cref="DurableFlowOptions"/> settings with store-specific settings. Provider
+    /// packages use this overload to expose one cohesive <c>With*DurableFlows(...)</c> callback.
+    /// </summary>
+    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore, TOptions>(
+        this AsyncResponseRegistrationBuilder builder,
+        Action<TOptions>? configure = null)
+        where TFlowStateStore : class, IFlowStateStore
+        where TOptions : DurableFlowOptions
     {
+        builder.Services.AddOptions<TOptions>();
+        if (configure is not null)
+            builder.Services.Configure(configure);
+
+        // The engine consumes the same configured instance as the provider store, viewed through
+        // the common base type. This keeps all durable-flow settings in one callback without a
+        // second options object or per-execution adaptation/allocation.
+        builder.Services.AddSingleton<DurableFlowOptions>(provider =>
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<TOptions>>().Value);
+
         // Forward the interface to the concrete registration so resolving either yields the same
         // instance within a scope. TryAdd lets callers (and the DurableFlows.* packages) pre-register
         // the concrete type with a different lifetime — e.g. singleton for stores whose dependencies
         // are all singletons — without this scoped default overriding it.
         builder.Services.TryAddScoped<TFlowStateStore>();
         builder.Services.AddScoped<IFlowStateStore>(provider => provider.GetRequiredService<TFlowStateStore>());
+        builder.Services.AddSingleton(new AsyncResponseDurableFlowStoreMarker(typeof(TFlowStateStore)));
+        AddDurableFlowEngine(builder.Services);
         return builder;
+    }
+
+    /// <summary>
+    /// Uses an atomic process-local flow-state store. Intended for development, tests, and
+    /// single-process apps; choose a DurableFlows provider package for multi-replica execution.
+    /// </summary>
+    public static AsyncResponseRegistrationBuilder WithInMemoryDurableFlows(
+        this AsyncResponseRegistrationBuilder builder,
+        Action<DurableFlowOptions>? configure = null)
+    {
+        builder.Services.TryAddSingleton<InMemoryFlowStateStore>();
+        return builder.WithDurableFlows<InMemoryFlowStateStore>(configure);
+    }
+
+    private static void AddDurableFlowEngine(IServiceCollection services)
+    {
+        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<IAsyncResponseSubscriber>(),
+            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetRequiredService<DurableFlowOptions>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
+        services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetRequiredService<DurableFlowOptions>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowService>>()));
     }
 
     /// <summary>
@@ -143,9 +179,14 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// for distributed, durable execution use a full broker-backed transport package such as
     /// <c>WithGooglePubSubTransport</c> or <c>WithRabbitMqTransport</c>.
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithInMemoryTransport(this AsyncResponseRegistrationBuilder builder)
+    public static AsyncResponseRegistrationBuilder WithInMemoryTransport(
+        this AsyncResponseRegistrationBuilder builder,
+        Action<InMemoryWorkerTransportOptions>? configure = null)
     {
         var services = builder.Services;
+        services.AddOptions();
+        if (configure is not null)
+            services.Configure(configure);
         services.TryAddSingleton<WorkerJobExecutor>();
         services.TryAddSingleton<InMemoryWorkerTransport>();
         services.TryAddSingleton<IWorkerTransport>(provider => provider.GetRequiredService<InMemoryWorkerTransport>());

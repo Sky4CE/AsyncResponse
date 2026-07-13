@@ -35,7 +35,7 @@ builder.AddServiceDefaults();
 builder.Services.AddOpenApi();
 
 // --- Provider selection (configuration-driven) ----------------------------------------------
-// Channel = the response/recovery substrate (exactly one); Transport = worker dispatch (exactly one).
+// Channel = response/recovery, transport = worker dispatch, durable store = flow ledgers (exactly one each).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
 // override them to Redis + broker transports to exercise the durable, broker-backed stack.
 var channel = builder.Configuration["AsyncResponse:Channel"] ?? "InMemory";      // InMemory | Redis | NATS | PostgreSQL | SqlServer | MongoDB
@@ -532,11 +532,8 @@ asyncResponse
     .WithContextPropagator<SampleTracePropagator>()
     .WithContextPropagator<SampleTenantPropagator>();
 
-// Durable-flow state store (opt-in). By default durable flows checkpoint through the channel's
-// recovery store — fine for dev/test, but production flows should use a DurableFlows.* package.
-// Set AsyncResponse:DurableFlowStore=sqlite (or the ASYNCRESPONSE_SAMPLE_DURABLE_STORE env var) to
-// persist flow ledgers with the AsyncResponse.DurableFlows.Sqlite package instead: flow state then
-// survives restarts independently of the channel.
+// Exactly one durable-flow store (enforced at host startup), independent from waiter recovery
+// state. The sample defaults to process-local state; choose SQLite or MongoDB for restart durability.
 var durableFlowStore = builder.Configuration["AsyncResponse:DurableFlowStore"]
     ?? Environment.GetEnvironmentVariable("ASYNCRESPONSE_SAMPLE_DURABLE_STORE");
 if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase))
@@ -550,6 +547,10 @@ else if (string.Equals(durableFlowStore, "mongodb", StringComparison.OrdinalIgno
     // IMongoDatabase registered above — the same server backs channel, transport, and flow state.
     asyncResponse.WithMongoDbDurableFlows(options =>
         options.CollectionName = builder.Configuration["MongoDB:FlowStateCollection"] ?? options.CollectionName);
+}
+else
+{
+    asyncResponse.WithInMemoryDurableFlows();
 }
 
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
@@ -2433,6 +2434,7 @@ app.MapPost("/seed-recovery", async (IRecoveryStateStore store, string correlati
 {
     await store.SaveAsync(correlationId, new RecoveryState
     {
+        RegistrationId = Guid.NewGuid(),
         CorrelationId = correlationId,
         PayloadTypeFullName = typeof(OperationResult).FullName,
         RegisteredAtUtc = DateTime.UtcNow.AddMinutes(-(ageMinutes ?? 5))
@@ -2444,7 +2446,12 @@ app.MapPost("/seed-recovery", async (IRecoveryStateStore store, string correlati
 
 app.MapDelete("/test/recovery/{correlationId}", async (IRecoveryStateStore store, string correlationId) =>
 {
-    var deleted = await store.TryDeleteAsync(correlationId);
+    var deleted = 0;
+    foreach (var state in await store.GetAllAsync(correlationId))
+    {
+        if (await store.TryDeleteAsync(correlationId, state.RegistrationId))
+            deleted++;
+    }
     return Results.Ok(new { deleted });
 })
 .WithTags("Observability");
@@ -2455,7 +2462,7 @@ app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateS
     await foreach (var state in scanner.ScanAsync(cancellationToken))
     {
         if (!string.IsNullOrWhiteSpace(state.CorrelationId)
-            && await store.TryDeleteAsync(state.CorrelationId, cancellationToken))
+            && await store.TryDeleteAsync(state.CorrelationId, state.RegistrationId, cancellationToken))
         {
             deleted++;
         }

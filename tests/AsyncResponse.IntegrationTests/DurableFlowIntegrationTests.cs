@@ -104,16 +104,21 @@ public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : In
         var done = await WaitForCallAsync(Client, $"flow-done:{flowId}");
         Assert.Equal("flow-done", done.Kind);
 
-        // A second start with the same id re-enqueues the existing (already succeeded) run: the
-        // state is neither reset nor duplicated, and no step re-executes.
-        var second = await Client.PostAsync($"/durable-flow?name=other&flowId={flowId}", content: null);
+        // An identical retry re-enqueues the existing (already succeeded) run: the state is neither
+        // reset nor duplicated, and no step re-executes.
+        var second = await Client.PostAsync($"/durable-flow?name=itest&flowId={flowId}", content: null);
         second.EnsureSuccessStatusCode();
         Assert.Equal(flowId, (await second.Content.ReadFromJsonAsync<StartFlowResult>())!.FlowId);
+
+        // The id is permanently bound to its original flow contract. A different input is a
+        // conflicting command, not an idempotent retry, and must never silently reuse old work.
+        var conflicting = await Client.PostAsync($"/durable-flow?name=other&flowId={flowId}", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.InternalServerError, conflicting.StatusCode);
 
         await Task.Delay(500);
         var state = await Client.GetFromJsonAsync<FlowStateDto>($"/durable-flow/{flowId}");
         Assert.Equal((int)FlowRunStatus.Succeeded, state!.Status);
-        Assert.Contains("itest", state.InputJson); // the original input won; "other" did not overwrite
+        Assert.Contains("itest", state.InputJson);
     }
 
     [Fact]

@@ -79,7 +79,7 @@ public class InMemoryAsyncResponseTests
         var resumed = Assert.IsType<OperationResult>(Assert.Single(spy.ResumedPayloads));
         Assert.Equal("recovered", resumed.Message);
         Assert.Empty(spy.Failures);
-        Assert.Null(await store.GetAsync(CorrelationId));
+        Assert.Empty(await store.GetAllAsync(CorrelationId));
     }
 
     [Fact]
@@ -105,7 +105,7 @@ public class InMemoryAsyncResponseTests
         }
 
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -134,7 +134,7 @@ public class InMemoryAsyncResponseTests
         Assert.Equal("done", (await first.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         Assert.Equal("done", (await second.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -257,6 +257,69 @@ public class InMemoryAsyncResponseTests
             correlationId);
 
         Assert.Equal("done", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+    }
+
+    [Fact]
+    public async Task ConcurrentPublishes_InvokeOneWaiterPredicateSerially()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+        var correlationId = $"{CorrelationId}-serialized-predicate";
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var active = 0;
+        var maxActive = 0;
+        var calls = 0;
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            completionPredicate: async payload =>
+            {
+                var nowActive = Interlocked.Increment(ref active);
+                var observed = Volatile.Read(ref maxActive);
+                while (nowActive > observed)
+                {
+                    var prior = Interlocked.CompareExchange(ref maxActive, nowActive, observed);
+                    if (prior == observed)
+                        break;
+                    observed = prior;
+                }
+
+                var call = Interlocked.Increment(ref calls);
+                try
+                {
+                    if (call == 1)
+                    {
+                        firstEntered.TrySetResult();
+                        await releaseFirst.Task.ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await Task.Delay(2).ConfigureAwait(false);
+                    }
+
+                    return payload.Status == OperationStatus.Completed;
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref active);
+                }
+            },
+            timeout: TimeSpan.FromSeconds(10));
+
+        var first = publisher.SetResponse(new OperationResult { Status = OperationStatus.Running }, correlationId);
+        await firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var publishes = Enumerable.Range(0, 20)
+            .Select(_ => publisher.SetResponse(new OperationResult { Status = OperationStatus.Running }, correlationId))
+            .ToList();
+        publishes.Add(publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId));
+        releaseFirst.TrySetResult();
+
+        await Task.WhenAll(publishes.Prepend(first));
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Status);
+        Assert.Equal(1, maxActive);
+        Assert.True(calls >= 2);
     }
 
     [Fact]
@@ -475,13 +538,13 @@ public class InMemoryAsyncResponseTests
 
         Assert.Equal("first", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
 
         await publisher.SetResponse(
             new OperationResult { Status = OperationStatus.Failed, Message = "late" },
             correlationId);
 
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -512,7 +575,7 @@ public class InMemoryAsyncResponseTests
         Assert.Equal(correlationId, failure.CorrelationId);
         Assert.Equal(typeof(SelfReferencingFailurePayload).FullName, failure.PayloadTypeFullName);
         Assert.Null(failure.PayloadJson);
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -540,7 +603,7 @@ public class InMemoryAsyncResponseTests
         var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(spy.Failures));
         Assert.Equal(correlationId, failure.CorrelationId);
         Assert.Equal("null", failure.PayloadJson);
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -559,7 +622,7 @@ public class InMemoryAsyncResponseTests
         await waiter.DisposeAsync();
 
         Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -627,9 +690,6 @@ public class InMemoryAsyncResponseTests
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(failure);
         store
-            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        store
             .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
         var channel = new InMemoryAsyncResponseChannel(
@@ -670,9 +730,6 @@ public class InMemoryAsyncResponseTests
                 saveStarted.TrySetResult();
                 await releaseSave.Task.ConfigureAwait(false);
             });
-        store
-            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
         store
             .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
@@ -754,7 +811,7 @@ public class InMemoryAsyncResponseTests
 
         Assert.Empty(spy.ResumedPayloads);
         Assert.Empty(spy.Failures);
-        Assert.NotNull(await store.GetAsync(correlationId));
+        Assert.NotEmpty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -767,7 +824,7 @@ public class InMemoryAsyncResponseTests
 
         await publisher.SetException(new InvalidOperationException("remote failure"), correlationId);
 
-        Assert.Null(await store.GetAsync(correlationId));
+        Assert.Empty(await store.GetAllAsync(correlationId));
     }
 
     [Fact]
@@ -867,9 +924,6 @@ public class InMemoryAsyncResponseTests
             CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
-        public Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
-            => Task.FromResult<RecoveryState?>(null);
-
         public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(
             string correlationId,
             CancellationToken cancellationToken = default)
@@ -891,9 +945,6 @@ public class InMemoryAsyncResponseTests
                 }
             ];
         }
-
-        public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
-            => Task.FromResult(true);
 
         public Task<bool> TryDeleteAsync(
             string correlationId,

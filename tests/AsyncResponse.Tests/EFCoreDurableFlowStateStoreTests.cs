@@ -104,26 +104,74 @@ public sealed class EFCoreDurableFlowStateStoreTests
     }
 
     [Fact]
-    public async Task EFCoreStore_ConcurrentUpsertsOfSameFlowIds_LoseTheInsertRaceGracefully()
+    public async Task EFCoreStore_ConcurrentCreatesOfSameFlowIds_LoseTheInsertRaceGracefully()
     {
         await using var database = new TempSqliteDatabase();
         await database.EnsureSchemaAsync();
         await using var provider = BuildFactoryProvider(database.ConnectionString + ";Default Timeout=10");
         var store = CreateStore(provider);
 
-        // 8 flow ids, each hammered by 8 concurrent first-time saves: whoever loses the insert
-        // race must fall back to updating the winner's row instead of surfacing DbUpdateException.
+        // Eight flow ids, each hammered by eight concurrent creates: losers return false instead of
+        // surfacing the provider's unique-key exception.
         await Parallel.ForEachAsync(
             Enumerable.Range(0, 64),
             new ParallelOptions { MaxDegreeOfParallelism = 8 },
             async (i, _) =>
             {
                 var flowId = $"flow-race-{i % 8}";
-                await store.SaveAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
+                await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
             });
 
         for (var i = 0; i < 8; i++)
             Assert.NotNull(await store.LoadAsync($"flow-race-{i}"));
+    }
+
+    [Fact]
+    public async Task EFCoreStore_DoesNotMisreportNonDuplicateInsertFailureAsExistingFlow()
+    {
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        await database.ExecuteSqlAsync(
+            """
+            CREATE TRIGGER reject_flow_insert
+            BEFORE INSERT ON asyncresponse_flow_state
+            WHEN NEW.flow_id = 'rejected-flow'
+            BEGIN
+                SELECT RAISE(ABORT, 'insert rejected by test trigger');
+            END;
+            """);
+        await using var provider = BuildFactoryProvider(database.ConnectionString);
+        var store = CreateStore(provider);
+
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => store.TryCreateAsync(
+                "rejected-flow",
+                CreateState("rejected-flow"),
+                TimeSpan.FromMinutes(5)));
+    }
+
+    [Fact]
+    public async Task EFCoreStore_RevisionAndLeaseContract()
+    {
+        await using var database = new TempSqliteDatabase();
+        await database.EnsureSchemaAsync();
+        await using var provider = BuildFactoryProvider(database.ConnectionString);
+        IFlowStateStore store = CreateStore(provider);
+
+        var state = CreateState("concurrent-flow");
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        Assert.False(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+        Assert.True(await store.TryAcquireLeaseAsync(state.FlowId!, "owner-a", TimeSpan.FromMinutes(1)));
+        Assert.False(await store.TryAcquireLeaseAsync(state.FlowId!, "owner-b", TimeSpan.FromMinutes(1)));
+
+        state.Revision = 1;
+        state.LastMessage = "updated";
+        Assert.True(await store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5), "owner-a"));
+        Assert.False(await store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5), "owner-a"));
+        Assert.Equal(1, (await store.LoadAsync(state.FlowId!))!.Revision);
+
+        await store.ReleaseLeaseAsync(state.FlowId!, "owner-a");
+        Assert.True(await store.TryAcquireLeaseAsync(state.FlowId!, "owner-b", TimeSpan.FromMinutes(1)));
     }
 
     [Fact]
@@ -132,11 +180,11 @@ public sealed class EFCoreDurableFlowStateStoreTests
         await using var database = new TempSqliteDatabase();
         await database.EnsureSchemaAsync();
         await using var provider = BuildFactoryProvider(database.ConnectionString);
-        var store = CreateStore(provider, pruneInterval: TimeSpan.Zero); // prune on every save
+        var store = CreateStore(provider, pruneInterval: TimeSpan.Zero); // prune on every create
 
-        await store.SaveAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1));
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1)));
         await Task.Delay(30);
-        await store.SaveAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5));
+        Assert.True(await store.TryCreateAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5)));
 
         // Regression guard: expired rows must be physically deleted by the opportunistic prune,
         // not merely filtered out on load — otherwise the table grows forever.
@@ -152,10 +200,10 @@ public sealed class EFCoreDurableFlowStateStoreTests
         await using var provider = BuildFactoryProvider(database.ConnectionString);
         var store = CreateStore(provider, pruneInterval: TimeSpan.FromHours(1));
 
-        // The first save always prunes (the throttle starts elapsed); this one arms the throttle.
-        await store.SaveAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1));
+        // The first create always prunes (the throttle starts elapsed); this one arms the throttle.
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1)));
         await Task.Delay(30);
-        await store.SaveAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5));
+        Assert.True(await store.TryCreateAsync("live-flow", CreateState("live-flow"), TimeSpan.FromMinutes(5)));
 
         // Within the prune interval the expired row survives physically, but loads must already
         // treat it as absent — expiry correctness never depends on pruning.
@@ -210,7 +258,7 @@ public sealed class EFCoreDurableFlowStateStoreTests
             async (i, _) =>
             {
                 var flowId = $"flow-storm-{i}";
-                await store.SaveAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5));
+                Assert.True(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
                 Assert.NotNull(await store.LoadAsync(flowId));
                 Assert.True(await store.TryDeleteAsync(flowId));
                 Assert.Null(await store.LoadAsync(flowId));
@@ -221,7 +269,7 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         var state = CreateState("flow-example");
 
-        await store.SaveAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
 
         var loaded = await store.LoadAsync(state.FlowId!);
         Assert.NotNull(loaded);
@@ -231,10 +279,11 @@ public sealed class EFCoreDurableFlowStateStoreTests
 
         state.Status = FlowRunStatus.Succeeded;
         state.LastMessage = "done";
-        await store.SaveAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        state.Revision = 1;
+        Assert.True(await store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5)));
         Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(state.FlowId!))!.Status);
 
-        await store.SaveAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1));
+        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), TimeSpan.FromMilliseconds(1)));
         await Task.Delay(30);
         Assert.Null(await store.LoadAsync("expired-flow"));
 
@@ -281,6 +330,12 @@ public sealed class EFCoreDurableFlowStateStoreTests
         {
             await using var context = CreateContext();
             return await context.Set<DurableFlowStateRecord>().CountAsync(r => r.FlowId == flowId);
+        }
+
+        public async Task ExecuteSqlAsync(string sql)
+        {
+            await using var context = CreateContext();
+            await context.Database.ExecuteSqlRawAsync(sql);
         }
 
         private TestFlowDbContext CreateContext()

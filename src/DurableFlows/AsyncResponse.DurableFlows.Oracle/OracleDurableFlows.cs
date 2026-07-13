@@ -16,15 +16,11 @@ namespace Microsoft.Extensions.DependencyInjection
             this AsyncResponseRegistrationBuilder builder,
             Action<OracleDurableFlowOptions>? configure = null)
         {
-            builder.Services.AddOptions();
-            if (configure is not null)
-                builder.Services.Configure(configure);
-
             // Singleton on purpose: schema provisioning is cached per store instance, and the
             // executor resolves the store from a fresh scope per flow execution — a scoped store
             // would re-run EnsureCreated's DDL round-trip on every run.
             builder.Services.TryAddSingleton<OracleFlowStateStore>();
-            return builder.WithCustomDurableFlows<OracleFlowStateStore>();
+            return builder.WithDurableFlows<OracleFlowStateStore, OracleDurableFlowOptions>(configure);
         }
     }
 }
@@ -32,7 +28,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.Oracle
 {
 /// <summary>Options for the Oracle durable-flow state store.</summary>
-public sealed class OracleDurableFlowOptions
+public sealed class OracleDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>Oracle connection string. Required.</summary>
     public string? ConnectionString { get; set; }
@@ -44,7 +40,7 @@ public sealed class OracleDurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="OracleFlowStateStore.SaveAsync"/> opportunistically deletes expired rows
+    /// How often <see cref="OracleFlowStateStore.TryCreateAsync"/> opportunistically deletes expired rows
     /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
     /// prunes on every save. Default: 5 minutes.
     /// </summary>
@@ -77,53 +73,6 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         _options.Validate();
     }
 
-    public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-    {
-        DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
-        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
-
-        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            await MergeAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OracleException ex) when (ex.Number == UniqueConstraintViolated)
-        {
-            // Oracle MERGE has no HOLDLOCK equivalent: two concurrent saves for the same NEW flow
-            // id can both take WHEN NOT MATCHED, and the loser dies with ORA-00001. The row exists
-            // now, so one retry takes the MATCHED branch — ordinary last-writer-wins, matching the
-            // other stores' atomic upserts.
-            await MergeAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private async Task MergeAsync(OracleConnection connection, string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken)
-    {
-        await using var command = connection.CreateCommand();
-        command.BindByName = true;
-        command.CommandText =
-            $"""
-            MERGE INTO {Table} target
-            USING (SELECT :flow_id AS flow_id FROM dual) source
-                ON (target.flow_id = source.flow_id)
-            WHEN MATCHED THEN
-                UPDATE SET target.state_json = :state_json,
-                           target.expires_at_utc = :expires_at_utc,
-                           target.updated_at_utc = :updated_at_utc
-            WHEN NOT MATCHED THEN
-                INSERT (flow_id, state_json, expires_at_utc, updated_at_utc)
-                VALUES (:flow_id, :state_json, :expires_at_utc, :updated_at_utc)
-            """;
-        var now = DateTime.UtcNow;
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = DurableFlowStoreShared.Serialize(state) });
-        command.Parameters.Add(new OracleParameter("expires_at_utc", now.Add(ttl)));
-        command.Parameters.Add(new OracleParameter("updated_at_utc", now));
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
@@ -132,21 +81,136 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.BindByName = true;
-        command.CommandText = $"SELECT state_json FROM {Table} WHERE flow_id = :flow_id AND expires_at_utc > :now_utc";
+        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = :flow_id AND expires_at_utc > :now_utc";
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
         command.Parameters.Add(new OracleParameter("now_utc", DateTime.UtcNow));
 
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        switch (result)
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        FlowState? state;
+        switch (reader.GetValue(0))
         {
             case string json:
-                return DurableFlowStoreShared.Deserialize(json);
+                state = DurableFlowStoreShared.Deserialize(json);
+                break;
             case OracleClob clob:
                 using (clob)
-                    return DurableFlowStoreShared.Deserialize(clob.Value);
+                    state = DurableFlowStoreShared.Deserialize(clob.Value);
+                break;
             default:
                 return null;
         }
+
+        return state?.Revision == reader.GetInt64(1) ? state : null;
+    }
+
+    public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await TryCreateCoreAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OracleException ex) when (ex.Number == UniqueConstraintViolated)
+        {
+            return await TryCreateCoreAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<bool> TryCreateCoreAsync(
+        OracleConnection connection,
+        string flowId,
+        FlowState state,
+        TimeSpan ttl,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText =
+            $"""
+            MERGE INTO {Table} target
+            USING (SELECT :flow_id AS flow_id FROM dual) source ON (target.flow_id = source.flow_id)
+            WHEN MATCHED THEN UPDATE SET
+                target.state_json = :state_json,
+                target.expires_at_utc = :expires_at_utc,
+                target.updated_at_utc = :now_utc,
+                target.revision = :revision,
+                target.lease_id = NULL,
+                target.lease_expires_at_utc = NULL
+                WHERE target.expires_at_utc <= :now_utc
+            WHEN NOT MATCHED THEN
+                INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
+                VALUES (:flow_id, :state_json, :expires_at_utc, :now_utc, :revision)
+            """;
+        var now = DateTime.UtcNow;
+        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = DurableFlowStoreShared.Serialize(state) });
+        command.Parameters.Add(new OracleParameter("expires_at_utc", now.Add(ttl)));
+        command.Parameters.Add(new OracleParameter("now_utc", now));
+        command.Parameters.Add(new OracleParameter("revision", state.Revision));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    public async Task<bool> TryUpdateAsync(
+        string flowId,
+        FlowState state,
+        long expectedRevision,
+        TimeSpan ttl,
+        string? leaseId = null,
+        CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText =
+            $"""
+            UPDATE {Table}
+            SET state_json = :state_json,
+                expires_at_utc = :expires_at_utc,
+                updated_at_utc = :now_utc,
+                revision = :new_revision
+            WHERE flow_id = :flow_id
+              AND revision = :expected_revision
+              AND expires_at_utc > :now_utc
+              AND (:lease_id IS NULL OR (lease_id = :lease_id AND lease_expires_at_utc > :now_utc))
+            """;
+        var now = DateTime.UtcNow;
+        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = DurableFlowStoreShared.Serialize(state) });
+        command.Parameters.Add(new OracleParameter("expires_at_utc", now.Add(ttl)));
+        command.Parameters.Add(new OracleParameter("now_utc", now));
+        command.Parameters.Add(new OracleParameter("expected_revision", expectedRevision));
+        command.Parameters.Add(new OracleParameter("new_revision", state.Revision));
+        command.Parameters.Add(new OracleParameter("lease_id", OracleDbType.NVarchar2) { Value = (object?)leaseId ?? DBNull.Value });
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: true, cancellationToken);
+
+    public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: false, cancellationToken);
+
+    public async Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText = $"UPDATE {Table} SET lease_id = NULL, lease_expires_at_utc = NULL WHERE flow_id = :flow_id AND lease_id = :lease_id";
+        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(new OracleParameter("lease_id", leaseId));
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -191,7 +255,10 @@ public sealed class OracleFlowStateStore : IFlowStateStore
                     flow_id NVARCHAR2(400) NOT NULL PRIMARY KEY,
                     state_json NCLOB NOT NULL,
                     expires_at_utc TIMESTAMP(6) NOT NULL,
-                    updated_at_utc TIMESTAMP(6) NOT NULL
+                    updated_at_utc TIMESTAMP(6) NOT NULL,
+                    revision NUMBER(19) DEFAULT 0 NOT NULL,
+                    lease_id NVARCHAR2(64) NULL,
+                    lease_expires_at_utc TIMESTAMP(6) NULL
                 )
                 """,
                 cancellationToken).ConfigureAwait(false);
@@ -218,6 +285,38 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         catch (OracleException ex) when (ex.Number == ObjectAlreadyExists)
         {
         }
+    }
+
+    private async Task<bool> UpdateLeaseAsync(
+        string flowId,
+        string leaseId,
+        TimeSpan leaseDuration,
+        bool acquire,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        if (leaseDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        var now = DateTime.UtcNow;
+        command.CommandText =
+            $"""
+            UPDATE {Table}
+            SET lease_id = :lease_id, lease_expires_at_utc = :lease_expires_at_utc
+            WHERE flow_id = :flow_id
+              AND expires_at_utc > :now_utc
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= :now_utc OR lease_id = :lease_id)" : "lease_id = :lease_id AND lease_expires_at_utc > :now_utc")}
+            """;
+        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(new OracleParameter("lease_id", leaseId));
+        command.Parameters.Add(new OracleParameter("now_utc", now));
+        command.Parameters.Add(new OracleParameter("lease_expires_at_utc", now.Add(leaseDuration)));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
     private async Task<OracleConnection> OpenConnectionAsync(CancellationToken cancellationToken)

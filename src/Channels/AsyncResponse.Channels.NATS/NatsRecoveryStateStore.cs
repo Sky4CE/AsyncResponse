@@ -45,6 +45,10 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         ArgumentNullException.ThrowIfNull(state);
         if (ttl <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
+        if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            throw new ArgumentException("The recovery-state correlation id must match the store key.", nameof(state));
+        if (state.SchemaVersion != RecoveryStateSchema.Current)
+            throw new ArgumentException("The recovery state must use the current schema version.", nameof(state));
 
         cancellationToken.ThrowIfCancellationRequested();
         if (state.RegistrationId == Guid.Empty)
@@ -53,8 +57,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
 
         // Revision-conditioned read-modify-write: two waiters registering the same correlation id
-        // concurrently must both survive, so a plain Put (which silently overwrites the other
-        // writer's list) is only acceptable as a last resort.
+        // concurrently must both survive.
         for (var attempt = 0; attempt < MaxCasAttempts; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -64,6 +67,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             var states = stored is not null && !IsExpired(stored)
                 ? StatesFrom(stored)
                 : [];
+            states.RemoveAll(existingState => !IsStateReadable(existingState, key, correlationId));
             states.RemoveAll(existingState => existingState.RegistrationId == state.RegistrationId);
             states.Add(state);
             var json = SerializeStates(states, _timeProvider.GetUtcNow() + ttl);
@@ -75,24 +79,9 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 return;
         }
 
-        // Registering recovery must not fail the wait: fall back to last-writer-wins after
-        // sustained contention (pathological for a single correlation id) and say so.
-        _logger.LogWarning(
-            "Recovery-state save for correlationId {CorrelationId} exhausted {Attempts} optimistic attempts; falling back to an unconditional write.",
-            correlationId, MaxCasAttempts);
-        var fallbackEntry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-        var fallbackStored = fallbackEntry is { } fe ? TryDeserialize(fe.Value, key) : null;
-        var fallbackStates = fallbackStored is not null && !IsExpired(fallbackStored)
-            ? StatesFrom(fallbackStored)
-            : [];
-        fallbackStates.RemoveAll(existingState => existingState.RegistrationId == state.RegistrationId);
-        fallbackStates.Add(state);
-        await PutStatesAsync(key, fallbackStates, _timeProvider.GetUtcNow() + ttl, cancellationToken).ConfigureAwait(false);
+        throw new InvalidOperationException(
+            $"Recovery-state save for correlationId '{correlationId}' could not commit after {MaxCasAttempts} optimistic attempts.");
     }
-
-    /// <inheritdoc />
-    public async Task<RecoveryState?> GetAsync(string correlationId, CancellationToken cancellationToken = default)
-        => (await GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false)).FirstOrDefault();
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
@@ -117,31 +106,22 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         for (var i = states.Count - 1; i >= 0; i--)
         {
             var state = states[i];
-            if (!IsSchemaReadable(state, key))
+            if (!IsStateReadable(state, key, correlationId))
             {
                 states.RemoveAt(i);
                 continue;
             }
-
-            if (string.IsNullOrWhiteSpace(state.CorrelationId))
-                state.CorrelationId = correlationId;
         }
 
         return states;
     }
 
     /// <inheritdoc />
-    public Task<bool> TryDeleteAsync(string correlationId, CancellationToken cancellationToken = default)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
-        cancellationToken.ThrowIfCancellationRequested();
-        return _store.DeleteAsync(NatsSubjectSchema.RecoveryKey(correlationId), cancellationToken);
-    }
-
-    /// <inheritdoc />
     public async Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(correlationId);
+        if (registrationId == Guid.Empty)
+            throw new ArgumentException("Registration id cannot be empty.", nameof(registrationId));
         cancellationToken.ThrowIfCancellationRequested();
 
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
@@ -167,6 +147,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             }
 
             var states = StatesFrom(stored);
+            states.RemoveAll(state => !IsStateReadable(state, key, correlationId));
             var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
             if (!removed)
                 return false;
@@ -203,12 +184,9 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
             foreach (var state in StatesFrom(stored))
             {
-                if (!IsSchemaReadable(state, key))
+                var correlationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
+                if (!IsStateReadable(state, key, correlationId))
                     continue;
-
-                // Older entries may predate the persisted correlation id; recover it from the key.
-                if (string.IsNullOrWhiteSpace(state.CorrelationId))
-                    state.CorrelationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
 
                 yield return state;
             }
@@ -226,28 +204,36 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     private static string SerializeStates(List<RecoveryState> states, DateTimeOffset expiresAtUtc)
         => JsonSerializer.Serialize(new StoredRecoveryState
         {
-            State = states[0],
             States = states,
             ExpiresAtUtc = expiresAtUtc
         });
 
-    private Task PutStatesAsync(
-        string key,
-        List<RecoveryState> states,
-        DateTimeOffset expiresAtUtc,
-        CancellationToken cancellationToken)
-        => _store.PutAsync(key, SerializeStates(states, expiresAtUtc), cancellationToken);
-
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
 
-    private bool IsSchemaReadable(RecoveryState state, string key)
+    private bool IsStateReadable(RecoveryState? state, string key, string correlationId)
     {
-        if (RecoveryStateSchema.IsReadable(state.SchemaVersion))
+        if (state is null || state.RegistrationId == Guid.Empty)
+        {
+            _logger.LogWarning(
+                "Recovery state at key {RecoveryKey} has no registration id; rejecting it because it cannot be deleted safely.",
+                key);
+            return false;
+        }
+
+        if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
+        {
+            _logger.LogWarning(
+                "Recovery state at key {RecoveryKey} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
+                key, state.SchemaVersion, RecoveryStateSchema.Current);
+            return false;
+        }
+
+        if (string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
             return true;
 
         _logger.LogWarning(
-            "Recovery state at key {RecoveryKey} has schema version {SchemaVersion}, newer than this build supports ({Current}); rejecting it instead of risking a misinterpreted recovery.",
-            key, state.SchemaVersion, RecoveryStateSchema.Current);
+            "Recovery state at key {RecoveryKey} has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
+            key, state.CorrelationId, correlationId);
         return false;
     }
 
@@ -265,9 +251,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     }
 
     private static List<RecoveryState> StatesFrom(StoredRecoveryState stored)
-        => stored.States is { Count: > 0 }
-            ? [.. stored.States]
-            : stored.State is null ? [] : [stored.State];
+        => stored.States is { Count: > 0 } ? [.. stored.States] : [];
 
     private async Task TryDeleteSilentlyAsync(string key, CancellationToken cancellationToken)
     {
@@ -284,7 +268,6 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     /// <summary>The stored envelope: the recovery state plus its absolute expiry, for per-key logical TTL.</summary>
     internal sealed class StoredRecoveryState
     {
-        public RecoveryState? State { get; set; }
         public List<RecoveryState>? States { get; set; }
         public DateTimeOffset ExpiresAtUtc { get; set; }
     }

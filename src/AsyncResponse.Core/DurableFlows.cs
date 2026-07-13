@@ -1,6 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -19,13 +18,14 @@ internal sealed class DurableFlowService : IDurableFlows
         IServiceScopeFactory scopeFactory,
         IAsyncResponseBuilder builder,
         AsyncResponseContextPropagation propagation,
-        IOptions<AsyncResponseOptions> options,
+        DurableFlowOptions options,
         ILogger<DurableFlowService> logger)
     {
         _scopeFactory = scopeFactory;
         _builder = builder;
         _propagation = propagation;
-        _options = options.Value.DurableFlows;
+        _options = options;
+        FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
     }
 
@@ -37,42 +37,54 @@ internal sealed class DurableFlowService : IDurableFlows
         where TFlow : class, IDurableFlow<TInput>
     {
         ArgumentNullException.ThrowIfNull(input);
-        flowId = string.IsNullOrWhiteSpace(flowId)
-            ? $"flow-{AsyncResponseContext.GenerateCorrelationId()}"
-            : flowId;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (flowId is null)
+            flowId = $"flow-{AsyncResponseContext.GenerateCorrelationId()}";
+        else
+            ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
 
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
-        var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
-        if (existing is null)
+        var now = DateTime.UtcNow;
+        var inputJson = JsonSerializer.Serialize(input);
+        var state = new FlowState
         {
-            var now = DateTime.UtcNow;
-            var state = new FlowState
-            {
-                FlowId = flowId,
-                FlowTypeName = typeof(TFlow).FullName,
-                InputTypeName = typeof(TInput).FullName,
-                InputJson = JsonSerializer.Serialize(input),
-                Status = FlowRunStatus.Running,
-                LastMessage = "Flow started.",
-                CreatedAtUtc = now,
-                UpdatedAtUtc = now,
-                Context = _propagation.Capture()
-            };
+            FlowId = flowId,
+            FlowTypeName = typeof(TFlow).FullName,
+            InputTypeName = typeof(TInput).FullName,
+            InputJson = inputJson,
+            Status = FlowRunStatus.Running,
+            LastMessage = "Flow started.",
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Context = _propagation.Capture()
+        };
 
-            await store.SaveAsync(flowId, state, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+        if (await FlowStateConcurrency.TryCreateAsync(
+                store,
+                flowId,
+                state,
+                _options.StateExpiry,
+                cancellationToken).ConfigureAwait(false))
+        {
             _logger.LogInformation("Started durable flow {FlowId} ({FlowType}).", flowId, typeof(TFlow).Name);
         }
         else
         {
-            // Idempotent start: a caller-supplied id that already exists just re-enqueues the run
-            // (completed steps skip), so retried API calls and operator kicks are safe.
+            var existing = await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidOperationException(
+                    $"Durable flow '{flowId}' already exists but its ledger is expired or unreadable.");
+            EnsureIdempotentStart<TFlow, TInput>(existing, inputJson, flowId);
+
+            // A semantically identical retry re-enqueues the existing run; completed steps skip.
             _logger.LogInformation("Durable flow {FlowId} already exists; re-enqueueing instead of creating a duplicate.", flowId);
         }
 
         var id = flowId;
-        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id)).ConfigureAwait(false);
+        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(
+            executor => executor.ExecuteAsync(id),
+            cancellationToken).ConfigureAwait(false);
         return flowId;
     }
 
@@ -94,7 +106,9 @@ internal sealed class DurableFlowService : IDurableFlows
         }
 
         var id = flowId;
-        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id)).ConfigureAwait(false);
+        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(
+            executor => executor.ExecuteAsync(id),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -106,4 +120,20 @@ internal sealed class DurableFlowService : IDurableFlows
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
         return await store.LoadAsync(flowId, cancellationToken).ConfigureAwait(false);
     }
+
+    private static void EnsureIdempotentStart<TFlow, TInput>(
+        FlowState existing,
+        string requestedInputJson,
+        string flowId)
+    {
+        var sameFlowType = string.Equals(existing.FlowTypeName, typeof(TFlow).FullName, StringComparison.Ordinal);
+        var sameInputType = string.Equals(existing.InputTypeName, typeof(TInput).FullName, StringComparison.Ordinal);
+        if (sameFlowType && sameInputType && FlowStateJson.JsonEquivalent(existing.InputJson, requestedInputJson))
+            return;
+
+        throw new InvalidOperationException(
+            $"Durable flow id '{flowId}' is already bound to a different flow type or input. " +
+            "Idempotent retries must use the same TFlow, TInput, and semantically identical input value.");
+    }
+
 }

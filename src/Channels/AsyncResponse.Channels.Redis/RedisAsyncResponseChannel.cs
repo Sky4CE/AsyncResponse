@@ -127,8 +127,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
 
-        if (_logger.IsEnabled(LogLevel.Information))
-            _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         var registrationId = Guid.NewGuid();
@@ -199,7 +199,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     finished = true;
                     var schemaError = new InvalidOperationException(
                         $"Response envelope for correlationId {correlationId} has schema version {envelope.SchemaVersion}, " +
-                        $"newer than this build supports ({AsyncResponseEnvelopeSchema.Current}); it was produced by a newer deployment.");
+                        $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
                     AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
                     if (!tcs.TrySetException(schemaError))
                         _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
@@ -222,8 +222,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
                 else
                 {
-                    if (_logger.IsEnabled(LogLevel.Information))
-                        _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Received response for correlationId {CorrelationId}.", correlationId);
 
                     finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
 
@@ -394,8 +394,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                if (_logger.IsEnabled(LogLevel.Information))
-                    _logger.LogInformation("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Published response for correlationId {CorrelationId} on channel {Channel}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, typeof(T), numSubscribers);
             }
         }
         catch (Exception ex)
@@ -444,8 +444,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             }
             else
             {
-                if (_logger.IsEnabled(LogLevel.Information))
-                    _logger.LogInformation("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug("Published raw response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
             }
         }
         catch (Exception ex)
@@ -499,9 +499,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
-            else if (_logger.IsEnabled(LogLevel.Information))
+            else if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogInformation("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
+                _logger.LogDebug("Published exception response for correlationId {CorrelationId} on channel {Channel}. Subscribers: {SubscriberCount}.", correlationId, channel.ToString()!, numSubscribers);
             }
         }
         catch (Exception ex)

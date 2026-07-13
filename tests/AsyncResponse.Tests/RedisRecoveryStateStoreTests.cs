@@ -74,6 +74,7 @@ public class RedisRecoveryStateStoreTests
 
         var state = new RecoveryState
         {
+            RegistrationId = Guid.NewGuid(),
             CorrelationId = "corr-a",
             PayloadTypeFullName = typeof(OperationResult).FullName,
             RegisteredAtUtc = DateTime.UtcNow
@@ -94,6 +95,15 @@ public class RedisRecoveryStateStoreTests
         await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(" ", state, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentNullException>(() => _store.SaveAsync("corr-a", null!, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.SaveAsync("corr-a", state, TimeSpan.Zero));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync("corr-a", Guid.Empty));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(
+            "corr-a",
+            new RecoveryState
+            {
+                CorrelationId = "corr-a",
+                SchemaVersion = RecoveryStateSchema.Current + 1
+            },
+            TimeSpan.FromSeconds(1)));
 
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
@@ -102,7 +112,7 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAsync_ReturnsNullForMissingOrMalformedState()
+    public async Task GetAllAsync_ReturnsEmptyForMissingOrMalformedState()
     {
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:missing", It.IsAny<CommandFlags>()))
@@ -111,37 +121,37 @@ public class RedisRecoveryStateStoreTests
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:broken", It.IsAny<CommandFlags>()))
             .ReturnsAsync("{not-json");
 
-        Assert.Null(await _store.GetAsync("missing"));
-        Assert.Null(await _store.GetAsync("broken"));
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.GetAsync(" "));
+        Assert.Empty(await _store.GetAllAsync("missing"));
+        Assert.Empty(await _store.GetAllAsync("broken"));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.GetAllAsync(" "));
 
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => _store.GetAsync("missing", canceled.Token));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => _store.GetAllAsync("missing", canceled.Token));
     }
 
     [Fact]
-    public async Task GetAsync_DeserializesStoredState()
+    public async Task GetAllAsync_DeserializesStoredState()
     {
         var state = new RecoveryState
         {
+            RegistrationId = Guid.NewGuid(),
             CorrelationId = "corr-a",
             PayloadTypeFullName = typeof(OperationResult).FullName,
             RegisteredAtUtc = DateTime.UtcNow
         };
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
-            .ReturnsAsync(JsonSerializer.Serialize(state));
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { state }));
 
-        var loaded = await _store.GetAsync("corr-a");
+        var loaded = Assert.Single(await _store.GetAllAsync("corr-a"));
 
-        Assert.NotNull(loaded);
-        Assert.Equal("corr-a", loaded!.CorrelationId);
+        Assert.Equal("corr-a", loaded.CorrelationId);
         Assert.Equal(typeof(OperationResult).FullName, loaded.PayloadTypeFullName);
     }
 
     [Fact]
-    public async Task GetAllAsync_DeserializesArrayAndLegacySingleObject()
+    public async Task GetAllAsync_DeserializesArrayAndRejectsSingleObject()
     {
         var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
         var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
@@ -153,11 +163,11 @@ public class RedisRecoveryStateStoreTests
             .ReturnsAsync(JsonSerializer.Serialize(new RecoveryState { CorrelationId = "legacy" }));
 
         Assert.Equal(2, (await _store.GetAllAsync("corr-a")).Count);
-        Assert.Single(await _store.GetAllAsync("legacy"));
+        Assert.Empty(await _store.GetAllAsync("legacy"));
     }
 
     [Fact]
-    public async Task GetAllAsync_FiltersUnreadableSchemaAndBackfillsCorrelationId()
+    public async Task GetAllAsync_FiltersUnreadableSchemaAndRequiresMatchingCorrelationId()
     {
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
@@ -167,11 +177,12 @@ public class RedisRecoveryStateStoreTests
                 {
                     RegistrationId = Guid.NewGuid(),
                     SchemaVersion = RecoveryStateSchema.Current + 1,
-                    CorrelationId = "future"
+                    CorrelationId = "corr-a"
                 },
                 new RecoveryState
                 {
                     RegistrationId = Guid.NewGuid(),
+                    CorrelationId = "corr-a",
                     PayloadTypeFullName = typeof(OperationResult).FullName,
                     RegisteredAtUtc = DateTime.UtcNow
                 }
@@ -183,22 +194,25 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task TryDeleteAsync_DeletesRecoveryKey()
+    public async Task TryDeleteAsync_DeletesSpecificRegistration()
     {
-        RedisKey deletedKey = default;
+        var registrationId = Guid.NewGuid();
         _database
-            .Setup(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .Callback<RedisKey, CommandFlags>((key, _) => deletedKey = key)
-            .ReturnsAsync(true);
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[]
+            {
+                new RecoveryState { RegistrationId = registrationId, CorrelationId = "corr-a" }
+            }));
+        SetupTransactions(true);
 
-        Assert.True(await _store.TryDeleteAsync("corr-a"));
-        Assert.Equal("ar:recovery:corr-a", deletedKey.ToString());
+        Assert.True(await _store.TryDeleteAsync("corr-a", registrationId));
+        Assert.Single(_transactions[0].Invocations, invocation => invocation.Method.Name == nameof(IDatabase.KeyDeleteAsync));
 
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync(" "));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.TryDeleteAsync(" ", registrationId));
 
         using var canceled = new CancellationTokenSource();
         await canceled.CancelAsync();
-        await Assert.ThrowsAsync<OperationCanceledException>(() => _store.TryDeleteAsync("corr-a", canceled.Token));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => _store.TryDeleteAsync("corr-a", registrationId, canceled.Token));
     }
 
     [Fact]
@@ -344,7 +358,7 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task SaveAsync_ExhaustedOptimisticAttempts_FallsBackToUnconditionalWrite()
+    public async Task SaveAsync_ExhaustedOptimisticAttempts_ThrowsWithoutOverwriting()
     {
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
@@ -368,14 +382,12 @@ public class RedisRecoveryStateStoreTests
             .ReturnsAsync(true);
 
         var state = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
-        await _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3)));
 
-        // Registration must never fail the wait: after exhausting conditional attempts, the save
-        // degrades to last-writer-wins directly on the database.
+        // No unconditional write may overwrite registrations committed by competing waiters.
         Assert.Equal(4, _transactions.Count);
-        var fallback = Assert.Single(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
-        var written = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(((RedisValue)fallback.Arguments[1]!).ToString())!);
-        Assert.Equal(state.RegistrationId, written.RegistrationId);
+        Assert.DoesNotContain(_database.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
     }
 
     [Fact]
@@ -444,19 +456,22 @@ public class RedisRecoveryStateStoreTests
 
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
-            .ReturnsAsync(JsonSerializer.Serialize(new RecoveryState
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { new RecoveryState
             {
-                CorrelationId = "explicit-corr",
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = "corr-a",
                 PayloadTypeFullName = typeof(OperationResult).FullName,
                 RegisteredAtUtc = DateTime.UtcNow
-            }));
+            } }));
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-b", It.IsAny<CommandFlags>()))
-            .ReturnsAsync(JsonSerializer.Serialize(new RecoveryState
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { new RecoveryState
             {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = "corr-b",
                 PayloadTypeFullName = typeof(OperationResult).FullName,
                 RegisteredAtUtc = DateTime.UtcNow
-            }));
+            } }));
         _database
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:empty", It.IsAny<CommandFlags>()))
             .ReturnsAsync(RedisValue.Null);
@@ -472,7 +487,7 @@ public class RedisRecoveryStateStoreTests
             states.Add(state);
 
         Assert.Equal(2, states.Count);
-        Assert.Contains(states, state => state.CorrelationId == "explicit-corr");
+        Assert.Contains(states, state => state.CorrelationId == "corr-a");
         Assert.Contains(states, state => state.CorrelationId == "corr-b");
     }
 

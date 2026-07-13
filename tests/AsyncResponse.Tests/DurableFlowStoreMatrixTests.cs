@@ -1,75 +1,62 @@
-using AsyncResponse.Channels.NATS;
-using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.Extensions.Options;
-using Moq;
-using StackExchange.Redis;
 using Xunit;
 
 namespace AsyncResponse.Tests;
 
 /// <summary>
-/// Runs a real multi-step flow (local step → awaited step → value bag → local step) with the
-/// flow state persisted through each channel's recovery store reachable without Docker, proving
-/// <see cref="FlowState"/> survives every store's serialization envelope — not just the in-memory
-/// default. (PostgreSQL and SQL Server stores are SQL-side and covered by integration tests.)
+/// Runs a real multi-step flow through the explicit in-memory durable-flow store. Provider-backed
+/// stores are covered by their package and integration contract suites.
 /// </summary>
 public class DurableFlowStoreMatrixTests
 {
     [Fact]
-    public Task InMemoryRecoveryStore_RunsFlowEndToEnd()
-        => RunFlowAgainstStoreAsync(flowStateStore: null); // the default registration
+    public Task InMemoryDurableStore_RunsFlowEndToEnd()
+        => RunFlowAgainstStoreAsync();
 
     [Fact]
-    public async Task NatsKvBackedStore_RunsFlowEndToEnd_AndStatePersistsInBucket()
+    public async Task InMemoryDurableStore_EnforcesAtomicRevisionAndLeaseContract()
     {
-        var kv = new FakeNatsKvStore();
-        var recoveryStore = new NatsRecoveryStateStore(
-            kv,
-            Options.Create(new NatsAsyncResponseChannelOptions()),
-            NullLogger<NatsRecoveryStateStore>.Instance,
-            new TestTimeProvider());
+        var store = new InMemoryFlowStateStore();
+        var state = NewState("atomic");
 
-        var flowId = await RunFlowAgainstStoreAsync(new RecoveryBackedFlowStateStore(recoveryStore));
+        Assert.True(await store.TryCreateAsync("atomic", state, TimeSpan.FromMinutes(1)));
+        Assert.False(await store.TryCreateAsync("atomic", NewState("atomic"), TimeSpan.FromMinutes(1)));
+        Assert.True(await store.TryAcquireLeaseAsync("atomic", "owner-a", TimeSpan.FromMinutes(1)));
+        Assert.False(await store.TryAcquireLeaseAsync("atomic", "owner-b", TimeSpan.FromMinutes(1)));
 
-        // The ledger physically lives in the KV bucket, under the encoded recovery key.
-        Assert.Contains(kv.Entries.Keys, key => key == NatsSubjectSchema.RecoveryKey(flowId));
+        state.LastMessage = "checkpoint";
+        state.Revision = 1;
+        Assert.False(await store.TryUpdateAsync("atomic", state, 0, TimeSpan.FromMinutes(1), "owner-b"));
+        Assert.True(await store.TryUpdateAsync("atomic", state, 0, TimeSpan.FromMinutes(1), "owner-a"));
+        Assert.False(await store.TryUpdateAsync("atomic", state, 0, TimeSpan.FromMinutes(1), "owner-a"));
+        Assert.Equal(1, (await store.LoadAsync("atomic"))!.Revision);
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            store.TryUpdateAsync("atomic", state, -1, TimeSpan.FromMinutes(1)));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.TryCreateAsync("atomic", NewState("other"), TimeSpan.FromMinutes(1)));
+        var unrecognizedSchema = NewState("schema");
+        unrecognizedSchema.SchemaVersion = FlowStateSchema.Current + 1;
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            store.TryCreateAsync("schema", unrecognizedSchema, TimeSpan.FromMinutes(1)));
     }
 
-    [Fact]
-    public async Task RedisBackedStore_RunsFlowEndToEnd_AndStatePersistsInKey()
-    {
-        var (database, backing) = CreateWriteThroughRedisDatabase();
-        var multiplexer = new Mock<IConnectionMultiplexer>();
-        multiplexer.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object?>())).Returns(database);
-
-        var recoveryStore = new RedisRecoveryStateStore(
-            multiplexer.Object,
-            Options.Create(new RedisAsyncResponseOptions { KeyPrefix = "ar" }),
-            NullLogger<RedisRecoveryStateStore>.Instance);
-
-        var flowId = await RunFlowAgainstStoreAsync(new RecoveryBackedFlowStateStore(recoveryStore));
-
-        Assert.Contains(backing.Keys, key => key.ToString().Contains(flowId));
-    }
-
-    private static async Task<string> RunFlowAgainstStoreAsync(IFlowStateStore? flowStateStore)
+    private static async Task RunFlowAgainstStoreAsync()
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         services.AddSingleton<FlowProbe>();
         services.AddScoped<TestOnboardingFlow>();
-        if (flowStateStore is not null)
-            services.AddSingleton(flowStateStore); // wins over the TryAdd default registration
         services.AddAsyncResponse()
             .WithInMemoryChannel(options =>
             {
                 options.DefaultTimeout = TimeSpan.FromSeconds(10);
                 options.RecoveryStateExpiry = TimeSpan.FromMinutes(5);
             })
-            .WithInMemoryTransport();
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
         await using var provider = services.BuildServiceProvider();
 
         var flows = provider.GetRequiredService<IDurableFlows>();
@@ -98,56 +85,15 @@ public class DurableFlowStoreMatrixTests
         Assert.Contains("final-status", state.Values!.Keys);
         Assert.Equal(1, state.Attempts);
 
-        return flowId;
     }
 
-    private static (IDatabase Database, Dictionary<RedisKey, RedisValue> Backing) CreateWriteThroughRedisDatabase()
+    private static FlowState NewState(string flowId) => new()
     {
-        var backing = new Dictionary<RedisKey, RedisValue>();
-        var gate = new object();
-
-        var database = new Mock<IDatabase>();
-        database
-            .Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync((RedisKey key, CommandFlags _) =>
-            {
-                lock (gate) return backing.TryGetValue(key, out var value) ? value : RedisValue.Null;
-            });
-        database
-            .Setup(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync((RedisKey key, CommandFlags _) =>
-            {
-                lock (gate) return backing.Remove(key);
-            });
-
-        var transaction = new Mock<ITransaction>();
-        transaction
-            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync((RedisKey key, RedisValue value, TimeSpan? _, When _, CommandFlags _) =>
-            {
-                lock (gate) backing[key] = value;
-                return true;
-            });
-        transaction
-            .Setup(t => t.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<Expiration>(), It.IsAny<ValueCondition>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync((RedisKey key, RedisValue value, Expiration _, ValueCondition _, CommandFlags _) =>
-            {
-                lock (gate) backing[key] = value;
-                return true;
-            });
-        transaction
-            .Setup(t => t.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync((RedisKey key, CommandFlags _) =>
-            {
-                lock (gate) return backing.Remove(key);
-            });
-        transaction
-            .Setup(t => t.ExecuteAsync(It.IsAny<CommandFlags>()))
-            .ReturnsAsync(true);
-        database
-            .Setup(d => d.CreateTransaction(It.IsAny<object?>()))
-            .Returns(transaction.Object);
-
-        return (database.Object, backing);
-    }
+        FlowId = flowId,
+        FlowTypeName = typeof(TestOnboardingFlow).FullName,
+        InputTypeName = typeof(TestFlowInput).FullName,
+        Status = FlowRunStatus.Running,
+        CreatedAtUtc = DateTime.UtcNow,
+        UpdatedAtUtc = DateTime.UtcNow
+    };
 }

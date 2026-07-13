@@ -79,12 +79,16 @@ public class NatsRegistrationTests
     [Fact]
     public async Task NatsChannelAndTransport_RegisterExactlyOneMarkerEach()
     {
-        var provider = Build(builder => builder.WithNatsChannel().WithNatsTransport(_ => { }));
+        var provider = Build(builder => builder
+            .WithNatsChannel()
+            .WithNatsTransport(_ => { })
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
-        await validator.StartAsync(CancellationToken.None); // single NATS channel + single NATS transport → must not throw
+        await validator.StartAsync(CancellationToken.None); // one NATS channel + transport + flow store → must not throw
         await validator.StopAsync(CancellationToken.None);
     }
 

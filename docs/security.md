@@ -39,7 +39,8 @@ per-method attributes on your flow classes.
 builder.Services.AddAsyncResponse()
     .AuthorizeCallbacks(a => a.Allow<IOrderFlow>())   // only IOrderFlow methods are invokable
     .WithRedisChannel()
-    .WithRedisTransport(/* … */);
+    .WithRedisTransport(options => options.KeyPrefix = "orders")
+    .WithInMemoryDurableFlows();
 ```
 
 The builder offers several `Allow` shapes, plus a fully custom authorizer:

@@ -48,9 +48,6 @@ public class RedisAsyncResponseChannelWaiterTests
                 It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         _store
-            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        _store
             .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(true);
     }
@@ -459,7 +456,7 @@ public class RedisAsyncResponseChannelWaiterTests
         logger ?? NullLogger<RedisAsyncResponseChannel>.Instance);
 
     [Fact]
-    public async Task CreateResponseWaiter_NewerEnvelopeSchema_FaultsWaiter()
+    public async Task CreateResponseWaiter_UnsupportedEnvelopeSchema_FaultsWaiter()
     {
         var channel = CreateChannel();
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AsyncResponse;
 
 /// <summary>Lifecycle of a durable flow run.</summary>
@@ -23,14 +25,21 @@ public enum FlowRunStatus
 /// <para>
 /// <b>Contract warning:</b> instances are serialized into the flow state store and must remain
 /// readable across deployments. Treat property names as a wire contract — additive changes only;
-/// <see cref="SchemaVersion"/> lets readers reject entries written by an incompatible newer
-/// schema (see <see cref="FlowStateSchema"/>).
+/// <see cref="SchemaVersion"/> lets readers reject entries written with an unrecognized schema
+/// (see <see cref="FlowStateSchema"/>).
 /// </para>
 /// </summary>
 public sealed class FlowState
 {
-    /// <summary>The wire schema version this state was written with.</summary>
+    /// <summary>The required wire schema version this state was written with.</summary>
+    [JsonRequired]
     public int SchemaVersion { get; set; } = FlowStateSchema.Current;
+
+    /// <summary>
+    /// Optimistic-concurrency revision maintained by durable flow stores. It starts at zero and is
+    /// incremented on every conditional checkpoint so a stale executor cannot overwrite newer state.
+    /// </summary>
+    public long Revision { get; set; }
 
     /// <summary>The flow run id.</summary>
     public string? FlowId { get; set; }
@@ -111,14 +120,17 @@ public sealed class FlowStepState
 }
 
 /// <summary>
-/// Wire-schema version stamp for <see cref="FlowState"/>. Readers reject entries written by a
-/// newer version instead of misinterpreting them; additive changes only, bump on breaking ones.
+/// Wire-schema version stamp for <see cref="FlowState"/>. Readers reject versions not explicitly
+/// supported by the build instead of guessing compatibility.
 /// </summary>
 public static class FlowStateSchema
 {
     /// <summary>The current wire schema version written by this build.</summary>
     public const int Current = 1;
 
-    /// <summary>Returns <c>true</c> when an entry with <paramref name="entryVersion"/> is safe to read on this build.</summary>
-    public static bool IsReadable(int entryVersion) => entryVersion <= Current;
+    /// <summary>
+    /// Returns <c>true</c> only for a schema version explicitly supported by this build. Add older
+    /// versions here deliberately if a future release provides a tested migration path.
+    /// </summary>
+    public static bool IsReadable(int entryVersion) => entryVersion == Current;
 }

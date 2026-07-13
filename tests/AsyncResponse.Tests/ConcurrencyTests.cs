@@ -89,7 +89,9 @@ public class ConcurrencyTests
     {
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
-        var builder = services.AddAsyncResponse(options => options.Watchdog.Enabled = false).WithInMemoryChannel();
+        var builder = services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
+            .WithInMemoryChannel()
+            .WithInMemoryDurableFlows();
         if (withWorker)
         {
             builder.WithInMemoryTransport();

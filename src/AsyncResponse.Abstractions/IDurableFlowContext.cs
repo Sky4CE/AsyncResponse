@@ -83,9 +83,11 @@ public interface IDurableFlowContext
     /// fails. The parent worker is released while the child runs; when the child reaches a terminal
     /// state the executor re-enqueues the parent, which resumes from this checkpoint.
     /// <para>
-    /// The default child id is <c>{FlowId}:{name}</c>. Pass <paramref name="flowId"/> when the child
-    /// needs a domain-owned idempotency key. On success the child <see cref="FlowState"/> snapshot is
-    /// memoized as this step's result. On failure the step is also memoized, then
+    /// The default child id is <c>{FlowId}:{name}</c>. Pass a nonblank <paramref name="flowId"/> when
+    /// the child needs a domain-owned idempotency key. A child id is permanently bound to one parent
+    /// step, flow type, input type, and semantically identical input value; conflicting reuse fails
+    /// fast. On success the child <see cref="FlowState"/> snapshot is memoized as this step's result.
+    /// On failure the step is also memoized, then
     /// <see cref="DurableFlowFailedException"/> is thrown unless
     /// <paramref name="failOnChildFailure"/> is <c>false</c>.
     /// </para>
@@ -96,12 +98,13 @@ public interface IDurableFlowContext
         string? flowId = null,
         bool failOnChildFailure = true,
         CancellationToken cancellationToken = default)
-        where TFlow : class, IDurableFlow<TInput>
-        => throw new NotSupportedException($"{nameof(AwaitChildFlowAsync)} is implemented by the AsyncResponse durable-flow runtime.");
+        where TFlow : class, IDurableFlow<TInput>;
 
     /// <summary>
-    /// Persists an operator-facing progress message on the flow state
-    /// (<see cref="FlowState.LastMessage"/>). Safe to call from <c>until</c> predicates.
+    /// Updates the operator-facing progress message on the flow state
+    /// (<see cref="FlowState.LastMessage"/>). Rapid reports may be coalesced according to
+    /// <c>DurableFlowOptions.ProgressPersistenceInterval</c>; the latest value is included in the
+    /// next checkpoint or flow outcome. Safe to call from <c>until</c> predicates.
     /// </summary>
     Task ReportProgressAsync(string message, CancellationToken cancellationToken = default);
 

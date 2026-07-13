@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -112,6 +113,44 @@ public class WorkerJobExecutorTests
     }
 
     [Fact]
+    public async Task InMemoryWorkerTransport_BoundedQueueBackpressuresPublishers()
+    {
+        var transport = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions
+        {
+            QueueCapacity = 1,
+            WorkerCount = 1
+        }));
+        var first = CreateJob("first");
+        var second = CreateJob("second");
+
+        await transport.PublishAsync(first);
+        var blocked = transport.PublishAsync(second);
+        await Task.Delay(30);
+        Assert.False(blocked.IsCompleted);
+
+        Assert.Equal("first", (await transport.Reader.ReadAsync()).Job.CorrelationId);
+        await blocked.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("second", (await transport.Reader.ReadAsync()).Job.CorrelationId);
+    }
+
+    [Theory]
+    [InlineData(nameof(InMemoryWorkerTransportOptions.QueueCapacity))]
+    [InlineData(nameof(InMemoryWorkerTransportOptions.WorkerCount))]
+    public void InMemoryWorkerTransport_InvalidOptionsAreRejected(string propertyName)
+    {
+        var options = new InMemoryWorkerTransportOptions();
+        if (propertyName == nameof(InMemoryWorkerTransportOptions.QueueCapacity))
+            options.QueueCapacity = 0;
+        else
+            options.WorkerCount = 0;
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => new InMemoryWorkerTransport(Options.Create(options)));
+
+        Assert.Contains(propertyName, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task InMemoryWorkerHost_ContinuesAfterFailedJobAndRunsWithoutCapturedExecutionContext()
     {
         var probe = new WorkerProbe();
@@ -181,4 +220,16 @@ public class WorkerJobExecutorTests
 
         throw new TimeoutException("Condition was not met in time.");
     }
+
+    private static WorkerJobEnvelope CreateJob(string correlationId)
+        => new()
+        {
+            CorrelationId = correlationId,
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IWorkerProbe).FullName!,
+                MethodName = nameof(IWorkerProbe.RunAsync),
+                Params = []
+            }
+        };
 }

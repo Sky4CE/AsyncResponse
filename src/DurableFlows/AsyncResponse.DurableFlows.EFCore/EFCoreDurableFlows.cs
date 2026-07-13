@@ -28,15 +28,11 @@ namespace Microsoft.Extensions.DependencyInjection
             Action<EFCoreDurableFlowOptions>? configure = null)
             where TContext : DbContext
         {
-            builder.Services.AddOptions();
-            if (configure is not null)
-                builder.Services.Configure(configure);
-
             // Singleton on purpose: the store holds no DbContext (each operation leases one, see
             // above), and the executor resolves the store from a fresh scope per flow execution —
             // a scoped store would redo the mapped-model check on every run.
             builder.Services.TryAddSingleton<EFCoreFlowStateStore<TContext>>();
-            return builder.WithCustomDurableFlows<EFCoreFlowStateStore<TContext>>();
+            return builder.WithDurableFlows<EFCoreFlowStateStore<TContext>, EFCoreDurableFlowOptions>(configure);
         }
     }
 }
@@ -44,10 +40,10 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.EFCore
 {
 /// <summary>Options for the Entity Framework Core durable-flow state store.</summary>
-public sealed class EFCoreDurableFlowOptions
+public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>
-    /// How often <see cref="EFCoreFlowStateStore{TContext}.SaveAsync"/> opportunistically deletes
+    /// How often <see cref="EFCoreFlowStateStore{TContext}.TryCreateAsync"/> opportunistically deletes
     /// expired rows (loads already treat expired state as absent; pruning bounds table growth).
     /// Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
@@ -73,6 +69,15 @@ public sealed class DurableFlowStateRecord
 
     /// <summary>UTC instant of the last save.</summary>
     public DateTime UpdatedAtUtc { get; set; }
+
+    /// <summary>Optimistic-concurrency revision of the durable ledger.</summary>
+    public long Revision { get; set; }
+
+    /// <summary>Current execution-lease owner, when a worker is running the flow.</summary>
+    public string? LeaseId { get; set; }
+
+    /// <summary>UTC expiry of the current execution lease.</summary>
+    public DateTime? LeaseExpiresAtUtc { get; set; }
 }
 
 /// <summary>Maps the durable-flow state table into an application model.</summary>
@@ -107,6 +112,9 @@ public static class EFCoreDurableFlowModelBuilderExtensions
             entity.Property(r => r.StateJson).HasColumnName("state_json").IsRequired();
             entity.Property(r => r.ExpiresAtUtc).HasColumnName("expires_at_utc");
             entity.Property(r => r.UpdatedAtUtc).HasColumnName("updated_at_utc");
+            entity.Property(r => r.Revision).HasColumnName("revision").HasDefaultValue(0L);
+            entity.Property(r => r.LeaseId).HasColumnName("lease_id").HasMaxLength(64);
+            entity.Property(r => r.LeaseExpiresAtUtc).HasColumnName("lease_expires_at_utc");
             entity.HasIndex(r => r.ExpiresAtUtc).HasDatabaseName($"{tableName}_expires_idx");
         });
 
@@ -133,66 +141,109 @@ public sealed class EFCoreFlowStateStore<TContext> : IFlowStateStore
         _options = options.Value;
     }
 
-    public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-    {
-        DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
-        await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
-        var db = lease.Context;
-
-        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
-            await PruneExpiredAsync(db, cancellationToken).ConfigureAwait(false);
-
-        var now = DateTime.UtcNow;
-        var expiresAt = now.Add(ttl);
-        var stateJson = DurableFlowStoreShared.Serialize(state);
-
-        // Portable upsert: update-first (bulk, no tracking), insert on miss, and on a lost insert
-        // race (concurrent save of the same new flow id) loop back to update the winner's row.
-        for (var attempt = 0; ; attempt++)
-        {
-            var updated = await Records(db)
-                .Where(r => r.FlowId == flowId)
-                .ExecuteUpdateAsync(setters => setters
-                    .SetProperty(r => r.StateJson, stateJson)
-                    .SetProperty(r => r.ExpiresAtUtc, expiresAt)
-                    .SetProperty(r => r.UpdatedAtUtc, now), cancellationToken)
-                .ConfigureAwait(false);
-            if (updated > 0)
-                return;
-
-            db.Add(new DurableFlowStateRecord
-            {
-                FlowId = flowId,
-                StateJson = stateJson,
-                ExpiresAtUtc = expiresAt,
-                UpdatedAtUtc = now
-            });
-            try
-            {
-                await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-                return;
-            }
-            catch (DbUpdateException) when (attempt < 2)
-            {
-                db.ChangeTracker.Clear();
-            }
-        }
-    }
-
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
 
         var now = DateTime.UtcNow;
-        var stateJson = await Records(lease.Context)
+        var record = await Records(lease.Context)
             .AsNoTracking()
             .Where(r => r.FlowId == flowId && r.ExpiresAtUtc > now)
-            .Select(r => r.StateJson)
+            .Select(r => new { r.StateJson, r.Revision })
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        return stateJson is null ? null : DurableFlowStoreShared.Deserialize(stateJson);
+        if (record is null)
+            return null;
+
+        var state = DurableFlowStoreShared.Deserialize(record.StateJson);
+        return state?.Revision == record.Revision ? state : null;
+    }
+
+    public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
+        var db = lease.Context;
+        var now = DateTime.UtcNow;
+
+        if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
+            await PruneExpiredAsync(db, cancellationToken).ConfigureAwait(false);
+
+        await Records(db)
+            .Where(r => r.FlowId == flowId && r.ExpiresAtUtc <= now)
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
+        db.Add(new DurableFlowStateRecord
+        {
+            FlowId = flowId,
+            StateJson = DurableFlowStoreShared.Serialize(state),
+            ExpiresAtUtc = now.Add(ttl),
+            UpdatedAtUtc = now,
+            Revision = state.Revision
+        });
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (DbUpdateException)
+        {
+            db.ChangeTracker.Clear();
+            // Provider-agnostic duplicate-key detection is not reliable. Verify that another
+            // creator actually owns this id; otherwise preserve the real database failure instead
+            // of misreporting truncation, trigger, permission, or schema errors as "already exists".
+            if (await Records(db)
+                    .AsNoTracking()
+                    .AnyAsync(r => r.FlowId == flowId, cancellationToken)
+                    .ConfigureAwait(false))
+                return false;
+
+            throw;
+        }
+    }
+
+    public async Task<bool> TryUpdateAsync(
+        string flowId,
+        FlowState state,
+        long expectedRevision,
+        TimeSpan ttl,
+        string? leaseId = null,
+        CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTime.UtcNow;
+        var query = Records(lease.Context).Where(r =>
+            r.FlowId == flowId
+            && r.Revision == expectedRevision
+            && r.ExpiresAtUtc > now
+            && (leaseId == null || (r.LeaseId == leaseId && r.LeaseExpiresAtUtc > now)));
+        var updated = await query.ExecuteUpdateAsync(setters => setters
+                .SetProperty(r => r.StateJson, DurableFlowStoreShared.Serialize(state))
+                .SetProperty(r => r.ExpiresAtUtc, now.Add(ttl))
+                .SetProperty(r => r.UpdatedAtUtc, now)
+                .SetProperty(r => r.Revision, state.Revision), cancellationToken)
+            .ConfigureAwait(false);
+        return updated > 0;
+    }
+
+    public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: true, cancellationToken);
+
+    public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: false, cancellationToken);
+
+    public async Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+    {
+        await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
+        await Records(lease.Context)
+            .Where(r => r.FlowId == flowId && r.LeaseId == leaseId)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(r => r.LeaseId, (string?)null)
+                .SetProperty(r => r.LeaseExpiresAtUtc, (DateTime?)null), cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -217,6 +268,33 @@ public sealed class EFCoreFlowStateStore<TContext> : IFlowStateStore
     }
 
     private static DbSet<DurableFlowStateRecord> Records(TContext db) => db.Set<DurableFlowStateRecord>();
+
+    private async Task<bool> UpdateLeaseAsync(
+        string flowId,
+        string leaseId,
+        TimeSpan leaseDuration,
+        bool acquire,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        if (leaseDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+
+        await using var contextLease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
+        var now = DateTime.UtcNow;
+        var query = Records(contextLease.Context).Where(r =>
+            r.FlowId == flowId
+            && r.ExpiresAtUtc > now
+            && (acquire
+                ? r.LeaseId == null || r.LeaseExpiresAtUtc <= now || r.LeaseId == leaseId
+                : r.LeaseId == leaseId && r.LeaseExpiresAtUtc > now));
+        var updated = await query.ExecuteUpdateAsync(setters => setters
+                .SetProperty(r => r.LeaseId, leaseId)
+                .SetProperty(r => r.LeaseExpiresAtUtc, now.Add(leaseDuration)), cancellationToken)
+            .ConfigureAwait(false);
+        return updated > 0;
+    }
 
     /// <summary>
     /// Leases a context for one operation: an <see cref="IDbContextFactory{TContext}"/>-created

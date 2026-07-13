@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace AsyncResponse;
 
 /// <summary>
@@ -8,11 +10,11 @@ public sealed class WorkerJobEnvelope
 {
     /// <summary>
     /// The wire schema version this job was written with. New jobs are always stamped with
-    /// <see cref="WorkerJobEnvelopeSchema.Current"/>. Jobs written before this field existed carry no
-    /// version on the wire and are read as the current version (and therefore executed); a job whose
-    /// version is greater than the reader's current is rejected so a newer producer cannot silently
-    /// invoke an incompatible method shape on an older worker.
+    /// <see cref="WorkerJobEnvelopeSchema.Current"/>. The property is required on the wire; a missing
+    /// or unsupported version is rejected so an incompatible producer cannot silently invoke the
+    /// wrong method shape.
     /// </summary>
+    [JsonRequired]
     public int SchemaVersion { get; set; } = WorkerJobEnvelopeSchema.Current;
 
     /// <summary>The service method to execute.</summary>
@@ -56,9 +58,8 @@ public interface IWorkerTransport
 /// <summary>
 /// Wire-schema version stamp for <see cref="WorkerJobEnvelope"/>. New jobs are stamped with
 /// <see cref="Current"/>. The ingress loader rejects (dead-letters) any job whose version is
-/// greater than <see cref="Current"/>: a newer producer must never silently invoke an incompatible
-/// method shape on an older worker. Jobs whose version is missing or lower are read
-/// forward-compatibly — additive schema changes only.
+/// not explicitly supported: an unrecognized producer must never silently invoke an incompatible
+/// method shape. The JSON property is required.
 /// </summary>
 public static class WorkerJobEnvelopeSchema
 {
@@ -70,5 +71,5 @@ public static class WorkerJobEnvelopeSchema
     /// this build. See <see cref="RecoveryStateSchema.IsReadable"/> for the policy.
     /// </summary>
     public static bool IsReadable(int entryVersion)
-        => entryVersion <= Current;
+        => entryVersion == Current;
 }

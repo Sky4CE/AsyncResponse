@@ -16,10 +16,11 @@ internal abstract class AsyncResponseBuilderBase(
             ? correlationId
             : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
-    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto)" />
-    public async Task EnqueueWorkerAsync(ReflectionCallDto work)
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto, CancellationToken)" />
+    public async Task EnqueueWorkerAsync(ReflectionCallDto work, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(work);
+        cancellationToken.ThrowIfCancellationRequested();
 
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.enqueue_worker",
@@ -35,13 +36,15 @@ internal abstract class AsyncResponseBuilderBase(
                 ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
                 "or install another full AsyncResponse transport package.");
 
-            await transport.PublishAsync(new WorkerJobEnvelope
-            {
-                Call = work,
-                CorrelationId = AsyncResponseContext.CorrelationId,
-                ReplyTarget = AsyncResponseContext.ReplyTarget,
-                Context = _propagation?.Capture()
-            }).ConfigureAwait(false);
+            await transport.PublishAsync(
+                new WorkerJobEnvelope
+                {
+                    Call = work,
+                    CorrelationId = AsyncResponseContext.CorrelationId,
+                    ReplyTarget = AsyncResponseContext.ReplyTarget,
+                    Context = _propagation?.Capture()
+                },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -50,17 +53,26 @@ internal abstract class AsyncResponseBuilderBase(
         }
     }
 
-    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Action{TService}})" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work)
-        => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Action{TService}}, CancellationToken)" />
+    public Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+    }
 
-    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}})" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work)
-        => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}}, CancellationToken)" />
+    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+    }
 
-    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}})" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work)
-        => EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work));
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}}, CancellationToken)" />
+    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+    }
 }
 
 /// <inheritdoc cref="IAsyncResponseBuilder"/>

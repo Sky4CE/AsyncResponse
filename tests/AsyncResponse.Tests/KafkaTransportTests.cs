@@ -527,7 +527,8 @@ public class KafkaTransportTests
     {
         var provider = Build(builder => builder
             .WithInMemoryChannel()
-            .WithKafkaTransport(options => options.BootstrapServers = "localhost:9092"));
+            .WithKafkaTransport(options => options.BootstrapServers = "localhost:9092")
+            .WithInMemoryDurableFlows());
 
         Assert.IsType<KafkaWorkerTransport>(provider.GetRequiredService<IWorkerTransport>());
         Assert.IsType<KafkaReplyTargetProvider>(provider.GetRequiredService<IAsyncResponseReplyTargetProvider>());
@@ -568,13 +569,15 @@ public class KafkaTransportTests
     {
         var provider = Build(builder => builder
             .WithInMemoryChannel()
-            .WithKafkaTransport(options => options.BootstrapServers = "localhost:9092"));
+            .WithKafkaTransport(options => options.BootstrapServers = "localhost:9092")
+            .WithInMemoryDurableFlows());
 
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
-        await validator.StartAsync(CancellationToken.None); // single channel + single Kafka transport → must not throw
+        await validator.StartAsync(CancellationToken.None); // one channel + transport + flow store → must not throw
         await validator.StopAsync(CancellationToken.None);
     }
 

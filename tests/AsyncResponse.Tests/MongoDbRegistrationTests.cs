@@ -154,10 +154,14 @@ public sealed class MongoDbRegistrationTests
     [Fact]
     public async Task MongoDbChannelAndTransport_RegisterExactlyOneMarkerEach()
     {
-        var provider = Build(builder => builder.WithMongoDbChannel().WithMongoDbTransport(_ => { }));
+        var provider = Build(builder => builder
+            .WithMongoDbChannel()
+            .WithMongoDbTransport(_ => { })
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         await validator.StartAsync(CancellationToken.None);
         await validator.StopAsync(CancellationToken.None);

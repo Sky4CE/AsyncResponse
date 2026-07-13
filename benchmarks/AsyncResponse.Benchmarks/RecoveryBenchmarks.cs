@@ -53,10 +53,10 @@ public class RecoveryBenchmarks
 
         await _store.SaveAsync(correlationId, NewRecoveryState(correlationId), TimeSpan.FromMinutes(5))
             .ConfigureAwait(false);
-        var loaded = await _store.GetAsync(correlationId).ConfigureAwait(false);
-        var deleted = await _store.TryDeleteAsync(correlationId).ConfigureAwait(false);
+        var loaded = await _store.GetAllAsync(correlationId).ConfigureAwait(false);
+        var deleted = await _store.TryDeleteAsync(correlationId, loaded[0].RegistrationId).ConfigureAwait(false);
 
-        return loaded is not null && deleted;
+        return loaded.Count == 1 && deleted;
     }
 
     [Benchmark]
@@ -75,7 +75,12 @@ public class RecoveryBenchmarks
             count++;
 
         for (var i = 0; i < Entries; i++)
-            await _store.TryDeleteAsync(prefix + i).ConfigureAwait(false);
+        {
+            var correlationId = prefix + i;
+            var states = await _store.GetAllAsync(correlationId).ConfigureAwait(false);
+            if (states.Count > 0)
+                await _store.TryDeleteAsync(correlationId, states[0].RegistrationId).ConfigureAwait(false);
+        }
 
         return count;
     }
@@ -95,6 +100,7 @@ public class RecoveryBenchmarks
     private static RecoveryState NewRecoveryState(string correlationId)
         => new()
         {
+            RegistrationId = Guid.NewGuid(),
             CorrelationId = correlationId,
             PayloadTypeFullName = typeof(BenchPayload).FullName,
             RegisteredAtUtc = DateTime.UtcNow

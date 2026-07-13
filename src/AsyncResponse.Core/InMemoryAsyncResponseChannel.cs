@@ -92,8 +92,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             else
                 subscription.ArmTimeout();
 
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
         }
         catch (Exception ex)
         {
@@ -172,8 +172,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -230,8 +230,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Published raw response for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -275,8 +275,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
 
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Published exception for correlationId {CorrelationId}. Subscribers: {SubscriberCount}.", correlationId, subscribers.Count);
         }
         catch (Exception ex)
         {
@@ -510,8 +510,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         private readonly CancellationTokenSource _timeoutCts;
         private readonly Activity? _activity;
         private readonly object _cleanupSync = new();
+        private SemaphoreSlim? _dispatchWaiters;
         private CancellationTokenRegistration _timeoutRegistration;
         private Task? _cleanupTask;
+        private int _dispatching;
+        private int _dispatchWaiterCount;
         private int _terminal;
         private int _cleanupStarted;
 
@@ -571,13 +574,101 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         /// <summary>Faults this subscription with a published exception.</summary>
         public Task DispatchExceptionAsync(Exception exception)
+            => DispatchSerialAsync(
+                exception,
+                static (subscription, state) => subscription.DispatchExceptionCoreAsync(state));
+
+        private Task DispatchExceptionCoreAsync(Exception exception)
         {
+            if (CleanupStarted)
+                return Task.CompletedTask;
+
             if (!TryBeginTerminal())
                 return Task.CompletedTask;
 
             AsyncResponseDiagnostics.SetError(_activity, exception);
             TrySetException(exception);
             return CleanupOnceAsTask();
+        }
+
+        /// <summary>
+        /// Serializes every signal for one waiter. The uncontended path uses only an interlocked
+        /// owner bit; the semaphore is created lazily if concurrent publishers actually contend.
+        /// </summary>
+        protected Task DispatchSerialAsync<TState>(
+            TState state,
+            Func<SubscriptionBase, TState, Task> dispatch)
+        {
+            if (Interlocked.CompareExchange(ref _dispatching, 1, 0) != 0)
+                return WaitAndDispatchAsync(this, state, dispatch);
+
+            Task task;
+            try
+            {
+                task = dispatch(this, state);
+            }
+            catch
+            {
+                ReleaseDispatch();
+                throw;
+            }
+
+            if (task.IsCompletedSuccessfully)
+            {
+                ReleaseDispatch();
+                return task;
+            }
+
+            return ReleaseAfterDispatchAsync(this, task);
+        }
+
+        private static async Task WaitAndDispatchAsync<TState>(
+            SubscriptionBase subscription,
+            TState state,
+            Func<SubscriptionBase, TState, Task> dispatch)
+        {
+            Interlocked.Increment(ref subscription._dispatchWaiterCount);
+            try
+            {
+                var waiters = LazyInitializer.EnsureInitialized(
+                    ref subscription._dispatchWaiters,
+                    static () => new SemaphoreSlim(0));
+                while (Interlocked.CompareExchange(ref subscription._dispatching, 1, 0) != 0)
+                    await waiters.WaitAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref subscription._dispatchWaiterCount);
+            }
+
+            try
+            {
+                await dispatch(subscription, state).ConfigureAwait(false);
+            }
+            finally
+            {
+                subscription.ReleaseDispatch();
+            }
+        }
+
+        private static async Task ReleaseAfterDispatchAsync(SubscriptionBase subscription, Task task)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            finally
+            {
+                subscription.ReleaseDispatch();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ReleaseDispatch()
+        {
+            Volatile.Write(ref _dispatching, 0);
+            if (Volatile.Read(ref _dispatchWaiterCount) > 0)
+                Volatile.Read(ref _dispatchWaiters)?.Release();
         }
 
         /// <summary>Runs subscription, recovery-state, timeout, and activity cleanup once.</summary>
@@ -645,7 +736,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         }
 
         private Task TimeoutAsync()
+            => DispatchSerialAsync(
+                0,
+                static (subscription, _) => subscription.TimeoutCoreAsync());
+
+        private Task TimeoutCoreAsync()
         {
+            if (CleanupStarted)
+                return Task.CompletedTask;
+
             if (!TryBeginTerminal())
                 return Task.CompletedTask;
 
@@ -683,6 +782,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         /// <inheritdoc />
         public override Task DispatchResponseAsync(object? response)
+            => DispatchSerialAsync(
+                response,
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state));
+
+        private Task DispatchResponseUnserializedAsync(object? response)
         {
             if (CleanupStarted)
                 return Task.CompletedTask;
@@ -700,6 +804,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         /// <inheritdoc />
         public override Task DispatchRawJsonResponseAsync(RawJsonResponse response)
+            => DispatchSerialAsync(
+                response,
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchRawJsonResponseUnserializedAsync(state));
+
+        private Task DispatchRawJsonResponseUnserializedAsync(RawJsonResponse response)
         {
             if (CleanupStarted)
                 return Task.CompletedTask;

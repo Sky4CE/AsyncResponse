@@ -22,15 +22,23 @@ internal sealed class AsyncResponseTransportMarker(string name)
     public string Name { get; } = name;
 }
 
+/// <summary>Internal marker registered by each durable-flow state-store registration.</summary>
+internal sealed class AsyncResponseDurableFlowStoreMarker(Type storeType)
+{
+    public Type StoreType { get; } = storeType;
+    public string Name { get; } = storeType.FullName ?? storeType.Name;
+}
+
 /// <summary>
 /// Validates at host startup that <c>AddAsyncResponse()</c> was paired with exactly one response
-/// channel and exactly one worker transport. Both are mandatory core concepts: without a channel,
-/// waiters can never receive a response; without a transport, worker dispatch cannot run. This
-/// turns silently-broken configuration into a fast, explicit failure on boot.
+/// channel, one worker transport, and one durable-flow state store. These are mandatory core
+/// choices; making each explicit keeps the fluent registration complete and prevents silently
+/// unusable services from reaching production.
 /// </summary>
 internal sealed class AsyncResponseStartupValidator(
     IEnumerable<AsyncResponseChannelMarker> _channels,
-    IEnumerable<AsyncResponseTransportMarker> _transports) : IHostedService
+    IEnumerable<AsyncResponseTransportMarker> _transports,
+    IEnumerable<AsyncResponseDurableFlowStoreMarker> _flowStores) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
@@ -61,6 +69,22 @@ internal sealed class AsyncResponseStartupValidator(
             throw new InvalidOperationException(
                 $"AsyncResponse has multiple worker transports registered ({string.Join(", ", transportNames)}). " +
                 "Register exactly one transport.");
+
+        var flowStores = _flowStores.DistinctBy(store => store.StoreType).ToArray();
+        if (flowStores.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "AsyncResponse has no durable-flow state store registered. After AddAsyncResponse(), call " +
+                ".WithInMemoryDurableFlows() (AsyncResponse.Core), a provider registration such as " +
+                ".WithPostgreSqlDurableFlows(...), or .WithDurableFlows<TStore>() for an application-owned store.");
+        }
+
+        if (flowStores.Length > 1)
+        {
+            throw new InvalidOperationException(
+                $"AsyncResponse has multiple durable-flow state stores registered ({string.Join(", ", flowStores.Select(store => store.Name))}). " +
+                "Register exactly one durable-flow store.");
+        }
 
         return Task.CompletedTask;
     }

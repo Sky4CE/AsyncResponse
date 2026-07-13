@@ -14,9 +14,9 @@ namespace AsyncResponse.Tests;
 /// <summary>
 /// What each channel/transport registration wires into DI: the in-memory channel shares one
 /// instance across publisher/subscriber/probe and one store across store/scanner; the channel
-/// marker drives the single-channel startup rule (multiple channels fail fast); transport markers
-/// drive the same single-transport rule; and the Google Pub/Sub transport replaces the worker
-/// transport and reply-target provider.
+/// marker drives the single-channel startup rule (multiple channels fail fast); transport and
+/// durable-flow markers drive the same exactly-one rule; and the Google Pub/Sub transport replaces
+/// the worker transport and reply-target provider.
 /// </summary>
 public class ChannelTransportRegistrationTests
 {
@@ -53,14 +53,30 @@ public class ChannelTransportRegistrationTests
     }
 
     [Fact]
+    public void CoreRegistration_DoesNotEnableDurableFlowsImplicitly()
+    {
+        var provider = Build(builder => builder.WithInMemoryChannel().WithInMemoryTransport());
+
+        Assert.Null(provider.GetService<IDurableFlows>());
+        Assert.Null(provider.GetService<IDurableFlowExecutor>());
+        Assert.Null(provider.GetService<IFlowStateStore>());
+        Assert.Empty(provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+    }
+
+    [Fact]
     public async Task MultipleChannels_FailFastAtStartup()
     {
         // Build the validator directly from the markers so we don't construct the (Redis-dependent)
         // watchdog, which would need an IConnectionMultiplexer that this test deliberately omits.
-        var provider = Build(builder => builder.WithInMemoryChannel().WithRedisChannel());
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithRedisChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -69,10 +85,14 @@ public class ChannelTransportRegistrationTests
     [Fact]
     public async Task RedisChannel_RegistersExactlyOneChannelMarker()
     {
-        var provider = Build(builder => builder.WithRedisChannel().WithInMemoryTransport());
+        var provider = Build(builder => builder
+            .WithRedisChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         await validator.StartAsync(CancellationToken.None); // single "Redis" channel → must not throw
         await validator.StopAsync(CancellationToken.None);
@@ -144,7 +164,8 @@ public class ChannelTransportRegistrationTests
             {
                 options.ProjectId = "proj";
                 options.WorkerTopicId = "worker-topic";
-            }));
+            })
+            .WithInMemoryDurableFlows());
 
         Assert.IsType<GooglePubSubWorkerTransport>(provider.GetRequiredService<IWorkerTransport>());
         Assert.IsType<GooglePubSubReplyTargetProvider>(provider.GetRequiredService<IAsyncResponseReplyTargetProvider>());
@@ -161,14 +182,34 @@ public class ChannelTransportRegistrationTests
             {
                 options.ProjectId = "proj";
                 options.WorkerTopicId = "worker-topic";
-            }));
+            })
+            .WithInMemoryDurableFlows());
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
-            provider.GetServices<AsyncResponseTransportMarker>());
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("transport", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task MultipleDurableFlowStores_FailFastAtStartup()
+    {
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows()
+            .WithDurableFlows<AlternateFlowStateStore>());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("durable-flow", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)
@@ -177,5 +218,29 @@ public class ChannelTransportRegistrationTests
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         configure(services.AddAsyncResponse());
         return services.BuildServiceProvider();
+    }
+
+    private sealed class AlternateFlowStateStore : IFlowStateStore
+    {
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => throw new NotSupportedException();
     }
 }

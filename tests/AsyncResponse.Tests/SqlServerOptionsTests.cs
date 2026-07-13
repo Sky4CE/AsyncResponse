@@ -445,10 +445,19 @@ public sealed class SqlServerOptionsTests
             store.SaveAsync("corr", new RecoveryState(), TimeSpan.Zero));
 
         Assert.Equal("ttl", ex.ParamName);
+        await Assert.ThrowsAsync<ArgumentException>(() => store.TryDeleteAsync("corr", Guid.Empty));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SaveAsync(
+            "corr",
+            new RecoveryState
+            {
+                CorrelationId = "corr",
+                SchemaVersion = RecoveryStateSchema.Current + 1
+            },
+            TimeSpan.FromSeconds(1)));
     }
 
     [Fact]
-    public void RecoveryStateStore_DeserializeState_FiltersUnreadableJsonAndFillsLegacyCorrelationId()
+    public void RecoveryStateStore_DeserializeState_RejectsUnreadableOrMismatchedRecords()
     {
         var store = CreateRecoveryStateStore();
 
@@ -463,13 +472,28 @@ public sealed class SqlServerOptionsTests
             }),
             "fallback"));
 
-        var state = InvokeDeserializeState(
+        Assert.Null(InvokeDeserializeState(
             store,
             JsonSerializer.Serialize(new RecoveryState { RegistrationId = Guid.NewGuid() }),
-            "fallback");
+            "fallback"));
+        Assert.Null(InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState
+            {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = "other"
+            }),
+            "fallback"));
 
+        var state = InvokeDeserializeState(
+            store,
+            JsonSerializer.Serialize(new RecoveryState
+            {
+                RegistrationId = Guid.NewGuid(),
+                CorrelationId = "fallback"
+            }),
+            "fallback");
         Assert.NotNull(state);
-        Assert.Equal("fallback", state.CorrelationId);
     }
 
     [Fact]

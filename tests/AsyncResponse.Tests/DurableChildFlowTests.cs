@@ -98,7 +98,8 @@ public class DurableChildFlowTests
         services.AddScoped<NaiveChildFlow>();
         services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
             .WithInMemoryChannel()
-            .WithInMemoryTransport();
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
         return services.BuildServiceProvider();
     }
 

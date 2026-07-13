@@ -16,9 +16,16 @@ id. Local listener loops load pending rows from the table and deliver them to li
 correlation ids produce an empty notification payload, which asks listeners to scan all local
 subscriptions; this stays under PostgreSQL's 8 KB notification payload limit.
 
-Active waiters write heartbeat rows to `asyncresponse_channel_subscribers`. A publisher first checks
-for live subscribers; if none exist, it routes directly to lost-subscriber recovery. If subscribers do
-exist, the publisher inserts a message row and waits for delivery confirmation:
+`NOTIFY` is only a wake hint. Signals are deliberately coalesced in a bounded in-process channel,
+and the periodic safety scan remains authoritative. For each subscribed correlation id the reader
+uses a stable `created_at, id` keyset cursor until the retained result set is exhausted; a terminal
+response therefore cannot sit forever behind the oldest `PendingMessageBatchSize` progress rows.
+
+Active waiters write rows to `asyncresponse_channel_subscribers`; one channel-level loop snapshots
+the registrations that are still active locally and extends only those rows with one statement per
+heartbeat interval. A publisher first checks for live subscribers; if none exist, it routes directly
+to lost-subscriber recovery. If subscribers do exist, the publisher inserts a message row and waits
+for delivery confirmation:
 
 1. Same-process delivery completes an in-memory confirmation immediately.
 2. Cross-process delivery sets `acked_at`, which the publisher polls as a fallback.
@@ -91,6 +98,12 @@ builder.Services.AddAsyncResponse()
         options.ResponseQueue = "response";
         options.DeadLetterQueue = "deadletter";
         options.WorkerSubscriber.UseAckAfterReceive(4, 256);
+    })
+    .WithPostgreSqlDurableFlows(options =>
+    {
+        options.SchemaName = "public";
+        options.TableName = "asyncresponse_flow_state";
+        options.StateExpiry = TimeSpan.FromDays(14);
     });
 ```
 
@@ -107,10 +120,13 @@ Recommended Npgsql connection-string settings:
 - Use simple PostgreSQL identifiers for schema/table/notification names: letters, digits, and
   underscores, not starting with a digit.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
-  rows to decide whether to wait for live delivery. Heartbeat upserts retry on transient database
-  errors (logged at Warning) — a subscriber row only expires if upserts keep failing for longer
-  than `SubscriberHeartbeatTimeout`, so leave headroom for more than one interval inside the
-  timeout.
+  rows to decide whether to wait for live delivery. Registration writes one row, then each interval
+  performs one update for the process's current active-registration snapshot. Rows no longer in that
+  snapshot are allowed to expire even if cleanup deletion failed. A failed batch is logged and the
+  next interval retries, so leave enough timeout headroom for multiple attempts.
+- `PendingMessageBatchSize` is a page-size tuning knob, not a cap per sweep. Smaller pages lower
+  peak materialization; larger pages reduce round trips when one correlation id carries heavy
+  progress traffic.
 - Keep `DeliveryConfirmationTimeout` long enough for the slowest expected live delivery, but short
   enough that a truly lost subscriber routes to recovery promptly.
 - Set `DeadLetterRetention` if operators do not inspect dead-letter rows indefinitely.

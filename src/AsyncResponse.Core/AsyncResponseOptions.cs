@@ -2,8 +2,8 @@ namespace AsyncResponse;
 
 /// <summary>
 /// Engine-level options for AsyncResponse, configured by <c>AddAsyncResponse()</c>. These apply
-/// regardless of which channel or transport is registered. Channel-specific settings (per-waiter
-/// timeouts, recovery-state expiry, key prefixes) live on the channel's own options — see
+/// regardless of which channel, transport, or durable-flow store is registered. Component-specific
+/// settings live on that component's own <c>With*</c> registration — see
 /// <see cref="InMemoryAsyncResponseOptions"/> and the Redis channel package's <c>RedisAsyncResponseOptions</c>.
 /// </summary>
 public sealed class AsyncResponseOptions
@@ -16,10 +16,4 @@ public sealed class AsyncResponseOptions
     /// durable store, to avoid duplicate scans and warnings.
     /// </summary>
     public AsyncResponseWatchdogOptions Watchdog { get; set; } = new();
-
-    /// <summary>
-    /// Settings for durable flows (<see cref="IDurableFlows"/>): flow-state expiry and the
-    /// default awaited-step timeout.
-    /// </summary>
-    public DurableFlowOptions DurableFlows { get; set; } = new();
 }

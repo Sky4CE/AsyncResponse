@@ -112,8 +112,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         activity?.SetTag("asyncresponse.timeout_seconds", timeout.Value.TotalSeconds);
 
-        if (_logger.IsEnabled(LogLevel.Information))
-            _logger.LogInformation("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         var registrationId = Guid.NewGuid();
@@ -182,7 +182,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     finished = true;
                     var schemaError = new InvalidOperationException(
                         $"Response envelope for correlationId {correlationId} has schema version {envelope.SchemaVersion}, " +
-                        $"newer than this build supports ({AsyncResponseEnvelopeSchema.Current}); it was produced by a newer deployment.");
+                        $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
                     AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
                     if (!tcs.TrySetException(schemaError))
                         _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
@@ -203,8 +203,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
                 else
                 {
-                    if (_logger.IsEnabled(LogLevel.Information))
-                        _logger.LogInformation("Received response for correlationId {CorrelationId}.", correlationId);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug("Received response for correlationId {CorrelationId}.", correlationId);
                     finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
                     if (finished && !tcs.TrySetResult(envelope.Payload!))
                         _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
@@ -384,9 +384,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Information))
+            else if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogInformation("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", correlationId, subject, typeof(T), outcome);
+                _logger.LogDebug("Published response for correlationId {CorrelationId} on subject {Subject}. PayloadType: {PayloadType}. Outcome: {Outcome}.", correlationId, subject, typeof(T), outcome);
             }
         }
         catch (Exception ex)
@@ -429,9 +429,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Information))
+            else if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogInformation("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+                _logger.LogDebug("Published raw response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
             }
         }
         catch (Exception ex)
@@ -483,9 +483,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
                 AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
             }
-            else if (_logger.IsEnabled(LogLevel.Information))
+            else if (_logger.IsEnabled(LogLevel.Debug))
             {
-                _logger.LogInformation("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
+                _logger.LogDebug("Published exception response for correlationId {CorrelationId} on subject {Subject}. Outcome: {Outcome}.", correlationId, subject, outcome);
             }
         }
         catch (Exception ex)

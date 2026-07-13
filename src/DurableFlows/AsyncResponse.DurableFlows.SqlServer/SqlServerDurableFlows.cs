@@ -15,15 +15,11 @@ namespace Microsoft.Extensions.DependencyInjection
             this AsyncResponseRegistrationBuilder builder,
             Action<SqlServerDurableFlowOptions>? configure = null)
         {
-            builder.Services.AddOptions();
-            if (configure is not null)
-                builder.Services.Configure(configure);
-
             // Singleton on purpose: schema provisioning is cached per store instance, and the
             // executor resolves the store from a fresh scope per flow execution — a scoped store
             // would re-run EnsureCreated's DDL round-trip on every run.
             builder.Services.TryAddSingleton<SqlServerFlowStateStore>();
-            return builder.WithCustomDurableFlows<SqlServerFlowStateStore>();
+            return builder.WithDurableFlows<SqlServerFlowStateStore, SqlServerDurableFlowOptions>(configure);
         }
     }
 }
@@ -31,7 +27,7 @@ namespace Microsoft.Extensions.DependencyInjection
 namespace AsyncResponse.DurableFlows.SqlServer
 {
 /// <summary>Options for the SQL Server durable-flow state store.</summary>
-public sealed class SqlServerDurableFlowOptions
+public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>SQL Server connection string. Required.</summary>
     public string? ConnectionString { get; set; }
@@ -46,7 +42,7 @@ public sealed class SqlServerDurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="SqlServerFlowStateStore.SaveAsync"/> opportunistically deletes expired
+    /// How often <see cref="SqlServerFlowStateStore.TryCreateAsync"/> opportunistically deletes expired
     /// rows (loads already treat expired state as absent; pruning bounds table growth). Zero or
     /// negative prunes on every save. Default: 5 minutes.
     /// </summary>
@@ -77,9 +73,28 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         _options.Validate();
     }
 
-    public async Task SaveAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
     {
-        DurableFlowStoreShared.ValidateSave(flowId, state, ttl);
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > @now_utc;";
+        command.Parameters.AddWithValue("@flow_id", flowId);
+        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
+        return state?.Revision == reader.GetInt64(1) ? state : null;
+    }
+
+    public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
@@ -89,37 +104,78 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         command.CommandText =
             $"""
             MERGE {Table} WITH (HOLDLOCK) AS target
-            USING (SELECT @flow_id AS flow_id) AS source
-                ON target.flow_id = source.flow_id
-            WHEN MATCHED THEN
+            USING (SELECT @flow_id AS flow_id) AS source ON target.flow_id = source.flow_id
+            WHEN MATCHED AND target.expires_at_utc <= @now_utc THEN
                 UPDATE SET state_json = @state_json,
                            expires_at_utc = @expires_at_utc,
-                           updated_at_utc = @updated_at_utc
+                           updated_at_utc = @now_utc,
+                           revision = @revision,
+                           lease_id = NULL,
+                           lease_expires_at_utc = NULL
             WHEN NOT MATCHED THEN
-                INSERT (flow_id, state_json, expires_at_utc, updated_at_utc)
-                VALUES (@flow_id, @state_json, @expires_at_utc, @updated_at_utc);
+                INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
+                VALUES (@flow_id, @state_json, @expires_at_utc, @now_utc, @revision);
             """;
         var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
         command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("@updated_at_utc", now);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@revision", state.Revision);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+    public async Task<bool> TryUpdateAsync(
+        string flowId,
+        FlowState state,
+        long expectedRevision,
+        TimeSpan ttl,
+        string? leaseId = null,
+        CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT state_json FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > @now_utc;";
+        command.CommandText =
+            $"""
+            UPDATE {Table}
+            SET state_json = @state_json,
+                expires_at_utc = @expires_at_utc,
+                updated_at_utc = @now_utc,
+                revision = @new_revision
+            WHERE flow_id = @flow_id
+              AND revision = @expected_revision
+              AND expires_at_utc > @now_utc
+              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > @now_utc));
+            """;
+        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+        command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
+        command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
+        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@expected_revision", expectedRevision);
+        command.Parameters.AddWithValue("@new_revision", state.Revision);
+        command.Parameters.AddWithValue("@lease_id", (object?)leaseId ?? DBNull.Value);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
 
-        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-        return result is string json ? DurableFlowStoreShared.Deserialize(json) : null;
+    public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: true, cancellationToken);
+
+    public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: false, cancellationToken);
+
+    public async Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"UPDATE {Table} SET lease_id = NULL, lease_expires_at_utc = NULL WHERE flow_id = @flow_id AND lease_id = @lease_id;";
+        command.Parameters.AddWithValue("@flow_id", flowId);
+        command.Parameters.AddWithValue("@lease_id", leaseId);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -192,7 +248,10 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                     flow_id nvarchar(400) NOT NULL PRIMARY KEY,
                     state_json nvarchar(max) NOT NULL,
                     expires_at_utc datetime2 NOT NULL,
-                    updated_at_utc datetime2 NOT NULL
+                    updated_at_utc datetime2 NOT NULL,
+                    revision bigint NOT NULL CONSTRAINT {Quote($"DF_{_options.TableName}_revision")} DEFAULT 0,
+                    lease_id nvarchar(64) NULL,
+                    lease_expires_at_utc datetime2 NULL
                 );
 
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{IndexName}' AND object_id = OBJECT_ID(N'{_options.SchemaName}.{_options.TableName}'))
@@ -206,6 +265,37 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         {
             _ensureGate.Release();
         }
+    }
+
+    private async Task<bool> UpdateLeaseAsync(
+        string flowId,
+        string leaseId,
+        TimeSpan leaseDuration,
+        bool acquire,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        if (leaseDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        var now = DateTime.UtcNow;
+        command.CommandText =
+            $"""
+            UPDATE {Table}
+            SET lease_id = @lease_id, lease_expires_at_utc = @lease_expires_at_utc
+            WHERE flow_id = @flow_id
+              AND expires_at_utc > @now_utc
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= @now_utc OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > @now_utc")};
+            """;
+        command.Parameters.AddWithValue("@flow_id", flowId);
+        command.Parameters.AddWithValue("@lease_id", leaseId);
+        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@lease_expires_at_utc", now.Add(leaseDuration));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
     private async Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
