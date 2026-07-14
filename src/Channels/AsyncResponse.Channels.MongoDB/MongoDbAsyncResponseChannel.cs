@@ -463,7 +463,6 @@ internal sealed class MongoDbAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -507,7 +506,6 @@ internal sealed class MongoDbAsyncResponseChannel :
         return registrationIds;
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
         var failures = 0;
@@ -547,7 +545,6 @@ internal sealed class MongoDbAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task DispatchLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -709,7 +706,6 @@ internal sealed class MongoDbAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task TryDispatchLocalSubscribersAsync(MongoDbChannelMessage message, CancellationToken cancellationToken)
     {
         if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
@@ -815,7 +811,6 @@ internal sealed class MongoDbAsyncResponseChannel :
     private static void OnWaiterTimeout(object? state)
         => ((IWaiterTimeoutState)state!).Schedule();
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task HandleWaiterTimeoutAsync<T>(
         MongoDbSubscription<T> subscription,
         Activity? activity,

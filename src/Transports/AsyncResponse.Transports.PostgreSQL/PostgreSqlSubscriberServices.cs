@@ -39,7 +39,6 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
     protected abstract Task HandleMessageAsync(PostgreSqlTransportDelivery delivery, CancellationToken cancellationToken);
 
     /// <inheritdoc />
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         PostgreSqlTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
@@ -66,7 +65,6 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
@@ -116,7 +114,6 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
         try
@@ -136,7 +133,6 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task WaitForSignalOrDelayAsync(CancellationToken cancellationToken)
     {
         var delay = Task.Delay(SubscriberOptions.EmptyPollDelay, cancellationToken);

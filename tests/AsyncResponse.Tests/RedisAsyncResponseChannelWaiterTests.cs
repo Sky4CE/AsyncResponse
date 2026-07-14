@@ -570,4 +570,90 @@ public class RedisAsyncResponseChannelWaiterTests
             await Task.Delay(10, timeout.Token);
         }
     }
+
+    [Fact]
+    public void ServiceCollectionExtensions_ThrowsWhenNoConnectionStringOrMultiplexer()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncResponse().WithRedisChannel();
+
+        var provider = services.BuildServiceProvider();
+        Assert.Throws<InvalidOperationException>(() => provider.GetRequiredService<RedisAsyncResponseChannel>());
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SynchronousCompletion_HandlesDisposedCts()
+    {
+        var mockSubscriber = new Mock<ISubscriber>();
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(mockSubscriber.Object);
+
+        var channelName = "corr-sync";
+        var validEnvelope = new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed }
+        };
+        var json = JsonSerializer.Serialize(validEnvelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        mockSubscriber
+            .Setup(s => s.SubscribeAsync(
+                It.IsAny<RedisChannel>(),
+                It.IsAny<Action<RedisChannel, RedisValue>>(),
+                It.IsAny<CommandFlags>()))
+            .Callback<RedisChannel, Action<RedisChannel, RedisValue>, CommandFlags>((channel, handler, _) =>
+            {
+                handler(channel, json);
+            })
+            .Returns(Task.CompletedTask);
+
+        mockSubscriber
+            .Setup(s => s.UnsubscribeAsync(
+                It.IsAny<RedisChannel>(),
+                It.IsAny<Action<RedisChannel, RedisValue>?>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(Task.CompletedTask);
+
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            new TestLogger<RedisAsyncResponseChannel>());
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(channelName);
+        var result = await waiter.ResponseTask;
+        Assert.Equal(OperationStatus.Completed, result.Status);
+    }
+
+    [Fact]
+    public async Task CountActiveSubscribersAsync_HandlesServerException()
+    {
+        var mockSubscriber = new Mock<ISubscriber>();
+        var multiplexer = new Mock<IConnectionMultiplexer>();
+        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(mockSubscriber.Object);
+
+        var endPoint = new Mock<EndPoint>().Object;
+        multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endPoint]);
+
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        server.Setup(s => s.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .Throws(new InvalidOperationException("Redis command failed"));
+
+        multiplexer.Setup(m => m.GetServer(endPoint, It.IsAny<object?>())).Returns(server.Object);
+
+        var channel = new RedisAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            multiplexer.Object,
+            _store.Object,
+            Options.Create(new RedisAsyncResponseOptions()),
+            new AsyncResponseContextPropagation([]),
+            new TestLogger<RedisAsyncResponseChannel>());
+
+        var count = await channel.CountActiveSubscribersAsync("corr");
+        Assert.Equal(0, count);
+    }
 }

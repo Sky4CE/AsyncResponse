@@ -459,7 +459,6 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -503,7 +502,6 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         return registrationIds;
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
         var failures = 0;
@@ -532,7 +530,6 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task DispatchLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -692,7 +689,6 @@ internal sealed class PostgreSqlAsyncResponseChannel :
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task TryDispatchLocalSubscribersAsync(PostgreSqlChannelMessage message, CancellationToken cancellationToken)
     {
         if (!_subscriptions.TryGetValue(message.CorrelationId, out var group))
@@ -798,7 +794,6 @@ internal sealed class PostgreSqlAsyncResponseChannel :
     private static void OnWaiterTimeout(object? state)
         => ((IWaiterTimeoutState)state!).Schedule();
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task HandleWaiterTimeoutAsync<T>(
         PostgreSqlSubscription<T> subscription,
         Activity? activity,

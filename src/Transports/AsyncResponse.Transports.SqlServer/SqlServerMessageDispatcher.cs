@@ -153,7 +153,6 @@ internal sealed class SqlServerMessageDispatcher : IAsyncDisposable
     }
 
     /// <inheritdoc />
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     public async ValueTask DisposeAsync()
     {
         if (_backgroundQueue is null)

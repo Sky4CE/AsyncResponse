@@ -182,7 +182,6 @@ internal sealed class MongoDbMessageDispatcher : IAsyncDisposable
     }
 
     /// <inheritdoc />
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     public async ValueTask DisposeAsync()
     {
         if (_backgroundQueue is null)

@@ -530,4 +530,40 @@ public class NatsAsyncResponseChannelTests
         while (!condition())
             await Task.Delay(10, timeout.Token);
     }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SynchronousCompletion_HandlesDisposedCts()
+    {
+        var mockClient = new Mock<INatsResponseChannelClient>();
+        var channel = new NatsAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            mockClient.Object,
+            _store.Object,
+            Options.Create(new NatsAsyncResponseChannelOptions()),
+            new AsyncResponseContextPropagation([]),
+            new TestLogger<NatsAsyncResponseChannel>());
+
+        var subscriptionMock = new Mock<INatsChannelSubscription>();
+        var messageChannel = System.Threading.Channels.Channel.CreateUnbounded<NatsInboundResponse>();
+        subscriptionMock.Setup(s => s.ReadAsync(It.IsAny<CancellationToken>()))
+            .Returns(messageChannel.Reader.ReadAllAsync());
+
+        var validEnvelope = new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed }
+        };
+        var json = JsonSerializer.Serialize(validEnvelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        mockClient.Setup(c => c.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Callback<string, CancellationToken>((sub, token) =>
+            {
+                messageChannel.Writer.TryWrite(new NatsInboundResponse(json, false, () => ValueTask.CompletedTask));
+            })
+            .ReturnsAsync(subscriptionMock.Object);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-sync");
+        var result = await waiter.ResponseTask;
+        Assert.Equal(OperationStatus.Completed, result.Status);
+    }
 }

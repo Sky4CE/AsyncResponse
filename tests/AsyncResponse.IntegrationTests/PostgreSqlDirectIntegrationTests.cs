@@ -1,3 +1,4 @@
+using System.Reflection;
 using AsyncResponse.Channels.PostgreSQL;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.PostgreSQL;
@@ -854,6 +855,125 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
 
     private static string SuccessEnvelope(string message)
         => $$"""{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"{{message}}"},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+
+    [Fact]
+    public async Task PostgreSqlAsyncResponseChannel_CoverInternalEdgeCases()
+    {
+        await WithDataSourceAsync("channel_edges", async (schema, dataSource) =>
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            var options = ChannelOptions(schema);
+            options.DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(10);
+            options.DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(5);
+            
+            services.AddSingleton(Options.Create(options));
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            services.AddSingleton(sql);
+            services.AddSingleton(MockRecoveryStore());
+            services.AddSingleton(new AsyncResponseContextPropagation([]));
+            services.AddSingleton<PostgreSqlAsyncResponseChannel>();
+            
+            await using var provider = services.BuildServiceProvider();
+            var channel = provider.GetRequiredService<PostgreSqlAsyncResponseChannel>();
+            
+            // Cover EnsureCreatedAsync double call (first/second return)
+            await sql.EnsureCreatedAsync();
+            await sql.EnsureCreatedAsync();
+
+            // Cover HeartbeatSubscribersAsync empty collection fast return
+            await sql.HeartbeatSubscribersAsync("instance", [], TimeSpan.FromMinutes(1), CancellationToken.None);
+
+            var subscription1 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription2 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription3 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+            
+            SetField(subscription1.Instance, "_dropped", true);
+
+            var addSubMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("AddSubscription", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            addSubMethod.Invoke(channel, ["corr", subscription1.Instance]);
+            addSubMethod.Invoke(channel, ["corr", subscription2.Instance]);
+            addSubMethod.Invoke(channel, ["corr", subscription3.Instance]);
+
+            // 1. Cover DispatchPendingMessagesAsync where subscriptions.Count == 0
+            var channelClean = provider.GetRequiredService<PostgreSqlAsyncResponseChannel>();
+            var subsField = typeof(PostgreSqlAsyncResponseChannel).GetField("_subscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var subsDict = (System.Collections.IDictionary)subsField.GetValue(channelClean)!;
+            subsDict.Clear();
+            
+            addSubMethod.Invoke(channelClean, ["corr-dropped-only", subscription1.Instance]);
+            
+            var dispatchPendingMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var scope = new HashSet<string> { "corr-dropped-only" };
+            await (Task)dispatchPendingMethod.Invoke(channelClean, [scope, CancellationToken.None])!;
+
+            // 2. Cover WaitForAcknowledgementAsync break branch and pollDelay branches
+            var beginConfirmationMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var tryConfirmMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("TryConfirmDeliveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            
+            var messageId = Guid.NewGuid();
+            await sql.InsertMessageAsync(messageId, "corr", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
+            
+            var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
+            await (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!;
+
+            // 3. Cover DispatchMessageToSubscribersAsync continue branch (dropped & seen & live)
+            var messageId2 = Guid.NewGuid();
+            await sql.InsertMessageAsync(messageId2, "corr", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
+
+            subscription2.Instance.GetType().GetMethod("MarkSeen", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+                .Invoke(subscription2.Instance, [messageId2]);
+
+            var message2 = new PostgreSqlChannelMessage(messageId2, "corr", "{}", DateTimeOffset.UtcNow);
+            var dispatchMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            
+            var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("IPostgreSqlSubscription", BindingFlags.NonPublic)!;
+            var subArray = Array.CreateInstance(subInterfaceType, 3);
+            subArray.SetValue(subscription1.Instance, 0); // Dropped
+            subArray.SetValue(subscription2.Instance, 1); // Already seen
+            subArray.SetValue(subscription3.Instance, 2); // Live (covers ProcessUnderCapturedContextAsync)
+            
+            await (Task)dispatchMethod.Invoke(channel, [message2, subArray, CancellationToken.None])!;
+
+            // Start listener to cover background task dispose/cancellation
+            var ensureListenerStartedMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("EnsureListenerStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            ensureListenerStartedMethod.Invoke(channel, null);
+
+            await channel.DisposeAsync();
+            await channelClean.DisposeAsync();
+        });
+    }
+
+    private static (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
+        Type channelType,
+        string nestedTypeName,
+        object channel,
+        Func<OperationResult, ValueTask<bool>> predicate)
+    {
+        var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+            .MakeGenericType(typeof(OperationResult));
+        var instance = Activator.CreateInstance(
+            type,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null, null],
+            culture: null)!;
+        SetField(instance, "_cleanupStarted", 1);
+        return (instance, completion);
+    }
+
+    private static void SetField(object target, string name, object value)
+        => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
+
+    private static IRecoveryStateStore MockRecoveryStore() => new FakeRecoveryStore();
+
+    private sealed class FakeRecoveryStore : IRecoveryStateStore
+    {
+        public Task SaveAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyList<RecoveryState>>([]);
+        public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default) => Task.FromResult(true);
+    }
 
     private interface IDirectPostgreSqlRecoveryFlow
     {

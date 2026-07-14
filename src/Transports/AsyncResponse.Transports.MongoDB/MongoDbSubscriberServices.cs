@@ -39,7 +39,6 @@ internal abstract class MongoDbSubscriberService : BackgroundService
     protected abstract Task HandleMessageAsync(MongoDbTransportDelivery delivery, CancellationToken cancellationToken);
 
     /// <inheritdoc />
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         MongoDbTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
@@ -66,7 +65,6 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
@@ -118,7 +116,6 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
         try
@@ -145,7 +142,6 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task WaitForSignalOrDelayAsync(CancellationToken cancellationToken)
     {
         var delay = Task.Delay(SubscriberOptions.EmptyPollDelay, cancellationToken);

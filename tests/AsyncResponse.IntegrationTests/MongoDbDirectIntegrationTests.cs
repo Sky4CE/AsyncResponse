@@ -1,3 +1,4 @@
+using System.Reflection;
 using AsyncResponse.Channels.MongoDB;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.MongoDB;
@@ -501,6 +502,119 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         var name = $"itest_direct_{prefix.Replace('-', '_')}_{Guid.NewGuid():N}"[..40];
         _databases.Add(name);
         return name;
+    }
+
+    [Fact]
+    public async Task MongoDbAsyncResponseChannel_CoverInternalEdgeCases()
+    {
+        var (database, options) = NewChannelDatabase("channel_edges");
+        options.DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(10);
+        options.DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(5);
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton(Options.Create(options));
+        var store = new MongoDbChannelStore(database, Options.Create(options));
+        services.AddSingleton(store);
+        services.AddSingleton(MockRecoveryStore());
+        services.AddSingleton(new AsyncResponseContextPropagation([]));
+        services.AddSingleton<MongoDbAsyncResponseChannel>();
+
+        await using var provider = services.BuildServiceProvider();
+        var channel = provider.GetRequiredService<MongoDbAsyncResponseChannel>();
+        
+        // Cover EnsureCreatedAsync double call (first/second return)
+        await store.EnsureCreatedAsync();
+        await store.EnsureCreatedAsync();
+
+        var subscription1 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription2 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription3 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
+
+        SetField(subscription1.Instance, "_dropped", true);
+
+        var addSubMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("AddSubscription", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        addSubMethod.Invoke(channel, ["corr", subscription1.Instance]);
+        addSubMethod.Invoke(channel, ["corr", subscription2.Instance]);
+        addSubMethod.Invoke(channel, ["corr", subscription3.Instance]);
+
+        // 1. Cover DispatchPendingMessagesAsync where subscriptions.Count == 0
+        var channelClean = provider.GetRequiredService<MongoDbAsyncResponseChannel>();
+        var subsField = typeof(MongoDbAsyncResponseChannel).GetField("_subscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var subsDict = (System.Collections.IDictionary)subsField.GetValue(channelClean)!;
+        subsDict.Clear();
+
+        addSubMethod.Invoke(channelClean, ["corr-dropped-only", subscription1.Instance]);
+
+        var dispatchPendingMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var scope = new HashSet<string> { "corr-dropped-only" };
+        await (Task)dispatchPendingMethod.Invoke(channelClean, [scope, CancellationToken.None])!;
+
+        // 2. Cover WaitForAcknowledgementAsync break branch and pollDelay branches
+        var beginConfirmationMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var tryConfirmMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("TryConfirmDeliveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var messageId = Guid.NewGuid();
+        await store.InsertMessageAsync(messageId, "corr", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
+
+        var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
+        await (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!;
+
+        // 3. Cover DispatchMessageToSubscribersAsync continue branch (dropped & seen & live)
+        var messageId2 = Guid.NewGuid();
+        await store.InsertMessageAsync(messageId2, "corr", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
+
+        subscription2.Instance.GetType().GetMethod("MarkSeen", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .Invoke(subscription2.Instance, [messageId2]);
+
+        var message2 = new MongoDbChannelMessage(messageId2, "corr", "{}", DateTimeOffset.UtcNow);
+        var dispatchMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var subInterfaceType = typeof(MongoDbAsyncResponseChannel).GetNestedType("IMongoDbSubscription", BindingFlags.NonPublic)!;
+        var subArray = Array.CreateInstance(subInterfaceType, 3);
+        subArray.SetValue(subscription1.Instance, 0); // Dropped
+        subArray.SetValue(subscription2.Instance, 1); // Already seen
+        subArray.SetValue(subscription3.Instance, 2); // Live (covers ProcessUnderCapturedContextAsync)
+
+        await (Task)dispatchMethod.Invoke(channel, [message2, subArray, CancellationToken.None])!;
+
+        // Start listener to cover background task dispose/cancellation
+        var ensureListenerStartedMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("EnsureListenerStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        ensureListenerStartedMethod.Invoke(channel, null);
+
+        await channel.DisposeAsync();
+        await channelClean.DisposeAsync();
+    }
+
+    private static (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
+        Type channelType,
+        string nestedTypeName,
+        object channel,
+        Func<OperationResult, ValueTask<bool>> predicate)
+    {
+        var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+            .MakeGenericType(typeof(OperationResult));
+        var instance = Activator.CreateInstance(
+            type,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null, null],
+            culture: null)!;
+        SetField(instance, "_cleanupStarted", 1);
+        return (instance, completion);
+    }
+
+    private static void SetField(object target, string name, object value)
+        => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
+
+    private static IRecoveryStateStore MockRecoveryStore() => new FakeRecoveryStore();
+
+    private sealed class FakeRecoveryStore : IRecoveryStateStore
+    {
+        public Task SaveAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyList<RecoveryState>>([]);
+        public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default) => Task.FromResult(true);
     }
 
     private static async Task EventuallyAsync(Func<Task<bool>> probe)

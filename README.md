@@ -603,10 +603,10 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **2700+ unit tests on each target framework** (.NET 8 + .NET 10 executions), including
+- **2800+ unit tests on each target framework** (.NET 8 + .NET 10 executions), including
   concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
   duplicate-execution detection.
-- **167 integration test cases** drive the shipped sample app black-box over HTTP against **real
+- **170 integration test cases** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
   Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
   for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport.

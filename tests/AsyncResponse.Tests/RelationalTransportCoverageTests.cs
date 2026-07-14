@@ -105,4 +105,31 @@ public sealed class RelationalTransportCoverageTests
             Params = []
         }
     };
+
+    [Fact]
+    public async Task RelationalTransport_ExceptionCoverage()
+    {
+        // 1. SQL Server Transport Store EnsureCreatedAsync and InsertAsync exceptions
+        var sqlOptions = Options.Create(new SqlServerAsyncResponseTransportOptions
+        {
+            ConnectionString = "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+            AutoCreateSchema = true
+        });
+        var sqlStore = new SqlServerTransportStore(sqlOptions);
+        await Assert.ThrowsAnyAsync<Exception>(() => sqlStore.EnsureCreatedAsync());
+
+        sqlStore.GetType().GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(sqlStore, true);
+        var insertMethod = sqlStore.GetType().GetMethod("InsertAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)insertMethod.Invoke(sqlStore, [Guid.NewGuid(), "worker", "{}", new Dictionary<string, string>(), null, false, CancellationToken.None])!);
+
+        // 2. PostgreSQL Transport Store EnsureCreatedAsync exception
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=localhost;Port=1;Database=unused;Username=unused;Password=unused;Timeout=1;Pooling=false");
+        var pgOptions = Options.Create(new PostgreSqlAsyncResponseTransportOptions
+        {
+            AutoCreateSchema = true
+        });
+        var pgStore = new PostgreSqlTransportStore(dataSource, pgOptions);
+        await Assert.ThrowsAnyAsync<Exception>(() => pgStore.EnsureCreatedAsync());
+    }
 }

@@ -53,7 +53,6 @@ internal abstract class SqlServerSubscriberService : BackgroundService
     }
 
     /// <inheritdoc />
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         SqlServerTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
@@ -80,7 +79,6 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
@@ -131,7 +129,6 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         }
     }
 
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private async Task WaitForSignalOrDelayAsync(CancellationToken cancellationToken)
     {
         var delay = Task.Delay(SubscriberOptions.EmptyPollDelay, cancellationToken);

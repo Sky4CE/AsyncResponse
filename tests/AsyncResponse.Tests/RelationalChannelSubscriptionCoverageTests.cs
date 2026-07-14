@@ -29,7 +29,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             MockRecoveryStore(),
             options,
             new AsyncResponseContextPropagation([]),
-            NullLogger<SqlServerAsyncResponseChannel>.Instance);
+            new FakeDebugLogger<SqlServerAsyncResponseChannel>());
         var recoveryStore = new SqlServerRecoveryStateStore(
             sql,
             NullLogger<SqlServerRecoveryStateStore>.Instance);
@@ -50,6 +50,10 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             channel,
             json => new SqlServerChannelMessage(Guid.NewGuid(), "corr", json, DateTimeOffset.UtcNow));
 
+        var nestedType = typeof(SqlServerAsyncResponseChannel).GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
+        var confirmation = Activator.CreateInstance(nestedType, [channel, Guid.NewGuid(), new TaskCompletionSource<bool>()])!;
+        ((IDisposable)confirmation).Dispose();
+
         await channel.DisposeAsync();
     }
 
@@ -67,7 +71,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             MockRecoveryStore(),
             options,
             new AsyncResponseContextPropagation([]),
-            NullLogger<PostgreSqlAsyncResponseChannel>.Instance);
+            new FakeDebugLogger<PostgreSqlAsyncResponseChannel>());
         ExerciseRecoveryDeserializer(
             new PostgreSqlRecoveryStateStore(sql, NullLogger<PostgreSqlRecoveryStateStore>.Instance));
 
@@ -76,6 +80,10 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             "PostgreSqlSubscription`1",
             channel,
             json => new PostgreSqlChannelMessage(Guid.NewGuid(), "corr", json, DateTimeOffset.UtcNow));
+
+        var nestedType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
+        var confirmation = Activator.CreateInstance(nestedType, [channel, Guid.NewGuid(), new TaskCompletionSource<bool>()])!;
+        ((IDisposable)confirmation).Dispose();
 
         await channel.DisposeAsync();
     }
@@ -206,4 +214,177 @@ public sealed class RelationalChannelSubscriptionCoverageTests
 
     private static void SetField(object target, string name, object value)
         => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
+
+    private sealed class FakeDebugLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => logLevel == Microsoft.Extensions.Logging.LogLevel.Debug;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) {}
+    }
+
+    [Fact]
+    public async Task SqlServerChannelSql_ExceptionCoverage()
+    {
+        var options = Options.Create(new SqlServerAsyncResponseChannelOptions
+        {
+            ConnectionString = "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+            AutoCreateSchema = true
+        });
+        var sql = new SqlServerChannelSql(options);
+
+        // 1. EnsureCreatedAsync throws when AutoCreateSchema = true
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.EnsureCreatedAsync());
+
+        // 2. Set _created to true to bypass DDL, so other methods fail on their actual commands
+        SetField(sql, "_created", true);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [Guid.NewGuid()], TimeSpan.FromMinutes(1), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.SaveRecoveryStateAsync("corr", new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr" }, TimeSpan.FromMinutes(1), CancellationToken.None));
+
+        var pruneRecovery = typeof(SqlServerChannelSql).GetMethod("PruneExpiredRecoveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneRecovery.Invoke(sql, [null, CancellationToken.None])!);
+
+        var pruneMessages = typeof(SqlServerChannelSql).GetMethod("PruneExpiredMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneMessages.Invoke(sql, [CancellationToken.None])!);
+
+        var pruneSubscribers = typeof(SqlServerChannelSql).GetMethod("PruneExpiredSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pruneSubscribers.Invoke(sql, [null, CancellationToken.None])!);
+    }
+
+    [Fact]
+    public async Task PostgreSqlChannelSql_ExceptionCoverage()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=localhost;Port=1;Database=unused;Username=unused;Password=unused;Timeout=1;Pooling=false");
+        var options = Options.Create(new PostgreSqlAsyncResponseChannelOptions { AutoCreateSchema = true });
+        var sql = new PostgreSqlChannelSql(dataSource, options);
+
+        // 1. EnsureCreatedAsync throws when AutoCreateSchema = true
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.EnsureCreatedAsync());
+
+        // 2. Set _created to true
+        SetField(sql, "_created", true);
+
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [Guid.NewGuid()], TimeSpan.FromMinutes(1), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
+
+        var pgPruneSubscribers = typeof(PostgreSqlChannelSql).GetMethod("PruneExpiredSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)pgPruneSubscribers.Invoke(sql, [null, CancellationToken.None])!);
+
+        var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.ExecuteListenAsync(_ => Task.CompletedTask, cts.Token));
+    }
+
+    [Fact]
+    public async Task SqlServerAsyncResponseChannel_InternalCoverage()
+    {
+        var options = Options.Create(new SqlServerAsyncResponseChannelOptions
+        {
+            ConnectionString = "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+            AutoCreateSchema = false,
+            DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
+            DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
+        });
+        var sql = new SqlServerChannelSql(options);
+        using var provider = new ServiceCollection().BuildServiceProvider();
+        var channel = new SqlServerAsyncResponseChannel(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            sql,
+            MockRecoveryStore(),
+            options,
+            new AsyncResponseContextPropagation([]),
+            new FakeDebugLogger<SqlServerAsyncResponseChannel>());
+
+        // 1. Test DispatchMessageToSubscribersAsync with subscription marked dropped or seen
+        var subscription = Subscription(typeof(SqlServerAsyncResponseChannel), "SqlServerSubscription`1", channel, _ => new ValueTask<bool>(true));
+        SetField(subscription.Instance, "_dropped", true);
+
+        var message = new SqlServerChannelMessage(Guid.NewGuid(), "corr", "null", DateTimeOffset.UtcNow);
+        var dispatchMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var subInterfaceType = typeof(SqlServerAsyncResponseChannel).GetNestedType("ISqlServerSubscription", BindingFlags.NonPublic)!;
+        var subArray = Array.CreateInstance(subInterfaceType, 1);
+        subArray.SetValue(subscription.Instance, 0);
+
+        await (Task)dispatchMethod.Invoke(channel, [message, subArray, CancellationToken.None])!;
+
+        // 2. Test DispatchPendingMessagesAsync with scope filtering
+        var addSubMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("AddSubscription", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        addSubMethod.Invoke(channel, ["corr", subscription.Instance]);
+
+        var dispatchPendingMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var scope = new HashSet<string> { "other-corr" };
+        await (Task)dispatchPendingMethod.Invoke(channel, [scope, CancellationToken.None])!;
+
+        // 3. Test WaitForAcknowledgementAsync timeout path / database failure path
+        var beginConfirmationMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var tryConfirmMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("TryConfirmDeliveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var confirmation = beginConfirmationMethod.Invoke(channel, [message.Id])!;
+
+        await Task.Delay(10);
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!);
+
+        await channel.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PostgreSqlAsyncResponseChannel_InternalCoverage()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=localhost;Port=1;Database=unused;Username=unused;Password=unused;Timeout=1;Pooling=false");
+        var options = Options.Create(new PostgreSqlAsyncResponseChannelOptions
+        {
+            AutoCreateSchema = false,
+            DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
+            DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
+        });
+        var sql = new PostgreSqlChannelSql(dataSource, options);
+        using var provider = new ServiceCollection().BuildServiceProvider();
+        var channel = new PostgreSqlAsyncResponseChannel(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            sql,
+            MockRecoveryStore(),
+            options,
+            new AsyncResponseContextPropagation([]),
+            new FakeDebugLogger<PostgreSqlAsyncResponseChannel>());
+
+        // 1. Test DispatchMessageToSubscribersAsync with subscription marked dropped or seen
+        var subscription = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+        SetField(subscription.Instance, "_dropped", true);
+
+        var message = new PostgreSqlChannelMessage(Guid.NewGuid(), "corr", "null", DateTimeOffset.UtcNow);
+        var dispatchMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("IPostgreSqlSubscription", BindingFlags.NonPublic)!;
+        var subArray = Array.CreateInstance(subInterfaceType, 1);
+        subArray.SetValue(subscription.Instance, 0);
+
+        await (Task)dispatchMethod.Invoke(channel, [message, subArray, CancellationToken.None])!;
+
+        // 2. Test DispatchPendingMessagesAsync with scope filtering
+        var addSubMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("AddSubscription", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        addSubMethod.Invoke(channel, ["corr", subscription.Instance]);
+
+        var dispatchPendingMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var scope = new HashSet<string> { "other-corr" };
+        await (Task)dispatchPendingMethod.Invoke(channel, [scope, CancellationToken.None])!;
+
+        // 3. Test WaitForAcknowledgementAsync timeout path / database failure path
+        var beginConfirmationMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var tryConfirmMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("TryConfirmDeliveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var confirmation = beginConfirmationMethod.Invoke(channel, [message.Id])!;
+
+        await Task.Delay(10);
+        await Assert.ThrowsAnyAsync<Exception>(() => (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!);
+
+        await channel.DisposeAsync();
+    }
 }

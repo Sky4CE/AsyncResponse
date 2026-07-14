@@ -8,7 +8,7 @@ using MongoDB.Driver.Core.Clusters;
 using MongoDB.Driver.Core.Connections;
 using MongoDB.Driver.Core.Servers;
 using Moq;
-using System.Diagnostics;
+using System.Linq.Expressions;
 using System.Reflection;
 using Xunit;
 
@@ -243,15 +243,297 @@ public sealed class MongoDbChannelCoverageTests
         await fixture.Channel.DisposeAsync();
     }
 
+    [Fact]
+    public async Task CollectDispatchScopeAsync_CoversAllBranches()
+    {
+        var fixture = new ChannelFixture(listenerPollInterval: TimeSpan.FromMilliseconds(1));
+        var channel = fixture.Channel;
+
+        var collectMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("CollectDispatchScopeAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        await Task.Delay(5);
+        var resultNull = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
+        Assert.Null(resultNull);
+
+        var signalMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("SignalDispatcher", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        signalMethod.Invoke(channel, [null]);
+        var resultSweepNull = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
+        Assert.Null(resultSweepNull);
+
+        signalMethod.Invoke(channel, ["corr-id-1"]);
+        signalMethod.Invoke(channel, ["corr-id-2"]);
+        var resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
+        Assert.NotNull(resultScope);
+        Assert.Contains("corr-id-1", resultScope);
+        Assert.Contains("corr-id-2", resultScope);
+    }
+
+    [Fact]
+    public async Task ProcessUnderCapturedContextAsync_HandlesNullContext()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        using (ExecutionContext.SuppressFlow())
+        {
+            await using var waiter = await channel.CreateResponseWaiter<OperationResult>("null-context-waiter", timeout: TimeSpan.FromSeconds(30));
+            var message = Message("""{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"processed"}}""");
+            
+            var subscriptionsField = typeof(MongoDbAsyncResponseChannel)
+                .GetField("_subscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var subscriptionsDict = (System.Collections.IDictionary)subscriptionsField.GetValue(channel)!;
+            
+            var group = (System.Collections.IDictionary)subscriptionsDict["null-context-waiter"]!;
+            object? subscription = null;
+            foreach (System.Collections.DictionaryEntry entry in group)
+            {
+                subscription = entry.Value;
+                break;
+            }
+            Assert.NotNull(subscription);
+            
+            var processUnderContextAsyncProperty = subscription.GetType().GetProperty("ProcessUnderContextAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+            var processUnderContextAsync = (Func<MongoDbChannelMessage, Task>)processUnderContextAsyncProperty.GetValue(subscription)!;
+            
+            await processUnderContextAsync(message);
+            
+            var result = await waiter.ResponseTask;
+            Assert.Equal("processed", result.Message);
+        }
+    }
+
+    [Fact]
+    public async Task ProcessUnderCapturedContextAsync_HandlesNonNullContext()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("non-null-context-waiter", timeout: TimeSpan.FromSeconds(30));
+        var message = Message("""{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"processed-non-null"}}""");
+        
+        var subscriptionsField = typeof(MongoDbAsyncResponseChannel)
+            .GetField("_subscriptions", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var subscriptionsDict = (System.Collections.IDictionary)subscriptionsField.GetValue(channel)!;
+        
+        var group = (System.Collections.IDictionary)subscriptionsDict["non-null-context-waiter"]!;
+        object? subscription = null;
+        foreach (System.Collections.DictionaryEntry entry in group)
+        {
+            subscription = entry.Value;
+            break;
+        }
+        Assert.NotNull(subscription);
+        
+        var processUnderContextAsyncProperty = subscription.GetType().GetProperty("ProcessUnderContextAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+        var processUnderContextAsync = (Func<MongoDbChannelMessage, Task>)processUnderContextAsyncProperty.GetValue(subscription)!;
+        
+        await processUnderContextAsync(message);
+        
+        var result = await waiter.ResponseTask;
+        Assert.Equal("processed-non-null", result.Message);
+    }
+
+    [Fact]
+    public async Task DispatchMessageToSubscribers_WakesPendingConfirmation()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        var messageId = Guid.NewGuid();
+        var beginConfirmationMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        
+        var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
+        
+        var deliveredProperty = confirmation.GetType().GetProperty("Delivered")!;
+        var deliveredTask = (Task<bool>)deliveredProperty.GetValue(confirmation)!;
+        
+        Assert.False(deliveredTask.IsCompleted);
+
+        var active = fixture.Subscription(_ => new ValueTask<bool>(true));
+        var message = new MongoDbChannelMessage(messageId, "corr", """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2}}""", DateTimeOffset.UtcNow);
+
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument());
+
+        await DispatchAsync(channel, message, active.Instance);
+
+        Assert.True(deliveredTask.IsCompleted);
+        Assert.True(await deliveredTask);
+    }
+
+    [Fact]
+    public async Task DispatchPendingMessagesAsync_CoversPagination()
+    {
+        var fixture = new ChannelFixture(pendingMessageBatchSize: 2);
+        var channel = fixture.Channel;
+
+        var correlationId = "paginate-corr";
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true), correlationId);
+        AddSubscription(channel, correlationId, subscription.Instance);
+
+        var doc1 = new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = correlationId, EnvelopeJson = "{}", CreatedAtUtc = DateTime.UtcNow };
+        var doc2 = new MongoChannelMessageDocument { Id = Guid.NewGuid(), CorrelationId = correlationId, EnvelopeJson = "{}", CreatedAtUtc = DateTime.UtcNow };
+
+        var cursorMock1 = new Mock<IAsyncCursor<MongoChannelMessageDocument>>();
+        cursorMock1.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursorMock1.Setup(c => c.Current)
+            .Returns([doc1, doc2]);
+
+        var cursorMock2 = new Mock<IAsyncCursor<MongoChannelMessageDocument>>();
+        cursorMock2.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursorMock2.Setup(c => c.Current)
+            .Returns([]);
+
+        fixture.Messages
+            .SetupSequence(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cursorMock1.Object)
+            .ReturnsAsync(cursorMock2.Object);
+
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(doc1);
+
+        var dispatchMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        await (Task)dispatchMethod.Invoke(channel, [null, CancellationToken.None])!;
+
+        fixture.Messages.Verify(c => c.FindAsync(
+            It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+            It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+            It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    [Fact]
+    public async Task TryConfirmDeliveryAsync_HandlesTimeoutAndAcks()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        var messageId = Guid.NewGuid();
+        var beginConfirmationMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("BeginConfirmation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        
+        var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
+
+        var anonymousType = typeof(MongoDbChannelStore).Assembly.GetTypes()
+            .First(t => t.Name.StartsWith("<>f__AnonymousType") && t.GetProperties().Any(p => p.Name == "AckedAtUtc"));
+        var closedAnonymousType = anonymousType.MakeGenericType([typeof(DateTime?)]);
+
+        var acknowledgeAttempts = 0;
+        SetupFindAsync(fixture.Messages, closedAnonymousType, () =>
+        {
+            var listType = typeof(List<>).MakeGenericType(closedAnonymousType);
+            var list = Activator.CreateInstance(listType)!;
+
+            acknowledgeAttempts++;
+            if (acknowledgeAttempts == 1)
+            {
+                var anonymousInstance = Activator.CreateInstance(closedAnonymousType, [(DateTime?)DateTime.UtcNow]);
+                listType.GetMethod("Add")!.Invoke(list, [anonymousInstance]);
+            }
+            return list;
+        });
+
+        var tryConfirmMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("TryConfirmDeliveryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        await Task.Delay(10);
+        var confirmed = await (Task<bool>)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!;
+        Assert.True(confirmed);
+
+        var messageId2 = Guid.NewGuid();
+        var confirmation2 = beginConfirmationMethod.Invoke(channel, [messageId2])!;
+
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument());
+
+        var confirmed2 = await (Task<bool>)tryConfirmMethod.Invoke(channel, [confirmation2, CancellationToken.None])!;
+        Assert.False(confirmed2);
+    }
+
+    [Fact]
+    public async Task EnsureCreatedAsync_CoversDoubleCheckedLock()
+    {
+        var fixture = new ChannelFixture(autoCreateIndexes: true);
+        var store = fixture.Store;
+
+        var recoveryIndexes = new Mock<IMongoIndexManager<MongoRecoveryStateDocument>>();
+        var tcs = new TaskCompletionSource();
+        recoveryIndexes
+            .Setup(i => i.CreateOneAsync(
+                It.IsAny<CreateIndexModel<MongoRecoveryStateDocument>>(),
+                It.IsAny<CreateOneIndexOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                await tcs.Task;
+                return "index";
+            });
+        fixture.Recovery.SetupGet(c => c.Indexes).Returns(recoveryIndexes.Object);
+
+        SetupSuccessfulIndexes(fixture.Messages);
+        SetupSuccessfulIndexes(fixture.Subscribers);
+
+        var task1 = store.EnsureCreatedAsync();
+        var task2 = store.EnsureCreatedAsync();
+
+        tcs.SetResult();
+
+        await Task.WhenAll(task1, task2);
+    }
+
+    [Fact]
+    public async Task HeartbeatSubscribersAsync_ReturnsEarlyForEmptyCollection()
+    {
+        var fixture = new ChannelFixture();
+        var store = fixture.Store;
+
+        await store.HeartbeatSubscribersAsync("instance", [], TimeSpan.FromSeconds(30), CancellationToken.None);
+        fixture.Subscribers.Verify(
+            s => s.UpdateManyAsync(
+                It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelSubscriberDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
     private sealed class ChannelFixture
     {
-        public ChannelFixture(bool autoCreateIndexes = false)
+        public ChannelFixture(bool autoCreateIndexes = false, TimeSpan? listenerPollInterval = null, int pendingMessageBatchSize = 64)
         {
             var options = Options.Create(new MongoDbAsyncResponseChannelOptions
             {
                 AutoCreateIndexes = autoCreateIndexes,
                 UseChangeStreams = false,
-                ListenerPollInterval = TimeSpan.FromHours(1),
+                ListenerPollInterval = listenerPollInterval ?? TimeSpan.FromHours(1),
+                PendingMessageBatchSize = pendingMessageBatchSize,
                 DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
                 DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
             });
@@ -309,13 +591,15 @@ public sealed class MongoDbChannelCoverageTests
                 .ReturnsAsync(true);
             Store = new MongoDbChannelStore(Database.Object, options);
             var provider = new ServiceCollection().BuildServiceProvider();
+            var mockLogger = new Mock<Microsoft.Extensions.Logging.ILogger<MongoDbAsyncResponseChannel>>();
+            mockLogger.Setup(l => l.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug)).Returns(true);
             Channel = new MongoDbAsyncResponseChannel(
                 provider.GetRequiredService<IServiceScopeFactory>(),
                 Store,
                 RecoveryState.Object,
                 options,
                 new AsyncResponseContextPropagation([]),
-                NullLogger<MongoDbAsyncResponseChannel>.Instance);
+                mockLogger.Object);
         }
 
         public Mock<IMongoDatabase> Database { get; } = new(MockBehavior.Loose);
@@ -411,5 +695,191 @@ public sealed class MongoDbChannelCoverageTests
                 It.IsAny<CancellationToken>()))
             .ReturnsAsync("index");
         collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+    }
+
+    private class DummyCursor<T> : IAsyncCursor<T>
+    {
+        private readonly List<T> _items;
+        private bool _moved;
+
+        public DummyCursor(List<T> items)
+        {
+            _items = items;
+        }
+
+        public IEnumerable<T> Current => _items;
+
+        public bool MoveNext(CancellationToken cancellationToken = default)
+        {
+            if (_moved) return false;
+            _moved = true;
+            return true;
+        }
+
+        public async Task<bool> MoveNextAsync(CancellationToken cancellationToken = default)
+        {
+            if (_moved) return false;
+            _moved = true;
+            return await Task.FromResult(true);
+        }
+
+        public void Dispose() {}
+    }
+
+    [Fact]
+    public void ServiceCollectionExtensions_ThrowsWhenNoDatabaseOrClientOrConnectionString()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncResponse().WithMongoDbChannel(options =>
+        {
+            options.DatabaseName = "test-db";
+            options.ConnectionString = ""; // Empty
+        });
+
+        var provider = services.BuildServiceProvider();
+        Assert.Throws<InvalidOperationException>(() => provider.GetRequiredService<MongoDbChannelStore>());
+    }
+
+    [Fact]
+    public async Task DispatchMessageToSubscribers_CoversDroppedOrSeen()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true));
+        
+        // 1. Mark as dropped
+        SetField(subscription.Instance, "_dropped", true);
+        
+        var message = Message("null");
+        await DispatchAsync(channel, message, subscription.Instance);
+
+        // 2. Mark as not dropped, but make MarkSeen return false (by marking it seen manually first)
+        SetField(subscription.Instance, "_dropped", false);
+        Invoke(subscription.Instance, "MarkSeen", message.Id);
+        
+        await DispatchAsync(channel, message, subscription.Instance);
+    }
+
+    [Fact]
+    public async Task DispatchPendingMessagesAsync_CoversScopeFiltering()
+    {
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true), "corr");
+        AddSubscription(channel, "corr", subscription.Instance);
+
+        var dispatchMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        var scope = new HashSet<string> { "other-corr" };
+        await (Task)dispatchMethod.Invoke(channel, [scope, CancellationToken.None])!;
+    }
+
+    [Fact]
+    public async Task MongoDbRecoveryStateStore_ThrowsOnMismatchedCorrelationId()
+    {
+        var fixture = new ChannelFixture();
+        var recoveryStore = new MongoDbRecoveryStateStore(fixture.Store, NullLogger<MongoDbRecoveryStateStore>.Instance);
+
+        var state = new RecoveryState
+        {
+            CorrelationId = "corr-1",
+            RegistrationId = Guid.NewGuid(),
+            SchemaVersion = RecoveryStateSchema.Current
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(() => recoveryStore.SaveAsync("corr-2", state, TimeSpan.FromMinutes(5)));
+    }
+
+    [Fact]
+    public async Task WatchMessagesAsync_ExitsOnEmptyCursor()
+    {
+        var fixture = new ChannelFixture();
+        var store = fixture.Store;
+
+        var cursorMock = new Mock<IChangeStreamCursor<ChangeStreamDocument<MongoChannelMessageDocument>>>();
+        cursorMock.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        fixture.Messages
+            .Setup(c => c.WatchAsync(
+                It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoChannelMessageDocument>, ChangeStreamDocument<MongoChannelMessageDocument>>>(),
+                It.IsAny<ChangeStreamOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cursorMock.Object);
+
+        var called = false;
+        await store.WatchMessagesAsync(_ => { called = true; return Task.CompletedTask; }, CancellationToken.None);
+        Assert.False(called);
+    }
+
+    private static void SetupFindAsync(
+        Mock<IMongoCollection<MongoChannelMessageDocument>> messagesMock,
+        Type projectionType,
+        Func<object> listFactory)
+    {
+        var filterExpr = Expression.Call(
+            typeof(It),
+            "IsAny",
+            [typeof(FilterDefinition<MongoChannelMessageDocument>)]);
+            
+        var findOptionsType = typeof(FindOptions<,>).MakeGenericType(typeof(MongoChannelMessageDocument), projectionType);
+        var optionsExpr = Expression.Call(
+            typeof(It),
+            "IsAny",
+            [findOptionsType]);
+            
+        var tokenExpr = Expression.Call(
+            typeof(It),
+            "IsAny",
+            [typeof(CancellationToken)]);
+            
+        var param = Expression.Parameter(typeof(IMongoCollection<MongoChannelMessageDocument>), "c");
+        
+        var findAsyncMethod = typeof(IMongoCollection<MongoChannelMessageDocument>)
+            .GetMethods()
+            .First(m => m.Name == "FindAsync" && m.GetGenericArguments().Length == 1)
+            .MakeGenericMethod(projectionType);
+            
+        var call = Expression.Call(param, findAsyncMethod, filterExpr, optionsExpr, tokenExpr);
+        
+        var lambdaType = typeof(Func<,>).MakeGenericType(typeof(IMongoCollection<MongoChannelMessageDocument>), findAsyncMethod.ReturnType);
+        var lambda = Expression.Lambda(lambdaType, call, param);
+        
+        var mockType = typeof(Mock<IMongoCollection<MongoChannelMessageDocument>>);
+        var setupMethod = mockType.GetMethods()
+            .First(m => m.Name == "Setup" && m.IsGenericMethod && m.GetParameters()[0].ParameterType.GetGenericTypeDefinition() == typeof(System.Linq.Expressions.Expression<>))
+            .MakeGenericMethod(findAsyncMethod.ReturnType);
+            
+        var setupPhrase = setupMethod.Invoke(messagesMock, [lambda])!;
+        
+        var returnsDelegate = CreateReturnsDelegate(projectionType, listFactory);
+        
+        var returnsMethod = setupPhrase.GetType().GetMethod("Returns", [typeof(Delegate)])!;
+        returnsMethod.Invoke(setupPhrase, [returnsDelegate]);
+    }
+
+    private static Delegate CreateReturnsDelegate(Type projectionType, Func<object> listFactory)
+    {
+        var helper = typeof(MongoDbChannelCoverageTests)
+            .GetMethod(nameof(ReturnsDelegateHelper), BindingFlags.Static | BindingFlags.NonPublic)!
+            .MakeGenericMethod(projectionType);
+            
+        return (Delegate)helper.Invoke(null, [listFactory])!;
+    }
+
+    private static Delegate ReturnsDelegateHelper<TProjection>(Func<object> listFactory)
+    {
+        Func<FilterDefinition<MongoChannelMessageDocument>, object, CancellationToken, Task<IAsyncCursor<TProjection>>> del = 
+            (filter, options, ct) =>
+            {
+                var list = (List<TProjection>)listFactory();
+                var cursor = new DummyCursor<TProjection>(list);
+                return Task.FromResult<IAsyncCursor<TProjection>>(cursor);
+            };
+        return del;
     }
 }
