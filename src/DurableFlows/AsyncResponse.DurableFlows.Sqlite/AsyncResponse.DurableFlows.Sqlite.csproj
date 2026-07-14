@@ -20,8 +20,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
-    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.10" />
     <!-- Explicit native-lib pin: Microsoft.Data.Sqlite's bundled SQLitePCLRaw carries an older
          e_sqlite3 build; keep this version in step with the bundle's expected provider major/minor
          when bumping Microsoft.Data.Sqlite. -->
