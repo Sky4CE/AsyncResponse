@@ -1,0 +1,41 @@
+#nullable enable
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.AutoCreateSchema.get -> bool
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.AutoCreateSchema.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationTimeout.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.MessageRetention.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.MessageRetention.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.MessageTable.get -> string!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.MessageTable.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.NotificationChannel.get -> string!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.NotificationChannel.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PendingMessageBatchSize.get -> int
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PendingMessageBatchSize.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PostgreSqlAsyncResponseChannelOptions() -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PruneInterval.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PruneInterval.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.RecoveryStateTable.get -> string!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.RecoveryStateTable.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SchemaName.get -> string!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SchemaName.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatInterval.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatInterval.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberTable.get -> string!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.SubscriberTable.set -> void
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.Validate() -> void
+const AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.ChannelName = "PostgreSQL" -> string!
+Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions.WithPostgreSqlChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

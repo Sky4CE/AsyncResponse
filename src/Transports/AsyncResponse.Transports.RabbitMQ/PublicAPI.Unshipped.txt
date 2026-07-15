@@ -1,0 +1,102 @@
+#nullable enable
+AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode
+AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode
+AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AddReplyTarget(string! name, string! exchange, string! routingKey) -> AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AutomaticRecoveryEnabled.get -> bool
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.AutomaticRecoveryEnabled.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ClientProvidedName.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ClientProvidedName.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ConnectionString.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ConnectionString.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterExchange.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterExchange.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterQueue.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterQueue.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterRoutingKey.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeadLetterRoutingKey.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeclareTopology.get -> bool
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DeclareTopology.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostName.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostName.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.NetworkRecoveryInterval.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.NetworkRecoveryInterval.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Password.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Password.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Port.get -> int
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.Port.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.RabbitMqAsyncResponseOptions() -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions!>!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.RequestedHeartbeat.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.RequestedHeartbeat.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseExchange.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseExchange.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseRoutingKey.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseRoutingKey.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseSubscriber.get -> AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TopologyRecoveryEnabled.get -> bool
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TopologyRecoveryEnabled.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.UserName.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.UserName.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.VirtualHost.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.VirtualHost.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerExchange.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerExchange.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerRoutingKey.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerRoutingKey.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.WorkerSubscriber.get -> AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions!
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.DeliveryTag.get -> ulong
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.Exchange.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.RoutingKey.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.Exchange.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.Exchange.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.Queue.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.Queue.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.RabbitMqReplyTargetOptions() -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.RoutingKey.get -> string?
+AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions.RoutingKey.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.AckMode.get -> AsyncResponse.Transports.RabbitMQ.RabbitMqAckMode
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.PrefetchCount.get -> ushort
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.PrefetchCount.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.RabbitMqSubscriberOptions() -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions!
+AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport
+AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport.RabbitMqWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!>! options) -> void
+const AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TransportName = "rabbitmq" -> string!
+Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions.WithRabbitMqTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

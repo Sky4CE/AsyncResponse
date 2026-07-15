@@ -1,0 +1,67 @@
+#nullable enable
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.AddReplyTarget(string! name, string! projectId, string! topicId) -> AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.CorrelationIdAttribute.get -> string!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.CorrelationIdAttribute.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.GooglePubSubAsyncResponseOptions() -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ProjectId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ProjectId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions!>!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ResponseSubscriber.get -> AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ResponseSubscriptionId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ResponseSubscriptionId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ResponseTopicId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ResponseTopicId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.WorkerSubscriber.get -> AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.WorkerSubscriptionId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.WorkerSubscriptionId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.WorkerTopicId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.WorkerTopicId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext.Message.get -> Google.Cloud.PubSub.V1.PubsubMessage!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext.MessageId.get -> string!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext.SubscriptionId.get -> string!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.GooglePubSubReplyTargetOptions() -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.ProjectId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.ProjectId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.TopicId.get -> string?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions.TopicId.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.AckMode.get -> AsyncResponse.Transports.GooglePubSub.GooglePubSubAckMode
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.GooglePubSubSubscriberOptions() -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions!
+AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport
+AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.GooglePubSubWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions!>! options) -> void
+AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions.TransportName = "google-pubsub" -> string!
+Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions.WithGooglePubSubTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

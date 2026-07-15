@@ -1,0 +1,103 @@
+#nullable enable
+AsyncResponse.Transports.Redis.RedisAckMode
+AsyncResponse.Transports.Redis.RedisAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.Redis.RedisAckMode
+AsyncResponse.Transports.Redis.RedisAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.Redis.RedisAckMode
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseStream) -> AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ConsumerName.get -> string?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ConsumerName.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CorrelationIdField.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CorrelationIdField.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CreateConsumerGroups.get -> bool
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.CreateConsumerGroups.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterStream.get -> string?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterStream.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterStreamMaxLength.get -> long?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DeadLetterStreamMaxLength.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.KeyPrefix.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.KeyPrefix.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.OperationTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.OperationTimeout.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PayloadField.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PayloadField.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.RedisAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.Redis.RedisReplyTargetOptions!>!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseConsumerGroup.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseConsumerGroup.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseStream.get -> string?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseStream.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.Redis.RedisSubscriberOptions!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.StreamMaxLength.get -> long?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.StreamMaxLength.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.UseApproximateStreamTrimming.get -> bool
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.UseApproximateStreamTrimming.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.WorkerConsumerGroup.get -> string!
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.WorkerConsumerGroup.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.WorkerStream.get -> string?
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.WorkerStream.set -> void
+AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.Redis.RedisSubscriberOptions!
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.ConsumerGroup.get -> string!
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.MessageId.get -> string!
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.Stream.get -> string!
+AsyncResponse.Transports.Redis.RedisBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.ConsumerGroup.get -> string?
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.ConsumerGroup.set -> void
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.RedisReplyTargetOptions() -> void
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.ResponseStream.get -> string?
+AsyncResponse.Transports.Redis.RedisReplyTargetOptions.ResponseStream.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.AckMode.get -> AsyncResponse.Transports.Redis.RedisAckMode
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BatchSize.get -> int
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.BatchSize.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.EmptyPollDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.EmptyPollDelay.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.Redis.RedisBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingClaimBatchSize.get -> int
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingClaimBatchSize.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingClaimInterval.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingClaimInterval.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingMessageMinIdleTime.get -> System.TimeSpan
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.PendingMessageMinIdleTime.set -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.RedisSubscriberOptions() -> void
+AsyncResponse.Transports.Redis.RedisSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.Redis.RedisSubscriberOptions!
+AsyncResponse.Transports.Redis.RedisWorkerTransport
+AsyncResponse.Transports.Redis.RedisWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.Redis.RedisWorkerTransport.RedisWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions!>! options, StackExchange.Redis.IConnectionMultiplexer! multiplexer) -> void
+const AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.TransportName = "redis" -> string!
+Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions.WithRedisTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

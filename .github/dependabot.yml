@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  # NuGet — versions are centralized in Directory.Packages.props (CPM). Dependabot reads the
+  # central manifest and opens PRs that edit it. Related package families are grouped so a
+  # multi-package line moves together instead of in fragmented, potentially-incompatible PRs.
+  - package-ecosystem: nuget
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      aspire:
+        patterns: ["Aspire.*"]
+      opentelemetry:
+        patterns: ["OpenTelemetry.*"]
+      microsoft-testing:
+        patterns: ["Microsoft.Testing.*", "xunit*"]
+      microsoft-extensions:
+        patterns: ["Microsoft.Extensions.*"]
+      aws-sdk:
+        patterns: ["AWSSDK.*"]
+
+  # GitHub Actions used by the workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

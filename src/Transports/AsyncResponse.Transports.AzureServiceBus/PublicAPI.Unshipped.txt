@@ -1,0 +1,76 @@
+#nullable enable
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AddReplyTarget(string! name, string! queue) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AzureServiceBusAsyncResponseOptions() -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ConnectionString.get -> string?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ConnectionString.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.CorrelationIdProperty.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.CorrelationIdProperty.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.MaxMessagesPerReceive.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.MaxMessagesPerReceive.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ReceiveWaitTime.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ReceiveWaitTime.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions!>!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ResponseSubscriber.get -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.WorkerSubscriber.get -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.MessageId.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.SequenceNumber.get -> long
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions.AzureServiceBusReplyTargetOptions() -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions.Queue.get -> string?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions.Queue.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.AckMode.get -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.AzureServiceBusSubscriberOptions() -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.PrefetchCount.get -> int
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.PrefetchCount.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.AzureServiceBusWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! options) -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.TransportName = "AzureServiceBus" -> string!
+Microsoft.Extensions.DependencyInjection.AzureServiceBusAsyncResponseServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.AzureServiceBusAsyncResponseServiceCollectionExtensions.WithAzureServiceBusTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

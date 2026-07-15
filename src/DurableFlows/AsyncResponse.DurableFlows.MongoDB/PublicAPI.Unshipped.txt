@@ -1,0 +1,24 @@
+#nullable enable
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.AutoCreateIndexes.get -> bool
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.AutoCreateIndexes.set -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.CollectionName.get -> string!
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.CollectionName.set -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.ConnectionString.get -> string?
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.DatabaseName.get -> string?
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.DatabaseName.set -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.MongoDbDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.Validate() -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.Dispose() -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.MongoDbFlowStateStore(MongoDB.Driver.IMongoDatabase! database, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions!>! options, MongoDB.Driver.IMongoClient? ownedClient = null) -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionExtensions.WithMongoDbDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

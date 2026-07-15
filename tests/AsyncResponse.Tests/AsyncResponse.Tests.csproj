@@ -26,10 +26,8 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
 
-    <!-- Microsoft.Testing.Platform extensions we take advantage of (TRX report + code coverage).
-         Versions are pinned to the MTP 1.9.x line that xUnit.net v3 3.2.x is built against; the
-         explicit Microsoft.Testing.Platform pin keeps the whole MTP graph on one (v1) major so the
-         shared host assembly stays compatible. -->
+    <!-- MTP extensions (TRX report + code coverage). The MTP-graph version lock is explained
+         alongside these versions in Directory.Packages.props. -->
     <PackageReference Include="Microsoft.Testing.Platform" />
     <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" />
     <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />

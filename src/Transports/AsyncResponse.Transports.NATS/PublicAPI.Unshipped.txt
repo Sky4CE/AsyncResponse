@@ -1,0 +1,95 @@
+#nullable enable
+AsyncResponse.Transports.NATS.NatsAckMode
+AsyncResponse.Transports.NATS.NatsAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.NATS.NatsAckMode
+AsyncResponse.Transports.NATS.NatsAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.NATS.NatsAckMode
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.AckWait.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.AckWait.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseSubject) -> AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CreateStreams.get -> bool
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.CreateStreams.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterStream.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterStream.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterStreamMaxMessages.get -> long?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterStreamMaxMessages.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterSubject.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterSubject.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.NatsAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.NATS.NatsReplyTargetOptions!>!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseConsumer.get -> string!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseConsumer.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseStream.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseStream.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubject.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubject.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.get -> long?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubjectPrefix.get -> string!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubjectPrefix.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerConsumer.get -> string!
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerConsumer.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerStream.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerStream.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerSubject.get -> string?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerSubject.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.Consumer.get -> string!
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.NumDelivered.get -> long
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.Subject.get -> string!
+AsyncResponse.Transports.NATS.NatsBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.Consumer.get -> string?
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.Consumer.set -> void
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.NatsReplyTargetOptions() -> void
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.ResponseSubject.get -> string?
+AsyncResponse.Transports.NATS.NatsReplyTargetOptions.ResponseSubject.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.AckMode.get -> AsyncResponse.Transports.NATS.NatsAckMode
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BatchSize.get -> int
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.BatchSize.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.NatsSubscriberOptions() -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.NATS.NatsBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.RedeliveryDelay.set -> void
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
+AsyncResponse.Transports.NATS.NatsWorkerTransport
+AsyncResponse.Transports.NATS.NatsWorkerTransport.NatsWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions!>! options, NATS.Client.Core.INatsConnection! connection) -> void
+AsyncResponse.Transports.NATS.NatsWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.TransportName = "NATS" -> string!
+Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions.WithNatsTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

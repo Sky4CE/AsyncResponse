@@ -1,0 +1,274 @@
+#nullable enable
+AsyncResponse.AsyncResponseContext
+AsyncResponse.AsyncResponseDomainFailureException
+AsyncResponse.AsyncResponseDomainFailureException.AsyncResponseDomainFailureException(string? correlationId, string? payloadTypeFullName, string? payloadJson) -> void
+AsyncResponse.AsyncResponseDomainFailureException.CorrelationId.get -> string?
+AsyncResponse.AsyncResponseDomainFailureException.PayloadJson.get -> string?
+AsyncResponse.AsyncResponseDomainFailureException.PayloadTypeFullName.get -> string?
+AsyncResponse.AsyncResponsePayloadReflection
+AsyncResponse.AsyncResponseReplyTarget
+AsyncResponse.AsyncResponseReplyTarget.Address.get -> string!
+AsyncResponse.AsyncResponseReplyTarget.Address.init -> void
+AsyncResponse.AsyncResponseReplyTarget.AsyncResponseReplyTarget() -> void
+AsyncResponse.AsyncResponseReplyTarget.Name.get -> string!
+AsyncResponse.AsyncResponseReplyTarget.Name.init -> void
+AsyncResponse.AsyncResponseReplyTarget.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.AsyncResponseReplyTarget.Properties.init -> void
+AsyncResponse.AsyncResponseReplyTarget.Transport.get -> string!
+AsyncResponse.AsyncResponseReplyTarget.Transport.init -> void
+AsyncResponse.AsyncResponseRequestContext
+AsyncResponse.AsyncResponseRequestContext.<Clone>$() -> AsyncResponse.AsyncResponseRequestContext!
+AsyncResponse.AsyncResponseRequestContext.AsyncResponseRequestContext(string! CorrelationId, AsyncResponse.AsyncResponseReplyTarget? ReplyTarget) -> void
+AsyncResponse.AsyncResponseRequestContext.CorrelationId.get -> string!
+AsyncResponse.AsyncResponseRequestContext.CorrelationId.init -> void
+AsyncResponse.AsyncResponseRequestContext.Deconstruct(out string! CorrelationId, out AsyncResponse.AsyncResponseReplyTarget? ReplyTarget) -> void
+AsyncResponse.AsyncResponseRequestContext.Equals(AsyncResponse.AsyncResponseRequestContext? other) -> bool
+AsyncResponse.AsyncResponseRequestContext.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?
+AsyncResponse.AsyncResponseRequestContext.ReplyTarget.init -> void
+AsyncResponse.CallbackParam
+AsyncResponse.CallbackParam.CallbackParam() -> void
+AsyncResponse.CallbackParam.Placeholder.get -> AsyncResponse.PlaceholderType?
+AsyncResponse.CallbackParam.Placeholder.set -> void
+AsyncResponse.CallbackParam.Value.get -> object?
+AsyncResponse.CallbackParam.Value.set -> void
+AsyncResponse.DurableFlowFailedException
+AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message) -> void
+AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message, System.Exception! innerException) -> void
+AsyncResponse.FlowRunStatus
+AsyncResponse.FlowRunStatus.Failed = 2 -> AsyncResponse.FlowRunStatus
+AsyncResponse.FlowRunStatus.Running = 0 -> AsyncResponse.FlowRunStatus
+AsyncResponse.FlowRunStatus.Succeeded = 1 -> AsyncResponse.FlowRunStatus
+AsyncResponse.FlowState
+AsyncResponse.FlowState.Attempts.get -> int
+AsyncResponse.FlowState.Attempts.set -> void
+AsyncResponse.FlowState.Context.get -> System.Collections.Generic.Dictionary<string!, string!>?
+AsyncResponse.FlowState.Context.set -> void
+AsyncResponse.FlowState.CreatedAtUtc.get -> System.DateTime?
+AsyncResponse.FlowState.CreatedAtUtc.set -> void
+AsyncResponse.FlowState.FlowId.get -> string?
+AsyncResponse.FlowState.FlowId.set -> void
+AsyncResponse.FlowState.FlowState() -> void
+AsyncResponse.FlowState.FlowTypeName.get -> string?
+AsyncResponse.FlowState.FlowTypeName.set -> void
+AsyncResponse.FlowState.InputJson.get -> string?
+AsyncResponse.FlowState.InputJson.set -> void
+AsyncResponse.FlowState.InputTypeName.get -> string?
+AsyncResponse.FlowState.InputTypeName.set -> void
+AsyncResponse.FlowState.LastMessage.get -> string?
+AsyncResponse.FlowState.LastMessage.set -> void
+AsyncResponse.FlowState.ParentFlowId.get -> string?
+AsyncResponse.FlowState.ParentFlowId.set -> void
+AsyncResponse.FlowState.ParentStepName.get -> string?
+AsyncResponse.FlowState.ParentStepName.set -> void
+AsyncResponse.FlowState.Revision.get -> long
+AsyncResponse.FlowState.Revision.set -> void
+AsyncResponse.FlowState.SchemaVersion.get -> int
+AsyncResponse.FlowState.SchemaVersion.set -> void
+AsyncResponse.FlowState.Status.get -> AsyncResponse.FlowRunStatus
+AsyncResponse.FlowState.Status.set -> void
+AsyncResponse.FlowState.Steps.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.FlowStepState!>?
+AsyncResponse.FlowState.Steps.set -> void
+AsyncResponse.FlowState.UpdatedAtUtc.get -> System.DateTime?
+AsyncResponse.FlowState.UpdatedAtUtc.set -> void
+AsyncResponse.FlowState.Values.get -> System.Collections.Generic.Dictionary<string!, string!>?
+AsyncResponse.FlowState.Values.set -> void
+AsyncResponse.FlowStateSchema
+AsyncResponse.FlowStepState
+AsyncResponse.FlowStepState.ChildFlowId.get -> string?
+AsyncResponse.FlowStepState.ChildFlowId.set -> void
+AsyncResponse.FlowStepState.Completed.get -> bool
+AsyncResponse.FlowStepState.Completed.set -> void
+AsyncResponse.FlowStepState.CompletedAtUtc.get -> System.DateTime?
+AsyncResponse.FlowStepState.CompletedAtUtc.set -> void
+AsyncResponse.FlowStepState.Faulted.get -> bool
+AsyncResponse.FlowStepState.Faulted.set -> void
+AsyncResponse.FlowStepState.FlowStepState() -> void
+AsyncResponse.FlowStepState.Message.get -> string?
+AsyncResponse.FlowStepState.Message.set -> void
+AsyncResponse.FlowStepState.PendingCorrelationId.get -> string?
+AsyncResponse.FlowStepState.PendingCorrelationId.set -> void
+AsyncResponse.FlowStepState.ResultJson.get -> string?
+AsyncResponse.FlowStepState.ResultJson.set -> void
+AsyncResponse.IActiveSubscriberProbe
+AsyncResponse.IActiveSubscriberProbe.CountActiveSubscribersAsync(string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<long>
+AsyncResponse.IAsyncResponseAttachedBuilder<T>
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.Until(System.Func<T, bool>! predicate) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.Until(System.Func<T, System.Threading.Tasks.Task<bool>!>! predicate) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.WaitAsync() -> System.Threading.Tasks.Task<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.WithReplyTarget() -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.WithReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.WithReplyTarget(string! name) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseAttachedBuilder<T>.WithTimeout(System.TimeSpan timeout) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseBuilder
+AsyncResponse.IAsyncResponseBuilder.EnqueueWorkerAsync(AsyncResponse.ReflectionCallDto! work, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseBuilder.EnqueueWorkerAsync<TService>(System.Linq.Expressions.Expression<System.Action<TService>!>! work, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseBuilder.EnqueueWorkerAsync<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.Task!>!>! work, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseBuilder.EnqueueWorkerAsync<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.ValueTask>!>! work, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseBuilder.For<T>() -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseBuilder.For<T>(string! correlationId) -> AsyncResponse.IAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IAsyncResponseCallbackAuthorizer
+AsyncResponse.IAsyncResponseCallbackAuthorizer.IsAllowed(string! serviceInterfaceFullName, string! methodName) -> bool
+AsyncResponse.IAsyncResponseContextPropagator
+AsyncResponse.IAsyncResponseContextPropagator.Capture(System.Collections.Generic.IDictionary<string!, string!>! carrier) -> void
+AsyncResponse.IAsyncResponseContextPropagator.Restore(System.Collections.Generic.IReadOnlyDictionary<string!, string!>! carrier) -> System.IDisposable!
+AsyncResponse.IAsyncResponseIngress
+AsyncResponse.IAsyncResponseIngress.HandleResponseMessageAsync(string! messageJson, string? correlationId) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseIngress.HandleWorkerMessageAsync(string! messageJson) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponsePayload
+AsyncResponse.IAsyncResponsePayload.ShouldResumeOnRecovery() -> bool
+AsyncResponse.IAsyncResponsePublisher
+AsyncResponse.IAsyncResponsePublisher.SetException(System.Exception! exception, string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponsePublisher.SetResponse<T>(T response, string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseReplyTargetProvider
+AsyncResponse.IAsyncResponseReplyTargetProvider.GetReplyTarget(string? name = null) -> AsyncResponse.AsyncResponseReplyTarget!
+AsyncResponse.IAsyncResponseSubscriber
+AsyncResponse.IAsyncResponseSubscriber.CreateResponseWaiter<T>(string! correlationId, System.Func<T, System.Threading.Tasks.ValueTask<bool>>? completionPredicate = null, System.TimeSpan? timeout = null) -> System.Threading.Tasks.Task<AsyncResponse.IAsyncResponseWaiter<T>!>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.Until(System.Func<T, bool>! predicate) -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.Until(System.Func<T, System.Threading.Tasks.Task<bool>!>! predicate) -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.WaitAsync(System.Func<AsyncResponse.AsyncResponseRequestContext!, System.Threading.Tasks.Task!>! trigger) -> System.Threading.Tasks.Task<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.WithReplyTarget() -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.WithReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.WithReplyTarget(string! name) -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseTriggeredBuilder<T>.WithTimeout(System.TimeSpan timeout) -> AsyncResponse.IAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IAsyncResponseWaiter<T>
+AsyncResponse.IAsyncResponseWaiter<T>.ResponseTask.get -> System.Threading.Tasks.Task<T>!
+AsyncResponse.IDurableFlow<TInput>
+AsyncResponse.IDurableFlow<TInput>.ExecuteAsync(AsyncResponse.IDurableFlowContext! flow, TInput input) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlowContext
+AsyncResponse.IDurableFlowContext.AwaitChildFlowAsync<TFlow, TInput>(string! name, TInput input, string? flowId = null, bool failOnChildFailure = true, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState!>!
+AsyncResponse.IDurableFlowContext.AwaitStepAsync<TResponse>(string! name, System.Func<string!, System.Threading.Tasks.Task!>! trigger, System.Func<TResponse, bool>! until, System.TimeSpan? timeout = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<TResponse>!
+AsyncResponse.IDurableFlowContext.AwaitStepAsync<TResponse>(string! name, System.Func<string!, System.Threading.Tasks.Task!>! trigger, System.Func<TResponse, System.Threading.Tasks.Task<bool>!>! until, System.TimeSpan? timeout = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<TResponse>!
+AsyncResponse.IDurableFlowContext.AwaitStepAsync<TResponse>(string! name, System.Func<string!, System.Threading.Tasks.Task!>! trigger, System.TimeSpan? timeout = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<TResponse>!
+AsyncResponse.IDurableFlowContext.FlowId.get -> string!
+AsyncResponse.IDurableFlowContext.GetValue<TValue>(string! key) -> TValue?
+AsyncResponse.IDurableFlowContext.ReportProgressAsync(string! message, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlowContext.SetValueAsync<TValue>(string! key, TValue value, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlowContext.StepAsync(string! name, System.Func<System.Threading.Tasks.Task!>! step, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlowContext.StepAsync<TResult>(string! name, System.Func<System.Threading.Tasks.Task<TResult>!>! step, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<TResult>!
+AsyncResponse.IDurableFlows
+AsyncResponse.IDurableFlows.GetStateAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.IDurableFlows.ResumeAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IDurableFlows.StartAsync<TFlow, TInput>(TInput input, string? flowId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<string!>!
+AsyncResponse.IFlowStateStore
+AsyncResponse.IFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.IFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure(AsyncResponse.ReflectionCallDto! callback) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.Task!>!>! callback) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume(AsyncResponse.ReflectionCallDto! callback) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.Task!>!>! callback) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.Until(System.Func<T, bool>! predicate) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.Until(System.Func<T, System.Threading.Tasks.Task<bool>!>! predicate) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget() -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.WithReplyTarget(string! name) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>.WithTimeout(System.TimeSpan timeout) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseBuilder
+AsyncResponse.IRecoverableAsyncResponseBuilder.For<T>() -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseBuilder.For<T>(string! correlationId) -> AsyncResponse.IRecoverableAsyncResponseAttachedBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseSubscriber
+AsyncResponse.IRecoverableAsyncResponseSubscriber.CreateRecoverableResponseWaiter<T>(string! correlationId, AsyncResponse.ReflectionCallDto? resumeCallback = null, AsyncResponse.ReflectionCallDto? failureCallback = null, System.Func<T, System.Threading.Tasks.ValueTask<bool>>? completionPredicate = null, System.TimeSpan? timeout = null) -> System.Threading.Tasks.Task<AsyncResponse.IAsyncResponseWaiter<T>!>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure(AsyncResponse.ReflectionCallDto! callback) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.Task!>!>! callback) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(AsyncResponse.ReflectionCallDto! callback) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume<TService>(System.Linq.Expressions.Expression<System.Func<TService, System.Threading.Tasks.Task!>!>! callback) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.Until(System.Func<T, bool>! predicate) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.Until(System.Func<T, System.Threading.Tasks.Task<bool>!>! predicate) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget() -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.WithReplyTarget(string! name) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>.WithTimeout(System.TimeSpan timeout) -> AsyncResponse.IRecoverableAsyncResponseTriggeredBuilder<T>!
+AsyncResponse.IRecoveryStateScanner
+AsyncResponse.IRecoveryStateScanner.ScanAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Collections.Generic.IAsyncEnumerable<AsyncResponse.RecoveryState!>!
+AsyncResponse.IRecoveryStateStore
+AsyncResponse.IRecoveryStateStore.GetAllAsync(string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryState!>!>!
+AsyncResponse.IRecoveryStateStore.SaveAsync(string! correlationId, AsyncResponse.RecoveryState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.IRecoveryStateStore.TryDeleteAsync(string! correlationId, System.Guid registrationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.IWorkerTransport
+AsyncResponse.IWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Placeholder
+AsyncResponse.PlaceholderType
+AsyncResponse.PlaceholderType.CorrelationId = 2 -> AsyncResponse.PlaceholderType
+AsyncResponse.PlaceholderType.Exception = 1 -> AsyncResponse.PlaceholderType
+AsyncResponse.PlaceholderType.Payload = 0 -> AsyncResponse.PlaceholderType
+AsyncResponse.RecoveryState
+AsyncResponse.RecoveryState.Context.get -> System.Collections.Generic.Dictionary<string!, string!>?
+AsyncResponse.RecoveryState.Context.set -> void
+AsyncResponse.RecoveryState.CorrelationId.get -> string?
+AsyncResponse.RecoveryState.CorrelationId.set -> void
+AsyncResponse.RecoveryState.FailureCallback.get -> AsyncResponse.ReflectionCallDto?
+AsyncResponse.RecoveryState.FailureCallback.set -> void
+AsyncResponse.RecoveryState.PayloadTypeFullName.get -> string?
+AsyncResponse.RecoveryState.PayloadTypeFullName.set -> void
+AsyncResponse.RecoveryState.RecoveryState() -> void
+AsyncResponse.RecoveryState.RegisteredAtUtc.get -> System.DateTime?
+AsyncResponse.RecoveryState.RegisteredAtUtc.set -> void
+AsyncResponse.RecoveryState.RegistrationId.get -> System.Guid
+AsyncResponse.RecoveryState.RegistrationId.set -> void
+AsyncResponse.RecoveryState.ResumeCallback.get -> AsyncResponse.ReflectionCallDto?
+AsyncResponse.RecoveryState.ResumeCallback.set -> void
+AsyncResponse.RecoveryState.SchemaVersion.get -> int
+AsyncResponse.RecoveryState.SchemaVersion.set -> void
+AsyncResponse.RecoveryStateSchema
+AsyncResponse.ReflectionCallDto
+AsyncResponse.ReflectionCallDto.MethodName.get -> string!
+AsyncResponse.ReflectionCallDto.MethodName.set -> void
+AsyncResponse.ReflectionCallDto.Params.get -> AsyncResponse.CallbackParam![]!
+AsyncResponse.ReflectionCallDto.Params.set -> void
+AsyncResponse.ReflectionCallDto.ReflectionCallDto() -> void
+AsyncResponse.ReflectionCallDto.ServiceInterfaceFullName.get -> string!
+AsyncResponse.ReflectionCallDto.ServiceInterfaceFullName.set -> void
+AsyncResponse.ReflectionInvocationDto
+AsyncResponse.ReflectionInvocationDto.MethodName.get -> string!
+AsyncResponse.ReflectionInvocationDto.MethodName.init -> void
+AsyncResponse.ReflectionInvocationDto.Params.get -> object?[]!
+AsyncResponse.ReflectionInvocationDto.Params.init -> void
+AsyncResponse.ReflectionInvocationDto.ReflectionInvocationDto() -> void
+AsyncResponse.ReflectionInvocationDto.ServiceInterfaceFullName.get -> string!
+AsyncResponse.ReflectionInvocationDto.ServiceInterfaceFullName.init -> void
+AsyncResponse.WorkerJobEnvelope
+AsyncResponse.WorkerJobEnvelope.Call.get -> AsyncResponse.ReflectionCallDto!
+AsyncResponse.WorkerJobEnvelope.Call.set -> void
+AsyncResponse.WorkerJobEnvelope.Context.get -> System.Collections.Generic.Dictionary<string!, string!>?
+AsyncResponse.WorkerJobEnvelope.Context.set -> void
+AsyncResponse.WorkerJobEnvelope.CorrelationId.get -> string?
+AsyncResponse.WorkerJobEnvelope.CorrelationId.set -> void
+AsyncResponse.WorkerJobEnvelope.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?
+AsyncResponse.WorkerJobEnvelope.ReplyTarget.set -> void
+AsyncResponse.WorkerJobEnvelope.SchemaVersion.get -> int
+AsyncResponse.WorkerJobEnvelope.SchemaVersion.set -> void
+AsyncResponse.WorkerJobEnvelope.WorkerJobEnvelope() -> void
+AsyncResponse.WorkerJobEnvelopeSchema
+const AsyncResponse.FlowStateSchema.Current = 1 -> int
+const AsyncResponse.RecoveryStateSchema.Current = 1 -> int
+const AsyncResponse.WorkerJobEnvelopeSchema.Current = 1 -> int
+override AsyncResponse.AsyncResponseRequestContext.Equals(object? obj) -> bool
+override AsyncResponse.AsyncResponseRequestContext.GetHashCode() -> int
+override AsyncResponse.AsyncResponseRequestContext.ToString() -> string!
+static AsyncResponse.AsyncResponseContext.ClearCorrelationId() -> void
+static AsyncResponse.AsyncResponseContext.ClearReplyTarget() -> void
+static AsyncResponse.AsyncResponseContext.CorrelationId.get -> string?
+static AsyncResponse.AsyncResponseContext.CreateCorrelationId() -> string!
+static AsyncResponse.AsyncResponseContext.EnsureCorrelationId() -> string!
+static AsyncResponse.AsyncResponseContext.GenerateCorrelationId() -> string!
+static AsyncResponse.AsyncResponseContext.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?
+static AsyncResponse.AsyncResponseContext.SetCorrelationId(string! correlationId) -> void
+static AsyncResponse.AsyncResponseContext.SetReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> void
+static AsyncResponse.AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(System.Type! payloadType) -> bool
+static AsyncResponse.AsyncResponseRequestContext.operator !=(AsyncResponse.AsyncResponseRequestContext? left, AsyncResponse.AsyncResponseRequestContext? right) -> bool
+static AsyncResponse.AsyncResponseRequestContext.operator ==(AsyncResponse.AsyncResponseRequestContext? left, AsyncResponse.AsyncResponseRequestContext? right) -> bool
+static AsyncResponse.CallbackParam.ForPlaceholder(AsyncResponse.PlaceholderType placeholder) -> AsyncResponse.CallbackParam!
+static AsyncResponse.CallbackParam.ForValue(object? value) -> AsyncResponse.CallbackParam!
+static AsyncResponse.FlowStateSchema.IsReadable(int entryVersion) -> bool
+static AsyncResponse.Placeholder.CorrelationId() -> string!
+static AsyncResponse.Placeholder.Exception() -> System.Exception!
+static AsyncResponse.Placeholder.Payload<TPayload>() -> TPayload
+static AsyncResponse.RecoveryStateSchema.IsReadable(int entryVersion) -> bool
+static AsyncResponse.WorkerJobEnvelopeSchema.IsReadable(int entryVersion) -> bool

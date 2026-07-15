@@ -1,0 +1,101 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/AsyncResponse.Benchmarks/AsyncResponse.Benchmarks.csproj" />
+    <Project Path="benchmarks/AsyncResponse.LoadTests/AsyncResponse.LoadTests.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/AsyncResponse.AppHost/AsyncResponse.AppHost.csproj" />
+    <Project Path="samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj" />
+    <Project Path="samples/AsyncResponse.ServiceDefaults/AsyncResponse.ServiceDefaults.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj" />
+    <Project Path="src/AsyncResponse.Core/AsyncResponse.Core.csproj" />
+  </Folder>
+  <Folder Name="/src/Channels/">
+    <Project Path="src/Channels/AsyncResponse.Channels.MongoDB/AsyncResponse.Channels.MongoDB.csproj" />
+    <Project Path="src/Channels/AsyncResponse.Channels.NATS/AsyncResponse.Channels.NATS.csproj" />
+    <Project Path="src/Channels/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj" />
+    <Project Path="src/Channels/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj" />
+    <Project Path="src/Channels/AsyncResponse.Channels.SqlServer/AsyncResponse.Channels.SqlServer.csproj" />
+  </Folder>
+  <Folder Name="/src/DurableFlows/">
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.Cosmos/AsyncResponse.DurableFlows.Cosmos.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.DynamoDB/AsyncResponse.DurableFlows.DynamoDB.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.EFCore/AsyncResponse.DurableFlows.EFCore.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.MongoDB/AsyncResponse.DurableFlows.MongoDB.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.MySql/AsyncResponse.DurableFlows.MySql.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.Oracle/AsyncResponse.DurableFlows.Oracle.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.PostgreSQL/AsyncResponse.DurableFlows.PostgreSQL.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.Sqlite/AsyncResponse.DurableFlows.Sqlite.csproj" />
+    <Project Path="src/DurableFlows/AsyncResponse.DurableFlows.SqlServer/AsyncResponse.DurableFlows.SqlServer.csproj" />
+  </Folder>
+  <Folder Name="/src/Transports/">
+    <Project Path="src/Transports/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.MongoDB/AsyncResponse.Transports.MongoDB.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj" />
+    <Project Path="src/Transports/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj" />
+    <Project Path="tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path=".gitattributes" />
+    <File Path=".gitignore" />
+    <File Path="Directory.Build.props" />
+    <File Path="Directory.Packages.props" />
+    <File Path="docker-compose.yml" />
+    <File Path="global.json" />
+  </Folder>
+  <Folder Name="/Solution Items/Build/">
+    <File Path="benchmarks/Directory.Build.props" />
+    <File Path="samples/Directory.Build.props" />
+    <File Path="src/Directory.Build.props" />
+    <File Path="tests/Directory.Build.props" />
+  </Folder>
+  <Folder Name="/Solution Items/GitHub/">
+    <File Path=".github/dependabot.yml" />
+    <File Path=".github/ISSUE_TEMPLATE/bug_report.md" />
+    <File Path=".github/ISSUE_TEMPLATE/feature_request.md" />
+    <File Path=".github/pull_request_template.md" />
+    <File Path=".github/workflows/benchmarks.yml" />
+    <File Path=".github/workflows/ci.yml" />
+    <File Path=".github/workflows/loadtest.yml" />
+    <File Path=".github/workflows/publish.yml" />
+  </Folder>
+  <Folder Name="/Solution Items/Docs/">
+    <File Path="CODE_OF_CONDUCT.md" />
+    <File Path="CONTRIBUTING.md" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+    <File Path="SECURITY.md" />
+  </Folder>
+  <Folder Name="/Solution Items/Docs/Guides/">
+    <File Path="docs/README.md" />
+    <File Path="docs/configuration.md" />
+    <File Path="docs/durable-flow-state-stores.md" />
+    <File Path="docs/durable-flows.md" />
+    <File Path="docs/observability.md" />
+    <File Path="docs/operations.md" />
+    <File Path="docs/postgresql.md" />
+    <File Path="docs/provider-examples.md" />
+    <File Path="docs/recovery.md" />
+    <File Path="docs/roadmap.md" />
+    <File Path="docs/sample.md" />
+    <File Path="docs/security.md" />
+    <File Path="docs/sqlserver.md" />
+  </Folder>
+</Solution>

@@ -1,0 +1,24 @@
+#nullable enable
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.AutoCreateTable.get -> bool
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.AutoCreateTable.set -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.DynamoDbDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.EnableTimeToLive.get -> bool
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.EnableTimeToLive.set -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TableName.get -> string!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TableName.set -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TimeToLiveAttributeName.get -> string!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TimeToLiveAttributeName.set -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.Validate() -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.Dispose() -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.DynamoDbFlowStateStore(Amazon.DynamoDBv2.IAmazonDynamoDB! client, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions!>! options, bool ownsClient = false) -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+Microsoft.Extensions.DependencyInjection.DynamoDbDurableFlowServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.DynamoDbDurableFlowServiceCollectionExtensions.WithDynamoDbDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

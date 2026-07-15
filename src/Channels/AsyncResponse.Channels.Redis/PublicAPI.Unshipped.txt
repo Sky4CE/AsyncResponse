@@ -1,0 +1,7 @@
+#nullable enable
+AsyncResponse.Channels.Redis.RedisAsyncResponseOptions
+AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.KeyPrefix.get -> string!
+AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.KeyPrefix.set -> void
+AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.RedisAsyncResponseOptions() -> void
+Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions.WithRedisChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.Redis.RedisAsyncResponseOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

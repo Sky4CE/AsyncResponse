@@ -6,6 +6,19 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AnalysisLevel>latest</AnalysisLevel>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!-- Audit direct AND transitive dependencies against the NuGet vulnerability database on every
+         restore (NU1901-1904). -->
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+
+    <!-- Warnings are errors in CI so the bar can't regress; local builds stay warning-tolerant for
+         work-in-progress. NuGet-audit advisories (NU19xx) are deliberately excluded: a newly
+         disclosed CVE in a dependency should surface and be handled (via Dependabot), not break
+         every unrelated PR's build. -->
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+
     <PackageIcon>icon.png</PackageIcon>
   </PropertyGroup>
 

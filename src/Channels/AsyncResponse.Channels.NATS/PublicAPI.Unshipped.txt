@@ -1,0 +1,17 @@
+#nullable enable
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.DeliveryConfirmationTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.DeliveryConfirmationTimeout.set -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.NatsAsyncResponseChannelOptions() -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.PresenceProbeTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.PresenceProbeTimeout.set -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.RecoveryBucket.get -> string!
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.RecoveryBucket.set -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.RecoveryBucketReplicas.get -> int
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.RecoveryBucketReplicas.set -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.SubjectPrefix.get -> string!
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.SubjectPrefix.set -> void
+AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.Validate() -> void
+const AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions.ChannelName = "NATS" -> string!
+Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions.WithNatsChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

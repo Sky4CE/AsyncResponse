@@ -1,0 +1,86 @@
+#nullable enable
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseQueue) -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.AutoCreateSchema.get -> bool
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.AutoCreateSchema.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterQueue.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterQueue.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention.get -> System.TimeSpan?
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.LockTimeout.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.MessageTable.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.MessageTable.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.NotificationChannel.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.NotificationChannel.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PostgreSqlAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions!>!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SchemaName.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SchemaName.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext.Attempt.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions
+AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions.PostgreSqlReplyTargetOptions() -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions.ResponseQueue.get -> string?
+AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.AckMode.get -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BatchSize.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.BatchSize.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.EmptyPollDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.EmptyPollDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.PostgreSqlSubscriberOptions() -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.RedeliveryDelay.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport
+AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport.PostgreSqlWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions!>! options, Npgsql.NpgsqlDataSource! dataSource) -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.TransportName = "PostgreSQL" -> string!
+Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions.WithPostgreSqlTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

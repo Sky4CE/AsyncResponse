@@ -1,0 +1,88 @@
+#nullable enable
+AsyncResponse.Transports.MongoDB.MongoDbAckMode
+AsyncResponse.Transports.MongoDB.MongoDbAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.MongoDB.MongoDbAckMode
+AsyncResponse.Transports.MongoDB.MongoDbAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.MongoDB.MongoDbAckMode
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseQueue) -> AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.AutoCreateIndexes.get -> bool
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.AutoCreateIndexes.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ConnectionString.get -> string?
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ConnectionString.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DatabaseName.get -> string?
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DatabaseName.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterQueue.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterQueue.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterRetention.get -> System.TimeSpan?
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterRetention.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.LockTimeout.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.MessageCollection.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.MessageCollection.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.MongoDbAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions!>!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseChangeStreamWake.get -> bool
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseChangeStreamWake.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions!
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext.Attempt.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions
+AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions.MongoDbReplyTargetOptions() -> void
+AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions.ResponseQueue.get -> string?
+AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.AckMode.get -> AsyncResponse.Transports.MongoDB.MongoDbAckMode
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BatchSize.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.BatchSize.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.EmptyPollDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.EmptyPollDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.MongoDbSubscriberOptions() -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.RedeliveryDelay.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions!
+AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport
+AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.MongoDbWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! options, MongoDB.Driver.IMongoDatabase! database) -> void
+AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.TransportName = "MongoDB" -> string!
+Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions.WithMongoDbTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

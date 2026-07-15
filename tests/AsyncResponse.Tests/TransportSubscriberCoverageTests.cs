@@ -156,7 +156,7 @@ public sealed class TransportSubscriberCoverageTests
     [Fact]
     public void RedisCorrelationIdExtractor_HandlesNullValues()
     {
-        var entry = new StreamEntry("1-0", null);
+        var entry = new StreamEntry("1-0", null!);
         var result = RedisCorrelationIdExtractor.TryReadField(entry, "corr");
         Assert.Null(result);
     }
@@ -351,7 +351,7 @@ public sealed class TransportSubscriberCoverageTests
             .ReturnsAsync(true)
             .ReturnsAsync(false);
 
-        mockCursor.SetupGet(c => c.Current).Returns(new ChangeStreamDocument<MongoTransportMessageDocument>[] { null });
+        mockCursor.SetupGet(c => c.Current).Returns(new ChangeStreamDocument<MongoTransportMessageDocument>[] { null! });
 
         mockCollection.Setup(c => c.WatchAsync(
             It.IsAny<PipelineDefinition<ChangeStreamDocument<MongoTransportMessageDocument>, ChangeStreamDocument<MongoTransportMessageDocument>>>(),

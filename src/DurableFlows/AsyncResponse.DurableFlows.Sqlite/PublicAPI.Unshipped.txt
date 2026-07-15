@@ -1,0 +1,23 @@
+#nullable enable
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.get -> bool
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.set -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.ConnectionString.get -> string!
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.PruneInterval.get -> System.TimeSpan
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.SqliteDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.TableName.get -> string!
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.TableName.set -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.Validate() -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.SqliteFlowStateStore(Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions!>! options) -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+Microsoft.Extensions.DependencyInjection.SqliteDurableFlowServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.SqliteDurableFlowServiceCollectionExtensions.WithSqliteDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

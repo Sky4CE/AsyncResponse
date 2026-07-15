@@ -28,11 +28,23 @@
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+
+    <!-- Validate the packed public API surface is consistent across target frameworks. Once 0.1.0
+         is published, set PackageValidationBaselineVersion to also catch binary-compat breaks
+         against the previous release. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="\" Visible="false" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+
+    <!-- Track the public API surface: RS0016/RS0017 flag any public member that is not recorded in
+         the per-project PublicAPI.{Shipped,Unshipped}.txt files, so surface changes are explicit in
+         review. Analyzer-only (PrivateAssets="All"); never a package dependency. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="All" />
+    <AdditionalFiles Include="PublicAPI.Shipped.txt" />
+    <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
   </ItemGroup>
 
 </Project>

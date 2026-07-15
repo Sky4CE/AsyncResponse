@@ -1,0 +1,84 @@
+#nullable enable
+AsyncResponse.Transports.SqlServer.SqlServerAckMode
+AsyncResponse.Transports.SqlServer.SqlServerAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.SqlServer.SqlServerAckMode
+AsyncResponse.Transports.SqlServer.SqlServerAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.SqlServer.SqlServerAckMode
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseQueue) -> AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.AutoCreateSchema.get -> bool
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.AutoCreateSchema.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ConnectionString.get -> string?
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ConnectionString.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterQueue.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterQueue.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterRetention.get -> System.TimeSpan?
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterRetention.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.LockTimeout.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.MessageTable.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.MessageTable.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions!>!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SchemaName.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SchemaName.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SqlServerAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions!
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext.Attempt.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions
+AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions.ResponseQueue.get -> string?
+AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions.SqlServerReplyTargetOptions() -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.AckMode.get -> AsyncResponse.Transports.SqlServer.SqlServerAckMode
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BatchSize.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.BatchSize.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.EmptyPollDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.EmptyPollDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.RedeliveryDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.SqlServerSubscriberOptions() -> void
+AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions!
+AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport
+AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.SqlServerWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions!>! options) -> void
+const AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.TransportName = "SqlServer" -> string!
+Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportServiceCollectionExtensions.WithSqlServerTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

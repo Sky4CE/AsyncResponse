@@ -1,0 +1,41 @@
+#nullable enable
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.AutoCreateIndexes.get -> bool
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.AutoCreateIndexes.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ConnectionString.get -> string?
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ConnectionString.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DatabaseName.get -> string?
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DatabaseName.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DeliveryConfirmationTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.DeliveryConfirmationTimeout.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ListenerPollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ListenerPollInterval.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.MessageCollection.get -> string!
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.MessageCollection.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.MessageRetention.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.MessageRetention.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.MongoDbAsyncResponseChannelOptions() -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PendingMessageBatchSize.get -> int
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PendingMessageBatchSize.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.RecoveryStateCollection.get -> string!
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.RecoveryStateCollection.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberCollection.get -> string!
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberCollection.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatInterval.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatInterval.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseChangeStreams.get -> bool
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseChangeStreams.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.Validate() -> void
+const AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ChannelName = "MongoDB" -> string!
+Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions.WithMongoDbChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

@@ -1,0 +1,43 @@
+#nullable enable
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ActivePollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ActivePollInterval.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.AutoCreateSchema.get -> bool
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.AutoCreateSchema.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ConnectionString.get -> string?
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ConnectionString.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.DeliveryConfirmationPollInterval.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.DeliveryConfirmationTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.DeliveryConfirmationTimeout.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.IdlePollInterval.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.IdlePollInterval.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.MessageRetention.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.MessageRetention.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.MessageTable.get -> string!
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.MessageTable.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PendingMessageBatchSize.get -> int
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PendingMessageBatchSize.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PruneInterval.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PruneInterval.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.RecoveryStateTable.get -> string!
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.RecoveryStateTable.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SchemaName.get -> string!
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SchemaName.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SqlServerAsyncResponseChannelOptions() -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatInterval.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatInterval.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.get -> System.TimeSpan
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberTable.get -> string!
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.SubscriberTable.set -> void
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.Validate() -> void
+const AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ChannelName = "SqlServer" -> string!
+Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions.WithSqlServerChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

@@ -1,0 +1,110 @@
+#nullable enable
+AsyncResponse.Transports.Kafka.KafkaAckMode
+AsyncResponse.Transports.Kafka.KafkaAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.Kafka.KafkaAckMode
+AsyncResponse.Transports.Kafka.KafkaAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.Kafka.KafkaAckMode
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseTopic) -> AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.BootstrapServers.get -> string?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.BootstrapServers.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ClientId.get -> string?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ClientId.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureAdminClient.get -> System.Action<Confluent.Kafka.AdminClientConfig!>?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureAdminClient.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureConsumer.get -> System.Action<Confluent.Kafka.ConsumerConfig!>?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureConsumer.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureProducer.get -> System.Action<Confluent.Kafka.ProducerConfig!>?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ConfigureProducer.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CorrelationIdHeader.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CorrelationIdHeader.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CreateTopics.get -> bool
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.CreateTopics.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterEnabled.get -> bool
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterEnabled.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterTopic.get -> string?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterTopic.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterTopicSuffix.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DeadLetterTopicSuffix.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.KafkaAsyncResponseTransportOptions() -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.OffsetCommitInterval.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.OffsetCommitInterval.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.OperationTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.OperationTimeout.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions!>!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseConsumerGroup.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseConsumerGroup.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.Kafka.KafkaSubscriberOptions!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseTopic.get -> string?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseTopic.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicNumPartitions.get -> int
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicNumPartitions.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicPrefix.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicPrefix.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicReplicationFactor.get -> short
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TopicReplicationFactor.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.WorkerConsumerGroup.get -> string!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.WorkerConsumerGroup.set -> void
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.Kafka.KafkaSubscriberOptions!
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.WorkerTopic.get -> string?
+AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.WorkerTopic.set -> void
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.ConsumerGroup.get -> string!
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.Offset.get -> long
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.Partition.get -> int
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext.Topic.get -> string!
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.ConsumerGroup.get -> string?
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.ConsumerGroup.set -> void
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.KafkaReplyTargetOptions() -> void
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.ResponseTopic.get -> string?
+AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions.ResponseTopic.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.AckMode.get -> AsyncResponse.Transports.Kafka.KafkaAckMode
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackpressurePollDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.BackpressurePollDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.HandlerRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.HandlerRetryBaseDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.HandlerRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.HandlerRetryMaxDelay.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.KafkaSubscriberOptions() -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.PollTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.PollTimeout.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.Kafka.KafkaSubscriberOptions!
+AsyncResponse.Transports.Kafka.KafkaWorkerTransport
+AsyncResponse.Transports.Kafka.KafkaWorkerTransport.KafkaWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions!>! options) -> void
+AsyncResponse.Transports.Kafka.KafkaWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+const AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.TransportName = "kafka" -> string!
+Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions.WithKafkaTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

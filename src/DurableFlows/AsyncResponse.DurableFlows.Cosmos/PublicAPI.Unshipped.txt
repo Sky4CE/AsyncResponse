@@ -1,0 +1,28 @@
+#nullable enable
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AutoCreateContainer.get -> bool
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.AutoCreateContainer.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ConnectionString.get -> string?
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ContainerName.get -> string!
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ContainerName.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.CosmosDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.DatabaseName.get -> string?
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.DatabaseName.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.PartitionKeyPath.get -> string!
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.PartitionKeyPath.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Throughput.get -> int?
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Throughput.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Validate() -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.CosmosFlowStateStore(Microsoft.Azure.Cosmos.CosmosClient! client, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions!>! options, bool ownsClient = false) -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.Dispose() -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+Microsoft.Extensions.DependencyInjection.CosmosDurableFlowServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.CosmosDurableFlowServiceCollectionExtensions.WithCosmosDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

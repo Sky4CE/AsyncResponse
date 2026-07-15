@@ -1,0 +1,27 @@
+#nullable enable
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.AutoCreateSchema.get -> bool
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.AutoCreateSchema.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.ConnectionString.get -> string?
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PostgreSqlDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.get -> System.TimeSpan
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.SchemaName.get -> string!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.SchemaName.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.TableName.get -> string!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.TableName.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.Validate() -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.Dispose() -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.LoadAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.PostgreSqlFlowStateStore(Npgsql.NpgsqlDataSource! dataSource, Microsoft.Extensions.Options.IOptions<AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions!>! options, bool ownsDataSource = false) -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.ReleaseLeaseAsync(string! flowId, string! leaseId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryAcquireLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryCreateAsync(string! flowId, AsyncResponse.FlowState! state, System.TimeSpan ttl, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
+Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions.WithPostgreSqlDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

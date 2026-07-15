@@ -576,10 +576,10 @@ public sealed class RemainingCoverageTests
 
         // Call SqlServerChannelSql.IsTransient via reflection
         var isTransientMethod = typeof(SqlServerChannelSql).GetMethod("IsTransient", BindingFlags.Static | BindingFlags.NonPublic)!;
-        Assert.True((bool)isTransientMethod.Invoke(null, [sqlExTransient]));
-        Assert.False((bool)isTransientMethod.Invoke(null, [new OperationCanceledException()]));
-        Assert.True((bool)isTransientMethod.Invoke(null, [new TimeoutException()]));
-        Assert.False((bool)isTransientMethod.Invoke(null, [new Exception()]));
+        Assert.True((bool)isTransientMethod.Invoke(null, [sqlExTransient])!);
+        Assert.False((bool)isTransientMethod.Invoke(null, [new OperationCanceledException()])!);
+        Assert.True((bool)isTransientMethod.Invoke(null, [new TimeoutException()])!);
+        Assert.False((bool)isTransientMethod.Invoke(null, [new Exception()])!);
     }
 
     [Fact]
@@ -605,10 +605,10 @@ public sealed class RemainingCoverageTests
         mockNpgsqlExNonTransient.Setup(x => x.IsTransient).Returns(false);
 
         var isTransientMethod = typeof(PostgreSqlChannelSql).GetMethod("IsTransient", BindingFlags.Static | BindingFlags.NonPublic)!;
-        Assert.True((bool)isTransientMethod.Invoke(null, [mockNpgsqlExTransient.Object]));
-        Assert.False((bool)isTransientMethod.Invoke(null, [mockNpgsqlExNonTransient.Object]));
-        Assert.False((bool)isTransientMethod.Invoke(null, [new OperationCanceledException()]));
-        Assert.True((bool)isTransientMethod.Invoke(null, [new TimeoutException()]));
-        Assert.False((bool)isTransientMethod.Invoke(null, [new Exception()]));
+        Assert.True((bool)isTransientMethod.Invoke(null, [mockNpgsqlExTransient.Object])!);
+        Assert.False((bool)isTransientMethod.Invoke(null, [mockNpgsqlExNonTransient.Object])!);
+        Assert.False((bool)isTransientMethod.Invoke(null, [new OperationCanceledException()])!);
+        Assert.True((bool)isTransientMethod.Invoke(null, [new TimeoutException()])!);
+        Assert.False((bool)isTransientMethod.Invoke(null, [new Exception()])!);
     }
 }

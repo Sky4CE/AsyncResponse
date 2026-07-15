@@ -1,0 +1,115 @@
+# EditorConfig — https://editorconfig.org
+# Root of the settings tree; no parent .editorconfig is consulted above this.
+root = true
+
+# ----------------------------------------------------------------------------------------------
+# All files
+# ----------------------------------------------------------------------------------------------
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Markdown keeps trailing whitespace (two trailing spaces = hard line break).
+[*.md]
+trim_trailing_whitespace = false
+
+# Project/config files conventionally use 2-space indentation.
+[*.{csproj,props,targets,json,yml,yaml,xml,slnx,config}]
+indent_size = 2
+
+[*.{cmd,bat}]
+end_of_line = crlf
+
+# ----------------------------------------------------------------------------------------------
+# C#
+#
+# NOTE: EnforceCodeStyleInBuild is on, so any rule set to `warning`/`error` here surfaces in the
+# build. Code-style preferences are intentionally kept at `suggestion` for now (visible in the IDE
+# and to `dotnet format`, but not build-breaking). Ratchet specific rules up to `warning` — paired
+# with TreatWarningsAsErrors — as the codebase is brought into line.
+# ----------------------------------------------------------------------------------------------
+[*.cs]
+# Usings
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = false
+csharp_using_directive_placement = outside_namespace:suggestion
+
+# Namespaces / file layout
+csharp_style_namespace_declarations = file_scoped:suggestion
+
+# `this.` qualification — off, rely on naming.
+dotnet_style_qualification_for_field = false:suggestion
+dotnet_style_qualification_for_property = false:suggestion
+dotnet_style_qualification_for_method = false:suggestion
+dotnet_style_qualification_for_event = false:suggestion
+
+# Language keywords over BCL type names (int vs Int32).
+dotnet_style_predefined_type_for_locals_parameters_members = true:suggestion
+dotnet_style_predefined_type_for_member_access = true:suggestion
+
+# `var` preferences.
+csharp_style_var_for_built_in_types = true:suggestion
+csharp_style_var_when_type_is_apparent = true:suggestion
+csharp_style_var_elsewhere = false:suggestion
+
+# Modern expression preferences.
+csharp_style_expression_bodied_methods = when_on_single_line:suggestion
+csharp_style_expression_bodied_properties = true:suggestion
+csharp_style_expression_bodied_accessors = true:suggestion
+csharp_prefer_braces = true:suggestion
+csharp_style_prefer_switch_expression = true:suggestion
+csharp_style_prefer_pattern_matching = true:suggestion
+csharp_style_throw_expression = true:suggestion
+dotnet_style_object_initializer = true:suggestion
+dotnet_style_collection_initializer = true:suggestion
+dotnet_style_prefer_conditional_expression_over_assignment = true:suggestion
+dotnet_style_null_propagation = true:suggestion
+dotnet_style_coalesce_expression = true:suggestion
+dotnet_style_readonly_field = true:suggestion
+
+# Accessibility modifiers should be explicit.
+dotnet_style_require_accessibility_modifiers = for_non_interface_members:suggestion
+
+# 'new()' target-typed where the type is obvious.
+csharp_style_implicit_object_creation_when_type_is_apparent = true:suggestion
+
+# Unnecessary usings / code — kept as suggestion for now (IDE0005 etc.).
+dotnet_diagnostic.IDE0005.severity = suggestion
+
+# Public API tracking (Microsoft.CodeAnalysis.PublicApiAnalyzers). RS0016/RS0017 (the public surface
+# must be recorded in PublicAPI.*.txt) are enforced. RS0026/RS0027 (optional-parameter + overload
+# design advisories) are turned off: they flag deliberate, long-standing overload patterns rather
+# than correctness problems.
+dotnet_diagnostic.RS0026.severity = none
+dotnet_diagnostic.RS0027.severity = none
+
+# ----------------------------------------------------------------------------------------------
+# Naming conventions
+# ----------------------------------------------------------------------------------------------
+# Interfaces are PascalCase with an 'I' prefix.
+dotnet_naming_rule.interfaces_start_with_i.severity = suggestion
+dotnet_naming_rule.interfaces_start_with_i.symbols = interface_symbol
+dotnet_naming_rule.interfaces_start_with_i.style = i_prefix_pascal_style
+dotnet_naming_symbols.interface_symbol.applicable_kinds = interface
+dotnet_naming_style.i_prefix_pascal_style.capitalization = pascal_case
+dotnet_naming_style.i_prefix_pascal_style.required_prefix = I
+
+# Types and members are PascalCase.
+dotnet_naming_rule.types_pascal.severity = suggestion
+dotnet_naming_rule.types_pascal.symbols = type_symbols
+dotnet_naming_rule.types_pascal.style = pascal_style
+dotnet_naming_symbols.type_symbols.applicable_kinds = class,struct,enum,delegate
+dotnet_naming_style.pascal_style.capitalization = pascal_case
+
+# Private fields are _camelCase.
+dotnet_naming_rule.private_fields_underscore.severity = suggestion
+dotnet_naming_rule.private_fields_underscore.symbols = private_field_symbols
+dotnet_naming_rule.private_fields_underscore.style = underscore_camel_style
+dotnet_naming_symbols.private_field_symbols.applicable_kinds = field
+dotnet_naming_symbols.private_field_symbols.applicable_accessibilities = private
+dotnet_naming_style.underscore_camel_style.capitalization = camel_case
+dotnet_naming_style.underscore_camel_style.required_prefix = _

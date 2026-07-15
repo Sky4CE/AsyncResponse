@@ -1,0 +1,22 @@
+# Normalize all text files to LF in the repository; Git converts on checkout as needed.
+* text=auto eol=lf
+
+# Scripts that must keep platform-native line endings.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.sh   text eol=lf
+
+# C# gets language-aware diffing.
+*.cs   text diff=csharp
+
+# Binary assets: never normalize or attempt to diff.
+*.png  binary
+*.ico  binary
+*.snk  binary
+*.pfx  binary
+*.nupkg binary
+*.snupkg binary
+
+# Keep generated/vendored output out of language stats and collapsed in diffs.
+graphify-out/** linguist-generated=true

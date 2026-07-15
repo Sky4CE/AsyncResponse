@@ -1,0 +1,90 @@
+#nullable enable
+AsyncResponse.Transports.SQS.SqsAckMode
+AsyncResponse.Transports.SQS.SqsAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.SQS.SqsAckMode
+AsyncResponse.Transports.SQS.SqsAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.SQS.SqsAckMode
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.AccessKey.get -> string?
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.AccessKey.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.AddReplyTarget(string! name, string! queue) -> AsyncResponse.Transports.SQS.SqsAsyncResponseOptions!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CorrelationIdAttribute.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CorrelationIdAttribute.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CorrelationIdJsonPaths.get -> string![]!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CorrelationIdJsonPaths.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CreateQueues.get -> bool
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.CreateQueues.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.DeadLetterQueueSuffix.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.DeadLetterQueueSuffix.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.DefaultReplyTargetName.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.FifoMessageGroupIdFallback.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.FifoMessageGroupIdFallback.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.HostShutdownTimeout.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.MaxMessagesPerReceive.get -> int
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.MaxMessagesPerReceive.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.MaxReceiveCount.get -> int
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.MaxReceiveCount.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishMaxAttempts.get -> int
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishMaxAttempts.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishRetryBaseDelay.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.PublishRetryMaxDelay.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ReceiveWaitTime.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ReceiveWaitTime.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.Region.get -> string?
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.Region.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ReplyTargets.get -> System.Collections.Generic.Dictionary<string!, AsyncResponse.Transports.SQS.SqsReplyTargetOptions!>!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ResponseQueue.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ResponseQueue.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ResponseSubscriber.get -> AsyncResponse.Transports.SQS.SqsSubscriberOptions!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SecretKey.get -> string?
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SecretKey.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ServiceUrl.get -> string?
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ServiceUrl.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SqsAsyncResponseOptions() -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryMaxDelay.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.WorkerQueue.get -> string!
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.WorkerQueue.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.WorkerSubscriber.get -> AsyncResponse.Transports.SQS.SqsSubscriberOptions!
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.CorrelationId.get -> string?
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.Exception.get -> System.Exception!
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.MessageId.get -> string!
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.Queue.get -> string!
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.ReceiveCount.get -> int
+AsyncResponse.Transports.SQS.SqsBackgroundFailureContext.SubscriberRole.get -> string!
+AsyncResponse.Transports.SQS.SqsReplyTargetOptions
+AsyncResponse.Transports.SQS.SqsReplyTargetOptions.Properties.get -> System.Collections.Generic.Dictionary<string!, string!>!
+AsyncResponse.Transports.SQS.SqsReplyTargetOptions.Queue.get -> string?
+AsyncResponse.Transports.SQS.SqsReplyTargetOptions.Queue.set -> void
+AsyncResponse.Transports.SQS.SqsReplyTargetOptions.SqsReplyTargetOptions() -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.AckMode.get -> AsyncResponse.Transports.SQS.SqsAckMode
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.AckMode.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundDrainTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundDrainTimeout.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundQueueCapacity.get -> int
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundQueueCapacity.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundWorkerCount.get -> int
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.SQS.SqsBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.OnBackgroundFailure.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan?
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.RedeliveryDelay.set -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.SqsSubscriberOptions() -> void
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.SQS.SqsSubscriberOptions!
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.set -> void
+AsyncResponse.Transports.SQS.SqsWorkerTransport
+AsyncResponse.Transports.SQS.SqsWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.SQS.SqsWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.SQS.SqsWorkerTransport.SqsWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.SQS.SqsAsyncResponseOptions!>! options) -> void
+const AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.TransportName = "AmazonSQS" -> string!
+Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionExtensions
+static Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionExtensions.WithSqsTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.SQS.SqsAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
