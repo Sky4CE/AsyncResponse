@@ -20,12 +20,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
-    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.10" />
-    <!-- Explicit native-lib pin: Microsoft.Data.Sqlite's bundled SQLitePCLRaw carries an older
-         e_sqlite3 build; keep this version in step with the bundle's expected provider major/minor
-         when bumping Microsoft.Data.Sqlite. -->
-    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <!-- Explicit native-lib pin: overrides the older e_sqlite3 build that Microsoft.Data.Sqlite
+         bundles transitively. Version and the co-bump note live in Directory.Packages.props. -->
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
   </ItemGroup>
 
 </Project>
