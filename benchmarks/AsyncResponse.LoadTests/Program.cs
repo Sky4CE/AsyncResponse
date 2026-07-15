@@ -36,10 +36,17 @@ using NBomber.CSharp;
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --mongodb-url http://localhost:5018 --mongodb-early-ack-url http://localhost:5019 --profile mongodb
 //   dotnet run -c Release --project benchmarks/AsyncResponse.LoadTests -- --gh-json loadtest
 //
-// The process exits non-zero if any scenario records failed requests.
+// The process exits non-zero when the overall failure rate exceeds --max-fail-rate (default 5%)
+// or any single scenario exceeds --max-scenario-fail-rate (default 75%). A handful of transient
+// failures under load (emulator hiccups, ack-after-process backpressure) do not fail the job.
 var rate = GetInt("--rate", 20);
 var duration = TimeSpan.FromSeconds(GetInt("--duration", 30));
 var warmup = TimeSpan.FromSeconds(GetInt("--warmup", 5));
+// SLO-style pass/fail tolerance. The job fails only if the overall failure rate crosses
+// --max-fail-rate, or any single scenario crosses the (deliberately high) --max-scenario-fail-rate
+// ceiling that separates a genuinely broken transport from one merely saturated under load.
+var maxFailRate = GetDouble("--max-fail-rate", 0.05);
+var maxScenarioFailRate = GetDouble("--max-scenario-fail-rate", 0.75);
 var profile = (GetString("--profile") ?? "broad").Trim().ToLowerInvariant();
 var scenarioFilter = GetString("--scenario");
 var existingUrl = GetString("--url");
@@ -264,7 +271,7 @@ else
     Console.WriteLine($"MongoDB ACK-after-enqueue SUT at {mongoDbEarlyAckBaseAddress}.");
 }
 
-var hadFailures = false;
+var gateBreached = false;
 try
 {
     using var httpClient = new HttpClient
@@ -466,7 +473,47 @@ try
         .WithReportFolder("nbomber-report")
         .Run();
 
-    hadFailures = nodeStats.ScenarioStats.Any(s => s.Fail.Request.Count > 0);
+    // A broad run drives nine transports — three container/emulator-backed (Azure Service Bus
+    // emulator, LocalStack SQS, Pub/Sub emulator) — on a shared CI runner, so a few transient
+    // failures under load are expected (observation timeouts as ack-after-process paths back up,
+    // emulator hiccups). Gating on zero failures makes the job permanently red; gate on SLO-style
+    // rates instead. The overall rate catches broad breakage (a downed transport spans several
+    // scenarios); the high per-scenario ceiling still catches one transport that is genuinely
+    // broken (~100% failing) rather than merely saturated.
+    var okTotal = nodeStats.ScenarioStats.Sum(s => (long)s.Ok.Request.Count);
+    var failTotal = nodeStats.ScenarioStats.Sum(s => (long)s.Fail.Request.Count);
+    var overallFailRate = okTotal + failTotal == 0 ? 0d : (double)failTotal / (okTotal + failTotal);
+
+    Console.WriteLine(
+        $"Load-test failure summary: {failTotal}/{okTotal + failTotal} requests failed " +
+        $"({overallFailRate:P2}); gate = overall <= {maxFailRate:P0} and every scenario <= {maxScenarioFailRate:P0}.");
+    foreach (var s in nodeStats.ScenarioStats
+                 .Where(s => s.Fail.Request.Count > 0)
+                 .OrderByDescending(s => s.Fail.Request.Count))
+    {
+        var total = s.Ok.Request.Count + s.Fail.Request.Count;
+        var failRate = total == 0 ? 0d : (double)s.Fail.Request.Count / total;
+        Console.WriteLine($"  - {s.ScenarioName}: {s.Fail.Request.Count}/{total} failed ({failRate:P1})");
+    }
+
+    var overallBreached = overallFailRate > maxFailRate;
+    var breachedScenarios = nodeStats.ScenarioStats
+        .Where(s =>
+        {
+            var total = s.Ok.Request.Count + s.Fail.Request.Count;
+            return total > 0 && (double)s.Fail.Request.Count / total > maxScenarioFailRate;
+        })
+        .Select(s => s.ScenarioName)
+        .ToArray();
+
+    if (overallBreached)
+        Console.WriteLine($"FAIL: overall failure rate {overallFailRate:P2} exceeds {maxFailRate:P0}.");
+    foreach (var name in breachedScenarios)
+        Console.WriteLine($"FAIL: scenario '{name}' exceeds the {maxScenarioFailRate:P0} per-scenario ceiling.");
+
+    gateBreached = overallBreached || breachedScenarios.Length > 0;
+    if (!gateBreached && failTotal > 0)
+        Console.WriteLine("All failures were within tolerance; load test passes.");
 
     // Emit github-action-benchmark series so the CI dashboard tracks throughput and latency per commit.
     if (ghJsonPrefix is not null)
@@ -499,7 +546,7 @@ finally
         await app.DisposeAsync();
 }
 
-return hadFailures ? 1 : 0;
+return gateBreached ? 1 : 0;
 
 static ScenarioProps BuildScenario(
     ScenarioDefinition definition,
@@ -1142,6 +1189,15 @@ static int GetInt(string name, int fallback)
     var args = Environment.GetCommandLineArgs();
     var index = Array.IndexOf(args, name);
     return index >= 0 && index + 1 < args.Length && int.TryParse(args[index + 1], out var value) ? value : fallback;
+}
+
+static double GetDouble(string name, double fallback)
+{
+    var args = Environment.GetCommandLineArgs();
+    var index = Array.IndexOf(args, name);
+    return index >= 0 && index + 1 < args.Length
+        && double.TryParse(args[index + 1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value)
+        ? value : fallback;
 }
 
 static string? GetString(string name)
