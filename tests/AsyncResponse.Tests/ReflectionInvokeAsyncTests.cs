@@ -13,6 +13,8 @@ public interface IInvokeTarget
     void RecordVoid(string value);
     int RecordSync(string value);
     Task RecordNumberAsync(int value);
+    Task RecordMultipleAsync(int value, string passThrough);
+    Task RecordLongAsync(long value);
     Task ByRefAsync(ref int value);
     Task GenericAsync<T>(T value);
 
@@ -60,6 +62,18 @@ public sealed class InvokeTarget : IInvokeTarget
     }
 
     public Task RecordNumberAsync(int value)
+    {
+        Recorded.Add(value.ToString());
+        return Task.CompletedTask;
+    }
+
+    public Task RecordMultipleAsync(int value, string passThrough)
+    {
+        Recorded.Add(value.ToString() + passThrough);
+        return Task.CompletedTask;
+    }
+
+    public Task RecordLongAsync(long value)
     {
         Recorded.Add(value.ToString());
         return Task.CompletedTask;
@@ -260,5 +274,37 @@ public class ReflectionInvokeAsyncTests
         }));
 
         Assert.Contains("generic", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ConvertsIntToLongWithPrimitiveFallback()
+    {
+        var target = new InvokeTarget();
+        using var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(target).BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
+            MethodName = nameof(IInvokeTarget.RecordLongAsync),
+            Params = [(int)42]
+        });
+
+        Assert.Equal("42", Assert.Single(target.Recorded));
+    }
+
+    [Fact]
+    public async Task InvokeAsync_MultipleArguments_ConvertsAndCopiesCorrectly()
+    {
+        var target = new InvokeTarget();
+        using var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(target).BuildServiceProvider();
+
+        await provider.InvokeAsync(new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
+            MethodName = nameof(IInvokeTarget.RecordMultipleAsync),
+            Params = ["123", "pass"]
+        });
+
+        Assert.Equal("123pass", Assert.Single(target.Recorded));
     }
 }

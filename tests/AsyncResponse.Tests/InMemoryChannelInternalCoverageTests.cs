@@ -141,6 +141,24 @@ public sealed class InMemoryChannelInternalCoverageTests
         await CleanupAsync(asyncFailure);
     }
 
+    [Fact]
+    public async Task CreateResponseWaiter_WhenStoreThrows_RemovesSubscriptionAndRethrows()
+    {
+        var (channel, store) = CreateChannel();
+        store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new InvalidOperationException("Store failed"));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.CreateResponseWaiter<OperationResult>("throw-corr"));
+
+        Assert.Equal("Store failed", error.Message);
+        Assert.Equal(0, await channel.CountActiveSubscribersAsync("throw-corr"));
+        store.Verify(instance => instance.TryDeleteAsync(
+            "throw-corr",
+            It.IsAny<Guid>(),
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     private static (InMemoryAsyncResponseChannel Channel, Mock<IRecoveryStateStore> Store) CreateChannel()
     {
         var provider = new ServiceCollection().BuildServiceProvider();

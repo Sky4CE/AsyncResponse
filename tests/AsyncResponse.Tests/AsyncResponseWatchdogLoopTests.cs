@@ -190,6 +190,37 @@ public class AsyncResponseWatchdogLoopTests
         Assert.Contains("scan boom", snapshot.Error!, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ScanCancellation_OnStop_IsHandledGracefully()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var scanner = new CancellationScanner(entered);
+        var watchdog = Build(state, Options(enabled: true), scanner, new FakeProbe(0));
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            await entered.Task.WaitAsync(PublishTimeout);
+        }
+        finally
+        {
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+
+        Assert.Null(state.Latest);
+    }
+
+    private sealed class CancellationScanner(TaskCompletionSource entered) : IRecoveryStateScanner
+    {
+        public async IAsyncEnumerable<RecoveryState> ScanAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            entered.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            yield break;
+        }
+    }
+
     private static AsyncResponseWatchdog Build(
         AsyncResponseWatchdogState state,
         IOptions<AsyncResponseOptions> options,
@@ -209,7 +240,8 @@ public class AsyncResponseWatchdogLoopTests
             {
                 Enabled = enabled,
                 StartupDelay = TimeSpan.Zero,
-                Interval = TimeSpan.FromMilliseconds(50),
+                // These tests inspect the first publication; keep the next scan outside that window.
+                Interval = PublishTimeout + PublishTimeout,
                 StaleAfter = TimeSpan.FromMinutes(1)
             }
         });

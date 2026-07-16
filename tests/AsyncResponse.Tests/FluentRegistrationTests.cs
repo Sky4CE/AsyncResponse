@@ -65,6 +65,14 @@ public class FluentRegistrationTests
     }
 
     [Fact]
+    public void WithInMemoryTransport_WithConfigure_AppliesOptions()
+    {
+        using var provider = Build(builder => builder.WithInMemoryTransport(o => o.QueueCapacity = 999));
+        var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<InMemoryWorkerTransportOptions>>().Value;
+        Assert.Equal(999, options.QueueCapacity);
+    }
+
+    [Fact]
     public async Task InMemoryChannel_Scanner_YieldsSavedRecoveryState()
     {
         var provider = Build(builder => builder.WithInMemoryChannel());
