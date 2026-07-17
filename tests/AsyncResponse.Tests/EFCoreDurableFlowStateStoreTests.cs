@@ -1,5 +1,4 @@
 using AsyncResponse.DurableFlows.EFCore;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -334,7 +333,11 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         private readonly string _path = Path.Combine(Path.GetTempPath(), $"ar-efcore-flow-state-{Guid.NewGuid():N}.db");
 
-        public string ConnectionString => $"Data Source={_path}";
+        // Pooling=False: every closed connection releases its file handle immediately, so
+        // cleanup can delete the temp database on Windows and no process-wide pool state
+        // couples parallel tests (SqliteConnection.ClearAllPools() here previously flushed
+        // OTHER tests' idle connections mid-run and manifested as 'database is locked').
+        public string ConnectionString => $"Data Source={_path};Pooling=False";
 
         /// <summary>Creates the state table — the store itself never runs DDL.</summary>
         public async Task EnsureSchemaAsync()
@@ -360,11 +363,8 @@ public sealed class EFCoreDurableFlowStateStoreTests
 
         public ValueTask DisposeAsync()
         {
-            // Microsoft.Data.Sqlite pools connections: on Windows a pooled handle keeps the file
-            // locked and File.Delete throws IOException. Flush the pools first, and treat any
-            // residual failure as non-fatal — this is best-effort temp-file hygiene, not test
-            // behavior under assertion.
-            SqliteConnection.ClearAllPools();
+            // Pooling is disabled in the connection string, so the last closed context already
+            // released the file handle; deletion stays best-effort temp hygiene regardless.
             try
             {
                 File.Delete(_path);

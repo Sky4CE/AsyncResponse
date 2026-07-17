@@ -463,10 +463,23 @@ public sealed class RemainingCoverageTests
     private sealed class TempSqliteDb : IAsyncDisposable
     {
         private readonly string _path = Path.Combine(Path.GetTempPath(), $"ar-coverage-{Guid.NewGuid():N}.db");
-        public string ConnectionString => $"Data Source={_path}";
+        // Pooling=False: every closed connection releases its file handle immediately, so
+        // cleanup can delete the temp database on Windows and no process-wide pool state
+        // couples parallel tests (SqliteConnection.ClearAllPools() here previously flushed
+        // OTHER tests' idle connections mid-run and manifested as 'database is locked').
+        public string ConnectionString => $"Data Source={_path};Pooling=False";
         public ValueTask DisposeAsync()
         {
-            File.Delete(_path);
+            // Pooling is disabled in the connection string, so the last closed context already
+            // released the file handle; deletion stays best-effort temp hygiene regardless.
+            try
+            {
+                File.Delete(_path);
+            }
+            catch (IOException)
+            {
+            }
+
             return ValueTask.CompletedTask;
         }
     }
