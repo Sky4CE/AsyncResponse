@@ -335,10 +335,15 @@ internal sealed class MongoDbChannelStore : IDisposable
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
                      & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
-        var document = await _messages.Find(filter)
-            .Project(item => new { item.AckedAtUtc })
+        // Direct member projection, not an anonymous type: anonymous projections lower to the
+        // RequiresUnreferencedCode Expression.New(ctor, args, members) overload, which the ILC
+        // trim analysis rejects (Roslyn's analyzer skips compiler-lowered expression trees, so
+        // only Native AOT publishes catch it). Missing document and unacked document both come
+        // back as null, which is exactly the contract here.
+        var ackedAtUtc = await _messages.Find(filter)
+            .Project(item => item.AckedAtUtc)
             .FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
-        return document?.AckedAtUtc is not null;
+        return ackedAtUtc is not null;
     }
 
     public async Task UpsertSubscriberAsync(string correlationId, Guid registrationId, string instanceId, TimeSpan ttl, CancellationToken cancellationToken)

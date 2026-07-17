@@ -447,23 +447,16 @@ public sealed class MongoDbChannelCoverageTests
         
         var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
 
-        var anonymousType = typeof(MongoDbChannelStore).Assembly.GetTypes()
-            .First(t => t.Name.StartsWith("<>f__AnonymousType") && t.GetProperties().Any(p => p.Name == "AckedAtUtc"));
-        var closedAnonymousType = anonymousType.MakeGenericType([typeof(DateTime?)]);
-
+        // IsMessageAcknowledgedAsync projects straight to DateTime? (a named projection would
+        // lower anonymous types to the trim-unsafe Expression.New overload — see the store), so
+        // the mock cursor is a plain typed list: a value on the first attempt means "acked".
         var acknowledgeAttempts = 0;
-        SetupFindAsync(fixture.Messages, closedAnonymousType, () =>
+        SetupFindAsync(fixture.Messages, typeof(DateTime?), () =>
         {
-            var listType = typeof(List<>).MakeGenericType(closedAnonymousType);
-            var list = Activator.CreateInstance(listType)!;
-
             acknowledgeAttempts++;
-            if (acknowledgeAttempts == 1)
-            {
-                var anonymousInstance = Activator.CreateInstance(closedAnonymousType, [(DateTime?)DateTime.UtcNow]);
-                listType.GetMethod("Add")!.Invoke(list, [anonymousInstance]);
-            }
-            return list;
+            return acknowledgeAttempts == 1
+                ? new List<DateTime?> { DateTime.UtcNow }
+                : [];
         });
 
         var tryConfirmMethod = typeof(MongoDbAsyncResponseChannel)

@@ -15,6 +15,15 @@ of proof run in CI:
    exactly which, and why the rest stay JIT). Set `ASYNCRESPONSE_ITEST_SUT=aot` and
    `ASYNCRESPONSE_ITEST_SUT_PATH=<published binary>` to run it locally.
 
+The first two layers also run in every **local** full test run:
+`NativeAotPublishGateTests` (in the integration test project, no Docker needed) publishes the
+sample with `-warnaserror` and then boots the native binary and drives a request/response round
+trip plus a durable flow. It exists because two defect classes are invisible to build + unit
+runs — ILC-only trim errors (e.g. anonymous-type LINQ projections lower to the trim-unsafe
+`Expression.New` overload that Roslyn's analyzer never flags) and runtime-only AOT breaks — and
+it makes them fail in the IDE instead of the pipeline. Set `ASYNCRESPONSE_SKIP_AOT_GATE=1` to
+skip it while iterating.
+
 ## What you do in a trimmed / Native AOT app
 
 Two startup lines, and one registration per flow:

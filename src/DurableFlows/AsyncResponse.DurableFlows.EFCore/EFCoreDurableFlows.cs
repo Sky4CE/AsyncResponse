@@ -148,10 +148,13 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
 
         var now = DateTime.UtcNow;
+        // Named-record projection, not an anonymous type: anonymous projections lower to the
+        // RequiresUnreferencedCode Expression.New(ctor, args, members) overload, which ILC trim
+        // analysis rejects in Native AOT publishes even though the Roslyn analyzer stays quiet.
         var record = await Records(lease.Context)
             .AsNoTracking()
             .Where(r => r.FlowId == flowId && r.ExpiresAtUtc > now)
-            .Select(r => new { r.StateJson, r.Revision })
+            .Select(r => new StateRow(r.StateJson, r.Revision))
             .FirstOrDefaultAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -368,5 +371,11 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
             await _scope.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Ledger-row projection for <see cref="LoadAsync"/>. A named type keeps the LINQ projection
+    /// off the anonymous-type Expression.New overload that Native AOT trim analysis rejects.
+    /// </summary>
+    private sealed record StateRow(string StateJson, long Revision);
 }
 }

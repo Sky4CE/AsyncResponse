@@ -515,7 +515,19 @@ public sealed class DurableFlowStateStoreExampleTests
 
         public ValueTask DisposeAsync()
         {
-            File.Delete(_path);
+            // Microsoft.Data.Sqlite pools connections: on Windows a pooled handle keeps the file
+            // locked and File.Delete throws IOException. Flush the pools first, and treat any
+            // residual failure as non-fatal — this is best-effort temp-file hygiene, not test
+            // behavior under assertion.
+            SqliteConnection.ClearAllPools();
+            try
+            {
+                File.Delete(_path);
+            }
+            catch (IOException)
+            {
+            }
+
             return ValueTask.CompletedTask;
         }
     }

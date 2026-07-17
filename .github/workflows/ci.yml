@@ -172,6 +172,10 @@ jobs:
         env:
           ASYNCRESPONSE_ITEST_SUT: aot
           ASYNCRESPONSE_ITEST_SUT_PATH: ${{ github.workspace }}/artifacts/sut-aot/AsyncResponse.Sample
+          # This job already publishes the sample natively and runs the whole suite against it;
+          # the in-suite publish gate would only repeat that work here. The plain integration job
+          # keeps the gate active, so ILC-only regressions still fail CI (and local full runs).
+          ASYNCRESPONSE_SKIP_AOT_GATE: "1"
         run: |
           dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
             --configuration Release --no-build \
