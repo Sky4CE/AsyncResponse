@@ -46,6 +46,12 @@ public sealed class NativeAotPublishGateTests
                     "-c", "Release",
                     "-warnaserror",
                     "-o", output,
+                    // No persistent build children: the Roslyn compiler server and MSBuild
+                    // node-reuse workers would inherit this test host's redirected pipes and
+                    // keep the runner process "still running" after the tests finish (the
+                    // Rider/VSTest lingering-process warning).
+                    "-nodeReuse:false",
+                    "-p:UseSharedCompilation=false",
                 ],
                 repoRoot,
                 PublishTimeout);
@@ -136,6 +142,11 @@ public sealed class NativeAotPublishGateTests
                 {
                     // Already exited.
                 }
+
+                // Reap + stop the async readers so no pending pipe reads outlive the test.
+                app.WaitForExit(5_000);
+                app.CancelOutputRead();
+                app.CancelErrorRead();
             }
         }
         finally
@@ -185,6 +196,8 @@ public sealed class NativeAotPublishGateTests
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+        process.StartInfo.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        process.StartInfo.Environment["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0";
         foreach (var arg in args)
             process.StartInfo.ArgumentList.Add(arg);
 
@@ -199,12 +212,17 @@ public sealed class NativeAotPublishGateTests
         try
         {
             await process.WaitForExitAsync(cts.Token);
+
+            // Parameterless WaitForExit also drains the redirected streams to EOF; with build
+            // daemons disabled above nothing holds the pipe handles, so this returns promptly.
+            process.WaitForExit();
         }
         catch (OperationCanceledException)
         {
             try
             {
                 process.Kill(entireProcessTree: true);
+                process.WaitForExit(5_000);
             }
             catch (InvalidOperationException)
             {
