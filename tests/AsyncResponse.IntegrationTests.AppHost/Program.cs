@@ -237,13 +237,60 @@ var sqlServerEndpoint = sqlserver.GetEndpoint("sqlserver");
 var sqlServerConnectionString = ReferenceExpression.Create(
     $"Server={sqlServerEndpoint.Property(EndpointProperty.Host)},{sqlServerEndpoint.Property(EndpointProperty.Port)};User ID=sa;Password={sqlServerPassword};Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=120");
 
+// --- SUT mode -------------------------------------------------------------------------------
+// "project" (default) runs the sample from source (JIT); "aot" runs the Native AOT-published
+// binary named by ASYNCRESPONSE_ITEST_SUT_PATH, so the *same* integration suite exercises the
+// fully trimmed app against the real broker fleet. Resource names are identical in both modes,
+// which is what keeps the test project completely unchanged.
+//
+// SUTs run natively only where the full driver stack is Native AOT-capable (vendor matrix in
+// docs/aot.md). Verified natively today: the NATS and PostgreSQL channel/transport pairs. Pinned
+// to JIT, each for a driver-level reason observed empirically in this harness:
+//  - MongoDB: MongoDB.Driver serializes BSON through reflection (not trim/AOT-compatible).
+//  - SqlServer: Microsoft.Data.SqlClient fails the TDS pre-login handshake in a native binary.
+//  - Every Redis-channel SUT (including all broker-transport variants, which pair with the Redis
+//    channel): StackExchange.Redis 3.x throws MissingFieldException('_invocationList') under
+//    Native AOT — its net8+ Delegates helper UnsafeAccessor-reads CoreCLR's MulticastDelegate
+//    internals, which do not exist in the Native AOT runtime. Revisit when fixed upstream; a
+//    channel-remap mode (PostgreSQL channel under the broker transports) could verify the
+//    transports natively before then.
+var sutMode = Env("ASYNCRESPONSE_ITEST_SUT", "project").ToLowerInvariant();
+var sutAotPath = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_SUT_PATH");
+
+IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapable = true, params IResourceBuilder<IResource>[] waitFor)
+{
+    if (string.Equals(sutMode, "aot", StringComparison.Ordinal) && aotCapable)
+    {
+        if (string.IsNullOrWhiteSpace(sutAotPath) || !File.Exists(sutAotPath))
+        {
+            throw new InvalidOperationException(
+                "ASYNCRESPONSE_ITEST_SUT=aot requires ASYNCRESPONSE_ITEST_SUT_PATH to point at the published Native AOT " +
+                "sample binary (dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj -c Release -o <dir>).");
+        }
+
+        // Executables do not get the automatic ASP.NET endpoint wiring projects get; binding the
+        // allocated port through ASPNETCORE_HTTP_PORTS keeps Kestrel on the proxied endpoint.
+        var exe = builder.AddExecutable(name, sutAotPath, Path.GetDirectoryName(Path.GetFullPath(sutAotPath))!)
+            .WithHttpEndpoint(env: "ASPNETCORE_HTTP_PORTS")
+            .WithHttpHealthCheck("/alive");
+        foreach (var dependency in waitFor)
+            exe.WaitFor(dependency);
+        return exe;
+    }
+
+    var project = builder.AddProject<Projects.AsyncResponse_Sample>(name, launchProfileName: null)
+        .WithHttpEndpoint()
+        .WithHttpHealthCheck("/alive");
+    foreach (var dependency in waitFor)
+        project.WaitFor(dependency);
+    return project;
+}
+
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
-// Redis channel + Google Pub/Sub transport. launchProfileName: null disables the sample's launch
-// profile so the AppHost owns the endpoint (WithHttpEndpoint), matching how it provisions ports.
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app", launchProfileName: null)
+// Redis channel + Google Pub/Sub transport. AddSutApp owns the endpoint and the /alive health
+// check, and switches between project (JIT) and Native AOT binary per ASYNCRESPONSE_ITEST_SUT.
+AddSutApp("itest-app", aotCapable: false, waitFor: [redis, pubsub])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(pubsub)
     .WithEnvironment("PUBSUB_EMULATOR_HOST", emulatorHost)
     .WithEnvironment("PubSub:ProjectId", ProjectId)
     .WithEnvironment("PubSub:WorkerTopicId", WorkerTopic)
@@ -252,14 +299,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app", launchProfileName
     .WithEnvironment("PubSub:ResponseSubscriptionId", ResponseSubscription)
     .WithEnvironment("AsyncResponse:KeyPrefix", TestRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-early-ack", launchProfileName: null)
+AddSutApp("itest-app-early-ack", aotCapable: false, waitFor: [redis, pubsub])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(pubsub)
     .WithEnvironment("PUBSUB_EMULATOR_HOST", emulatorHost)
     .WithEnvironment("PubSub:ProjectId", ProjectId)
     .WithEnvironment("PubSub:WorkerTopicId", EarlyAckWorkerTopic)
@@ -273,14 +316,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-early-ack", launchP
     .WithEnvironment("PubSub:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", EarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "GooglePubSub");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq", launchProfileName: null)
+AddSutApp("itest-app-rabbitmq", aotCapable: false, waitFor: [redis, rabbitmq])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(rabbitmq)
     .WithEnvironment("RabbitMQ:ConnectionString", rabbitMqConnectionString)
     .WithEnvironment("RabbitMQ:WorkerExchange", RabbitMqWorkerExchange)
     .WithEnvironment("RabbitMQ:WorkerQueue", RabbitMqWorkerQueue)
@@ -290,14 +329,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq", launchPr
     .WithEnvironment("RabbitMQ:ResponseRoutingKey", RabbitMqResponseRoutingKey)
     .WithEnvironment("AsyncResponse:KeyPrefix", RabbitMqRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "RabbitMQ")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "RabbitMQ");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq-early-ack", launchProfileName: null)
+AddSutApp("itest-app-rabbitmq-early-ack", aotCapable: false, waitFor: [redis, rabbitmq])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(rabbitmq)
     .WithEnvironment("RabbitMQ:ConnectionString", rabbitMqConnectionString)
     .WithEnvironment("RabbitMQ:WorkerExchange", RabbitMqEarlyAckWorkerExchange)
     .WithEnvironment("RabbitMQ:WorkerQueue", RabbitMqEarlyAckWorkerQueue)
@@ -312,27 +347,19 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-rabbitmq-early-ack"
     .WithEnvironment("RabbitMQ:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", RabbitMqEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "RabbitMQ")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "RabbitMQ");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus", launchProfileName: null)
+AddSutApp("itest-app-azure-servicebus", aotCapable: false, waitFor: [redis, serviceBus])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(serviceBus)
     .WithEnvironment("ConnectionStrings:AzureServiceBus", serviceBusConnectionString)
     .WithEnvironment("AzureServiceBus:WorkerQueue", AzureServiceBusWorkerQueue)
     .WithEnvironment("AzureServiceBus:ResponseQueue", AzureServiceBusResponseQueue)
     .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus-early-ack", launchProfileName: null)
+AddSutApp("itest-app-azure-servicebus-early-ack", aotCapable: false, waitFor: [redis, serviceBus])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(serviceBus)
     .WithEnvironment("ConnectionStrings:AzureServiceBus", serviceBusConnectionString)
     .WithEnvironment("AzureServiceBus:WorkerQueue", AzureServiceBusEarlyAckWorkerQueue)
     .WithEnvironment("AzureServiceBus:ResponseQueue", AzureServiceBusEarlyAckResponseQueue)
@@ -343,14 +370,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-azure-servicebus-ea
     .WithEnvironment("AzureServiceBus:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs", launchProfileName: null)
+AddSutApp("itest-app-sqs", aotCapable: false, waitFor: [redis, localstack])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(localstack)
     .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
     .WithEnvironment("SQS:Region", "us-east-1")
     .WithEnvironment("SQS:AccessKey", "test")
@@ -361,14 +384,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs", launchProfile
     .WithEnvironment("SQS:ReceiveWaitTimeSeconds", Env("ASYNCRESPONSE_ITEST_SQS_RECEIVE_WAIT_SECONDS", "2"))
     .WithEnvironment("AsyncResponse:KeyPrefix", SqsRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "SQS")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "SQS");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs-early-ack", launchProfileName: null)
+AddSutApp("itest-app-sqs-early-ack", aotCapable: false, waitFor: [redis, localstack])
     .WithReference(redis)
-    .WaitFor(redis)
-    .WaitFor(localstack)
     .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
     .WithEnvironment("SQS:Region", "us-east-1")
     .WithEnvironment("SQS:AccessKey", "test")
@@ -384,13 +403,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqs-early-ack", lau
     .WithEnvironment("SQS:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", SqsEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "SQS")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "SQS");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis", launchProfileName: null)
+AddSutApp("itest-app-redis", aotCapable: false, waitFor: [redis])
     .WithReference(redis)
-    .WaitFor(redis)
     .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "Redis")
@@ -402,13 +418,10 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis", launchProfi
     .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
     .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
     .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"));
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis-early-ack", launchProfileName: null)
+AddSutApp("itest-app-redis-early-ack", aotCapable: false, waitFor: [redis])
     .WithReference(redis)
-    .WaitFor(redis)
     .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportEarlyAckKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "Redis")
@@ -425,26 +438,20 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-redis-early-ack", l
     .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
     .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
     .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30");
 
 // NATS channel + NATS transport on one connection. A single NATS server backs both the response
 // rendezvous (Core request/reply + JetStream KV recovery) and the worker/response transport (JetStream).
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats", launchProfileName: null)
-    .WaitFor(nats)
+AddSutApp("itest-app-nats", waitFor: [nats])
     .WithEnvironment("Nats:Url", natsConnectionString)
     .WithEnvironment("Nats:SubjectPrefix", NatsSubjectPrefix)
     .WithEnvironment("Nats:RecoveryBucket", "itest-nats-recovery")
     .WithEnvironment("Nats:WorkerConsumer", "asyncresponse-itest-nats-workers")
     .WithEnvironment("Nats:ResponseConsumer", "asyncresponse-itest-nats-responses")
     .WithEnvironment("AsyncResponse:Channel", "NATS")
-    .WithEnvironment("AsyncResponse:Transport", "NATS")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "NATS");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats-early-ack", launchProfileName: null)
-    .WaitFor(nats)
+AddSutApp("itest-app-nats-early-ack", waitFor: [nats])
     .WithEnvironment("Nats:Url", natsConnectionString)
     .WithEnvironment("Nats:SubjectPrefix", NatsEarlyAckSubjectPrefix)
     .WithEnvironment("Nats:RecoveryBucket", "itest-nats-earlyack-recovery")
@@ -455,15 +462,11 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-nats-early-ack", la
     .WithEnvironment("Nats:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_QUEUE_CAPACITY", "256"))
     .WithEnvironment("Nats:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("AsyncResponse:Channel", "NATS")
-    .WithEnvironment("AsyncResponse:Transport", "NATS")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "NATS");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka", launchProfileName: null)
+AddSutApp("itest-app-kafka", aotCapable: false, waitFor: [redis, kafka])
     .WithReference(redis)
     .WithReference(kafka)
-    .WaitFor(redis)
-    .WaitFor(kafka)
     .WithEnvironment("Kafka:WorkerTopic", KafkaWorkerTopic)
     .WithEnvironment("Kafka:ResponseTopic", KafkaResponseTopic)
     .WithEnvironment("Kafka:WorkerConsumerGroup", "asyncresponse-itest-kafka-workers")
@@ -473,15 +476,11 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka", launchProfi
     .WithEnvironment("Kafka:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_KAFKA_MAX_DELIVERY_ATTEMPTS", "5"))
     .WithEnvironment("AsyncResponse:KeyPrefix", KafkaRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "Kafka")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "Kafka");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka-early-ack", launchProfileName: null)
+AddSutApp("itest-app-kafka-early-ack", aotCapable: false, waitFor: [redis, kafka])
     .WithReference(redis)
     .WithReference(kafka)
-    .WaitFor(redis)
-    .WaitFor(kafka)
     .WithEnvironment("Kafka:WorkerTopic", KafkaEarlyAckWorkerTopic)
     .WithEnvironment("Kafka:ResponseTopic", KafkaEarlyAckResponseTopic)
     .WithEnvironment("Kafka:WorkerConsumerGroup", "asyncresponse-itest-kafka-workers-earlyack")
@@ -496,35 +495,26 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-kafka-early-ack", l
     .WithEnvironment("Kafka:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:KeyPrefix", KafkaEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "Kafka")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "Kafka");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql", launchProfileName: null)
-    .WaitFor(postgres)
+AddSutApp("itest-app-postgresql", waitFor: [postgres])
     .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
     .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlWorkerQueue)
     .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlResponseQueue)
     .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlDeadLetterQueue)
     .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
-    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqlserver", launchProfileName: null)
-    .WaitFor(sqlserver)
+AddSutApp("itest-app-sqlserver", aotCapable: false, waitFor: [sqlserver])
     .WithEnvironment("ConnectionStrings:SqlServer", sqlServerConnectionString)
     .WithEnvironment("SqlServer:SchemaName", SqlServerSchema)
     .WithEnvironment("SqlServer:WorkerQueue", SqlServerWorkerQueue)
     .WithEnvironment("SqlServer:ResponseQueue", SqlServerResponseQueue)
     .WithEnvironment("SqlServer:DeadLetterQueue", SqlServerDeadLetterQueue)
     .WithEnvironment("AsyncResponse:Channel", "SqlServer")
-    .WithEnvironment("AsyncResponse:Transport", "SqlServer")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "SqlServer");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqlserver-early-ack", launchProfileName: null)
-    .WaitFor(sqlserver)
+AddSutApp("itest-app-sqlserver-early-ack", aotCapable: false, waitFor: [sqlserver])
     .WithEnvironment("ConnectionStrings:SqlServer", sqlServerConnectionString)
     .WithEnvironment("SqlServer:SchemaName", SqlServerEarlyAckSchema)
     .WithEnvironment("SqlServer:WorkerQueue", SqlServerEarlyAckWorkerQueue)
@@ -536,12 +526,9 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-sqlserver-early-ack
     .WithEnvironment("SqlServer:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_SQLSERVER_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("SqlServer:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "SqlServer")
-    .WithEnvironment("AsyncResponse:Transport", "SqlServer")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "SqlServer");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql-early-ack", launchProfileName: null)
-    .WaitFor(postgres)
+AddSutApp("itest-app-postgresql-early-ack", waitFor: [postgres])
     .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
     .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlEarlyAckWorkerQueue)
     .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlEarlyAckResponseQueue)
@@ -552,15 +539,12 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-postgresql-early-ac
     .WithEnvironment("PostgreSQL:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("PostgreSQL:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
-    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL");
 
 // MongoDB channel + transport on one shared client. The default variant also persists durable-flow
 // ledgers through the AsyncResponse.DurableFlows.MongoDB package, so flow checkpoints, resumes, and
 // state reads ride the same replica set as the channel and the worker queue.
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb", launchProfileName: null)
-    .WaitFor(mongodb)
+AddSutApp("itest-app-mongodb", aotCapable: false, waitFor: [mongodb])
     .WithEnvironment("ConnectionStrings:MongoDB", mongoDbConnectionString)
     .WithEnvironment("MongoDB:DatabaseName", MongoDbDatabase)
     .WithEnvironment("MongoDB:WorkerQueue", MongoDbWorkerQueue)
@@ -568,12 +552,9 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb", launchPro
     .WithEnvironment("MongoDB:DeadLetterQueue", MongoDbDeadLetterQueue)
     .WithEnvironment("AsyncResponse:DurableFlowStore", "mongodb")
     .WithEnvironment("AsyncResponse:Channel", "MongoDB")
-    .WithEnvironment("AsyncResponse:Transport", "MongoDB")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "MongoDB");
 
-builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb-early-ack", launchProfileName: null)
-    .WaitFor(mongodb)
+AddSutApp("itest-app-mongodb-early-ack", aotCapable: false, waitFor: [mongodb])
     .WithEnvironment("ConnectionStrings:MongoDB", mongoDbConnectionString)
     .WithEnvironment("MongoDB:DatabaseName", MongoDbEarlyAckDatabase)
     .WithEnvironment("MongoDB:WorkerQueue", MongoDbEarlyAckWorkerQueue)
@@ -585,8 +566,7 @@ builder.AddProject<Projects.AsyncResponse_Sample>("itest-app-mongodb-early-ack",
     .WithEnvironment("MongoDB:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_MONGODB_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("MongoDB:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "MongoDB")
-    .WithEnvironment("AsyncResponse:Transport", "MongoDB")
-    .WithHttpEndpoint()
-    .WithHttpHealthCheck("/alive");
+    .WithEnvironment("AsyncResponse:Transport", "MongoDB");
 
 builder.Build().Run();
+

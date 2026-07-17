@@ -67,7 +67,7 @@ internal sealed class SqsQueueProvisioningService(
 
         var attributes = new Dictionary<string, string>(fifoAttributes, StringComparer.Ordinal)
         {
-            [QueueAttributeName.RedrivePolicy] = JsonSerializer.Serialize(new Dictionary<string, string>
+            [QueueAttributeName.RedrivePolicy] = AsyncResponseJson.Serialize(new Dictionary<string, string>
             {
                 ["deadLetterTargetArn"] = deadLetterQueueArn,
                 ["maxReceiveCount"] = o.MaxReceiveCount.ToString()

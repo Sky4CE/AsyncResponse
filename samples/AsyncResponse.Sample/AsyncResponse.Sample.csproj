@@ -3,6 +3,14 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
+
+    <!-- The sample is the integration-test SUT and doubles as the Native AOT proof for the whole
+         provider matrix: CI publishes it fully trimmed and runs the integration suite against the
+         native binary (see docs/aot.md). The Roslyn trim/AOT analyzers keep the app's own code
+         warning-free on every build; IL2104/IL3053 are publish-time rollup warnings from vendor
+         broker SDKs that ship without trim annotations (expected, tracked in docs/aot.md). -->
+    <PublishAot>true</PublishAot>
+    <NoWarn>$(NoWarn);IL2104;IL3053</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

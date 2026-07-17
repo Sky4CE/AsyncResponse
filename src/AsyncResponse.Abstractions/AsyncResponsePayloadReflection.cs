@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 
 namespace AsyncResponse;
 
@@ -24,17 +26,37 @@ public static class AsyncResponsePayloadReflection
         return OverrideCache.GetOrAdd(payloadType, DetectOverride);
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2070",
+        Justification = "Best-effort diagnostic: payload types reaching this check are statically referenced by the waiter " +
+                        "registration that triggers it (typeof(T)), so their methods are preserved; when the runtime still " +
+                        "cannot answer, the check fails open rather than failing a correct app.")]
     private static bool DetectOverride(Type type)
     {
         if (type.IsInterface || !typeof(IAsyncResponsePayload).IsAssignableFrom(type))
             return false;
 
-        var map = type.GetInterfaceMap(typeof(IAsyncResponsePayload));
-        var interfaceMethod = typeof(IAsyncResponsePayload).GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery))!;
-        var index = Array.IndexOf(map.InterfaceMethods, interfaceMethod);
+        // Implicit implementations (the overwhelmingly common shape) declare a public
+        // ShouldResumeOnRecovery on the class itself — detectable without the interface map.
+        if (type.GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery), BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes) is not null)
+            return true;
 
-        // When the type does not implement the method, the interface map points the target
-        // back at the interface's own default implementation.
-        return map.TargetMethods[index].DeclaringType != typeof(IAsyncResponsePayload);
+        try
+        {
+            var map = type.GetInterfaceMap(typeof(IAsyncResponsePayload));
+            var interfaceMethod = typeof(IAsyncResponsePayload).GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery))!;
+            var index = Array.IndexOf(map.InterfaceMethods, interfaceMethod);
+
+            // When the type does not implement the method, the interface map points the target
+            // back at the interface's own default implementation.
+            return map.TargetMethods[index].DeclaringType != typeof(IAsyncResponsePayload);
+        }
+        catch (NotSupportedException)
+        {
+            // Native AOT cannot compute the interface map for interfaces with default
+            // implementations. This check exists to fail fast on a payload that silently
+            // inherits the conservative default — when the runtime cannot answer, assume the
+            // payload is fine instead of breaking a correct app (fail open).
+            return true;
+        }
     }
 }

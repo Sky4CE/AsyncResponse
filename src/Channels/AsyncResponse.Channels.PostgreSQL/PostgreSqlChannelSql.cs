@@ -1,7 +1,6 @@
 using Npgsql;
 using NpgsqlTypes;
 using System.Text;
-using System.Text.Json;
 
 namespace AsyncResponse.Channels.PostgreSQL;
 
@@ -141,7 +140,7 @@ internal sealed class PostgreSqlChannelSql
             """;
         command.Parameters.AddWithValue("correlation_id", correlationId);
         command.Parameters.AddWithValue("registration_id", state.RegistrationId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = JsonSerializer.Serialize(state);
+        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(state);
         command.Parameters.AddWithValue("ttl", ttl);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

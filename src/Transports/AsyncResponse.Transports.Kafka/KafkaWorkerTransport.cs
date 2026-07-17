@@ -60,7 +60,7 @@ public sealed class KafkaWorkerTransport : IWorkerTransport
 
         try
         {
-            var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(job));
+            var payload = Encoding.UTF8.GetBytes(AsyncResponseJson.Serialize(job));
             var headers = CreateMessageHeaders(job.CorrelationId, _options);
             var result = await KafkaTransportRetry.ExecuteAsync(
                 token => _producer.PublishAsync(

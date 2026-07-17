@@ -68,7 +68,7 @@ public sealed class NatsWorkerTransport : IWorkerTransport
                     [_options.CorrelationIdHeader] = job.CorrelationId!
                 };
 
-            var payload = JsonSerializer.Serialize(job);
+            var payload = AsyncResponseJson.Serialize(job);
             var sequence = await NatsTransportRetry.ExecuteAsync(
                 token => _jetStream.PublishAsync(_schema.WorkerSubject, payload, headers, token),
                 _options.PublishMaxAttempts,

@@ -284,11 +284,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
         string? payloadJson = null;
         try
         {
-            payloadJson = JsonSerializer.Serialize(response);
+            payloadJson = AsyncResponseJson.Serialize(response);
         }
         catch (Exception)
         {
             // Ignore serialization failure here; the payload is only attached for diagnostics.
+            // Under trimmed/AOT deployments this also covers payload types without registered
+            // JSON metadata — the callback still fires, just without the diagnostic JSON.
         }
 
         if (recoveryState.FailureCallback == null)

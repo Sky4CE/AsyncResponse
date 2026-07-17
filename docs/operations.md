@@ -69,6 +69,17 @@ dotnet build
 dotnet test            # runs on Microsoft.Testing.Platform (xUnit.net v3)
 ```
 
+The Docker-backed integration suite can also run against the **Native AOT-published** sample as
+the system under test — the same tests, with every SUT resource switched from the JIT project to
+the trimmed native binary (MongoDB SUTs stay JIT; see [aot.md](aot.md#vendor-sdk-compatibility)):
+
+```bash
+dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj -c Release -o ./artifacts/sut-aot
+ASYNCRESPONSE_ITEST_SUT=aot \
+ASYNCRESPONSE_ITEST_SUT_PATH=$PWD/artifacts/sut-aot/AsyncResponse.Sample \
+dotnet test --project tests/AsyncResponse.IntegrationTests
+```
+
 The test project is a Microsoft.Testing.Platform application, so you can also run it directly and use
 MTP options — test filtering, a TRX report, and code coverage:
 

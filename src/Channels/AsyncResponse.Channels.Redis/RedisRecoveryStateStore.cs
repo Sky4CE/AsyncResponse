@@ -68,7 +68,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             transaction.AddCondition(previous.IsNull
                 ? Condition.KeyNotExists(recoveryKey)
                 : Condition.StringEqual(recoveryKey, previous));
-            _ = transaction.StringSetAsync(recoveryKey, JsonSerializer.Serialize(states), ttl);
+            _ = transaction.StringSetAsync(recoveryKey, AsyncResponseJson.Serialize(states), ttl);
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
                 return;
         }
@@ -117,7 +117,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
             if (states.Count == 0)
                 _ = transaction.KeyDeleteAsync(recoveryKey);
             else
-                _ = transaction.StringSetAsync(recoveryKey, JsonSerializer.Serialize(states), Expiration.KeepTtl, ValueCondition.Always);
+                _ = transaction.StringSetAsync(recoveryKey, AsyncResponseJson.Serialize(states), Expiration.KeepTtl, ValueCondition.Always);
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
                 return true;
         }
@@ -175,7 +175,7 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     {
         try
         {
-            var states = JsonSerializer.Deserialize<List<RecoveryState>>(value.ToString()) ?? [];
+            var states = AsyncResponseJson.Deserialize<List<RecoveryState>>(value.ToString()) ?? [];
 
             for (var i = states.Count - 1; i >= 0; i--)
             {

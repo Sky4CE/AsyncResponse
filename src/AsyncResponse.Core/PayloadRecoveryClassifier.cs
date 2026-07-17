@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 
 namespace AsyncResponse;
@@ -68,6 +69,10 @@ internal static class PayloadRecoveryClassifier
         }
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "The persisted payload type name comes from a recoverable-waiter registration whose payload type " +
+                        "parameter is statically referenced by the registering app; an unresolvable name is answered with " +
+                        "null — the conservative 'do not resume' route — plus a type-resolution-failure diagnostic.")]
     private static Type? ResolvePayloadType(string payloadTypeFullName)
     {
         if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached))

@@ -88,6 +88,103 @@ jobs:
           name: nuget-packages
           path: ./artifacts/*.nupkg
 
+  unit-tests-cross-platform:
+    # The library targets every OS .NET runs on; the unit suite (no Docker dependencies) proves it
+    # beyond Linux. The Docker-backed integration suite stays on ubuntu.
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Test (unit)
+        run: >
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj
+          --configuration Release
+
+  aot-smoke:
+    # The end-to-end proof behind the packages' IsAotCompatible=true claim: publish the smoke
+    # sample as Native AOT (full trimming, no reflection-based System.Text.Json) and run the
+    # native binary. It exercises the envelope round-trip, a durable flow (checkpoints, awaited
+    # step, values bag), worker-job dispatch, and the AsyncResponseJsonSerialization seam.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Publish (Native AOT)
+        run: dotnet publish samples/AsyncResponse.AotSmoke/AsyncResponse.AotSmoke.csproj --configuration Release -o ./artifacts/aot-smoke
+
+      - name: Run native binary
+        run: ./artifacts/aot-smoke/AsyncResponse.AotSmoke
+
+  integration-tests-aot:
+    # The same integration suite, but the 20 SUT resources run the Native AOT-published sample
+    # binary instead of the JIT project (ASYNCRESPONSE_ITEST_SUT=aot). MongoDB-configured SUTs
+    # stay JIT (MongoDB.Driver is not trim/AOT-compatible; vendor matrix in docs/aot.md). This is
+    # what actually proves every channel/transport package works when compiled into a trimmed
+    # native app against the real broker fleet.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Verify Docker
+        run: docker version
+
+      - name: Publish SUT (Native AOT)
+        run: dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj --configuration Release -o ./artifacts/sut-aot
+
+      - name: Restore
+        run: dotnet restore tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj
+
+      - name: Build
+        run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
+
+      - name: Test (integration, AOT SUT)
+        env:
+          ASYNCRESPONSE_ITEST_SUT: aot
+          ASYNCRESPONSE_ITEST_SUT_PATH: ${{ github.workspace }}/artifacts/sut-aot/AsyncResponse.Sample
+        run: |
+          dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
+            --configuration Release --no-build \
+            --report-trx \
+            --results-directory "${{ github.workspace }}/TestResults/IntegrationAot"
+
+      - name: Upload integration test results (AOT SUT)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-test-results-aot
+          path: ${{ github.workspace }}/TestResults/IntegrationAot
+
   integration-tests:
     # The weekly schedule exists only for the redis-compat matrix; skip the per-push jobs on it.
     if: github.event_name != 'schedule'

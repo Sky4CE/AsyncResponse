@@ -213,7 +213,7 @@ internal sealed class PostgreSqlTransportStore
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("queue", queue);
         command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
-        command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = JsonSerializer.Serialize(headers ?? EmptyHeaders);
+        command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(headers ?? EmptyHeaders);
         command.Parameters.AddWithValue("dead_letter_reason", (object?)deadLetterReason ?? DBNull.Value);
         if (notify)
         {
@@ -304,7 +304,7 @@ internal sealed class PostgreSqlTransportStore
             command.Parameters.AddWithValue("id", Guid.NewGuid());
             command.Parameters.AddWithValue("queue", _options.DeadLetterQueue);
             command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
-            command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = JsonSerializer.Serialize(deadHeaders);
+            command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(deadHeaders);
             command.Parameters.AddWithValue("dead_letter_reason", exception.Message);
             command.Parameters.AddWithValue("source_id", id);
             command.Parameters.AddWithValue("lock_id", lockId);
@@ -361,7 +361,7 @@ internal sealed class PostgreSqlTransportStore
 
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
     {
-        var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+        var parsed = AsyncResponseJson.Deserialize<Dictionary<string, string>>(json);
         return parsed is null
             ? EmptyHeaders
             : new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);

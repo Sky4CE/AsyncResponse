@@ -9,6 +9,7 @@
     <Project Path="benchmarks/AsyncResponse.LoadTests/AsyncResponse.LoadTests.csproj" />
   </Folder>
   <Folder Name="/samples/">
+    <Project Path="samples/AsyncResponse.AotSmoke/AsyncResponse.AotSmoke.csproj" />
     <Project Path="samples/AsyncResponse.AppHost/AsyncResponse.AppHost.csproj" />
     <Project Path="samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj" />
     <Project Path="samples/AsyncResponse.ServiceDefaults/AsyncResponse.ServiceDefaults.csproj" />

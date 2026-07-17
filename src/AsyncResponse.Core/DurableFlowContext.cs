@@ -1,6 +1,6 @@
 using Microsoft.Extensions.Logging;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
-using System.Text.Json;
 
 namespace AsyncResponse;
 
@@ -88,7 +88,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         cancellationToken.ThrowIfCancellationRequested();
         var result = await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
-        await CompleteStepAsync(name, checkpoint, JsonSerializer.Serialize(result), cancellationToken).ConfigureAwait(false);
+        await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(result), cancellationToken).ConfigureAwait(false);
         return result;
     }
 
@@ -154,12 +154,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         ThrowIfSuspended();
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         var values = _state.Values ??= new Dictionary<string, string>(StringComparer.Ordinal);
-        values[key] = JsonSerializer.Serialize(value);
+        values[key] = AsyncResponseJson.Serialize(value);
         return SaveAsync(cancellationToken);
     }
 
     /// <inheritdoc />
-    public async Task<FlowState> AwaitChildFlowAsync<TFlow, TInput>(
+    public async Task<FlowState> AwaitChildFlowAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         string name,
         TInput input,
         string? flowId = null,
@@ -184,7 +184,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
 
         var childFlowId = breadcrumb ?? requestedChildFlowId;
-        var inputJson = JsonSerializer.Serialize(input);
+        var inputJson = AsyncResponseJson.Serialize(input);
         if (checkpoint.Completed)
         {
             var completedChild = DeserializeResult<FlowState>(checkpoint.ResultJson)
@@ -311,7 +311,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
-            await CompleteStepAsync(name, checkpoint, JsonSerializer.Serialize(response), cancellationToken).ConfigureAwait(false);
+            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), cancellationToken).ConfigureAwait(false);
             return response;
         }
         catch (Exception ex)

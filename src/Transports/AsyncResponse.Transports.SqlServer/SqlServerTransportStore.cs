@@ -238,7 +238,7 @@ internal sealed class SqlServerTransportStore
         command.Parameters.AddWithValue("@id", id);
         command.Parameters.AddWithValue("@queue", queue);
         command.Parameters.AddWithValue("@payload_json", payload);
-        command.Parameters.AddWithValue("@headers_json", JsonSerializer.Serialize(headers ?? EmptyHeaders));
+        command.Parameters.AddWithValue("@headers_json", AsyncResponseJson.Serialize(headers ?? EmptyHeaders));
         command.Parameters.AddWithValue("@dead_letter_reason", (object?)deadLetterReason ?? DBNull.Value);
 
         try
@@ -330,7 +330,7 @@ internal sealed class SqlServerTransportStore
             command.Parameters.AddWithValue("@id", Guid.NewGuid());
             command.Parameters.AddWithValue("@queue", _options.DeadLetterQueue);
             command.Parameters.AddWithValue("@payload_json", payload);
-            command.Parameters.AddWithValue("@headers_json", JsonSerializer.Serialize(deadHeaders));
+            command.Parameters.AddWithValue("@headers_json", AsyncResponseJson.Serialize(deadHeaders));
             command.Parameters.AddWithValue("@dead_letter_reason", exception.Message);
             command.Parameters.AddWithValue("@source_id", id);
             command.Parameters.AddWithValue("@lock_id", lockId);
@@ -387,7 +387,7 @@ internal sealed class SqlServerTransportStore
 
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
     {
-        var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+        var parsed = AsyncResponseJson.Deserialize<Dictionary<string, string>>(json);
         return parsed is null
             ? EmptyHeaders
             : new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);

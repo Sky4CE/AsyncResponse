@@ -3,7 +3,6 @@ using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
-using System.Text.Json;
 
 namespace AsyncResponse.Channels.MongoDB;
 
@@ -129,7 +128,7 @@ internal sealed class MongoDbChannelStore : IDisposable
             Id = RegistrationKey(correlationId, state.RegistrationId),
             CorrelationId = correlationId,
             RegistrationId = state.RegistrationId,
-            StateJson = JsonSerializer.Serialize(state),
+            StateJson = AsyncResponseJson.Serialize(state),
             ExpiresAtUtc = now.Add(ttl),
             RegisteredAtUtc = now
         };

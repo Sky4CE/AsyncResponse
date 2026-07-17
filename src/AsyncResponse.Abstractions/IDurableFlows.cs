@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace AsyncResponse;
 
 /// <summary>
@@ -19,7 +21,7 @@ public interface IDurableFlows
     /// <typeparam name="TInput">The flow input, persisted as JSON with the flow state.</typeparam>
     /// <exception cref="ArgumentException"><paramref name="flowId"/> is empty or whitespace.</exception>
     /// <exception cref="InvalidOperationException"><paramref name="flowId"/> already belongs to different work.</exception>
-    Task<string> StartAsync<TFlow, TInput>(
+    Task<string> StartAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         TInput input,
         string? flowId = null,
         CancellationToken cancellationToken = default)

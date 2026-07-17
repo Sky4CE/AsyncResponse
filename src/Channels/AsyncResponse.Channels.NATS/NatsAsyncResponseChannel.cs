@@ -166,7 +166,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     return;
                 }
 
-                var envelope = JsonSerializer.Deserialize<AsyncResponseEnvelope<T>>(payload, AsyncResponseEnvelopeOptions<T>.Instance);
+                var envelope = JsonSerializer.Deserialize(payload, AsyncResponseEnvelopeJson.TypeInfo<T>());
 
                 if (envelope == null)
                 {
@@ -369,7 +369,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         try
         {
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.delivery", outcome.ToString());
 
@@ -470,7 +470,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 ExceptionStackTrace = RemoteStackTrace.ForWire(exception.StackTrace, _options.IncludeRemoteStackTrace, _options.MaxRemoteStackTraceLength),
                 Payload = null
             };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             var outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.delivery", outcome.ToString());
 

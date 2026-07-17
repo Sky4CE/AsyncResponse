@@ -1,5 +1,6 @@
 using AsyncResponse;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Microsoft.Extensions.DependencyInjection;
 
@@ -58,7 +59,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// <see cref="WithInMemoryDurableFlows"/> explicitly for a process-local development or test
     /// store; <see cref="AddAsyncResponse"/> does not select one implicitly.
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore>(
+    public static AsyncResponseRegistrationBuilder WithDurableFlows<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFlowStateStore>(
         this AsyncResponseRegistrationBuilder builder,
         Action<DurableFlowOptions>? configure = null)
         where TFlowStateStore : class, IFlowStateStore
@@ -69,7 +70,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// common <see cref="DurableFlowOptions"/> settings with store-specific settings. Provider
     /// packages use this overload to expose one cohesive <c>With*DurableFlows(...)</c> callback.
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithDurableFlows<TFlowStateStore, TOptions>(
+    public static AsyncResponseRegistrationBuilder WithDurableFlows<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFlowStateStore, [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicParameterlessConstructor)] TOptions>(
         this AsyncResponseRegistrationBuilder builder,
         Action<TOptions>? configure = null)
         where TFlowStateStore : class, IFlowStateStore
@@ -97,6 +98,32 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Registers a durable flow class for execution: adds it to DI (scoped, unless the app
+    /// pre-registered it with another lifetime) and records a statically-typed execution route the
+    /// flow executor prefers over reflection-based type-name resolution. Registration is optional
+    /// on JIT deployments (unregistered flows resolve reflectively as before) and required for
+    /// flows executed in trimmed/Native AOT apps, where persisted type names cannot root code.
+    /// </summary>
+    /// <typeparam name="TFlow">The flow class; its full name is the persisted <see cref="FlowState.FlowTypeName"/>.</typeparam>
+    /// <typeparam name="TInput">The flow input type, persisted as JSON with the flow state.</typeparam>
+    public static AsyncResponseRegistrationBuilder WithDurableFlow<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFlow, TInput>(
+        this AsyncResponseRegistrationBuilder builder)
+        where TFlow : class, IDurableFlow<TInput>
+    {
+        builder.Services.TryAddScoped<TFlow>();
+        builder.Services.AddSingleton(new DurableFlowRegistration
+        {
+            FlowTypeFullName = typeof(TFlow).FullName
+                ?? throw new InvalidOperationException("Durable flow classes must have a FullName."),
+            FlowType = typeof(TFlow),
+            DeserializeInput = static json => JsonSafety.SafeDeserialize<TInput>(json),
+            ExecuteAsync = static (flow, context, input) =>
+                ((TFlow)flow).ExecuteAsync(context, input is null ? default! : (TInput)input)
+        });
+        return builder;
+    }
+
+    /// <summary>
     /// Uses an atomic process-local flow-state store. Intended for development, tests, and
     /// single-process apps; choose a DurableFlows provider package for multi-replica execution.
     /// </summary>
@@ -108,6 +135,11 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         return builder.WithDurableFlows<InMemoryFlowStateStore>(configure);
     }
 
+    // The executor's public methods are lost-subscriber callback targets persisted by name
+    // (RecoverAsync / FailAsync / ExecuteAsync); root them explicitly so the reflective dispatch
+    // finds them in trimmed apps without any user action.
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods, typeof(IDurableFlowExecutor))]
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods, typeof(DurableFlowExecutor))]
     private static void AddDurableFlowEngine(IServiceCollection services)
     {
         services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
@@ -117,7 +149,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<IRecoverableAsyncResponseSubscriber>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
             provider.GetRequiredService<DurableFlowOptions>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>()));
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
+            provider.GetServices<DurableFlowRegistration>()));
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
@@ -134,7 +167,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// context that must survive serialization (broker-backed workers, recovery after a redeploy).
     /// Register one per concern (e.g. a trace propagator and a principal propagator).
     /// </summary>
-    public static AsyncResponseRegistrationBuilder WithContextPropagator<TPropagator>(this AsyncResponseRegistrationBuilder builder)
+    public static AsyncResponseRegistrationBuilder WithContextPropagator<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TPropagator>(this AsyncResponseRegistrationBuilder builder)
         where TPropagator : class, IAsyncResponseContextPropagator
     {
         builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<IAsyncResponseContextPropagator, TPropagator>());

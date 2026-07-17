@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 
 namespace AsyncResponse;
@@ -37,6 +38,8 @@ public static class AsyncResponseTypeResolution
     /// Registers an assembly (typically one loaded into a non-default <c>AssemblyLoadContext</c>) to
     /// be searched for persisted type names.
     /// </summary>
+    [RequiresUnreferencedCode("Resolves persisted type names against the assembly by string; a trimmed app may have removed " +
+                              "those types. Plugin/dynamic-load scenarios are inherently incompatible with trimming the plugin's types.")]
     public static void RegisterAssembly(Assembly assembly)
     {
         ArgumentNullException.ThrowIfNull(assembly);

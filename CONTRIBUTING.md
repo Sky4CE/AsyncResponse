@@ -66,6 +66,17 @@ To set up your local development environment:
 
 ---
 
+## Assembly signing and AOT expectations
+
+- All assemblies are strong-named with the checked-in `asyncresponse.snk`. The key is
+  intentionally public (strong naming is identity, not a security boundary) — nothing to
+  configure locally. `InternalsVisibleTo` entries carry the matching public key; test doubles
+  over internal seams additionally befriend Moq's `DynamicProxyGenAssembly2`.
+- Every shipped package builds with the trim/Native AOT analyzers enabled
+  (`IsAotCompatible=true`) and CI treats warnings as errors. New serialization goes through the
+  source-generated seam (`AsyncResponseJson` / `AsyncResponseJsonContext`); new reflection needs
+  an explicit annotation story — see [docs/aot.md](docs/aot.md) before adding either.
+
 ## Coding Guidelines
 
 * **Code Style**: We follow standard .NET coding conventions (PascalCase for public API, camelCase/prefix-underscore for private fields, etc.).

@@ -1,6 +1,5 @@
 using Microsoft.Data.SqlClient;
 using System.Data;
-using System.Text.Json;
 
 namespace AsyncResponse.Channels.SqlServer;
 
@@ -161,7 +160,7 @@ internal sealed class SqlServerChannelSql
             """;
         command.Parameters.AddWithValue("@correlation_id", correlationId);
         command.Parameters.AddWithValue("@registration_id", state.RegistrationId);
-        command.Parameters.AddWithValue("@state_json", JsonSerializer.Serialize(state));
+        command.Parameters.AddWithValue("@state_json", AsyncResponseJson.Serialize(state));
         command.Parameters.AddWithValue("@ttl_ms", (long)ttl.TotalMilliseconds);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

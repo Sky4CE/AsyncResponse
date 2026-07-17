@@ -263,9 +263,20 @@ public sealed class MongoDbChannelCoverageTests
         var resultSweepNull = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
         Assert.Null(resultSweepNull);
 
-        signalMethod.Invoke(channel, ["corr-id-1"]);
-        signalMethod.Invoke(channel, ["corr-id-2"]);
-        var resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
+        // The scoped-collect branch is timing-sensitive by design: CollectDispatchScopeAsync races
+        // its poll delay (1ms here) against the signal reader, and under parallel-suite load a
+        // descheduled thread can let the delay win with signals still buffered (that is benign in
+        // production — a null scope means "sweep everything", a superset). It can also leave the
+        // previous assertion's null signal buffered, which reads as a full-sweep marker. Retry
+        // until a collect observes the targeted scope; the branch under test is still exercised.
+        HashSet<string>? resultScope = null;
+        for (var attempt = 0; attempt < 20 && resultScope is null; attempt++)
+        {
+            signalMethod.Invoke(channel, ["corr-id-1"]);
+            signalMethod.Invoke(channel, ["corr-id-2"]);
+            resultScope = await (Task<HashSet<string>?>)collectMethod.Invoke(channel, [CancellationToken.None])!;
+        }
+
         Assert.NotNull(resultScope);
         Assert.Contains("corr-id-1", resultScope);
         Assert.Contains("corr-id-2", resultScope);

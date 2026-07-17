@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+
+    <!-- The end-to-end proof behind the packages' IsAotCompatible claim: this app publishes as
+         Native AOT (which also implies full trimming) and exercises the request/response envelope
+         path, a durable flow (checkpoints, awaited step, values), the worker-job dispatch, and the
+         AsyncResponseJsonSerialization context seam. CI publishes and runs it. -->
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <ProjectReference Include="../../src/AsyncResponse.Core/AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+</Project>

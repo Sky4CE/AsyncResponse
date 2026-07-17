@@ -100,7 +100,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         {
             var message = new PubsubMessage
             {
-                Data = ByteString.CopyFromUtf8(JsonSerializer.Serialize(job))
+                Data = ByteString.CopyFromUtf8(AsyncResponseJson.Serialize(job))
             };
 
             if (!string.IsNullOrWhiteSpace(job.CorrelationId))

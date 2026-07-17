@@ -5,19 +5,19 @@
     <Description>Contracts for AsyncResponse: correlation-id based request/response over messaging, pluggable recovery-state stores, domain-outcome classification of payloads, lost-subscriber recovery callbacks, and worker dispatch. Reference this package from class libraries; hosts reference AsyncResponse.Core plus optional backend packages.</Description>
 
     <!-- Contracts only (no reflection or serialization), so this package is verified trim- and
-         AOT-safe. Core and the backend packages are deliberately NOT marked: their JSON payload
-         serialization and dynamic type resolution require unreferenced/dynamic code (IL2026/IL3050)
-         and would need a source-generator rework before they could make the same guarantee. -->
+         AOT-safe. Core and the backend packages make the same guarantee via source-generated JSON
+         metadata (AsyncResponseJsonContext + the AsyncResponseJsonSerialization resolver seam) and
+         explicit annotations on the inherently dynamic surface (persisted reflection callbacks). -->
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="AsyncResponse.Core" />
-    <InternalsVisibleTo Include="AsyncResponse.Channels.MongoDB" />
-    <InternalsVisibleTo Include="AsyncResponse.Channels.NATS" />
-    <InternalsVisibleTo Include="AsyncResponse.Channels.PostgreSQL" />
-    <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" />
-    <InternalsVisibleTo Include="AsyncResponse.Channels.SqlServer" />
+    <InternalsVisibleTo Include="AsyncResponse.Core" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.MongoDB" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.NATS" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.PostgreSQL" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.Redis" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Channels.SqlServer" Key="$(AsyncResponsePublicKey)" />
   </ItemGroup>
 
 </Project>

@@ -50,7 +50,7 @@ public sealed class SqlServerWorkerTransport : IWorkerTransport
                     [_options.CorrelationIdHeader] = job.CorrelationId!
                 };
 
-            var payload = JsonSerializer.Serialize(job);
+            var payload = AsyncResponseJson.Serialize(job);
             // Stable id outside the retry loop so a retried publish is idempotent rather than enqueuing
             // the same worker job twice.
             var messageId = Guid.NewGuid();

@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AsyncResponse.Channels.NATS;
 
@@ -206,7 +207,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         {
             States = states,
             ExpiresAtUtc = expiresAtUtc
-        });
+        }, NatsChannelJsonContext.Default.StoredRecoveryState);
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
 
@@ -241,7 +242,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     {
         try
         {
-            return JsonSerializer.Deserialize<StoredRecoveryState>(json);
+            return JsonSerializer.Deserialize(json, NatsChannelJsonContext.Default.StoredRecoveryState);
         }
         catch (JsonException ex)
         {
@@ -272,3 +273,12 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         public DateTimeOffset ExpiresAtUtc { get; set; }
     }
 }
+
+/// <summary>
+/// Source-generated metadata for the package-local KV envelope (trim/AOT-safe; the wire format is
+/// unchanged — Metadata-mode generation with default options matches the previous reflection-based
+/// serialization exactly).
+/// </summary>
+[JsonSourceGenerationOptions(GenerationMode = JsonSourceGenerationMode.Metadata)]
+[JsonSerializable(typeof(NatsRecoveryStateStore.StoredRecoveryState))]
+internal sealed partial class NatsChannelJsonContext : JsonSerializerContext;

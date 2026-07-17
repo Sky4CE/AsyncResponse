@@ -83,7 +83,7 @@ internal sealed class MongoDbRecoveryStateStore(
     {
         try
         {
-            var state = JsonSerializer.Deserialize<RecoveryState>(json);
+            var state = AsyncResponseJson.Deserialize<RecoveryState>(json);
             if (state is null)
                 return null;
 

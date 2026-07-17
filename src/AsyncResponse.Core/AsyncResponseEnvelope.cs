@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse;
 
@@ -39,17 +40,47 @@ internal static class AsyncResponseEnvelopeSchema
 /// <summary>
 /// Pre-configured <see cref="JsonSerializerOptions"/> for (de)serializing
 /// <see cref="AsyncResponseEnvelope{T}"/> instances with null-payload tolerance.
+/// <para>
+/// The envelope's metadata is provided converter-backed via
+/// <see cref="JsonMetadataServices.CreateValueInfo{T}"/> (statically instantiated per
+/// <typeparamref name="T"/>, no reflection), and everything else — including the payload type —
+/// resolves through <see cref="AsyncResponseJson.Resolver"/>. Callers needing trim/AOT-clean
+/// (de)serialization go through <see cref="AsyncResponseEnvelopeJson"/> rather than the
+/// reflection-based <see cref="JsonSerializer"/> overloads.
+/// </para>
 /// </summary>
 internal static class AsyncResponseEnvelopeOptions<T>
 {
-    public static readonly JsonSerializerOptions Instance = CreateOptions();
+    public static readonly JsonSerializerOptions Instance = new() { TypeInfoResolver = new EnvelopeResolver() };
 
-    private static JsonSerializerOptions CreateOptions()
+    private sealed class EnvelopeResolver : IJsonTypeInfoResolver
     {
-        var options = new JsonSerializerOptions();
-        options.Converters.Add(new AsyncResponseEnvelopeConverter<T>());
-        return options;
+        public JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
+            => type == typeof(AsyncResponseEnvelope<T>)
+                ? JsonMetadataServices.CreateValueInfo<AsyncResponseEnvelope<T>>(options, new AsyncResponseEnvelopeConverter<T>())
+                : AsyncResponseJson.Resolver.GetTypeInfo(type, options);
     }
+}
+
+/// <summary>
+/// Trim/AOT-clean (de)serialization entry points for <see cref="AsyncResponseEnvelope{T}"/> —
+/// the typed-metadata counterparts of <c>JsonSerializer.Serialize(envelope,
+/// AsyncResponseEnvelopeOptions&lt;T&gt;.Instance)</c> and
+/// <c>JsonSafety.SafeDeserialize&lt;AsyncResponseEnvelope&lt;T&gt;&gt;(json, …)</c>.
+/// </summary>
+internal static class AsyncResponseEnvelopeJson
+{
+    /// <summary>Typed metadata for <see cref="AsyncResponseEnvelope{T}"/> bound to its pre-configured options.</summary>
+    public static JsonTypeInfo<AsyncResponseEnvelope<T>> TypeInfo<T>()
+        => AsyncResponseJson.GetTypeInfo<AsyncResponseEnvelope<T>>(AsyncResponseEnvelopeOptions<T>.Instance);
+
+    /// <summary>Serializes an envelope for publishing.</summary>
+    public static string Serialize<T>(AsyncResponseEnvelope<T> envelope)
+        => JsonSerializer.Serialize(envelope, TypeInfo<T>());
+
+    /// <summary>Deserializes an envelope with the standard broker-ingress guards (see <see cref="JsonSafety"/>).</summary>
+    public static AsyncResponseEnvelope<T>? SafeDeserialize<T>(string json)
+        => JsonSafety.SafeDeserialize(json, TypeInfo<T>());
 }
 
 /// <summary>
@@ -102,7 +133,9 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 else if (property == EnvelopeProperty.Payload)
                 {
                     // Instead of throwing, assign default(T)
-                    payload = reader.TokenType == JsonTokenType.Null ? default : JsonSerializer.Deserialize<T>(ref reader, options);
+                    payload = reader.TokenType == JsonTokenType.Null
+                        ? default
+                        : JsonSerializer.Deserialize(ref reader, AsyncResponseJson.GetTypeInfo<T>(options));
                 }
                 else if (property == EnvelopeProperty.ExceptionMessage)
                 {
@@ -139,7 +172,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         writer.WriteNumber(SchemaVersionName, value.SchemaVersion);
         writer.WriteBoolean(SuccessName, value.Success);
         writer.WritePropertyName(PayloadName);
-        JsonSerializer.Serialize(writer, value.Payload, options);
+        JsonSerializer.Serialize(writer, (object?)value.Payload, AsyncResponseJson.GetTypeInfo(typeof(T), options));
         writer.WriteString(ExceptionMessageName, value.ExceptionMessage);
         writer.WriteString(ExceptionStackTraceName, value.ExceptionStackTrace);
         writer.WriteEndObject();

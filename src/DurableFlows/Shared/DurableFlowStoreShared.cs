@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse.DurableFlows.Internal;
 
@@ -8,8 +9,12 @@ internal static class DurableFlowStoreShared
 {
     private static readonly JsonSerializerOptions Options = new()
     {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        TypeInfoResolver = DurableFlowStoreJsonContext.Default
     };
+
+    private static JsonTypeInfo<FlowState> FlowStateTypeInfo
+        => (JsonTypeInfo<FlowState>)Options.GetTypeInfo(typeof(FlowState));
 
     public static void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
     {
@@ -27,13 +32,13 @@ internal static class DurableFlowStoreShared
             throw new ArgumentException("The new flow-state revision must increment the expected revision by one.", nameof(state));
     }
 
-    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, Options);
+    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, FlowStateTypeInfo);
 
     public static FlowState? Deserialize(string json)
     {
         try
         {
-            var state = JsonSerializer.Deserialize<FlowState>(json);
+            var state = JsonSerializer.Deserialize(json, DurableFlowStoreJsonContext.Default.FlowState);
             return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
         }
         catch (JsonException)
@@ -108,3 +113,15 @@ internal static class DurableFlowStoreShared
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
     }
 }
+
+/// <summary>
+/// Source-generated JSON metadata for <see cref="FlowState"/> so the store packages never fall back
+/// to reflection-based serialization (trim/AOT-safe). Compiled into each store package alongside
+/// <see cref="DurableFlowStoreShared"/>, so every assembly gets its own generated context. Metadata
+/// mode (no fast-path writer) so writes honor <see cref="DurableFlowStoreShared"/>'s options
+/// (WhenWritingNull) and the persisted bytes are unchanged; reads use the context's bare default
+/// options, matching the previous options-less <c>Deserialize&lt;FlowState&gt;(json)</c> call.
+/// </summary>
+[JsonSourceGenerationOptions(GenerationMode = JsonSourceGenerationMode.Metadata)]
+[JsonSerializable(typeof(FlowState))]
+internal sealed partial class DurableFlowStoreJsonContext : JsonSerializerContext;

@@ -254,7 +254,7 @@ internal sealed class MongoDbAsyncResponseChannel :
             }
 
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             var messageId = Guid.NewGuid();
             using var confirmation = BeginConfirmation(messageId);
             await PublishMessageAsync(messageId, correlationId, json, cancellationToken).ConfigureAwait(false);
@@ -367,7 +367,7 @@ internal sealed class MongoDbAsyncResponseChannel :
                 ExceptionStackTrace = RemoteStackTrace.ForWire(exception.StackTrace, _options.IncludeRemoteStackTrace, _options.MaxRemoteStackTraceLength),
                 Payload = null
             };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             var messageId = Guid.NewGuid();
             using var confirmation = BeginConfirmation(messageId);
             await PublishMessageAsync(messageId, correlationId, json, cancellationToken).ConfigureAwait(false);
@@ -1012,7 +1012,7 @@ internal sealed class MongoDbAsyncResponseChannel :
             var finished = false;
             try
             {
-                var envelope = JsonSerializer.Deserialize<AsyncResponseEnvelope<T>>(message.EnvelopeJson, AsyncResponseEnvelopeOptions<T>.Instance);
+                var envelope = JsonSerializer.Deserialize(message.EnvelopeJson, AsyncResponseEnvelopeJson.TypeInfo<T>());
                 if (envelope is null)
                 {
                     finished = true;

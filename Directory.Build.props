@@ -20,6 +20,15 @@
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
 
     <PackageIcon>icon.png</PackageIcon>
+
+    <!-- Strong-name every assembly (Microsoft's OSS library guidance): strongly-named consumers
+         can reference the packages, and InternalsVisibleTo carries the matching public key. The
+         checked-in key is intentionally public — strong naming is identity, not a security
+         boundary. Signing must never be conditional: a signed/unsigned split would change
+         assembly identity between builds. -->
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)asyncresponse.snk</AssemblyOriginatorKeyFile>
+    <AsyncResponsePublicKey>0024000004800000140100000602000000240000525341310008000001000100cb99b7c3c5086a6d2ca9987b7890dde0197e5e6023c0564a43025745bc9e1aa223ea07a068e1599fff9185893e9e6b6bd5b37c27eb2bafc92616d7808fa34830cdadf0637e5e8178e0d06e3f8c5a557775b29698774fa0e486ce7fd704042dd6118fd7b4631ff037d67d5c7a21aac9dec75726fcb37dc2e36009f70e7e679ae1e15ec5dfcfbe551214dfd0192c9ce453d66a888f506b089c3fa7bfa5036923e09531591f1dcbd210b28e92bf908aefc827eb8b7c1d00ceecd83febfcf9a9df58eea1976a908d143c889c510b7bd6001ac454a80eedd2b31bf70ac2897914973445a889939bcbbf14c51c5ba3874b9500802be8baa2eb95e8821c5a8e68c6c9b9</AsyncResponsePublicKey>
   </PropertyGroup>
 
   <ItemGroup>

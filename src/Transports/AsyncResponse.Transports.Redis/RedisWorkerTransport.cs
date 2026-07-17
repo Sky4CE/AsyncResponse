@@ -74,7 +74,7 @@ public sealed class RedisWorkerTransport : IWorkerTransport
         try
         {
             var fields = CreateMessageFields(
-                JsonSerializer.Serialize(job),
+                AsyncResponseJson.Serialize(job),
                 job.CorrelationId,
                 _options);
             var messageId = await RedisTransportRetry.ExecuteAsync(

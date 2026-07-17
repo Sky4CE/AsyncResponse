@@ -125,37 +125,53 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
-        var document = CreateDocument(flowId, state, ttl, now);
-        try
+
+        // Bounded retry: documents carry native Cosmos TTL alongside the logical ExpiresAtUtc, so
+        // the server's TTL sweep can physically purge an expired document between our create's
+        // 409 and the follow-up read (or the conditional replace). A vanished conflicting
+        // document means the slot is free — create again — not that a live competitor won.
+        for (var attempt = 0; attempt < 4; attempt++)
         {
-            await container.CreateItemAsync(document, new PartitionKey(flowId), cancellationToken: cancellationToken).ConfigureAwait(false);
-            return true;
-        }
-        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
-        {
+            var now = DateTime.UtcNow;
+            var document = CreateDocument(flowId, state, ttl, now);
             try
             {
-                var current = await container.ReadItemAsync<CosmosFlowStateDocument>(
-                    flowId,
-                    new PartitionKey(flowId),
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
-                if (current.Resource.ExpiresAtUtc > now)
-                    return false;
-
-                await container.ReplaceItemAsync(
-                    document,
-                    flowId,
-                    new PartitionKey(flowId),
-                    new ItemRequestOptions { IfMatchEtag = current.ETag },
-                    cancellationToken).ConfigureAwait(false);
+                await container.CreateItemAsync(document, new PartitionKey(flowId), cancellationToken: cancellationToken).ConfigureAwait(false);
                 return true;
             }
-            catch (CosmosException retryEx) when (retryEx.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.NotFound)
+            catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.Conflict)
             {
-                return false;
+                try
+                {
+                    var current = await container.ReadItemAsync<CosmosFlowStateDocument>(
+                        flowId,
+                        new PartitionKey(flowId),
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
+                    if (current.Resource.ExpiresAtUtc > now)
+                        return false;
+
+                    await container.ReplaceItemAsync(
+                        document,
+                        flowId,
+                        new PartitionKey(flowId),
+                        new ItemRequestOptions { IfMatchEtag = current.ETag },
+                        cancellationToken).ConfigureAwait(false);
+                    return true;
+                }
+                catch (CosmosException retryEx) when (retryEx.StatusCode == HttpStatusCode.PreconditionFailed)
+                {
+                    // The ETag moved under us: a live writer (create or expired-replace) won.
+                    return false;
+                }
+                catch (CosmosException retryEx) when (retryEx.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // The expired document was TTL-purged after our 409 — the id is free again.
+                    continue;
+                }
             }
         }
+
+        return false;
     }
 
     public async Task<bool> TryUpdateAsync(

@@ -1,6 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Text.Json;
+using System.Diagnostics.CodeAnalysis;
 
 namespace AsyncResponse;
 
@@ -30,7 +30,7 @@ internal sealed class DurableFlowService : IDurableFlows
     }
 
     /// <inheritdoc />
-    public async Task<string> StartAsync<TFlow, TInput>(
+    public async Task<string> StartAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         TInput input,
         string? flowId = null,
         CancellationToken cancellationToken = default)
@@ -47,7 +47,7 @@ internal sealed class DurableFlowService : IDurableFlows
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
         var now = DateTime.UtcNow;
-        var inputJson = JsonSerializer.Serialize(input);
+        var inputJson = AsyncResponseJson.Serialize(input);
         var state = new FlowState
         {
             FlowId = flowId,

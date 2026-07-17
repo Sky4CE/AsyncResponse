@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json;
@@ -13,12 +14,6 @@ namespace AsyncResponse;
 internal static class ReflectionExtensions
 {
     private delegate ValueTask AsyncMethodInvoker(object service, object?[] args);
-
-    // Loose options for any JSON deserialization here.
-    private static readonly JsonSerializerOptions _looseJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true
-    };
 
     private static readonly ConcurrentDictionary<string, Type> ServiceTypes = new(StringComparer.Ordinal);
     private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
@@ -101,6 +96,11 @@ internal static class ReflectionExtensions
 
     // Internal: the durable-flow executor resolves persisted flow/input type names through the
     // same default-ALC scan + custom-resolver chain as persisted callback targets.
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "Persisted callback/flow targets are registered through APIs that root them: the expression-based " +
+                        "registration APIs annotate TService with DynamicallyAccessedMembers, WithDurableFlow<TFlow, TInput> roots " +
+                        "flows, and the DTO-based registration APIs carry RequiresUnreferencedCode. A name that still cannot be " +
+                        "resolved fails closed with an actionable error and a type-resolution-failure diagnostic instead of misbehaving.")]
     internal static Type? ResolveServiceType(string serviceInterfaceFullName)
     {
         if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
@@ -130,6 +130,11 @@ internal static class ReflectionExtensions
         return null;
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2075",
+        Justification = "The service type reaching this plan was rooted at registration: expression-based registration APIs " +
+                        "annotate TService with DynamicallyAccessedMembers(PublicMethods), and DTO-based registration carries " +
+                        "RequiresUnreferencedCode. A method removed regardless (e.g. a job enqueued by a different, non-trimmed " +
+                        "deployment) fails closed with an actionable 'no method' error.")]
     private static InvocationPlan CreateInvocationPlan(InvocationPlanKey key)
     {
         // Pick the overload by name + parameter count once, then reuse the compiled plan.
@@ -190,6 +195,14 @@ internal static class ReflectionExtensions
         return Expression.Lambda<AsyncMethodInvoker>(body, service, args).Compile();
     }
 
+    [UnconditionalSuppressMessage("Trimming", "IL2060",
+        Justification = "AwaitGenericValueTask<T> is instantiated over the callback method's ValueTask<T> result type. The " +
+                        "callback method itself was rooted at registration, and for reference-type results shared generic code " +
+                        "always exists. Value-type results over a method never instantiated statically fail closed at dispatch " +
+                        "with a clear exception rather than silently misroute.")]
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "Same contract: reference-type ValueTask<T> results use shared generic code under Native AOT; the " +
+                        "exotic value-type case throws an actionable error at dispatch.")]
     private static Expression ToValueTaskExpression(MethodCallExpression call, Type returnType)
     {
         if (returnType == typeof(void))
@@ -297,16 +310,17 @@ internal static class ReflectionExtensions
         /// <summary>Converts the supplied value.</summary>
         public object? Convert(object? value)
         {
-            // Handle JSON payloads
+            // Handle JSON payloads (contract metadata resolved through the AOT-safe chain; loose
+            // case-insensitive matching as before).
             if (value is JsonElement je)
             {
-                return JsonSerializer.Deserialize(je, targetType, _looseJsonOptions);
+                return JsonSerializer.Deserialize(je, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
             }
 
             // JSON in a string
             if (value is string s && !_isString)
             {
-                return JsonSerializer.Deserialize(s, targetType, _looseJsonOptions);
+                return JsonSerializer.Deserialize(s, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
             }
 
             // Already the correct CLR type (a boxed value also satisfies its nullable counterpart)

@@ -55,6 +55,10 @@ around them.
 - **The local hot path is small.** The checked-in BenchmarkDotNet suite measures the complete
   subscribe → publish → complete cycle, while the stress harness checks isolation, cleanup,
   fan-out, timeouts, context propagation, transport dispatch, and durable flows.
+- **Trim- and Native AOT-compatible.** Every package builds warning-free with
+  `IsAotCompatible=true`: internal serialization is source-generated, payload types plug in
+  through one startup registration, and CI publishes and runs a fully trimmed Native AOT sample.
+  See [docs/aot.md](docs/aot.md).
 
 ## Pick the smallest setup that fits
 
@@ -614,11 +618,20 @@ code pushes to `main`; per-commit trends with regression alerting are published 
   MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, and EF Core.
   A scheduled CI matrix reruns the Redis-backed suite against Valkey; Dragonfly is validated by
   running the real channel and transport against a live server.
+- **The same integration suite runs against a Native AOT SUT**: the sample publishes fully
+  trimmed and the Aspire harness boots the native binary wherever the full driver stack is
+  AOT-capable today (NATS and PostgreSQL pairs; the rest stay JIT with the exact driver-level
+  reasons recorded), proving the packages inside a real trimmed app against real brokers, not
+  just under the analyzers — vendor matrix in [docs/aot.md](docs/aot.md).
+- **Unit tests run on Linux, Windows, and macOS** in CI; the wire-format tests pin byte-for-byte
+  JSON compatibility between the source-generated serializer paths and the reflection-based
+  output they replaced.
 - A **stress harness** asserts correctness invariants under storm load (zero lost, crossed,
   duplicated, or leaked responses) and fails CI on violation; NBomber load profiles include a
   destructive recovery scenario.
 - Focused tests also cover option validation, ACK-mode dispatch, metric/span emission, callback
   authorization, unsupported-schema rejection, and recovery cleanup.
+- **CodeQL** static analysis runs on every push and weekly against the shipped packages.
 
 ## When to use it — and when not
 
@@ -672,6 +685,9 @@ the right page. The pages:
   plugin/ALC scenarios.
 - **[Operations](docs/operations.md)** — best practices, building and testing, and benchmarking and
   load testing.
+- **[Trimming & Native AOT](docs/aot.md)** — what to register in a trimmed/AOT app (one JSON
+  context line plus `WithDurableFlow` per flow), how the metadata seam works, and the annotated
+  dynamic surface.
 - **[PostgreSQL](docs/postgresql.md)** — channel/transport architecture, schema, delivery
   confirmation, ACK modes, and operational tuning.
 - **[SQL Server](docs/sqlserver.md)** — channel/transport architecture, adaptive polling wake,

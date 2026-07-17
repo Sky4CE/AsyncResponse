@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- NBomber is not strong-named (CS8002); this harness needs no assembly identity
+         and no InternalsVisibleTo, so it opts out of the repo-wide signing. -->
+    <SignAssembly>false</SignAssembly>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>

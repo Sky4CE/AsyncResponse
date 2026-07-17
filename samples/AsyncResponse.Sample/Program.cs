@@ -34,6 +34,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults();
 builder.Services.AddOpenApi();
 
+// Native AOT-ready JSON: without reflection-based System.Text.Json, HTTP responses resolve
+// through SampleHttpJsonContext (the web camelCase defaults still apply at runtime) and the
+// payloads AsyncResponse serializes on the app's behalf resolve through SampleWireJsonContext.
+// JIT runs keep the reflection fallback behind these, so behavior is identical either way.
+builder.Services.ConfigureHttpJsonOptions(options =>
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, SampleHttpJsonContext.Default));
+AsyncResponseJsonSerialization.RegisterResolver(SampleWireJsonContext.Default);
+
 // --- Provider selection (configuration-driven) ----------------------------------------------
 // Channel = response/recovery, transport = worker dispatch, durable store = flow ledgers (exactly one each).
 // Defaults are fully in-memory so `dotnet run` works with no external dependencies; the AppHosts
@@ -558,9 +566,12 @@ builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();
 builder.Services.AddSingleton<FlowRecorder>();
 builder.Services.AddSingleton<ISampleFlowService, SampleFlowService>();
 builder.Services.AddSingleton<RemoteWorkSimulator>();
-builder.Services.AddScoped<SampleProvisioningFlow>(); // durable flow: resolved by type name on execute/resume
-builder.Services.AddScoped<SampleOnboardingFlow>();   // parent durable flow for the child-flow demo
-builder.Services.AddScoped<SampleSeedDataFlow>();     // child durable flow awaited by SampleOnboardingFlow
+// Durable flows: WithDurableFlow adds the class to DI and records the statically-typed
+// execution route the executor prefers over persisted-type-name reflection — required under
+// trimming/Native AOT, harmless (and slightly faster) on JIT.
+asyncResponse.WithDurableFlow<SampleProvisioningFlow, ProvisioningFlowInput>();
+asyncResponse.WithDurableFlow<SampleOnboardingFlow, OnboardingFlowInput>();  // parent for the child-flow demo
+asyncResponse.WithDurableFlow<SampleSeedDataFlow, string>();                 // child awaited by SampleOnboardingFlow
 
 var app = builder.Build();
 app.Logger.LogInformation("AsyncResponse sample started: channel={Channel}, transport={Transport}.", channel, transport);
@@ -594,64 +605,58 @@ app.MapGet("/alive", () => Results.Ok("alive")).ExcludeFromDescription();
 // selectable providers stay exercised even though one app process boots only one pair.
 app.MapGet("/config", (IServiceProvider services) =>
 {
-    object? pubsub = null;
-    object? kafka = null;
-    object? rabbitmq = null;
-    object? redis = null;
-    object? nats = null;
-    object? postgres = null;
-    object? sqlserver = null;
-    object? mongodb = null;
-    object? azureServiceBus = null;
-    object? sqs = null;
+    PubSubConfig? pubsub = null;
+    KafkaConfig? kafka = null;
+    RabbitMqConfig? rabbitmq = null;
+    RedisTransportConfig? redis = null;
+    NatsConfig? nats = null;
+    PostgresConfig? postgres = null;
+    SqlServerConfig? sqlserver = null;
+    MongoDbConfig? mongodb = null;
+    AzureServiceBusConfig? azureServiceBus = null;
+    SqsConfig? sqs = null;
     if (useSqs)
     {
         var sqsOptions = services.GetRequiredService<IOptions<SqsAsyncResponseOptions>>().Value;
-        sqs = new
-        {
-            workerQueue = sqsOptions.WorkerQueue,
-            responseQueue = sqsOptions.ResponseQueue,
-            createQueues = sqsOptions.CreateQueues,
-            maxReceiveCount = sqsOptions.MaxReceiveCount,
-            workerAckMode = sqsOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = sqsOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = sqsOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            responseAckMode = sqsOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = sqsOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = sqsOptions.ResponseSubscriber.BackgroundQueueCapacity
-        };
+        sqs = new SqsConfig(
+            sqsOptions.WorkerQueue,
+            sqsOptions.ResponseQueue,
+            sqsOptions.CreateQueues,
+            sqsOptions.MaxReceiveCount,
+            sqsOptions.WorkerSubscriber.AckMode.ToString(),
+            sqsOptions.WorkerSubscriber.BackgroundWorkerCount,
+            sqsOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            sqsOptions.ResponseSubscriber.AckMode.ToString(),
+            sqsOptions.ResponseSubscriber.BackgroundWorkerCount,
+            sqsOptions.ResponseSubscriber.BackgroundQueueCapacity);
     }
 
     if (useAzureServiceBus)
     {
         var serviceBusOptions = services.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value;
-        azureServiceBus = new
-        {
-            workerQueue = serviceBusOptions.WorkerQueue,
-            responseQueue = serviceBusOptions.ResponseQueue,
-            workerAckMode = serviceBusOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = serviceBusOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = serviceBusOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            workerMaxDeliveryAttempts = serviceBusOptions.WorkerSubscriber.MaxDeliveryAttempts,
-            responseAckMode = serviceBusOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = serviceBusOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = serviceBusOptions.ResponseSubscriber.BackgroundQueueCapacity,
-            responseMaxDeliveryAttempts = serviceBusOptions.ResponseSubscriber.MaxDeliveryAttempts
-        };
+        azureServiceBus = new AzureServiceBusConfig(
+            serviceBusOptions.WorkerQueue,
+            serviceBusOptions.ResponseQueue,
+            serviceBusOptions.WorkerSubscriber.AckMode.ToString(),
+            serviceBusOptions.WorkerSubscriber.BackgroundWorkerCount,
+            serviceBusOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            serviceBusOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            serviceBusOptions.ResponseSubscriber.AckMode.ToString(),
+            serviceBusOptions.ResponseSubscriber.BackgroundWorkerCount,
+            serviceBusOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            serviceBusOptions.ResponseSubscriber.MaxDeliveryAttempts);
     }
 
     if (useGooglePubSub)
     {
         var googleOptions = services.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
-        pubsub = new
-        {
-            workerAckMode = googleOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = googleOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = googleOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            responseAckMode = googleOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = googleOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = googleOptions.ResponseSubscriber.BackgroundQueueCapacity
-        };
+        pubsub = new PubSubConfig(
+            googleOptions.WorkerSubscriber.AckMode.ToString(),
+            googleOptions.WorkerSubscriber.BackgroundWorkerCount,
+            googleOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            googleOptions.ResponseSubscriber.AckMode.ToString(),
+            googleOptions.ResponseSubscriber.BackgroundWorkerCount,
+            googleOptions.ResponseSubscriber.BackgroundQueueCapacity);
     }
 
     if (useKafka)
@@ -659,46 +664,42 @@ app.MapGet("/config", (IServiceProvider services) =>
         var kafkaOptions = services.GetRequiredService<IOptions<KafkaAsyncResponseTransportOptions>>().Value;
         var workerTopic = ResolveKafkaTopic(kafkaOptions.WorkerTopic, kafkaOptions.TopicPrefix, "worker");
         var responseTopic = ResolveKafkaTopic(kafkaOptions.ResponseTopic, kafkaOptions.TopicPrefix, "response");
-        kafka = new
-        {
+        kafka = new KafkaConfig(
             workerTopic,
-            workerConsumerGroup = kafkaOptions.WorkerConsumerGroup,
+            kafkaOptions.WorkerConsumerGroup,
             responseTopic,
-            responseConsumerGroup = kafkaOptions.ResponseConsumerGroup,
-            deadLetterTopic = kafkaOptions.DeadLetterEnabled
+            kafkaOptions.ResponseConsumerGroup,
+            kafkaOptions.DeadLetterEnabled
                 ? !string.IsNullOrWhiteSpace(kafkaOptions.DeadLetterTopic)
                     ? kafkaOptions.DeadLetterTopic
                     : workerTopic + kafkaOptions.DeadLetterTopicSuffix
                 : null,
-            workerAckMode = kafkaOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = kafkaOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = kafkaOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            workerMaxDeliveryAttempts = kafkaOptions.WorkerSubscriber.MaxDeliveryAttempts,
-            responseAckMode = kafkaOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = kafkaOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = kafkaOptions.ResponseSubscriber.BackgroundQueueCapacity,
-            responseMaxDeliveryAttempts = kafkaOptions.ResponseSubscriber.MaxDeliveryAttempts
-        };
+            kafkaOptions.WorkerSubscriber.AckMode.ToString(),
+            kafkaOptions.WorkerSubscriber.BackgroundWorkerCount,
+            kafkaOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            kafkaOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            kafkaOptions.ResponseSubscriber.AckMode.ToString(),
+            kafkaOptions.ResponseSubscriber.BackgroundWorkerCount,
+            kafkaOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            kafkaOptions.ResponseSubscriber.MaxDeliveryAttempts);
     }
 
     if (useRabbitMq)
     {
         var rabbitOptions = services.GetRequiredService<IOptions<RabbitMqAsyncResponseOptions>>().Value;
-        rabbitmq = new
-        {
-            workerExchange = rabbitOptions.WorkerExchange,
-            workerQueue = rabbitOptions.WorkerQueue,
-            workerRoutingKey = rabbitOptions.WorkerRoutingKey,
-            responseExchange = rabbitOptions.ResponseExchange,
-            responseQueue = rabbitOptions.ResponseQueue,
-            responseRoutingKey = rabbitOptions.ResponseRoutingKey,
-            workerAckMode = rabbitOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = rabbitOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = rabbitOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            responseAckMode = rabbitOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = rabbitOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = rabbitOptions.ResponseSubscriber.BackgroundQueueCapacity
-        };
+        rabbitmq = new RabbitMqConfig(
+            rabbitOptions.WorkerExchange,
+            rabbitOptions.WorkerQueue,
+            rabbitOptions.WorkerRoutingKey,
+            rabbitOptions.ResponseExchange,
+            rabbitOptions.ResponseQueue,
+            rabbitOptions.ResponseRoutingKey,
+            rabbitOptions.WorkerSubscriber.AckMode.ToString(),
+            rabbitOptions.WorkerSubscriber.BackgroundWorkerCount,
+            rabbitOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            rabbitOptions.ResponseSubscriber.AckMode.ToString(),
+            rabbitOptions.ResponseSubscriber.BackgroundWorkerCount,
+            rabbitOptions.ResponseSubscriber.BackgroundQueueCapacity);
     }
 
     if (useRedisTransport)
@@ -707,22 +708,20 @@ app.MapGet("/config", (IServiceProvider services) =>
         var workerStream = ResolveRedisStream(redisOptions.WorkerStream, redisOptions.KeyPrefix, "worker");
         var responseStream = ResolveRedisStream(redisOptions.ResponseStream, redisOptions.KeyPrefix, "response");
         var deadLetterStream = ResolveRedisStream(redisOptions.DeadLetterStream, redisOptions.KeyPrefix, "deadletter");
-        redis = new
-        {
+        redis = new RedisTransportConfig(
             workerStream,
-            workerConsumerGroup = redisOptions.WorkerConsumerGroup,
+            redisOptions.WorkerConsumerGroup,
             responseStream,
-            responseConsumerGroup = redisOptions.ResponseConsumerGroup,
-            deadLetterStream = redisOptions.DeadLetterEnabled ? deadLetterStream : null,
-            workerAckMode = redisOptions.WorkerSubscriber.AckMode.ToString(),
-            workerBackgroundWorkerCount = redisOptions.WorkerSubscriber.BackgroundWorkerCount,
-            workerBackgroundQueueCapacity = redisOptions.WorkerSubscriber.BackgroundQueueCapacity,
-            workerMaxDeliveryAttempts = redisOptions.WorkerSubscriber.MaxDeliveryAttempts,
-            responseAckMode = redisOptions.ResponseSubscriber.AckMode.ToString(),
-            responseBackgroundWorkerCount = redisOptions.ResponseSubscriber.BackgroundWorkerCount,
-            responseBackgroundQueueCapacity = redisOptions.ResponseSubscriber.BackgroundQueueCapacity,
-            responseMaxDeliveryAttempts = redisOptions.ResponseSubscriber.MaxDeliveryAttempts
-        };
+            redisOptions.ResponseConsumerGroup,
+            redisOptions.DeadLetterEnabled ? deadLetterStream : null,
+            redisOptions.WorkerSubscriber.AckMode.ToString(),
+            redisOptions.WorkerSubscriber.BackgroundWorkerCount,
+            redisOptions.WorkerSubscriber.BackgroundQueueCapacity,
+            redisOptions.WorkerSubscriber.MaxDeliveryAttempts,
+            redisOptions.ResponseSubscriber.AckMode.ToString(),
+            redisOptions.ResponseSubscriber.BackgroundWorkerCount,
+            redisOptions.ResponseSubscriber.BackgroundQueueCapacity,
+            redisOptions.ResponseSubscriber.MaxDeliveryAttempts);
     }
 
     if (useNats || useNatsTransport)
@@ -755,8 +754,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             subjectPrefix ??= natsChannelOptions.SubjectPrefix;
         }
 
-        nats = new
-        {
+        nats = new NatsConfig(
             subjectPrefix,
             recoveryBucket,
             workerSubject,
@@ -764,8 +762,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             workerAckMode,
             workerBackgroundWorkerCount,
             workerBackgroundQueueCapacity,
-            responseAckMode
-        };
+            responseAckMode);
     }
 
     if (usePostgreSql || usePostgreSqlTransport)
@@ -802,8 +799,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
         }
 
-        postgres = new
-        {
+        postgres = new PostgresConfig(
             schemaName,
             recoveryStateTable,
             channelMessageTable,
@@ -813,8 +809,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             workerAckMode,
             workerBackgroundWorkerCount,
             workerBackgroundQueueCapacity,
-            responseAckMode
-        };
+            responseAckMode);
     }
 
     if (useSqlServer || useSqlServerTransport)
@@ -851,8 +846,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
         }
 
-        sqlserver = new
-        {
+        sqlserver = new SqlServerConfig(
             schemaName,
             recoveryStateTable,
             channelMessageTable,
@@ -862,8 +856,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             workerAckMode,
             workerBackgroundWorkerCount,
             workerBackgroundQueueCapacity,
-            responseAckMode
-        };
+            responseAckMode);
     }
 
     if (useMongoDb || useMongoDbTransport)
@@ -899,8 +892,7 @@ app.MapGet("/config", (IServiceProvider services) =>
             responseAckMode = transportOptions.ResponseSubscriber.AckMode.ToString();
         }
 
-        mongodb = new
-        {
+        mongodb = new MongoDbConfig(
             recoveryStateCollection,
             channelMessageCollection,
             subscriberCollection,
@@ -910,11 +902,10 @@ app.MapGet("/config", (IServiceProvider services) =>
             workerAckMode,
             workerBackgroundWorkerCount,
             workerBackgroundQueueCapacity,
-            responseAckMode
-        };
+            responseAckMode);
     }
 
-    return Results.Ok(new { channel, transport, azureServiceBus, sqs, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver, mongodb });
+    return Results.Ok(new ConfigResponse(channel, transport, azureServiceBus, sqs, pubsub, kafka, rabbitmq, redis, nats, postgres, sqlserver, mongodb));
 }).WithTags("Observability");
 
 static string NormalizeBehavior(string? behavior)
@@ -1587,7 +1578,7 @@ app.MapPost("/request-response", async (
                 }
             });
 
-        return Results.Ok(new { result.Status, result.Message });
+        return Results.Ok(new StatusMessageResult(result.Status, result.Message));
     }
     catch (TimeoutException)
     {
@@ -1613,7 +1604,7 @@ app.MapPost("/attach", async (IAsyncResponseBuilder asyncResponse, RemoteWorkSim
         .Until(response => response.Status != OperationStatus.Running)
         .WaitAsync();
 
-    return Results.Ok(new { correlationId, result.Status, result.Message });
+    return Results.Ok(new AttachOutcomeResult(correlationId, result.Status, result.Message));
 })
 .WithTags("Request/response");
 
@@ -1702,7 +1693,7 @@ app.MapPost("/ambient-exception", async (
     }
     catch (Exception ex)
     {
-        return Results.Ok(new { faulted = true, exceptionType = ex.GetType().Name, detail = ex.Message });
+        return Results.Ok(new FaultResult(true, ex.GetType().Name, ex.Message));
     }
 })
 .WithTags("Request/response");
@@ -1755,7 +1746,7 @@ app.MapGet("/reply-target", async (IAsyncResponseBuilder asyncResponse, IAsyncRe
         return Results.Conflict(ex.Message); // no reply-target provider registered for this transport
     }
 
-    return Results.Ok(new { observed?.Transport, observed?.Address });
+    return Results.Ok(new ReplyTargetResult(observed?.Transport, observed?.Address));
 })
 .WithTags("Request/response");
 
@@ -1767,7 +1758,7 @@ app.MapPost("/worker", async (IAsyncResponseBuilder asyncResponse, string token,
     SampleTraceContext.Set(trace);
     SampleTenantContext.Set("tenant-acme");
     await asyncResponse.EnqueueWorkerAsync<ISampleFlowService>(flow => flow.ProcessWorkAsync(token));
-    return Results.Ok(new { correlationId });
+    return Results.Ok(new CorrelationResult(correlationId));
 })
 .WithTags("Workers");
 
@@ -1798,9 +1789,15 @@ app.MapPost("/arm", async (IServiceProvider services, FlowRecorder recorder, str
             return Task.CompletedTask;
         });
 
+    // A waiter that faults before its trigger runs would otherwise hang this endpoint silently
+    // (the armed TCS never resolves) — surface it in the logs and fail fast instead.
+    _ = waitTask.ContinueWith(
+        t => armed.TrySetException(t.Exception?.GetBaseException() ?? new InvalidOperationException("arm waiter faulted")),
+        default, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+
     var correlationId = await armed.Task;
     _ = waitTask.ContinueWith(t => recorder.RecordWaiterResult(correlationId, t), TaskScheduler.Default);
-    return Results.Ok(new { correlationId });
+    return Results.Ok(new CorrelationResult(correlationId));
 })
 .WithTags("Recovery");
 
@@ -2030,8 +2027,8 @@ static async Task<IResult> EmitSqsResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     // A one-off client mirrors how a remote system would feed the response queue; the hosted
     // response-ingress subscriber picks the message up from there.
@@ -2088,8 +2085,8 @@ static async Task<IResult> EmitMongoDbResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
     var headers = useAttribute
         ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
         : null;
@@ -2114,8 +2111,8 @@ static async Task<IResult> EmitPubSubResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     var pubsubMessage = new PubsubMessage { Data = ByteString.CopyFromUtf8(json) };
     if (useAttribute)
@@ -2145,8 +2142,8 @@ static async Task<IResult> EmitAzureServiceBusResponseAsync(
         return Results.Conflict("Azure Service Bus response ingress requires AzureServiceBus:ConnectionString.");
 
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
     var serviceBusMessage = new ServiceBusMessage(BinaryData.FromString(json))
     {
         ContentType = "application/json",
@@ -2185,8 +2182,8 @@ static async Task<IResult> EmitKafkaResponseAsync(
 
     var responseTopic = ResolveKafkaTopic(o.ResponseTopic, o.TopicPrefix, "response");
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     var kafkaMessage = new Message<string?, byte[]> { Value = System.Text.Encoding.UTF8.GetBytes(json) };
     if (useAttribute)
@@ -2219,8 +2216,8 @@ static async Task<IResult> EmitRabbitMqResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     var factory = CreateRabbitMqConnectionFactory(o);
     await using var connection = await factory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -2280,8 +2277,8 @@ static async Task<IResult> EmitRedisResponseAsync(
     var o = options.Value;
     var responseStream = ResolveRedisStream(o.ResponseStream, o.KeyPrefix, "response");
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     var fields = useAttribute
         ?
@@ -2325,8 +2322,8 @@ static async Task<IResult> EmitNatsResponseAsync(
         ? $"{o.SubjectPrefix}.transport.response"
         : o.ResponseSubject;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
 
     // The response stream (created by the hosted response-ingress subscriber on startup) captures any
     // message on its subject, so a Core publish is sufficient to feed the transport's response ingress.
@@ -2353,8 +2350,8 @@ static async Task<IResult> EmitPostgreSqlResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
     var headers = useAttribute
         ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
         : null;
@@ -2380,8 +2377,8 @@ static async Task<IResult> EmitSqlServerResponseAsync(
 
     var o = options.Value;
     var json = useAttribute
-        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message })
-        : JsonSerializer.Serialize(new { CorrelationId = correlationId, Status = (int)status, Message = message });
+        ? JsonSerializer.Serialize(new OperationResult { Status = status, Message = message }, SampleWireJsonContext.Default.OperationResult)
+        : JsonSerializer.Serialize(new RawResponseBody(correlationId, (int)status, message), SampleWireJsonContext.Default.RawResponseBody);
     var headers = useAttribute
         ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [o.CorrelationIdHeader] = correlationId }
         : null;
@@ -2452,7 +2449,7 @@ app.MapDelete("/test/recovery/{correlationId}", async (IRecoveryStateStore store
         if (await store.TryDeleteAsync(correlationId, state.RegistrationId))
             deleted++;
     }
-    return Results.Ok(new { deleted });
+    return Results.Ok(new DeletedResult(deleted));
 })
 .WithTags("Observability");
 
@@ -2469,27 +2466,33 @@ app.MapPost("/test/reset", async (IRecoveryStateScanner scanner, IRecoveryStateS
     }
 
     recorder.Clear();
-    return Results.Ok(new { deleted });
+    return Results.Ok(new DeletedResult(deleted));
 })
 .WithTags("Observability");
 
 // Health endpoint with full JSON details, including the recovery check's data payload.
+// Typed metadata + an explicit camelCase policy reproduce the previous anonymous-type health
+// JSON byte-for-byte while staying Native AOT-safe.
+var healthJsonOptions = new JsonSerializerOptions
+{
+    WriteIndented = true,
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    TypeInfoResolver = SampleHttpJsonContext.Default
+};
 app.MapHealthChecks("/healthz", new HealthCheckOptions
 {
     ResponseWriter = async (context, report) =>
     {
         context.Response.ContentType = "application/json; charset=utf-8";
-        await context.Response.WriteAsync(JsonSerializer.Serialize(new
-        {
-            status = report.Status.ToString(),
-            checks = report.Entries.Select(entry => new
-            {
-                name = entry.Key,
-                status = entry.Value.Status.ToString(),
-                description = entry.Value.Description,
-                data = entry.Value.Data
-            })
-        }, new JsonSerializerOptions { WriteIndented = true }));
+        await context.Response.WriteAsync(JsonSerializer.Serialize(
+            new HealthReportResponse(
+                report.Status.ToString(),
+                [.. report.Entries.Select(entry => new HealthCheckEntryResponse(
+                    entry.Key,
+                    entry.Value.Status.ToString(),
+                    entry.Value.Description,
+                    entry.Value.Data))]),
+            healthJsonOptions.GetTypeInfo(typeof(HealthReportResponse))));
     }
 }).WithTags("Health");
 

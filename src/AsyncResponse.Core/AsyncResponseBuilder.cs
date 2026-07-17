@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq.Expressions;
 
 namespace AsyncResponse;
@@ -17,7 +18,15 @@ internal abstract class AsyncResponseBuilderBase(
             : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto, CancellationToken)" />
-    public async Task EnqueueWorkerAsync(ReflectionCallDto work, CancellationToken cancellationToken = default)
+    [RequiresUnreferencedCode("The descriptor names its target service and method as strings, resolved by reflection when the " +
+                              "job executes; trimming may have removed them. Use the expression-based EnqueueWorkerAsync<TService> " +
+                              "overloads, which root the service's public methods automatically.")]
+    public Task EnqueueWorkerAsync(ReflectionCallDto work, CancellationToken cancellationToken = default)
+        => EnqueueWorkerCoreAsync(work, cancellationToken);
+
+    // Shared by the annotation-free expression overloads (whose TService is rooted via
+    // DynamicallyAccessedMembers) and the RequiresUnreferencedCode DTO overload above.
+    private async Task EnqueueWorkerCoreAsync(ReflectionCallDto work, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(work);
         cancellationToken.ThrowIfCancellationRequested();
@@ -54,24 +63,24 @@ internal abstract class AsyncResponseBuilderBase(
     }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Action{TService}}, CancellationToken)" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Action<TService>> work, CancellationToken cancellationToken = default)
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Action<TService>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
     }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}}, CancellationToken)" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, Task>> work, CancellationToken cancellationToken = default)
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
     }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}}, CancellationToken)" />
-    public Task EnqueueWorkerAsync<TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default)
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
     }
 }
 
@@ -345,25 +354,31 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
     private void SetFailureCallback(ReflectionCallDto callback)
         => _failureCallback = callback ?? throw new ArgumentNullException(nameof(callback));
 
+    [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
+                              "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
+                              "public methods automatically.")]
     IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {
         SetResumeCallback(callback);
         return this;
     }
 
-    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberResume<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> callback)
     {
         SetResumeCallback(CallbackExpressionConverter.ToReflectionCall(callback));
         return this;
     }
 
+    [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
+                              "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
+                              "public methods automatically.")]
     IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
     {
         SetFailureCallback(callback);
         return this;
     }
 
-    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
+    IRecoverableAsyncResponseAttachedBuilder<T> IRecoverableAsyncResponseAttachedBuilder<T>.OnLostSubscriberFailure<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> callback)
     {
         SetFailureCallback(CallbackExpressionConverter.ToReflectionCall(callback));
         return this;
@@ -405,25 +420,31 @@ internal sealed class RecoverableAsyncResponseBuilder<T> :
         return this;
     }
 
+    [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
+                              "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
+                              "public methods automatically.")]
     IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume(ReflectionCallDto callback)
     {
         SetResumeCallback(callback);
         return this;
     }
 
-    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume<TService>(Expression<Func<TService, Task>> callback)
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberResume<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> callback)
     {
         SetResumeCallback(CallbackExpressionConverter.ToReflectionCall(callback));
         return this;
     }
 
+    [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
+                              "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
+                              "public methods automatically.")]
     IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure(ReflectionCallDto callback)
     {
         SetFailureCallback(callback);
         return this;
     }
 
-    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure<TService>(Expression<Func<TService, Task>> callback)
+    IRecoverableAsyncResponseTriggeredBuilder<T> IRecoverableAsyncResponseTriggeredBuilder<T>.OnLostSubscriberFailure<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> callback)
     {
         SetFailureCallback(CallbackExpressionConverter.ToReflectionCall(callback));
         return this;

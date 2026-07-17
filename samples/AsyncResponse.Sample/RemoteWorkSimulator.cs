@@ -69,7 +69,7 @@ public sealed class RemoteWorkSimulator(IAsyncResponseIngress _ingress, ILogger<
     /// <summary>Delivers one raw-JSON terminal/progress message, like a broker consumer would.</summary>
     public Task DeliverAsync(string correlationId, OperationResult result)
     {
-        var json = JsonSerializer.Serialize(result);
+        var json = JsonSerializer.Serialize(result, SampleWireJsonContext.Default.OperationResult);
         _logger.LogInformation("BROKER: delivering message for {CorrelationId}: {Json}", correlationId, json);
         return _ingress.HandleResponseMessageAsync(json, correlationId);
     }

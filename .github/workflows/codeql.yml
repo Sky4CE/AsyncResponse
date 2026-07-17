@@ -1,0 +1,50 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 4 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # CodeQL uploads its findings to the repository's code-scanning view.
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: csharp
+          build-mode: manual
+
+      - name: Build
+        # Build only the shipped packages: analysis on the src closure, not tests/benchmarks.
+        run: |
+          dotnet restore
+          dotnet build src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-restore
+          for proj in src/Channels/*/*.csproj src/Transports/*/*.csproj src/DurableFlows/AsyncResponse.*/*.csproj; do
+            dotnet build "$proj" --configuration Release --no-restore
+          done
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:csharp"

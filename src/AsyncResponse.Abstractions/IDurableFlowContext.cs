@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace AsyncResponse;
 
 /// <summary>
@@ -92,7 +94,7 @@ public interface IDurableFlowContext
     /// <paramref name="failOnChildFailure"/> is <c>false</c>.
     /// </para>
     /// </summary>
-    Task<FlowState> AwaitChildFlowAsync<TFlow, TInput>(
+    Task<FlowState> AwaitChildFlowAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         string name,
         TInput input,
         string? flowId = null,

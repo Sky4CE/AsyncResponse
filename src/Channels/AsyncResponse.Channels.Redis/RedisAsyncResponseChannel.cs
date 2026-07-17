@@ -182,7 +182,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             bool finished = false;
             try
             {
-                var envelope = JsonSerializer.Deserialize<AsyncResponseEnvelope<T>>(messageValue.ToString(), AsyncResponseEnvelopeOptions<T>.Instance);
+                var envelope = JsonSerializer.Deserialize(messageValue.ToString(), AsyncResponseEnvelopeJson.TypeInfo<T>());
 
                 if (envelope == null)
                 {
@@ -374,7 +374,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 Success = true,
                 Payload = response
             };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<T>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", numSubscribers);
 
@@ -484,7 +484,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 ExceptionStackTrace = RemoteStackTrace.ForWire(exception.StackTrace, _options.IncludeRemoteStackTrace, _options.MaxRemoteStackTraceLength),
                 Payload = null
             };
-            var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<object>.Instance);
+            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
             long numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
             activity?.SetTag("asyncresponse.subscribers", numSubscribers);
 

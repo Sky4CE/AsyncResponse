@@ -1,6 +1,30 @@
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using System.Text.Json.Serialization;
 
 namespace AsyncResponse;
+
+/// <summary>
+/// Aggregate counts the recovery health check reports under the <c>stats</c> key of its
+/// <see cref="HealthCheckResult.Data"/>. A named type (with pinned JSON property names) rather
+/// than an anonymous one so trimmed/Native AOT apps can serialize health reports: register it —
+/// plus <see cref="AsyncResponseStaleRecoveryEntry"/> — in the app's
+/// <see cref="JsonSerializerContext"/> if the app writes health data as JSON.
+/// </summary>
+public sealed record AsyncResponseRecoveryStats(
+    [property: JsonPropertyName("outstandingRegistrations")] int OutstandingRegistrations,
+    [property: JsonPropertyName("withLiveWaiter")] int WithLiveWaiter,
+    [property: JsonPropertyName("stale")] int Stale,
+    [property: JsonPropertyName("unknownAge")] int UnknownAge);
+
+/// <summary>
+/// One stale recovery registration listed under the <c>staleEntries</c> key of the recovery
+/// health check's <see cref="HealthCheckResult.Data"/> (JSON names pinned; see
+/// <see cref="AsyncResponseRecoveryStats"/> for the AOT registration note).
+/// </summary>
+public sealed record AsyncResponseStaleRecoveryEntry(
+    [property: JsonPropertyName("correlationId")] string? CorrelationId,
+    [property: JsonPropertyName("payloadType")] string? PayloadType,
+    [property: JsonPropertyName("registeredAtUtc")] DateTime? RegisteredAtUtc);
 
 /// <summary>
 /// Surfaces the async-response watchdog findings on the health endpoints (e.g. <c>/readyz</c>).
@@ -76,24 +100,20 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
         if (snapshot.Report is not { } report)
             return data;
 
-        data["stats"] = new
-        {
-            outstandingRegistrations = report.TotalEntries,
-            withLiveWaiter = report.EntriesWithActiveWaiter,
-            stale = report.StaleEntries.Count,
-            unknownAge = report.UnknownAgeEntries
-        };
+        data["stats"] = new AsyncResponseRecoveryStats(
+            report.TotalEntries,
+            report.EntriesWithActiveWaiter,
+            report.StaleEntries.Count,
+            report.UnknownAgeEntries);
 
         if (report.StaleEntries.Count > 0)
         {
             data["staleEntries"] = report.StaleEntries
                 .Take(MaxReportedStaleEntries)
-                .Select(e => new
-                {
-                    correlationId = e.CorrelationId,
-                    payloadType = e.PayloadTypeFullName,
-                    registeredAtUtc = e.RegisteredAtUtc
-                })
+                .Select(e => new AsyncResponseStaleRecoveryEntry(
+                    e.CorrelationId,
+                    e.PayloadTypeFullName,
+                    e.RegisteredAtUtc))
                 .ToList();
 
             if (report.StaleEntries.Count > MaxReportedStaleEntries)

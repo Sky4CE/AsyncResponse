@@ -1,23 +1,23 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse;
 
 internal static class FlowStateJson
 {
-    private static readonly JsonSerializerOptions Options = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    // FlowState is a library wire type: its metadata is source-generated
+    // (AsyncResponseJsonContext), and the ledger omits nulls exactly as before.
+    private static JsonTypeInfo<FlowState> TypeInfo
+        => AsyncResponseJson.GetTypeInfo<FlowState>(AsyncResponseJson.IgnoreNullWrites);
 
-    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, Options);
+    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, TypeInfo);
 
     public static FlowState? Deserialize(string json)
     {
         try
         {
-            var state = JsonSerializer.Deserialize<FlowState>(json, Options);
+            var state = JsonSerializer.Deserialize(json, TypeInfo);
             return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
         }
         catch (JsonException)

@@ -93,7 +93,7 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDis
             if (!string.IsNullOrWhiteSpace(job.CorrelationId))
                 properties[_options.CorrelationIdProperty] = job.CorrelationId;
             var message = new AzureServiceBusOutboundMessage(
-                JsonSerializer.Serialize(job),
+                AsyncResponseJson.Serialize(job),
                 messageId,
                 string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId,
                 properties);

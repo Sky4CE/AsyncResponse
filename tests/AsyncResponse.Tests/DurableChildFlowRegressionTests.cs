@@ -560,7 +560,12 @@ public class DurableChildFlowRegressionTests
 
     private static async Task<FlowState> WaitForStateAsync(IDurableFlows flows, string flowId, FlowRunStatus status)
     {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        // Generous on purpose: these scenarios drive multi-hop chains (parent execute → child
+        // enqueue → child execute → parent notify → parent re-execute) over per-provider
+        // in-memory queues, and a fully parallel dual-TFM suite run can starve the thread pool
+        // for seconds at a time. Healthy runs return in milliseconds — the polling loop exits
+        // as soon as the state lands.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
         FlowState? state;
         do
         {

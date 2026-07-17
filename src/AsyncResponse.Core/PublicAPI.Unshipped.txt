@@ -6,6 +6,7 @@ AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.set -> void
 AsyncResponse.AsyncResponseChannelOptions.RecoveryStateExpiry.get -> System.TimeSpan
 AsyncResponse.AsyncResponseChannelOptions.RecoveryStateExpiry.set -> void
 AsyncResponse.AsyncResponseDiagnostics
+AsyncResponse.AsyncResponseJsonSerialization
 AsyncResponse.AsyncResponseOptions
 AsyncResponse.AsyncResponseOptions.AsyncResponseOptions() -> void
 AsyncResponse.AsyncResponseOptions.Watchdog.get -> AsyncResponse.AsyncResponseWatchdogOptions!
@@ -13,6 +14,30 @@ AsyncResponse.AsyncResponseOptions.Watchdog.set -> void
 AsyncResponse.AsyncResponseRecoveryHealthCheck
 AsyncResponse.AsyncResponseRecoveryHealthCheck.AsyncResponseRecoveryHealthCheck(AsyncResponse.AsyncResponseWatchdogState! _state) -> void
 AsyncResponse.AsyncResponseRecoveryHealthCheck.CheckHealthAsync(Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckContext! context, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult>!
+AsyncResponse.AsyncResponseRecoveryStats
+AsyncResponse.AsyncResponseRecoveryStats.<Clone>$() -> AsyncResponse.AsyncResponseRecoveryStats!
+AsyncResponse.AsyncResponseRecoveryStats.AsyncResponseRecoveryStats(int OutstandingRegistrations, int WithLiveWaiter, int Stale, int UnknownAge) -> void
+AsyncResponse.AsyncResponseRecoveryStats.Deconstruct(out int OutstandingRegistrations, out int WithLiveWaiter, out int Stale, out int UnknownAge) -> void
+AsyncResponse.AsyncResponseRecoveryStats.Equals(AsyncResponse.AsyncResponseRecoveryStats? other) -> bool
+AsyncResponse.AsyncResponseRecoveryStats.OutstandingRegistrations.get -> int
+AsyncResponse.AsyncResponseRecoveryStats.OutstandingRegistrations.init -> void
+AsyncResponse.AsyncResponseRecoveryStats.Stale.get -> int
+AsyncResponse.AsyncResponseRecoveryStats.Stale.init -> void
+AsyncResponse.AsyncResponseRecoveryStats.UnknownAge.get -> int
+AsyncResponse.AsyncResponseRecoveryStats.UnknownAge.init -> void
+AsyncResponse.AsyncResponseRecoveryStats.WithLiveWaiter.get -> int
+AsyncResponse.AsyncResponseRecoveryStats.WithLiveWaiter.init -> void
+AsyncResponse.AsyncResponseStaleRecoveryEntry
+AsyncResponse.AsyncResponseStaleRecoveryEntry.<Clone>$() -> AsyncResponse.AsyncResponseStaleRecoveryEntry!
+AsyncResponse.AsyncResponseStaleRecoveryEntry.AsyncResponseStaleRecoveryEntry(string? CorrelationId, string? PayloadType, System.DateTime? RegisteredAtUtc) -> void
+AsyncResponse.AsyncResponseStaleRecoveryEntry.CorrelationId.get -> string?
+AsyncResponse.AsyncResponseStaleRecoveryEntry.CorrelationId.init -> void
+AsyncResponse.AsyncResponseStaleRecoveryEntry.Deconstruct(out string? CorrelationId, out string? PayloadType, out System.DateTime? RegisteredAtUtc) -> void
+AsyncResponse.AsyncResponseStaleRecoveryEntry.Equals(AsyncResponse.AsyncResponseStaleRecoveryEntry? other) -> bool
+AsyncResponse.AsyncResponseStaleRecoveryEntry.PayloadType.get -> string?
+AsyncResponse.AsyncResponseStaleRecoveryEntry.PayloadType.init -> void
+AsyncResponse.AsyncResponseStaleRecoveryEntry.RegisteredAtUtc.get -> System.DateTime?
+AsyncResponse.AsyncResponseStaleRecoveryEntry.RegisteredAtUtc.init -> void
 AsyncResponse.AsyncResponseTypeResolution
 AsyncResponse.AsyncResponseWatchdogOptions
 AsyncResponse.AsyncResponseWatchdogOptions.AsyncResponseWatchdogOptions() -> void
@@ -102,12 +127,10 @@ AsyncResponse.RecoveryStateObservation.PayloadTypeFullName.init -> void
 AsyncResponse.RecoveryStateObservation.RecoveryStateObservation(string? CorrelationId, System.DateTime? RegisteredAtUtc, long ActiveSubscribers, string? PayloadTypeFullName) -> void
 AsyncResponse.RecoveryStateObservation.RegisteredAtUtc.get -> System.DateTime?
 AsyncResponse.RecoveryStateObservation.RegisteredAtUtc.init -> void
-const AsyncResponse.AsyncResponseDiagnostics.ActivitySourceName = "AsyncResponse" -> string!
-const AsyncResponse.AsyncResponseDiagnostics.MeterName = "AsyncResponse" -> string!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList
-Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(string! serviceInterfaceFullName) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(System.Func<string!, string!, bool>! predicate) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(System.Type! serviceType) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
+Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(string! serviceInterfaceFullName) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow<TService>() -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AsyncResponseCallbackAllowList() -> void
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions
@@ -115,6 +138,14 @@ Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExten
 Microsoft.Extensions.DependencyInjection.AsyncResponseHealthCheckExtensions
 Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder
 Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder.Services.get -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+const AsyncResponse.AsyncResponseDiagnostics.ActivitySourceName = "AsyncResponse" -> string!
+const AsyncResponse.AsyncResponseDiagnostics.MeterName = "AsyncResponse" -> string!
+override AsyncResponse.AsyncResponseRecoveryStats.Equals(object? obj) -> bool
+override AsyncResponse.AsyncResponseRecoveryStats.GetHashCode() -> int
+override AsyncResponse.AsyncResponseRecoveryStats.ToString() -> string!
+override AsyncResponse.AsyncResponseStaleRecoveryEntry.Equals(object? obj) -> bool
+override AsyncResponse.AsyncResponseStaleRecoveryEntry.GetHashCode() -> int
+override AsyncResponse.AsyncResponseStaleRecoveryEntry.ToString() -> string!
 override AsyncResponse.AsyncResponseWatchdogReport.Equals(object? obj) -> bool
 override AsyncResponse.AsyncResponseWatchdogReport.GetHashCode() -> int
 override AsyncResponse.AsyncResponseWatchdogReport.ToString() -> string!
@@ -124,6 +155,11 @@ override AsyncResponse.AsyncResponseWatchdogSnapshot.ToString() -> string!
 override AsyncResponse.RecoveryStateObservation.Equals(object? obj) -> bool
 override AsyncResponse.RecoveryStateObservation.GetHashCode() -> int
 override AsyncResponse.RecoveryStateObservation.ToString() -> string!
+static AsyncResponse.AsyncResponseJsonSerialization.RegisterResolver(System.Text.Json.Serialization.Metadata.IJsonTypeInfoResolver! resolver) -> void
+static AsyncResponse.AsyncResponseRecoveryStats.operator !=(AsyncResponse.AsyncResponseRecoveryStats? left, AsyncResponse.AsyncResponseRecoveryStats? right) -> bool
+static AsyncResponse.AsyncResponseRecoveryStats.operator ==(AsyncResponse.AsyncResponseRecoveryStats? left, AsyncResponse.AsyncResponseRecoveryStats? right) -> bool
+static AsyncResponse.AsyncResponseStaleRecoveryEntry.operator !=(AsyncResponse.AsyncResponseStaleRecoveryEntry? left, AsyncResponse.AsyncResponseStaleRecoveryEntry? right) -> bool
+static AsyncResponse.AsyncResponseStaleRecoveryEntry.operator ==(AsyncResponse.AsyncResponseStaleRecoveryEntry? left, AsyncResponse.AsyncResponseStaleRecoveryEntry? right) -> bool
 static AsyncResponse.AsyncResponseTypeResolution.RegisterAssembly(System.Reflection.Assembly! assembly) -> void
 static AsyncResponse.AsyncResponseTypeResolution.RegisterResolver(System.Func<string!, System.Type?>! resolver) -> void
 static AsyncResponse.AsyncResponseWatchdogReport.Evaluate(System.Collections.Generic.IReadOnlyCollection<AsyncResponse.RecoveryStateObservation!>! entries, System.DateTime utcNow, System.TimeSpan staleAfter) -> AsyncResponse.AsyncResponseWatchdogReport!
@@ -137,6 +173,7 @@ static Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizati
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions.AuthorizeCallbacks(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.AddAsyncResponse(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, System.Action<AsyncResponse.AsyncResponseOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithContextPropagator<TPropagator>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithDurableFlow<TFlow, TInput>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithDurableFlows<TFlowStateStore, TOptions>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<TOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithDurableFlows<TFlowStateStore>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithInMemoryChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.InMemoryAsyncResponseOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

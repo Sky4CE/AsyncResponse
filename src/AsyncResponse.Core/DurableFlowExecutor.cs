@@ -1,6 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Text.Json;
+using System.Diagnostics.CodeAnalysis;
 
 namespace AsyncResponse;
 
@@ -49,6 +49,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
     private readonly ILogger<DurableFlowExecutor> _logger;
+    private readonly Dictionary<string, DurableFlowRegistration> _registrations;
 
     /// <summary>Creates the flow executor.</summary>
     public DurableFlowExecutor(
@@ -58,7 +59,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         IRecoverableAsyncResponseSubscriber? recoverableSubscriber,
         AsyncResponseContextPropagation propagation,
         DurableFlowOptions options,
-        ILogger<DurableFlowExecutor> logger)
+        ILogger<DurableFlowExecutor> logger,
+        IEnumerable<DurableFlowRegistration>? registrations = null)
     {
         _scopeFactory = scopeFactory;
         _builder = builder;
@@ -68,6 +70,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
+        _registrations = new Dictionary<string, DurableFlowRegistration>(StringComparer.Ordinal);
+        foreach (var registration in registrations ?? [])
+        {
+            // Last registration wins, matching DI's usual override semantics.
+            _registrations[registration.FlowTypeFullName] = registration;
+        }
     }
 
     /// <inheritdoc />
@@ -221,7 +229,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     return false;
 
                 pending.Value.Completed = true;
-                pending.Value.ResultJson = JsonSerializer.Serialize(payload, payload.GetType());
+                pending.Value.ResultJson = AsyncResponseJson.Serialize(payload, payload.GetType());
                 pending.Value.PendingCorrelationId = null;
                 pending.Value.Faulted = false;
                 pending.Value.Message = "Terminal response recovered after subscriber loss.";
@@ -299,31 +307,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         FlowState state,
         FlowExecutionLease lease)
     {
-        var flowType = ResolveType(state.FlowTypeName, "flow");
-        var inputType = ResolveType(state.InputTypeName, "input");
-        var input = state.InputJson is null ? null : JsonSafety.SafeDeserialize(state.InputJson, inputType);
-
-        var contract = typeof(IDurableFlow<>).MakeGenericType(inputType);
-
-        object flow;
-        try
-        {
-            flow = serviceProvider.GetRequiredService(flowType);
-        }
-        catch (InvalidOperationException ex)
-        {
-            throw new InvalidOperationException(
-                $"Durable flow type '{flowType.FullName}' is not registered in DI. Register the class itself " +
-                $"(e.g. services.AddScoped<{flowType.Name}>()) so the flow can be resolved on execute and resume.", ex);
-        }
-
-        if (!contract.IsInstanceOfType(flow))
-        {
-            throw new InvalidOperationException(
-                $"Durable flow type '{flowType.FullName}' does not implement IDurableFlow<{inputType.Name}> " +
-                "matching the persisted input type; the flow state was written by an incompatible flow definition.");
-        }
-
         var context = new DurableFlowContext(
             state,
             store,
@@ -334,6 +317,52 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             _recoverableSubscriber,
             _logger,
             lease);
+
+        // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
+        // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
+        // Native AOT apps rely on.
+        if (state.FlowTypeName is not null && _registrations.TryGetValue(state.FlowTypeName, out var registration))
+        {
+            var flow = ResolveFlowFromDi(serviceProvider, registration.FlowType);
+            var input = state.InputJson is null ? null : registration.DeserializeInput(state.InputJson);
+            await registration.ExecuteAsync(flow, context, input).ConfigureAwait(false);
+            await context.FlushProgressAsync().ConfigureAwait(false);
+            return context.IsSuspended;
+        }
+
+        return await InvokeFlowByReflectionAsync(serviceProvider, state, context).ConfigureAwait(false);
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026",
+        Justification = "Reflection fallback for flows not registered via WithDurableFlow<TFlow, TInput>(). In a trimmed app an " +
+                        "unregistered flow fails closed here with an actionable error telling the operator to register it; nothing " +
+                        "is silently misexecuted.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2075",
+        Justification = "Same fallback contract: the flow type and IDurableFlow<TInput> instantiation exist whenever the app " +
+                        "actually defines and starts the flow; otherwise resolution fails closed with guidance.")]
+    [UnconditionalSuppressMessage("AOT", "IL3050",
+        Justification = "MakeGenericType over the flow's input type re-materializes an interface instantiation the user's flow " +
+                        "class already implements statically; flows whose types were trimmed fail closed with guidance to use " +
+                        "WithDurableFlow<TFlow, TInput>().")]
+    private async Task<bool> InvokeFlowByReflectionAsync(
+        IServiceProvider serviceProvider,
+        FlowState state,
+        DurableFlowContext context)
+    {
+        var flowType = ResolveType(state.FlowTypeName, "flow");
+        var inputType = ResolveType(state.InputTypeName, "input");
+        var input = state.InputJson is null ? null : JsonSafety.SafeDeserialize(state.InputJson, inputType);
+
+        var contract = typeof(IDurableFlow<>).MakeGenericType(inputType);
+
+        var flow = ResolveFlowFromDi(serviceProvider, flowType);
+        if (!contract.IsInstanceOfType(flow))
+        {
+            throw new InvalidOperationException(
+                $"Durable flow type '{flowType.FullName}' does not implement IDurableFlow<{inputType.Name}> " +
+                "matching the persisted input type; the flow state was written by an incompatible flow definition.");
+        }
+
         var execute = contract.GetMethod(nameof(IDurableFlow<object>.ExecuteAsync))!;
         try
         {
@@ -347,6 +376,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // DurableFlowFailedException handling (and user-visible stack traces) see the real one.
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
             throw;
+        }
+    }
+
+    private static object ResolveFlowFromDi(IServiceProvider serviceProvider, Type flowType)
+    {
+        try
+        {
+            return serviceProvider.GetRequiredService(flowType);
+        }
+        catch (InvalidOperationException ex)
+        {
+            throw new InvalidOperationException(
+                $"Durable flow type '{flowType.FullName}' is not registered in DI. Register it with " +
+                $"WithDurableFlow<{flowType.Name}, TInput>() (or services.AddScoped<{flowType.Name}>()) so the flow can be " +
+                "resolved on execute and resume.", ex);
         }
     }
 

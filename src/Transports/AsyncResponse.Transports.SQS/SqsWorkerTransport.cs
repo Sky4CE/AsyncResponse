@@ -102,7 +102,7 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IAsyncDisposable
             var queueUrl = await GetQueueUrlAsync(cancellationToken).ConfigureAwait(false);
             var message = new SqsOutboundMessage(
                 queueUrl,
-                JsonSerializer.Serialize(job),
+                AsyncResponseJson.Serialize(job),
                 string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId,
                 MessageGroupId: _isFifoQueue
                     ? (string.IsNullOrWhiteSpace(job.CorrelationId) ? _options.FifoMessageGroupIdFallback : job.CorrelationId)

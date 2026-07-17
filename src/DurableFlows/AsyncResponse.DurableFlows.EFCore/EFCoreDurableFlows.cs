@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using AsyncResponse;
 using AsyncResponse.DurableFlows.EFCore;
 using AsyncResponse.DurableFlows.Internal;
@@ -23,7 +24,7 @@ namespace Microsoft.Extensions.DependencyInjection
         /// flow executions therefore never share a <see cref="DbContext"/> instance.
         /// </para>
         /// </summary>
-        public static AsyncResponseRegistrationBuilder WithEFCoreDurableFlows<TContext>(
+        public static AsyncResponseRegistrationBuilder WithEFCoreDurableFlows<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext>(
             this AsyncResponseRegistrationBuilder builder,
             Action<EFCoreDurableFlowOptions>? configure = null)
             where TContext : DbContext
@@ -127,7 +128,7 @@ public static class EFCoreDurableFlowModelBuilderExtensions
 /// application-owned <typeparamref name="TContext"/>. Requires a relational provider
 /// (deletes and updates use <c>ExecuteDeleteAsync</c>/<c>ExecuteUpdateAsync</c>).
 /// </summary>
-public sealed class EFCoreFlowStateStore<TContext> : IFlowStateStore
+public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext> : IFlowStateStore
     where TContext : DbContext
 {
     private readonly IServiceScopeFactory _scopeFactory;

@@ -96,7 +96,7 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 
         try
         {
-            var payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(job));
+            var payload = Encoding.UTF8.GetBytes(AsyncResponseJson.Serialize(job));
             var properties = RabbitMqTopology.CreatePersistentJsonProperties(job.CorrelationId, _options.CorrelationIdHeader);
             var channel = await GetChannelAsync(cancellationToken).ConfigureAwait(false);
             await channel.BasicPublishAsync(
