@@ -60,6 +60,15 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
 {
     private readonly SqliteDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
+
+    // SQLite allows exactly one writer at a time, and its cross-connection busy handler is a
+    // poll loop, not a queue: under heavy concurrency on a slow machine an unlucky writer can
+    // lose every poll until the busy timeout expires ('database is locked' storms on 2-core CI
+    // runners). Serializing this process's writers through a real FIFO gate costs no throughput
+    // (they would serialize inside SQLite anyway) and makes in-process contention
+    // starvation-free; the busy timeout then only covers cross-process writers. Reads stay
+    // concurrent (WAL).
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private long _lastPruneTicks;
     private bool _created;
 
@@ -124,7 +133,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.Parameters.AddWithValue("$expires_at_utc", now.Add(ttl));
         command.Parameters.AddWithValue("$now_utc", now);
         command.Parameters.AddWithValue("$revision", state.Revision);
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+        return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false) > 0;
     }
 
     public async Task<bool> TryUpdateAsync(
@@ -160,7 +169,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.Parameters.AddWithValue("$expected_revision", expectedRevision);
         command.Parameters.AddWithValue("$now_utc", now);
         command.Parameters.AddWithValue("$lease_id", (object?)leaseId ?? DBNull.Value);
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+        return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false) > 0;
     }
 
     public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
@@ -177,7 +186,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.CommandText = $"UPDATE {Table} SET lease_id = NULL, lease_expires_at_utc = NULL WHERE flow_id = $flow_id AND lease_id = $lease_id;";
         command.Parameters.AddWithValue("$flow_id", flowId);
         command.Parameters.AddWithValue("$lease_id", leaseId);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
@@ -189,7 +198,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         await using var command = connection.CreateCommand();
         command.CommandText = $"DELETE FROM {Table} WHERE flow_id = $flow_id;";
         command.Parameters.AddWithValue("$flow_id", flowId);
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+        return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false) > 0;
     }
 
     private async Task PruneExpiredAsync(CancellationToken cancellationToken)
@@ -199,7 +208,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         await using var command = connection.CreateCommand();
         command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= $now_utc;";
         command.Parameters.AddWithValue("$now_utc", DateTime.UtcNow);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
@@ -236,7 +245,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
                 );
                 CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -273,7 +282,20 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         command.Parameters.AddWithValue("$lease_id", leaseId);
         command.Parameters.AddWithValue("$lease_expires_at_utc", now.Add(leaseDuration));
         command.Parameters.AddWithValue("$now_utc", now);
-        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+        return await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    private async Task<int> ExecuteWriteAsync(SqliteCommand command, CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)

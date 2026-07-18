@@ -155,7 +155,7 @@ public sealed class DurableFlowStateStoreExampleTests
         await using var database = new TempSqliteDatabase();
         var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
         {
-            ConnectionString = database.ConnectionString + ";Default Timeout=10"
+            ConnectionString = database.ConnectionString + ";Default Timeout=60"
         }));
 
         await Parallel.ForEachAsync(
@@ -177,7 +177,7 @@ public sealed class DurableFlowStateStoreExampleTests
         await using var database = new TempSqliteDatabase();
         var store = new SqliteFlowStateStore(Options.Create(new SqliteDurableFlowOptions
         {
-            ConnectionString = database.ConnectionString + ";Default Timeout=10"
+            ConnectionString = database.ConnectionString + ";Default Timeout=60"
         }));
 
         var creates = await Task.WhenAll(Enumerable.Range(0, 32).Select(_ =>
@@ -482,7 +482,7 @@ public sealed class DurableFlowStateStoreExampleTests
         services.AddAsyncResponse()
             .WithInMemoryChannel()
             .WithInMemoryTransport()
-            .WithSqliteDurableFlows(options => options.ConnectionString = connectionString + ";Default Timeout=10");
+            .WithSqliteDurableFlows(options => options.ConnectionString = connectionString + ";Default Timeout=60");
         return services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
     }
 

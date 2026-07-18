@@ -89,7 +89,7 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         await using var database = new TempSqliteDatabase();
         await database.EnsureSchemaAsync();
-        await using var provider = BuildScopedContextProvider(database.ConnectionString + ";Default Timeout=10");
+        await using var provider = BuildScopedContextProvider(database.ConnectionString + ";Default Timeout=60");
 
         await RunStormAsync(CreateStore(provider));
     }
@@ -99,7 +99,7 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         await using var database = new TempSqliteDatabase();
         await database.EnsureSchemaAsync();
-        await using var provider = BuildFactoryProvider(database.ConnectionString + ";Default Timeout=10");
+        await using var provider = BuildFactoryProvider(database.ConnectionString + ";Default Timeout=60");
 
         await RunStormAsync(CreateStore(provider));
     }
@@ -109,7 +109,7 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         await using var database = new TempSqliteDatabase();
         await database.EnsureSchemaAsync();
-        await using var provider = BuildFactoryProvider(database.ConnectionString + ";Default Timeout=10");
+        await using var provider = BuildFactoryProvider(database.ConnectionString + ";Default Timeout=60");
         var store = CreateStore(provider);
 
         // Eight flow ids, each hammered by eight concurrent creates: losers return false instead of
