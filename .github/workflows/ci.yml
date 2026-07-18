@@ -108,10 +108,18 @@ jobs:
             8.0.x
             10.0.x
 
-      - name: Test (unit)
+      # One TFM at a time: MTP runs multi-targeted test assemblies in parallel by default,
+      # which oversubscribes the 2-core runners and starves the suite's real-time tests
+      # (leases, watchdog scans, dispatch windows) — the source of rotating per-run flakes.
+      - name: Test (unit, net8.0)
         run: >
           dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj
-          --configuration Release
+          --configuration Release --framework net8.0
+
+      - name: Test (unit, net10.0)
+        run: >
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj
+          --configuration Release --framework net10.0
 
   aot-smoke:
     # The end-to-end proof behind the packages' IsAotCompatible=true claim: publish the smoke

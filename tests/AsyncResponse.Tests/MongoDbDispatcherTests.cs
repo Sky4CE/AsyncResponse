@@ -295,7 +295,9 @@ public sealed class MongoDbDispatcherTests
             (_, _) =>
             {
                 entered.Set();
-                release.Wait(TimeSpan.FromSeconds(5));
+                // Held while the test overflows the queue; must not lapse early on a
+                // starved runner or the overflow scenario silently collapses.
+                release.Wait(TimeSpan.FromSeconds(30));
                 return Task.CompletedTask;
             },
             new MongoDbAsyncResponseTransportOptions(),
@@ -304,7 +306,7 @@ public sealed class MongoDbDispatcherTests
             MongoDbSubscriberRole.Worker);
 
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
-        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(30)));
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
 

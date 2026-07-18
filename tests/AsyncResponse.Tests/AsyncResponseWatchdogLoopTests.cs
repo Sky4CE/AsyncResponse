@@ -12,7 +12,9 @@ namespace AsyncResponse.Tests;
 /// </summary>
 public class AsyncResponseWatchdogLoopTests
 {
-    private static readonly TimeSpan PublishTimeout = TimeSpan.FromSeconds(5);
+    // Generous: this is a wait-until budget (loops exit the moment the snapshot publishes,
+    // so healthy runs stay fast), and 5s starved out on oversubscribed 2-core CI runners.
+    private static readonly TimeSpan PublishTimeout = TimeSpan.FromSeconds(30);
 
     [Fact]
     public async Task Disabled_DoesNotScanOrPublish()
