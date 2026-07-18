@@ -344,6 +344,12 @@ public sealed class EFCoreDurableFlowStateStoreTests
         {
             await using var context = CreateContext();
             await context.Database.EnsureCreatedAsync();
+
+            // WAL keeps readers from blocking behind writers; without it the concurrent-storm
+            // test hits SQLITE_BUSY on slow CI disks. The EFCore store is provider-agnostic, so
+            // journal mode is the schema owner's job — which in these tests is this helper
+            // (persistent per database file, one-time cost).
+            await context.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
         }
 
         public async Task<int> CountRowsAsync(string flowId)
@@ -365,12 +371,15 @@ public sealed class EFCoreDurableFlowStateStoreTests
         {
             // Pooling is disabled in the connection string, so the last closed context already
             // released the file handle; deletion stays best-effort temp hygiene regardless.
-            try
+            foreach (var file in new[] { _path, _path + "-wal", _path + "-shm" })
             {
-                File.Delete(_path);
-            }
-            catch (IOException)
-            {
+                try
+                {
+                    File.Delete(file);
+                }
+                catch (IOException)
+                {
+                }
             }
 
             return ValueTask.CompletedTask;

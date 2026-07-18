@@ -472,12 +472,15 @@ public sealed class RemainingCoverageTests
         {
             // Pooling is disabled in the connection string, so the last closed context already
             // released the file handle; deletion stays best-effort temp hygiene regardless.
-            try
+            foreach (var file in new[] { _path, _path + "-wal", _path + "-shm" })
             {
-                File.Delete(_path);
-            }
-            catch (IOException)
-            {
+                try
+                {
+                    File.Delete(file);
+                }
+                catch (IOException)
+                {
+                }
             }
 
             return ValueTask.CompletedTask;

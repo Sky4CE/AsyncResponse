@@ -237,6 +237,12 @@ builder.Services.AddAsyncResponse()
 
 ### SQLite
 
+> The store sets `PRAGMA journal_mode=WAL` when it auto-creates the schema: concurrent flow
+> executors on one node are exactly the workload WAL exists for (readers never block behind a
+> writer). The mode persists in the database file. If you provision the database yourself
+> (`AutoCreateSchema = false`) — or host the EF Core store on SQLite — run the pragma once when
+> creating the file.
+
 SQLite is a useful one-node durable option: the ledger survives restarts without a separate server,
 but the file remains local to one host.
 

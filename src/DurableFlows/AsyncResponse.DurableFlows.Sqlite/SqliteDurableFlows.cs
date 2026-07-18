@@ -217,6 +217,14 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
             await using var command = connection.CreateCommand();
             command.CommandText =
                 $"""
+                -- WAL is the right journal mode for this store's use case (concurrent flow
+                -- executors on one node): readers never block behind a writer, which rollback
+                -- journal mode does not guarantee — concurrent load/save storms on slow disks
+                -- surface as SQLITE_BUSY 'database is locked' there. The mode is persistent in
+                -- the database file, so setting it alongside the schema costs nothing per
+                -- operation. Manually-provisioned databases (AutoCreateSchema=false) should set
+                -- it themselves — see docs/durable-flow-state-stores.md.
+                PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS {Table} (
                     flow_id TEXT NOT NULL PRIMARY KEY,
                     state_json TEXT NOT NULL,
