@@ -1,4 +1,5 @@
 using AsyncResponse.DurableFlows.EFCore;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -333,11 +334,13 @@ public sealed class EFCoreDurableFlowStateStoreTests
     {
         private readonly string _path = Path.Combine(Path.GetTempPath(), $"ar-efcore-flow-state-{Guid.NewGuid():N}.db");
 
-        // Pooling=False: every closed connection releases its file handle immediately, so
-        // cleanup can delete the temp database on Windows and no process-wide pool state
-        // couples parallel tests (SqliteConnection.ClearAllPools() here previously flushed
-        // OTHER tests' idle connections mid-run and manifested as 'database is locked').
-        public string ConnectionString => $"Data Source={_path};Pooling=False";
+        // Default (pooled) connections on purpose: with WAL, pooling keeps the shared-memory
+        // index warm and write locks microsecond-scale. Pooling=False looked like the clean
+        // fix for Windows file-lock cleanup, but it makes every operation pay a full file
+        // open plus a WAL checkpoint on close — concurrent storms then exhaust their busy
+        // timeout on slow CI disks. Cleanup instead clears THIS database's pool (targeted,
+        // unlike the process-global ClearAllPools) before deleting the files.
+        public string ConnectionString => $"Data Source={_path}";
 
         /// <summary>Creates the state table — the store itself never runs DDL.</summary>
         public async Task EnsureSchemaAsync()
@@ -369,8 +372,9 @@ public sealed class EFCoreDurableFlowStateStoreTests
 
         public ValueTask DisposeAsync()
         {
-            // Pooling is disabled in the connection string, so the last closed context already
-            // released the file handle; deletion stays best-effort temp hygiene regardless.
+            // Release this database's pooled handles (targeted — other tests' pools are not
+            // touched), then best-effort delete the file and its WAL sidecars.
+            SqliteConnection.ClearPool(new SqliteConnection(ConnectionString));
             foreach (var file in new[] { _path, _path + "-wal", _path + "-shm" })
             {
                 try
