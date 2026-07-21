@@ -46,7 +46,7 @@
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
     <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.101.2" />
-    <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.61.0" />
+    <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.62.0" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.10" />
     <!-- Explicit native-lib pin overriding the older e_sqlite3 that Microsoft.Data.Sqlite bundles.
          Bump in step with Microsoft.Data.Sqlite above, matching the provider major/minor its
