@@ -84,9 +84,58 @@ var builder = DistributedApplication.CreateBuilder(args);
 builder.Services.Configure<LoggerFilterOptions>(options =>
     options.AddFilter("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.Critical));
 
+// --- SUT mode -------------------------------------------------------------------------------
+// "project" (default) runs the sample from source (JIT); "aot" runs the Native AOT-published
+// binary named by ASYNCRESPONSE_ITEST_SUT_PATH, so the *same* integration suite exercises the
+// fully trimmed app against the real broker fleet. Resource names are identical in both modes,
+// which is what keeps the test project completely unchanged.
+//
+// SUTs run natively only where the full driver stack is Native AOT-capable (vendor matrix in
+// docs/aot.md). Verified natively today: the NATS and PostgreSQL channel/transport pairs. Pinned
+// to JIT, each for a driver-level reason observed empirically in this harness:
+//  - MongoDB: MongoDB.Driver serializes BSON through reflection (not trim/AOT-compatible).
+//  - SqlServer: Microsoft.Data.SqlClient fails the TDS pre-login handshake in a native binary.
+//  - Every Redis-channel SUT (including all broker-transport variants, which pair with the Redis
+//    channel): StackExchange.Redis 3.x throws MissingFieldException('_invocationList') under
+//    Native AOT — its net8+ Delegates helper UnsafeAccessor-reads CoreCLR's MulticastDelegate
+//    internals, which do not exist in the Native AOT runtime. Revisit when fixed upstream; a
+//    channel-remap mode (PostgreSQL channel under the broker transports) could verify the
+//    transports natively before then.
+var sutMode = Env("ASYNCRESPONSE_ITEST_SUT", "project").ToLowerInvariant();
+var sutAotPath = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_SUT_PATH");
+
+IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapable = true, params IResourceBuilder<IResource>[] waitFor)
+{
+    if (string.Equals(sutMode, "aot", StringComparison.Ordinal) && aotCapable)
+    {
+        if (string.IsNullOrWhiteSpace(sutAotPath) || !File.Exists(sutAotPath))
+        {
+            throw new InvalidOperationException(
+                "ASYNCRESPONSE_ITEST_SUT=aot requires ASYNCRESPONSE_ITEST_SUT_PATH to point at the published Native AOT " +
+                "sample binary (dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj -c Release -o <dir>).");
+        }
+
+        // Executables do not get the automatic ASP.NET endpoint wiring projects get; binding the
+        // allocated port through ASPNETCORE_HTTP_PORTS keeps Kestrel on the proxied endpoint.
+        var exe = builder.AddExecutable(name, sutAotPath, Path.GetDirectoryName(Path.GetFullPath(sutAotPath))!)
+            .WithHttpEndpoint(env: "ASPNETCORE_HTTP_PORTS")
+            .WithHttpHealthCheck("/alive");
+        foreach (var dependency in waitFor)
+            exe.WaitFor(dependency);
+        return exe;
+    }
+
+    var project = builder.AddProject<Projects.AsyncResponse_Sample>(name, launchProfileName: null)
+        .WithHttpEndpoint()
+        .WithHttpHealthCheck("/alive");
+    foreach (var dependency in waitFor)
+        project.WaitFor(dependency);
+    return project;
+}
+
 // The Redis channel + transport speak RESP via StackExchange.Redis, so they run unchanged on
 // Redis-compatible servers. The CI compatibility matrix overrides the image via these env vars to run
-// the whole Redis-backed suite against Valkey; the default is the official Redis. Only servers that
+// the focused Redis suite against Valkey; the default is the official Redis. Only servers that
 // share the redis docker-entrypoint.sh + *-server launch contract work through this override — Valkey
 // does. Dragonfly (different container entrypoint) and Garnet (no stream commands) are not drop-ins for
 // this harness and are validated separately (see docs/configuration.md#redis-compatible-servers).
@@ -97,6 +146,49 @@ if (Env("ASYNCRESPONSE_ITEST_REDIS_IMAGE", "") is { Length: > 0 } redisImage)
         redis = redis.WithImageRegistry(redisRegistry);
     redis = redis.WithImage(redisImage, Env("ASYNCRESPONSE_ITEST_REDIS_TAG", "latest"));
 }
+
+IResourceBuilder<IResourceWithEnvironment> AddRedisTransportApp(string name, bool earlyAck)
+{
+    var keyPrefix = earlyAck ? RedisTransportEarlyAckKeyPrefix : RedisTransportKeyPrefix;
+    var consumerGroupSuffix = earlyAck ? "-earlyack" : "";
+    var app = AddSutApp(name, aotCapable: false, waitFor: [redis])
+        .WithReference(redis)
+        .WithEnvironment("AsyncResponse:KeyPrefix", keyPrefix)
+        .WithEnvironment("AsyncResponse:Channel", "Redis")
+        .WithEnvironment("AsyncResponse:Transport", "Redis")
+        .WithEnvironment("Redis:KeyPrefix", keyPrefix)
+        .WithEnvironment("Redis:WorkerConsumerGroup", $"asyncresponse-itest-redis-workers{consumerGroupSuffix}")
+        .WithEnvironment("Redis:ResponseConsumerGroup", $"asyncresponse-itest-redis-responses{consumerGroupSuffix}")
+        .WithEnvironment("Redis:StreamMaxLength", Env("ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH", "100000"))
+        .WithEnvironment("Redis:PublishMaxAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS", "3"))
+        .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+        .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
+        .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
+        .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"));
+
+    if (earlyAck)
+    {
+        app.WithEnvironment("Redis:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE", "AckAfterEnqueue"))
+            .WithEnvironment("Redis:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS", "4"))
+            .WithEnvironment("Redis:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY", "256"))
+            .WithEnvironment("Redis:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_DRAIN_SECONDS", "10"))
+            .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30");
+    }
+
+    return app;
+}
+
+// The compatibility profile intentionally excludes every unrelated broker and database. This keeps a
+// Redis/Valkey signal from failing because SQL Server, Kafka, Oracle, or another heavyweight fixture
+// exhausts a hosted runner or loses a transient port race.
+if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", StringComparison.OrdinalIgnoreCase))
+{
+    AddRedisTransportApp("itest-app-redis", earlyAck: false);
+    AddRedisTransportApp("itest-app-redis-early-ack", earlyAck: true);
+    builder.Build().Run();
+    return;
+}
+
 var rabbitmq = builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
     .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
     .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");
@@ -237,55 +329,6 @@ var sqlServerEndpoint = sqlserver.GetEndpoint("sqlserver");
 var sqlServerConnectionString = ReferenceExpression.Create(
     $"Server={sqlServerEndpoint.Property(EndpointProperty.Host)},{sqlServerEndpoint.Property(EndpointProperty.Port)};User ID=sa;Password={sqlServerPassword};Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=120");
 
-// --- SUT mode -------------------------------------------------------------------------------
-// "project" (default) runs the sample from source (JIT); "aot" runs the Native AOT-published
-// binary named by ASYNCRESPONSE_ITEST_SUT_PATH, so the *same* integration suite exercises the
-// fully trimmed app against the real broker fleet. Resource names are identical in both modes,
-// which is what keeps the test project completely unchanged.
-//
-// SUTs run natively only where the full driver stack is Native AOT-capable (vendor matrix in
-// docs/aot.md). Verified natively today: the NATS and PostgreSQL channel/transport pairs. Pinned
-// to JIT, each for a driver-level reason observed empirically in this harness:
-//  - MongoDB: MongoDB.Driver serializes BSON through reflection (not trim/AOT-compatible).
-//  - SqlServer: Microsoft.Data.SqlClient fails the TDS pre-login handshake in a native binary.
-//  - Every Redis-channel SUT (including all broker-transport variants, which pair with the Redis
-//    channel): StackExchange.Redis 3.x throws MissingFieldException('_invocationList') under
-//    Native AOT — its net8+ Delegates helper UnsafeAccessor-reads CoreCLR's MulticastDelegate
-//    internals, which do not exist in the Native AOT runtime. Revisit when fixed upstream; a
-//    channel-remap mode (PostgreSQL channel under the broker transports) could verify the
-//    transports natively before then.
-var sutMode = Env("ASYNCRESPONSE_ITEST_SUT", "project").ToLowerInvariant();
-var sutAotPath = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_SUT_PATH");
-
-IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapable = true, params IResourceBuilder<IResource>[] waitFor)
-{
-    if (string.Equals(sutMode, "aot", StringComparison.Ordinal) && aotCapable)
-    {
-        if (string.IsNullOrWhiteSpace(sutAotPath) || !File.Exists(sutAotPath))
-        {
-            throw new InvalidOperationException(
-                "ASYNCRESPONSE_ITEST_SUT=aot requires ASYNCRESPONSE_ITEST_SUT_PATH to point at the published Native AOT " +
-                "sample binary (dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj -c Release -o <dir>).");
-        }
-
-        // Executables do not get the automatic ASP.NET endpoint wiring projects get; binding the
-        // allocated port through ASPNETCORE_HTTP_PORTS keeps Kestrel on the proxied endpoint.
-        var exe = builder.AddExecutable(name, sutAotPath, Path.GetDirectoryName(Path.GetFullPath(sutAotPath))!)
-            .WithHttpEndpoint(env: "ASPNETCORE_HTTP_PORTS")
-            .WithHttpHealthCheck("/alive");
-        foreach (var dependency in waitFor)
-            exe.WaitFor(dependency);
-        return exe;
-    }
-
-    var project = builder.AddProject<Projects.AsyncResponse_Sample>(name, launchProfileName: null)
-        .WithHttpEndpoint()
-        .WithHttpHealthCheck("/alive");
-    foreach (var dependency in waitFor)
-        project.WaitFor(dependency);
-    return project;
-}
-
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. AddSutApp owns the endpoint and the /alive health
 // check, and switches between project (JIT) and Native AOT binary per ASYNCRESPONSE_ITEST_SUT.
@@ -405,40 +448,8 @@ AddSutApp("itest-app-sqs-early-ack", aotCapable: false, waitFor: [redis, localst
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "SQS");
 
-AddSutApp("itest-app-redis", aotCapable: false, waitFor: [redis])
-    .WithReference(redis)
-    .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportKeyPrefix)
-    .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "Redis")
-    .WithEnvironment("Redis:KeyPrefix", RedisTransportKeyPrefix)
-    .WithEnvironment("Redis:WorkerConsumerGroup", "asyncresponse-itest-redis-workers")
-    .WithEnvironment("Redis:ResponseConsumerGroup", "asyncresponse-itest-redis-responses")
-    .WithEnvironment("Redis:StreamMaxLength", Env("ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH", "100000"))
-    .WithEnvironment("Redis:PublishMaxAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS", "3"))
-    .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
-    .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
-    .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"));
-
-AddSutApp("itest-app-redis-early-ack", aotCapable: false, waitFor: [redis])
-    .WithReference(redis)
-    .WithEnvironment("AsyncResponse:KeyPrefix", RedisTransportEarlyAckKeyPrefix)
-    .WithEnvironment("AsyncResponse:Channel", "Redis")
-    .WithEnvironment("AsyncResponse:Transport", "Redis")
-    .WithEnvironment("Redis:KeyPrefix", RedisTransportEarlyAckKeyPrefix)
-    .WithEnvironment("Redis:WorkerConsumerGroup", "asyncresponse-itest-redis-workers-earlyack")
-    .WithEnvironment("Redis:ResponseConsumerGroup", "asyncresponse-itest-redis-responses-earlyack")
-    .WithEnvironment("Redis:StreamMaxLength", Env("ASYNCRESPONSE_ITEST_REDIS_STREAM_MAX_LENGTH", "100000"))
-    .WithEnvironment("Redis:PublishMaxAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_PUBLISH_MAX_ATTEMPTS", "3"))
-    .WithEnvironment("Redis:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_ACK_MODE", "AckAfterEnqueue"))
-    .WithEnvironment("Redis:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_BACKGROUND_WORKERS", "4"))
-    .WithEnvironment("Redis:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_QUEUE_CAPACITY", "256"))
-    .WithEnvironment("Redis:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_WORKER_DRAIN_SECONDS", "10"))
-    .WithEnvironment("Redis:Worker:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
-    .WithEnvironment("Redis:Response:MaxDeliveryAttempts", Env("ASYNCRESPONSE_ITEST_REDIS_MAX_DELIVERY_ATTEMPTS", "5"))
-    .WithEnvironment("Redis:Worker:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithEnvironment("Redis:Response:PendingMessageMinIdleTimeSeconds", Env("ASYNCRESPONSE_ITEST_REDIS_PENDING_IDLE_SECONDS", "1"))
-    .WithEnvironment("Redis:HostShutdownTimeoutSeconds", "30");
+AddRedisTransportApp("itest-app-redis", earlyAck: false);
+AddRedisTransportApp("itest-app-redis-early-ack", earlyAck: true);
 
 // NATS channel + NATS transport on one connection. A single NATS server backs both the response
 // rendezvous (Core request/reply + JetStream KV recovery) and the worker/response transport (JetStream).
@@ -569,4 +580,3 @@ AddSutApp("itest-app-mongodb-early-ack", aotCapable: false, waitFor: [mongodb])
     .WithEnvironment("AsyncResponse:Transport", "MongoDB");
 
 builder.Build().Run();
-

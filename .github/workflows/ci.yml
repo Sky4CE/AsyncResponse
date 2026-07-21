@@ -4,9 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The Redis-compatible-server matrix (currently Valkey; Dragonfly and Garnet are validated outside
-  # this harness — see the redis-compat job) reruns the whole Docker-backed suite per server, so it
-  # runs weekly and on demand rather than on every push.
+  # Keep the focused Redis-compatible-server check on its weekly cadence in addition to pull requests
+  # and pushes to main. The other CI jobs skip this scheduled invocation.
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
@@ -36,12 +35,20 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
-      - name: Test (unit)
-        # .NET 10 Native MTP mode: parameters pass directly to Microsoft.Testing.Platform.
-        # An absolute results directory keeps output stable regardless of the test app's working directory.
+      # MTP otherwise executes both target frameworks concurrently. On the 2-core hosted runner that
+      # has repeatedly starved real-time durable-flow tests; keep the same coverage, one TFM at a time.
+      - name: Test (unit, net8.0)
         run: |
           dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
-            --configuration Release --no-build \
+            --configuration Release --framework net8.0 --no-build \
+            --report-trx \
+            --coverage \
+            --results-directory "${{ github.workspace }}/TestResults"
+
+      - name: Test (unit, net10.0)
+        run: |
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
+            --configuration Release --framework net10.0 --no-build \
             --report-trx \
             --coverage \
             --results-directory "${{ github.workspace }}/TestResults"
@@ -170,6 +177,17 @@ jobs:
       - name: Publish SUT (Native AOT)
         run: dotnet publish samples/AsyncResponse.Sample/AsyncResponse.Sample.csproj --configuration Release -o ./artifacts/sut-aot
 
+      - name: Reclaim hosted runner disk
+        # The full broker fleet exhausted the stock runner while Docker was extracting images. These
+        # SDKs are unrelated to this .NET job; remove them only from the disposable hosted runner.
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/swift \
+            /usr/local/.ghcup
+          df -h /
+
       - name: Restore
         run: dotnet restore tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj
 
@@ -184,6 +202,9 @@ jobs:
           # the in-suite publish gate would only repeat that work here. The plain integration job
           # keeps the gate active, so ILC-only regressions still fail CI (and local full runs).
           ASYNCRESPONSE_SKIP_AOT_GATE: "1"
+          # The regular integration job owns the Oracle and Cosmos store contracts. Avoid pulling
+          # those two large images again in the job whose distinct purpose is the Native AOT SUT.
+          ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: "true"
         run: |
           dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
             --configuration Release --no-build \
@@ -211,6 +232,17 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
+
+      - name: Reclaim hosted runner disk
+        # The real CI failures were ENOSPC while Docker extracted the broker/database fleet, not test
+        # timeouts. Keep the required .NET toolchain and remove unrelated preinstalled SDKs.
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/swift \
+            /usr/local/.ghcup
+          df -h /
 
       - name: Verify Docker
         run: docker version
@@ -240,23 +272,18 @@ jobs:
 
   redis-compat:
     # Validates that the Redis channel + transport (RESP via StackExchange.Redis) run unchanged on
-    # Redis-compatible servers. Overrides the AppHost "redis" container image and reruns the full
-    # integration suite against Valkey — most SUTs use the Redis channel, and itest-app-redis exercises
-    # the Redis Streams transport, so a single swap covers both roles.
+    # Redis-compatible servers. The profile boots only Valkey and the two Redis SUT variants, then
+    # runs the Redis channel + Streams transport tests. That keeps unrelated databases and brokers
+    # from turning this compatibility signal red.
     #
     # Only true drop-ins go here — servers whose image shares the redis `docker-entrypoint.sh` +
     # `*-server` launch contract that the Aspire Redis integration drives. Valkey qualifies. Dragonfly
     # and Garnet do NOT and are validated separately (see docs/configuration.md#redis-compatible-servers):
     # Dragonfly's RESP is compatible but its container entrypoint differs, so it is validated by direct
     # connection; Garnet has no stream commands, so it is a channel-only server.
-    # Gated to schedule/manual so it does not multiply per-push CI time.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # This focused matrix runs on each normal CI invocation and retains the weekly scheduled check.
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # Oracle + Cosmos back the opt-in durable-flow store contract tests only — nothing Redis-related —
-      # so the weekly matrix skips their (heavy) containers; the store tests then Assert.Skip cleanly.
-      ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -285,15 +312,18 @@ jobs:
         run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
 
       - name: Test (integration on ${{ matrix.server }})
-        # The AppHost reads these to swap its "redis" resource image; every Redis-backed SUT then runs
-        # against ${{ matrix.server }} instead of the official Redis image.
+        # The AppHost reads these to start its Redis-only profile on the compatible server image.
         env:
+          ASYNCRESPONSE_ITEST_PROFILE: redis-compat
           ASYNCRESPONSE_ITEST_REDIS_IMAGE: ${{ matrix.image }}
           ASYNCRESPONSE_ITEST_REDIS_TAG: ${{ matrix.tag }}
           ASYNCRESPONSE_ITEST_REDIS_REGISTRY: ${{ matrix.registry }}
         run: |
           dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
             --configuration Release --no-build \
+            --filter-class \
+              AsyncResponse.IntegrationTests.RedisChannelTests \
+              AsyncResponse.IntegrationTests.RedisTransportTests \
             --report-trx \
             --results-directory "${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}"
 

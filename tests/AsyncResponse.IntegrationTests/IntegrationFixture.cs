@@ -61,6 +61,26 @@ public sealed class IntegrationFixture : IAsyncLifetime
         _app = await appHost.BuildAsync().WaitAsync(StartupTimeout);
         await _app.StartAsync().WaitAsync(StartupTimeout);
 
+        if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", StringComparison.OrdinalIgnoreCase))
+        {
+            await _app.ResourceNotifications
+                .WaitForResourceHealthyAsync("itest-app-redis")
+                .WaitAsync(StartupTimeout);
+            await _app.ResourceNotifications
+                .WaitForResourceHealthyAsync("itest-app-redis-early-ack")
+                .WaitAsync(StartupTimeout);
+
+            // RedisChannelTests use the fixture's default client; in the focused profile the Redis
+            // channel is paired with the Redis transport instead of booting Pub/Sub just for that role.
+            Client = _app.CreateHttpClient("itest-app-redis");
+            RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
+            RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
+
+            await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
+            await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
+            return;
+        }
+
         // Wait until the SUT reports healthy (its /alive probe) — i.e. it has connected to Redis and the
         // emulator and provisioned its topics/subscriptions — before driving any scenario.
         await _app.ResourceNotifications

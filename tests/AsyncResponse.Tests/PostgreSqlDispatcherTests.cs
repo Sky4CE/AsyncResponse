@@ -409,7 +409,7 @@ public sealed class PostgreSqlDispatcherTests
 
         // The drain CTS must stay alive until the worker actually finishes: after the timed-out dispose the
         // cancelled handler still dead-letters through the background failure path (no ObjectDisposedException).
-        await WaitUntilAsync(() => calls.DeadLetter == 1);
+        await calls.DeadLettered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.False(calls.DeleteOriginalOnDeadLetter);
     }
 
@@ -451,6 +451,7 @@ public sealed class PostgreSqlDispatcherTests
             {
                 calls.DeadLetter++;
                 calls.DeleteOriginalOnDeadLetter = deleteOriginal;
+                calls.DeadLettered.TrySetResult();
                 return ValueTask.FromResult(calls.DeadLetterResult);
             });
 
@@ -472,6 +473,7 @@ public sealed class PostgreSqlDispatcherTests
         public int Ack;
         public int Nak;
         public int DeadLetter;
+        public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool DeleteOriginalOnDeadLetter;
         public bool DeadLetterResult;
         public TimeSpan LastNakDelay;
