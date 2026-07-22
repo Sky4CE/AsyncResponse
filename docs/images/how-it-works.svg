@@ -89,9 +89,9 @@
       .step { fill: #031128; font-size: 14px; font-weight: 800; }
       .motion-dot { opacity: 0.9; }
       .progress-line { animation: dash 6s linear infinite; }
-      .pulse { animation: pulse 2.8s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
-      @keyframes dash { to { stroke-dashoffset: -56; } }
-      @keyframes pulse { 0%, 100% { opacity: 0.62; transform: scale(0.92); } 50% { opacity: 1; transform: scale(1.08); } }
+      .pulse { animation: pulse 2.8s ease-in-out infinite; }
+      @keyframes dash { to { stroke-dashoffset: -57; } }
+      @keyframes pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
       @media (prefers-reduced-motion: reduce) {
         .progress-line, .pulse { animation: none; }
         .motion-dot { display: none; }
@@ -176,7 +176,8 @@
     <text x="777" y="301" class="flow-label">subscribe + save</text>
     <text x="777" y="318" class="flow-note code">RecoveryState</text>
     <circle r="4" fill="#9CF7FF" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="3.8s" repeatCount="indefinite" path="M241 304H691" />
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M241 304H691" keyPoints="0; 1; 1" keyTimes="0; 0.167; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 1" />
     </circle>
   </g>
 
@@ -187,7 +188,8 @@
     <text x="969" y="350" class="flow-label code" text-anchor="middle">run trigger</text>
     <text x="969" y="385" class="flow-note" text-anchor="middle">the request is sent only after subscription exists</text>
     <circle r="4" fill="#9DBEFF" class="motion-dot" filter="url(#glow)">
-      <animateMotion begin="0.9s" dur="3.8s" repeatCount="indefinite" path="M749 368H1190" />
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M749 368H1190" keyPoints="0; 0; 1; 1" keyTimes="0; 0.167; 0.333; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 0.333; 0.334; 1" />
     </circle>
   </g>
 
@@ -197,6 +199,20 @@
     <rect x="405" y="411" width="274" height="42" rx="21" fill="#2A2415" stroke="#BD9041" stroke-opacity="0.75" />
     <circle cx="427" cy="432" r="5" fill="#FFD166" class="pulse" />
     <text x="443" y="437" class="flow-label code" fill="#FFE7AD">Until(...) → keep waiting</text>
+    
+    <!-- Frequent Progress Message Stream Dots -->
+    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.333; 0.450; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.332; 0.333; 0.450; 0.451; 1" />
+    </circle>
+    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.433; 0.550; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.432; 0.433; 0.550; 0.551; 1" />
+    </circle>
+    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.533; 0.650; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.532; 0.533; 0.650; 0.651; 1" />
+    </circle>
   </g>
 
   <g>
@@ -206,7 +222,8 @@
     <path d="M449 496L455 502L466 490" fill="none" stroke="#5AF0B3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
     <text x="477" y="502" class="flow-label" fill="#B9FFE1">terminal payload wins</text>
     <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
-      <animateMotion begin="1.8s" dur="3.8s" repeatCount="indefinite" path="M1190 497H749" />
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 497H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.683; 0.833; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.682; 0.683; 0.833; 0.834; 1" />
     </circle>
   </g>
 
@@ -219,7 +236,8 @@
     <text x="777" y="557" class="flow-label" fill="#B9FFE1">complete the await</text>
     <text x="777" y="574" class="flow-note">and clean up the registration</text>
     <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
-      <animateMotion begin="2.7s" dur="3.8s" repeatCount="indefinite" path="M691 561H241" />
+      <animateMotion dur="6.0s" repeatCount="indefinite" path="M691 561H241" keyPoints="0; 0; 1; 1" keyTimes="0; 0.833; 1.0; 1.0" calcMode="linear" />
+      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1" keyTimes="0; 0.832; 0.833; 1.0" />
     </circle>
   </g>
 
