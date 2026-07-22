@@ -43,6 +43,24 @@
       <stop offset="0.48" stop-color="#71EFFF" />
       <stop offset="1" stop-color="#268DFF" />
     </linearGradient>
+
+    <!-- Fading Comet Trail Gradients -->
+    <linearGradient id="trailCyanL2R" x1="-42" y1="0" x2="0" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#52EDFF" stop-opacity="0" />
+      <stop offset="100%" stop-color="#77F1FF" stop-opacity="1" />
+    </linearGradient>
+    <linearGradient id="trailBlueL2R" x1="-42" y1="0" x2="0" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#377BFF" stop-opacity="0" />
+      <stop offset="100%" stop-color="#50DDF8" stop-opacity="1" />
+    </linearGradient>
+    <linearGradient id="trailAmberR2L" x1="0" y1="0" x2="42" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFD166" stop-opacity="1" />
+      <stop offset="100%" stop-color="#FFD166" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="trailMintR2L" x1="0" y1="0" x2="42" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5AF0B3" stop-opacity="1" />
+      <stop offset="100%" stop-color="#5AF0B3" stop-opacity="0" />
+    </linearGradient>
     <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
       <path d="M48 0H0V48" fill="none" stroke="#2E76A2" stroke-opacity="0.065" />
     </pattern>
@@ -175,10 +193,14 @@
     <rect x="759" y="282" width="250" height="46" rx="13" fill="#082746" stroke="#2DBFE9" stroke-opacity="0.5" />
     <text x="777" y="301" class="flow-label">subscribe + save</text>
     <text x="777" y="318" class="flow-note code">RecoveryState</text>
-    <circle r="4" fill="#9CF7FF" class="motion-dot" filter="url(#glow)">
+    <!-- Step 1 Glowing Energy Bullet + Comet Tail -->
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M241 304H691" keyPoints="0; 1; 1" keyTimes="0; 0.167; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 1" />
-    </circle>
+      <rect x="-42" y="-3.5" width="42" height="7" rx="3.5" fill="url(#trailCyanL2R)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="8" fill="#52EDFF" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="4" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
   </g>
 
   <g>
@@ -187,10 +209,15 @@
     <text x="720" y="373" class="step" text-anchor="middle">2</text>
     <text x="969" y="350" class="flow-label code" text-anchor="middle">run trigger</text>
     <text x="969" y="385" class="flow-note" text-anchor="middle">the request is sent only after subscription exists</text>
-    <circle r="4" fill="#9DBEFF" class="motion-dot" filter="url(#glow)">
+    
+    <!-- Step 2 Glowing Energy Bullet + Comet Tail -->
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M749 368H1190" keyPoints="0; 0; 1; 1" keyTimes="0; 0.167; 0.333; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 0.333; 0.334; 1" />
-    </circle>
+      <rect x="-42" y="-3.5" width="42" height="7" rx="3.5" fill="url(#trailBlueL2R)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="8" fill="#377BFF" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="4" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
   </g>
 
   <g>
@@ -200,27 +227,42 @@
     <circle cx="427" cy="432" r="5" fill="#FFD166" class="pulse" />
     <text x="443" y="437" class="flow-label code" fill="#FFE7AD">Until(...) → keep waiting</text>
     
-    <!-- Frequent Progress Message Stream Dots (5 Dots in Stream) -->
-    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+    <!-- Frequent Progress Message Stream Bullets with Fading Comet Tails (5 Bullets) -->
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.333; 0.472; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.332; 0.333; 0.472; 0.473; 1" />
-    </circle>
-    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <rect x="0" y="-3" width="38" height="6" rx="3" fill="url(#trailAmberR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="7.5" fill="#FFD166" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="3.5" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.382; 0.521; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.381; 0.382; 0.521; 0.522; 1" />
-    </circle>
-    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <rect x="0" y="-3" width="38" height="6" rx="3" fill="url(#trailAmberR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="7.5" fill="#FFD166" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="3.5" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.431; 0.569; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.430; 0.431; 0.569; 0.570; 1" />
-    </circle>
-    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <rect x="0" y="-3" width="38" height="6" rx="3" fill="url(#trailAmberR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="7.5" fill="#FFD166" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="3.5" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.479; 0.618; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.478; 0.479; 0.618; 0.619; 1" />
-    </circle>
-    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <rect x="0" y="-3" width="38" height="6" rx="3" fill="url(#trailAmberR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="7.5" fill="#FFD166" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="3.5" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.528; 0.667; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.527; 0.528; 0.667; 0.668; 1" />
-    </circle>
+      <rect x="0" y="-3" width="38" height="6" rx="3" fill="url(#trailAmberR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="7.5" fill="#FFD166" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="3.5" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
   </g>
 
   <g>
@@ -229,10 +271,15 @@
     <rect x="429" y="476" width="250" height="42" rx="21" fill="#0B2C2D" stroke="#45D7A3" stroke-opacity="0.7" />
     <path d="M449 496L455 502L466 490" fill="none" stroke="#5AF0B3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
     <text x="477" y="502" class="flow-label" fill="#B9FFE1">terminal payload wins</text>
-    <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
+    
+    <!-- Terminal Message Glowing Energy Bullet + Comet Tail -->
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 497H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.681; 0.833; 1" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.680; 0.681; 0.833; 0.834; 1" />
-    </circle>
+      <rect x="0" y="-3.5" width="42" height="7" rx="3.5" fill="url(#trailMintR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="8" fill="#5AF0B3" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="4" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
   </g>
 
   <g>
@@ -243,10 +290,15 @@
     <rect x="759" y="538" width="250" height="46" rx="13" fill="#092A2D" stroke="#45D7A3" stroke-opacity="0.55" />
     <text x="777" y="557" class="flow-label" fill="#B9FFE1">complete the await</text>
     <text x="777" y="574" class="flow-note">and clean up the registration</text>
-    <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
+    
+    <!-- Step 3 Glowing Energy Bullet + Comet Tail -->
+    <g class="motion-dot">
       <animateMotion dur="7.2s" repeatCount="indefinite" path="M691 561H241" keyPoints="0; 0; 1; 1" keyTimes="0; 0.833; 1.0; 1.0" calcMode="linear" />
       <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1" keyTimes="0; 0.832; 0.833; 1.0" />
-    </circle>
+      <rect x="0" y="-3.5" width="42" height="7" rx="3.5" fill="url(#trailMintR2L)" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="8" fill="#5AF0B3" fill-opacity="0.6" filter="url(#glow)" />
+      <circle cx="0" cy="0" r="4" fill="#FFFFFF" filter="url(#glow)" />
+    </g>
   </g>
 
   <g filter="url(#shadow)">
