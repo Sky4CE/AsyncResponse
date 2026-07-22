@@ -140,24 +140,7 @@ durability or transport semantics demand it.
 
 ## How it works
 
-```
-        you                       AsyncResponse                         remote system
-         │                              │                                     │
-         │  For<T>().WaitAsync(send)    │                                     │
-         ├─────────────────────────────►│ 1. subscribe cid + save             │
-         │                              │    RecoveryState (store)            │
-         │                              │ 2. run trigger ────────────────────►│  (request sent
-         │        await response        │                                     │   AFTER subscribe)
-         │                              │◄──────── progress message ──────────┤
-         │                              │   Until(…) → keep waiting           │
-         │                              │◄──────── terminal message ──────────┤
-         │◄────── payload / exception ──┤ 3. complete + clean up              │
-         │                              │                                     │
-         │   …and when a redeploy killed the waiter before step 3:            │
-         │                              │◄──────── terminal message ──────────┤
-         │   ResumeCallback(payload)  ◄─┤ nobody listening →                  │
-         │   FailureCallback(exception)◄┤ payload.ShouldResumeOnRecovery()    │
-```
+![AsyncResponse subscribes before triggering remote work, handles progress and terminal messages, and safely routes late responses after a redeploy.](docs/images/how-it-works.svg)
 
 Three layers, one decision each, made exactly where its deciding fact is knowable:
 

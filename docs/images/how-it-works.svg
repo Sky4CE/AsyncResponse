@@ -1,0 +1,272 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title description">
+  <title id="title">How AsyncResponse turns correlated messages into an ordinary await</title>
+  <desc id="description">
+    AsyncResponse subscribes and saves recovery state before it triggers remote work. Progress
+    messages keep the caller waiting, a terminal message completes the await, and late responses
+    after a redeploy are routed to either the resume or failure callback.
+  </desc>
+
+  <defs>
+    <linearGradient id="background" x1="64" y1="24" x2="1372" y2="792" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#020A1B" />
+      <stop offset="0.48" stop-color="#061A36" />
+      <stop offset="1" stop-color="#031126" />
+    </linearGradient>
+    <radialGradient id="blueNebula" cx="0" cy="0" r="1" gradientTransform="translate(728 306) rotate(90) scale(460 690)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B5F9C" stop-opacity="0.24" />
+      <stop offset="0.58" stop-color="#063158" stop-opacity="0.08" />
+      <stop offset="1" stop-color="#020A1B" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#0B2A4E" stop-opacity="0.96" />
+      <stop offset="1" stop-color="#06172F" stop-opacity="0.96" />
+    </linearGradient>
+    <linearGradient id="centerCard" x1="525" y1="126" x2="915" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0A355E" />
+      <stop offset="0.5" stop-color="#082544" />
+      <stop offset="1" stop-color="#06172F" />
+    </linearGradient>
+    <linearGradient id="cyanStroke" x1="220" y1="0" x2="720" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B89DF" />
+      <stop offset="1" stop-color="#52EDFF" />
+    </linearGradient>
+    <linearGradient id="blueStroke" x1="720" y1="0" x2="1220" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#46DFFF" />
+      <stop offset="1" stop-color="#377BFF" />
+    </linearGradient>
+    <linearGradient id="mintStroke" x1="1220" y1="0" x2="720" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#39C6FF" />
+      <stop offset="1" stop-color="#5AF0B3" />
+    </linearGradient>
+    <linearGradient id="rocket" x1="600" y1="158" x2="627" y2="219" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F6FCFF" />
+      <stop offset="0.48" stop-color="#71EFFF" />
+      <stop offset="1" stop-color="#268DFF" />
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#2E76A2" stroke-opacity="0.065" />
+    </pattern>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#000817" flood-opacity="0.6" />
+    </filter>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="5" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <filter id="softGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="10" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <marker id="arrowCyan" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#52EDFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#377BFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </marker>
+    <marker id="arrowAmber" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#FFD166" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </marker>
+    <marker id="arrowMint" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#5AF0B3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </marker>
+    <marker id="arrowRose" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#FF789F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    </marker>
+    <style>
+      text { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 2.4px; }
+      .actor { fill: #F4FAFF; font-size: 20px; font-weight: 750; letter-spacing: 0.3px; }
+      .actor-note { fill: #83A9C7; font-size: 14px; font-weight: 500; }
+      .flow-label { fill: #D8EEFF; font-size: 15px; font-weight: 650; }
+      .flow-note { fill: #789FBD; font-size: 12px; font-weight: 500; }
+      .code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+      .step { fill: #031128; font-size: 14px; font-weight: 800; }
+      .motion-dot { opacity: 0.9; }
+      .progress-line { animation: dash 6s linear infinite; }
+      .pulse { animation: pulse 2.8s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+      @keyframes dash { to { stroke-dashoffset: -56; } }
+      @keyframes pulse { 0%, 100% { opacity: 0.62; transform: scale(0.92); } 50% { opacity: 1; transform: scale(1.08); } }
+      @media (prefers-reduced-motion: reduce) {
+        .progress-line, .pulse { animation: none; }
+        .motion-dot { display: none; }
+      }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1424" height="804" rx="34" fill="url(#background)" />
+  <rect x="8.75" y="8.75" width="1422.5" height="802.5" rx="33.25" fill="none" stroke="#1A496E" stroke-width="1.5" />
+  <rect x="9" y="9" width="1422" height="802" rx="33" fill="url(#grid)" />
+  <rect x="9" y="9" width="1422" height="802" rx="33" fill="url(#blueNebula)" />
+
+  <g fill="#BDEFFF">
+    <circle cx="89" cy="83" r="1.5" opacity="0.8" />
+    <circle cx="347" cy="67" r="1" opacity="0.55" />
+    <circle cx="457" cy="112" r="1.5" opacity="0.65" />
+    <circle cx="998" cy="70" r="1.5" opacity="0.68" />
+    <circle cx="1308" cy="99" r="1" opacity="0.52" />
+    <circle cx="1371" cy="279" r="1.5" opacity="0.48" />
+    <circle cx="71" cy="383" r="1" opacity="0.58" />
+    <circle cx="1352" cy="515" r="1" opacity="0.66" />
+  </g>
+  <g fill="#48DFFF" filter="url(#softGlow)">
+    <circle cx="121" cy="110" r="2" opacity="0.75" />
+    <circle cx="1168" cy="80" r="2" opacity="0.72" />
+    <circle cx="1338" cy="344" r="2" opacity="0.58" />
+  </g>
+
+  <text x="56" y="62" fill="#F5FBFF" font-size="30" font-weight="780" letter-spacing="-0.6">Subscribe first. Send second. Await normally.</text>
+  <text x="56" y="94" fill="#83A9C7" font-size="16">Correlation, progress, completion, and recovery—without polling or callback plumbing.</text>
+  <g transform="translate(1308 54)" opacity="0.8">
+    <circle cx="22" cy="22" r="20" fill="none" stroke="#35CDF2" stroke-opacity="0.36" />
+    <circle cx="22" cy="22" r="11" fill="none" stroke="#35CDF2" stroke-opacity="0.72" />
+    <circle cx="22" cy="22" r="3" fill="#69F2FF" class="pulse" filter="url(#glow)" />
+    <path d="M2 22H-8M52 22H42M22 2V-8M22 52V42" stroke="#35CDF2" stroke-opacity="0.55" stroke-linecap="round" />
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="56" y="132" width="330" height="112" rx="24" fill="url(#card)" stroke="#18527B" />
+    <rect x="540" y="126" width="380" height="124" rx="26" fill="url(#centerCard)" stroke="#35C9EE" stroke-opacity="0.72" stroke-width="1.5" />
+    <rect x="1054" y="132" width="330" height="112" rx="24" fill="url(#card)" stroke="#18527B" />
+  </g>
+
+  <g>
+    <rect x="82" y="157" width="64" height="64" rx="18" fill="#092744" stroke="#2DBFE9" stroke-opacity="0.7" />
+    <path d="M98 178L109 189L98 200M116 201H130" fill="none" stroke="#77F1FF" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="133" cy="169" r="3" fill="#50E9FF" filter="url(#glow)" />
+    <text x="164" y="176" class="eyebrow" fill="#4BDDF8">YOUR APP</text>
+    <text x="164" y="204" class="actor">plain async / await</text>
+  </g>
+
+  <g>
+    <circle cx="615" cy="188" r="42" fill="#06182F" stroke="#2CCFF3" stroke-opacity="0.68" />
+    <circle cx="615" cy="188" r="34" fill="none" stroke="#3A9CD0" stroke-opacity="0.3" stroke-dasharray="4 7" />
+    <path d="M615 158C628 171 632 186 627 203L615 195L603 203C598 186 602 171 615 158Z" fill="none" stroke="url(#rocket)" stroke-width="2.4" stroke-linejoin="round" />
+    <path d="M604 190L596 202L604 200M626 190L634 202L626 200" fill="none" stroke="#6CEBFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="615" cy="180" r="4" fill="#0D4D78" stroke="#B8FAFF" stroke-width="1.5" />
+    <path d="M610 201L615 217L620 201" fill="url(#rocket)" opacity="0.92" filter="url(#glow)" />
+    <text x="676" y="174" class="eyebrow" fill="#58E7FF">ASYNCRESPONSE</text>
+    <text x="676" y="202" class="actor" style="font-size: 17px" textLength="220" lengthAdjust="spacingAndGlyphs">correlate · recover · resume</text>
+    <text x="676" y="226" class="actor-note">one correlation ID</text>
+  </g>
+
+  <g>
+    <rect x="1080" y="157" width="64" height="64" rx="18" fill="#092744" stroke="#397EF5" stroke-opacity="0.75" />
+    <path d="M1096 179H1128V198H1096ZM1102 186H1105M1111 186H1122M1102 205H1122" fill="none" stroke="#88C7FF" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="1103" cy="186" r="1.5" fill="#5AF0B3" />
+    <text x="1162" y="176" class="eyebrow" fill="#77A9FF">REMOTE SYSTEM</text>
+    <text x="1162" y="201" class="actor">broker · webhook</text>
+    <text x="1162" y="224" class="actor-note">queue · worker</text>
+  </g>
+
+  <rect x="56" y="267" width="1328" height="322" rx="26" fill="#04142B" fill-opacity="0.72" stroke="#123D60" />
+  <path d="M221 244V574M720 250V574M1219 244V574" fill="none" stroke="#2A6489" stroke-opacity="0.48" stroke-width="1.5" stroke-dasharray="5 9" />
+
+  <g>
+    <path d="M241 304H691" fill="none" stroke="url(#cyanStroke)" stroke-width="3" stroke-linecap="round" marker-end="url(#arrowCyan)" />
+    <text x="456" y="290" class="flow-label code" text-anchor="middle">For&lt;T&gt;().WaitAsync(send)</text>
+    <circle cx="720" cy="304" r="19" fill="#57E9FF" filter="url(#glow)" />
+    <text x="720" y="309" class="step" text-anchor="middle">1</text>
+    <rect x="759" y="282" width="250" height="46" rx="13" fill="#082746" stroke="#2DBFE9" stroke-opacity="0.5" />
+    <text x="777" y="301" class="flow-label">subscribe + save</text>
+    <text x="777" y="318" class="flow-note code">RecoveryState</text>
+    <circle r="4" fill="#9CF7FF" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="3.8s" repeatCount="indefinite" path="M241 304H691" />
+    </circle>
+  </g>
+
+  <g>
+    <path d="M749 368H1190" fill="none" stroke="url(#blueStroke)" stroke-width="3" stroke-linecap="round" marker-end="url(#arrowBlue)" />
+    <circle cx="720" cy="368" r="19" fill="#50DDF8" filter="url(#glow)" />
+    <text x="720" y="373" class="step" text-anchor="middle">2</text>
+    <text x="969" y="350" class="flow-label code" text-anchor="middle">run trigger</text>
+    <text x="969" y="385" class="flow-note" text-anchor="middle">the request is sent only after subscription exists</text>
+    <circle r="4" fill="#9DBEFF" class="motion-dot" filter="url(#glow)">
+      <animateMotion begin="0.9s" dur="3.8s" repeatCount="indefinite" path="M749 368H1190" />
+    </circle>
+  </g>
+
+  <g>
+    <path d="M1190 432H749" fill="none" stroke="#FFD166" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="10 9" stroke-dashoffset="0" class="progress-line" marker-end="url(#arrowAmber)" />
+    <text x="969" y="416" class="flow-label" text-anchor="middle" fill="#FFE19A">progress message</text>
+    <rect x="405" y="411" width="274" height="42" rx="21" fill="#2A2415" stroke="#BD9041" stroke-opacity="0.75" />
+    <circle cx="427" cy="432" r="5" fill="#FFD166" class="pulse" />
+    <text x="443" y="437" class="flow-label code" fill="#FFE7AD">Until(...) → keep waiting</text>
+  </g>
+
+  <g>
+    <path d="M1190 497H749" fill="none" stroke="url(#mintStroke)" stroke-width="3" stroke-linecap="round" marker-end="url(#arrowMint)" />
+    <text x="969" y="481" class="flow-label" text-anchor="middle" fill="#A9FFD8">terminal message</text>
+    <rect x="429" y="476" width="250" height="42" rx="21" fill="#0B2C2D" stroke="#45D7A3" stroke-opacity="0.7" />
+    <path d="M449 496L455 502L466 490" fill="none" stroke="#5AF0B3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="477" y="502" class="flow-label" fill="#B9FFE1">terminal payload wins</text>
+    <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
+      <animateMotion begin="1.8s" dur="3.8s" repeatCount="indefinite" path="M1190 497H749" />
+    </circle>
+  </g>
+
+  <g>
+    <path d="M691 561H241" fill="none" stroke="url(#mintStroke)" stroke-width="3" stroke-linecap="round" marker-end="url(#arrowMint)" />
+    <circle cx="720" cy="561" r="19" fill="#5AF0B3" filter="url(#glow)" />
+    <text x="720" y="566" class="step" text-anchor="middle">3</text>
+    <text x="456" y="545" class="flow-label code" text-anchor="middle" fill="#B9FFE1">payload / exception</text>
+    <rect x="759" y="538" width="250" height="46" rx="13" fill="#092A2D" stroke="#45D7A3" stroke-opacity="0.55" />
+    <text x="777" y="557" class="flow-label" fill="#B9FFE1">complete the await</text>
+    <text x="777" y="574" class="flow-note">and clean up the registration</text>
+    <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
+      <animateMotion begin="2.7s" dur="3.8s" repeatCount="indefinite" path="M691 561H241" />
+    </circle>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="56" y="611" width="1328" height="162" rx="26" fill="#07162D" stroke="#245476" />
+  </g>
+  <rect x="57" y="612" width="4" height="160" rx="2" fill="#41DFFF" />
+  <text x="88" y="643" class="eyebrow" fill="#58E7FF">RECOVERY PATH</text>
+
+  <g>
+    <rect x="80" y="660" width="56" height="56" rx="16" fill="#082744" stroke="#2DBFE9" stroke-opacity="0.72" />
+    <g transform="translate(87 667) scale(1.75)" fill="none" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12A9 9 0 0 0 6 5.3L3 8" stroke="#72EFFF" />
+      <path d="M3 3V8H8" stroke="#72EFFF" />
+      <path d="M3 12A9 9 0 0 0 18 18.7L21 16" stroke="#397EF5" />
+      <path d="M21 21V16H16" stroke="#397EF5" />
+    </g>
+    <text x="151" y="674" class="flow-label">Waiter gone after a redeploy.</text>
+    <text x="151" y="697" class="flow-note">Recovery state routes the late response</text>
+    <text x="151" y="716" class="flow-note">instead of dropping it.</text>
+  </g>
+
+  <g>
+    <rect x="387" y="682" width="146" height="40" rx="20" fill="#0B2A48" stroke="#2D83B5" />
+    <text x="460" y="707" class="flow-label" text-anchor="middle">message arrives</text>
+    <path d="M533 702H565" fill="none" stroke="#54DDF8" stroke-width="2.2" marker-end="url(#arrowCyan)" />
+
+    <rect x="573" y="682" width="126" height="40" rx="20" fill="#101E35" stroke="#58738D" />
+    <text x="636" y="707" class="flow-label" text-anchor="middle">no waiter</text>
+    <path d="M699 702H731" fill="none" stroke="#8AB0CC" stroke-width="2.2" marker-end="url(#arrowCyan)" />
+
+    <path d="M797 672L855 702L797 732L739 702Z" fill="#0A3150" stroke="#48DCF5" stroke-width="1.5" />
+    <text x="820" y="658" class="flow-note code" text-anchor="end">ShouldResumeOnRecovery()</text>
+    <text x="797" y="707" class="flow-label" text-anchor="middle">resume?</text>
+
+    <path d="M855 702C875 702 871 666 891 666" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" />
+    <path d="M883 659L893 666L883 673" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="879" y="650" class="flow-note" text-anchor="middle" fill="#75F0BB" style="font-size: 13px; font-weight: 650">true</text>
+    <rect x="903" y="642" width="441" height="48" rx="14" fill="#0A2D2D" stroke="#45D7A3" stroke-opacity="0.75" />
+    <text x="922" y="663" class="flow-label code" fill="#B9FFE1">ResumeCallback(payload)</text>
+    <text x="922" y="681" class="flow-note">continue the interrupted work</text>
+
+    <path d="M855 702C875 702 871 738 891 738" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" />
+    <path d="M883 731L893 738L883 745" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="879" y="759" class="flow-note" text-anchor="middle" fill="#FF9CB8" style="font-size: 13px; font-weight: 650">false</text>
+    <rect x="903" y="714" width="441" height="48" rx="14" fill="#321A2A" stroke="#FF789F" stroke-opacity="0.75" />
+    <text x="922" y="735" class="flow-label code" fill="#FFC3D4">FailureCallback(exception)</text>
+    <text x="922" y="753" class="flow-note">fail safely when the payload cannot resume</text>
+  </g>
+</svg>
