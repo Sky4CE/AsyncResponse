@@ -21,7 +21,7 @@
       <stop stop-color="#0B2A4E" stop-opacity="0.96" />
       <stop offset="1" stop-color="#06172F" stop-opacity="0.96" />
     </linearGradient>
-    <linearGradient id="centerCard" x1="525" y1="126" x2="915" y2="250" gradientUnits="userSpaceOnUse">
+    <linearGradient id="centerCard" x1="515" y1="126" x2="905" y2="250" gradientUnits="userSpaceOnUse">
       <stop stop-color="#0A355E" />
       <stop offset="0.5" stop-color="#082544" />
       <stop offset="1" stop-color="#06172F" />
@@ -38,7 +38,7 @@
       <stop stop-color="#39C6FF" />
       <stop offset="1" stop-color="#5AF0B3" />
     </linearGradient>
-    <linearGradient id="rocket" x1="600" y1="158" x2="627" y2="219" gradientUnits="userSpaceOnUse">
+    <linearGradient id="rocket" x1="590" y1="158" x2="617" y2="219" gradientUnits="userSpaceOnUse">
       <stop stop-color="#F6FCFF" />
       <stop offset="0.48" stop-color="#71EFFF" />
       <stop offset="1" stop-color="#268DFF" />
@@ -131,7 +131,7 @@
 
   <g filter="url(#shadow)">
     <rect x="56" y="132" width="330" height="112" rx="24" fill="url(#card)" stroke="#18527B" />
-    <rect x="540" y="126" width="380" height="124" rx="26" fill="url(#centerCard)" stroke="#35C9EE" stroke-opacity="0.72" stroke-width="1.5" />
+    <rect x="530" y="126" width="380" height="124" rx="26" fill="url(#centerCard)" stroke="#35C9EE" stroke-opacity="0.72" stroke-width="1.5" />
     <rect x="1054" y="132" width="330" height="112" rx="24" fill="url(#card)" stroke="#18527B" />
   </g>
 
@@ -144,15 +144,15 @@
   </g>
 
   <g>
-    <circle cx="615" cy="188" r="42" fill="#06182F" stroke="#2CCFF3" stroke-opacity="0.68" />
-    <circle cx="615" cy="188" r="34" fill="none" stroke="#3A9CD0" stroke-opacity="0.3" stroke-dasharray="4 7" />
-    <path d="M615 158C628 171 632 186 627 203L615 195L603 203C598 186 602 171 615 158Z" fill="none" stroke="url(#rocket)" stroke-width="2.4" stroke-linejoin="round" />
-    <path d="M604 190L596 202L604 200M626 190L634 202L626 200" fill="none" stroke="#6CEBFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-    <circle cx="615" cy="180" r="4" fill="#0D4D78" stroke="#B8FAFF" stroke-width="1.5" />
-    <path d="M610 201L615 217L620 201" fill="url(#rocket)" opacity="0.92" filter="url(#glow)" />
-    <text x="676" y="174" class="eyebrow" fill="#58E7FF">ASYNCRESPONSE</text>
-    <text x="676" y="202" class="actor" style="font-size: 17px" textLength="220" lengthAdjust="spacingAndGlyphs">correlate · recover · resume</text>
-    <text x="676" y="226" class="actor-note">one correlation ID</text>
+    <circle cx="605" cy="188" r="42" fill="#06182F" stroke="#2CCFF3" stroke-opacity="0.68" />
+    <circle cx="605" cy="188" r="34" fill="none" stroke="#3A9CD0" stroke-opacity="0.3" stroke-dasharray="4 7" />
+    <path d="M605 158C618 171 622 186 617 203L605 195L593 203C588 186 592 171 605 158Z" fill="none" stroke="url(#rocket)" stroke-width="2.4" stroke-linejoin="round" />
+    <path d="M594 190L586 202L594 200M616 190L624 202L616 200" fill="none" stroke="#6CEBFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="605" cy="180" r="4" fill="#0D4D78" stroke="#B8FAFF" stroke-width="1.5" />
+    <path d="M600 201L605 217L610 201" fill="url(#rocket)" opacity="0.92" filter="url(#glow)" />
+    <text x="666" y="174" class="eyebrow" fill="#58E7FF">ASYNCRESPONSE</text>
+    <text x="666" y="202" class="actor" style="font-size: 17px" textLength="220" lengthAdjust="spacingAndGlyphs">correlate · recover · resume</text>
+    <text x="666" y="226" class="actor-note">one correlation ID</text>
   </g>
 
   <g>
@@ -255,18 +255,18 @@
     <text x="820" y="658" class="flow-note code" text-anchor="end">ShouldResumeOnRecovery()</text>
     <text x="797" y="707" class="flow-label" text-anchor="middle">resume?</text>
 
-    <path d="M855 702C875 702 871 666 891 666" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" />
-    <path d="M883 659L893 666L883 673" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-    <text x="879" y="650" class="flow-note" text-anchor="middle" fill="#75F0BB" style="font-size: 13px; font-weight: 650">true</text>
-    <rect x="903" y="642" width="441" height="48" rx="14" fill="#0A2D2D" stroke="#45D7A3" stroke-opacity="0.75" />
-    <text x="922" y="663" class="flow-label code" fill="#B9FFE1">ResumeCallback(payload)</text>
-    <text x="922" y="681" class="flow-note">continue the interrupted work</text>
+    <path d="M855 702C895 702 915 666 952 666" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" />
+    <path d="M944 659L954 666L944 673" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="895" y="650" class="flow-note" text-anchor="middle" fill="#75F0BB" style="font-size: 13px; font-weight: 650">true</text>
+    <rect x="964" y="642" width="396" height="48" rx="14" fill="#0A2D2D" stroke="#45D7A3" stroke-opacity="0.75" />
+    <text x="982" y="663" class="flow-label code" fill="#B9FFE1">ResumeCallback(payload)</text>
+    <text x="982" y="681" class="flow-note">continue the interrupted work</text>
 
-    <path d="M855 702C875 702 871 738 891 738" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" />
-    <path d="M883 731L893 738L883 745" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-    <text x="879" y="759" class="flow-note" text-anchor="middle" fill="#FF9CB8" style="font-size: 13px; font-weight: 650">false</text>
-    <rect x="903" y="714" width="441" height="48" rx="14" fill="#321A2A" stroke="#FF789F" stroke-opacity="0.75" />
-    <text x="922" y="735" class="flow-label code" fill="#FFC3D4">FailureCallback(exception)</text>
-    <text x="922" y="753" class="flow-note">fail safely when the payload cannot resume</text>
+    <path d="M855 702C895 702 915 738 952 738" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" />
+    <path d="M944 731L954 738L944 745" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="895" y="759" class="flow-note" text-anchor="middle" fill="#FF9CB8" style="font-size: 13px; font-weight: 650">false</text>
+    <rect x="964" y="714" width="396" height="48" rx="14" fill="#321A2A" stroke="#FF789F" stroke-opacity="0.75" />
+    <text x="982" y="735" class="flow-label code" fill="#FFC3D4">FailureCallback(exception)</text>
+    <text x="982" y="753" class="flow-note">fail safely when the payload cannot resume</text>
   </g>
 </svg>
