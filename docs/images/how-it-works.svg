@@ -176,8 +176,8 @@
     <text x="777" y="301" class="flow-label">subscribe + save</text>
     <text x="777" y="318" class="flow-note code">RecoveryState</text>
     <circle r="4" fill="#9CF7FF" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M241 304H691" keyPoints="0; 1; 1" keyTimes="0; 0.167; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M241 304H691" keyPoints="0; 1; 1" keyTimes="0; 0.167; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 1" />
     </circle>
   </g>
 
@@ -188,8 +188,8 @@
     <text x="969" y="350" class="flow-label code" text-anchor="middle">run trigger</text>
     <text x="969" y="385" class="flow-note" text-anchor="middle">the request is sent only after subscription exists</text>
     <circle r="4" fill="#9DBEFF" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M749 368H1190" keyPoints="0; 0; 1; 1" keyTimes="0; 0.167; 0.333; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 0.333; 0.334; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M749 368H1190" keyPoints="0; 0; 1; 1" keyTimes="0; 0.167; 0.333; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.166; 0.167; 0.333; 0.334; 1" />
     </circle>
   </g>
 
@@ -200,18 +200,26 @@
     <circle cx="427" cy="432" r="5" fill="#FFD166" class="pulse" />
     <text x="443" y="437" class="flow-label code" fill="#FFE7AD">Until(...) → keep waiting</text>
     
-    <!-- Frequent Progress Message Stream Dots -->
+    <!-- Frequent Progress Message Stream Dots (5 Dots in Stream) -->
     <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.333; 0.450; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.332; 0.333; 0.450; 0.451; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.333; 0.472; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.332; 0.333; 0.472; 0.473; 1" />
     </circle>
     <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.433; 0.550; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.432; 0.433; 0.550; 0.551; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.382; 0.521; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.381; 0.382; 0.521; 0.522; 1" />
     </circle>
     <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.533; 0.650; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.532; 0.533; 0.650; 0.651; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.431; 0.569; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.430; 0.431; 0.569; 0.570; 1" />
+    </circle>
+    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.479; 0.618; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.478; 0.479; 0.618; 0.619; 1" />
+    </circle>
+    <circle r="3.5" fill="#FFD166" class="motion-dot" filter="url(#glow)">
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 432H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.528; 0.667; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.527; 0.528; 0.667; 0.668; 1" />
     </circle>
   </g>
 
@@ -222,8 +230,8 @@
     <path d="M449 496L455 502L466 490" fill="none" stroke="#5AF0B3" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
     <text x="477" y="502" class="flow-label" fill="#B9FFE1">terminal payload wins</text>
     <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M1190 497H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.683; 0.833; 1" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.682; 0.683; 0.833; 0.834; 1" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M1190 497H749" keyPoints="0; 0; 1; 1" keyTimes="0; 0.681; 0.833; 1" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1; 0; 0" keyTimes="0; 0.680; 0.681; 0.833; 0.834; 1" />
     </circle>
   </g>
 
@@ -236,8 +244,8 @@
     <text x="777" y="557" class="flow-label" fill="#B9FFE1">complete the await</text>
     <text x="777" y="574" class="flow-note">and clean up the registration</text>
     <circle r="4" fill="#A2FFD7" class="motion-dot" filter="url(#glow)">
-      <animateMotion dur="6.0s" repeatCount="indefinite" path="M691 561H241" keyPoints="0; 0; 1; 1" keyTimes="0; 0.833; 1.0; 1.0" calcMode="linear" />
-      <animate attributeName="opacity" dur="6.0s" repeatCount="indefinite" values="0; 0; 1; 1" keyTimes="0; 0.832; 0.833; 1.0" />
+      <animateMotion dur="7.2s" repeatCount="indefinite" path="M691 561H241" keyPoints="0; 0; 1; 1" keyTimes="0; 0.833; 1.0; 1.0" calcMode="linear" />
+      <animate attributeName="opacity" dur="7.2s" repeatCount="indefinite" values="0; 0; 1; 1" keyTimes="0; 0.832; 0.833; 1.0" />
     </circle>
   </g>
 
