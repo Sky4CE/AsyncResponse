@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785268423468,
+  "lastUpdate": 1785268445136,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -44032,6 +44032,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2890.405311131321,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "86b0e229bd73ef0b612da8680ad4f713ceb90174",
+          "message": "fix: full-depth hardening\n\nEngine/channels: durable-flow wakes retry through dead lease windows (stuck\nRunning-flow fix); durable channels throw on registration failure instead of\nreturning pre-faulted waiters; heartbeat upserts, safe registration/cleanup\nordering, RetryLive re-checks (incl. exception path); RawJsonResponse\nthread-safety; in-memory transport drains on shutdown.\n\nTransports: early-ACK saturation gating (SQS redrive-burn P1; ASB/GPS/NATS\nparity); unique ASB MessageId; unified hard-stop drain + HostShutdownTimeout\neverywhere; ASB/SQS lock-visibility renewal + fenced DB claim renewal;\nGPS unbounded-redelivery warning; asyncresponse.sqlserver.receive span rename.\n\nFlow stores: server-clock lease/expiry math (PG/SqlServer/MySQL/Oracle/Mongo),\nMaxStateBytes size guard, MatchedCount renewals, batched prunes.\n\nCI/docs: slnx-level pack, publish-pipeline hardening, weekly CodeQL (pinned);\nCHANGELOG + troubleshooting pages, capability-first roadmap rewrite, doc\ndrift/false-claim fixes; ~130 new regression tests (1504 unit + integration\ngreen on net8.0/net10.0).",
+          "timestamp": "2026-07-28T21:36:52+02:00",
+          "tree_id": "2a4a68d479ab17ac9637d29d59ff0c896fb9197d",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/86b0e229bd73ef0b612da8680ad4f713ceb90174"
+        },
+        "date": 1785268444817,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 146125.76752559392,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 116398.71682054577,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 101125.81345604344,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 300235.3845414805,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 482485.7666698832,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 355583.37007694825,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 382836.6665645769,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 315059.861373661,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 286021.5545843535,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 288167.8289435768,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 305664.5759209674,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 428250.85221919586,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 486031.4559558295,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 226347.9928365387,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 106816.60870085367,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 78993.23438746118,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 25580.576770380558,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4849.811051361439,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 279861.18885033025,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 132702.72996056074,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1589142.9751934782,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2913.1682429237394,
             "unit": "flows/s"
           }
         ]
