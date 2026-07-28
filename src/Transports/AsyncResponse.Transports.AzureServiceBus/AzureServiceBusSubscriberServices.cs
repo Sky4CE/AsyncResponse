@@ -82,13 +82,18 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested)
             {
+                // In early-ACK mode, receiving while the background queue is saturated would burn
+                // DeliveryCount via queue-full abandons, so wait for free capacity and never request
+                // more messages than the dispatcher can accept.
+                await dispatcher.WaitForCapacityAsync(stoppingToken).ConfigureAwait(false);
+                var maxMessages = Math.Min(Options.MaxMessagesPerReceive, dispatcher.FreeCapacity);
+
                 var messages = await receiver.ReceiveMessagesAsync(
-                    Options.MaxMessagesPerReceive,
+                    maxMessages,
                     Options.ReceiveWaitTime,
                     stoppingToken).ConfigureAwait(false);
 
-                foreach (var message in messages)
-                    await dispatcher.HandleAsync(message, stoppingToken).ConfigureAwait(false);
+                await DispatchBatchAsync(dispatcher, messages, queue, stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -96,6 +101,100 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
             using var shutdown = new CancellationTokenSource(Options.ShutdownTimeout);
             await receiver.CloseAsync(shutdown.Token).ConfigureAwait(false);
         }
+    }
+
+    private async Task DispatchBatchAsync(
+        AzureServiceBusMessageDispatcher dispatcher,
+        IReadOnlyList<AzureServiceBusTransportDelivery> messages,
+        string queue,
+        CancellationToken stoppingToken)
+    {
+        if (messages.Count == 0)
+            return;
+
+        if (SubscriberOptions.AckMode is not AzureServiceBusAckMode.AckAfterHandlerCompletes
+            || SubscriberOptions.LockRenewalInterval is not { } renewalInterval)
+        {
+            foreach (var message in messages)
+                await dispatcher.HandleAsync(message, stoppingToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The batch is processed serially, so a slow handler lets the peek locks of the later (still
+        // unsettled) messages expire and Service Bus redelivers them to a competing consumer while
+        // they are still queued here — systematic duplicate processing. While the batch is in flight,
+        // a background loop renews the lock of every unsettled message each interval.
+        var progress = new BatchProgress();
+        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var renewalTask = RenewLocksLoopAsync(messages, progress, renewalInterval, queue, renewalCancellation.Token);
+        try
+        {
+            foreach (var message in messages)
+            {
+                try
+                {
+                    await dispatcher.HandleAsync(message, stoppingToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    progress.MarkSettled();
+                }
+            }
+        }
+        finally
+        {
+            renewalCancellation.Cancel();
+            await renewalTask.ConfigureAwait(false);
+        }
+    }
+
+    private async Task RenewLocksLoopAsync(
+        IReadOnlyList<AzureServiceBusTransportDelivery> messages,
+        BatchProgress progress,
+        TimeSpan renewalInterval,
+        string queue,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
+
+                // Renew from the first unsettled message onward: that covers the message currently in
+                // the handler plus everything still waiting its turn. A renewal racing a just-settled
+                // message merely fails and is logged; redelivery keeps at-least-once intact.
+                for (var i = progress.SettledCount; i < messages.Count; i++)
+                {
+                    var message = messages[i];
+                    try
+                    {
+                        await message.RenewLockAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(
+                            ex,
+                            "Failed to renew the lock of Azure Service Bus message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
+                            message.MessageId,
+                            queue);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The batch finished or the subscriber is stopping.
+        }
+    }
+
+    private sealed class BatchProgress
+    {
+        private int _settledCount;
+
+        public int SettledCount => Volatile.Read(ref _settledCount);
+
+        public void MarkSettled() => Interlocked.Increment(ref _settledCount);
     }
 
     private TimeSpan RetryDelay(int failures)

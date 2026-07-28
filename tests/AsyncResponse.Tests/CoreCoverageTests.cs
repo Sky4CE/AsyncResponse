@@ -131,7 +131,7 @@ public sealed class CoreCoverageTests
         var lease = new FlowExecutionLease(store.Object, "flow", "lease", options, NullLogger.Instance);
 
         await WaitUntilAsync(() => lease.LostToken.IsCancellationRequested);
-        Assert.Throws<InvalidOperationException>(lease.ThrowIfLost);
+        Assert.Throws<InvalidOperationException>(() => lease.ThrowIfLost());
         await lease.DisposeAsync();
         await lease.DisposeAsync();
         InvokePrivate(lease, "MarkLost");

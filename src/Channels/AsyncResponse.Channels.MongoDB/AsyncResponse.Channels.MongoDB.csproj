@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Channels.MongoDB</PackageId>
     <Description>MongoDB channel for AsyncResponse: change-stream response wakeups and durable TTL-indexed recovery-state collections for lost-subscriber recovery across redeploys, with domain-state-aware failure routing. Requires a replica set (change streams). Plugs into the Core engine's recovery watchdog and readiness health check.</Description>
+    <PackageTags>$(PackageTags);mongodb</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

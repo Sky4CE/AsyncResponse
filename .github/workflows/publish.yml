@@ -14,9 +14,16 @@ on:
     tags:
       - "v*"
 
+# Publishing a release for tag vX.Y.Z also pushes the tag, so both triggers can fire for the same
+# version; serialize runs per ref (no cancellation) so two publishes never run concurrently.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -45,37 +52,29 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore -p:Version=$PACKAGE_VERSION
 
-      - name: Test
-        run: dotnet test --configuration Release --no-build
+      # Unit suite only, one TFM at a time — same invocation shape as ci.yml (MTP otherwise runs
+      # both TFMs concurrently, which starves real-time tests on the 2-core hosted runner).
+      # The Docker/Aspire integration suite is omitted here because it already gates every merge to main.
+      - name: Test (unit, net8.0)
+        run: |
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
+            --configuration Release --framework net8.0 --no-build \
+            --report-trx \
+            --coverage \
+            --results-directory "${{ github.workspace }}/TestResults"
+
+      - name: Test (unit, net10.0)
+        run: |
+          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
+            --configuration Release --framework net10.0 --no-build \
+            --report-trx \
+            --coverage \
+            --results-directory "${{ github.workspace }}/TestResults"
 
       - name: Pack
-        run: |
-          dotnet pack src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Channels/AsyncResponse.Channels.MongoDB/AsyncResponse.Channels.MongoDB.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Channels/AsyncResponse.Channels.NATS/AsyncResponse.Channels.NATS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Channels/AsyncResponse.Channels.PostgreSQL/AsyncResponse.Channels.PostgreSQL.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Channels/AsyncResponse.Channels.Redis/AsyncResponse.Channels.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Channels/AsyncResponse.Channels.SqlServer/AsyncResponse.Channels.SqlServer.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.AzureServiceBus/AsyncResponse.Transports.AzureServiceBus.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.Kafka/AsyncResponse.Transports.Kafka.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.MongoDB/AsyncResponse.Transports.MongoDB.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.NATS/AsyncResponse.Transports.NATS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.PostgreSQL/AsyncResponse.Transports.PostgreSQL.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.RabbitMQ/AsyncResponse.Transports.RabbitMQ.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.Redis/AsyncResponse.Transports.Redis.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.SqlServer/AsyncResponse.Transports.SqlServer.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.GooglePubSub/AsyncResponse.Transports.GooglePubSub.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/Transports/AsyncResponse.Transports.SQS/AsyncResponse.Transports.SQS.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.SqlServer/AsyncResponse.DurableFlows.SqlServer.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.PostgreSQL/AsyncResponse.DurableFlows.PostgreSQL.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.MySql/AsyncResponse.DurableFlows.MySql.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Sqlite/AsyncResponse.DurableFlows.Sqlite.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Oracle/AsyncResponse.DurableFlows.Oracle.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.MongoDB/AsyncResponse.DurableFlows.MongoDB.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.Cosmos/AsyncResponse.DurableFlows.Cosmos.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.DynamoDB/AsyncResponse.DurableFlows.DynamoDB.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
-          dotnet pack src/DurableFlows/AsyncResponse.DurableFlows.EFCore/AsyncResponse.DurableFlows.EFCore.csproj --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
+        # Solution-level pack: every non-src project sets IsPackable=false, so this packs exactly
+        # the shipped src/** packages without a hand-maintained list.
+        run: dotnet pack AsyncResponse.slnx --configuration Release --no-build -p:Version=$PACKAGE_VERSION -o ./artifacts
 
       - name: Push to nuget.org
         run: >

@@ -9,6 +9,8 @@ AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.ContainerName.set -> 
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.CosmosDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.DatabaseName.get -> string?
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.DatabaseName.set -> void
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.PartitionKeyPath.get -> string!
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.PartitionKeyPath.set -> void
 AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions.Throughput.get -> int?

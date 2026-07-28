@@ -21,6 +21,21 @@ public abstract class AsyncResponseChannelOptions
     /// hanging forever.
     /// </summary>
     public TimeSpan? DefaultTimeout { get; set; }
+
+    /// <summary>
+    /// Validates the shared channel settings, throwing an actionable
+    /// <see cref="InvalidOperationException"/> on misconfiguration. Concrete channels call this from
+    /// their own <c>Validate()</c> so every channel fails fast at registration/startup instead of
+    /// misbehaving at the first wait (a non-positive expiry silently disables recovery; a
+    /// non-positive default timeout faults every waiter).
+    /// </summary>
+    internal void ValidateShared(string optionsName)
+    {
+        if (RecoveryStateExpiry <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionsName}.{nameof(RecoveryStateExpiry)} must be positive.");
+        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionsName}.{nameof(DefaultTimeout)} must be positive when configured.");
+    }
 }
 
 /// <summary>

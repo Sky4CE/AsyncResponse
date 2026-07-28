@@ -46,7 +46,8 @@ public sealed class MongoDbDispatcherTests
             1,
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
-            (_, _, _) => ValueTask.FromResult(true));
+            (_, _, _) => ValueTask.FromResult(true),
+            () => ValueTask.FromResult(true));
         var dispatcher = new MongoDbMessageDispatcher(
             (_, _) => Task.CompletedTask,
             options,
@@ -427,6 +428,132 @@ public sealed class MongoDbDispatcherTests
         Assert.Contains(nameof(MongoDbSubscriberOptions.BackgroundWorkerCount), ex.Message);
     }
 
+    [Fact]
+    public void ValidateSubscriber_DrainBudgetExceedingHostShutdownBudget_Throws()
+    {
+        var options = new MongoDbAsyncResponseTransportOptions
+        {
+            ShutdownTimeout = TimeSpan.FromSeconds(20),
+            HostShutdownTimeout = TimeSpan.FromSeconds(25)
+        };
+        var subscriber = new MongoDbSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10));
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
+
+        Assert.Contains(nameof(MongoDbAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+
+        // A null host budget or an awaiting-mode subscriber skips the check.
+        options.HostShutdownTimeout = null;
+        MongoDbTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker");
+        MongoDbTransportOptionsValidator.ValidateSubscriber(
+            new MongoDbAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.FromSeconds(1) },
+            new MongoDbSubscriberOptions(),
+            "Worker");
+    }
+
+    [Fact]
+    public void ValidateSubscriber_NonPositiveHostShutdownTimeout_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            MongoDbTransportOptionsValidator.ValidateSubscriber(
+                new MongoDbAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.Zero },
+                new MongoDbSubscriberOptions().UseAckAfterEnqueue(1, 8),
+                "Worker"));
+
+        Assert.Contains(nameof(MongoDbAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_SlowHandler_RenewsLeaseUntilHandlerFinishes()
+    {
+        var calls = new Calls();
+        var dispatcher = new MongoDbMessageDispatcher(
+            async (_, _) =>
+            {
+                while (Volatile.Read(ref calls.Renew) < 2)
+                    await Task.Delay(10);
+            },
+            new MongoDbAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromMilliseconds(100) },
+            new MongoDbSubscriberOptions(),
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.True(calls.Renew >= 2);
+        Assert.Equal(1, calls.Ack);
+
+        // The renewal loop stops with the handler; no further renewals happen afterwards.
+        var renewalsAfterAck = calls.Renew;
+        await Task.Delay(200);
+        Assert.Equal(renewalsAfterAck, calls.Renew);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_LeaseFenceLost_StopsRenewingAndKeepsProcessing()
+    {
+        var calls = new Calls { RenewResult = false };
+        var dispatcher = new MongoDbMessageDispatcher(
+            async (_, _) =>
+            {
+                while (Volatile.Read(ref calls.Renew) < 1)
+                    await Task.Delay(10);
+                await Task.Delay(250); // long enough for several more beats if the loop kept going
+            },
+            new MongoDbAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromMilliseconds(100) },
+            new MongoDbSubscriberOptions(),
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        // The fence was lost on the first beat: the loop stops instead of hammering the store, and
+        // the handler still completes with the fenced ack no-oping server-side.
+        Assert.Equal(1, calls.Renew);
+        Assert.Equal(1, calls.Ack);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_QueuedButUnstartedDocuments_AreAttemptedAndSurfacedInsteadOfDropped()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = 0;
+        var runningCalls = new Calls();
+        var queuedCalls = new Calls();
+        var subscriberOptions = new MongoDbSubscriberOptions
+        {
+            OnBackgroundFailure = _ =>
+            {
+                Interlocked.Increment(ref failures);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
+        var dispatcher = new MongoDbMessageDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            },
+            new MongoDbAsyncResponseTransportOptions(),
+            subscriberOptions,
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(runningCalls), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2)); // worker is blocked in the handler
+        await dispatcher.HandleAsync(Delivery(queuedCalls), CancellationToken.None); // already ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The hard stop must not silently drop the already-ACKed queued document: it is attempted
+        // with the cancelled drain token, dead-lettered, and surfaced via OnBackgroundFailure — same
+        // as the one that was mid-handler.
+        await WaitUntilAsync(() => Volatile.Read(ref failures) == 2);
+        Assert.Equal(1, runningCalls.DeadLetter);
+        Assert.Equal(1, queuedCalls.DeadLetter);
+    }
+
     private static MongoDbTransportDelivery Delivery(
         Calls calls,
         int attempt = 1,
@@ -454,6 +581,11 @@ public sealed class MongoDbDispatcherTests
                 calls.DeleteOriginalOnDeadLetter = deleteOriginal;
                 calls.DeadLettered.TrySetResult();
                 return ValueTask.FromResult(calls.DeadLetterResult);
+            },
+            () =>
+            {
+                calls.Renew++;
+                return ValueTask.FromResult(calls.RenewResult);
             });
 
     private static async Task WaitUntilAsync(Func<bool> condition)
@@ -468,15 +600,21 @@ public sealed class MongoDbDispatcherTests
 
     private sealed class Calls
     {
-        public Calls() => DeadLetterResult = true;
+        public Calls()
+        {
+            DeadLetterResult = true;
+            RenewResult = true;
+        }
 
         public int Handler;
         public int Ack;
         public int Nak;
         public int DeadLetter;
+        public int Renew;
         public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool DeleteOriginalOnDeadLetter;
         public bool DeadLetterResult;
+        public bool RenewResult;
         public TimeSpan LastNakDelay;
     }
 }

@@ -104,6 +104,14 @@ public sealed class MongoDbAsyncResponseTransportOptions
     /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// The hosting shutdown budget that must contain MongoDB subscriber shutdown plus
+    /// <see cref="MongoDbSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
+    /// <see cref="MongoDbAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
+    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// </summary>
+    public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Adds or replaces a named MongoDB reply target.</summary>
     public MongoDbAsyncResponseTransportOptions AddReplyTarget(string name, string responseQueue)
     {

@@ -77,6 +77,26 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
         SqsTransportDelivery delivery,
         CancellationToken subscriberCancellationToken);
 
+    /// <summary>
+    /// Whether the dispatcher can accept more deliveries right now. Awaiting dispatchers always can
+    /// (handlers run inline); the queued dispatcher returns <c>false</c> while its bounded queue is
+    /// saturated so the receive loop stops pulling messages instead of receiving and releasing them —
+    /// SQS counts every receive toward the queue's redrive policy.
+    /// </summary>
+    public virtual bool CanAcceptMore => true;
+
+    /// <summary>
+    /// Number of deliveries the dispatcher can accept right now. The receive loop requests at most
+    /// this many messages per receive in early-ACK mode so a burst never overflows the background queue.
+    /// </summary>
+    public virtual int FreeCapacity => int.MaxValue;
+
+    /// <summary>
+    /// Waits until the dispatcher can accept at least one more delivery. Completes immediately for
+    /// awaiting dispatchers; the queued dispatcher waits for a background worker to free a slot.
+    /// </summary>
+    public virtual ValueTask WaitForCapacityAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -207,6 +227,7 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
     private readonly Task[] _workers;
     private readonly CancellationTokenSource _drainCancellation = new();
     private readonly TimeSpan _drainTimeout;
+    private readonly int _capacity;
     private readonly string _queueName;
     private readonly SqsSubscriberRole _role;
     private int _pendingCount;
@@ -224,6 +245,7 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
         : base(handler, transportOptions, subscriberOptions, logger, queue, role)
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _capacity = subscriberOptions.BackgroundQueueCapacity;
         _queueName = queue;
         _role = role;
         _queue = Channel.CreateBounded<SqsTransportDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
@@ -249,6 +271,21 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
     internal int PendingCount => Volatile.Read(ref _pendingCount);
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
+    public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
+
+    public override int FreeCapacity => Math.Max(0, _capacity - Volatile.Read(ref _pendingCount));
+
+    public override async ValueTask WaitForCapacityAsync(CancellationToken cancellationToken)
+    {
+        // WaitToWriteAsync completes when the bounded channel has room (or the channel is completed
+        // during dispose, in which case there is nothing left to gate).
+        while (!CanAcceptMore)
+        {
+            if (!await _queue.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
+                return;
+        }
+    }
+
     /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
         SqsTransportDelivery delivery,
@@ -259,14 +296,18 @@ internal sealed class QueuedSqsMessageDispatcher : SqsMessageDispatcher
         {
             Interlocked.Decrement(ref _pendingCount);
             Logger.LogWarning(
-                "SQS background queue rejected message {MessageId} for {Queue}; releasing it for immediate redelivery. Pending={PendingCount}, Running={RunningCount}.",
+                "SQS background queue rejected message {MessageId} for {Queue}; leaving it to redeliver via its visibility timeout. Pending={PendingCount}, Running={RunningCount}.",
                 delivery.MessageId,
                 _queueName,
                 PendingCount,
                 RunningCount);
-            // Visibility zero is the SQS equivalent of an abandon: the message becomes receivable
-            // again immediately instead of waiting out the full visibility timeout.
-            await TryChangeVisibilityAsync(delivery, TimeSpan.Zero).ConfigureAwait(false);
+            // Do not release visibility to zero here: SQS counts every receive toward the queue's
+            // redrive policy, so an instantly re-receivable message that keeps hitting a full queue
+            // would cross maxReceiveCount and dead-letter without ever being processed. Let the
+            // visibility timeout lapse naturally (or shorten it via RedeliveryDelay when configured)
+            // so redelivery lands after capacity has had time to free.
+            if (RedeliveryDelay is { } redeliveryDelay)
+                await TryChangeVisibilityAsync(delivery, redeliveryDelay).ConfigureAwait(false);
             return;
         }
 

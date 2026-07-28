@@ -82,13 +82,18 @@ public sealed class MongoDbChannelCoverageTests
                 It.IsAny<TimeSpan>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("save failed"));
-        await using (var failed = await fixture.Channel.CreateResponseWaiter<OperationResult>(
-            "save-failure",
-            timeout: TimeSpan.FromSeconds(30)))
-        {
-            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => failed.ResponseTask);
-            Assert.Equal("save failed", error.Message);
-        }
+
+        // Must throw rather than return a pre-faulted waiter: the builder's contract is that the
+        // trigger only runs once the subscription AND recovery state exist, so a registration
+        // failure has to surface before any trigger could fire the remote operation.
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            fixture.Channel.CreateResponseWaiter<OperationResult>(
+                "save-failure",
+                timeout: TimeSpan.FromSeconds(30)));
+        Assert.Equal("save failed", error.Message);
+        fixture.RecoveryState.Verify(
+            s => s.TryDeleteAsync("save-failure", It.IsAny<Guid>(), It.IsAny<CancellationToken>()),
+            Times.Once);
 
         await fixture.Channel.DisposeAsync();
         await Assert.ThrowsAsync<ObjectDisposedException>(
@@ -520,12 +525,105 @@ public sealed class MongoDbChannelCoverageTests
 
         await store.HeartbeatSubscribersAsync("instance", [], TimeSpan.FromSeconds(30), CancellationToken.None);
         fixture.Subscribers.Verify(
-            s => s.UpdateManyAsync(
+            s => s.BulkWriteAsync(
+                It.IsAny<IEnumerable<WriteModel<MongoChannelSubscriberDocument>>>(),
+                It.IsAny<BulkWriteOptions>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task HeartbeatSubscribersAsync_UpsertsEveryLiveRegistration()
+    {
+        // The heartbeat must be an UPSERT of the process's live registrations: a bare UPDATE
+        // no-ops once the TTL reaper deletes the document, leaving a >timeout-stalled waiter
+        // permanently invisible to publishers.
+        var fixture = new ChannelFixture();
+        List<WriteModel<MongoChannelSubscriberDocument>>? writes = null;
+        fixture.Subscribers
+            .Setup(s => s.BulkWriteAsync(
+                It.IsAny<IEnumerable<WriteModel<MongoChannelSubscriberDocument>>>(),
+                It.IsAny<BulkWriteOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<WriteModel<MongoChannelSubscriberDocument>>, BulkWriteOptions, CancellationToken>(
+                (models, _, _) => writes = models.ToList())
+            .ReturnsAsync((BulkWriteResult<MongoChannelSubscriberDocument>)null!);
+        var registrationA = Guid.NewGuid();
+        var registrationB = Guid.NewGuid();
+
+        await fixture.Store.HeartbeatSubscribersAsync(
+            "instance-1",
+            [("corr-a", registrationA), ("corr-b", registrationB)],
+            TimeSpan.FromSeconds(30),
+            CancellationToken.None);
+
+        Assert.NotNull(writes);
+        Assert.Equal(2, writes!.Count);
+        Assert.All(writes, model =>
+        {
+            var update = Assert.IsType<UpdateOneModel<MongoChannelSubscriberDocument>>(model);
+            Assert.True(update.IsUpsert);
+        });
+    }
+
+    [Fact]
+    public async Task Dispatch_SkipsMessagesCreatedBeforeSubscriptionWatermark()
+    {
+        // Fan-out watermark: the sweep queries with the OLDEST waiter's watermark, so a
+        // late-joining waiter on a shared correlation id must not receive (or ack-claim) retained
+        // messages created before it registered.
+        var fixture = new ChannelFixture();
+        var late = fixture.Subscription(_ => new ValueTask<bool>(true));
+        var oldMessage = new MongoDbChannelMessage(Guid.NewGuid(), "corr", "null", DateTimeOffset.UtcNow.AddSeconds(-30));
+
+        await DispatchAsync(fixture.Channel, oldMessage, late.Instance);
+
+        Assert.False(late.Completion.Task.IsCompleted);
+        Assert.False(Invoke<bool>(late.Instance, "HasSeen", oldMessage.Id));
+        fixture.Messages.Verify(
+            c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+
+        await fixture.Channel.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task WaiterRegistration_WritesSubscriberBeforeRecoveryState()
+    {
+        // "Recovery state visible ⇒ subscription visible": the lost-subscriber dispatcher's live
+        // re-check relies on the subscriber document landing first, so a publisher that sees the
+        // state and no subscriber knows the waiter is truly gone (not mid-registration).
+        var fixture = new ChannelFixture();
+        var order = new List<string>();
+        fixture.Subscribers
+            .Setup(c => c.UpdateOneAsync(
                 It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
                 It.IsAny<UpdateDefinition<MongoChannelSubscriberDocument>>(),
                 It.IsAny<UpdateOptions>(),
-                It.IsAny<CancellationToken>()),
-            Times.Never);
+                It.IsAny<CancellationToken>()))
+            .Callback(() => order.Add("subscriber"))
+            .ReturnsAsync((UpdateResult)null!);
+        fixture.RecoveryState
+            .Setup(s => s.SaveAsync(
+                "registration-order",
+                It.IsAny<RecoveryState>(),
+                It.IsAny<TimeSpan>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => order.Add("recovery"))
+            .Returns(Task.CompletedTask);
+
+        await using (await fixture.Channel.CreateResponseWaiter<OperationResult>(
+            "registration-order",
+            timeout: TimeSpan.FromSeconds(30)))
+        {
+            Assert.Equal(["subscriber", "recovery"], order);
+        }
+
+        await fixture.Channel.DisposeAsync();
     }
 
     private sealed class ChannelFixture

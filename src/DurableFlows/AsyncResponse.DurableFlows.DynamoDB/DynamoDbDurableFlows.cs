@@ -56,6 +56,14 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
     /// <summary>Attribute used for DynamoDB TTL. Default: <c>expires_at</c>.</summary>
     public string TimeToLiveAttributeName { get; set; } = "expires_at";
 
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of the raw 400 KB item-cap ValidationException the
+    /// executor would retry into the dead-letter queue. Default: 350 KB (headroom under DynamoDB's
+    /// 400 KB item cap for the sibling attributes); <c>null</c> disables the guard.
+    /// </summary>
+    public long? MaxStateBytes { get; set; } = 350_000;
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -63,6 +71,8 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(TableName)} must be configured.");
         if (string.IsNullOrWhiteSpace(TimeToLiveAttributeName))
             throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(TimeToLiveAttributeName)} must be configured.");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
@@ -75,6 +85,12 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
     private const string RevisionAttribute = "revision";
     private const string LeaseIdAttribute = "lease_id";
     private const string LeaseExpiresAtAttribute = "lease_expires_at_ms";
+
+    // Time authority: this store keeps the app clock (DateTimeOffset.UtcNow) for expiry and lease
+    // comparisons. DynamoDB condition expressions evaluate client-supplied values only — there is
+    // no server-clock function available in a conditional write — so multi-node deployments
+    // should keep worker clocks synchronized well inside the lease window. (DynamoDB's own TTL
+    // reaper, by contrast, runs on the service clock against the epoch-seconds expiry attribute.)
 
     private readonly IAmazonDynamoDB _client;
     private readonly DynamoDbDurableFlowOptions _options;
@@ -115,13 +131,13 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
             || !long.TryParse(revision.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(json.S);
-        return state?.Revision == value ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, json.S, value);
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "DynamoDB");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         var now = DateTimeOffset.UtcNow;
@@ -130,7 +146,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
             await _client.PutItemAsync(new PutItemRequest
             {
                 TableName = _options.TableName,
-                Item = CreateItem(flowId, state, ttl, now),
+                Item = CreateItem(flowId, stateJson, state.Revision, ttl, now),
                 ConditionExpression = "attribute_not_exists(#flow_id) OR #expires <= :now",
                 ExpressionAttributeNames = new Dictionary<string, string>
                 {
@@ -159,6 +175,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "DynamoDB");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         var now = DateTimeOffset.UtcNow;
@@ -171,8 +188,8 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         };
         var values = new Dictionary<string, AttributeValue>
         {
-            [":state"] = new() { S = DurableFlowStoreShared.Serialize(state) },
-            [":expires"] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
+            [":state"] = new() { S = stateJson },
+            [":expires"] = new() { N = UnixSecondsCeiling(DurableFlowStoreShared.AddSaturating(now, ttl)) },
             [":updated"] = new() { N = UnixSeconds(now) },
             [":expected_revision"] = new() { N = expectedRevision.ToString(CultureInfo.InvariantCulture) },
             [":new_revision"] = new() { N = state.Revision.ToString(CultureInfo.InvariantCulture) },
@@ -444,7 +461,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
                     [":now"] = new() { N = UnixSeconds(now) },
                     [":now_ms"] = new() { N = UnixMilliseconds(now) },
                     [":lease_id"] = new() { S = leaseId },
-                    [":lease_expires"] = new() { N = UnixMilliseconds(now.Add(leaseDuration)) }
+                    [":lease_expires"] = new() { N = UnixMilliseconds(DurableFlowStoreShared.AddSaturating(now, leaseDuration)) }
                 }
             }, cancellationToken).ConfigureAwait(false);
             return true;
@@ -455,14 +472,14 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         }
     }
 
-    private Dictionary<string, AttributeValue> CreateItem(string flowId, FlowState state, TimeSpan ttl, DateTimeOffset now)
+    private Dictionary<string, AttributeValue> CreateItem(string flowId, string stateJson, long revision, TimeSpan ttl, DateTimeOffset now)
         => new(StringComparer.Ordinal)
         {
             [FlowIdAttribute] = new() { S = flowId },
-            [StateJsonAttribute] = new() { S = DurableFlowStoreShared.Serialize(state) },
-            [_options.TimeToLiveAttributeName] = new() { N = UnixSecondsCeiling(now.Add(ttl)) },
+            [StateJsonAttribute] = new() { S = stateJson },
+            [_options.TimeToLiveAttributeName] = new() { N = UnixSecondsCeiling(DurableFlowStoreShared.AddSaturating(now, ttl)) },
             [UpdatedAtAttribute] = new() { N = UnixSeconds(now) },
-            [RevisionAttribute] = new() { N = state.Revision.ToString(CultureInfo.InvariantCulture) }
+            [RevisionAttribute] = new() { N = revision.ToString(CultureInfo.InvariantCulture) }
         };
 
     private static Dictionary<string, AttributeValue> Key(string flowId)

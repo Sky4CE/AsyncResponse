@@ -5,6 +5,8 @@ AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.AutoCreateTable.s
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.DynamoDbDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.EnableTimeToLive.get -> bool
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.EnableTimeToLive.set -> void
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TableName.get -> string!
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TableName.set -> void
 AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions.TimeToLiveAttributeName.get -> string!

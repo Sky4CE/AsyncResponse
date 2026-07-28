@@ -22,6 +22,8 @@ AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterSubjec
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DeadLetterSubject.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.NatsAsyncResponseTransportOptions() -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishMaxAttempts.get -> int
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.PublishMaxAttempts.set -> void

@@ -375,7 +375,7 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterEnqueue_Overflow_ReleasesVisibilityForImmediateRedelivery()
+    public async Task AckAfterEnqueue_Overflow_LetsVisibilityTimeoutLapseInsteadOfZeroingIt()
     {
         var calls = new SettlementCalls();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -397,10 +397,133 @@ public sealed class SqsDispatcherTests
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
 
-        // The overflowing message is not deleted; its visibility is zeroed so SQS redelivers it now.
-        Assert.Equal(TimeSpan.Zero, Assert.Single(calls.VisibilityChanges));
+        // The overflowing message is neither deleted nor made instantly re-receivable: a zero
+        // visibility would burn a receive against the queue's redrive policy on every retry while
+        // the queue stays full. It redelivers when its visibility timeout lapses.
+        Assert.Empty(calls.VisibilityChanges);
         Assert.Equal(2, calls.Delete);
         release.TrySetResult();
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_OverflowWithRedeliveryDelay_ShortensVisibilityToThatDelay()
+    {
+        var calls = new SettlementCalls();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                entered.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions { RedeliveryDelay = TimeSpan.FromSeconds(9) }
+                .UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.Equal(TimeSpan.FromSeconds(9), Assert.Single(calls.VisibilityChanges));
+        Assert.Equal(2, calls.Delete);
+        release.TrySetResult();
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_CapacitySignals_TrackSaturationAndRelease()
+    {
+        var calls = new SettlementCalls();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                entered.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        Assert.True(dispatcher.CanAcceptMore);
+        Assert.Equal(1, dispatcher.FreeCapacity);
+
+        // First delivery goes straight to the (blocked) worker; the second fills the queue.
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.False(dispatcher.CanAcceptMore);
+        Assert.Equal(0, dispatcher.FreeCapacity);
+
+        var waitTask = dispatcher.WaitForCapacityAsync(CancellationToken.None).AsTask();
+        Assert.False(waitTask.IsCompleted);
+
+        release.TrySetResult();
+        await waitTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(dispatcher.CanAcceptMore);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_CapacitySignals_AlwaysOpen()
+    {
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions(),
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        Assert.True(dispatcher.CanAcceptMore);
+        Assert.Equal(int.MaxValue, dispatcher.FreeCapacity);
+        await dispatcher.WaitForCapacityAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public void ValidateOptions_VisibilityRenewalInterval_RequiresVisibilityTimeoutAndShorterInterval()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqsMessageDispatcher.ValidateOptions(
+                new SqsAsyncResponseOptions(),
+                new SqsSubscriberOptions { VisibilityRenewalInterval = TimeSpan.Zero },
+                SqsSubscriberRole.Worker));
+        Assert.Contains(nameof(SqsSubscriberOptions.VisibilityRenewalInterval), ex.Message, StringComparison.Ordinal);
+
+        ex = Assert.Throws<InvalidOperationException>(() =>
+            SqsMessageDispatcher.ValidateOptions(
+                new SqsAsyncResponseOptions(),
+                new SqsSubscriberOptions { VisibilityRenewalInterval = TimeSpan.FromSeconds(10) },
+                SqsSubscriberRole.Worker));
+        Assert.Contains(nameof(SqsSubscriberOptions.VisibilityTimeout), ex.Message, StringComparison.Ordinal);
+
+        ex = Assert.Throws<InvalidOperationException>(() =>
+            SqsMessageDispatcher.ValidateOptions(
+                new SqsAsyncResponseOptions(),
+                new SqsSubscriberOptions
+                {
+                    VisibilityTimeout = TimeSpan.FromSeconds(10),
+                    VisibilityRenewalInterval = TimeSpan.FromSeconds(10)
+                },
+                SqsSubscriberRole.Worker));
+        Assert.Contains("shorter", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // A renewal interval below the visibility timeout is valid.
+        SqsMessageDispatcher.ValidateOptions(
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions
+            {
+                VisibilityTimeout = TimeSpan.FromSeconds(30),
+                VisibilityRenewalInterval = TimeSpan.FromSeconds(10)
+            },
+            SqsSubscriberRole.Worker);
     }
 
     [Fact]

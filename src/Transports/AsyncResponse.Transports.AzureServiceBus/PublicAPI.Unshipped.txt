@@ -60,6 +60,8 @@ AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.Backgr
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundQueueCapacity.set -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundWorkerCount.get -> int
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.BackgroundWorkerCount.set -> void
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.LockRenewalInterval.get -> System.TimeSpan?
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.LockRenewalInterval.set -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.MaxDeliveryAttempts.get -> int
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.MaxDeliveryAttempts.set -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?

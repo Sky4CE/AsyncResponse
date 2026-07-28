@@ -25,7 +25,10 @@ public class NatsAckDispatchBenchmarks
     public void Setup()
     {
         var jetStream = new BenchmarkNatsJetStreamTransport();
-        var options = new NatsAsyncResponseTransportOptions();
+        var options = new NatsAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(60)
+        };
         var schema = new NatsTransportSubjectSchema(options);
 
         _awaiting = new NatsMessageDispatcher(

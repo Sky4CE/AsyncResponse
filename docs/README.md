@@ -32,6 +32,7 @@ recipes; come back here to go deeper.
 | Understand a transport's ACK, redelivery, and dead-letter semantics | [Transport options](configuration.md#transport-options) |
 | Run the Redis pair on Valkey / Dragonfly / Garnet or managed Redis | [Redis-compatible servers](configuration.md#redis-compatible-servers) |
 | Connect traces and metrics (span names, instruments, tags) | [observability.md](observability.md) |
+| Ship a trimmed / Native AOT app | [aot.md](aot.md) |
 | Understand the PostgreSQL channel/transport internals and tuning | [postgresql.md](postgresql.md) |
 | Understand the SQL Server channel/transport internals and tuning | [sqlserver.md](sqlserver.md) |
 
@@ -42,4 +43,5 @@ recipes; come back here to go deeper.
 | Apply the production best practices | [Best practices](operations.md#best-practices) |
 | Build the solution and run the unit/integration suites | [Building and testing](operations.md#building-and-testing) |
 | Benchmark, stress-test, or load-test the library | [Benchmarking and load testing](operations.md#benchmarking-and-load-testing) |
-| See which channels/transports are planned next — and what was rejected, and why | [roadmap.md](roadmap.md) |
+| Diagnose a symptom — stuck flow, lock-lost redeliveries, slow MongoDB wakes, analyzer errors | [troubleshooting.md](troubleshooting.md) |
+| See what's planned next — capabilities and backends — and what was rejected, and why | [roadmap.md](roadmap.md) |

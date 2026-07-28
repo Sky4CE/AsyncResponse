@@ -18,6 +18,8 @@ AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord.UpdatedAtUtc.set -> voi
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.EFCoreDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions.PruneInterval.set -> void
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>
@@ -29,7 +31,7 @@ AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryCreateAsync(
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryDeleteAsync(string! flowId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryRenewLeaseAsync(string! flowId, string! leaseId, System.TimeSpan leaseDuration, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
-const AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.DefaultTableName = "asyncresponse_flow_state" -> string!
 Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions
+const AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.DefaultTableName = "asyncresponse_flow_state" -> string!
 static AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows(this Microsoft.EntityFrameworkCore.ModelBuilder! modelBuilder, string! tableName = "asyncresponse_flow_state", string? schema = null) -> Microsoft.EntityFrameworkCore.ModelBuilder!
 static Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions.WithEFCoreDurableFlows<TContext>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

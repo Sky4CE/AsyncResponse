@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Channels.SqlServer</PackageId>
     <Description>Microsoft SQL Server channel for AsyncResponse: adaptive-polling response wakeups and durable SQL Server recovery-state tables for lost-subscriber recovery across redeploys, with domain-state-aware failure routing. Plugs into the Core engine's recovery watchdog and readiness health check.</Description>
+    <PackageTags>$(PackageTags);sqlserver;mssql</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

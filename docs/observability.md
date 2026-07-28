@@ -30,6 +30,7 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.wait` | active waiter lifetime, including timeout/fault status |
 | `asyncresponse.set_response`, `asyncresponse.set_exception` | publishing a response or exception through the configured channel |
 | `asyncresponse.ingress.response`, `asyncresponse.ingress.worker` | transport-neutral response and worker message ingress |
+| `asyncresponse.ingress.raw_response` | raw response ingress — broker JSON published into the channel before payload typing |
 | `asyncresponse.enqueue_worker`, `asyncresponse.worker.publish`, `asyncresponse.worker.execute` | worker enqueue, transport publish, and execution |
 | `asyncresponse.redis.receive` | Redis Streams subscriber message handling |
 | `asyncresponse.azure_service_bus.receive` | Azure Service Bus subscriber message handling |
@@ -39,7 +40,8 @@ Spans cover the whole library path, not only Redis:
 | `asyncresponse.sqs.receive` | AWS SQS subscriber message handling |
 | `asyncresponse.nats.receive` | NATS JetStream subscriber message handling |
 | `asyncresponse.postgresql.receive` | PostgreSQL transport subscriber message handling |
-| `asyncresponse.worker.receive`, `asyncresponse.response.receive` | SQL Server transport subscriber message handling (named by role) |
+| `asyncresponse.sqlserver.receive` | SQL Server transport subscriber message handling |
+| `asyncresponse.mongodb.receive` | MongoDB transport subscriber message handling |
 | `asyncresponse.lost_subscriber.dispatch` | recovery callback routing when no waiter is alive |
 | `asyncresponse.watchdog.scan` | recovery watchdog scans |
 | `asyncresponse.flow.execute` | one durable-flow run execution, tagged `asyncresponse.flow_id` and `asyncresponse.flow_type` (see [durable-flows.md](durable-flows.md)) |

@@ -198,6 +198,10 @@ entry or its stale ledger), not as a silent parent hang — see the failure tabl
 propagation machinery the parent never needs), but it does embed the child's own step results —
 so deeply nested parent → child → grandchild chains grow the parent's ledger with each completed
 child. Keep very large payloads in your own storage and pass references through flow state.
+Stores enforce a `MaxStateBytes` budget on every write (defaulted below each provider's hard
+item/document cap — DynamoDB 400 KB, Cosmos 2 MB, MongoDB 16 MB); an oversized checkpoint fails
+with an error naming the flow id, size, and limit instead of a raw provider error
+(see [configuration.md](configuration.md#common-durable-flow-options)).
 
 For best-effort child work, keep the failure as data:
 
@@ -477,7 +481,7 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
 | Hotfixing in-flight runs | Resume into current code; no determinism constraints | Version/patch workflows so old histories still replay |
 | Compensation | Explicit: you write compensating steps; the state tells you what completed | Saga frameworks track and run compensations automatically |
 | Durable timers (weeks), cron, human tasks | Per-step timeouts up to `StateExpiry`; longer cadence belongs to your scheduler | First-class durable timers |
-| Extra infrastructure | None — state rides in the channel you already run | An engine cluster/service to operate and upgrade |
+| Extra infrastructure | None new — the flow ledger lives in a database/store you already run | An engine cluster/service to operate and upgrade |
 
 Reach for an engine when you need engine-*owned* semantics: automatically derived compensation
 graphs, months-long durable timers, human-approval tasks, or replayable audit histories. For

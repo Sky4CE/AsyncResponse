@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.MongoDB</PackageId>
     <Description>MongoDB transport for AsyncResponse: publish worker jobs to durable MongoDB queue collections, consume worker-job and response-ingress queues with atomic findOneAndUpdate claims, bounded redelivery and dead-lettering, and expose MongoDB reply targets.</Description>
+    <PackageTags>$(PackageTags);mongodb</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

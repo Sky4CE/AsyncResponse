@@ -543,12 +543,16 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
                     _drainCancellation.Token,
                     logFailures: false).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (_drainCancellation.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (_drainCancellation.IsCancellationRequested)
             {
-                Logger.LogDebug(
-                    "Redis background handler for already-ACKed message {MessageId} on {Stream} was canceled during dispatcher shutdown.",
+                // The drain budget lapsed with this already-ACKed entry still unprocessed: Redis
+                // will not redeliver it, so surface the drop through OnBackgroundFailure instead of
+                // losing it silently.
+                Logger.LogWarning(
+                    "Redis background handler for already-ACKed message {MessageId} on {Stream} was canceled during dispatcher shutdown; surfacing via OnBackgroundFailure.",
                     delivery.MessageId.ToString(),
                     _stream);
+                await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

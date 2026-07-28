@@ -76,7 +76,8 @@ public class ChannelTransportRegistrationTests
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
             provider.GetServices<AsyncResponseTransportMarker>(),
-            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -92,7 +93,8 @@ public class ChannelTransportRegistrationTests
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
             provider.GetServices<AsyncResponseTransportMarker>(),
-            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>());
 
         await validator.StartAsync(CancellationToken.None); // single "Redis" channel → must not throw
         await validator.StopAsync(CancellationToken.None);
@@ -187,7 +189,8 @@ public class ChannelTransportRegistrationTests
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
             provider.GetServices<AsyncResponseTransportMarker>(),
-            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
@@ -205,11 +208,83 @@ public class ChannelTransportRegistrationTests
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
             provider.GetServices<AsyncResponseTransportMarker>(),
-            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>());
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains("multiple", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("durable-flow", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AddAsyncResponseTwice_RegistersHostedServicesOnce()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddAsyncResponse().WithInMemoryChannel().WithInMemoryTransport().WithInMemoryDurableFlows();
+        services.AddAsyncResponse();
+
+        using var provider = services.BuildServiceProvider();
+        var hostedServices = provider.GetServices<IHostedService>().ToArray();
+
+        // A second AddAsyncResponse() must not double the validator or watchdog: two watchdogs
+        // would duplicate scans and warnings, and two validators are pure waste.
+        Assert.Single(hostedServices, service => service is AsyncResponseStartupValidator);
+        Assert.Single(hostedServices, service => service is AsyncResponseWatchdog);
+    }
+
+    [Theory]
+    [InlineData(0, 1, 0, nameof(AsyncResponseWatchdogOptions.Interval))]
+    [InlineData(1, 0, 0, nameof(AsyncResponseWatchdogOptions.StaleAfter))]
+    [InlineData(1, 1, -1, nameof(AsyncResponseWatchdogOptions.StartupDelay))]
+    public async Task StartupValidator_RejectsInvalidWatchdogOptions(
+        int intervalHours,
+        int staleAfterHours,
+        int startupDelayMinutes,
+        string expectedOption)
+    {
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            Options.Create(new AsyncResponseOptions
+            {
+                Watchdog = new AsyncResponseWatchdogOptions
+                {
+                    Interval = TimeSpan.FromHours(intervalHours),
+                    StaleAfter = TimeSpan.FromHours(staleAfterHours),
+                    StartupDelay = TimeSpan.FromMinutes(startupDelayMinutes)
+                }
+            }));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains(expectedOption, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void InMemoryChannel_RejectsNonPositiveSharedChannelOptions()
+    {
+        using var services = new ServiceCollection().BuildServiceProvider();
+
+        var expiry = Assert.Throws<InvalidOperationException>(() => new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new InMemoryRecoveryStateStore(),
+            Options.Create(new InMemoryAsyncResponseOptions { RecoveryStateExpiry = TimeSpan.Zero }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance));
+        Assert.Contains(nameof(AsyncResponseChannelOptions.RecoveryStateExpiry), expiry.Message, StringComparison.Ordinal);
+
+        var timeout = Assert.Throws<InvalidOperationException>(() => new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new InMemoryRecoveryStateStore(),
+            Options.Create(new InMemoryAsyncResponseOptions { DefaultTimeout = TimeSpan.Zero }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance));
+        Assert.Contains(nameof(AsyncResponseChannelOptions.DefaultTimeout), timeout.Message, StringComparison.Ordinal);
     }
 
     private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)

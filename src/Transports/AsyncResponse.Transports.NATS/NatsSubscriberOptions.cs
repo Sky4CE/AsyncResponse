@@ -86,7 +86,8 @@ public sealed class NatsSubscriberOptions
     /// <summary>
     /// Maximum number of messages waiting in the background queue for
     /// <see cref="NatsAckMode.AckAfterReceive"/>. When full, the consume loop pauses pulling new
-    /// messages until capacity frees.
+    /// messages until a background worker frees capacity; a message caught waiting when the
+    /// subscriber stops is NAKed so JetStream redelivers it.
     /// </summary>
     public int BackgroundQueueCapacity { get; set; }
 

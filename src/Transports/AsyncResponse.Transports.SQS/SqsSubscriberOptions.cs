@@ -82,6 +82,21 @@ public sealed class SqsSubscriberOptions
     /// </summary>
     public TimeSpan? RedeliveryDelay { get; set; }
 
+    /// <summary>
+    /// Heartbeat cadence for extending the visibility of received-but-unprocessed messages while a
+    /// <see cref="SqsAckMode.AckAfterHandlerCompletes"/> batch is worked through serially. Each beat
+    /// resets every unprocessed message's invisibility to <see cref="VisibilityTimeout"/> via
+    /// <c>ChangeMessageVisibility</c>, so a slow handler does not let later batch messages become
+    /// visible (and be processed twice) before their turn. Requires <see cref="VisibilityTimeout"/>
+    /// to be set and must be shorter than it. Renewal failures are logged and processing continues —
+    /// the message simply redelivers, preserving at-least-once semantics.
+    /// <c>null</c> (the default) disables renewal: it is off by default because extending visibility
+    /// silently changes redrive timing operators tune on the queue, and on FIFO queues an extended
+    /// message keeps its whole message group blocked if the consumer wedges, delaying failover.
+    /// Ignored in <see cref="SqsAckMode.AckAfterEnqueue"/> (messages are already deleted).
+    /// </summary>
+    public TimeSpan? VisibilityRenewalInterval { get; set; }
+
     /// <summary>Number of background workers used by <see cref="SqsAckMode.AckAfterEnqueue"/>.</summary>
     public int BackgroundWorkerCount { get; set; }
 

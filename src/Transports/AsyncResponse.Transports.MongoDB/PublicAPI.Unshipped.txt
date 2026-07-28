@@ -22,6 +22,8 @@ AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetter
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DeadLetterRetention.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.LockTimeout.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.MessageCollection.get -> string!

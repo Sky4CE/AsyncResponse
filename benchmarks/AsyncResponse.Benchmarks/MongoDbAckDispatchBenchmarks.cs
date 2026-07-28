@@ -23,7 +23,10 @@ public class MongoDbAckDispatchBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var options = new MongoDbAsyncResponseTransportOptions();
+        var options = new MongoDbAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(60)
+        };
 
         _awaiting = new MongoDbMessageDispatcher(
             (_, _) => Task.CompletedTask,
@@ -67,5 +70,6 @@ public class MongoDbAckDispatchBenchmarks
             Attempt: 1,
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
-            (_, _, _) => ValueTask.FromResult(true));
+            (_, _, _) => ValueTask.FromResult(true),
+            () => ValueTask.FromResult(true));
 }

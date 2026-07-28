@@ -607,7 +607,8 @@ public class KafkaTransportTests
         var validator = new AsyncResponseStartupValidator(
             provider.GetServices<AsyncResponseChannelMarker>(),
             provider.GetServices<AsyncResponseTransportMarker>(),
-            provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>());
 
         await validator.StartAsync(CancellationToken.None); // one channel + transport + flow store → must not throw
         await validator.StopAsync(CancellationToken.None);

@@ -96,10 +96,11 @@ no separate fixture app to keep in sync). They run at two levels:
 - **In-process, no Docker** — `WebApplicationFactory` boots the sample on the fully in-memory channel
   and transport, covering the core request/response, attach, worker, and concurrency paths. They need
   no containers, so they stay fast and reliable even where Docker is unavailable.
-- **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts real Redis,
-  a Google Pub/Sub emulator container, the Azure Service Bus emulator, RabbitMQ, NATS, PostgreSQL,
-  SQL Server, and sample-app SUTs for default and early-ACK variants. Tests drive the Redis, Pub/Sub,
-  Azure Service Bus, RabbitMQ, Redis transport, NATS, PostgreSQL, and SQL Server scenarios over HTTP. They need a running
+- **Aspire-orchestrated, Docker** — `Aspire.Hosting.Testing` boots an AppHost that starts every
+  broker, emulator, and store container the suite needs, plus a dedicated sample-app SUT per
+  transport for the default and early-ACK variants. The complete container inventory lives in the
+  README's [How it's tested](../README.md#how-its-tested) section (the single source of truth, so
+  this page doesn't drift). Tests drive each provider's scenarios over HTTP. They need a running
   Docker daemon (and pull broker images on first run), so CI runs them in a separate Docker-backed
   `integration-tests` job:
 
@@ -163,7 +164,9 @@ queue rows), **sqlserver-ack-after-enqueue-dispatch-storm** (the same bounded ea
 SQL Server queue rows), **azure-servicebus-ack-after-receive-dispatch-storm** (the same bounded early-ACK
 invariant for Azure Service Bus messages), **sqs-ack-after-enqueue-dispatch-storm** (the same bounded
 early-ACK invariant for AWS SQS deliveries: every message deleted exactly once, never released back via
-`ChangeMessageVisibility`), **race-burst** (subscribe-before-send under contention),
+`ChangeMessageVisibility`), **kafka-ack-after-enqueue-dispatch-storm** (the same bounded early-ACK
+invariant for Kafka deliveries), **mongodb-ack-after-enqueue-dispatch-storm** (the same bounded
+early-ACK invariant for MongoDB queue documents), **race-burst** (subscribe-before-send under contention),
 **raw-ingress-storm** (broker JSON into typed waiters), **shared-response-fanout** and
 **exception-fanout** (many waiters on one correlation id), **timeout-storm** and
 **dispose-cleanup-storm** (subscription/recovery cleanup), **context-isolation-storm** (captured
@@ -175,7 +178,7 @@ exactly once). A separate BenchmarkDotNet baseline compares the SQLite durable-f
 against the explicit in-memory store. The core concurrency
 invariants are gated on every CI run, at smaller scale, by
 [`ConcurrencyTests`](../tests/AsyncResponse.Tests/ConcurrencyTests.cs) in the unit suite. The broker
-dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server
+dispatch storms stay in-process too: they bypass external Pub/Sub/Azure Service Bus/SQS/RabbitMQ/Redis/NATS/PostgreSQL/SQL Server/Kafka/MongoDB
 servers while exercising the transport callback/ACK dispatchers.
 
 **End-to-end load (NBomber).** [`benchmarks/AsyncResponse.LoadTests`](../benchmarks/AsyncResponse.LoadTests)

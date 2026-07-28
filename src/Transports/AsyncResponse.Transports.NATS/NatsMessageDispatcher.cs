@@ -46,7 +46,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         NatsSubscriberRole role,
         string consumer)
     {
-        NatsTransportOptionsValidator.ValidateSubscriber(subscriberOptions, role.ToString());
+        NatsTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
         _handler = handler;
         _jetStream = jetStream;
@@ -77,7 +77,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     {
         if (_subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
         {
-            await HandleEarlyAckAsync(delivery).ConfigureAwait(false);
+            await HandleEarlyAckAsync(delivery, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -119,42 +119,48 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         }
     }
 
-    private async Task HandleEarlyAckAsync(NatsJobDelivery delivery)
+    private async Task HandleEarlyAckAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
-        // Accept into the background queue and ACK; if the queue is saturated, NAK so JetStream
-        // redelivers later rather than dropping the message or blocking the consume loop.
+        // Accept into the background queue and ACK. If the queue is saturated, wait for a worker to
+        // free a slot instead of NAKing: the wait blocks the consume loop, so the subscriber stops
+        // pulling new messages until capacity frees rather than churning NAK/redeliver cycles.
         if (_backgroundQueue!.Writer.TryWrite(delivery))
         {
             await delivery.AckAsync().ConfigureAwait(false);
+            return;
         }
-        else
+
+        try
         {
-            _logger.LogDebug("Background queue full for {Role}; NAKing message for redelivery.", _role);
+            _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role);
+            await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
+            await delivery.AckAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
+        {
+            // Subscriber stopping or dispatcher disposing: NAK so JetStream redelivers elsewhere.
+            _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role);
             await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
         }
     }
 
     private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
     {
-        try
+        // Token-less ReadAllAsync: on shutdown the queue is completed and fully drained, so every
+        // already-ACKed delivery is attempted (with the drain token once the drain budget lapses)
+        // instead of being silently dropped; each failure is dead-lettered and surfaced below.
+        await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            try
             {
-                try
-                {
-                    await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject);
-                    await DeadLetterAsync(delivery, ex, CancellationToken.None).ConfigureAwait(false);
-                    await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
-                }
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected on shutdown.
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject);
+                await DeadLetterAsync(delivery, ex, CancellationToken.None).ConfigureAwait(false);
+                await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+            }
         }
     }
 

@@ -39,11 +39,18 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="MySqlFlowStateStore.TryCreateAsync"/> opportunistically deletes expired rows
-    /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
-    /// prunes on every save. Default: 5 minutes.
+    /// How often <see cref="MySqlFlowStateStore.TryCreateAsync"/> opportunistically deletes one bounded
+    /// batch (1000 rows) of expired rows (loads already treat expired state as absent; pruning
+    /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
+    /// (unlimited — <c>longtext</c> holds up to 4 GB), settable as an operator budget.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
@@ -52,12 +59,25 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
 
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
 /// <summary>MySQL/MariaDB implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class MySqlFlowStateStore : IFlowStateStore
 {
+    private const int PruneBatchSize = 1000;
+
+    /// <summary>
+    /// SQL expression adding a millisecond bigint parameter to the database clock. All expiry and
+    /// lease math runs on <c>UTC_TIMESTAMP(6)</c> (statement-stable, like <c>NOW()</c>) so app
+    /// clock skew can never fence a lease in or out; microsecond arithmetic keeps
+    /// <c>datetime(6)</c> precision.
+    /// </summary>
+    private static string AddMilliseconds(string parameterName)
+        => $"TIMESTAMPADD(MICROSECOND, {parameterName} * 1000, UTC_TIMESTAMP(6))";
+
     private readonly MySqlDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
@@ -76,21 +96,20 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > @now_utc;";
+        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > UTC_TIMESTAMP(6);";
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
-        return state?.Revision == reader.GetInt64(1) ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
@@ -100,13 +119,11 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         command.CommandText =
             $"""
             INSERT INTO {Table} (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-            VALUES (@flow_id, @state_json, @expires_at_utc, @now_utc, @revision);
+            VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, UTC_TIMESTAMP(6), @revision);
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
-        command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@state_json", stateJson);
+        command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
         command.Parameters.AddWithValue("@revision", state.Revision);
         try
         {
@@ -129,9 +146,9 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                 revision = @revision,
                 lease_id = NULL,
                 lease_expires_at_utc = NULL,
-                updated_at_utc = @now_utc,
-                expires_at_utc = @expires_at_utc
-            WHERE flow_id = @flow_id AND expires_at_utc <= @now_utc;
+                updated_at_utc = UTC_TIMESTAMP(6),
+                expires_at_utc = {AddMilliseconds("@ttl_ms")}
+            WHERE flow_id = @flow_id AND expires_at_utc <= UTC_TIMESTAMP(6);
             """;
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
@@ -145,6 +162,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MySQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -153,19 +171,17 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             $"""
             UPDATE {Table}
             SET state_json = @state_json,
-                expires_at_utc = @expires_at_utc,
-                updated_at_utc = @now_utc,
+                expires_at_utc = {AddMilliseconds("@ttl_ms")},
+                updated_at_utc = UTC_TIMESTAMP(6),
                 revision = @new_revision
             WHERE flow_id = @flow_id
               AND revision = @expected_revision
-              AND expires_at_utc > @now_utc
-              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > @now_utc));
+              AND expires_at_utc > UTC_TIMESTAMP(6)
+              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > UTC_TIMESTAMP(6)));
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
-        command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@state_json", stateJson);
+        command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
         command.Parameters.AddWithValue("@expected_revision", expectedRevision);
         command.Parameters.AddWithValue("@new_revision", state.Revision);
         command.Parameters.AddWithValue("@lease_id", (object?)leaseId ?? DBNull.Value);
@@ -203,10 +219,13 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
     private async Task PruneExpiredAsync(CancellationToken cancellationToken)
     {
+        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // unbatched DELETE over a large expired backlog holds row locks and bloats one
+        // transaction for the unlucky create that triggered the prune. Loads already filter on
+        // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= @now_utc;";
-        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= UTC_TIMESTAMP(6) LIMIT {PruneBatchSize};";
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -261,24 +280,31 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        var now = DateTime.UtcNow;
+        // Lease fencing runs entirely on the database clock: acquire steals only leases the
+        // database considers expired, and renew/extend stays relative to UTC_TIMESTAMP(6), so
+        // worker clock skew can never make two nodes hold the same lease.
         command.CommandText =
             $"""
             UPDATE {Table}
-            SET lease_id = @lease_id, lease_expires_at_utc = @lease_expires_at_utc
+            SET lease_id = @lease_id, lease_expires_at_utc = {AddMilliseconds("@lease_ms")}
             WHERE flow_id = @flow_id
-              AND expires_at_utc > @now_utc
-              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= @now_utc OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > @now_utc")};
+              AND expires_at_utc > UTC_TIMESTAMP(6)
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= UTC_TIMESTAMP(6) OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > UTC_TIMESTAMP(6)")};
             """;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@lease_id", leaseId);
-        command.Parameters.AddWithValue("@now_utc", now);
-        command.Parameters.AddWithValue("@lease_expires_at_utc", now.Add(leaseDuration));
+        command.Parameters.AddWithValue("@lease_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
     private async Task<MySqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
+        // Row-count semantics guard: this store's lease renewal (and update fencing) treats
+        // ExecuteNonQuery's result as ROWS MATCHED, which is MySqlConnector's default
+        // (UseAffectedRows=false). A connection string with UseAffectedRows=true switches the
+        // result to ROWS CHANGED, and a renewal that lands in the same microsecond as the current
+        // lease expiry would report 0 and abort a healthy execution. Do not set
+        // UseAffectedRows=true on this store's connection string.
         var connection = new MySqlConnection(_options.ConnectionString);
         try
         {

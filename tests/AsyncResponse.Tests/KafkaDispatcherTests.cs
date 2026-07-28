@@ -672,6 +672,63 @@ public class KafkaDispatcherTests
         await handlerCanceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
+    [Fact]
+    public async Task Queued_Dispose_CancelledDrain_SurfacesDroppedMessagesViaOnBackgroundFailure()
+    {
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = new List<KafkaBackgroundFailureContext>();
+        var subscriberOptions = new KafkaSubscriberOptions
+        {
+            OnBackgroundFailure = context =>
+            {
+                lock (failures)
+                {
+                    failures.Add(context);
+                }
+
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100));
+        var dispatcher = CreateDispatcher(
+            async (_, token) =>
+            {
+                handlerStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token).ConfigureAwait(false);
+            },
+            subscriberOptions);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 2), CancellationToken.None); // committed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // drain budget elapses; the interrupted work must not vanish silently
+
+        // Both the in-handler message and the still-queued one are already committed: the shutdown
+        // interruption is surfaced through OnBackgroundFailure for each instead of only debug-logged.
+        await WaitUntilAsync(() =>
+        {
+            lock (failures)
+            {
+                return failures.Count == 2;
+            }
+        });
+        lock (failures)
+        {
+            Assert.All(failures, context => Assert.IsAssignableFrom<OperationCanceledException>(context.Exception));
+            Assert.Equal([1L, 2L], failures.Select(context => context.Offset).OrderBy(offset => offset));
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            await Task.Delay(20, cts.Token);
+        }
+    }
+
     // ---------- Unprocessable messages ----------
 
     [Fact]

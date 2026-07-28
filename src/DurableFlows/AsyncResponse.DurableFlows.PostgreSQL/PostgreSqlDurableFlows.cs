@@ -63,23 +63,34 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="PostgreSqlFlowStateStore.TryCreateAsync"/> opportunistically deletes expired
-    /// rows (loads already treat expired state as absent; pruning bounds table growth). Zero or
-    /// negative prunes on every save. Default: 5 minutes.
+    /// How often <see cref="PostgreSqlFlowStateStore.TryCreateAsync"/> opportunistically deletes one
+    /// bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
+    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
+    /// (unlimited — PostgreSQL <c>jsonb</c> is effectively unbounded), settable as an operator budget.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
         DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(SchemaName)}", "PostgreSQL");
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)}", "PostgreSQL");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
 /// <summary>PostgreSQL implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAsyncDisposable
 {
+    private const int PruneBatchSize = 1000;
+
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -102,23 +113,25 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
+        // All expiry/lease time math in this store runs on the database clock (now()), never an
+        // app-computed timestamp: with multiple workers, app clock skew beyond the lease window
+        // would let two nodes both consider a lease expired and double-run a flow.
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT state_json::text, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > @now_utc;";
+        command.CommandText = $"SELECT state_json::text, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > now();";
         command.Parameters.AddWithValue("flow_id", flowId);
-        command.Parameters.AddWithValue("now_utc", DateTime.UtcNow);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
-        return state?.Revision == reader.GetInt64(1) ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "PostgreSQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
@@ -128,7 +141,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         command.CommandText =
             $"""
             INSERT INTO {Table} (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-            VALUES (@flow_id, @state_json, @expires_at_utc, @now_utc, @revision)
+            VALUES (@flow_id, @state_json, now() + @ttl, now(), @revision)
             ON CONFLICT (flow_id) DO UPDATE
             SET state_json = EXCLUDED.state_json,
                 expires_at_utc = EXCLUDED.expires_at_utc,
@@ -136,13 +149,11 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                 revision = EXCLUDED.revision,
                 lease_id = NULL,
                 lease_expires_at_utc = NULL
-            WHERE {Table}.expires_at_utc <= @now_utc;
+            WHERE {Table}.expires_at_utc <= now();
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("flow_id", flowId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = DurableFlowStoreShared.Serialize(state);
-        command.Parameters.AddWithValue("expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("now_utc", now);
+        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = stateJson;
+        command.Parameters.Add("ttl", NpgsqlDbType.Interval).Value = DurableFlowStoreShared.ServerClockTtl(ttl);
         command.Parameters.AddWithValue("revision", state.Revision);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
@@ -156,6 +167,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "PostgreSQL");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -164,19 +176,17 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             $"""
             UPDATE {Table}
             SET state_json = @state_json,
-                expires_at_utc = @expires_at_utc,
-                updated_at_utc = @now_utc,
+                expires_at_utc = now() + @ttl,
+                updated_at_utc = now(),
                 revision = @new_revision
             WHERE flow_id = @flow_id
               AND revision = @expected_revision
-              AND expires_at_utc > @now_utc
-              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > @now_utc));
+              AND expires_at_utc > now()
+              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > now()));
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("flow_id", flowId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = DurableFlowStoreShared.Serialize(state);
-        command.Parameters.AddWithValue("expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("now_utc", now);
+        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = stateJson;
+        command.Parameters.Add("ttl", NpgsqlDbType.Interval).Value = DurableFlowStoreShared.ServerClockTtl(ttl);
         command.Parameters.AddWithValue("expected_revision", expectedRevision);
         command.Parameters.AddWithValue("new_revision", state.Revision);
         command.Parameters.AddWithValue("lease_id", NpgsqlDbType.Text, (object?)leaseId ?? DBNull.Value);
@@ -214,10 +224,17 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
 
     private async Task PruneExpiredAsync(CancellationToken cancellationToken)
     {
+        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // unbatched DELETE over a large expired backlog holds row locks and bloats one
+        // transaction for the unlucky create that triggered the prune. Loads already filter on
+        // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= @now_utc;";
-        command.Parameters.AddWithValue("now_utc", DateTime.UtcNow);
+        command.CommandText =
+            $"""
+            DELETE FROM {Table}
+            WHERE ctid IN (SELECT ctid FROM {Table} WHERE expires_at_utc <= now() LIMIT {PruneBatchSize});
+            """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -290,19 +307,20 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        var now = DateTime.UtcNow;
+        // Lease fencing runs entirely on the database clock: acquire steals only leases the
+        // database considers expired, and renew/extend stays relative to now(), so worker clock
+        // skew can never make two nodes hold the same lease.
         command.CommandText =
             $"""
             UPDATE {Table}
-            SET lease_id = @lease_id, lease_expires_at_utc = @lease_expires_at_utc
+            SET lease_id = @lease_id, lease_expires_at_utc = now() + @lease_duration
             WHERE flow_id = @flow_id
-              AND expires_at_utc > @now_utc
-              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= @now_utc OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > @now_utc")};
+              AND expires_at_utc > now()
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= now() OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > now()")};
             """;
         command.Parameters.AddWithValue("flow_id", flowId);
         command.Parameters.AddWithValue("lease_id", leaseId);
-        command.Parameters.AddWithValue("now_utc", now);
-        command.Parameters.AddWithValue("lease_expires_at_utc", now.Add(leaseDuration));
+        command.Parameters.Add("lease_duration", NpgsqlDbType.Interval).Value = DurableFlowStoreShared.ServerClockTtl(leaseDuration);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 

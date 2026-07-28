@@ -41,7 +41,7 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        PostgreSqlTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
+        PostgreSqlTransportOptionsValidator.ValidateSubscriber(Options, SubscriberOptions, Role.ToString());
 
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)

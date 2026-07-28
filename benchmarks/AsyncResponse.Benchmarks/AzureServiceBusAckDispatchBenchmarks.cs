@@ -74,5 +74,6 @@ public class AzureServiceBusAckDispatchBenchmarks
             Properties,
             () => ValueTask.CompletedTask,
             () => ValueTask.CompletedTask,
-            (_, _) => ValueTask.CompletedTask);
+            (_, _) => ValueTask.CompletedTask,
+            () => ValueTask.CompletedTask);
 }

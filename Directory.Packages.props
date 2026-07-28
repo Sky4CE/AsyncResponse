@@ -7,8 +7,7 @@
     <!-- Deliberately OFF. This repo ships dedicated NuGet packages, so transitive pinning is the
          wrong default here: it would hoist transitive dependencies into each package's declared
          dependency list and change what downstream consumers restore. Every shipped package must
-         advertise only its own direct dependencies, so pinning stays disabled (and, by keeping the
-         default, per-project VersionOverride stays enabled for the one legacy pin below). -->
+         advertise only its own direct dependencies, so pinning stays disabled. -->
     <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
   <!-- ==========================================================================================
@@ -26,7 +25,7 @@
   </ItemGroup>
   <!-- Channel / transport provider clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.5" />
+    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.7" />
     <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
     <PackageVersion Include="Confluent.Kafka" Version="2.15.0" />
     <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.36.0" />
@@ -39,7 +38,7 @@
   </ItemGroup>
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.101.3" />
+    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.102.1" />
     <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.62.0" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.10" />
     <!-- Explicit native-lib pin overriding the older e_sqlite3 that Microsoft.Data.Sqlite bundles.
@@ -48,7 +47,7 @@
     <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
     <PackageVersion Include="MySqlConnector" Version="2.6.1" />
     <PackageVersion Include="Newtonsoft.Json" Version="13.0.4" />
-    <PackageVersion Include="Oracle.ManagedDataAccess.Core" Version="23.26.200" />
+    <PackageVersion Include="Oracle.ManagedDataAccess.Core" Version="23.26.300" />
   </ItemGroup>
   <!-- Build-time only (analyzers + SourceLink), referenced with PrivateAssets="All" so they never
        become package dependencies of the shipped libraries. -->
@@ -92,8 +91,8 @@
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.10" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.10" />
     <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.9.0" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.2" />
-    <PackageVersion Include="Microsoft.Testing.Platform" Version="2.3.2" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.3" />
+    <PackageVersion Include="Microsoft.Testing.Platform" Version="2.3.3" />
     <PackageVersion Include="Moq" Version="4.20.72" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
     <PackageVersion Include="xunit.v3.mtp-v2" Version="3.2.2" />

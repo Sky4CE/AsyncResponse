@@ -70,7 +70,7 @@ reaches the store, only an explicitly allowlisted surface can be driven.
 
 When a remote side fails technically (`SetException`), the exception's stack trace can travel on the
 wire and is surfaced on the receiving side via `Exception.Data["RemoteStackTrace"]`. Two channel
-options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server) bound this:
+options (on the durable channels — Redis, NATS, PostgreSQL, SQL Server, MongoDB) bound this:
 
 | Option | Default | Effect |
 |---|---|---|

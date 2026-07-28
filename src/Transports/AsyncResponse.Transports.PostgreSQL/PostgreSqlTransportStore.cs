@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using NpgsqlTypes;
@@ -14,6 +15,11 @@ internal enum PostgreSqlSubscriberRole
 }
 
 /// <summary>A claimed PostgreSQL transport row, decoupled from Npgsql types for dispatch tests.</summary>
+/// <remarks>
+/// <c>RenewAsync</c> extends the claim's lease (<c>locked_until</c>) by the original lock timeout,
+/// fenced on the claim's <c>lock_id</c>; it returns <c>false</c> when the fence no longer matches
+/// (the lease lapsed and another subscriber re-claimed the row).
+/// </remarks>
 internal sealed record PostgreSqlTransportDelivery(
     Guid Id,
     string Queue,
@@ -22,22 +28,28 @@ internal sealed record PostgreSqlTransportDelivery(
     int Attempt,
     Func<ValueTask> AckAsync,
     Func<TimeSpan, ValueTask> NakAsync,
-    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync);
+    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync,
+    Func<ValueTask<bool>> RenewAsync);
 
 /// <summary>Small SQL adapter for the PostgreSQL transport queue table.</summary>
 internal sealed class PostgreSqlTransportStore
 {
     private readonly NpgsqlDataSource _dataSource;
     private readonly PostgreSqlAsyncResponseTransportOptions _options;
+    private readonly ILogger<PostgreSqlTransportStore>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
     private readonly long _schemaLockKey;
     private long _lastDeadLetterPruneTicks;
 
-    public PostgreSqlTransportStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlAsyncResponseTransportOptions> options)
+    public PostgreSqlTransportStore(
+        NpgsqlDataSource dataSource,
+        IOptions<PostgreSqlAsyncResponseTransportOptions> options,
+        ILogger<PostgreSqlTransportStore>? logger = null)
     {
         _dataSource = dataSource;
         _options = options.Value;
+        _logger = logger;
         PostgreSqlTransportOptionsValidator.ValidateCommon(_options);
         Schema = Quote(_options.SchemaName);
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
@@ -171,7 +183,8 @@ internal sealed class PostgreSqlTransportStore
             attempt,
             () => AckAsync(id, lockId),
             delay => NakAsync(id, lockId, delay),
-            (exception, deleteOriginal, token) => DeadLetterAsync(id, lockId, queue, payload, headers, exception, deleteOriginal, token));
+            (exception, deleteOriginal, token) => DeadLetterAsync(id, lockId, queue, payload, headers, exception, deleteOriginal, token),
+            () => RenewLeaseAsync(id, lockId, lockTimeout));
     }
 
     public async IAsyncEnumerable<PostgreSqlTransportDelivery> ClaimBatchAsync(
@@ -232,6 +245,22 @@ internal sealed class PostgreSqlTransportStore
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("lock_id", lockId);
         await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async ValueTask<bool> RenewLeaseAsync(Guid id, Guid lockId, TimeSpan lockTimeout)
+    {
+        await using var connection = await _dataSource.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            UPDATE {MessageTable}
+            SET locked_until = now() + @lock_timeout
+            WHERE id = @id AND lock_id = @lock_id;
+            """;
+        command.Parameters.AddWithValue("id", id);
+        command.Parameters.AddWithValue("lock_id", lockId);
+        command.Parameters.AddWithValue("lock_timeout", lockTimeout);
+        return await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false) > 0;
     }
 
     private async ValueTask NakAsync(Guid id, Guid lockId, TimeSpan delay)
@@ -312,8 +341,15 @@ internal sealed class PostgreSqlTransportStore
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            // Callers decide the redelivery consequence from the false return; log the cause here so
+            // a failing dead-letter write is never silent.
+            _logger?.LogError(
+                ex,
+                "Failed to write PostgreSQL dead-letter row for message {MessageId} from queue {SourceQueue}.",
+                id,
+                sourceQueue);
             return false;
         }
     }

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 
 namespace AsyncResponse;
 
@@ -38,11 +39,14 @@ internal sealed class AsyncResponseDurableFlowStoreMarker(Type storeType)
 internal sealed class AsyncResponseStartupValidator(
     IEnumerable<AsyncResponseChannelMarker> _channels,
     IEnumerable<AsyncResponseTransportMarker> _transports,
-    IEnumerable<AsyncResponseDurableFlowStoreMarker> _flowStores) : IHostedService
+    IEnumerable<AsyncResponseDurableFlowStoreMarker> _flowStores,
+    IOptions<AsyncResponseOptions> _options) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
+        ValidateWatchdogOptions(_options.Value.Watchdog);
+
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
 
         if (channelNames.Length == 0)
@@ -87,6 +91,24 @@ internal sealed class AsyncResponseStartupValidator(
         }
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Fails fast on watchdog misconfiguration: a non-positive interval spins the scan loop, a
+    /// non-positive stale threshold flags every entry, and a negative startup delay throws deep
+    /// inside <see cref="Task.Delay(TimeSpan)"/> long after registration.
+    /// </summary>
+    private static void ValidateWatchdogOptions(AsyncResponseWatchdogOptions watchdog)
+    {
+        if (watchdog.Interval <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.Interval)} must be positive.");
+        if (watchdog.StaleAfter <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.StaleAfter)} must be positive.");
+        if (watchdog.StartupDelay < TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.StartupDelay)} cannot be negative.");
     }
 
     /// <summary>Stops this service.</summary>

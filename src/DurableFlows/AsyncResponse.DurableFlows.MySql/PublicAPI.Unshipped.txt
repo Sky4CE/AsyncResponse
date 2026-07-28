@@ -4,6 +4,8 @@ AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.AutoCreateSchema.get ->
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.AutoCreateSchema.set -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.ConnectionString.get -> string?
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.MySqlDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions.PruneInterval.set -> void

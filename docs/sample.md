@@ -34,9 +34,9 @@ such as Docker or Podman for the Redis resource.
 ## Run standalone
 
 The sample is **configuration-driven**: `AsyncResponse:Channel` (`InMemory` | `Redis` | `NATS` |
-`PostgreSQL` | `SqlServer`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` |
-`GooglePubSub` | `SQS` | `Kafka` | `RabbitMQ` | `Redis` | `NATS` | `PostgreSQL` | `SqlServer`) select
-the providers,
+`PostgreSQL` | `SqlServer` | `MongoDB`) and `AsyncResponse:Transport` (`InMemory` | `AzureServiceBus` |
+`GooglePubSub` | `SQS` | `Kafka` | `RabbitMQ` | `Redis` | `NATS` | `PostgreSQL` | `SqlServer` |
+`MongoDB`) select the providers,
 defaulting to fully in-memory — so it runs standalone with **no external dependencies**:
 
 ```bash
@@ -162,8 +162,8 @@ For the lost-subscriber flow, copy the `correlationId` returned by `/arm` and re
 `/publish` request. `Completed` exercises the resume callback; `Failed` exercises the failure
 callback with an `AsyncResponseDomainFailureException`; `exception=...` exercises the technical
 failure path through `IAsyncResponsePublisher.SetException`. (`/arm`, `/crash`, `/publish`, and
-`/lost-subscriber-flow` require a durable channel — run with `AsyncResponse__Channel=Redis`,
-`AsyncResponse__Channel=PostgreSQL`, or `AsyncResponse__Channel=SqlServer`.)
+`/lost-subscriber-flow` require a durable channel — run with `AsyncResponse__Channel` set to
+`Redis`, `NATS`, `PostgreSQL`, `SqlServer`, or `MongoDB`.)
 `/crash` is intentionally a blunt manual demo that drops all local durable-channel subscriptions. For
 Redis, `/lost-subscriber-flow` drops only the correlation id it just armed so load tests can run many
 recovery flows concurrently without disturbing each other; for PostgreSQL and SQL Server, it uses the

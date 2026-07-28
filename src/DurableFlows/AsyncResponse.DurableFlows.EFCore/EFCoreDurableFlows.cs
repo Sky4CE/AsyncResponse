@@ -45,10 +45,18 @@ public sealed class EFCoreDurableFlowOptions : DurableFlowOptions
 {
     /// <summary>
     /// How often <see cref="EFCoreFlowStateStore{TContext}.TryCreateAsync"/> opportunistically deletes
-    /// expired rows (loads already treat expired state as absent; pruning bounds table growth).
-    /// Zero or negative prunes on every save. Default: 5 minutes.
+    /// one bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
+    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
+    /// (unlimited — relational text/blob columns are effectively unbounded), settable as an
+    /// operator budget.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 }
 
 /// <summary>
@@ -131,6 +139,13 @@ public static class EFCoreDurableFlowModelBuilderExtensions
 public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.NonPublicConstructors | DynamicallyAccessedMemberTypes.PublicProperties)] TContext> : IFlowStateStore
     where TContext : DbContext
 {
+    private const int PruneBatchSize = 1000;
+
+    // Time authority: this store deliberately keeps the app clock (DateTime.UtcNow) for expiry
+    // and lease comparisons. It is provider-agnostic LINQ — there is no portable way to reference
+    // the database server's clock in a translated expression — so multi-node deployments should
+    // either keep worker clocks synchronized well inside the lease window or use one of the
+    // provider-specific relational stores, which run all time math on the database clock.
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly EFCoreDurableFlowOptions _options;
     private long _lastPruneTicks;
@@ -140,6 +155,8 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
+        if (_options.MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(EFCoreDurableFlowOptions)}.{nameof(EFCoreDurableFlowOptions.MaxStateBytes)} must be positive when configured.");
     }
 
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -161,13 +178,13 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         if (record is null)
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(record.StateJson);
-        return state?.Revision == record.Revision ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, record.StateJson, record.Revision);
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "EF Core");
         await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
         var db = lease.Context;
         var now = DateTime.UtcNow;
@@ -182,8 +199,8 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         db.Add(new DurableFlowStateRecord
         {
             FlowId = flowId,
-            StateJson = DurableFlowStoreShared.Serialize(state),
-            ExpiresAtUtc = now.Add(ttl),
+            StateJson = stateJson,
+            ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
             UpdatedAtUtc = now,
             Revision = state.Revision
         });
@@ -217,16 +234,18 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "EF Core");
         await using var lease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTime.UtcNow;
+        var expiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl);
         var query = Records(lease.Context).Where(r =>
             r.FlowId == flowId
             && r.Revision == expectedRevision
             && r.ExpiresAtUtc > now
             && (leaseId == null || (r.LeaseId == leaseId && r.LeaseExpiresAtUtc > now)));
         var updated = await query.ExecuteUpdateAsync(setters => setters
-                .SetProperty(r => r.StateJson, DurableFlowStoreShared.Serialize(state))
-                .SetProperty(r => r.ExpiresAtUtc, now.Add(ttl))
+                .SetProperty(r => r.StateJson, stateJson)
+                .SetProperty(r => r.ExpiresAtUtc, expiresAtUtc)
                 .SetProperty(r => r.UpdatedAtUtc, now)
                 .SetProperty(r => r.Revision, state.Revision), cancellationToken)
             .ConfigureAwait(false);
@@ -264,9 +283,17 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
 
     private static async Task PruneExpiredAsync(TContext db, CancellationToken cancellationToken)
     {
+        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // unbatched delete over a large expired backlog holds row locks and bloats one
+        // transaction for the unlucky create that triggered the prune. Loads already filter on
+        // expiry, so any backlog beyond the batch just waits for the next interval. The OrderBy
+        // makes the row-limited delete deterministic (and keeps providers from warning about an
+        // unordered Take).
         var now = DateTime.UtcNow;
         await Records(db)
             .Where(r => r.ExpiresAtUtc <= now)
+            .OrderBy(r => r.FlowId)
+            .Take(PruneBatchSize)
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
     }
@@ -287,6 +314,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
 
         await using var contextLease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTime.UtcNow;
+        var leaseExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, leaseDuration);
         var query = Records(contextLease.Context).Where(r =>
             r.FlowId == flowId
             && r.ExpiresAtUtc > now
@@ -295,7 +323,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
                 : r.LeaseId == leaseId && r.LeaseExpiresAtUtc > now));
         var updated = await query.ExecuteUpdateAsync(setters => setters
                 .SetProperty(r => r.LeaseId, leaseId)
-                .SetProperty(r => r.LeaseExpiresAtUtc, now.Add(leaseDuration)), cancellationToken)
+                .SetProperty(r => r.LeaseExpiresAtUtc, leaseExpiresAtUtc), cancellationToken)
             .ConfigureAwait(false);
         return updated > 0;
     }

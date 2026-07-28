@@ -123,10 +123,14 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
 
     public CancellationToken LostToken => _lost.Token;
 
-    public void ThrowIfLost()
+    /// <summary>
+    /// Throws when the lease is lost. <paramref name="cause"/> (e.g. the exception that made the
+    /// caller check) is attached as the inner exception so the real failure is not discarded.
+    /// </summary>
+    public void ThrowIfLost(Exception? cause = null)
     {
         if (_lost.IsCancellationRequested)
-            throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.");
+            throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
     }
 
     public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)

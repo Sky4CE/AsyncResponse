@@ -23,6 +23,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 {
 
     private readonly ISubscriber _subscriber;
+    private readonly IRedisChannelSubscriber _channelSubscriber;
     private readonly IConnectionMultiplexer _multiplexer;
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly AsyncResponseContextPropagation _propagation;
@@ -40,13 +41,16 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         IRecoveryStateStore recoveryStateStore,
         IOptions<RedisAsyncResponseOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<RedisAsyncResponseChannel> logger)
+        ILogger<RedisAsyncResponseChannel> logger,
+        IRedisChannelSubscriber? channelSubscriber = null)
     {
         _subscriber = multiplexer.GetSubscriber();
+        _channelSubscriber = channelSubscriber ?? new RedisChannelMessageQueueSubscriber(_subscriber);
         _multiplexer = multiplexer;
         _recoveryStateStore = recoveryStateStore;
         _propagation = propagation;
         _options = options.Value;
+        _options.ValidateShared(nameof(RedisAsyncResponseOptions));
         _keys = new RedisKeySchema(_options.KeyPrefix);
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
@@ -138,21 +142,31 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // subscribing so a very fast terminal message can still clean up safely.
         var cancellationTokenSource = new CancellationTokenSource();
         CancellationTokenRegistration timeoutRegistration = default;
+        IRedisChannelSubscription? subscription = null;
+        var executorRegistered = false;
 
         // -------------------------------------------------------------------------
         // Local: CleanupOnceAsync
         // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
         // happen once no matter whether completion, timeout, or waiter disposal got there first.
         int cleanupStarted = 0;
-        async ValueTask CleanupOnceAsync(Action<RedisChannel, RedisValue> redisHandler)
+        async ValueTask CleanupOnceAsync()
         {
             if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
                 return;
 
             try
             {
-                await _subscriber.UnsubscribeAsync(channel, redisHandler).ConfigureAwait(false);
+                // Delete the recovery state BEFORE unsubscribing. In the reverse order a publish
+                // landing in the window sees "no subscriber, state present" and fires a spurious
+                // recovery callback for a wait that already reached a terminal state. In this
+                // order the window shows a subscriber that drops the message — a late or duplicate
+                // terminal message is droppable; a resurrected recovery callback is not.
                 await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                if (subscription is not null)
+                    await subscription.DisposeAsync().ConfigureAwait(false);
+                if (executorRegistered)
+                    _executors.OnSubscriptionRetired(channel.ToString()!);
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
                 // deadlocks with work currently running on the executor.
@@ -175,7 +189,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // -------------------------------------------------------------------------
         // Local: ProcessRedisMessageAsync
         // Deserializes and handles a single incoming envelope, completes the TCS when terminal.
-        async Task ProcessRedisMessageAsync(RedisChannel messageChannel, RedisValue messageValue, Action<RedisChannel, RedisValue> redisHandler)
+        async Task ProcessRedisMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
         {
             _logger.LogDebug("Received message on channel {Channel}.", messageChannel.ToString()!);
 
@@ -245,21 +259,24 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // Unsubscription also happens on dispose, but doing it immediately after the
                 // terminal message releases resources sooner.
                 if (finished)
-                    await CleanupOnceAsync(redisHandler).ConfigureAwait(false);
+                    await CleanupOnceAsync().ConfigureAwait(false);
             }
         }
 
         // -------------------------------------------------------------------------
-        // Local: RedisHandler
-        // Receives raw Redis pub/sub messages and enqueues them on the per-channel executor.
-        void RedisHandler(RedisChannel messageChannel, RedisValue messageValue)
+        // Local: HandleMessageAsync
+        // Receives pub/sub messages from the async subscription and enqueues them on the
+        // per-channel executor, awaiting admission so executor backpressure reaches the
+        // subscription's message loop instead of blocking a Redis reader thread.
+        Task HandleMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
         {
             // The registry coordinates create/enqueue/retire under one lock, so the message is never
             // enqueued onto an executor that is concurrently being torn down (no lost messages) and a
             // correlation-id reused mid-drain never produces two live executors for one channel.
-            _executors.Enqueue(
+            var enqueue = _executors.EnqueueAsync(
                 messageChannel.ToString()!,
-                () => ProcessUnderCapturedContextAsync(messageChannel, messageValue, RedisHandler));
+                () => ProcessUnderCapturedContextAsync(messageChannel, messageValue));
+            return enqueue.IsCompletedSuccessfully ? Task.CompletedTask : enqueue.AsTask();
         }
 
         // -------------------------------------------------------------------------
@@ -267,12 +284,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // Restores the waiter's subscribe-time ExecutionContext (app AsyncLocals: trace, principal,
         // logging scope) plus the correlation id before processing — the Redis subscriber callback
         // runs on a foreign thread-pool thread that never had them.
-        Task ProcessUnderCapturedContextAsync(RedisChannel messageChannel, RedisValue messageValue, Action<RedisChannel, RedisValue> redisHandler)
+        Task ProcessUnderCapturedContextAsync(RedisChannel messageChannel, RedisValue messageValue)
         {
             async Task ProcessAsync()
             {
                 using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
-                await ProcessRedisMessageAsync(messageChannel, messageValue, redisHandler).ConfigureAwait(false);
+                await ProcessRedisMessageAsync(messageChannel, messageValue).ConfigureAwait(false);
             }
 
             if (capturedContext is null)
@@ -291,13 +308,15 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                 AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                await CleanupOnceAsync(RedisHandler).ConfigureAwait(false);
+                await CleanupOnceAsync().ConfigureAwait(false);
             });
         });
 
         try
         {
-            await _subscriber.SubscribeAsync(channel, RedisHandler).ConfigureAwait(false);
+            subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
+            _executors.OnSubscriptionRegistered(channel.ToString()!);
+            executorRegistered = true;
             var recoveryState = new RecoveryState
             {
                 RegistrationId = registrationId,
@@ -315,10 +334,15 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         {
             _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            tcs.TrySetException(ex);
-            await CleanupOnceAsync(RedisHandler).ConfigureAwait(false);
-            // Return an already-faulted waiter.
-            return new RedisAsyncResponseWaiter<T>(tcs.Task, () => CleanupOnceAsync(RedisHandler));
+            await CleanupOnceAsync().ConfigureAwait(false);
+
+            // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
+            // the trigger runs only once the subscription AND recovery state exist. A returned
+            // waiter would still let the trigger fire the remote operation with no registration
+            // left to receive (or recover) its response. Cleanup leaves nothing behind, and the
+            // response task is cancelled rather than faulted so no unobserved fault lingers.
+            tcs.TrySetCanceled();
+            throw;
         }
 
         try
@@ -331,7 +355,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // A response completed and cleaned up between the check and CancelAfter.
         }
 
-        return new RedisAsyncResponseWaiter<T>(tcs.Task, () => CleanupOnceAsync(RedisHandler));
+        return new RedisAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -384,8 +408,29 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // over to the lost-subscriber dispatcher, which asks the payload whether to resume
                 // the flow or fail it, and invokes the matching callback.
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        channel.ToString()!,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the publish and the recovery-state read —
+                    // re-publish live instead of consuming its registration; only a second miss
+                    // consumes it.
+                    numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.subscribers", numSubscribers);
+                    if (numSubscribers > 0)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
@@ -434,8 +479,29 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        channel.ToString()!,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the publish and the recovery-state read —
+                    // re-publish live instead of consuming its registration; only a second miss
+                    // consumes it.
+                    numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.subscribers", numSubscribers);
+                    if (numSubscribers > 0)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
@@ -491,11 +557,32 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             if (numSubscribers == 0)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var callbackInvoked = await _lostSubscriberDispatcher
-                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, channel.ToString()!, cancellationToken)
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(
+                        _recoveryStateStore,
+                        correlationId,
+                        exception,
+                        channel.ToString()!,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the publish and the recovery-state read —
+                    // re-publish live instead of consuming its registration; only a second miss
+                    // consumes it.
+                    numSubscribers = await _subscriber.PublishAsync(channel, json).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.subscribers", numSubscribers);
+                    if (numSubscribers > 0)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, channel.ToString()!, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
@@ -544,6 +631,13 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         return new ValueTask<long>(subscribers);
     }
+
+    /// <summary>
+    /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
+    /// using the same PUBSUB NUMSUB-based probe the watchdog uses.
+    /// </summary>
+    private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
+        => await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
 
     private static string SerializeRawSuccessEnvelope(string payloadJson)
     {

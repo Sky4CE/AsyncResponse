@@ -375,20 +375,42 @@ internal sealed class PostgreSqlChannelSql
 
     public async Task HeartbeatSubscribersAsync(
         string instanceId,
-        IReadOnlyCollection<Guid> registrationIds,
+        IReadOnlyCollection<(string CorrelationId, Guid RegistrationId)> registrations,
         TimeSpan ttl,
         CancellationToken cancellationToken)
     {
-        if (registrationIds.Count == 0)
+        if (registrations.Count == 0)
             return;
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+
+        // UPSERT rather than a bare UPDATE: the caller only heartbeats registrations that are live
+        // in this process, so a missing row means the pruner deleted it (e.g. after a >timeout
+        // stall) — re-creating it here is what brings the waiter back from "permanently invisible".
+        var correlationIds = new string[registrations.Count];
+        var registrationIds = new Guid[registrations.Count];
+        var index = 0;
+        foreach (var (correlationId, registrationId) in registrations)
+        {
+            correlationIds[index] = correlationId;
+            registrationIds[index] = registrationId;
+            index++;
+        }
+
         command.CommandText =
-            $"UPDATE {SubscriberTable} SET expires_at = now() + @ttl WHERE instance_id = @instance_id AND registration_id = ANY(@registration_ids);";
+            $"""
+            INSERT INTO {SubscriberTable} (correlation_id, registration_id, instance_id, expires_at)
+            SELECT correlation_id, registration_id, @instance_id, now() + @ttl
+            FROM unnest(@correlation_ids, @registration_ids) AS live (correlation_id, registration_id)
+            ON CONFLICT (correlation_id, registration_id)
+            DO UPDATE SET instance_id = EXCLUDED.instance_id,
+                          expires_at = EXCLUDED.expires_at;
+            """;
         command.Parameters.AddWithValue("instance_id", instanceId);
-        command.Parameters.AddWithValue("registration_ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid, registrationIds.ToArray());
+        command.Parameters.AddWithValue("correlation_ids", NpgsqlDbType.Array | NpgsqlDbType.Text, correlationIds);
+        command.Parameters.AddWithValue("registration_ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid, registrationIds);
         command.Parameters.AddWithValue("ttl", ttl);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

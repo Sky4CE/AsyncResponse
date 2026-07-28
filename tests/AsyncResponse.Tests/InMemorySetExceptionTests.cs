@@ -133,6 +133,76 @@ public sealed class InMemorySetExceptionTests
         await Assert.ThrowsAsync<ArgumentNullException>(() => publisher.SetException(null!, "cid"));
     }
 
+    [Fact]
+    public async Task SetException_WhenSubscriberAppearsDuringRecoveryRead_DeliversLive()
+    {
+        // Same snapshot race the response path re-checks: a waiter registers between the empty
+        // subscriber snapshot and the recovery-state read. The exception must be delivered live
+        // instead of consuming the registration (or, with no failure callback, silently dropping).
+        var services = new ServiceCollection().BuildServiceProvider();
+        var correlationId = $"retry-live-exception-{Guid.NewGuid():N}";
+        var store = new RetryLiveExceptionRecoveryStore(correlationId);
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store,
+            Microsoft.Extensions.Options.Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+        IAsyncResponseWaiter<OperationResult>? waiter = null;
+        store.BeforeGetAllAsync = async () =>
+        {
+            waiter ??= await channel.CreateResponseWaiter<OperationResult>(
+                correlationId,
+                timeout: TimeSpan.FromSeconds(5));
+        };
+        var expected = new InvalidOperationException("late but live");
+
+        await channel.SetException(expected, correlationId);
+
+        var liveWaiter = waiter ?? throw new InvalidOperationException("Retry-live waiter was not created.");
+        await using (liveWaiter)
+        {
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                liveWaiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Same(expected, thrown);
+        }
+    }
+
+    private sealed class RetryLiveExceptionRecoveryStore(string _correlationId) : IRecoveryStateStore
+    {
+        public Func<Task>? BeforeGetAllAsync { get; set; }
+
+        public Task SaveAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public async Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
+        {
+            if (BeforeGetAllAsync is not null)
+            {
+                var callback = BeforeGetAllAsync;
+                BeforeGetAllAsync = null;
+                await callback().ConfigureAwait(false);
+            }
+
+            return
+            [
+                new RecoveryState
+                {
+                    RegistrationId = Guid.NewGuid(),
+                    CorrelationId = _correlationId,
+                    PayloadTypeFullName = typeof(OperationResult).FullName
+                }
+            ];
+        }
+
+        public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
+            => Task.FromResult(true);
+    }
+
     private static ServiceProvider CreateProvider(Action<IServiceCollection>? configure = null)
     {
         var services = new ServiceCollection();

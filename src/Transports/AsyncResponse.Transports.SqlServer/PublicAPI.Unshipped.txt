@@ -20,6 +20,8 @@ AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLe
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DeadLetterRetention.set -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.LockTimeout.set -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.MessageTable.get -> string!
@@ -39,6 +41,8 @@ AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.Schema
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SqlServerAsyncResponseTransportOptions() -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.ShutdownTimeout.set -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
 AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.WorkerQueue.get -> string!

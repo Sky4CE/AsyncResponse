@@ -241,7 +241,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
-        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [Guid.NewGuid()], TimeSpan.FromMinutes(1), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [("corr", Guid.NewGuid())], TimeSpan.FromMinutes(1), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.SaveRecoveryStateAsync("corr", new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr" }, TimeSpan.FromMinutes(1), CancellationToken.None));
 
@@ -272,7 +272,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => sql.GetServerTimeUtcAsync(CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.IsMessageAcknowledgedAsync(Guid.NewGuid(), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.LoadMessagesAsync("corr", DateTimeOffset.UtcNow, 10, null, null, CancellationToken.None));
-        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [Guid.NewGuid()], TimeSpan.FromMinutes(1), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<Exception>(() => sql.HeartbeatSubscribersAsync("instance", [("corr", Guid.NewGuid())], TimeSpan.FromMinutes(1), CancellationToken.None));
         await Assert.ThrowsAnyAsync<Exception>(() => sql.CountActiveSubscribersAsync("corr", CancellationToken.None));
 
         var pgPruneSubscribers = typeof(PostgreSqlChannelSql).GetMethod("PruneExpiredSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
@@ -333,6 +333,35 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!);
 
         await channel.DisposeAsync();
+
+        // 4. Disposal is observed under the dispatcher gate: a racing registration must refuse
+        // instead of recreating the CTS/loops the teardown just stopped.
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => channel.CreateResponseWaiter<OperationResult>("post-dispose"));
+    }
+
+    [Fact]
+    public async Task PostgreSqlAsyncResponseChannel_DisposedChannelRefusesNewWaiters()
+    {
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=localhost;Port=1;Database=unused;Username=unused;Password=unused;Timeout=1;Pooling=false");
+        var options = Options.Create(new PostgreSqlAsyncResponseChannelOptions { AutoCreateSchema = false });
+        var sql = new PostgreSqlChannelSql(dataSource, options);
+        using var provider = new ServiceCollection().BuildServiceProvider();
+        var channel = new PostgreSqlAsyncResponseChannel(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            sql,
+            MockRecoveryStore(),
+            options,
+            new AsyncResponseContextPropagation([]),
+            new FakeDebugLogger<PostgreSqlAsyncResponseChannel>());
+
+        await channel.DisposeAsync();
+
+        // Disposal is observed under the listener gate: a racing registration must refuse instead
+        // of recreating the CTS/loops the teardown just stopped.
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => channel.CreateResponseWaiter<OperationResult>("post-dispose"));
     }
 
     [Fact]

@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Channels.Redis</PackageId>
     <Description>Redis channel for AsyncResponse: Redis pub/sub response channel and durable Redis recovery-state store for lost-subscriber recovery across redeploys, with domain-state-aware failure routing. Plugs into the Core engine's recovery watchdog and readiness health check.</Description>
+    <PackageTags>$(PackageTags);redis;valkey;dragonfly</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

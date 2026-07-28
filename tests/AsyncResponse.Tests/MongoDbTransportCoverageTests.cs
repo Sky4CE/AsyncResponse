@@ -42,6 +42,9 @@ public sealed class MongoDbTransportCoverageTests
         Assert.NotNull(documents[1].Headers);
         Assert.Equal("corr-mongo", documents[0].Headers![options.Value.CorrelationIdHeader]);
         Assert.Empty(documents[1].Headers!);
+        // Fresh publishes must be claimable regardless of client/server clock skew: the claim
+        // filter compares available_at against the server's $$NOW, so inserts stamp epoch.
+        Assert.All(documents, d => Assert.Equal(DateTime.UnixEpoch, d.AvailableAtUtc));
 
         collection
             .Setup(c => c.InsertOneAsync(
@@ -192,7 +195,8 @@ public sealed class MongoDbTransportCoverageTests
         1,
         () => ValueTask.CompletedTask,
         _ => ValueTask.CompletedTask,
-        (_, _, _) => ValueTask.FromResult(true));
+        (_, _, _) => ValueTask.FromResult(true),
+        () => ValueTask.FromResult(true));
 
     private static MongoDbTransportStore CreateStore(
         IMongoCollection<MongoTransportMessageDocument> collection,

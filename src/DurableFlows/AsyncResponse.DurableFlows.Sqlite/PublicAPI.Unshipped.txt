@@ -4,6 +4,8 @@ AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.get 
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.AutoCreateSchema.set -> void
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.ConnectionString.get -> string!
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.PruneInterval.set -> void
 AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions.SqliteDurableFlowOptions() -> void

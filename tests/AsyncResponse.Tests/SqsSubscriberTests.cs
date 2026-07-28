@@ -159,6 +159,124 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_EarlyAckSaturated_PausesReceivingAndBoundsRequestSize()
+    {
+        var client = new FakeSqsClient();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            });
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var thirdCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        client.Enqueue(Delivery(firstCalls, messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, messageId: "m2"));
+        client.Enqueue(Delivery(thirdCalls, messageId: "m3"));
+
+        // m1 goes to the (blocked) worker; m2 fills the queue of capacity 1; the receive loop must
+        // now pause instead of receiving m3 — every receive counts toward the redrive policy.
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var receiveAttemptsWhileSaturated = client.ReceiveAttempts;
+        await Task.Delay(200);
+        Assert.Equal(receiveAttemptsWhileSaturated, client.ReceiveAttempts);
+        Assert.Equal(0, thirdCalls.Delete);
+        // Requests are bounded by the dispatcher's free capacity, never the full MaxMessagesPerReceive.
+        Assert.Equal(1, client.LastReceiveRequest!.MaxMessages);
+
+        release.TrySetResult();
+        await thirdCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        // No message was released with zero visibility or abandoned; all three were processed.
+        Assert.Empty(firstCalls.VisibilityChanges);
+        Assert.Empty(secondCalls.VisibilityChanges);
+        Assert.Empty(thirdCalls.VisibilityChanges);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_SlowHandler_RenewsVisibilityOfUnprocessedBatchMessages()
+    {
+        var client = new FakeSqsClient();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = true;
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                if (first)
+                {
+                    first = false;
+                    firstStarted.TrySetResult();
+                    await release.Task;
+                }
+            });
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        // Both messages arrive in one batch; the first blocks in the handler while the second waits
+        // its turn. The heartbeat must extend both (the in-handler one and the queued one).
+        client.Enqueue(Delivery(firstCalls, messageId: "m1"));
+        client.Enqueue(Delivery(secondCalls, messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => firstCalls.VisibilityChanges.Count >= 2 && secondCalls.VisibilityChanges.Count >= 2);
+        Assert.All(firstCalls.VisibilityChanges, delay => Assert.Equal(TimeSpan.FromSeconds(45), delay));
+        Assert.All(secondCalls.VisibilityChanges, delay => Assert.Equal(TimeSpan.FromSeconds(45), delay));
+
+        release.TrySetResult();
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Equal(1, firstCalls.Delete);
+        Assert.Equal(1, secondCalls.Delete);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            await Task.Delay(20, cts.Token);
+        }
+    }
+
+    [Fact]
     public async Task ProvisioningService_Disabled_DoesNothing()
     {
         var client = new FakeSqsClient();
@@ -510,14 +628,35 @@ public sealed class SqsSubscriberTests
             },
             delay =>
             {
-                calls.VisibilityChanges.Add(delay);
+                calls.RecordVisibilityChange(delay);
                 return ValueTask.CompletedTask;
             });
 
     private sealed class SettlementCalls
     {
+        private readonly List<TimeSpan> _visibilityChanges = [];
+
         public int Delete;
-        public List<TimeSpan> VisibilityChanges { get; } = [];
         public TaskCompletionSource Deleted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // The visibility-renewal heartbeat mutates this from a background loop while tests poll it.
+        public IReadOnlyList<TimeSpan> VisibilityChanges
+        {
+            get
+            {
+                lock (_visibilityChanges)
+                {
+                    return _visibilityChanges.ToArray();
+                }
+            }
+        }
+
+        public void RecordVisibilityChange(TimeSpan delay)
+        {
+            lock (_visibilityChanges)
+            {
+                _visibilityChanges.Add(delay);
+            }
+        }
     }
 }

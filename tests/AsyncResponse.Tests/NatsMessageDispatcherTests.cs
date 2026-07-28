@@ -67,7 +67,7 @@ public class NatsMessageDispatcherTests
     {
         using var collector = new AsyncResponseActivityCollector();
         var processed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4);
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => { processed.TrySetResult(); return Task.CompletedTask; }, subscriber);
 
         var rec = new RecordingDelivery();
@@ -158,7 +158,7 @@ public class NatsMessageDispatcherTests
     public async Task EarlyAck_AcksImmediately_AndProcessesInBackground()
     {
         var processed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4);
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((delivery, _) => { processed.TrySetResult(delivery.Payload); return Task.CompletedTask; }, subscriber);
 
         var rec = new RecordingDelivery();
@@ -173,7 +173,7 @@ public class NatsMessageDispatcherTests
     {
         var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var subscriber = new NatsSubscriberOptions { OnBackgroundFailure = ctx => { failure.TrySetResult(ctx); return ValueTask.CompletedTask; } }
-            .UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4);
+            .UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("bg-boom"), subscriber);
 
         var rec = new RecordingDelivery();
@@ -190,11 +190,11 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
-    public async Task EarlyAck_WhenQueueFull_NaksForRedelivery()
+    public async Task EarlyAck_WhenQueueFull_PausesConsumeLoopUntilCapacityFrees()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1);
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher(async (_, _) => { started.TrySetResult(); await gate.Task; }, subscriber);
 
         var first = new RecordingDelivery();
@@ -204,13 +204,53 @@ public class NatsMessageDispatcherTests
         var second = new RecordingDelivery();
         await dispatcher.HandleAsync(second.Create("p2", 1), CancellationToken.None); // fills the single queue slot
 
+        // Queue full: HandleAsync must wait for capacity (pausing the consume loop that awaits it)
+        // instead of NAKing — NAK churn burns redeliveries without making progress.
         var third = new RecordingDelivery();
-        await dispatcher.HandleAsync(third.Create("p3", 1), CancellationToken.None); // queue full → NAK
+        var thirdHandle = dispatcher.HandleAsync(third.Create("p3", 1), CancellationToken.None);
+        await Task.Delay(100);
+        Assert.False(thirdHandle.IsCompleted);
+        Assert.Equal(0, third.Acks);
+        Assert.Empty(third.Naks);
+
+        gate.TrySetResult(); // p1 finishes, the worker frees a slot, p3 is accepted and ACKed
+        await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.Equal(1, first.Acks);
         Assert.Equal(1, second.Acks);
+        Assert.Equal(1, third.Acks);
+        Assert.Empty(third.Naks);
+    }
+
+    [Fact]
+    public async Task EarlyAck_WhenQueueFullAndSubscriberStops_NaksWaitingMessageForRedelivery()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new NatsSubscriberOptions
+        {
+            RedeliveryDelay = TimeSpan.FromSeconds(3)
+        }.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        await using var dispatcher = CreateDispatcher(async (_, _) => { started.TrySetResult(); await gate.Task; }, subscriber);
+
+        var first = new RecordingDelivery();
+        await dispatcher.HandleAsync(first.Create("p1", 1), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var second = new RecordingDelivery();
+        await dispatcher.HandleAsync(second.Create("p2", 1), CancellationToken.None);
+
+        using var stopping = new CancellationTokenSource();
+        var third = new RecordingDelivery();
+        var thirdHandle = dispatcher.HandleAsync(third.Create("p3", 1), stopping.Token);
+        await Task.Delay(50);
+
+        stopping.Cancel();
+        await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // A message caught waiting when the subscriber stops is NAKed so JetStream redelivers it.
         Assert.Equal(0, third.Acks);
-        Assert.Single(third.Naks);
+        Assert.Equal([TimeSpan.FromSeconds(3)], third.Naks);
 
         gate.TrySetResult();
     }
@@ -241,7 +281,7 @@ public class NatsMessageDispatcherTests
                 callbackInvoked.TrySetResult();
                 throw new InvalidOperationException("callback boom");
             }
-        }.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4);
+        }.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("bg"), subscriber);
 
         var rec = new RecordingDelivery();
@@ -307,6 +347,45 @@ public class NatsMessageDispatcherTests
         var context = await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.IsAssignableFrom<OperationCanceledException>(context.Exception);
         Assert.Contains(_jetStream.Published, p => p.Subject == DeadLetterSubject);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_QueuedButUnstartedMessages_AreAttemptedAndSurfacedInsteadOfDropped()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = 0;
+        var subscriber = new NatsSubscriberOptions
+        {
+            OnBackgroundFailure = _ =>
+            {
+                Interlocked.Increment(ref failures);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterReceive(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 4,
+            backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
+        var dispatcher = CreateDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            },
+            subscriber);
+
+        var running = new RecordingDelivery();
+        var queued = new RecordingDelivery();
+        await dispatcher.HandleAsync(running.Create("p1", 1), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2)); // worker is blocked in the handler
+        await dispatcher.HandleAsync(queued.Create("p2", 1), CancellationToken.None); // already ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The hard stop must not silently drop the already-ACKed queued message: it is attempted
+        // with the cancelled drain token, dead-lettered, and surfaced via OnBackgroundFailure —
+        // same as the one that was mid-handler.
+        await WaitUntilAsync(() => Volatile.Read(ref failures) == 2);
+        Assert.Equal(2, _jetStream.Published.Count(p => p.Subject == DeadLetterSubject));
     }
 
     [Fact]

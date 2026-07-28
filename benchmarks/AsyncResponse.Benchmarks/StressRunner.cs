@@ -496,7 +496,10 @@ internal static class StressRunner
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
         var jetStream = new BenchmarkNatsJetStreamTransport();
-        var options = new NatsAsyncResponseTransportOptions();
+        var options = new NatsAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
+        };
         var schema = new NatsTransportSubjectSchema(options);
         var seen = new int[count];
         var processed = 0;
@@ -584,7 +587,10 @@ internal static class StressRunner
     private static async Task<int> PostgreSqlAckAfterReceiveDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
-        var options = new PostgreSqlAsyncResponseTransportOptions();
+        var options = new PostgreSqlAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
+        };
         var seen = new int[count];
         var processed = 0;
         var duplicates = 0;
@@ -637,7 +643,8 @@ internal static class StressRunner
                 Attempt: 1,
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
-                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
+                () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         });
 
@@ -671,7 +678,8 @@ internal static class StressRunner
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
         var options = new AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions
         {
-            ConnectionString = "Server=localhost;Database=asyncresponse_stress;User ID=sa;Password=unused;TrustServerCertificate=True"
+            ConnectionString = "Server=localhost;Database=asyncresponse_stress;User ID=sa;Password=unused;TrustServerCertificate=True",
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
         };
         var seen = new int[count];
         var processed = 0;
@@ -725,7 +733,8 @@ internal static class StressRunner
                 Attempt: 1,
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
-                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
+                () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         });
 
@@ -758,7 +767,10 @@ internal static class StressRunner
     private static async Task<int> MongoDbAckAfterEnqueueDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
-        var options = new MongoDbAsyncResponseTransportOptions();
+        var options = new MongoDbAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(90)
+        };
         var seen = new int[count];
         var processed = 0;
         var duplicates = 0;
@@ -811,7 +823,8 @@ internal static class StressRunner
                 Attempt: 1,
                 () => { Interlocked.Increment(ref acks); return ValueTask.CompletedTask; },
                 _ => { Interlocked.Increment(ref naks); return ValueTask.CompletedTask; },
-                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); }),
+                (_, _, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.FromResult(true); },
+                () => ValueTask.FromResult(true)),
                 CancellationToken.None).ConfigureAwait(false);
         });
 
@@ -903,7 +916,8 @@ internal static class StressRunner
                 },
                 () => { Interlocked.Increment(ref completes); return ValueTask.CompletedTask; },
                 () => { Interlocked.Increment(ref abandons); return ValueTask.CompletedTask; },
-                (_, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.CompletedTask; }),
+                (_, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.CompletedTask; },
+                () => ValueTask.CompletedTask),
                 CancellationToken.None).ConfigureAwait(false);
         });
 

@@ -4,6 +4,8 @@ AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.AutoCreateSchem
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.AutoCreateSchema.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.ConnectionString.get -> string?
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.PruneInterval.set -> void
 AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions.SchemaName.get -> string!

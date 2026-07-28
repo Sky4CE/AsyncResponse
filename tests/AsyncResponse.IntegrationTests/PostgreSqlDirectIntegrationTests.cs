@@ -95,11 +95,26 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             await sql.UpsertSubscriberAsync("heartbeat-b", heartbeatB, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
             await sql.UpsertSubscriberAsync("heartbeat-stale", staleHeartbeat, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
             await Task.Delay(50);
-            await sql.HeartbeatSubscribersAsync("heartbeat-instance", [heartbeatA, heartbeatB], TimeSpan.FromSeconds(2), CancellationToken.None);
+            await sql.HeartbeatSubscribersAsync(
+                "heartbeat-instance",
+                [("heartbeat-a", heartbeatA), ("heartbeat-b", heartbeatB)],
+                TimeSpan.FromSeconds(2),
+                CancellationToken.None);
             await Task.Delay(100);
             Assert.Equal(1, await sql.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
             Assert.Equal(1, await sql.CountActiveSubscribersAsync("heartbeat-b", CancellationToken.None));
             Assert.Equal(0, await sql.CountActiveSubscribersAsync("heartbeat-stale", CancellationToken.None));
+
+            // The heartbeat is an UPSERT: a row pruned out from under a live waiter (e.g. after a
+            // >timeout stall) is re-created by the next heartbeat cycle instead of staying gone.
+            await sql.DeleteSubscriberAsync("heartbeat-a", heartbeatA, CancellationToken.None);
+            Assert.Equal(0, await sql.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
+            await sql.HeartbeatSubscribersAsync(
+                "heartbeat-instance",
+                [("heartbeat-a", heartbeatA)],
+                TimeSpan.FromSeconds(2),
+                CancellationToken.None);
+            Assert.Equal(1, await sql.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
 
             var startedAt = await sql.GetServerTimeUtcAsync(CancellationToken.None);
             var messageId = Guid.NewGuid();
@@ -471,10 +486,10 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
         var badRawPublisher = badProvider.GetRequiredService<IRawAsyncResponsePublisher>();
         var badProbe = badProvider.GetRequiredService<IActiveSubscriberProbe>();
 
-        await using (var faulted = await badSubscriber.CreateResponseWaiter<OperationResult>(NewId("missing"), timeout: TimeSpan.FromSeconds(5)))
-        {
-            await Assert.ThrowsAnyAsync<Exception>(() => faulted.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
-        }
+        // Registration failure must throw instead of returning a pre-faulted waiter, so the
+        // builder can never run its trigger with no registration behind it.
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            badSubscriber.CreateResponseWaiter<OperationResult>(NewId("missing"), timeout: TimeSpan.FromSeconds(5)));
 
         Assert.Equal(0, await badProbe.CountActiveSubscribersAsync(NewId("missing-count")));
         await Assert.ThrowsAnyAsync<Exception>(() =>

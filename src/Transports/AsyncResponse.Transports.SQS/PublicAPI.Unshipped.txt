@@ -79,6 +79,8 @@ AsyncResponse.Transports.SQS.SqsSubscriberOptions.RedeliveryDelay.get -> System.
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.RedeliveryDelay.set -> void
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.SqsSubscriberOptions() -> void
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.SQS.SqsSubscriberOptions!
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityRenewalInterval.get -> System.TimeSpan?
+AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityRenewalInterval.set -> void
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.get -> System.TimeSpan?
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.set -> void
 AsyncResponse.Transports.SQS.SqsWorkerTransport

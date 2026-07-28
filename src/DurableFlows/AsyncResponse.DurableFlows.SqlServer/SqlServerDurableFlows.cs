@@ -42,11 +42,18 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="SqlServerFlowStateStore.TryCreateAsync"/> opportunistically deletes expired
-    /// rows (loads already treat expired state as absent; pruning bounds table growth). Zero or
-    /// negative prunes on every save. Default: 5 minutes.
+    /// How often <see cref="SqlServerFlowStateStore.TryCreateAsync"/> opportunistically deletes one
+    /// bounded batch (1000 rows) of expired rows (loads already treat expired state as absent;
+    /// pruning bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
+    /// (unlimited — <c>nvarchar(max)</c> is effectively unbounded), settable as an operator budget.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
@@ -56,12 +63,16 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
 
         DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(SchemaName)}", "SQL Server");
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(TableName)}", "SQL Server");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(SqlServerDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
 /// <summary>SQL Server implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class SqlServerFlowStateStore : IFlowStateStore
 {
+    private const int PruneBatchSize = 1000;
+
     private readonly SqlServerDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
@@ -78,23 +89,25 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
+        // All expiry/lease time math in this store runs on the database clock (SYSUTCDATETIME()),
+        // never an app-computed timestamp: with multiple workers, app clock skew beyond the lease
+        // window would let two nodes both consider a lease expired and double-run a flow.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > @now_utc;";
+        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = @flow_id AND expires_at_utc > SYSUTCDATETIME();";
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
-        return state?.Revision == reader.GetInt64(1) ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQL Server");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
@@ -105,22 +118,20 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             $"""
             MERGE {Table} WITH (HOLDLOCK) AS target
             USING (SELECT @flow_id AS flow_id) AS source ON target.flow_id = source.flow_id
-            WHEN MATCHED AND target.expires_at_utc <= @now_utc THEN
+            WHEN MATCHED AND target.expires_at_utc <= SYSUTCDATETIME() THEN
                 UPDATE SET state_json = @state_json,
-                           expires_at_utc = @expires_at_utc,
-                           updated_at_utc = @now_utc,
+                           expires_at_utc = {AddMilliseconds("@ttl_ms")},
+                           updated_at_utc = SYSUTCDATETIME(),
                            revision = @revision,
                            lease_id = NULL,
                            lease_expires_at_utc = NULL
             WHEN NOT MATCHED THEN
                 INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-                VALUES (@flow_id, @state_json, @expires_at_utc, @now_utc, @revision);
+                VALUES (@flow_id, @state_json, {AddMilliseconds("@ttl_ms")}, SYSUTCDATETIME(), @revision);
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
-        command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@state_json", stateJson);
+        command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
         command.Parameters.AddWithValue("@revision", state.Revision);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
@@ -134,6 +145,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "SQL Server");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -142,19 +154,17 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             $"""
             UPDATE {Table}
             SET state_json = @state_json,
-                expires_at_utc = @expires_at_utc,
-                updated_at_utc = @now_utc,
+                expires_at_utc = {AddMilliseconds("@ttl_ms")},
+                updated_at_utc = SYSUTCDATETIME(),
                 revision = @new_revision
             WHERE flow_id = @flow_id
               AND revision = @expected_revision
-              AND expires_at_utc > @now_utc
-              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > @now_utc));
+              AND expires_at_utc > SYSUTCDATETIME()
+              AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()));
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.AddWithValue("@flow_id", flowId);
-        command.Parameters.AddWithValue("@state_json", DurableFlowStoreShared.Serialize(state));
-        command.Parameters.AddWithValue("@expires_at_utc", now.Add(ttl));
-        command.Parameters.AddWithValue("@now_utc", now);
+        command.Parameters.AddWithValue("@state_json", stateJson);
+        command.Parameters.AddWithValue("@ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl));
         command.Parameters.AddWithValue("@expected_revision", expectedRevision);
         command.Parameters.AddWithValue("@new_revision", state.Revision);
         command.Parameters.AddWithValue("@lease_id", (object?)leaseId ?? DBNull.Value);
@@ -192,10 +202,13 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
     private async Task PruneExpiredAsync(CancellationToken cancellationToken)
     {
+        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // unbatched DELETE over a large expired backlog holds row locks and bloats one
+        // transaction for the unlucky create that triggered the prune. Loads already filter on
+        // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= @now_utc;";
-        command.Parameters.AddWithValue("@now_utc", DateTime.UtcNow);
+        command.CommandText = $"DELETE TOP ({PruneBatchSize}) FROM {Table} WHERE expires_at_utc <= SYSUTCDATETIME();";
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -282,19 +295,20 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        var now = DateTime.UtcNow;
+        // Lease fencing runs entirely on the database clock: acquire steals only leases the
+        // database considers expired, and renew/extend stays relative to SYSUTCDATETIME(), so
+        // worker clock skew can never make two nodes hold the same lease.
         command.CommandText =
             $"""
             UPDATE {Table}
-            SET lease_id = @lease_id, lease_expires_at_utc = @lease_expires_at_utc
+            SET lease_id = @lease_id, lease_expires_at_utc = {AddMilliseconds("@lease_ms")}
             WHERE flow_id = @flow_id
-              AND expires_at_utc > @now_utc
-              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= @now_utc OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > @now_utc")};
+              AND expires_at_utc > SYSUTCDATETIME()
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= SYSUTCDATETIME() OR lease_id = @lease_id)" : "lease_id = @lease_id AND lease_expires_at_utc > SYSUTCDATETIME()")};
             """;
         command.Parameters.AddWithValue("@flow_id", flowId);
         command.Parameters.AddWithValue("@lease_id", leaseId);
-        command.Parameters.AddWithValue("@now_utc", now);
-        command.Parameters.AddWithValue("@lease_expires_at_utc", now.Add(leaseDuration));
+        command.Parameters.AddWithValue("@lease_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -312,6 +326,16 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             throw;
         }
     }
+
+    /// <summary>
+    /// SQL expression adding a millisecond bigint parameter to the database clock (the same
+    /// pattern as the SQL Server channel package). DATEADD only takes int arguments, so the value
+    /// is split into whole seconds and a sub-second remainder — TTLs and lease durations stay on
+    /// the database clock, immune to app-side clock skew, without overflowing on multi-day spans
+    /// such as the 7-day default state expiry.
+    /// </summary>
+    private static string AddMilliseconds(string parameterName)
+        => $"DATEADD(SECOND, CAST({parameterName} / 1000 AS int), DATEADD(MILLISECOND, CAST({parameterName} % 1000 AS int), SYSUTCDATETIME()))";
 
     private string Table => $"{Quote(_options.SchemaName)}.{Quote(_options.TableName)}";
     private string IndexName => $"{_options.TableName}_expires_idx";

@@ -316,7 +316,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (Exception ex)
         {
-            _lease.ThrowIfLost();
+            // A lost lease throws with the wait failure attached as inner, so the real cause of
+            // the faulted step is not discarded by the takeover signal.
+            _lease.ThrowIfLost(ex);
             // Timeout, trigger failure, or a faulted wait: record it so the next execution
             // restarts this step fresh instead of re-attaching to a dead correlation id.
             checkpoint.Faulted = true;

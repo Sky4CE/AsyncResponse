@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.Redis</PackageId>
     <Description>Redis Streams transport for AsyncResponse: publish worker jobs to Redis streams, consume worker-job streams, and feed response streams into the transport-neutral AsyncResponse ingress with bounded retries and dead-lettering.</Description>
+    <PackageTags>$(PackageTags);redis;valkey;dragonfly</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

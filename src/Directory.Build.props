@@ -14,8 +14,12 @@
     <PackageProjectUrl>https://github.com/Sky4CE/AsyncResponse</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Sky4CE/AsyncResponse</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageTags>async;response;correlation;correlation-id;channel;transport;redis;pubsub;request-response;messaging;background-worker;recovery;resilience</PackageTags>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <!-- Ecosystem-wide tags only. Each provider package appends its own terms in its csproj via
+         <PackageTags>$(PackageTags);...</PackageTags>. -->
+    <PackageTags>async;response;correlation;correlation-id;channel;transport;request-response;messaging;background-worker;recovery;resilience</PackageTags>
+    <!-- Package-facing readme with absolute links only; the repo README's relative links would
+         break on nuget.org. -->
+    <PackageReadmeFile>nuget-readme.md</PackageReadmeFile>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
 
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -29,14 +33,14 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
 
-    <!-- Validate the packed public API surface is consistent across target frameworks. Once 0.1.0
-         is published, set PackageValidationBaselineVersion to also catch binary-compat breaks
-         against the previous release. -->
+    <!-- Validate the packed public API surface is consistent across target frameworks.
+         PackageValidationBaselineVersion MUST be set to 0.1.0 immediately after the first stable
+         release ships, or binary-compat breaks go undetected. -->
     <EnablePackageValidation>true</EnablePackageValidation>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)../README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)../docs/nuget-readme.md" Pack="true" PackagePath="\" Visible="false" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
 
     <!-- Track the public API surface: RS0016/RS0017 flag any public member that is not recorded in

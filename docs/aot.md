@@ -37,7 +37,7 @@ AsyncResponseJsonSerialization.RegisterResolver(MyAppJsonContext.Default);
 builder.Services.AddAsyncResponse()
     .WithRedisChannel(...)
     .WithRabbitMqTransport(...)
-    .WithRedisDurableFlows(...)
+    .WithPostgreSqlDurableFlows(...)
     .WithDurableFlow<ProvisioningFlow, ProvisionRequest>();   // per flow
 ```
 

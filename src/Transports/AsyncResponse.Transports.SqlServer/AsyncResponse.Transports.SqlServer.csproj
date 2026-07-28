@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.SqlServer</PackageId>
     <Description>Microsoft SQL Server transport for AsyncResponse: publish worker jobs to durable SQL Server queue tables, consume worker-job and response-ingress queues claimed with UPDLOCK/READPAST, with bounded redelivery and dead-lettering, and expose SQL Server reply targets.</Description>
+    <PackageTags>$(PackageTags);sqlserver;mssql</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

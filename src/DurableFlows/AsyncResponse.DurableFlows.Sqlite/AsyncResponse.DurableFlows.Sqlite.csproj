@@ -6,6 +6,7 @@
     <!-- FlowState (the only JSON this package writes) uses source-generated metadata
          (DurableFlowStoreJsonContext); no reflection-based serialization remains. -->
     <IsAotCompatible>true</IsAotCompatible>
+    <PackageTags>$(PackageTags);sqlite;durable;workflow;orchestration</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

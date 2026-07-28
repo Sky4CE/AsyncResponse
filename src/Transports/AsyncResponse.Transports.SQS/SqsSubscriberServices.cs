@@ -88,17 +88,124 @@ internal abstract class SqsSubscriberService : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            // In early-ACK mode, receiving while the background queue is saturated would burn the
+            // queue's redrive policy (SQS counts every receive), so wait for free capacity and never
+            // request more messages than the dispatcher can accept.
+            await dispatcher.WaitForCapacityAsync(stoppingToken).ConfigureAwait(false);
+            var maxMessages = Math.Min(Options.MaxMessagesPerReceive, dispatcher.FreeCapacity);
+
             var deliveries = await _client.ReceiveMessagesAsync(
                 new SqsReceiveRequest(
                     queueUrl,
-                    Options.MaxMessagesPerReceive,
+                    maxMessages,
                     Options.ReceiveWaitTime,
                     SubscriberOptions.VisibilityTimeout),
                 stoppingToken).ConfigureAwait(false);
 
+            await DispatchBatchAsync(dispatcher, deliveries, queue, stoppingToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task DispatchBatchAsync(
+        SqsMessageDispatcher dispatcher,
+        IReadOnlyList<SqsTransportDelivery> deliveries,
+        string queue,
+        CancellationToken stoppingToken)
+    {
+        if (deliveries.Count == 0)
+            return;
+
+        if (SubscriberOptions.AckMode is not SqsAckMode.AckAfterHandlerCompletes
+            || SubscriberOptions.VisibilityRenewalInterval is not { } renewalInterval
+            || SubscriberOptions.VisibilityTimeout is not { } visibilityTimeout)
+        {
             foreach (var delivery in deliveries)
                 await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+            return;
         }
+
+        // The batch is processed serially, so a slow handler lets the visibility timeout of the later
+        // (still unprocessed) messages lapse and a competing consumer processes them a second time.
+        // While the batch is in flight, a heartbeat resets every unsettled message's invisibility to
+        // the configured visibility timeout.
+        var progress = new BatchProgress();
+        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var renewalTask = RenewVisibilityLoopAsync(
+            deliveries,
+            progress,
+            renewalInterval,
+            visibilityTimeout,
+            queue,
+            renewalCancellation.Token);
+        try
+        {
+            foreach (var delivery in deliveries)
+            {
+                try
+                {
+                    await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    progress.MarkSettled();
+                }
+            }
+        }
+        finally
+        {
+            renewalCancellation.Cancel();
+            await renewalTask.ConfigureAwait(false);
+        }
+    }
+
+    private async Task RenewVisibilityLoopAsync(
+        IReadOnlyList<SqsTransportDelivery> deliveries,
+        BatchProgress progress,
+        TimeSpan renewalInterval,
+        TimeSpan visibilityTimeout,
+        string queue,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
+
+                // Renew from the first unsettled message onward: that covers the message currently in
+                // the handler plus everything still waiting its turn. A renewal racing a just-settled
+                // message merely fails and is logged; SQS redelivery keeps at-least-once intact.
+                for (var i = progress.SettledCount; i < deliveries.Count; i++)
+                {
+                    var delivery = deliveries[i];
+                    try
+                    {
+                        await delivery.ChangeVisibilityAsync(visibilityTimeout).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.LogWarning(
+                            ex,
+                            "Failed to renew visibility of SQS message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",
+                            delivery.MessageId,
+                            queue);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The batch finished or the subscriber is stopping.
+        }
+    }
+
+    private sealed class BatchProgress
+    {
+        private int _settledCount;
+
+        public int SettledCount => Volatile.Read(ref _settledCount);
+
+        public void MarkSettled() => Interlocked.Increment(ref _settledCount);
     }
 }
 

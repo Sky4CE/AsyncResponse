@@ -39,11 +39,18 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateSchema { get; set; } = true;
 
     /// <summary>
-    /// How often <see cref="OracleFlowStateStore.TryCreateAsync"/> opportunistically deletes expired rows
-    /// (loads already treat expired state as absent; pruning bounds table growth). Zero or negative
-    /// prunes on every save. Default: 5 minutes.
+    /// How often <see cref="OracleFlowStateStore.TryCreateAsync"/> opportunistically deletes one bounded
+    /// batch (1000 rows) of expired rows (loads already treat expired state as absent; pruning
+    /// bounds table growth). Zero or negative prunes on every save. Default: 5 minutes.
     /// </summary>
     public TimeSpan PruneInterval { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of an opaque provider error. Default: <c>null</c>
+    /// (unlimited — <c>NCLOB</c> is effectively unbounded), settable as an operator budget.
+    /// </summary>
+    public long? MaxStateBytes { get; set; }
 
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
@@ -52,6 +59,8 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
 
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)}", "Oracle");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
@@ -59,7 +68,20 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
 public sealed class OracleFlowStateStore : IFlowStateStore
 {
     private const int ObjectAlreadyExists = 955;
+    private const int ColumnListAlreadyIndexed = 1408;
     private const int UniqueConstraintViolated = 1;
+    private const int PruneBatchSize = 1000;
+
+    /// <summary>
+    /// SQL expression adding a millisecond bind parameter to the database clock. All expiry and
+    /// lease math runs on <c>SYS_EXTRACT_UTC(SYSTIMESTAMP)</c> so app clock skew can never fence a
+    /// lease in or out; Oracle NUMBER division keeps fractional seconds, so <c>datetime</c>
+    /// precision survives the millisecond parameter.
+    /// </summary>
+    private static string AddMilliseconds(string parameterName)
+        => $"SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL({parameterName} / 1000, 'SECOND')";
+
+    private const string UtcNowSql = "SYS_EXTRACT_UTC(SYSTIMESTAMP)";
 
     private readonly OracleDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -80,21 +102,20 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.BindByName = true;
-        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = :flow_id AND expires_at_utc > :now_utc";
+        command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = :flow_id AND expires_at_utc > {UtcNowSql}";
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("now_utc", DateTime.UtcNow));
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(reader.GetString(0));
-        return state?.Revision == reader.GetInt64(1) ? state : null;
+        return DurableFlowStoreShared.ReadState(flowId, reader.GetString(0), reader.GetInt64(1));
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Oracle");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (DurableFlowStoreShared.ShouldPrune(ref _lastPruneTicks, _options.PruneInterval))
             await PruneExpiredAsync(cancellationToken).ConfigureAwait(false);
@@ -102,18 +123,19 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await TryCreateCoreAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+            return await TryCreateCoreAsync(connection, flowId, stateJson, state.Revision, ttl, cancellationToken).ConfigureAwait(false);
         }
         catch (OracleException ex) when (ex.Number == UniqueConstraintViolated)
         {
-            return await TryCreateCoreAsync(connection, flowId, state, ttl, cancellationToken).ConfigureAwait(false);
+            return await TryCreateCoreAsync(connection, flowId, stateJson, state.Revision, ttl, cancellationToken).ConfigureAwait(false);
         }
     }
 
     private async Task<bool> TryCreateCoreAsync(
         OracleConnection connection,
         string flowId,
-        FlowState state,
+        string stateJson,
+        long revision,
         TimeSpan ttl,
         CancellationToken cancellationToken)
     {
@@ -125,22 +147,20 @@ public sealed class OracleFlowStateStore : IFlowStateStore
             USING (SELECT :flow_id AS flow_id FROM dual) source ON (target.flow_id = source.flow_id)
             WHEN MATCHED THEN UPDATE SET
                 target.state_json = :state_json,
-                target.expires_at_utc = :expires_at_utc,
-                target.updated_at_utc = :now_utc,
+                target.expires_at_utc = {AddMilliseconds(":ttl_ms")},
+                target.updated_at_utc = {UtcNowSql},
                 target.revision = :revision,
                 target.lease_id = NULL,
                 target.lease_expires_at_utc = NULL
-                WHERE target.expires_at_utc <= :now_utc
+                WHERE target.expires_at_utc <= {UtcNowSql}
             WHEN NOT MATCHED THEN
                 INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
-                VALUES (:flow_id, :state_json, :expires_at_utc, :now_utc, :revision)
+                VALUES (:flow_id, :state_json, {AddMilliseconds(":ttl_ms")}, {UtcNowSql}, :revision)
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = DurableFlowStoreShared.Serialize(state) });
-        command.Parameters.Add(new OracleParameter("expires_at_utc", now.Add(ttl)));
-        command.Parameters.Add(new OracleParameter("now_utc", now));
-        command.Parameters.Add(new OracleParameter("revision", state.Revision));
+        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = stateJson });
+        command.Parameters.Add(new OracleParameter("ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl)));
+        command.Parameters.Add(new OracleParameter("revision", revision));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -153,6 +173,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Oracle");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -162,19 +183,17 @@ public sealed class OracleFlowStateStore : IFlowStateStore
             $"""
             UPDATE {Table}
             SET state_json = :state_json,
-                expires_at_utc = :expires_at_utc,
-                updated_at_utc = :now_utc,
+                expires_at_utc = {AddMilliseconds(":ttl_ms")},
+                updated_at_utc = {UtcNowSql},
                 revision = :new_revision
             WHERE flow_id = :flow_id
               AND revision = :expected_revision
-              AND expires_at_utc > :now_utc
-              AND (:lease_id IS NULL OR (lease_id = :lease_id AND lease_expires_at_utc > :now_utc))
+              AND expires_at_utc > {UtcNowSql}
+              AND (:lease_id IS NULL OR (lease_id = :lease_id AND lease_expires_at_utc > {UtcNowSql}))
             """;
-        var now = DateTime.UtcNow;
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = DurableFlowStoreShared.Serialize(state) });
-        command.Parameters.Add(new OracleParameter("expires_at_utc", now.Add(ttl)));
-        command.Parameters.Add(new OracleParameter("now_utc", now));
+        command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = stateJson });
+        command.Parameters.Add(new OracleParameter("ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl)));
         command.Parameters.Add(new OracleParameter("expected_revision", expectedRevision));
         command.Parameters.Add(new OracleParameter("new_revision", state.Revision));
         command.Parameters.Add(new OracleParameter("lease_id", OracleDbType.NVarchar2) { Value = (object?)leaseId ?? DBNull.Value });
@@ -214,11 +233,14 @@ public sealed class OracleFlowStateStore : IFlowStateStore
 
     private async Task PruneExpiredAsync(CancellationToken cancellationToken)
     {
+        // One bounded batch per prune interval (policy shared by all relational stores): an
+        // unbatched DELETE over a large expired backlog holds row locks and bloats one
+        // transaction for the unlucky create that triggered the prune. Loads already filter on
+        // expiry, so any backlog beyond the batch just waits for the next interval.
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.BindByName = true;
-        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= :now_utc";
-        command.Parameters.Add(new OracleParameter("now_utc", DateTime.UtcNow));
+        command.CommandText = $"DELETE FROM {Table} WHERE expires_at_utc <= {UtcNowSql} AND ROWNUM <= {PruneBatchSize}";
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -268,8 +290,11 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         {
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OracleException ex) when (ex.Number == ObjectAlreadyExists)
+        catch (OracleException ex) when (ex.Number is ObjectAlreadyExists or ColumnListAlreadyIndexed)
         {
+            // ORA-00955: the object (table/index name) already exists. ORA-01408: the column list
+            // is already indexed — raised instead of ORA-00955 when an operator pre-created the
+            // expiry index under a different name; the index we want exists in substance.
         }
     }
 
@@ -289,19 +314,20 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.BindByName = true;
-        var now = DateTime.UtcNow;
+        // Lease fencing runs entirely on the database clock: acquire steals only leases the
+        // database considers expired, and renew/extend stays relative to the server's UTC time,
+        // so worker clock skew can never make two nodes hold the same lease.
         command.CommandText =
             $"""
             UPDATE {Table}
-            SET lease_id = :lease_id, lease_expires_at_utc = :lease_expires_at_utc
+            SET lease_id = :lease_id, lease_expires_at_utc = {AddMilliseconds(":lease_ms")}
             WHERE flow_id = :flow_id
-              AND expires_at_utc > :now_utc
-              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= :now_utc OR lease_id = :lease_id)" : "lease_id = :lease_id AND lease_expires_at_utc > :now_utc")}
+              AND expires_at_utc > {UtcNowSql}
+              AND {(acquire ? $"(lease_id IS NULL OR lease_expires_at_utc <= {UtcNowSql} OR lease_id = :lease_id)" : $"lease_id = :lease_id AND lease_expires_at_utc > {UtcNowSql}")}
             """;
         command.Parameters.Add(new OracleParameter("flow_id", flowId));
         command.Parameters.Add(new OracleParameter("lease_id", leaseId));
-        command.Parameters.Add(new OracleParameter("now_utc", now));
-        command.Parameters.Add(new OracleParameter("lease_expires_at_utc", now.Add(leaseDuration)));
+        command.Parameters.Add(new OracleParameter("lease_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration)));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 

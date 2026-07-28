@@ -172,7 +172,6 @@ internal sealed class SqlServerAsyncResponseChannel :
 
         subscription.ProcessUnderContextAsync = ProcessUnderCapturedContextAsync;
 
-        var armed = false;
         try
         {
             var recoveryState = new RecoveryState
@@ -185,11 +184,14 @@ internal sealed class SqlServerAsyncResponseChannel :
                 RegisteredAtUtc = DateTime.UtcNow,
                 Context = _propagation.Capture()
             };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            // Subscriber row BEFORE recovery state: "recovery state visible ⇒ subscription
+            // visible" is the invariant the lost-subscriber dispatcher's live re-check relies on.
+            // In the reverse order a publisher could see the state, see no subscriber, and consume
+            // the registration while this waiter is milliseconds from being live.
             await _sql.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
 
             timeoutCts.CancelAfter(timeout.Value);
-            armed = true;
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for SQL Server response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
@@ -198,18 +200,22 @@ internal sealed class SqlServerAsyncResponseChannel :
         {
             _logger.LogError(ex, "Failed to create SQL Server waiter for correlationId {CorrelationId}.", correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            tcs.TrySetException(ex);
             await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
+
+            // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
+            // the trigger runs only once the subscription AND recovery state exist. A returned
+            // waiter would still let the trigger fire the remote operation with no registration
+            // left to receive (or recover) its response. Cleanup cancels the response task, so no
+            // pending task is left behind.
+            tcs.TrySetCanceled();
+            throw;
         }
 
-        if (armed)
-        {
-            // Publish the subscription only once it is fully armed (heartbeat + timeout + context
-            // delegate), then signal a scan targeted at this correlation id so any already-stored
-            // response is delivered promptly without a full-table sweep.
-            AddSubscription(correlationId, subscription);
-            SignalDispatcher(correlationId);
-        }
+        // Publish the subscription only once it is fully armed (heartbeat + timeout + context
+        // delegate), then signal a scan targeted at this correlation id so any already-stored
+        // response is delivered promptly without a full-table sweep.
+        AddSubscription(correlationId, subscription);
+        SignalDispatcher(correlationId);
 
         return new SqlServerAsyncResponseWaiter<T>(tcs.Task, () => subscription.CleanupOnceAsync(deleteRecoveryState: true));
     }
@@ -245,12 +251,24 @@ internal sealed class SqlServerAsyncResponseChannel :
             if (subscribers <= 0)
             {
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
@@ -298,12 +316,24 @@ internal sealed class SqlServerAsyncResponseChannel :
             {
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var messageId = Guid.NewGuid();
@@ -352,12 +382,24 @@ internal sealed class SqlServerAsyncResponseChannel :
             activity?.SetTag("asyncresponse.subscribers", subscribers);
             if (subscribers <= 0)
             {
-                var invoked = await _lostSubscriberDispatcher
-                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(
+                        _recoveryStateStore,
+                        correlationId,
+                        exception,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var envelope = new AsyncResponseEnvelope<object>
@@ -374,11 +416,13 @@ internal sealed class SqlServerAsyncResponseChannel :
 
             if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
-                var invoked = await _lostSubscriberDispatcher
+                // No live re-check here: TryClaimForRecoveryAsync already won the message for the
+                // recovery path, so live delivery of it is no longer possible.
+                var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
             }
         }
         catch (Exception ex)
@@ -427,10 +471,18 @@ internal sealed class SqlServerAsyncResponseChannel :
         }
     }
 
+    /// <summary>
+    /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
+    /// using the same active-subscriber count the publish path consulted.
+    /// </summary>
+    private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
+        => await _sql.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+
     private void AddSubscription(string correlationId, ISqlServerSubscription subscription)
     {
         var group = _subscriptions.GetOrAdd(correlationId, _ => new ConcurrentDictionary<Guid, ISqlServerSubscription>());
         group[subscription.Id] = subscription;
+        _executors.OnSubscriptionRegistered(ChannelName(correlationId));
     }
 
     private void RemoveSubscription(string correlationId, Guid registrationId)
@@ -438,18 +490,21 @@ internal sealed class SqlServerAsyncResponseChannel :
         if (!_subscriptions.TryGetValue(correlationId, out var group))
             return;
 
-        group.TryRemove(registrationId, out _);
+        if (group.TryRemove(registrationId, out _))
+            _executors.OnSubscriptionRetired(ChannelName(correlationId));
         if (group.IsEmpty)
             _subscriptions.TryRemove(correlationId, out _);
     }
 
     private void EnsureDispatcherStarted()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(SqlServerAsyncResponseChannel));
-
         lock (_dispatcherGate)
         {
+            // Checked under the same gate DisposeAsync sets it under: a racing registration must
+            // never recreate the CTS and loops after disposal tore them down.
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(SqlServerAsyncResponseChannel));
+
             if (_dispatcherCts is not null)
                 return;
 
@@ -467,12 +522,12 @@ internal sealed class SqlServerAsyncResponseChannel :
             try
             {
                 await Task.Delay(_options.SubscriberHeartbeatInterval, cancellationToken).ConfigureAwait(false);
-                var registrationIds = SnapshotActiveRegistrationIds();
-                if (registrationIds.Count > 0)
+                var registrations = SnapshotActiveRegistrations();
+                if (registrations.Count > 0)
                 {
                     await _sql.HeartbeatSubscribersAsync(
                         _instanceId,
-                        registrationIds,
+                        registrations,
                         _options.SubscriberHeartbeatTimeout,
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -488,19 +543,21 @@ internal sealed class SqlServerAsyncResponseChannel :
         }
     }
 
-    private List<Guid> SnapshotActiveRegistrationIds()
+    private List<(string CorrelationId, Guid RegistrationId)> SnapshotActiveRegistrations()
     {
-        var registrationIds = new List<Guid>();
-        foreach (var group in _subscriptions.Values)
+        // Full (correlation id, registration id) pairs: the heartbeat UPSERTs the subscriber rows,
+        // so it needs everything required to re-create a row the pruner has already deleted.
+        var registrations = new List<(string CorrelationId, Guid RegistrationId)>();
+        foreach (var (correlationId, group) in _subscriptions)
         {
             foreach (var subscription in group.Values)
             {
                 if (!subscription.Dropped)
-                    registrationIds.Add(subscription.Id);
+                    registrations.Add((correlationId, subscription.Id));
             }
         }
 
-        return registrationIds;
+        return registrations;
     }
 
     private async Task DispatchLoopAsync(CancellationToken cancellationToken)
@@ -630,12 +687,13 @@ internal sealed class SqlServerAsyncResponseChannel :
         IReadOnlyList<ISqlServerSubscription> subscriptions,
         CancellationToken cancellationToken)
     {
-        // Only subscriptions that are still live and have not already processed this message. Skipping
-        // when there is nothing to deliver also avoids a redundant claim on every re-sweep.
+        // Only subscriptions that are still live, inside their delivery watermark, and have not
+        // already processed this message. Skipping when there is nothing to deliver also avoids a
+        // redundant claim on every re-sweep.
         var hasTargets = false;
         foreach (var subscription in subscriptions)
         {
-            if (!subscription.Dropped && !subscription.HasSeen(message.Id))
+            if (!subscription.Dropped && IsWithinWatermark(subscription, message) && !subscription.HasSeen(message.Id))
             {
                 hasTargets = true;
                 break;
@@ -663,12 +721,20 @@ internal sealed class SqlServerAsyncResponseChannel :
 
         foreach (var subscription in subscriptions)
         {
-            if (subscription.Dropped || !subscription.MarkSeen(message.Id))
+            if (subscription.Dropped || !IsWithinWatermark(subscription, message) || !subscription.MarkSeen(message.Id))
                 continue;
 
             await subscription.ProcessUnderContextAsync(message).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Per-subscription delivery watermark. The sweep queries with the OLDEST waiter's watermark on
+    /// a shared correlation id, so without this filter a late-joining waiter would receive retained
+    /// messages created before it registered. Same 1s tolerance as the query watermark.
+    /// </summary>
+    private static bool IsWithinWatermark(ISqlServerSubscription subscription, SqlServerChannelMessage message)
+        => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1);
 
     private async Task TryDispatchLocalSubscribersAsync(SqlServerChannelMessage message, CancellationToken cancellationToken)
     {
@@ -831,12 +897,14 @@ internal sealed class SqlServerAsyncResponseChannel :
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        _disposed = true;
         CancellationTokenSource? cts;
         Task? dispatchTask;
         Task? heartbeatTask;
         lock (_dispatcherGate)
         {
+            // Set under the gate so EnsureDispatcherStarted can never observe "not disposed" and
+            // then recreate the CTS/loops this teardown is about to stop.
+            _disposed = true;
             cts = _dispatcherCts;
             dispatchTask = _dispatchTask;
             heartbeatTask = _heartbeatTask;
@@ -1028,10 +1096,18 @@ internal sealed class SqlServerAsyncResponseChannel :
             try
             {
                 _dropped = true;
-                _owner.RemoveSubscription(_correlationId, Id);
-                await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
+
+                // Delete the recovery state BEFORE removing the subscription (locally and in the
+                // subscriber table). In the reverse order a publish landing in the window sees
+                // "no subscriber, state present" and fires a spurious recovery callback for a wait
+                // that already reached a terminal state. In this order the window shows a
+                // subscriber that drops the message — a late or duplicate terminal message is
+                // droppable; a resurrected recovery callback is not. (Shutdown/redeploy paths pass
+                // deleteRecoveryState: false and keep the state for lost-subscriber recovery.)
                 if (deleteRecoveryState)
                     await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
+                _owner.RemoveSubscription(_correlationId, Id);
+                await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
 
                 // Schedule the executor retirement on the thread pool; do not await directly —
                 // dispatch-loop deliveries run this cleanup ON the executor, and RemoveAsync waits

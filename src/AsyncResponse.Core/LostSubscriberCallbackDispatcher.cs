@@ -60,7 +60,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         T response,
         string channel,
         CancellationToken cancellationToken,
-        Func<bool>? hasLiveSubscriber = null)
+        Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
         var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
         if (recoveryStates.Count == 0)
@@ -70,7 +70,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         // visible here implies its subscription is visible too. If the caller can now see a live
         // subscriber, the "nobody listening" premise was a snapshot race — hand the response back
         // for live delivery instead of consuming the registration and stranding the waiter.
-        if (hasLiveSubscriber?.Invoke() == true)
+        if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
             return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
 
         var callbackInvoked = false;
@@ -120,16 +120,23 @@ internal sealed class LostSubscriberCallbackDispatcher(
     /// Loads every recovery registration for <paramref name="correlationId"/> and dispatches a lost
     /// exception to each registration's failure callback.
     /// </summary>
-    public async Task<bool> DispatchLostExceptions(
+    public async Task<LostSubscriberDispatchResult> DispatchLostExceptions(
         IRecoveryStateStore recoveryStateStore,
         string correlationId,
         Exception exception,
         string channel,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
         var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
         if (recoveryStates.Count == 0)
-            return await DispatchLostException(null, exception, channel).ConfigureAwait(false);
+            return new LostSubscriberDispatchResult(false, await DispatchLostException(null, exception, channel).ConfigureAwait(false));
+
+        // Same snapshot-race re-check as DispatchLostResponses: a registration that is visible here
+        // implies its subscription is visible too, so a live subscriber means the exception should
+        // be delivered live instead of consuming the registration.
+        if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
+            return new LostSubscriberDispatchResult(false, false) { RetryLive = true };
 
         var callbackInvoked = false;
         ExceptionDispatchInfo? firstException = null;
@@ -157,7 +164,8 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         firstException?.Throw();
 
-        return callbackInvoked;
+        // Exception envelopes always take the failure route, so ShouldResume is fixed at false.
+        return new LostSubscriberDispatchResult(false, callbackInvoked);
     }
 
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>

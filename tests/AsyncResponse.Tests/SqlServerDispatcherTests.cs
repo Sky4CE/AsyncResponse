@@ -1,11 +1,66 @@
 using AsyncResponse.Transports.SqlServer;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Diagnostics;
 using Xunit;
 
 namespace AsyncResponse.Tests;
 
 public sealed class SqlServerDispatcherTests
 {
+    [Fact]
+    public async Task HandlerExecution_EmitsSqlServerReceiveSpanWithMessagingTags()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var options = Options();
+        var calls = new Calls();
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [options.CorrelationIdHeader] = "corr-sql" };
+        var dispatcher = new SqlServerMessageDispatcher(
+            (_, _) => Task.CompletedTask,
+            options,
+            new SqlServerSubscriberOptions(),
+            NullLogger.Instance,
+            SqlServerSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, headers: headers), CancellationToken.None);
+
+        // The span follows the per-broker convention (asyncresponse.<broker>.receive + role/ack_mode
+        // tags) instead of the old asyncresponse.worker.receive/asyncresponse.response.receive names.
+        var activity = collector.Single("asyncresponse.sqlserver.receive", "asyncresponse.transport", "sqlserver");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
+        Assert.Equal("Worker", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.sqlserver.role"));
+        Assert.Equal(nameof(SqlServerAckMode.AckAfterHandlerCompletes), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.sqlserver.ack_mode"));
+        Assert.Equal("sqlserver", AsyncResponseActivityCollector.Tag(activity, "messaging.system"));
+        Assert.Equal("worker", AsyncResponseActivityCollector.Tag(activity, "messaging.destination.name"));
+        Assert.Equal(1, AsyncResponseActivityCollector.Tag(activity, "messaging.message.delivery_attempt"));
+        Assert.Equal("corr-sql", AsyncResponseActivityCollector.Tag(activity, "asyncresponse.correlation_id"));
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_BackgroundHandlerStillEmitsReceiveSpan()
+    {
+        using var collector = new AsyncResponseActivityCollector();
+        var calls = new Calls();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new SqlServerMessageDispatcher(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
+            Options(),
+            new SqlServerSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            SqlServerSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await WaitUntilAsync(() => collector.Count("asyncresponse.sqlserver.receive") == 1);
+        var activity = collector.Single("asyncresponse.sqlserver.receive", "asyncresponse.transport", "sqlserver");
+        Assert.Equal(ActivityKind.Consumer, activity.Kind);
+        Assert.Equal(nameof(SqlServerAckMode.AckAfterEnqueue), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.sqlserver.ack_mode"));
+    }
+
     [Fact]
     public async Task AckAfterHandlerCompletes_AcksOnlyAfterSuccessfulHandler()
     {
@@ -340,6 +395,136 @@ public sealed class SqlServerDispatcherTests
         Assert.Contains(nameof(SqlServerSubscriberOptions.BackgroundWorkerCount), ex.Message);
     }
 
+    [Fact]
+    public void ValidateSubscriber_DrainBudgetExceedingHostShutdownBudget_Throws()
+    {
+        var options = Options();
+        options.ShutdownTimeout = TimeSpan.FromSeconds(20);
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(25);
+        var subscriber = new SqlServerSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10));
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqlServerTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
+
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+
+        // A null host budget or an awaiting-mode subscriber skips the check.
+        options.HostShutdownTimeout = null;
+        SqlServerTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker");
+        var awaiting = Options();
+        awaiting.HostShutdownTimeout = TimeSpan.FromSeconds(1);
+        SqlServerTransportOptionsValidator.ValidateSubscriber(awaiting, new SqlServerSubscriberOptions(), "Worker");
+    }
+
+    [Fact]
+    public void ValidateSubscriber_NonPositiveHostShutdownTimeout_Throws()
+    {
+        var options = Options();
+        options.HostShutdownTimeout = TimeSpan.Zero;
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            SqlServerTransportOptionsValidator.ValidateSubscriber(
+                options,
+                new SqlServerSubscriberOptions().UseAckAfterEnqueue(1, 8),
+                "Worker"));
+
+        Assert.Contains(nameof(SqlServerAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_SlowHandler_RenewsLeaseUntilHandlerFinishes()
+    {
+        var calls = new Calls();
+        var options = Options();
+        options.LockTimeout = TimeSpan.FromMilliseconds(100);
+        var dispatcher = new SqlServerMessageDispatcher(
+            async (_, _) =>
+            {
+                while (Volatile.Read(ref calls.Renew) < 2)
+                    await Task.Delay(10);
+            },
+            options,
+            new SqlServerSubscriberOptions(),
+            NullLogger.Instance,
+            SqlServerSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.True(calls.Renew >= 2);
+        Assert.Equal(1, calls.Ack);
+
+        // The renewal loop stops with the handler; no further renewals happen afterwards.
+        var renewalsAfterAck = calls.Renew;
+        await Task.Delay(200);
+        Assert.Equal(renewalsAfterAck, calls.Renew);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_LeaseFenceLost_StopsRenewingAndKeepsProcessing()
+    {
+        var calls = new Calls { RenewResult = false };
+        var options = Options();
+        options.LockTimeout = TimeSpan.FromMilliseconds(100);
+        var dispatcher = new SqlServerMessageDispatcher(
+            async (_, _) =>
+            {
+                while (Volatile.Read(ref calls.Renew) < 1)
+                    await Task.Delay(10);
+                await Task.Delay(250); // long enough for several more beats if the loop kept going
+            },
+            options,
+            new SqlServerSubscriberOptions(),
+            NullLogger.Instance,
+            SqlServerSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        // The fence was lost on the first beat: the loop stops instead of hammering the store, and
+        // the handler still completes with the fenced ack no-oping server-side.
+        Assert.Equal(1, calls.Renew);
+        Assert.Equal(1, calls.Ack);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_QueuedButUnstartedRows_AreAttemptedAndSurfacedInsteadOfDropped()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = 0;
+        var runningCalls = new Calls();
+        var queuedCalls = new Calls();
+        var subscriberOptions = new SqlServerSubscriberOptions
+        {
+            OnBackgroundFailure = _ =>
+            {
+                Interlocked.Increment(ref failures);
+                return ValueTask.CompletedTask;
+            }
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
+        var dispatcher = new SqlServerMessageDispatcher(
+            async (_, cancellationToken) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
+            },
+            Options(),
+            subscriberOptions,
+            NullLogger.Instance,
+            SqlServerSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(runningCalls), CancellationToken.None);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2)); // worker is blocked in the handler
+        await dispatcher.HandleAsync(Delivery(queuedCalls), CancellationToken.None); // already ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The hard stop must not silently drop the already-ACKed queued row: it is attempted with
+        // the cancelled drain token, dead-lettered, and surfaced via OnBackgroundFailure — same as
+        // the one that was mid-handler.
+        await WaitUntilAsync(() => Volatile.Read(ref failures) == 2);
+        Assert.Equal(1, runningCalls.DeadLetter);
+        Assert.Equal(1, queuedCalls.DeadLetter);
+    }
+
     internal static SqlServerAsyncResponseTransportOptions Options()
         => new() { ConnectionString = "Server=localhost;Database=asyncresponse_tests;User ID=sa;Password=unused;TrustServerCertificate=True" };
 
@@ -370,6 +555,11 @@ public sealed class SqlServerDispatcherTests
                 calls.DeleteOriginalOnDeadLetter = deleteOriginal;
                 calls.DeadLettered.TrySetResult();
                 return ValueTask.FromResult(calls.DeadLetterResult);
+            },
+            () =>
+            {
+                calls.Renew++;
+                return ValueTask.FromResult(calls.RenewResult);
             });
 
     private static async Task WaitUntilAsync(Func<bool> condition)
@@ -384,15 +574,21 @@ public sealed class SqlServerDispatcherTests
 
     private sealed class Calls
     {
-        public Calls() => DeadLetterResult = true;
+        public Calls()
+        {
+            DeadLetterResult = true;
+            RenewResult = true;
+        }
 
         public int Handler;
         public int Ack;
         public int Nak;
         public int DeadLetter;
+        public int Renew;
         public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool DeleteOriginalOnDeadLetter;
         public bool DeadLetterResult;
+        public bool RenewResult;
         public TimeSpan LastNakDelay;
     }
 }

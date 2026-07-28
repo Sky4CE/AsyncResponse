@@ -135,9 +135,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             try
             {
+                // Delete the recovery state BEFORE disposing the subscription. In the reverse
+                // order a publish landing in the window sees "no responders, state present" and
+                // fires a spurious recovery callback for a wait that already reached a terminal
+                // state. In this order the window shows a subscriber that drops the message — a
+                // late or duplicate terminal message is droppable; a resurrected recovery callback
+                // is not.
+                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
                 if (subscription is not null)
                     await subscription.DisposeAsync().ConfigureAwait(false);
-                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
                 _logger.LogDebug("Unsubscribed from subject {Subject}.", subject);
             }
             catch (Exception ex)
@@ -319,9 +325,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         {
             _logger.LogError(ex, "Failed to subscribe to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            tcs.TrySetException(ex);
             await CleanupOnceAsync().ConfigureAwait(false);
-            return new NatsAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
+
+            // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
+            // the trigger runs only once the subscription AND recovery state exist. A returned
+            // waiter would still let the trigger fire the remote operation with no registration
+            // left to receive (or recover) its response. Cleanup leaves nothing behind, and the
+            // response task is cancelled rather than faulted so no unobserved fault lingers.
+            tcs.TrySetCanceled();
+            throw;
         }
 
         try
@@ -378,8 +390,29 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 // Nobody was listening (the waiter died, e.g. with a redeploy): hand the response over
                 // to the lost-subscriber dispatcher, which asks the payload whether to resume or fail.
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        subject,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the request and the recovery-state read —
+                    // re-attempt the live publish instead of consuming its registration; only a
+                    // second no-responders consumes it.
+                    outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+                    if (outcome != NatsDeliveryOutcome.NoResponders)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
@@ -423,8 +456,29 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
 
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        subject,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the request and the recovery-state read —
+                    // re-attempt the live publish instead of consuming its registration; only a
+                    // second no-responders consumes it.
+                    outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+                    if (outcome != NatsDeliveryOutcome.NoResponders)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
                 AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
@@ -477,11 +531,32 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             if (outcome == NatsDeliveryOutcome.NoResponders)
             {
                 // Nobody was listening: exception envelopes always go to the failure callback.
-                var callbackInvoked = await _lostSubscriberDispatcher
-                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, subject, cancellationToken)
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(
+                        _recoveryStateStore,
+                        correlationId,
+                        exception,
+                        subject,
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", callbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, callbackInvoked);
+                if (dispatchResult.RetryLive)
+                {
+                    // A waiter subscribed between the request and the recovery-state read —
+                    // re-attempt the live publish instead of consuming its registration; only a
+                    // second no-responders consumes it.
+                    outcome = await _client.RequestAsync(subject, json, probe: false, _options.DeliveryConfirmationTimeout, cancellationToken).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.delivery", outcome.ToString());
+                    if (outcome != NatsDeliveryOutcome.NoResponders)
+                        return;
+
+                    dispatchResult = await _lostSubscriberDispatcher
+                        .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, subject, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
             {
@@ -524,6 +599,13 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             return 0L;
         }
     }
+
+    /// <summary>
+    /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
+    /// using the same presence probe the watchdog uses.
+    /// </summary>
+    private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
+        => await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
 
     private static string SerializeRawSuccessEnvelope(string payloadJson)
     {

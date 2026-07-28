@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.GooglePubSub</PackageId>
     <Description>Google Pub/Sub transport for AsyncResponse: publish worker jobs to Pub/Sub, consume worker-job subscriptions, and feed response subscriptions into the transport-neutral AsyncResponse ingress.</Description>
+    <PackageTags>$(PackageTags);googlecloud;pubsub</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

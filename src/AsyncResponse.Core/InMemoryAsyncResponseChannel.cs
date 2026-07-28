@@ -32,6 +32,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     {
         _recoveryStateStore = recoveryStateStore;
         _options = options.Value;
+        _options.ValidateShared(nameof(InMemoryAsyncResponseOptions));
         _propagation = propagation;
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
@@ -152,7 +153,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                         response,
                         ChannelName(correlationId),
                         cancellationToken,
-                        hasLiveSubscriber: () => SnapshotSubscribers(correlationId).Count > 0)
+                        hasLiveSubscriber: () => new ValueTask<bool>(SnapshotSubscribers(correlationId).Count > 0))
                     .ConfigureAwait(false);
 
                 if (!result.RetryLive)
@@ -210,7 +211,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                         response.DeserializeUntyped(),
                         ChannelName(correlationId),
                         cancellationToken,
-                        hasLiveSubscriber: () => SnapshotSubscribers(correlationId).Count > 0)
+                        hasLiveSubscriber: () => new ValueTask<bool>(SnapshotSubscribers(correlationId).Count > 0))
                     .ConfigureAwait(false);
 
                 if (!result.RetryLive)
@@ -263,14 +264,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             if (subscribers.Count == 0)
             {
-                var invoked = await _lostSubscriberDispatcher
-                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
+                var result = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(
+                        _recoveryStateStore,
+                        correlationId,
+                        exception,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => new ValueTask<bool>(SnapshotSubscribers(correlationId).Count > 0))
                     .ConfigureAwait(false);
 
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
+                if (!result.RetryLive)
+                {
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, result.CallbackInvoked);
 
-                return;
+                    return;
+                }
+
+                // A waiter registered between the snapshot and the recovery-state read — deliver
+                // live instead of consuming its registration.
+                subscribers = SnapshotSubscribers(correlationId);
+                activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
             }
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);

@@ -58,9 +58,12 @@ Configured through the `AddAsyncResponse(options => …)` callback.
 | Option | Default | Purpose |
 |---|---|---|
 | `Watchdog.Enabled` | `true` | Run the recovery watchdog in this host. Disable in all but one host when several share one store, so its scan and warnings aren't duplicated. |
-| `Watchdog.Interval` | (see watchdog) | How often the watchdog scans persisted recovery state. |
-| `Watchdog.StaleAfter` | (see watchdog) | Age at which an entry with no live waiter is reported stale. |
-| `Watchdog.StartupDelay` | (see watchdog) | Delay before the first scan after host start. |
+| `Watchdog.Interval` | 6 hours | How often the watchdog scans persisted recovery state. |
+| `Watchdog.StaleAfter` | 24 hours | Age at which an entry with no live waiter is reported stale. |
+| `Watchdog.StartupDelay` | 5 minutes | Delay before the first scan after host start. |
+
+The watchdog values in the [example above](#configuration) are exactly these defaults — shown so
+you can see which knobs exist, not because they need changing.
 
 See [recovery.md](recovery.md) for the watchdog in context and [security.md](security.md) for
 `.AuthorizeCallbacks(...)` and type-resolution registration, which are also chained off
@@ -83,6 +86,7 @@ that same options object.
 | `ExecutionLeaseDuration` | 1 minute | How long one store lease owns a flow execution before another replica may take over after owner loss. |
 | `ExecutionLeaseRenewInterval` | 20 seconds | Renewal cadence; must be positive and shorter than `ExecutionLeaseDuration`. |
 | `ProgressPersistenceInterval` | 1 second | Minimum interval between writes caused only by progress reports. Faster updates are coalesced into the next checkpoint/outcome; zero writes every report. |
+| `MaxStateBytes` | DynamoDB 350 000 · Cosmos 1 900 000 · MongoDB 15 000 000 · `null` (unlimited) elsewhere | Serialized-ledger size budget checked on every create/checkpoint. An oversized write fails with a diagnosable error (flow id, size, limit) instead of the raw provider error, before the run burns redeliveries — defaults sit under each provider's hard item/document cap. Keep large payloads in your own storage and pass references (see the ledger-size note in [durable-flows.md](durable-flows.md#child-flows)). |
 
 Configure these on the selected store, for example:
 
@@ -127,7 +131,7 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 
 | Option | Channels | Default | Purpose |
 |---|---|---|---|
-| `KeyPrefix` | Redis | — | Isolate apps/environments sharing one Redis. **Persisted — treat as a deployment contract.** |
+| `KeyPrefix` | Redis | `asyncresponse` | Isolate apps/environments sharing one Redis. **Persisted — treat as a deployment contract.** |
 | `SubjectPrefix` | NATS | `asyncresponse` | Response subjects: `{prefix}.response.{cid}`. |
 | `RecoveryBucket` | NATS | `asyncresponse-recovery` | JetStream KV bucket for recovery state. |
 | `SchemaName` | PostgreSQL, SQL Server | `public` / `dbo` | Schema that contains the channel tables. |
@@ -189,9 +193,11 @@ The in-memory transport is configured directly on registration:
 | `WorkerQueue` / `ResponseQueue` / `DeadLetterQueue` | PostgreSQL, SQL Server, MongoDB | Logical queue names stored in the queue table/collection. They must be distinct. |
 | `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. SQL Server has no equivalent: same-process publishes wake subscribers through an in-process signal, and cross-process rows are picked up within `EmptyPollDelay`. |
 | `UseChangeStreamWake` | MongoDB | Wake idle subscribers with a change stream on the queue collection (requires a replica set). When disabled — or when the server is standalone — subscribers fall back to `EmptyPollDelay` polling. |
-| `LockTimeout` | PostgreSQL, SQL Server, MongoDB | How long a claimed row/document stays locked (leased) before another subscriber may retry it. |
+| `LockTimeout` | PostgreSQL, SQL Server, MongoDB | How long a claimed row/document stays locked (leased) before another subscriber may retry it. While a handler runs, the subscriber renews the claim automatically at half this cadence (fenced by `lock_id`), so one slow handler is not redelivered mid-execution. |
+| `WorkerSubscriber.LockRenewalInterval` | Azure Service Bus | Peek-lock renewal cadence for received-but-unsettled messages while a batch is processed (default 30 s; `null` disables). Keeps slow handlers from losing their lock mid-batch — see the lock-budget note below. |
+| `WorkerSubscriber.VisibilityRenewalInterval` | SQS | Opt-in visibility heartbeat for received-but-unprocessed batch messages (default `null` = off; requires `VisibilityTimeout` set and a shorter interval). Off by default because extending visibility overrides queue-tuned redrive timing, and on FIFO queues an extended message keeps its whole message group blocked if the consumer wedges. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
-| `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. |
+| `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Each transport exposes exactly one of the two, named for when the early ACK happens: `UseAckAfterReceive` on Azure Service Bus, NATS, and PostgreSQL; `UseAckAfterEnqueue` on Kafka, RabbitMQ, Redis, Google Pub/Sub, SQS, SQL Server, and MongoDB. |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub and SQS | Redeliveries before dead-lettering. Google Pub/Sub and SQS perform redelivery natively — bound attempts with the subscription's `DeadLetterPolicy` (Pub/Sub) or the queue's redrive policy `maxReceiveCount` (SQS, provisioned by `CreateQueues` or your infra). On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
 | `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub, SQS | Bounded backoff for restarting a failed hosted subscriber (streaming-pull/long-poll fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
@@ -214,9 +220,11 @@ Service Bus. In `AckAfterReceive`, the message is completed as soon as it enters
 background queue; later handler failures cannot be broker-dead-lettered because the lock is gone, so
 use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path. Mind the peek-lock
 budget: a receive batch is processed sequentially, so the last message in a batch waits up to
-`MaxMessagesPerReceive × handler latency` before settlement — keep that product well under the
-queue's lock duration (or lower `MaxMessagesPerReceive`) to avoid `MessageLockLostException`
-redeliveries of already-processed messages.
+`MaxMessagesPerReceive × handler latency` before settlement. By default the subscriber renews the
+peek-lock of every unsettled batch message every `WorkerSubscriber.LockRenewalInterval` (30 s), so
+slow handlers no longer hit `MessageLockLostException` redeliveries of already-processed messages;
+if you disable renewal (`LockRenewalInterval = null`), keep that product well under the queue's
+lock duration (or lower `MaxMessagesPerReceive`).
 
 AWS SQS uses visibility-timeout settlement with long-poll `ReceiveMessage` (up to 10 messages and
 20 seconds per call). In `AckAfterHandlerCompletes`, a successful handler deletes the message;
@@ -230,7 +238,9 @@ background queue; later handler failures cannot be redelivered because the messa
 budget the same way as the Service Bus lock budget: a receive batch is processed sequentially, so
 keep `MaxMessagesPerReceive × handler latency` under the queue's visibility timeout (or set
 `WorkerSubscriber.VisibilityTimeout` higher / `MaxMessagesPerReceive` lower) to avoid duplicate
-executions of already-processed messages. FIFO queues are opt-in by naming the queue `*.fifo`.
+executions of already-processed messages — or opt into the
+`WorkerSubscriber.VisibilityRenewalInterval` heartbeat, which re-extends unprocessed batch
+messages' invisibility while the batch drains (see the option table for why it is off by default). FIFO queues are opt-in by naming the queue `*.fifo`.
 
 Kafka is built on classic consumer groups with manual offset management (`enable.auto.commit=true` +
 `enable.auto.offset.store=false`; an offset is stored only once its message is fully resolved). Two
@@ -263,13 +273,18 @@ log a startup warning. `AckAfterEnqueue` ACKs after the bounded enqueue and rout
 Google Pub/Sub uses streaming pull with the client library extending the ack deadline while a handler
 runs. Redelivery and dead-lettering are **native**, like SQS: bound them with the subscription's
 `DeadLetterPolicy` and `maxDeliveryAttempts` rather than an app-level `MaxDeliveryAttempts`. A failed
-handler NACKs the message for Pub/Sub to redeliver; `AckAfterEnqueue` ACKs after enqueue and reports
+handler NACKs the message for Pub/Sub to redeliver. In `AckAfterEnqueue` the client's flow control
+is bounded to the background queue capacity (`MaxOutstandingElementCount`), and a full queue parks
+the delivery callback until capacity frees instead of NACKing — so backpressure cannot burn a
+subscription `DeadLetterPolicy`'s delivery attempts; `AckAfterEnqueue` ACKs after enqueue and reports
 later failures through `OnBackgroundFailure`.
 
 NATS JetStream uses explicit acknowledgement. A successful handler `ACK`s; a failure `NAK`s with a
 delay so JetStream redelivers after a backoff, and a message that reaches `MaxDeliveryAttempts` is
 written to the dead-letter stream. Consumers are durable, so a restarted subscriber resumes from its
-last acknowledged position. `AckAfterReceive` ACKs as soon as the message enters the bounded queue.
+last acknowledged position. `AckAfterReceive` ACKs as soon as the message enters the bounded queue;
+when that queue is full the consume loop pauses until capacity frees (a NAK is sent only on
+shutdown/cancellation, so backpressure does not churn redeliveries).
 
 The PostgreSQL and SQL Server transports are table-backed queues: a publish is an idempotent
 `INSERT`, and each subscriber claims a batch of rows atomically — PostgreSQL with

@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.PostgreSQL</PackageId>
     <Description>PostgreSQL transport for AsyncResponse: publish worker jobs to durable PostgreSQL queue tables, consume worker-job and response-ingress queues with bounded redelivery and dead-lettering, and expose PostgreSQL reply targets.</Description>
+    <PackageTags>$(PackageTags);postgresql;npgsql</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

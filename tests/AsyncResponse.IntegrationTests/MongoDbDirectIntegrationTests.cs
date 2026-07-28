@@ -106,11 +106,26 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         await store.UpsertSubscriberAsync("heartbeat-b", heartbeatB, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
         await store.UpsertSubscriberAsync("heartbeat-stale", staleHeartbeat, "heartbeat-instance", TimeSpan.FromMilliseconds(100), CancellationToken.None);
         await Task.Delay(50);
-        await store.HeartbeatSubscribersAsync("heartbeat-instance", [heartbeatA, heartbeatB], TimeSpan.FromSeconds(2), CancellationToken.None);
+        await store.HeartbeatSubscribersAsync(
+            "heartbeat-instance",
+            [("heartbeat-a", heartbeatA), ("heartbeat-b", heartbeatB)],
+            TimeSpan.FromSeconds(2),
+            CancellationToken.None);
         await Task.Delay(100);
         Assert.Equal(1, await store.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
         Assert.Equal(1, await store.CountActiveSubscribersAsync("heartbeat-b", CancellationToken.None));
         Assert.Equal(0, await store.CountActiveSubscribersAsync("heartbeat-stale", CancellationToken.None));
+
+        // The heartbeat is an UPSERT: a document reaped out from under a live waiter (e.g. after a
+        // >timeout stall) is re-created by the next heartbeat cycle instead of staying gone.
+        await store.DeleteSubscriberAsync("heartbeat-a", heartbeatA, CancellationToken.None);
+        Assert.Equal(0, await store.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
+        await store.HeartbeatSubscribersAsync(
+            "heartbeat-instance",
+            [("heartbeat-a", heartbeatA)],
+            TimeSpan.FromSeconds(2),
+            CancellationToken.None);
+        Assert.Equal(1, await store.CountActiveSubscribersAsync("heartbeat-a", CancellationToken.None));
 
         // Messages: idempotent insert, server-stamped watermark ordering, and claim arbitration.
         var messageCorrelation = NewId("direct-message");

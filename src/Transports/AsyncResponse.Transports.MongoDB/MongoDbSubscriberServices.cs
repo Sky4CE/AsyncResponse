@@ -41,7 +41,7 @@ internal abstract class MongoDbSubscriberService : BackgroundService
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        MongoDbTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
+        MongoDbTransportOptionsValidator.ValidateSubscriber(Options, SubscriberOptions, Role.ToString());
 
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)

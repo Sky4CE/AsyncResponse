@@ -76,6 +76,24 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
             ? $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriber)}"
             : $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ResponseSubscriber)}";
 
+        if (!string.IsNullOrWhiteSpace(transportOptions.WorkerSubscriptionId)
+            && !string.IsNullOrWhiteSpace(transportOptions.ResponseSubscriptionId)
+            && StringComparer.Ordinal.Equals(transportOptions.WorkerSubscriptionId, transportOptions.ResponseSubscriptionId))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriptionId)} and " +
+                $"{nameof(GooglePubSubAsyncResponseOptions.ResponseSubscriptionId)} must be distinct so worker and response subscribers do not consume each other's messages.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(transportOptions.WorkerTopicId)
+            && !string.IsNullOrWhiteSpace(transportOptions.ResponseTopicId)
+            && StringComparer.Ordinal.Equals(transportOptions.WorkerTopicId, transportOptions.ResponseTopicId))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerTopicId)} and " +
+                $"{nameof(GooglePubSubAsyncResponseOptions.ResponseTopicId)} must be distinct so worker jobs and responses do not share one topic.");
+        }
+
         switch (subscriberOptions.AckMode)
         {
             case GooglePubSubAckMode.AckAfterHandlerCompletes:
@@ -262,8 +280,8 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
         _queue = Channel.CreateBounded<PubsubMessage>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
         {
             AllowSynchronousContinuations = false,
-            // TryWrite never waits; NACK-on-full comes from TryWrite returning false. Keep Wait so
-            // any future WriteAsync usage would apply backpressure instead of dropping messages.
+            // Wait powers the queue-full backpressure path in HandleAsync: WriteAsync parks the
+            // subscriber callback until a worker frees a slot instead of dropping or NACKing.
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = subscriberOptions.BackgroundWorkerCount == 1,
             SingleWriter = false
@@ -285,7 +303,7 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
     /// <summary>Handles the delivered message.</summary>
-    public override Task<SubscriberClient.Reply> HandleAsync(
+    public override async Task<SubscriberClient.Reply> HandleAsync(
         PubsubMessage message,
         CancellationToken subscriberCancellationToken)
     {
@@ -300,23 +318,41 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                     _subscriptionId,
                     PendingCount,
                     RunningCount);
-                return Task.FromResult(SubscriberClient.Reply.Ack);
+                return SubscriberClient.Reply.Ack;
             }
 
-            Interlocked.Decrement(ref _pendingCount);
-            Logger.LogWarning(
-                "Pub/Sub background queue rejected message {MessageId} for {SubscriptionId}; returning NACK. Pending={PendingCount}, Running={RunningCount}.",
-                message.MessageId,
+            // Queue full: apply backpressure instead of NACKing. A NACK burns one delivery attempt of
+            // a DeadLetterPolicy configured on the subscription, so a saturated worker pool would
+            // dead-letter healthy, never-executed messages. The streaming pull is flow-control-bounded
+            // to the queue capacity, so at most capacity callbacks wait here; the await completes as
+            // soon as a background worker frees a slot.
+            Logger.LogDebug(
+                "Pub/Sub background queue is full for {SubscriptionId}; waiting for capacity before ACKing message {MessageId}. Pending={PendingCount}, Running={RunningCount}.",
                 _subscriptionId,
+                message.MessageId,
                 PendingCount,
                 RunningCount);
-            return Task.FromResult(SubscriberClient.Reply.Nack);
+            await _queue.Writer.WriteAsync(message, subscriberCancellationToken).ConfigureAwait(false);
+            return SubscriberClient.Reply.Ack;
         }
         catch (Exception ex)
         {
+            // Cancellation (subscriber stopping) or a completed channel (dispatcher disposing):
+            // NACK so Pub/Sub redelivers the message to the next subscriber instance.
             Interlocked.Decrement(ref _pendingCount);
-            Logger.LogError(ex, "Failed to enqueue Pub/Sub message {MessageId} for {SubscriptionId}; returning NACK.", message.MessageId, _subscriptionId);
-            return Task.FromResult(SubscriberClient.Reply.Nack);
+            if (ex is OperationCanceledException or ChannelClosedException)
+            {
+                Logger.LogDebug(
+                    "Pub/Sub message {MessageId} for {SubscriptionId} could not be enqueued during shutdown; returning NACK.",
+                    message.MessageId,
+                    _subscriptionId);
+            }
+            else
+            {
+                Logger.LogError(ex, "Failed to enqueue Pub/Sub message {MessageId} for {SubscriptionId}; returning NACK.", message.MessageId, _subscriptionId);
+            }
+
+            return SubscriberClient.Reply.Nack;
         }
     }
 
@@ -352,6 +388,15 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
                 _subscriptionId,
                 PendingCount,
                 RunningCount);
+
+            // The workers are still running and read _drainCancellation.Token each loop, so disposing
+            // it now would throw ObjectDisposedException inside them. Dispose once they actually finish,
+            // off the shutdown path, so the source is not leaked either.
+            _ = Task.WhenAll(_workers).ContinueWith(
+                _ => _drainCancellation.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
     }
 

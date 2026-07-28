@@ -42,13 +42,15 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetRequiredService<AsyncResponseContextPropagation>()));
 
         // Fail fast before background services do any real work if the required channel,
-        // transport, and durable-flow store choices were not made explicitly.
-        services.AddHostedService<AsyncResponseStartupValidator>();
+        // transport, and durable-flow store choices were not made explicitly. TryAddEnumerable
+        // (keyed by implementation type) keeps a second AddAsyncResponse() call from registering a
+        // second validator or watchdog instance.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<Microsoft.Extensions.Hosting.IHostedService, AsyncResponseStartupValidator>());
 
         // The recovery watchdog is part of the engine and runs by default for whatever channel is
         // registered (scanning + liveness go through IRecoveryStateScanner / IActiveSubscriberProbe).
         services.TryAddSingleton<AsyncResponseWatchdogState>();
-        services.AddHostedService<AsyncResponseWatchdog>();
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<Microsoft.Extensions.Hosting.IHostedService, AsyncResponseWatchdog>());
 
         return new AsyncResponseRegistrationBuilder(services);
     }

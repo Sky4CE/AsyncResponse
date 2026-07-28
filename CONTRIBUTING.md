@@ -58,11 +58,16 @@ To set up your local development environment:
    ```bash
    git clone https://github.com/<your-username>/AsyncResponse.git
    ```
-2. Open the solution file `AsyncResponse.sln` using your favorite IDE (JetBrains Rider, Visual Studio, or VS Code).
+2. Open the solution file `AsyncResponse.slnx` using your favorite IDE (JetBrains Rider, Visual Studio, or VS Code).
 3. To run all tests from the command line:
    ```bash
    dotnet test
    ```
+   The integration tests boot real brokers (Redis, RabbitMQ, PostgreSQL, …) through .NET Aspire, so they need a **running Docker daemon** (images are pulled on first run). The unit suite and the in-process integration level run without it. See [docs/operations.md](docs/operations.md#building-and-testing) for the full testing layout.
+
+### Adding public API
+
+Every shipped package tracks its public surface with `Microsoft.CodeAnalysis.PublicApiAnalyzers`. If your change adds (or removes) a public type or member, the build fails with `RS0016`/`RS0017` until you record it in that package's `PublicAPI.Unshipped.txt` — most IDEs offer a code fix ("Add to public API"), or run `dotnet format analyzers` to apply it in bulk. This is expected on first PRs; it is the API-review gate, not a broken build.
 
 ---
 

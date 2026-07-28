@@ -40,6 +40,37 @@ internal static class MongoDbTransportOptionsValidator
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(options.SubscriberRetryBaseDelay)} cannot exceed {nameof(options.SubscriberRetryMaxDelay)}.");
     }
 
+    /// <summary>Validates the supplied subscriber options together with the transport-wide shutdown budget.</summary>
+    public static void ValidateSubscriber(
+        MongoDbAsyncResponseTransportOptions transportOptions,
+        MongoDbSubscriberOptions subscriber,
+        string role)
+    {
+        ValidateSubscriber(subscriber, role);
+
+        if (subscriber.AckMode is not MongoDbAckMode.AckAfterEnqueue)
+            return;
+
+        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
+        {
+            if (hostShutdownTimeout <= TimeSpan.Zero)
+                throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
+
+            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
+            if (requiredShutdownBudget > hostShutdownTimeout)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
+                    $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
+                    $"requires {requiredShutdownBudget}, which exceeds " +
+                    $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
+                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
+                    $"and mirror that value in {nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
+                    "or reduce the MongoDB shutdown/drain timeouts.");
+            }
+        }
+    }
+
     public static void ValidateSubscriber(MongoDbSubscriberOptions subscriber, string role)
     {
         if (subscriber.BatchSize <= 0)

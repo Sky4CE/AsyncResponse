@@ -48,7 +48,7 @@ public sealed class TransportSubscriberCoverageTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         var startTask = subscriber.StartAsync(CancellationToken.None);
 
@@ -71,7 +71,7 @@ public sealed class TransportSubscriberCoverageTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => {
+            (_, _) => {
                 cts.Cancel();
                 throw new OperationCanceledException(cts.Token);
             });
@@ -257,7 +257,8 @@ public sealed class TransportSubscriberCoverageTests
             new Dictionary<string, object?>(),
             () => ValueTask.CompletedTask,
             () => ValueTask.CompletedTask,
-            (_, _) => ValueTask.CompletedTask);
+            (_, _) => ValueTask.CompletedTask,
+            () => ValueTask.CompletedTask);
 
         var method = typeof(AzureServiceBusMessageDispatcher).GetMethod("NotifyBackgroundFailureAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var task = (ValueTask)method.Invoke(dispatcher, [delivery, new Exception("boom"), "queue", AzureServiceBusSubscriberRole.Worker])!;

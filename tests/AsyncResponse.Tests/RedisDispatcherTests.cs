@@ -389,6 +389,58 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_Dispose_CancelledDrain_SurfacesDroppedEntriesViaOnBackgroundFailure()
+    {
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failures = new List<RedisBackgroundFailureContext>();
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100));
+        options.OnBackgroundFailure = context =>
+        {
+            lock (failures)
+            {
+                failures.Add(context);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RedisMessageDispatcher.Create(
+            async (_, token) =>
+            {
+                handlerStarted.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token).ConfigureAwait(false);
+            },
+            database,
+            new RedisAsyncResponseTransportOptions(),
+            options,
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None); // ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // drain budget elapses; the interrupted work must not vanish silently
+
+        // Both the in-handler entry and the still-queued one were already ACKed: the shutdown
+        // interruption is surfaced through OnBackgroundFailure for each instead of only debug-logged.
+        await WaitUntilAsync(() =>
+        {
+            lock (failures)
+            {
+                return failures.Count == 2;
+            }
+        });
+        lock (failures)
+        {
+            Assert.All(failures, context => Assert.IsAssignableFrom<OperationCanceledException>(context.Exception));
+            Assert.Equal(["1-0", "2-0"], failures.Select(context => context.MessageId).OrderBy(id => id, StringComparer.Ordinal));
+        }
+    }
+
+    [Fact]
     public async Task Queued_BackgroundFailure_ReportsAndDeadLetters()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

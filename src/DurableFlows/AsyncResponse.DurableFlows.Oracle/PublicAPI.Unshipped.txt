@@ -4,6 +4,8 @@ AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.AutoCreateSchema.get 
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.AutoCreateSchema.set -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.ConnectionString.get -> string?
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.OracleDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions.PruneInterval.set -> void

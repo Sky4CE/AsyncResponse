@@ -77,6 +77,26 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
         AzureServiceBusTransportDelivery delivery,
         CancellationToken subscriberCancellationToken);
 
+    /// <summary>
+    /// Whether the dispatcher can accept more deliveries right now. Awaiting dispatchers always can
+    /// (handlers run inline); the queued dispatcher returns <c>false</c> while its bounded queue is
+    /// saturated so the receive loop stops pulling messages instead of receiving and abandoning them —
+    /// every abandon burns <c>DeliveryCount</c> toward the entity's MaxDeliveryCount.
+    /// </summary>
+    public virtual bool CanAcceptMore => true;
+
+    /// <summary>
+    /// Number of deliveries the dispatcher can accept right now. The receive loop requests at most
+    /// this many messages per receive in early-ACK mode so a burst never overflows the background queue.
+    /// </summary>
+    public virtual int FreeCapacity => int.MaxValue;
+
+    /// <summary>
+    /// Waits until the dispatcher can accept at least one more delivery. Completes immediately for
+    /// awaiting dispatchers; the queued dispatcher waits for a background worker to free a slot.
+    /// </summary>
+    public virtual ValueTask WaitForCapacityAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
+
     /// <summary>Releases resources held by this instance.</summary>
     public virtual ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
@@ -195,6 +215,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
     private readonly Task[] _workers;
     private readonly CancellationTokenSource _drainCancellation = new();
     private readonly TimeSpan _drainTimeout;
+    private readonly int _capacity;
     private readonly string _queueName;
     private readonly AzureServiceBusSubscriberRole _role;
     private int _pendingCount;
@@ -212,6 +233,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
         : base(handler, transportOptions, subscriberOptions, logger, queue, role)
     {
         _drainTimeout = subscriberOptions.BackgroundDrainTimeout;
+        _capacity = subscriberOptions.BackgroundQueueCapacity;
         _queueName = queue;
         _role = role;
         _queue = Channel.CreateBounded<AzureServiceBusTransportDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
@@ -237,6 +259,21 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
     internal int PendingCount => Volatile.Read(ref _pendingCount);
     internal int RunningCount => Volatile.Read(ref _runningCount);
 
+    public override bool CanAcceptMore => Volatile.Read(ref _pendingCount) < _capacity;
+
+    public override int FreeCapacity => Math.Max(0, _capacity - Volatile.Read(ref _pendingCount));
+
+    public override async ValueTask WaitForCapacityAsync(CancellationToken cancellationToken)
+    {
+        // WaitToWriteAsync completes when the bounded channel has room (or the channel is completed
+        // during dispose, in which case there is nothing left to gate).
+        while (!CanAcceptMore)
+        {
+            if (!await _queue.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
+                return;
+        }
+    }
+
     /// <summary>Handles the delivered message.</summary>
     public override async Task HandleAsync(
         AzureServiceBusTransportDelivery delivery,
@@ -245,6 +282,10 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
         Interlocked.Increment(ref _pendingCount);
         if (!_queue.Writer.TryWrite(delivery))
         {
+            // The receive loop gates on free capacity, so this only covers the residual race between
+            // its capacity check and this write. The abandon burns one DeliveryCount, but the loop
+            // never receives while saturated, so a healthy message cannot repeat this path toward
+            // the entity's MaxDeliveryCount.
             Interlocked.Decrement(ref _pendingCount);
             Logger.LogWarning(
                 "Azure Service Bus background queue rejected message {MessageId} for {Queue}; abandoning for redelivery. Pending={PendingCount}, Running={RunningCount}.",

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Transports.SqlServer;
@@ -25,7 +26,7 @@ internal sealed class SqlServerMessageDispatcher : IAsyncDisposable
         ILogger logger,
         SqlServerSubscriberRole role)
     {
-        SqlServerTransportOptionsValidator.ValidateSubscriber(subscriberOptions, role.ToString());
+        SqlServerTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
         _handler = handler;
         _options = options;
@@ -59,12 +60,98 @@ internal sealed class SqlServerMessageDispatcher : IAsyncDisposable
 
         try
         {
-            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+            // While the handler runs, a fenced heartbeat keeps extending the row's lease at
+            // LockTimeout/2 cadence so a slow handler does not let the lock lapse and a competing
+            // subscriber re-claim (and duplicate-process) the row.
+            using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
+            try
+            {
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                renewalCancellation.Cancel();
+                await renewalTask.ConfigureAwait(false);
+            }
+
             await delivery.AckAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    // Single choke point for handler execution so both ACK modes emit the consumer receive span.
+    private async Task ExecuteHandlerAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
+    {
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.sqlserver.receive",
+            ActivityKind.Consumer);
+        activity?.SetTag("asyncresponse.transport", "sqlserver");
+        activity?.SetTag("asyncresponse.sqlserver.role", _role.ToString());
+        activity?.SetTag("asyncresponse.sqlserver.ack_mode", _subscriberOptions.AckMode.ToString());
+        activity?.SetTag("messaging.system", "sqlserver");
+        activity?.SetTag("messaging.destination.name", delivery.Queue);
+        activity?.SetTag("messaging.message.id", delivery.Id.ToString());
+        activity?.SetTag("messaging.message.delivery_attempt", delivery.Attempt);
+
+        if (delivery.Headers.TryGetValue(_options.CorrelationIdHeader, out var correlationId))
+            AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
+
+        try
+        {
+            await _handler(delivery, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            throw;
+        }
+    }
+
+    private async Task RenewLeaseLoopAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromTicks(Math.Max(1, _options.LockTimeout.Ticks / 2));
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+
+                bool renewed;
+                try
+                {
+                    renewed = await delivery.RenewAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to renew the lease of SQL Server message {MessageId} on queue {Queue} ({Role}); retrying next beat.",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                    continue;
+                }
+
+                if (!renewed)
+                {
+                    // The lock_id fence no longer matches: the lease expired and another subscriber
+                    // claimed the row. Stop renewing; the fenced ack/NAK will no-op for this claim.
+                    _logger.LogWarning(
+                        "Lease of SQL Server message {MessageId} on queue {Queue} ({Role}) was lost; another subscriber may process it (at-least-once preserved).",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The handler finished or the subscriber is stopping.
         }
     }
 
@@ -83,24 +170,29 @@ internal sealed class SqlServerMessageDispatcher : IAsyncDisposable
 
     private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
     {
-        try
+        // Token-less ReadAllAsync: on shutdown the queue is completed and fully drained, so every
+        // already-ACKed row is attempted (with the drain token once the drain budget lapses)
+        // instead of being silently dropped; each failure is dead-lettered and surfaced below.
+        await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            try
             {
-                try
-                {
-                    await _handler(delivery, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "SQL Server background handler failed for {Role} on queue {Queue} after early ACK.", _role, delivery.Queue);
-                    await delivery.DeadLetterAsync(ex, false, CancellationToken.None).ConfigureAwait(false);
-                    await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
-                }
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
-        }
-        catch (OperationCanceledException)
-        {
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SQL Server background handler failed for {Role} on queue {Queue} after early ACK.", _role, delivery.Queue);
+                if (!await delivery.DeadLetterAsync(ex, false, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _logger.LogError(
+                        "Failed to dead-letter already-ACKed SQL Server message {MessageId} on queue {Queue} ({Role}); the failure is only observable via logs and OnBackgroundFailure.",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                }
+
+                await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+            }
         }
     }
 

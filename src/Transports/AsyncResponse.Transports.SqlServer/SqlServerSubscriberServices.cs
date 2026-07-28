@@ -1,7 +1,6 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Diagnostics;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Transports.SqlServer;
@@ -39,23 +38,10 @@ internal abstract class SqlServerSubscriberService : BackgroundService
     protected abstract SqlServerSubscriberRole Role { get; }
     protected abstract Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken);
 
-    /// <summary>Starts a consumer-side receive span carrying the standard messaging attributes.</summary>
-    protected Activity? StartReceiveActivity(string name, SqlServerTransportDelivery delivery)
-    {
-        delivery.Headers.TryGetValue(Options.CorrelationIdHeader, out var correlationId);
-        var activity = AsyncResponseDiagnostics.StartActivity(name, ActivityKind.Consumer, correlationId);
-        activity?.SetTag("asyncresponse.transport", "sqlserver");
-        activity?.SetTag("messaging.system", "sqlserver");
-        activity?.SetTag("messaging.destination.name", delivery.Queue);
-        activity?.SetTag("messaging.operation.type", "process");
-        activity?.SetTag("messaging.message.delivery_attempt", delivery.Attempt);
-        return activity;
-    }
-
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        SqlServerTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
+        SqlServerTransportOptionsValidator.ValidateSubscriber(Options, SubscriberOptions, Role.ToString());
 
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)
@@ -161,19 +147,8 @@ internal sealed class SqlServerWorkerSubscriber : SqlServerSubscriberService
     protected override SqlServerSubscriberOptions SubscriberOptions => Options.WorkerSubscriber;
     protected override SqlServerSubscriberRole Role => SqlServerSubscriberRole.Worker;
 
-    protected override async Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
-    {
-        using var activity = StartReceiveActivity("asyncresponse.worker.receive", delivery);
-        try
-        {
-            await _ingress.HandleWorkerMessageAsync(delivery.Payload).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AsyncResponseDiagnostics.SetError(activity, ex);
-            throw;
-        }
-    }
+    protected override Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
+        => _ingress.HandleWorkerMessageAsync(delivery.Payload);
 }
 
 /// <summary>Consumes response rows and feeds them into the AsyncResponse ingress.</summary>
@@ -193,19 +168,9 @@ internal sealed class SqlServerResponseIngressSubscriber : SqlServerSubscriberSe
     protected override SqlServerSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override SqlServerSubscriberRole Role => SqlServerSubscriberRole.ResponseIngress;
 
-    protected override async Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
+    protected override Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
     {
         var correlationId = SqlServerCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);
-        using var activity = StartReceiveActivity("asyncresponse.response.receive", delivery);
-        AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-        try
-        {
-            await _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AsyncResponseDiagnostics.SetError(activity, ex);
-            throw;
-        }
+        return _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId);
     }
 }

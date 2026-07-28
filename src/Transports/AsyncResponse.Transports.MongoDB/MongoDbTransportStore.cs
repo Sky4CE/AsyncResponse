@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
@@ -16,6 +17,11 @@ internal enum MongoDbSubscriberRole
 }
 
 /// <summary>A claimed MongoDB transport document, decoupled from driver types for dispatch tests.</summary>
+/// <remarks>
+/// <c>RenewAsync</c> extends the claim's lease (<c>locked_until</c>) by the original lock timeout,
+/// fenced on the claim's <c>lock_id</c>; it returns <c>false</c> when the fence no longer matches
+/// (the lease lapsed and another subscriber re-claimed the document).
+/// </remarks>
 internal sealed record MongoDbTransportDelivery(
     Guid Id,
     string Queue,
@@ -24,13 +30,15 @@ internal sealed record MongoDbTransportDelivery(
     int Attempt,
     Func<ValueTask> AckAsync,
     Func<TimeSpan, ValueTask> NakAsync,
-    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync);
+    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync,
+    Func<ValueTask<bool>> RenewAsync);
 
 /// <summary>Small document adapter for the MongoDB transport queue collection.</summary>
 internal sealed class MongoDbTransportStore : IDisposable
 {
     private readonly IMongoCollection<MongoTransportMessageDocument> _messages;
     private readonly MongoDbAsyncResponseTransportOptions _options;
+    private readonly ILogger<MongoDbTransportStore>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly IMongoClient? _ownedClient;
     private bool _created;
@@ -39,9 +47,11 @@ internal sealed class MongoDbTransportStore : IDisposable
     public MongoDbTransportStore(
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseTransportOptions> options,
-        IMongoClient? ownedClient = null)
+        IMongoClient? ownedClient = null,
+        ILogger<MongoDbTransportStore>? logger = null)
     {
         _options = options.Value;
+        _logger = logger;
         MongoDbTransportOptionsValidator.ValidateCommon(_options);
         _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
         _ownedClient = ownedClient;
@@ -125,7 +135,8 @@ internal sealed class MongoDbTransportStore : IDisposable
             claimed.Attempts,
             () => AckAsync(claimed.Id, lockId),
             delay => NakAsync(claimed.Id, lockId, delay),
-            (exception, deleteOriginal, token) => DeadLetterAsync(claimed.Id, lockId, queue, claimed.Payload, headers, exception, deleteOriginal, token));
+            (exception, deleteOriginal, token) => DeadLetterAsync(claimed.Id, lockId, queue, claimed.Payload, headers, exception, deleteOriginal, token),
+            () => RenewLeaseAsync(claimed.Id, lockId, lockTimeout));
     }
 
     /// <summary>
@@ -196,7 +207,11 @@ internal sealed class MongoDbTransportStore : IDisposable
                 ? new Dictionary<string, string>(0, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase),
             CreatedAtUtc = now,
-            AvailableAtUtc = now,
+            // "Available immediately on arrival": InsertOne cannot evaluate $$NOW, and stamping the
+            // client clock here would let client-ahead-of-server skew hide a fresh message from the
+            // server-clock claim filter until the skew elapsed. Epoch expresses what the SQL stores'
+            // "available_at DEFAULT now()" expresses; a NAK re-stamps a real server-relative time.
+            AvailableAtUtc = DateTime.UnixEpoch,
             Attempts = 0,
             DeadLetterReason = deadLetterReason
         };
@@ -227,6 +242,30 @@ internal sealed class MongoDbTransportStore : IDisposable
             options: null,
             CancellationToken.None).ConfigureAwait(false);
     }
+
+    private async ValueTask<bool> RenewLeaseAsync(Guid id, Guid lockId, TimeSpan lockTimeout)
+    {
+        var result = await _messages.UpdateOneAsync(
+            Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id)
+            & Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.LockId, lockId),
+            BuildRenewUpdate(lockTimeout),
+            options: null,
+            CancellationToken.None).ConfigureAwait(false);
+        return result.MatchedCount > 0;
+    }
+
+    /// <summary>
+    /// Fenced lease renewal: extends <c>locked_until</c> from the server clock (<c>$$NOW</c>) only
+    /// while the claim's <c>lock_id</c> fence still matches, mirroring the claim update.
+    /// </summary>
+    internal static UpdateDefinition<MongoTransportMessageDocument> BuildRenewUpdate(TimeSpan lockTimeout)
+        => Builders<MongoTransportMessageDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["locked_until"] = new BsonDocument("$add", new BsonArray { "$$NOW", lockTimeout.TotalMilliseconds })
+            })
+        });
 
     internal static UpdateDefinition<MongoTransportMessageDocument> BuildNakUpdate(TimeSpan delay)
         => Builders<MongoTransportMessageDocument>.Update.Pipeline(new[]
@@ -279,8 +318,15 @@ internal sealed class MongoDbTransportStore : IDisposable
             await AckAsync(id, lockId).ConfigureAwait(false);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            // Callers decide the redelivery consequence from the false return; log the cause here so
+            // a failing dead-letter write is never silent.
+            _logger?.LogError(
+                ex,
+                "Failed to write MongoDB dead-letter document for message {MessageId} from queue {SourceQueue}.",
+                id,
+                sourceQueue);
             return false;
         }
     }

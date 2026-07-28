@@ -21,15 +21,48 @@ namespace AsyncResponse;
 /// </summary>
 internal sealed class SerialExecutorRegistry(ILogger _logger)
 {
+    // How long a retired channel's tombstone blocks executor re-creation. Long enough to outlive
+    // any enqueue that was already in flight when cleanup retired the executor, short enough that
+    // an unpruned tombstone only ever delays a reused correlation id briefly.
+    internal static readonly TimeSpan TombstoneLifetime = TimeSpan.FromSeconds(30);
+
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTime> _tombstones = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _registrations = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
     /// <summary>
-    /// Enqueues <paramref name="work"/> onto the channel's serial executor, creating the executor on
-    /// first use. Admission is reserved under the registry lock against a guaranteed-live executor.
+    /// Records a live subscription for <paramref name="channel"/>. While any subscription is
+    /// registered, retirement tombstones do not drop work — a retired executor is legitimately
+    /// recreated, and the remaining subscription's own cleanup retires it again (no leak).
     /// </summary>
-    public void Enqueue(string channel, Func<Task> work)
-        => EnqueueAsync(channel, work).AsTask().GetAwaiter().GetResult();
+    public void OnSubscriptionRegistered(string channel)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+
+        lock (_gate)
+        {
+            _registrations[channel] = _registrations.TryGetValue(channel, out var count) ? count + 1 : 1;
+            _tombstones.Remove(channel);
+        }
+    }
+
+    /// <summary>Records that a subscription for <paramref name="channel"/> is gone.</summary>
+    public void OnSubscriptionRetired(string channel)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(channel);
+
+        lock (_gate)
+        {
+            if (!_registrations.TryGetValue(channel, out var count))
+                return;
+
+            if (count <= 1)
+                _registrations.Remove(channel);
+            else
+                _registrations[channel] = count - 1;
+        }
+    }
 
     /// <summary>Asynchronously enqueues work, applying bounded per-channel backpressure.</summary>
     public async ValueTask EnqueueAsync(string channel, Func<Task> work, CancellationToken cancellationToken = default)
@@ -45,6 +78,15 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
             {
                 if (!_executors.TryGetValue(channel, out var current))
                 {
+                    // A tombstoned channel was retired and no subscription is registered anymore:
+                    // recreating an executor here (typically for an enqueue that was already in
+                    // flight when cleanup ran) would leak it — nothing retires it again — and the
+                    // work item would no-op anyway because the subscriptions are gone. Drop it.
+                    // With a subscription still registered the recreate is legitimate (its own
+                    // cleanup retires the new executor), so the tombstone does not apply.
+                    if (!_registrations.ContainsKey(channel) && IsTombstonedUnderLock(channel))
+                        return;
+
                     current = new ExecutorEntry(new ChannelSerialExecutor(_logger, channel));
                     _executors[channel] = current;
                 }
@@ -141,10 +183,48 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
             {
                 if (_executors.TryGetValue(channel, out var current) && ReferenceEquals(current, entry))
                     _executors.Remove(channel);
+
+                // Tombstone the retired channel so an enqueue that raced this retirement cannot
+                // recreate a leaked executor; ClearTombstone lifts it the moment a new
+                // subscription legitimately reuses the channel.
+                _tombstones[channel] = DateTime.UtcNow + TombstoneLifetime;
+                PruneTombstonesUnderLock();
             }
 
             entry.Retired.TrySetResult();
         }
+    }
+
+    private bool IsTombstonedUnderLock(string channel)
+    {
+        if (!_tombstones.TryGetValue(channel, out var expiresAtUtc))
+            return false;
+
+        if (expiresAtUtc > DateTime.UtcNow)
+            return true;
+
+        _tombstones.Remove(channel);
+        return false;
+    }
+
+    private void PruneTombstonesUnderLock()
+    {
+        if (_tombstones.Count == 0)
+            return;
+
+        var now = DateTime.UtcNow;
+        List<string>? expired = null;
+        foreach (var (channel, expiresAtUtc) in _tombstones)
+        {
+            if (expiresAtUtc <= now)
+                (expired ??= []).Add(channel);
+        }
+
+        if (expired is null)
+            return;
+
+        foreach (var channel in expired)
+            _tombstones.Remove(channel);
     }
 
     private sealed class ExecutorEntry(ChannelSerialExecutor executor)

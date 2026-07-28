@@ -23,7 +23,10 @@ public class PostgreSqlAckDispatchBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var options = new PostgreSqlAsyncResponseTransportOptions();
+        var options = new PostgreSqlAsyncResponseTransportOptions
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(60)
+        };
 
         _awaiting = new PostgreSqlMessageDispatcher(
             (_, _) => Task.CompletedTask,
@@ -67,5 +70,6 @@ public class PostgreSqlAckDispatchBenchmarks
             Attempt: 1,
             () => ValueTask.CompletedTask,
             _ => ValueTask.CompletedTask,
-            (_, _, _) => ValueTask.FromResult(true));
+            (_, _, _) => ValueTask.FromResult(true),
+            () => ValueTask.FromResult(true));
 }

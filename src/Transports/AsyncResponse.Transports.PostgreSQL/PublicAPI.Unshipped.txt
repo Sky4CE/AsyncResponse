@@ -18,6 +18,8 @@ AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.Dead
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DeadLetterRetention.set -> void
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DefaultReplyTargetName.get -> string!
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.DefaultReplyTargetName.set -> void
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.HostShutdownTimeout.get -> System.TimeSpan?
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.HostShutdownTimeout.set -> void
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.LockTimeout.get -> System.TimeSpan
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.LockTimeout.set -> void
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.MessageTable.get -> string!

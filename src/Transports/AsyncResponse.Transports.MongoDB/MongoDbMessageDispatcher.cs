@@ -26,7 +26,7 @@ internal sealed class MongoDbMessageDispatcher : IAsyncDisposable
         ILogger logger,
         MongoDbSubscriberRole role)
     {
-        MongoDbTransportOptionsValidator.ValidateSubscriber(subscriberOptions, role.ToString());
+        MongoDbTransportOptionsValidator.ValidateSubscriber(options, subscriberOptions, role.ToString());
 
         _handler = handler;
         _options = options;
@@ -60,12 +60,70 @@ internal sealed class MongoDbMessageDispatcher : IAsyncDisposable
 
         try
         {
-            await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
+            // While the handler runs, a fenced heartbeat keeps extending the document's lease at
+            // LockTimeout/2 cadence so a slow handler does not let the lock lapse and a competing
+            // subscriber re-claim (and duplicate-process) the document.
+            using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
+            try
+            {
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                renewalCancellation.Cancel();
+                await renewalTask.ConfigureAwait(false);
+            }
+
             await delivery.AckAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task RenewLeaseLoopAsync(MongoDbTransportDelivery delivery, CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromTicks(Math.Max(1, _options.LockTimeout.Ticks / 2));
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+
+                bool renewed;
+                try
+                {
+                    renewed = await delivery.RenewAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to renew the lease of MongoDB message {MessageId} on queue {Queue} ({Role}); retrying next beat.",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                    continue;
+                }
+
+                if (!renewed)
+                {
+                    // The lock_id fence no longer matches: the lease expired and another subscriber
+                    // claimed the document. Stop renewing; the fenced ack/NAK will no-op for this claim.
+                    _logger.LogWarning(
+                        "Lease of MongoDB message {MessageId} on queue {Queue} ({Role}) was lost; another subscriber may process it (at-least-once preserved).",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The handler finished or the subscriber is stopping.
         }
     }
 
@@ -112,24 +170,29 @@ internal sealed class MongoDbMessageDispatcher : IAsyncDisposable
 
     private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
     {
-        try
+        // Token-less ReadAllAsync: on shutdown the queue is completed and fully drained, so every
+        // already-ACKed document is attempted (with the drain token once the drain budget lapses)
+        // instead of being silently dropped; each failure is dead-lettered and surfaced below.
+        await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            try
             {
-                try
-                {
-                    await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "MongoDB background handler failed for {Role} on queue {Queue} after early ACK.", _role, delivery.Queue);
-                    await delivery.DeadLetterAsync(ex, false, CancellationToken.None).ConfigureAwait(false);
-                    await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
-                }
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
-        }
-        catch (OperationCanceledException)
-        {
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "MongoDB background handler failed for {Role} on queue {Queue} after early ACK.", _role, delivery.Queue);
+                if (!await delivery.DeadLetterAsync(ex, false, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _logger.LogError(
+                        "Failed to dead-letter already-ACKed MongoDB message {MessageId} on queue {Queue} ({Role}); the failure is only observable via logs and OnBackgroundFailure.",
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                }
+
+                await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+            }
         }
     }
 

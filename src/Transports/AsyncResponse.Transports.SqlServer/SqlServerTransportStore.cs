@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -12,6 +13,11 @@ internal enum SqlServerSubscriberRole
 }
 
 /// <summary>A claimed SQL Server transport row, decoupled from SqlClient types for dispatch tests.</summary>
+/// <remarks>
+/// <c>RenewAsync</c> extends the claim's lease (<c>locked_until</c>) by the original lock timeout,
+/// fenced on the claim's <c>lock_id</c>; it returns <c>false</c> when the fence no longer matches
+/// (the lease lapsed and another subscriber re-claimed the row).
+/// </remarks>
 internal sealed record SqlServerTransportDelivery(
     Guid Id,
     string Queue,
@@ -20,7 +26,8 @@ internal sealed record SqlServerTransportDelivery(
     int Attempt,
     Func<ValueTask> AckAsync,
     Func<TimeSpan, ValueTask> NakAsync,
-    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync);
+    Func<Exception, bool, CancellationToken, ValueTask<bool>> DeadLetterAsync,
+    Func<ValueTask<bool>> RenewAsync);
 
 /// <summary>Small SQL adapter for the SQL Server transport queue table.</summary>
 internal sealed class SqlServerTransportStore
@@ -36,13 +43,17 @@ internal sealed class SqlServerTransportStore
 
     private readonly string _connectionString;
     private readonly SqlServerAsyncResponseTransportOptions _options;
+    private readonly ILogger<SqlServerTransportStore>? _logger;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private bool _created;
     private long _lastDeadLetterPruneTicks;
 
-    public SqlServerTransportStore(IOptions<SqlServerAsyncResponseTransportOptions> options)
+    public SqlServerTransportStore(
+        IOptions<SqlServerAsyncResponseTransportOptions> options,
+        ILogger<SqlServerTransportStore>? logger = null)
     {
         _options = options.Value;
+        _logger = logger;
         SqlServerTransportOptionsValidator.ValidateCommon(_options);
         _connectionString = _options.ConnectionString!;
         Schema = Quote(_options.SchemaName);
@@ -196,7 +207,8 @@ internal sealed class SqlServerTransportStore
             attempt,
             () => AckAsync(id, lockId),
             delay => NakAsync(id, lockId, delay),
-            (exception, deleteOriginal, token) => DeadLetterAsync(id, lockId, queue, payload, headers, exception, deleteOriginal, token));
+            (exception, deleteOriginal, token) => DeadLetterAsync(id, lockId, queue, payload, headers, exception, deleteOriginal, token),
+            () => RenewLeaseAsync(id, lockId, lockTimeout));
     }
 
     public async IAsyncEnumerable<SqlServerTransportDelivery> ClaimBatchAsync(
@@ -261,6 +273,22 @@ internal sealed class SqlServerTransportStore
         command.Parameters.AddWithValue("@id", id);
         command.Parameters.AddWithValue("@lock_id", lockId);
         await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private async ValueTask<bool> RenewLeaseAsync(Guid id, Guid lockId, TimeSpan lockTimeout)
+    {
+        await using var connection = await OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            UPDATE {MessageTable}
+            SET locked_until = {AddMilliseconds("@lock_timeout_ms")}
+            WHERE id = @id AND lock_id = @lock_id;
+            """;
+        command.Parameters.AddWithValue("@id", id);
+        command.Parameters.AddWithValue("@lock_id", lockId);
+        command.Parameters.AddWithValue("@lock_timeout_ms", (long)lockTimeout.TotalMilliseconds);
+        return await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false) > 0;
     }
 
     private async ValueTask NakAsync(Guid id, Guid lockId, TimeSpan delay)
@@ -338,8 +366,15 @@ internal sealed class SqlServerTransportStore
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            // Callers decide the redelivery consequence from the false return; log the cause here so
+            // a failing dead-letter write is never silent.
+            _logger?.LogError(
+                ex,
+                "Failed to write SQL Server dead-letter row for message {MessageId} from queue {SourceQueue}.",
+                id,
+                sourceQueue);
             return false;
         }
     }

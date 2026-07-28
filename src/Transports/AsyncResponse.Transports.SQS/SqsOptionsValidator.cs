@@ -82,6 +82,29 @@ internal static class SqsOptionsValidator
                 $"{optionPath}.{nameof(SqsSubscriberOptions.RedeliveryDelay)} must be between zero and 12 hours (the SQS visibility limit).");
         }
 
+        if (subscriberOptions.VisibilityRenewalInterval is { } renewalInterval)
+        {
+            if (renewalInterval <= TimeSpan.Zero)
+            {
+                throw new InvalidOperationException(
+                    $"{optionPath}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)} must be positive when set.");
+            }
+
+            if (subscriberOptions.VisibilityTimeout is not { } renewedVisibility)
+            {
+                throw new InvalidOperationException(
+                    $"{optionPath}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)} requires " +
+                    $"{nameof(SqsSubscriberOptions.VisibilityTimeout)} so the heartbeat knows how far to extend each message.");
+            }
+
+            if (renewalInterval >= renewedVisibility)
+            {
+                throw new InvalidOperationException(
+                    $"{optionPath}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)} must be shorter than " +
+                    $"{nameof(SqsSubscriberOptions.VisibilityTimeout)}, or messages become visible between heartbeats.");
+            }
+        }
+
         switch (subscriberOptions.AckMode)
         {
             case SqsAckMode.AckAfterHandlerCompletes:

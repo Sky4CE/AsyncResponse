@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Channels.NATS</PackageId>
     <Description>NATS channel for AsyncResponse: a NATS Core request/reply response channel and a durable NATS JetStream Key-Value recovery-state store for lost-subscriber recovery across redeploys, with domain-state-aware failure routing. Plugs into the Core engine's recovery watchdog and readiness health check.</Description>
+    <PackageTags>$(PackageTags);nats;jetstream</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

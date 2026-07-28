@@ -42,6 +42,37 @@ internal static class PostgreSqlTransportOptionsValidator
             throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.SubscriberRetryBaseDelay)} cannot exceed {nameof(options.SubscriberRetryMaxDelay)}.");
     }
 
+    /// <summary>Validates the supplied subscriber options together with the transport-wide shutdown budget.</summary>
+    public static void ValidateSubscriber(
+        PostgreSqlAsyncResponseTransportOptions transportOptions,
+        PostgreSqlSubscriberOptions subscriber,
+        string role)
+    {
+        ValidateSubscriber(subscriber, role);
+
+        if (subscriber.AckMode is not PostgreSqlAckMode.AckAfterReceive)
+            return;
+
+        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
+        {
+            if (hostShutdownTimeout <= TimeSpan.Zero)
+                throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
+
+            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
+            if (requiredShutdownBudget > hostShutdownTimeout)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
+                    $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
+                    $"requires {requiredShutdownBudget}, which exceeds " +
+                    $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
+                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
+                    $"and mirror that value in {nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
+                    "or reduce the PostgreSQL shutdown/drain timeouts.");
+            }
+        }
+    }
+
     public static void ValidateSubscriber(PostgreSqlSubscriberOptions subscriber, string role)
     {
         if (subscriber.BatchSize <= 0)

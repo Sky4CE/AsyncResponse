@@ -16,30 +16,12 @@ public class RedisAsyncResponseChannelWaiterTests
     private readonly Mock<IConnectionMultiplexer> _multiplexer = new();
     private readonly Mock<ISubscriber> _subscriber = new();
     private readonly Mock<IRecoveryStateStore> _store = new();
+    private readonly FakeRedisChannelSubscriber _channelSubscriber = new();
     private readonly ServiceProvider _services = new ServiceCollection().BuildServiceProvider();
-    private Action<RedisChannel, RedisValue>? _handler;
-    private RedisChannel _subscribedChannel;
 
     public RedisAsyncResponseChannelWaiterTests()
     {
         _multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(_subscriber.Object);
-        _subscriber
-            .Setup(s => s.SubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>>(),
-                It.IsAny<CommandFlags>()))
-            .Callback<RedisChannel, Action<RedisChannel, RedisValue>, CommandFlags>((channel, handler, _) =>
-            {
-                _subscribedChannel = channel;
-                _handler = handler;
-            })
-            .Returns(Task.CompletedTask);
-        _subscriber
-            .Setup(s => s.UnsubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>?>(),
-                It.IsAny<CommandFlags>()))
-            .Returns(Task.CompletedTask);
         _store
             .Setup(s => s.SaveAsync(
                 It.IsAny<string>(),
@@ -52,6 +34,45 @@ public class RedisAsyncResponseChannelWaiterTests
             .ReturnsAsync(true);
     }
 
+    /// <summary>
+    /// Fake for the channel's async subscribe seam (ChannelMessageQueue is sealed and cannot be
+    /// mocked): captures the handler for tests to push messages through, and counts unsubscribes.
+    /// </summary>
+    private sealed class FakeRedisChannelSubscriber : IRedisChannelSubscriber
+    {
+        private int _unsubscribeCount;
+
+        public RedisChannel SubscribedChannel { get; private set; }
+        public Func<RedisChannel, RedisValue, Task>? Handler { get; private set; }
+        public Exception? SubscribeException { get; set; }
+        public Exception? UnsubscribeException { get; set; }
+        public RedisValue? InvokeOnSubscribe { get; set; }
+        public int UnsubscribeCount => Volatile.Read(ref _unsubscribeCount);
+
+        public async Task<IRedisChannelSubscription> SubscribeAsync(RedisChannel channel, Func<RedisChannel, RedisValue, Task> onMessage)
+        {
+            if (SubscribeException is not null)
+                throw SubscribeException;
+
+            SubscribedChannel = channel;
+            Handler = onMessage;
+            if (InvokeOnSubscribe is { } message)
+                await onMessage(channel, message);
+            return new Subscription(this);
+        }
+
+        private sealed class Subscription(FakeRedisChannelSubscriber owner) : IRedisChannelSubscription
+        {
+            public ValueTask DisposeAsync()
+            {
+                Interlocked.Increment(ref owner._unsubscribeCount);
+                return owner.UnsubscribeException is null
+                    ? ValueTask.CompletedTask
+                    : ValueTask.FromException(owner.UnsubscribeException);
+            }
+        }
+    }
+
     [Fact]
     public async Task CreateResponseWaiter_CompletesFromSubscribedRedisMessage()
     {
@@ -61,19 +82,18 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-a",
             timeout: TimeSpan.FromSeconds(5));
 
-        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
 
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal("done", result.Message);
-        Assert.Equal("asyncresponse:response:corr-a", _subscribedChannel.ToString());
+        Assert.Equal("asyncresponse:response:corr-a", _channelSubscriber.SubscribedChannel.ToString());
         _store.Verify(s => s.SaveAsync(
             "corr-a",
             It.Is<RecoveryState>(state => state.CorrelationId == "corr-a"
                 && state.PayloadTypeFullName == typeof(OperationResult).FullName),
             It.IsAny<TimeSpan>(),
             It.IsAny<CancellationToken>()), Times.Once);
-        await Eventually(() =>
-            _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
+        await Eventually(() => _channelSubscriber.UnsubscribeCount == 1);
     }
 
     [Fact]
@@ -99,15 +119,15 @@ public class RedisAsyncResponseChannelWaiterTests
 
         await using (var success = await channel.CreateResponseWaiter<OperationResult>("duplicate-success"))
         {
-            var handler = _handler!;
-            var subscribed = _subscribedChannel;
+            var handler = _channelSubscriber.Handler!;
+            var subscribed = _channelSubscriber.SubscribedChannel;
             var json = JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
             {
                 Success = true,
                 Payload = new OperationResult { Status = OperationStatus.Completed, Message = "first" }
             }, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
-            handler(subscribed, json);
-            handler(subscribed, json);
+            await handler(subscribed, json);
+            await handler(subscribed, json);
             Assert.Equal("first", (await success.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
         }
 
@@ -144,11 +164,11 @@ public class RedisAsyncResponseChannelWaiterTests
             completionPredicate: payload => new ValueTask<bool>(payload.Status == OperationStatus.Completed),
             timeout: TimeSpan.FromSeconds(5));
 
-        PublishSuccess(new OperationResult { Status = OperationStatus.Running, Message = "still running" });
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Running, Message = "still running" });
         await Task.Delay(50);
         Assert.False(waiter.ResponseTask.IsCompleted);
 
-        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
 
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal("done", result.Message);
@@ -163,7 +183,7 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-a",
             timeout: TimeSpan.FromSeconds(5));
 
-        PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
+        await PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
         {
             Success = false,
             ExceptionMessage = "remote failed",
@@ -184,7 +204,7 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-a",
             timeout: TimeSpan.FromSeconds(5));
 
-        _handler!.Invoke(_subscribedChannel, "{not-json");
+        await _channelSubscriber.Handler!.Invoke(_channelSubscriber.SubscribedChannel, "{not-json");
 
         await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
     }
@@ -198,7 +218,7 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-null",
             timeout: TimeSpan.FromSeconds(5));
 
-        _handler!.Invoke(_subscribedChannel, "null");
+        await _channelSubscriber.Handler!.Invoke(_channelSubscriber.SubscribedChannel, "null");
 
         await Assert.ThrowsAsync<JsonException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
     }
@@ -206,25 +226,18 @@ public class RedisAsyncResponseChannelWaiterTests
     [Fact]
     public async Task CreateResponseWaiter_UnsubscribeFailureDoesNotMaskCompletedResponse()
     {
-        var failure = new InvalidOperationException("unsubscribe failed");
-        _subscriber
-            .Setup(s => s.UnsubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>?>(),
-                It.IsAny<CommandFlags>()))
-            .ThrowsAsync(failure);
+        _channelSubscriber.UnsubscribeException = new InvalidOperationException("unsubscribe failed");
         var channel = CreateChannel();
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
             "corr-cleanup",
             timeout: TimeSpan.FromSeconds(5));
 
-        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
 
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal("done", result.Message);
-        await Eventually(() =>
-            _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) >= 1);
+        await Eventually(() => _channelSubscriber.UnsubscribeCount >= 1);
     }
 
     [Fact]
@@ -241,7 +254,7 @@ public class RedisAsyncResponseChannelWaiterTests
 
         await using var waiter = await waiterTask;
 
-        PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "done" });
 
         var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.Equal("done", result.Message);
@@ -257,35 +270,31 @@ public class RedisAsyncResponseChannelWaiterTests
             timeout: TimeSpan.FromMilliseconds(5));
 
         await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
-        await Eventually(() =>
-            _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
+        await Eventually(() => _channelSubscriber.UnsubscribeCount == 1);
         _store.Verify(s => s.TryDeleteAsync("corr-timeout", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
-    public async Task CreateResponseWaiter_SubscribeFailureReturnsFaultedWaiter()
+    public async Task CreateResponseWaiter_SubscribeFailureThrowsAndDeletesRecoveryState()
     {
         var failure = new InvalidOperationException("subscribe failed");
-        _subscriber
-            .Setup(s => s.SubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>>(),
-                It.IsAny<CommandFlags>()))
-            .ThrowsAsync(failure);
+        _channelSubscriber.SubscribeException = failure;
         var channel = CreateChannel();
 
-        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
-            "corr-a",
-            timeout: TimeSpan.FromSeconds(5));
-
+        // Must throw rather than return a pre-faulted waiter: the builder's contract is that the
+        // trigger only runs once the subscription AND recovery state exist, so a registration
+        // failure has to surface before any trigger could fire the remote operation.
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+            channel.CreateResponseWaiter<OperationResult>(
+                "corr-a",
+                timeout: TimeSpan.FromSeconds(5)));
         Assert.Same(failure, ex);
         _store.Verify(s => s.SaveAsync(
             It.IsAny<string>(),
             It.IsAny<RecoveryState>(),
             It.IsAny<TimeSpan>(),
             It.IsAny<CancellationToken>()), Times.Never);
+        _store.Verify(s => s.TryDeleteAsync("corr-a", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -433,8 +442,7 @@ public class RedisAsyncResponseChannelWaiterTests
 
         await waiter.DisposeAsync();
 
-        await Eventually(() =>
-            _subscriber.Invocations.Count(invocation => invocation.Method.Name == nameof(ISubscriber.UnsubscribeAsync)) == 1);
+        await Eventually(() => _channelSubscriber.UnsubscribeCount == 1);
         _store.Verify(s => s.TryDeleteAsync("corr-dispose", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
@@ -511,7 +519,8 @@ public class RedisAsyncResponseChannelWaiterTests
         _store.Object,
         Options.Create(options),
         new AsyncResponseContextPropagation([]),
-        logger ?? NullLogger<RedisAsyncResponseChannel>.Instance);
+        logger ?? NullLogger<RedisAsyncResponseChannel>.Instance,
+        _channelSubscriber);
 
     [Fact]
     public async Task CreateResponseWaiter_UnsupportedEnvelopeSchema_FaultsWaiter()
@@ -521,7 +530,7 @@ public class RedisAsyncResponseChannelWaiterTests
             "corr-schema",
             timeout: TimeSpan.FromSeconds(5));
 
-        PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
+        await PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
         {
             SchemaVersion = AsyncResponseEnvelopeSchema.Current + 1,
             Success = true,
@@ -532,17 +541,17 @@ public class RedisAsyncResponseChannelWaiterTests
         Assert.IsType<InvalidOperationException>(ex);
     }
 
-    private void PublishSuccess(OperationResult payload)
+    private Task PublishSuccess(OperationResult payload)
         => PublishEnvelope(new AsyncResponseEnvelope<OperationResult>
         {
             Success = true,
             Payload = payload
         });
 
-    private void PublishEnvelope(AsyncResponseEnvelope<OperationResult> envelope)
+    private Task PublishEnvelope(AsyncResponseEnvelope<OperationResult> envelope)
     {
         var json = JsonSerializer.Serialize(envelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
-        _handler!.Invoke(_subscribedChannel, json);
+        return _channelSubscriber.Handler!.Invoke(_channelSubscriber.SubscribedChannel, json);
     }
 
     private async Task DuplicateFaultAsync(
@@ -552,10 +561,10 @@ public class RedisAsyncResponseChannelWaiterTests
         Type exceptionType)
     {
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(correlationId);
-        var handler = _handler!;
-        var subscribed = _subscribedChannel;
-        handler(subscribed, message);
-        handler(subscribed, message);
+        var handler = _channelSubscriber.Handler!;
+        var subscribed = _channelSubscriber.SubscribedChannel;
+        await handler(subscribed, message);
+        await handler(subscribed, message);
 
         var exception = await Assert.ThrowsAnyAsync<Exception>(() =>
             waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
@@ -585,10 +594,6 @@ public class RedisAsyncResponseChannelWaiterTests
     [Fact]
     public async Task CreateResponseWaiter_SynchronousCompletion_HandlesDisposedCts()
     {
-        var mockSubscriber = new Mock<ISubscriber>();
-        var multiplexer = new Mock<IConnectionMultiplexer>();
-        multiplexer.Setup(m => m.GetSubscriber(It.IsAny<object?>())).Returns(mockSubscriber.Object);
-
         var channelName = "corr-sync";
         var validEnvelope = new AsyncResponseEnvelope<OperationResult>
         {
@@ -597,31 +602,10 @@ public class RedisAsyncResponseChannelWaiterTests
         };
         var json = JsonSerializer.Serialize(validEnvelope, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
-        mockSubscriber
-            .Setup(s => s.SubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>>(),
-                It.IsAny<CommandFlags>()))
-            .Callback<RedisChannel, Action<RedisChannel, RedisValue>, CommandFlags>((channel, handler, _) =>
-            {
-                handler(channel, json);
-            })
-            .Returns(Task.CompletedTask);
-
-        mockSubscriber
-            .Setup(s => s.UnsubscribeAsync(
-                It.IsAny<RedisChannel>(),
-                It.IsAny<Action<RedisChannel, RedisValue>?>(),
-                It.IsAny<CommandFlags>()))
-            .Returns(Task.CompletedTask);
-
-        var channel = new RedisAsyncResponseChannel(
-            _services.GetRequiredService<IServiceScopeFactory>(),
-            multiplexer.Object,
-            _store.Object,
-            Options.Create(new RedisAsyncResponseOptions()),
-            new AsyncResponseContextPropagation([]),
-            new TestLogger<RedisAsyncResponseChannel>());
+        // Deliver the terminal message during SubscribeAsync itself, so cleanup can dispose the
+        // timeout CTS before CreateResponseWaiterCore reaches CancelAfter.
+        _channelSubscriber.InvokeOnSubscribe = json;
+        var channel = CreateChannel(new RedisAsyncResponseOptions(), new TestLogger<RedisAsyncResponseChannel>());
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>(channelName);
         var result = await waiter.ResponseTask;

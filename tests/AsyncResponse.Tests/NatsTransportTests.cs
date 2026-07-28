@@ -70,6 +70,42 @@ public class NatsTransportOptionsAndSchemaTests
             NatsTransportOptionsValidator.ValidateSubscriber(new NatsSubscriberOptions { BatchSize = 0 }, "Worker"));
 
     [Fact]
+    public void ValidateSubscriber_DrainBudgetExceedingHostShutdownBudget_Throws()
+    {
+        var options = new NatsAsyncResponseTransportOptions
+        {
+            ShutdownTimeout = TimeSpan.FromSeconds(20),
+            HostShutdownTimeout = TimeSpan.FromSeconds(25)
+        };
+        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(10));
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            NatsTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+
+        // A null host budget or an awaiting-mode subscriber skips the check.
+        options.HostShutdownTimeout = null;
+        NatsTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker");
+        NatsTransportOptionsValidator.ValidateSubscriber(
+            new NatsAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.FromSeconds(1) },
+            new NatsSubscriberOptions(),
+            "Worker");
+    }
+
+    [Fact]
+    public void ValidateSubscriber_NonPositiveHostShutdownTimeout_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            NatsTransportOptionsValidator.ValidateSubscriber(
+                new NatsAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.Zero },
+                new NatsSubscriberOptions().UseAckAfterReceive(1, 8),
+                "Worker"));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+    }
+
+    [Fact]
     public void SubjectSchema_DerivesDefaultsFromPrefix()
     {
         var schema = new NatsTransportSubjectSchema(new NatsAsyncResponseTransportOptions { SubjectPrefix = "myapp" });

@@ -8,7 +8,7 @@ namespace AsyncResponse.Transports.GooglePubSub;
 
 internal abstract class GooglePubSubSubscriberService : BackgroundService
 {
-    private readonly Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
+    private readonly Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> _subscriberFactory;
 
     /// <summary>Runs the GooglePubSubSubscriberService operation.</summary>
     protected GooglePubSubSubscriberService(
@@ -22,7 +22,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     protected GooglePubSubSubscriberService(
         IOptions<GooglePubSubAsyncResponseOptions> options,
         ILogger logger,
-        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
     {
         Options = options.Value;
         Logger = logger;
@@ -40,15 +40,32 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
 
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private static async Task<IGooglePubSubSubscriberClient> CreateSubscriberAsync(
-        SubscriptionName subscriptionName)
+        SubscriptionName subscriptionName,
+        GooglePubSubSubscriberOptions subscriberOptions)
     {
         // EmulatorOrProduction honors PUBSUB_EMULATOR_HOST when present (local dev / tests) and uses
         // real Google Cloud otherwise — no behavior change in production.
-        var subscriber = await new SubscriberClientBuilder
+        var builder = new SubscriberClientBuilder
         {
             SubscriptionName = subscriptionName,
             EmulatorDetection = EmulatorDetection.EmulatorOrProduction
-        }.BuildAsync().ConfigureAwait(false);
+        };
+
+        // In early-ACK mode, bound the streaming pull to the background queue capacity so the client
+        // never holds more un-ACKed messages than the dispatcher can accept. Combined with the
+        // dispatcher's write-side backpressure this keeps queue-full NACKs (which burn a configured
+        // DeadLetterPolicy's delivery attempts) out of steady-state operation.
+        if (subscriberOptions.AckMode is GooglePubSubAckMode.AckAfterEnqueue)
+        {
+            builder.Settings = new SubscriberClient.Settings
+            {
+                FlowControlSettings = new Google.Api.Gax.FlowControlSettings(
+                    maxOutstandingElementCount: subscriberOptions.BackgroundQueueCapacity,
+                    maxOutstandingByteCount: null)
+            };
+        }
+
+        var subscriber = await builder.BuildAsync().ConfigureAwait(false);
         return new GooglePubSubSubscriberClientAdapter(subscriber);
     }
 
@@ -59,6 +76,16 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         var subscriptionId = SubscriptionId;
         GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
+
+        // The transport intentionally has no MaxDeliveryAttempts and no library-managed dead-letter
+        // queue for Pub/Sub: capping redelivery is delegated to the subscription's native
+        // DeadLetterPolicy. The client cannot cheaply probe whether one is configured, so tell the
+        // operator unconditionally instead of failing silently forever on a poison message.
+        Logger.LogWarning(
+            "Pub/Sub redelivery is unbounded for subscription {Subscription} ({Role}): the transport enforces no delivery-attempt cap and has no library dead-letter queue. "
+            + "Configure a DeadLetterPolicy on the subscription to cap redeliveries of failing messages.",
+            subscriptionName.ToString(),
+            SubscriberRole);
 
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)
@@ -95,7 +122,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         string subscriptionId,
         CancellationToken stoppingToken)
     {
-        var subscriber = await _subscriberFactory(subscriptionName).ConfigureAwait(false);
+        var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions).ConfigureAwait(false);
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(
             HandleMessageAsync,
             Options,
@@ -148,7 +175,7 @@ internal sealed class GooglePubSubWorkerSubscriber : GooglePubSubSubscriberServi
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<GooglePubSubWorkerSubscriber> logger,
-        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
         : base(options, logger, subscriberFactory)
     {
         _ingress = ingress;
@@ -183,7 +210,7 @@ internal sealed class GooglePubSubResponseIngressSubscriber : GooglePubSubSubscr
         IOptions<GooglePubSubAsyncResponseOptions> options,
         IAsyncResponseIngress ingress,
         ILogger<GooglePubSubResponseIngressSubscriber> logger,
-        Func<SubscriptionName, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
+        Func<SubscriptionName, GooglePubSubSubscriberOptions, Task<IGooglePubSubSubscriberClient>> subscriberFactory)
         : base(options, logger, subscriberFactory)
     {
         _ingress = ingress;

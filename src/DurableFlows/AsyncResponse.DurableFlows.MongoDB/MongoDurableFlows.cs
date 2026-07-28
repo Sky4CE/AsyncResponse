@@ -3,6 +3,7 @@ using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.MongoDB;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 
@@ -68,11 +69,21 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
     /// <summary>Creates the expiry index on first use.</summary>
     public bool AutoCreateIndexes { get; set; } = true;
 
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of the raw 16 MB BSON-document error the executor would
+    /// retry into the dead-letter queue. Default: 15 MB (headroom under MongoDB's 16 MB document
+    /// cap for the sibling fields); <c>null</c> disables the guard.
+    /// </summary>
+    public long? MaxStateBytes { get; set; } = 15_000_000;
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(CollectionName))
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} must be configured.");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
@@ -98,34 +109,57 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
-        var now = DateTime.UtcNow;
-        var filter = Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
-                     & Builders<MongoFlowStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, now);
-        var document = await _collection.Find(filter).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
+        // Expiry is evaluated against the server clock ($$NOW) — the same authority the TTL
+        // monitor reaps with — so app clock skew can never resurrect an expired ledger or hide a
+        // live one. All lease fencing below uses the same authority.
+        var document = await _collection.Find(BuildLiveFilter(flowId)).FirstOrDefaultAsync(cancellationToken).ConfigureAwait(false);
         if (document is null)
             return null;
 
-        var state = DurableFlowStoreShared.Deserialize(document.StateJson);
-        return document.Revision is { } revision && state?.Revision == revision ? state : null;
+        return document.Revision is { } revision
+            ? DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision)
+            : null;
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MongoDB");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
+        // Two server-side steps instead of one upsert because MongoDB rejects upserts whose query
+        // uses $expr, and $expr is what lets the expired-check run on the server clock.
+        //
+        // Step 1: atomically replace an expired ledger in place. Filter and assignments both
+        // evaluate on $$NOW, so exactly one competing creator wins and every loser then sees the
+        // fresh future expiry.
+        var replaced = await _collection.UpdateOneAsync(
+            BuildExpiredReplaceFilter(flowId),
+            BuildStateUpdate(stateJson, state.Revision, ttl, resetLease: true),
+            options: null,
+            cancellationToken).ConfigureAwait(false);
+        if (replaced.ModifiedCount > 0)
+            return true;
+
+        // Step 2: the id was absent (or the expired document was TTL-purged after step 1 looked):
+        // insert a fresh ledger. The initial timestamps are assignment-only app-clock stamps (no
+        // comparison happens on them here); every later expiry/lease decision and refresh runs on
+        // the server clock. A duplicate key means a live ledger owns the id.
         var now = DateTime.UtcNow;
-        var document = CreateDocument(flowId, state, ttl, now);
-        var filter = Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
-                     & Builders<MongoFlowStateDocument>.Filter.Lte(item => item.ExpiresAtUtc, now);
         try
         {
-            var result = await _collection.ReplaceOneAsync(
-                filter,
-                document,
-                new ReplaceOptions { IsUpsert = true },
+            await _collection.InsertOneAsync(
+                new MongoFlowStateDocument
+                {
+                    FlowId = flowId,
+                    StateJson = stateJson,
+                    ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
+                    UpdatedAtUtc = now,
+                    Revision = state.Revision
+                },
+                options: null,
                 cancellationToken).ConfigureAwait(false);
-            return result.ModifiedCount > 0 || result.UpsertedId is not null;
+            return true;
         }
         catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
         {
@@ -142,24 +176,16 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "MongoDB");
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
 
-        var now = DateTime.UtcNow;
-        var filter = Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
-                     & Builders<MongoFlowStateDocument>.Filter.Eq(item => item.Revision, expectedRevision)
-                     & Builders<MongoFlowStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, now);
-        if (leaseId is not null)
-        {
-            filter &= Builders<MongoFlowStateDocument>.Filter.Eq(item => item.LeaseId, leaseId)
-                      & Builders<MongoFlowStateDocument>.Filter.Gt(item => item.LeaseExpiresAtUtc, now);
-        }
-
-        var update = Builders<MongoFlowStateDocument>.Update
-            .Set(item => item.StateJson, DurableFlowStoreShared.Serialize(state))
-            .Set(item => item.ExpiresAtUtc, now.Add(ttl))
-            .Set(item => item.UpdatedAtUtc, now)
-            .Set(item => item.Revision, state.Revision);
-        var result = await _collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var result = await _collection.UpdateOneAsync(
+            BuildCheckpointFilter(flowId, expectedRevision, leaseId),
+            BuildStateUpdate(stateJson, state.Revision, ttl, resetLease: false),
+            options: null,
+            cancellationToken).ConfigureAwait(false);
+        // ModifiedCount is safe here (unlike lease renewal): a checkpoint always bumps the
+        // revision, so a matched document is always modified.
         return result.ModifiedCount > 0;
     }
 
@@ -233,34 +259,113 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             throw new ArgumentOutOfRangeException(nameof(leaseDuration));
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
+        var result = await _collection.UpdateOneAsync(
+            BuildLeaseFilter(flowId, leaseId, acquire),
+            BuildLeaseUpdate(leaseId, leaseDuration),
+            options: null,
+            cancellationToken).ConfigureAwait(false);
+        // MatchedCount, not ModifiedCount: matching the filter proves this owner held (or could
+        // take) the lease — the atomic update then applied. A renewal that lands in the same
+        // millisecond as the previous one writes an identical lease_expires_at_utc, which MongoDB
+        // reports as matched-but-not-modified; treating that no-op as failure would abort a
+        // healthy execution mid-flight.
+        return result.MatchedCount > 0;
+    }
+
+    /// <summary>Live-ledger filter: id match plus a server-clock ($$NOW) expiry check.</summary>
+    internal static FilterDefinition<MongoFlowStateDocument> BuildLiveFilter(string flowId)
+        => Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
+           & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$expires_at_utc", "$$NOW" }));
+
+    /// <summary>Expired-ledger filter used by create to replace a dead ledger in place.</summary>
+    internal static FilterDefinition<MongoFlowStateDocument> BuildExpiredReplaceFilter(string flowId)
+        => Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
+           & ServerClockExpr(new BsonDocument("$lte", new BsonArray { "$expires_at_utc", "$$NOW" }));
+
+    /// <summary>
+    /// Checkpoint filter: revision fence plus server-clock expiry (and, when fenced by a lease,
+    /// server-clock lease validity).
+    /// </summary>
+    internal static FilterDefinition<MongoFlowStateDocument> BuildCheckpointFilter(string flowId, long expectedRevision, string? leaseId)
+    {
+        var filter = Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
+                     & Builders<MongoFlowStateDocument>.Filter.Eq(item => item.Revision, expectedRevision)
+                     & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$expires_at_utc", "$$NOW" }));
+        if (leaseId is not null)
+        {
+            filter &= Builders<MongoFlowStateDocument>.Filter.Eq(item => item.LeaseId, leaseId)
+                      & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$lease_expires_at_utc", "$$NOW" }));
+        }
+
+        return filter;
+    }
+
+    /// <summary>
+    /// Lease filter: acquire takes a free lease (absent, expired on the server clock, or already
+    /// ours); renew requires ours and still live on the server clock. A missing
+    /// <c>lease_expires_at_utc</c> compares below any date, so it counts as expired for acquire
+    /// and as unrenewable for renew.
+    /// </summary>
+    internal static FilterDefinition<MongoFlowStateDocument> BuildLeaseFilter(string flowId, string leaseId, bool acquire)
+    {
         var filter = Builders<MongoFlowStateDocument>.Filter.Eq(item => item.FlowId, flowId)
                      & Builders<MongoFlowStateDocument>.Filter.Ne(item => item.Revision, null)
-                     & Builders<MongoFlowStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, now);
+                     & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$expires_at_utc", "$$NOW" }));
         filter &= acquire
             ? Builders<MongoFlowStateDocument>.Filter.Or(
                 Builders<MongoFlowStateDocument>.Filter.Eq(item => item.LeaseId, null),
-                Builders<MongoFlowStateDocument>.Filter.Lte(item => item.LeaseExpiresAtUtc, now),
+                ServerClockExpr(new BsonDocument("$lte", new BsonArray { "$lease_expires_at_utc", "$$NOW" })),
                 Builders<MongoFlowStateDocument>.Filter.Eq(item => item.LeaseId, leaseId))
             : Builders<MongoFlowStateDocument>.Filter.Eq(item => item.LeaseId, leaseId)
-              & Builders<MongoFlowStateDocument>.Filter.Gt(item => item.LeaseExpiresAtUtc, now);
-
-        var update = Builders<MongoFlowStateDocument>.Update
-            .Set(item => item.LeaseId, leaseId)
-            .Set(item => item.LeaseExpiresAtUtc, now.Add(leaseDuration));
-        var result = await _collection.UpdateOneAsync(filter, update, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return result.ModifiedCount > 0;
+              & ServerClockExpr(new BsonDocument("$gt", new BsonArray { "$lease_expires_at_utc", "$$NOW" }));
+        return filter;
     }
 
-    private static MongoFlowStateDocument CreateDocument(string flowId, FlowState state, TimeSpan ttl, DateTime now)
-        => new()
+    /// <summary>
+    /// Full-state write as an aggregation-pipeline update so the expiry lands on the server clock
+    /// ($$NOW + ttl). <paramref name="resetLease"/> clears the lease columns (create-over-expired
+    /// replaces ownership); checkpoints leave the running lease in place.
+    /// </summary>
+    internal static UpdateDefinition<MongoFlowStateDocument> BuildStateUpdate(string stateJson, long revision, TimeSpan ttl, bool resetLease)
+    {
+        var stages = new List<BsonDocument>
         {
-            FlowId = flowId,
-            StateJson = DurableFlowStoreShared.Serialize(state),
-            ExpiresAtUtc = now.Add(ttl),
-            UpdatedAtUtc = now,
-            Revision = state.Revision
+            new("$set", new BsonDocument
+            {
+                // $literal keeps the JSON payload a value: a pipeline $set treats "$"-prefixed
+                // strings as field paths.
+                ["state_json"] = new BsonDocument("$literal", stateJson),
+                ["expires_at_utc"] = new BsonDocument("$add", new BsonArray
+                {
+                    "$$NOW",
+                    DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl)
+                }),
+                ["updated_at_utc"] = "$$NOW",
+                ["revision"] = revision
+            })
         };
+        if (resetLease)
+            stages.Add(new BsonDocument("$unset", new BsonArray { "lease_id", "lease_expires_at_utc" }));
+        return Builders<MongoFlowStateDocument>.Update.Pipeline(stages.ToArray());
+    }
+
+    /// <summary>Lease grant/renewal on the server clock: <c>lease_expires_at_utc = $$NOW + duration</c>.</summary>
+    internal static UpdateDefinition<MongoFlowStateDocument> BuildLeaseUpdate(string leaseId, TimeSpan leaseDuration)
+        => Builders<MongoFlowStateDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["lease_id"] = new BsonDocument("$literal", leaseId),
+                ["lease_expires_at_utc"] = new BsonDocument("$add", new BsonArray
+                {
+                    "$$NOW",
+                    DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration)
+                })
+            })
+        });
+
+    private static FilterDefinition<MongoFlowStateDocument> ServerClockExpr(BsonDocument comparison)
+        => new BsonDocumentFilterDefinition<MongoFlowStateDocument>(new BsonDocument("$expr", comparison));
 
     /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>
     public void Dispose()

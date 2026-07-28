@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.NATS</PackageId>
     <Description>NATS JetStream transport for AsyncResponse: publish worker jobs to JetStream subjects, consume worker-job subjects, and feed response subjects into the transport-neutral AsyncResponse ingress with explicit acknowledgement, bounded redelivery, and dead-lettering.</Description>
+    <PackageTags>$(PackageTags);nats;jetstream</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

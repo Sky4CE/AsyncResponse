@@ -66,6 +66,14 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
     /// <summary>Optional throughput used when auto-creating the container.</summary>
     public int? Throughput { get; set; }
 
+    /// <summary>
+    /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
+    /// with an actionable error instead of the raw Cosmos 413 the executor would retry into the
+    /// dead-letter queue. Default: 1.9 MB (headroom under Cosmos's 2 MB item cap for the sibling
+    /// fields); <c>null</c> disables the guard.
+    /// </summary>
+    public long? MaxStateBytes { get; set; } = 1_900_000;
+
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
@@ -77,12 +85,20 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(PartitionKeyPath)} must start with '/'.");
         if (Throughput is <= 0)
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(Throughput)} must be positive when configured.");
+        if (MaxStateBytes is <= 0)
+            throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
 }
 
 /// <summary>Azure Cosmos DB implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 {
+    // Time authority: this store keeps the app clock (DateTime.UtcNow) for expiry and lease
+    // comparisons. Cosmos conditional writes (ETag preconditions) evaluate client-supplied
+    // values only — there is no server-clock expression usable inside a point write — so the
+    // read-check-replace cycles below compare against the app clock and rely on the ETag fence
+    // for atomicity. Multi-node deployments should keep worker clocks synchronized well inside
+    // the lease window. (The server's own TTL sweep, by contrast, runs on the service clock.)
     private readonly CosmosClient _client;
     private readonly CosmosDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -109,11 +125,14 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 new PartitionKey(flowId),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
             var document = response.Resource;
+            // Point reads have no predicate, so the expiry check happens client-side on the app
+            // clock — see the time-authority note on this class.
             if (document.ExpiresAtUtc <= DateTime.UtcNow)
                 return null;
 
-            var state = DurableFlowStoreShared.Deserialize(document.StateJson);
-            return document.Revision is { } revision && state?.Revision == revision ? state : null;
+            return document.Revision is { } revision
+                ? DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision)
+                : null;
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
@@ -124,6 +143,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateCreate(flowId, state, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Cosmos DB");
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
 
         // Bounded retry: documents carry native Cosmos TTL alongside the logical ExpiresAtUtc, so
@@ -133,7 +153,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         for (var attempt = 0; attempt < 4; attempt++)
         {
             var now = DateTime.UtcNow;
-            var document = CreateDocument(flowId, state, ttl, now);
+            var document = CreateDocument(flowId, stateJson, state.Revision, ttl, now);
             try
             {
                 await container.CreateItemAsync(document, new PartitionKey(flowId), cancellationToken: cancellationToken).ConfigureAwait(false);
@@ -183,6 +203,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         CancellationToken cancellationToken = default)
     {
         DurableFlowStoreShared.ValidateUpdate(flowId, state, expectedRevision, ttl);
+        var stateJson = DurableFlowStoreShared.SerializeBounded(flowId, state, _options.MaxStateBytes, "Cosmos DB");
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
         for (var attempt = 0; attempt < 4; attempt++)
         {
@@ -199,11 +220,11 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 if (leaseId is not null && (document.LeaseId != leaseId || document.LeaseExpiresAtUtc <= now))
                     return false;
 
-                document.StateJson = DurableFlowStoreShared.Serialize(state);
-                document.ExpiresAtUtc = now.Add(ttl);
+                document.StateJson = stateJson;
+                document.ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl);
                 document.UpdatedAtUtc = now;
                 document.Revision = state.Revision;
-                document.Ttl = (int)Math.Ceiling(ttl.TotalSeconds);
+                document.Ttl = CosmosTtlSeconds(ttl);
                 await container.ReplaceItemAsync(
                     document,
                     flowId,
@@ -339,11 +360,51 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                     $"Cosmos container '{_options.ContainerName}' does not have TTL enabled. " +
                     "Enable container TTL (DefaultTimeToLive = -1) before using it for durable flows.");
 
+            ValidateHostSerializer();
             _created = true;
         }
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Fails provisioning fast when a host-registered <see cref="CosmosClient"/> carries a custom
+    /// serializer that does not honor the flow-state document's JSON property names.
+    /// <see cref="CosmosFlowStateDocument"/> is attributed for both Newtonsoft.Json
+    /// (<c>[JsonProperty]</c>) and System.Text.Json (<c>[JsonPropertyName]</c>), so the SDK's
+    /// default serializer and STJ-based serializers both map correctly; a serializer honoring
+    /// neither would write documents whose <c>id</c> Cosmos rejects — or, worse, whose fields
+    /// silently round-trip as nulls. The probe serializes a sentinel document through the host's
+    /// serializer and verifies the wire property names survive.
+    /// </summary>
+    private void ValidateHostSerializer()
+    {
+        if (_client.ClientOptions?.Serializer is not { } serializer)
+            return; // The SDK default serializer honors [JsonProperty]; nothing to probe.
+
+        var now = DateTime.UtcNow;
+        using var stream = serializer.ToStream(new CosmosFlowStateDocument
+        {
+            Id = "asyncresponse-serializer-probe",
+            FlowId = "asyncresponse-serializer-probe",
+            StateJson = "{}",
+            ExpiresAtUtc = now,
+            UpdatedAtUtc = now,
+            Revision = 0,
+            LeaseId = "probe",
+            LeaseExpiresAtUtc = now,
+            Ttl = 1
+        });
+        using var probe = System.Text.Json.JsonDocument.Parse(stream);
+        if (!probe.RootElement.TryGetProperty("id", out _) || !probe.RootElement.TryGetProperty("leaseExpiresAtUtc", out _))
+        {
+            throw new InvalidOperationException(
+                $"The registered CosmosClient's serializer ({serializer.GetType().Name}) does not honor the durable-flow document's " +
+                "JSON property names ('id', 'flowId', 'leaseExpiresAtUtc', ...). Flow-state documents would be written with wrong " +
+                "property names and could not be read back. Configure the serializer to honor Newtonsoft.Json [JsonProperty] or " +
+                "System.Text.Json [JsonPropertyName] attributes, or let the SDK use its default serializer.");
         }
     }
 
@@ -383,7 +444,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 }
 
                 document.LeaseId = leaseId;
-                document.LeaseExpiresAtUtc = now.Add(leaseDuration);
+                document.LeaseExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, leaseDuration);
                 await container.ReplaceItemAsync(
                     document,
                     flowId,
@@ -404,19 +465,23 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         return false;
     }
 
-    private static CosmosFlowStateDocument CreateDocument(string flowId, FlowState state, TimeSpan ttl, DateTime now)
+    private static CosmosFlowStateDocument CreateDocument(string flowId, string stateJson, long revision, TimeSpan ttl, DateTime now)
         => new()
         {
             Id = flowId,
             FlowId = flowId,
-            StateJson = DurableFlowStoreShared.Serialize(state),
-            ExpiresAtUtc = now.Add(ttl),
+            StateJson = stateJson,
+            ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
             UpdatedAtUtc = now,
-            Revision = state.Revision,
+            Revision = revision,
             // Cosmos reaps the item itself once container TTL is enabled. Ceiling keeps the
             // server-side TTL from being shorter than the requested duration.
-            Ttl = (int)Math.Ceiling(ttl.TotalSeconds)
+            Ttl = CosmosTtlSeconds(ttl)
         };
+
+    /// <summary>Per-item TTL in whole seconds, rounded up and saturated at int.MaxValue (~68 years) for absurd expiries.</summary>
+    private static int CosmosTtlSeconds(TimeSpan ttl)
+        => (int)Math.Min(Math.Ceiling(ttl.TotalSeconds), int.MaxValue);
 
     /// <summary>Disposes the Cosmos client when the store created (and therefore owns) it.</summary>
     public void Dispose()
@@ -427,34 +492,54 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     }
 }
 
+/// <summary>
+/// One durable-flow ledger document. Attributed for BOTH Newtonsoft.Json and System.Text.Json:
+/// the Cosmos SDK's default serializer is Newtonsoft-based, but hosts may register a
+/// <see cref="CosmosClient"/> with an STJ-based serializer — with single-stack attributes such a
+/// client would silently write PascalCase property names (breaking <c>id</c> and every read
+/// back). <see cref="CosmosFlowStateStore"/> additionally probes custom serializers at
+/// provisioning time and fails fast when neither attribute set is honored.
+/// </summary>
 internal sealed class CosmosFlowStateDocument
 {
     [JsonProperty("id")]
+    [System.Text.Json.Serialization.JsonPropertyName("id")]
     public string Id { get; set; } = "";
 
     [JsonProperty("flowId")]
+    [System.Text.Json.Serialization.JsonPropertyName("flowId")]
     public string FlowId { get; set; } = "";
 
     [JsonProperty("stateJson")]
+    [System.Text.Json.Serialization.JsonPropertyName("stateJson")]
     public string StateJson { get; set; } = "";
 
     [JsonProperty("expiresAtUtc")]
+    [System.Text.Json.Serialization.JsonPropertyName("expiresAtUtc")]
     public DateTime ExpiresAtUtc { get; set; }
 
     [JsonProperty("updatedAtUtc")]
+    [System.Text.Json.Serialization.JsonPropertyName("updatedAtUtc")]
     public DateTime UpdatedAtUtc { get; set; }
 
     [JsonProperty("revision")]
+    [System.Text.Json.Serialization.JsonPropertyName("revision")]
     public long? Revision { get; set; }
 
     [JsonProperty("leaseId", NullValueHandling = NullValueHandling.Ignore)]
+    [System.Text.Json.Serialization.JsonPropertyName("leaseId")]
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public string? LeaseId { get; set; }
 
     [JsonProperty("leaseExpiresAtUtc", NullValueHandling = NullValueHandling.Ignore)]
+    [System.Text.Json.Serialization.JsonPropertyName("leaseExpiresAtUtc")]
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public DateTime? LeaseExpiresAtUtc { get; set; }
 
     /// <summary>Cosmos per-item TTL in seconds; honored once the container enables TTL.</summary>
     [JsonProperty("ttl", NullValueHandling = NullValueHandling.Ignore)]
+    [System.Text.Json.Serialization.JsonPropertyName("ttl")]
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public int? Ttl { get; set; }
 }
 }

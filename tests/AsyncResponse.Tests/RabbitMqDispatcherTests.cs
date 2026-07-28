@@ -28,6 +28,23 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public void ValidateOptions_SameWorkerAndResponseQueues_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            RabbitMqMessageDispatcher.ValidateOptions(
+                new RabbitMqAsyncResponseOptions
+                {
+                    WorkerQueue = "shared-queue",
+                    ResponseQueue = "shared-queue"
+                },
+                new RabbitMqSubscriberOptions(),
+                RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.WorkerQueue), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.ResponseQueue), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateOptions_ZeroPrefetch_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>

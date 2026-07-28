@@ -413,31 +413,47 @@ internal sealed class SqlServerChannelSql
 
     public async Task HeartbeatSubscribersAsync(
         string instanceId,
-        IReadOnlyList<Guid> registrationIds,
+        IReadOnlyList<(string CorrelationId, Guid RegistrationId)> registrations,
         TimeSpan ttl,
         CancellationToken cancellationToken)
     {
-        if (registrationIds.Count == 0)
+        if (registrations.Count == 0)
             return;
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+        // Two parameters per row plus instance/ttl stays under SQL Server's 2100-parameter cap.
         const int batchSize = 1000;
-        for (var offset = 0; offset < registrationIds.Count; offset += batchSize)
+        for (var offset = 0; offset < registrations.Count; offset += batchSize)
         {
-            var count = Math.Min(batchSize, registrationIds.Count - offset);
+            var count = Math.Min(batchSize, registrations.Count - offset);
             await using var command = connection.CreateCommand();
-            var parameterNames = new string[count];
+            var sourceRows = new string[count];
             for (var index = 0; index < count; index++)
             {
-                var parameterName = $"@registration_id_{index}";
-                parameterNames[index] = parameterName;
-                command.Parameters.AddWithValue(parameterName, registrationIds[offset + index]);
+                var (correlationId, registrationId) = registrations[offset + index];
+                sourceRows[index] = $"(@correlation_id_{index}, @registration_id_{index})";
+                command.Parameters.AddWithValue($"@correlation_id_{index}", correlationId);
+                command.Parameters.AddWithValue($"@registration_id_{index}", registrationId);
             }
 
+            // MERGE upsert rather than a bare UPDATE, in the same WITH (HOLDLOCK) style as
+            // UpsertSubscriberAsync: the caller only heartbeats registrations that are live in this
+            // process, so a missing row means the pruner deleted it (e.g. after a >timeout stall)
+            // — re-creating it here is what brings the waiter back from "permanently invisible".
             command.CommandText =
-                $"UPDATE {SubscriberTable} SET expires_at = {AddMilliseconds("@ttl_ms")} " +
-                $"WHERE instance_id = @instance_id AND registration_id IN ({string.Join(",", parameterNames)});";
+                $"""
+                MERGE {SubscriberTable} WITH (HOLDLOCK) AS target
+                USING (VALUES {string.Join(", ", sourceRows)}) AS source (correlation_id, registration_id)
+                    ON target.correlation_id = source.correlation_id AND target.registration_id = source.registration_id
+                WHEN MATCHED THEN
+                    UPDATE SET instance_id = @instance_id,
+                               expires_at = {AddMilliseconds("@ttl_ms")}
+                WHEN NOT MATCHED THEN
+                    INSERT (correlation_id, registration_id, instance_id, expires_at)
+                    VALUES (source.correlation_id, source.registration_id, @instance_id, {AddMilliseconds("@ttl_ms")});
+                """;
             command.Parameters.AddWithValue("@instance_id", instanceId);
             command.Parameters.AddWithValue("@ttl_ms", (long)ttl.TotalMilliseconds);
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);

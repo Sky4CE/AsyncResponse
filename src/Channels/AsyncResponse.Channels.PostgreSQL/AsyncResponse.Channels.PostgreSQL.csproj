@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Channels.PostgreSQL</PackageId>
     <Description>PostgreSQL channel for AsyncResponse: LISTEN/NOTIFY response wakeups and durable PostgreSQL recovery-state tables for lost-subscriber recovery across redeploys, with domain-state-aware failure routing. Plugs into the Core engine's recovery watchdog and readiness health check.</Description>
+    <PackageTags>$(PackageTags);postgresql;npgsql</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

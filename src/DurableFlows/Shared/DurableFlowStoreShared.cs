@@ -7,6 +7,16 @@ namespace AsyncResponse.DurableFlows.Internal;
 
 internal static class DurableFlowStoreShared
 {
+    /// <summary>
+    /// Upper bound for TTL values handed to server-clock date arithmetic (~68 years). SQL Server's
+    /// <c>DATEADD</c> takes <c>int</c> seconds, and MySQL/Oracle datetime types stop at year 9999,
+    /// so an absurd <see cref="DurableFlowOptions.StateExpiry"/> (for example
+    /// <see cref="TimeSpan.MaxValue"/>) would overflow inside the database. Clamping mirrors
+    /// <see cref="AddSaturating(DateTime, TimeSpan)"/> on the client side: huge expiries saturate
+    /// to "effectively never" instead of failing every write.
+    /// </summary>
+    private static readonly TimeSpan MaxServerClockTtl = TimeSpan.FromSeconds(int.MaxValue);
+
     private static readonly JsonSerializerOptions Options = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -33,6 +43,65 @@ internal static class DurableFlowStoreShared
     }
 
     public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, FlowStateTypeInfo);
+
+    /// <summary>
+    /// Serializes a ledger for a full-state write and enforces the store's <c>MaxStateBytes</c>
+    /// budget. Without the guard an oversized ledger surfaces as the provider's opaque payload
+    /// error (DynamoDB 400 KB item cap, Cosmos 2 MB, MongoDB 16 MB) which the executor retries
+    /// into the dead-letter queue with no hint at the real cause. Throwing here keeps the same
+    /// at-least-once semantics (run fails → retries → DLQ = operator alarm) but names the cause.
+    /// </summary>
+    /// <exception cref="FlowStateTooLargeException">The serialized state exceeds <paramref name="maxStateBytes"/>.</exception>
+    public static string SerializeBounded(string flowId, FlowState state, long? maxStateBytes, string providerName)
+    {
+        var json = Serialize(state);
+        if (maxStateBytes is { } limit)
+        {
+            long size = Encoding.UTF8.GetByteCount(json);
+            if (size > limit)
+                throw new FlowStateTooLargeException(flowId, size, limit, providerName);
+        }
+
+        return json;
+    }
+
+    /// <summary>
+    /// Materializes a loaded ledger row. Unreadable JSON, an unknown schema version, a revision
+    /// that does not match the stored row, and an identity-mismatched ledger
+    /// (<c>state.FlowId != flowId</c>) all load as absent — the read-side mirror of the write-side
+    /// key/identity validation in <see cref="ValidateCreate"/>, so a row copied or restored under
+    /// the wrong key can never resurrect as that flow.
+    /// </summary>
+    public static FlowState? ReadState(string flowId, string stateJson, long revision)
+    {
+        var state = Deserialize(stateJson);
+        return state is not null
+            && state.Revision == revision
+            && string.Equals(state.FlowId, flowId, StringComparison.Ordinal)
+                ? state
+                : null;
+    }
+
+    /// <summary>
+    /// <paramref name="instant"/> + <paramref name="ttl"/>, saturating at
+    /// <see cref="DateTime.MaxValue"/> instead of throwing: an absurd
+    /// <see cref="DurableFlowOptions.StateExpiry"/> then means "effectively never expires" rather
+    /// than failing every write with an <see cref="ArgumentOutOfRangeException"/>.
+    /// </summary>
+    public static DateTime AddSaturating(DateTime instant, TimeSpan ttl)
+        => ttl > DateTime.MaxValue - instant ? DateTime.MaxValue : instant + ttl;
+
+    /// <inheritdoc cref="AddSaturating(DateTime, TimeSpan)"/>
+    public static DateTimeOffset AddSaturating(DateTimeOffset instant, TimeSpan ttl)
+        => ttl > DateTimeOffset.MaxValue - instant ? DateTimeOffset.MaxValue : instant + ttl;
+
+    /// <summary>TTL clamped for server-clock date arithmetic; see <see cref="MaxServerClockTtl"/>.</summary>
+    public static TimeSpan ServerClockTtl(TimeSpan ttl)
+        => ttl > MaxServerClockTtl ? MaxServerClockTtl : ttl;
+
+    /// <summary>Whole milliseconds of <see cref="ServerClockTtl"/>, for stores that bind the TTL as a number.</summary>
+    public static long ServerClockTtlMilliseconds(TimeSpan ttl)
+        => (long)ServerClockTtl(ttl).TotalMilliseconds;
 
     public static FlowState? Deserialize(string json)
     {
@@ -112,6 +181,29 @@ internal static class DurableFlowStoreShared
         if (ttl <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(ttl), "TTL must be greater than zero.");
     }
+}
+
+/// <summary>
+/// Thrown when a serialized durable-flow ledger exceeds the store's configured
+/// <c>MaxStateBytes</c> budget. Internal on purpose: this shared source is compiled into every
+/// store package, so a public type here would surface as identically-named colliding public types
+/// when a host references two store packages. Callers catch it as its
+/// <see cref="InvalidOperationException"/> base; the message carries the diagnosis.
+/// </summary>
+internal sealed class FlowStateTooLargeException(string flowId, long serializedSizeBytes, long maxStateBytes, string providerName)
+    : InvalidOperationException(
+        $"Flow '{flowId}' state serialized to {serializedSizeBytes} bytes, exceeding the {providerName} MaxStateBytes limit of {maxStateBytes} bytes — " +
+        "flow state exceeded the provider's size limit. Keep large payloads in your own storage and pass references in flow state; " +
+        "see docs/durable-flows.md (ledger-size note).")
+{
+    /// <summary>The flow whose ledger write was rejected.</summary>
+    public string FlowId { get; } = flowId;
+
+    /// <summary>Serialized ledger size in UTF-8 bytes.</summary>
+    public long SerializedSizeBytes { get; } = serializedSizeBytes;
+
+    /// <summary>The configured budget the write exceeded.</summary>
+    public long MaxStateBytes { get; } = maxStateBytes;
 }
 
 /// <summary>

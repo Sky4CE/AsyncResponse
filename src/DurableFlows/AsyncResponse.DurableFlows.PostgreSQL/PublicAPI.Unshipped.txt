@@ -4,6 +4,8 @@ AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.AutoCreateSch
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.AutoCreateSchema.set -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.ConnectionString.get -> string?
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.ConnectionString.set -> void
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.MaxStateBytes.get -> long?
+AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PostgreSqlDurableFlowOptions() -> void
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.get -> System.TimeSpan
 AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions.PruneInterval.set -> void

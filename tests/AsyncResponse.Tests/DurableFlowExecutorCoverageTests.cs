@@ -99,9 +99,13 @@ public sealed class DurableFlowExecutorCoverageTests
         await harness.Executor.FailAsync("missing", new InvalidOperationException("missing"));
         await harness.Executor.FailAsync("terminal-child", new InvalidOperationException("duplicate"));
 
+        // Four enqueues: ResumeAsync("running"), FailAsync("terminal-child")'s parent notify, and
+        // the two Running-flow recoveries with no matching pending step ("recover-no-steps",
+        // "recover-unmatched") — those re-enqueue to cover the checkpoint/enqueue crash window.
+        // The terminal-flow recovery deliberately does not enqueue.
         harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
             It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
-            It.IsAny<CancellationToken>()), Times.Exactly(2));
+            It.IsAny<CancellationToken>()), Times.Exactly(4));
     }
 
     [Theory]

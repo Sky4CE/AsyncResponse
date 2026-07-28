@@ -36,7 +36,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -70,7 +70,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            subscriptionName =>
+            (subscriptionName, _) =>
             {
                 subscriptionNames.Add(subscriptionName);
                 return Task.FromResult<IGooglePubSubSubscriberClient>(client);
@@ -111,7 +111,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -156,7 +156,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -208,7 +208,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -242,7 +242,7 @@ public class GooglePubSubSubscriberTests
             }),
             ingress.Object,
             NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
         var message = new PubsubMessage
         {
             MessageId = "message-3",
@@ -285,7 +285,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubResponseIngressSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
         var message = new PubsubMessage
         {
             MessageId = "message-response-early-ack",
@@ -333,7 +333,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             ingress.Object,
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
         await subscriber.StartAsync(CancellationToken.None);
         var handler = await WaitForHandlerAsync(client);
@@ -355,11 +355,10 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
-    public async Task WorkerSubscriberService_AckAfterEnqueue_NacksWhenBackgroundQueueIsFull()
+    public async Task WorkerSubscriberService_AckAfterEnqueue_QueueFullAppliesBackpressureInsteadOfNacking()
     {
         var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var calls = 0;
         await using var dispatcher = GooglePubSubMessageDispatcher.Create(
             async (_, _) =>
@@ -369,10 +368,6 @@ public class GooglePubSubSubscriberTests
                 {
                     firstStarted.TrySetResult();
                     await releaseFirst.Task.ConfigureAwait(false);
-                }
-                else if (call == 2)
-                {
-                    secondStarted.TrySetResult();
                 }
             },
             new GooglePubSubAsyncResponseOptions(),
@@ -388,12 +383,62 @@ public class GooglePubSubSubscriberTests
         await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
         Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-2"), CancellationToken.None));
-        Assert.Equal(SubscriberClient.Reply.Nack, await dispatcher.HandleAsync(Message("message-3"), CancellationToken.None));
+
+        // Queue full: the callback parks until a worker frees a slot instead of NACKing — a NACK
+        // would burn a delivery attempt of a DeadLetterPolicy configured on the subscription.
+        var thirdHandle = dispatcher.HandleAsync(Message("message-3"), CancellationToken.None);
+        await Task.Delay(100);
+        Assert.False(thirdHandle.IsCompleted);
         Assert.Equal(1, Volatile.Read(ref calls));
 
         releaseFirst.TrySetResult();
-        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal(2, Volatile.Read(ref calls));
+        Assert.Equal(SubscriberClient.Reply.Ack, await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5)));
+        await WaitForCallsAsync(() => Volatile.Read(ref calls) == 3);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriberService_AckAfterEnqueue_QueueFullDuringShutdown_Nacks()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                firstStarted.TrySetResult();
+                await releaseFirst.Task.ConfigureAwait(false);
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+                backgroundWorkerCount: 1,
+                backgroundQueueCapacity: 1,
+                backgroundDrainTimeout: TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-1"), CancellationToken.None));
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-2"), CancellationToken.None));
+
+        using var stopping = new CancellationTokenSource();
+        var thirdHandle = dispatcher.HandleAsync(Message("message-3"), stopping.Token);
+        await Task.Delay(50);
+        stopping.Cancel();
+
+        // A message caught waiting when the subscriber stops is NACKed so Pub/Sub redelivers it.
+        Assert.Equal(SubscriberClient.Reply.Nack, await thirdHandle.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        releaseFirst.TrySetResult();
+    }
+
+    private static async Task WaitForCallsAsync(Func<bool> condition)
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            cts.Token.ThrowIfCancellationRequested();
+            await Task.Delay(20, cts.Token);
+        }
     }
 
     [Fact]
@@ -498,6 +543,110 @@ public class GooglePubSubSubscriberTests
                 nameof(GooglePubSubSubscriberOptions.AckMode)
             }
         };
+
+    [Fact]
+    public void DispatcherValidateOptions_SameWorkerAndResponseSubscriptionIds_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions
+            {
+                WorkerSubscriptionId = "shared-subscription",
+                ResponseSubscriptionId = "shared-subscription"
+            },
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker));
+
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriptionId), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.ResponseSubscriptionId), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DispatcherValidateOptions_SameWorkerAndResponseTopicIds_Throws()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions
+            {
+                WorkerTopicId = "shared-topic",
+                ResponseTopicId = "shared-topic"
+            },
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker));
+
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.WorkerTopicId), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.ResponseTopicId), ex.Message, StringComparison.Ordinal);
+
+        // Distinct (or unset) destinations pass.
+        GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions
+            {
+                WorkerTopicId = "worker-topic",
+                ResponseTopicId = "response-topic",
+                WorkerSubscriptionId = "worker-sub",
+                ResponseSubscriptionId = "response-sub"
+            },
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker);
+        GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions(),
+            GooglePubSubSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public async Task SubscriberService_Startup_WarnsThatRedeliveryIsUnboundedWithoutDeadLetterPolicy()
+    {
+        var client = new FakeSubscriberClient();
+        var logger = new CapturingLogger<GooglePubSubWorkerSubscriber>();
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers"
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(client));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await WaitForHandlerAsync(client);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        // The transport has no delivery-attempt cap and no library DLQ for Pub/Sub; the operator is
+        // told (once, at startup) that only a subscription DeadLetterPolicy bounds redelivery.
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("unbounded", StringComparison.OrdinalIgnoreCase)
+            && entry.Message.Contains("DeadLetterPolicy", StringComparison.Ordinal));
+    }
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        private readonly object _gate = new();
+        private readonly List<(LogLevel Level, string Message)> _entries = [];
+
+        public IReadOnlyList<(LogLevel Level, string Message)> Entries
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _entries.ToArray();
+                }
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (_gate)
+            {
+                _entries.Add((logLevel, formatter(state, exception)));
+            }
+        }
+    }
 
     [Fact]
     public void DispatcherValidateOptions_AllowsEarlyAckWithinHostShutdownBudget()
@@ -689,7 +838,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Interlocked.Increment(ref attempts) == 1
+            (_, _) => Interlocked.Increment(ref attempts) == 1
                 ? Task.FromException<IGooglePubSubSubscriberClient>(new InvalidOperationException("pubsub unreachable"))
                 : Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
@@ -723,7 +872,7 @@ public class GooglePubSubSubscriberTests
             }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ => Interlocked.Increment(ref clients) == 1
+            (_, _) => Interlocked.Increment(ref clients) == 1
                 ? Task.FromResult<IGooglePubSubSubscriberClient>(new FaultingSubscriberClient())
                 : Task.FromResult<IGooglePubSubSubscriberClient>(client));
 
@@ -766,7 +915,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(new GooglePubSubAsyncResponseOptions { WorkerSubscriptionId = "workers" }),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ =>
+            (_, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
@@ -791,7 +940,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ =>
+            (_, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
@@ -822,7 +971,7 @@ public class GooglePubSubSubscriberTests
             Options.Create(options),
             Mock.Of<IAsyncResponseIngress>(),
             NullLogger<GooglePubSubWorkerSubscriber>.Instance,
-            _ =>
+            (_, _) =>
             {
                 factoryCalled = true;
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());

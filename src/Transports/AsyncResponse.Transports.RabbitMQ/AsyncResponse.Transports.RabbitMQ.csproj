@@ -6,6 +6,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <PackageId>AsyncResponse.Transports.RabbitMQ</PackageId>
     <Description>RabbitMQ transport for AsyncResponse: publish worker jobs to RabbitMQ, consume worker-job queues, and feed response queues into the transport-neutral AsyncResponse ingress.</Description>
+    <PackageTags>$(PackageTags);rabbitmq;amqp</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

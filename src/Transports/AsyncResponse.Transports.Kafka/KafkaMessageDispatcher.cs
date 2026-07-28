@@ -587,13 +587,17 @@ internal sealed class QueuedKafkaMessageDispatcher : KafkaMessageDispatcher
             {
                 await ExecuteWithRetryAsync(delivery).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (_drainCancellation.IsCancellationRequested)
+            catch (OperationCanceledException ex) when (_drainCancellation.IsCancellationRequested)
             {
-                Logger.LogDebug(
-                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown.",
+                // The drain budget lapsed with this already-committed message still unprocessed:
+                // Kafka will not redeliver it, so surface the drop through OnBackgroundFailure
+                // instead of losing it silently.
+                Logger.LogWarning(
+                    "Kafka background handler for already-committed message {Topic}[{Partition}]@{Offset} was canceled during dispatcher shutdown; surfacing via OnBackgroundFailure.",
                     delivery.Topic,
                     delivery.Partition,
                     delivery.Offset);
+                await NotifyBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
             }
             finally
             {

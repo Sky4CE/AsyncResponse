@@ -590,10 +590,10 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **2800+ unit tests on each target framework** (.NET 8 + .NET 10 executions), including
+- **1,500+ unit tests, run on each target framework** (~3,000 executions across .NET 8 and .NET 10), including
   concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
   duplicate-execution detection.
-- **170 integration test cases** drive the shipped sample app black-box over HTTP against **real
+- **170+ integration test cases** drive the shipped sample app black-box over HTTP against **real
   brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
   Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
   for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport.
@@ -668,6 +668,8 @@ the right page. The pages:
   plugin/ALC scenarios.
 - **[Operations](docs/operations.md)** — best practices, building and testing, and benchmarking and
   load testing.
+- **[Troubleshooting](docs/troubleshooting.md)** — symptom → cause → fix for the common gotchas:
+  broker lock/visibility budgets, MongoDB replica sets, stuck flows, AOT registration, and more.
 - **[Trimming & Native AOT](docs/aot.md)** — what to register in a trimmed/AOT app (one JSON
   context line plus `WithDurableFlow` per flow), how the metadata seam works, and the annotated
   dynamic surface.
@@ -677,8 +679,9 @@ the right page. The pages:
   `UPDLOCK/READPAST` claims, schema, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
   scenario.
-- **[Roadmap](docs/roadmap.md)** — which channels and transports are next (Hangfire, …),
-  with priorities and design sketches.
+- **[Roadmap](docs/roadmap.md)** — capabilities are the new headline: durable timers, a testing
+  kit, claim-check payloads, and a flow operations API — then Hangfire, Storage Queues, MQTT and
+  more, with priorities and design sketches.
 
 ## License
 

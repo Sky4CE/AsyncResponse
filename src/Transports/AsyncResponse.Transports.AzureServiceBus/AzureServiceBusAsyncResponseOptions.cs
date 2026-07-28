@@ -178,6 +178,19 @@ public sealed class AzureServiceBusSubscriberOptions
     /// <summary>Number of messages the receiver prefetches locally. Default: <c>0</c>.</summary>
     public int PrefetchCount { get; set; }
 
+    /// <summary>
+    /// Heartbeat cadence for renewing the peek locks of received-but-unsettled messages while a
+    /// <see cref="AzureServiceBusAckMode.AckAfterHandlerCompletes"/> batch is worked through
+    /// serially. Each beat calls <c>RenewMessageLockAsync</c> for every message that has not been
+    /// settled yet (including the one currently in the handler), so a slow handler does not let the
+    /// locks of later batch messages expire and cause systematic duplicate processing. Renewal
+    /// failures are logged and processing continues — the message simply redelivers, preserving
+    /// at-least-once semantics. Set to <c>null</c> to disable renewal. Ignored in
+    /// <see cref="AzureServiceBusAckMode.AckAfterReceive"/> (messages are already completed).
+    /// Default: <c>30 seconds</c>.
+    /// </summary>
+    public TimeSpan? LockRenewalInterval { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Number of background workers used by <see cref="AzureServiceBusAckMode.AckAfterReceive"/>.</summary>
     public int BackgroundWorkerCount { get; set; }
 

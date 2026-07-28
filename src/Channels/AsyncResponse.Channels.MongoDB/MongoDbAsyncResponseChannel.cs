@@ -172,7 +172,6 @@ internal sealed class MongoDbAsyncResponseChannel :
 
         subscription.ProcessUnderContextAsync = ProcessUnderCapturedContextAsync;
 
-        var armed = false;
         try
         {
             var recoveryState = new RecoveryState
@@ -185,11 +184,14 @@ internal sealed class MongoDbAsyncResponseChannel :
                 RegisteredAtUtc = DateTime.UtcNow,
                 Context = _propagation.Capture()
             };
-            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            // Subscriber document BEFORE recovery state: "recovery state visible ⇒ subscription
+            // visible" is the invariant the lost-subscriber dispatcher's live re-check relies on.
+            // In the reverse order a publisher could see the state, see no subscriber, and consume
+            // the registration while this waiter is milliseconds from being live.
             await _store.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
+            await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
 
             timeoutCts.CancelAfter(timeout.Value);
-            armed = true;
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for MongoDB response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
@@ -198,18 +200,22 @@ internal sealed class MongoDbAsyncResponseChannel :
         {
             _logger.LogError(ex, "Failed to create MongoDB waiter for correlationId {CorrelationId}.", correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            tcs.TrySetException(ex);
             await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
+
+            // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
+            // the trigger runs only once the subscription AND recovery state exist. A returned
+            // waiter would still let the trigger fire the remote operation with no registration
+            // left to receive (or recover) its response. Cleanup cancels the response task, so no
+            // pending task is left behind.
+            tcs.TrySetCanceled();
+            throw;
         }
 
-        if (armed)
-        {
-            // Publish the subscription only once it is fully armed (heartbeat + timeout + context
-            // delegate), then signal a scan targeted at this correlation id so any already-stored
-            // response is delivered promptly without a full-collection sweep.
-            AddSubscription(correlationId, subscription);
-            SignalDispatcher(correlationId);
-        }
+        // Publish the subscription only once it is fully armed (heartbeat + timeout + context
+        // delegate), then signal a scan targeted at this correlation id so any already-stored
+        // response is delivered promptly without a full-collection sweep.
+        AddSubscription(correlationId, subscription);
+        SignalDispatcher(correlationId);
 
         return new MongoDbAsyncResponseWaiter<T>(tcs.Task, () => subscription.CleanupOnceAsync(deleteRecoveryState: true));
     }
@@ -245,12 +251,24 @@ internal sealed class MongoDbAsyncResponseChannel :
             if (subscribers <= 0)
             {
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
@@ -298,12 +316,24 @@ internal sealed class MongoDbAsyncResponseChannel :
             {
                 var response = new RawJsonResponse(responseJson).DeserializeUntyped();
                 var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
+                    .DispatchLostResponses(
+                        _recoveryStateStore,
+                        correlationId,
+                        response,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var messageId = Guid.NewGuid();
@@ -352,12 +382,24 @@ internal sealed class MongoDbAsyncResponseChannel :
             activity?.SetTag("asyncresponse.subscribers", subscribers);
             if (subscribers <= 0)
             {
-                var invoked = await _lostSubscriberDispatcher
-                    .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
+                var dispatchResult = await _lostSubscriberDispatcher
+                    .DispatchLostExceptions(
+                        _recoveryStateStore,
+                        correlationId,
+                        exception,
+                        ChannelName(correlationId),
+                        cancellationToken,
+                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
-                return;
+                if (!dispatchResult.RetryLive)
+                {
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                    return;
+                }
+
+                // A waiter registered between the count and the recovery-state read — publish live
+                // instead of consuming its registration.
             }
 
             var envelope = new AsyncResponseEnvelope<object>
@@ -374,11 +416,13 @@ internal sealed class MongoDbAsyncResponseChannel :
 
             if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
             {
-                var invoked = await _lostSubscriberDispatcher
+                // No live re-check here: TryClaimForRecoveryAsync already won the message for the
+                // recovery path, so live delivery of it is no longer possible.
+                var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, invoked);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
             }
         }
         catch (Exception ex)
@@ -427,10 +471,18 @@ internal sealed class MongoDbAsyncResponseChannel :
         }
     }
 
+    /// <summary>
+    /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
+    /// using the same active-subscriber count the publish path consulted.
+    /// </summary>
+    private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
+        => await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+
     private void AddSubscription(string correlationId, IMongoDbSubscription subscription)
     {
         var group = _subscriptions.GetOrAdd(correlationId, _ => new ConcurrentDictionary<Guid, IMongoDbSubscription>());
         group[subscription.Id] = subscription;
+        _executors.OnSubscriptionRegistered(ChannelName(correlationId));
     }
 
     private void RemoveSubscription(string correlationId, Guid registrationId)
@@ -438,18 +490,21 @@ internal sealed class MongoDbAsyncResponseChannel :
         if (!_subscriptions.TryGetValue(correlationId, out var group))
             return;
 
-        group.TryRemove(registrationId, out _);
+        if (group.TryRemove(registrationId, out _))
+            _executors.OnSubscriptionRetired(ChannelName(correlationId));
         if (group.IsEmpty)
             _subscriptions.TryRemove(correlationId, out _);
     }
 
     private void EnsureListenerStarted()
     {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(MongoDbAsyncResponseChannel));
-
         lock (_listenerGate)
         {
+            // Checked under the same gate DisposeAsync sets it under: a racing registration must
+            // never recreate the CTS and loops after disposal tore them down.
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(MongoDbAsyncResponseChannel));
+
             if (_listenerCts is not null)
                 return;
 
@@ -470,12 +525,12 @@ internal sealed class MongoDbAsyncResponseChannel :
             try
             {
                 await Task.Delay(_options.SubscriberHeartbeatInterval, cancellationToken).ConfigureAwait(false);
-                var registrationIds = SnapshotActiveRegistrationIds();
-                if (registrationIds.Count > 0)
+                var registrations = SnapshotActiveRegistrations();
+                if (registrations.Count > 0)
                 {
                     await _store.HeartbeatSubscribersAsync(
                         _instanceId,
-                        registrationIds,
+                        registrations,
                         _options.SubscriberHeartbeatTimeout,
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -491,19 +546,21 @@ internal sealed class MongoDbAsyncResponseChannel :
         }
     }
 
-    private List<Guid> SnapshotActiveRegistrationIds()
+    private List<(string CorrelationId, Guid RegistrationId)> SnapshotActiveRegistrations()
     {
-        var registrationIds = new List<Guid>();
-        foreach (var group in _subscriptions.Values)
+        // Full (correlation id, registration id) pairs: the heartbeat UPSERTs the subscriber
+        // documents, so it needs everything required to re-create one the TTL reaper has deleted.
+        var registrations = new List<(string CorrelationId, Guid RegistrationId)>();
+        foreach (var (correlationId, group) in _subscriptions)
         {
             foreach (var subscription in group.Values)
             {
                 if (!subscription.Dropped)
-                    registrationIds.Add(subscription.Id);
+                    registrations.Add((correlationId, subscription.Id));
             }
         }
 
-        return registrationIds;
+        return registrations;
     }
 
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
@@ -666,12 +723,13 @@ internal sealed class MongoDbAsyncResponseChannel :
         IReadOnlyList<IMongoDbSubscription> subscriptions,
         CancellationToken cancellationToken)
     {
-        // Only subscriptions that are still live and have not already processed this message. Skipping
-        // when there is nothing to deliver also avoids a redundant claim on every re-sweep.
+        // Only subscriptions that are still live, inside their delivery watermark, and have not
+        // already processed this message. Skipping when there is nothing to deliver also avoids a
+        // redundant claim on every re-sweep.
         var hasTargets = false;
         foreach (var subscription in subscriptions)
         {
-            if (!subscription.Dropped && !subscription.HasSeen(message.Id))
+            if (!subscription.Dropped && IsWithinWatermark(subscription, message) && !subscription.HasSeen(message.Id))
             {
                 hasTargets = true;
                 break;
@@ -699,12 +757,20 @@ internal sealed class MongoDbAsyncResponseChannel :
 
         foreach (var subscription in subscriptions)
         {
-            if (subscription.Dropped || !subscription.MarkSeen(message.Id))
+            if (subscription.Dropped || !IsWithinWatermark(subscription, message) || !subscription.MarkSeen(message.Id))
                 continue;
 
             await subscription.ProcessUnderContextAsync(message).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Per-subscription delivery watermark. The sweep queries with the OLDEST waiter's watermark on
+    /// a shared correlation id, so without this filter a late-joining waiter would receive retained
+    /// messages created before it registered. Same 1s tolerance as the query watermark.
+    /// </summary>
+    private static bool IsWithinWatermark(IMongoDbSubscription subscription, MongoDbChannelMessage message)
+        => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1);
 
     private async Task TryDispatchLocalSubscribersAsync(MongoDbChannelMessage message, CancellationToken cancellationToken)
     {
@@ -867,13 +933,15 @@ internal sealed class MongoDbAsyncResponseChannel :
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        _disposed = true;
         CancellationTokenSource? cts;
         Task? listenTask;
         Task? dispatchTask;
         Task? heartbeatTask;
         lock (_listenerGate)
         {
+            // Set under the gate so EnsureListenerStarted can never observe "not disposed" and
+            // then recreate the CTS/loops this teardown is about to stop.
+            _disposed = true;
             cts = _listenerCts;
             listenTask = _listenTask;
             dispatchTask = _dispatchTask;
@@ -1067,10 +1135,18 @@ internal sealed class MongoDbAsyncResponseChannel :
             try
             {
                 _dropped = true;
-                _owner.RemoveSubscription(_correlationId, Id);
-                await _owner._store.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
+
+                // Delete the recovery state BEFORE removing the subscription (locally and in the
+                // subscriber collection). In the reverse order a publish landing in the window
+                // sees "no subscriber, state present" and fires a spurious recovery callback for a
+                // wait that already reached a terminal state. In this order the window shows a
+                // subscriber that drops the message — a late or duplicate terminal message is
+                // droppable; a resurrected recovery callback is not. (Shutdown/redeploy paths pass
+                // deleteRecoveryState: false and keep the state for lost-subscriber recovery.)
                 if (deleteRecoveryState)
                     await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
+                _owner.RemoveSubscription(_correlationId, Id);
+                await _owner._store.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
 
                 // Schedule the executor retirement on the thread pool; do not await directly —
                 // dispatch-loop deliveries run this cleanup ON the executor, and RemoveAsync waits

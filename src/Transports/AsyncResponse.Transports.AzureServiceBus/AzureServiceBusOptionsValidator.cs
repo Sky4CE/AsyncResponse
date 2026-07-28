@@ -47,6 +47,8 @@ internal static class AzureServiceBusOptionsValidator
             throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.MaxDeliveryAttempts)} cannot be negative.");
         if (subscriberOptions.PrefetchCount < 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.PrefetchCount)} cannot be negative.");
+        if (subscriberOptions.LockRenewalInterval is { } lockRenewalInterval && lockRenewalInterval <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval)} must be positive when set.");
 
         switch (subscriberOptions.AckMode)
         {

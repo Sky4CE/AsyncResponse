@@ -45,6 +45,12 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     internal ChannelReader<QueuedJob> Reader => _queue.Reader;
     internal InMemoryWorkerTransportOptions Options { get; }
 
+    /// <summary>
+    /// Stops accepting new jobs. Called by <see cref="InMemoryWorkerHost"/> on shutdown so the
+    /// workers can drain everything already accepted instead of dropping it.
+    /// </summary>
+    internal void CompleteForShutdown() => _queue.Writer.TryComplete();
+
     /// <inheritdoc/>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
@@ -105,6 +111,12 @@ internal sealed class InMemoryWorkerHost(
     /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Shutdown completes the writer instead of cancelling the readers: accepted jobs were
+        // promised in-process execution, so the workers drain the remaining queue to completion
+        // (bounded, because the queue is bounded) before exiting.
+        using var stopRegistration = stoppingToken.Register(static state =>
+            ((InMemoryWorkerTransport)state!).CompleteForShutdown(), _transport);
+
         try
         {
             var workers = new Task[_transport.Options.WorkerCount];
@@ -120,8 +132,13 @@ internal sealed class InMemoryWorkerHost(
 
     private async Task RunWorkerAsync(CancellationToken stoppingToken)
     {
-        await foreach (var queued in _transport.Reader.ReadAllAsync(stoppingToken).ConfigureAwait(false))
+        // Deliberately no cancellation token on the read: the loop ends when the completed queue
+        // is empty, never by abandoning accepted jobs mid-queue.
+        await foreach (var queued in _transport.Reader.ReadAllAsync().ConfigureAwait(false))
         {
+            if (stoppingToken.IsCancellationRequested && _logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug("Draining in-memory worker job {Target}.{Method} during shutdown.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+
             try
             {
                 await RunAsync(queued).ConfigureAwait(false);

@@ -60,6 +60,37 @@ internal static class NatsTransportOptionsValidator
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.SubscriberRetryMaxDelay)}.");
     }
 
+    /// <summary>Validates the supplied subscriber options together with the transport-wide shutdown budget.</summary>
+    public static void ValidateSubscriber(
+        NatsAsyncResponseTransportOptions transportOptions,
+        NatsSubscriberOptions subscriber,
+        string role)
+    {
+        ValidateSubscriber(subscriber, role);
+
+        if (subscriber.AckMode is not NatsAckMode.AckAfterReceive)
+            return;
+
+        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
+        {
+            if (hostShutdownTimeout <= TimeSpan.Zero)
+                throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
+
+            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
+            if (requiredShutdownBudget > hostShutdownTimeout)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
+                    $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
+                    $"requires {requiredShutdownBudget}, which exceeds " +
+                    $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
+                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
+                    $"and mirror that value in {nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
+                    "or reduce the NATS shutdown/drain timeouts.");
+            }
+        }
+    }
+
     /// <summary>Validates the supplied options.</summary>
     public static void ValidateSubscriber(NatsSubscriberOptions subscriber, string role)
     {

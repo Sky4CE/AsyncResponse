@@ -53,7 +53,7 @@ internal abstract class NatsSubscriberService : BackgroundService
     /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        NatsTransportOptionsValidator.ValidateSubscriber(SubscriberOptions, Role.ToString());
+        NatsTransportOptionsValidator.ValidateSubscriber(Options, SubscriberOptions, Role.ToString());
 
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)

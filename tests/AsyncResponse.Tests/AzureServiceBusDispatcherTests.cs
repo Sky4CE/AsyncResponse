@@ -450,6 +450,11 @@ public sealed class AzureServiceBusDispatcherTests
                 calls.DeadLetterReason = reason;
                 calls.DeadLetterDescription = description;
                 return ValueTask.CompletedTask;
+            },
+            () =>
+            {
+                calls.RenewLock++;
+                return ValueTask.CompletedTask;
             });
 
     private sealed class SettlementCalls
@@ -459,6 +464,7 @@ public sealed class AzureServiceBusDispatcherTests
         public Exception? CompleteException;
         public int Abandon;
         public int DeadLetter;
+        public int RenewLock;
         public string? DeadLetterReason;
         public string? DeadLetterDescription;
     }

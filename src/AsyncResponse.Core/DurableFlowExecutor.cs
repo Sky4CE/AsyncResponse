@@ -86,16 +86,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
-        await using var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
-            store,
-            flowId,
-            _options,
-            _logger).ConfigureAwait(false);
+        await using var lease = await AcquireExecutionLeaseWithRetryAsync(store, flowId).ConfigureAwait(false);
         if (lease is null)
-        {
-            _logger.LogDebug("Durable flow {FlowId} is already executing on another worker; skipping duplicate delivery.", flowId);
             return;
-        }
 
         var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
@@ -177,6 +170,81 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Acquires the execution lease for <paramref name="flowId"/>, retrying while the current
+    /// holder's lease window elapses. Returns <c>null</c> when this delivery is safe to ack without
+    /// executing (flow terminal/absent, or the lease is held by a demonstrably live worker).
+    /// <para>
+    /// A held lease alone is NOT proof this delivery is a duplicate: the holder may have died
+    /// inside its unexpired lease window, and acking would drop the only wake-up the flow has —
+    /// wake-ups would silently become at-most-once and the <see cref="FlowRunStatus.Running"/> run
+    /// would strand. A dead holder's lease expires within <see cref="DurableFlowOptions.ExecutionLeaseDuration"/>,
+    /// so polling for one full duration + renew interval guarantees this delivery either takes over
+    /// (checkpoints make the re-run idempotent) or proves the holder alive.
+    /// </para>
+    /// </summary>
+    private async Task<FlowExecutionLease?> AcquireExecutionLeaseWithRetryAsync(IFlowStateStore store, string flowId)
+    {
+        var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            flowId,
+            _options,
+            _logger).ConfigureAwait(false);
+        if (lease is not null)
+            return lease;
+
+        // Poll ceiling: a lease can only stay held past its duration if the holder renewed it, so
+        // one full duration + renew interval of failed acquires proves the holder is alive. The 2s
+        // poll delay is capped by the renew interval so short test-sized leases still get polled.
+        var deadline = DateTime.UtcNow + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
+        var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
+            ? _options.ExecutionLeaseRenewInterval
+            : TimeSpan.FromSeconds(2);
+
+        while (true)
+        {
+            // Between attempts, look at the state itself: a terminal or absent flow needs no
+            // execution, and reporting it accurately beats a misleading "already executing" log.
+            var state = await store.LoadAsync(flowId).ConfigureAwait(false);
+            if (state is null)
+            {
+                _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
+                return null;
+            }
+
+            if (state.Status != FlowRunStatus.Running)
+            {
+                _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", flowId, state.Status);
+                await NotifyParentAsync(state).ConfigureAwait(false);
+                return null;
+            }
+
+            lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+                store,
+                flowId,
+                _options,
+                _logger).ConfigureAwait(false);
+            if (lease is not null)
+                return lease;
+
+            if (DateTime.UtcNow >= deadline)
+                break;
+
+            await Task.Delay(pollDelay).ConfigureAwait(false);
+        }
+
+        // The lease survived a full duration + renew window, so the holder is alive and renewing.
+        // Every execution is driven by a worker job that stays unacked until its handler completes,
+        // so if that live holder crashes later the broker redelivers its own job — this delivery is
+        // genuinely redundant and safe to ack. The retry loop above exists purely to cover
+        // deliveries that arrive inside a DEAD holder's unexpired lease window, which broker
+        // redelivery alone cannot cover.
+        _logger.LogDebug(
+            "Durable flow {FlowId} is executing on another live worker (lease renewed through the full wait window); skipping duplicate delivery.",
+            flowId);
+        return null;
+    }
+
     /// <inheritdoc />
     public async Task ResumeAsync(string flowId)
     {
@@ -212,6 +280,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
         var checkpointed = false;
+        var running = false;
 
         var found = await FlowStateConcurrency.MutateAsync(
             store,
@@ -220,7 +289,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             state =>
             {
                 checkpointed = false;
-                if (state.Status != FlowRunStatus.Running || state.Steps is null)
+                running = state.Status == FlowRunStatus.Running;
+                if (!running || state.Steps is null)
                     return false;
 
                 var pending = state.Steps.FirstOrDefault(pair =>
@@ -247,7 +317,18 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         if (!checkpointed)
         {
-            _logger.LogDebug("Durable flow {FlowId} has no pending step for recovered correlationId {CorrelationId}; ignoring duplicate.", flowId, correlationId);
+            if (!running)
+            {
+                _logger.LogDebug("Durable flow {FlowId} is already terminal; ignoring recovered correlationId {CorrelationId}.", flowId, correlationId);
+                return;
+            }
+
+            // Still Running with no matching pending step: a previous delivery may have crashed
+            // between checkpointing this response and enqueueing the run, making this redelivery
+            // the only remaining wake-up. Re-enqueue instead of dropping — it is idempotent, and
+            // worst case the job finds a live holder's lease and acks as a duplicate.
+            _logger.LogDebug("Durable flow {FlowId} has no pending step for recovered correlationId {CorrelationId}; re-enqueueing execution to cover a checkpoint/enqueue crash window.", flowId, correlationId);
+            await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
             return;
         }
 

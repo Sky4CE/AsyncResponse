@@ -123,6 +123,14 @@ public sealed class NatsAsyncResponseTransportOptions
     /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
     public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// The hosting shutdown budget that must contain NATS subscriber shutdown plus
+    /// <see cref="NatsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
+    /// <see cref="NatsAckMode.AckAfterReceive"/>. Defaults to the Generic Host default of
+    /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
+    /// </summary>
+    public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Adds or replaces a named NATS reply target.</summary>
     public NatsAsyncResponseTransportOptions AddReplyTarget(string name, string responseSubject)
     {

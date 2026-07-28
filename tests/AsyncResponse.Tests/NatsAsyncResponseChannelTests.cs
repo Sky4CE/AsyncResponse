@@ -267,17 +267,20 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task CreateResponseWaiter_SubscribeOrSaveFailureReturnsFaultedWaiter()
+    public async Task CreateResponseWaiter_SubscribeOrSaveFailureThrowsAndDeletesRecoveryState()
     {
         var failure = new InvalidOperationException("save failed");
         _store.Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(failure);
         var channel = CreateChannel();
 
-        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5));
-
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        // Must throw rather than return a pre-faulted waiter: the builder's contract is that the
+        // trigger only runs once the subscription AND recovery state exist, so a registration
+        // failure has to surface before any trigger could fire the remote operation.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.CreateResponseWaiter<OperationResult>("corr-a", timeout: TimeSpan.FromSeconds(5)));
         Assert.Same(failure, ex);
+        _store.Verify(s => s.TryDeleteAsync("corr-a", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

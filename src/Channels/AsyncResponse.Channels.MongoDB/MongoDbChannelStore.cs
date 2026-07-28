@@ -122,28 +122,41 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async Task SaveRecoveryStateAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
-        var document = new MongoRecoveryStateDocument
-        {
-            Id = RegistrationKey(correlationId, state.RegistrationId),
-            CorrelationId = correlationId,
-            RegistrationId = state.RegistrationId,
-            StateJson = AsyncResponseJson.Serialize(state),
-            ExpiresAtUtc = now.Add(ttl),
-            RegisteredAtUtc = now
-        };
-        await _recovery.ReplaceOneAsync(
-            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, document.Id),
-            document,
-            new ReplaceOptions { IsUpsert = true },
+        // Upsert pipeline stamped with the server clock ($$NOW), matching the message-side
+        // discipline (and the PG/SqlServer DB-clock discipline): app-clock expiry math would shift
+        // the recovery window by whatever the client clock is skewed.
+        await _recovery.UpdateOneAsync(
+            Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, state.RegistrationId)),
+            BuildRecoveryStateUpsertPipeline(correlationId, state, ttl),
+            new UpdateOptions { IsUpsert = true },
             cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Upsert pipeline for a recovery registration: every field is overwritten (a re-save refreshes
+    /// the registration), with <c>expires_at</c>/<c>registered_at</c> computed on the server clock.
+    /// </summary>
+    internal static UpdateDefinition<MongoRecoveryStateDocument> BuildRecoveryStateUpsertPipeline(
+        string correlationId,
+        RecoveryState state,
+        TimeSpan ttl)
+        => Builders<MongoRecoveryStateDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["correlation_id"] = correlationId,
+                ["registration_id"] = new BsonBinaryData(state.RegistrationId, GuidRepresentation.Standard),
+                ["state_json"] = AsyncResponseJson.Serialize(state),
+                ["expires_at"] = new BsonDocument("$add", new BsonArray { "$$NOW", ttl.TotalMilliseconds }),
+                ["registered_at"] = "$$NOW"
+            })
+        });
 
     public async Task<IReadOnlyList<string>> LoadRecoveryStatesAsync(string correlationId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoRecoveryStateDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
-                     & Builders<MongoRecoveryStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+                     & NotExpiredOnServerClock<MongoRecoveryStateDocument>();
         var documents = await _recovery.Find(filter)
             .SortBy(item => item.RegisteredAtUtc)
             .Project(item => item.StateJson)
@@ -163,7 +176,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async IAsyncEnumerable<string> ScanRecoveryStateJsonAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var filter = Builders<MongoRecoveryStateDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+        var filter = NotExpiredOnServerClock<MongoRecoveryStateDocument>();
         using var cursor = await _recovery.Find(filter)
             .SortBy(item => item.RegisteredAtUtc)
             .Project(item => item.StateJson)
@@ -349,37 +362,64 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async Task UpsertSubscriberAsync(string correlationId, Guid registrationId, string instanceId, TimeSpan ttl, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var document = new MongoChannelSubscriberDocument
-        {
-            Id = RegistrationKey(correlationId, registrationId),
-            CorrelationId = correlationId,
-            RegistrationId = registrationId,
-            InstanceId = instanceId,
-            ExpiresAtUtc = DateTime.UtcNow.Add(ttl)
-        };
-        await _subscribers.ReplaceOneAsync(
-            Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.Id, document.Id),
-            document,
-            new ReplaceOptions { IsUpsert = true },
+        await _subscribers.UpdateOneAsync(
+            Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId)),
+            BuildSubscriberUpsertPipeline(correlationId, registrationId, instanceId, ttl),
+            new UpdateOptions { IsUpsert = true },
             cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Upsert pipeline for a subscriber liveness document, with <c>expires_at</c> computed on the
+    /// server clock ($$NOW) — app-clock liveness math would let a skewed client look dead (or
+    /// immortal) to publishers comparing against server-side expiry.
+    /// </summary>
+    internal static UpdateDefinition<MongoChannelSubscriberDocument> BuildSubscriberUpsertPipeline(
+        string correlationId,
+        Guid registrationId,
+        string instanceId,
+        TimeSpan ttl)
+        => Builders<MongoChannelSubscriberDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["correlation_id"] = correlationId,
+                ["registration_id"] = new BsonBinaryData(registrationId, GuidRepresentation.Standard),
+                ["instance_id"] = instanceId,
+                ["expires_at"] = new BsonDocument("$add", new BsonArray { "$$NOW", ttl.TotalMilliseconds })
+            })
+        });
+
     public async Task HeartbeatSubscribersAsync(
         string instanceId,
-        IReadOnlyCollection<Guid> registrationIds,
+        IReadOnlyCollection<(string CorrelationId, Guid RegistrationId)> registrations,
         TimeSpan ttl,
         CancellationToken cancellationToken)
     {
-        if (registrationIds.Count == 0)
+        if (registrations.Count == 0)
             return;
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var filter = Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.InstanceId, instanceId)
-                     & Builders<MongoChannelSubscriberDocument>.Filter.In(item => item.RegistrationId, registrationIds);
-        await _subscribers.UpdateManyAsync(
-            filter,
-            Builders<MongoChannelSubscriberDocument>.Update.Set(item => item.ExpiresAtUtc, DateTime.UtcNow.Add(ttl)),
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        // Per-registration upserts rather than one bare UpdateMany: the caller only heartbeats
+        // registrations that are live in this process, so a missing document means the TTL reaper
+        // deleted it (e.g. after a >timeout stall) — re-creating it here is what brings the waiter
+        // back from "permanently invisible". Same document shape as UpsertSubscriberAsync.
+        var writes = new List<WriteModel<MongoChannelSubscriberDocument>>(registrations.Count);
+        foreach (var (correlationId, registrationId) in registrations)
+        {
+            writes.Add(new UpdateOneModel<MongoChannelSubscriberDocument>(
+                Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.Id, RegistrationKey(correlationId, registrationId)),
+                BuildSubscriberUpsertPipeline(correlationId, registrationId, instanceId, ttl))
+            {
+                IsUpsert = true
+            });
+        }
+
+        await _subscribers.BulkWriteAsync(
+            writes,
+            new BulkWriteOptions { IsOrdered = false },
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task DeleteSubscriberAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken)
@@ -394,9 +434,17 @@ internal sealed class MongoDbChannelStore : IDisposable
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelSubscriberDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
-                     & Builders<MongoChannelSubscriberDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+                     & NotExpiredOnServerClock<MongoChannelSubscriberDocument>();
         return await _subscribers.CountDocumentsAsync(filter, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Server-clock expiry filter (<c>$expr: expires_at &gt; $$NOW</c>): liveness and recovery
+    /// expiry are stamped with $$NOW, so comparing them against the app clock would reintroduce
+    /// the clock-skew hole the server-side stamps exist to close.
+    /// </summary>
+    internal static FilterDefinition<TDocument> NotExpiredOnServerClock<TDocument>()
+        => new BsonDocument("$expr", new BsonDocument("$gt", new BsonArray { "$expires_at", "$$NOW" }));
 
     /// <summary>
     /// Watches the message collection with a change stream and invokes

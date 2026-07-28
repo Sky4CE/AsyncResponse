@@ -6,10 +6,11 @@ namespace AsyncResponse.Tests;
 
 /// <summary>
 /// The registry coordinates per-channel serial-executor lifecycle. Its core guarantee is that a
-/// message handed to <see cref="SerialExecutorRegistry.Enqueue"/> is never dropped because the
-/// executor it would have used is concurrently being retired — the lifecycle race the old
-/// ConcurrentDictionary + fire-and-forget removal scheme was vulnerable to when a correlation id was
-/// reused mid-drain.
+/// message handed to <see cref="SerialExecutorRegistry.EnqueueAsync"/> for a channel with a live
+/// registration is never dropped because the executor it would have used is concurrently being
+/// retired — the lifecycle race the old ConcurrentDictionary + fire-and-forget removal scheme was
+/// vulnerable to when a correlation id was reused mid-drain. Channels with no registration are
+/// tombstoned after retirement so a straggling enqueue cannot recreate (and leak) an executor.
 /// </summary>
 public class SerialExecutorRegistryTests
 {
@@ -19,7 +20,7 @@ public class SerialExecutorRegistryTests
         var registry = new SerialExecutorRegistry(NullLogger.Instance);
         var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        registry.Enqueue("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
+        await registry.EnqueueAsync("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
 
         await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await registry.RemoveAsync("cid");
@@ -34,7 +35,7 @@ public class SerialExecutorRegistryTests
         for (var i = 0; i < 100; i++)
         {
             var index = i;
-            registry.Enqueue("cid", async () => { await Task.Yield(); order.Enqueue(index); });
+            await registry.EnqueueAsync("cid", async () => { await Task.Yield(); order.Enqueue(index); });
         }
 
         await registry.RemoveAsync("cid"); // drains
@@ -49,7 +50,7 @@ public class SerialExecutorRegistryTests
         var completed = 0;
 
         for (var i = 0; i < 20; i++)
-            registry.Enqueue("cid", async () => { await Task.Delay(2); Interlocked.Increment(ref completed); });
+            await registry.EnqueueAsync("cid", async () => { await Task.Delay(2); Interlocked.Increment(ref completed); });
 
         await registry.RemoveAsync("cid");
 
@@ -83,11 +84,14 @@ public class SerialExecutorRegistryTests
     {
         var registry = new SerialExecutorRegistry(NullLogger.Instance);
 
-        registry.Enqueue("cid", () => Task.CompletedTask);
+        // A live registration keeps the retirement tombstone from dropping the later enqueue —
+        // the same bookkeeping every channel performs for its active subscriptions.
+        registry.OnSubscriptionRegistered("cid");
+        await registry.EnqueueAsync("cid", () => Task.CompletedTask);
         await registry.RemoveAsync("cid");
 
         var ranAgain = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        registry.Enqueue("cid", () => { ranAgain.TrySetResult(); return Task.CompletedTask; });
+        await registry.EnqueueAsync("cid", () => { ranAgain.TrySetResult(); return Task.CompletedTask; });
 
         await ranAgain.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await registry.RemoveAsync("cid");
@@ -103,10 +107,15 @@ public class SerialExecutorRegistryTests
         var executed = 0;
         const int total = 500;
 
-        var producer = Task.Run(() =>
+        // The producer stands in for dispatch on behalf of a live waiter, so register the
+        // subscription the way the channels do — otherwise the retirement tombstone would
+        // (correctly) drop work for a channel nobody is subscribed to.
+        registry.OnSubscriptionRegistered("cid");
+
+        var producer = Task.Run(async () =>
         {
             for (var i = 0; i < total; i++)
-                registry.Enqueue("cid", () => { Interlocked.Increment(ref executed); return Task.CompletedTask; });
+                await registry.EnqueueAsync("cid", () => { Interlocked.Increment(ref executed); return Task.CompletedTask; });
         });
 
         var remover = Task.Run(async () =>
@@ -130,6 +139,9 @@ public class SerialExecutorRegistryTests
     public async Task RemoveDuringBackpressure_DrainsBeforeReplacementWithoutOverlap()
     {
         var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        // A live registration models the waiter this backpressure race happens on behalf of, so
+        // the enqueue racing the retirement is recreated rather than tombstone-dropped.
+        registry.OnSubscriptionRegistered("cid");
         var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var order = new ConcurrentQueue<int>();
@@ -197,7 +209,7 @@ public class SerialExecutorRegistryTests
             for (var i = 0; i < perChannel; i++)
             {
                 var index = i;
-                registry.Enqueue($"cid-{channel}", async () =>
+                await registry.EnqueueAsync($"cid-{channel}", async () =>
                 {
                     // If two items for the SAME channel are ever active at once, record the violation.
                     if (Interlocked.Increment(ref perChannelConcurrent[channel]) > 1)
@@ -225,5 +237,65 @@ public class SerialExecutorRegistryTests
             Assert.Equal(0, perChannelOverlap[c]);  // never two at once within one correlation id
             Assert.Equal(Enumerable.Range(0, perChannel).ToArray(), completionOrder[c].ToArray()); // FIFO per cid
         }
+    }
+
+    [Fact]
+    public async Task EnqueueAfterRetirement_WithoutRegistration_IsDroppedByTombstone()
+    {
+        // The leak fix: cleanup schedules RemoveAsync while a straggling enqueue is still in
+        // flight. With no registration left for the channel, recreating an executor would leak it
+        // (nothing retires it again) and the work would no-op anyway — so the tombstone drops it.
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        await registry.EnqueueAsync("cid", () => Task.CompletedTask);
+        await registry.RemoveAsync("cid");
+
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
+
+        // RemoveAsync now completes immediately (no executor was recreated), and the work never ran.
+        await registry.RemoveAsync("cid");
+        Assert.False(ran.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task NewRegistration_LiftsTombstone_SoReusedChannelDeliversAgain()
+    {
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        registry.OnSubscriptionRegistered("cid");
+        await registry.EnqueueAsync("cid", () => Task.CompletedTask);
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid"); // tombstoned: no registration remains
+
+        // A new waiter reuses the correlation id: registration must lift the tombstone so its
+        // deliveries run immediately instead of being dropped for the tombstone lifetime.
+        registry.OnSubscriptionRegistered("cid");
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
+
+        await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid");
+    }
+
+    [Fact]
+    public async Task Retirement_WithAnotherWaiterStillRegistered_DoesNotDropItsWork()
+    {
+        // Fan-out: two waiters share one correlation id. The first waiter's cleanup retires the
+        // shared executor; the second waiter's deliveries must keep flowing (the tombstone only
+        // applies once no registration remains).
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        registry.OnSubscriptionRegistered("cid");
+        registry.OnSubscriptionRegistered("cid");
+        await registry.EnqueueAsync("cid", () => Task.CompletedTask);
+
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid"); // first waiter's cleanup
+
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
+
+        await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid");
     }
 }

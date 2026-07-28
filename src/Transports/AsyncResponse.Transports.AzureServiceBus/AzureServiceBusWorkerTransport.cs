@@ -86,9 +86,12 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDis
 
         try
         {
-            var messageId = string.IsNullOrWhiteSpace(job.CorrelationId)
-                ? Guid.NewGuid().ToString("N")
-                : job.CorrelationId;
+            // Every message carries a fresh MessageId: MessageId is the duplicate-detection key, so
+            // reusing the correlation id would silently drop the second job of a flow published on a
+            // dedup-enabled queue inside its detection window (distinct jobs of one flow share the
+            // correlation id). The correlation id still travels in the Service Bus CorrelationId
+            // system property and the configured application property.
+            var messageId = Guid.NewGuid().ToString("N");
             var properties = new Dictionary<string, object?>(StringComparer.Ordinal);
             if (!string.IsNullOrWhiteSpace(job.CorrelationId))
                 properties[_options.CorrelationIdProperty] = job.CorrelationId;

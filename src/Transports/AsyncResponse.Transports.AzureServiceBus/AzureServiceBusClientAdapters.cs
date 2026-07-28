@@ -131,7 +131,8 @@ internal sealed class AzureServiceBusReceiverAdapter(
                 message,
                 deadLetterReason: reason,
                 deadLetterErrorDescription: description,
-                cancellationToken: CancellationToken.None)));
+                cancellationToken: CancellationToken.None)),
+            () => new ValueTask(inner.RenewMessageLockAsync(message, CancellationToken.None)));
 
     /// <summary>Closes the receiver link.</summary>
     public Task CloseAsync(CancellationToken cancellationToken = default)
@@ -157,4 +158,5 @@ internal sealed record AzureServiceBusTransportDelivery(
     IReadOnlyDictionary<string, object?> ApplicationProperties,
     Func<ValueTask> CompleteAsync,
     Func<ValueTask> AbandonAsync,
-    Func<string, string?, ValueTask> DeadLetterAsync);
+    Func<string, string?, ValueTask> DeadLetterAsync,
+    Func<ValueTask> RenewLockAsync);
