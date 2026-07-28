@@ -29,6 +29,17 @@ public sealed class CosmosDurableFlowStateStoreTests
 
         Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
 
+        // An ETag moving under an expired-slot reclaim no longer concedes outright — the TTL purge
+        // itself can bump it. A purge race heals on the next attempt's create; only exhaustion (or
+        // reading a live document) reports the slot as taken.
+        harness.Container
+            .SetupSequence(container => container.CreateItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CosmosError(HttpStatusCode.Conflict))
+            .ReturnsAsync((ItemResponse<CosmosFlowStateDocument>)null!);
         harness.Container
             .Setup(container => container.ReplaceItemAsync(
                 It.IsAny<CosmosFlowStateDocument>(),
@@ -37,6 +48,16 @@ public sealed class CosmosDurableFlowStateStoreTests
                 It.IsAny<ItemRequestOptions>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(CosmosError(HttpStatusCode.PreconditionFailed));
+        Assert.True(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
+
+        // Every attempt conflicting while every replace 412s = the bounded loop exhausts.
+        harness.Container
+            .Setup(container => container.CreateItemAsync(
+                It.IsAny<CosmosFlowStateDocument>(),
+                It.IsAny<PartitionKey?>(),
+                It.IsAny<ItemRequestOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(CosmosError(HttpStatusCode.Conflict));
         Assert.False(await harness.Store.TryCreateAsync("flow", state, TimeSpan.FromMinutes(1)));
 
         state.Revision = 1;

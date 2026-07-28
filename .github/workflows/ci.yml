@@ -193,10 +193,26 @@ jobs:
           # those two large images again in the job whose distinct purpose is the Native AOT SUT.
           ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: "true"
         run: |
-          dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
-            --configuration Release --no-build \
-            --report-trx \
-            --results-directory "${{ github.workspace }}/TestResults/IntegrationAot"
+          # The Aspire fixture boots ~11 containers/emulators plus the SUT apps; on 2-core hosted
+          # runners that boot itself intermittently times out or a resource fails to start before
+          # any test executes. Retry once on that exact signature only — genuine test failures
+          # never produce it, so they still fail the job on the first pass.
+          run_integration_tests() {
+            dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
+              --configuration Release --no-build \
+              --report-trx \
+              --results-directory "${{ github.workspace }}/TestResults/IntegrationAot" \
+              2>&1 | tee itest-console.log
+            return "${PIPESTATUS[0]}"
+          }
+          if ! run_integration_tests; then
+            if grep -q "IntegrationFixture' threw in InitializeAsync" itest-console.log; then
+              echo "::warning::Integration fixture failed to boot (known hosted-runner resource flake) — retrying the suite once."
+              run_integration_tests
+            else
+              exit 1
+            fi
+          fi
 
       - name: Upload integration test results (AOT SUT)
         if: always()
@@ -245,10 +261,24 @@ jobs:
         # emulator, Azure Service Bus emulator, LocalStack (SQS), RabbitMQ, NATS, PostgreSQL,
         # SQL Server, Kafka, MongoDB (single-node replica set), and SUT apps.
         run: |
-          dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
-            --configuration Release --no-build \
-            --report-trx \
-            --results-directory "${{ github.workspace }}/TestResults/Integration"
+          # Same targeted boot-flake retry as the AOT integration job: rerun once only when the
+          # failure signature is the Aspire fixture failing to initialize, never for test failures.
+          run_integration_tests() {
+            dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
+              --configuration Release --no-build \
+              --report-trx \
+              --results-directory "${{ github.workspace }}/TestResults/Integration" \
+              2>&1 | tee itest-console.log
+            return "${PIPESTATUS[0]}"
+          }
+          if ! run_integration_tests; then
+            if grep -q "IntegrationFixture' threw in InitializeAsync" itest-console.log; then
+              echo "::warning::Integration fixture failed to boot (known hosted-runner resource flake) — retrying the suite once."
+              run_integration_tests
+            else
+              exit 1
+            fi
+          fi
 
       - name: Upload integration test results
         if: always()

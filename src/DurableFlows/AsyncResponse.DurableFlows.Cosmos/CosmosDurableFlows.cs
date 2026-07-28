@@ -150,8 +150,14 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         // the server's TTL sweep can physically purge an expired document between our create's
         // 409 and the follow-up read (or the conditional replace). A vanished conflicting
         // document means the slot is free — create again — not that a live competitor won.
+        // The short growing delay lets one purge cycle finish instead of burning all attempts
+        // inside the same inconsistency window (the Linux emulator is markedly worse here than
+        // the service, but the race itself is real on both).
         for (var attempt = 0; attempt < 4; attempt++)
         {
+            if (attempt > 0)
+                await Task.Delay(TimeSpan.FromMilliseconds(50 * attempt), cancellationToken).ConfigureAwait(false);
+
             var now = DateTime.UtcNow;
             var document = CreateDocument(flowId, stateJson, state.Revision, ttl, now);
             try
@@ -180,8 +186,11 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
                 }
                 catch (CosmosException retryEx) when (retryEx.StatusCode == HttpStatusCode.PreconditionFailed)
                 {
-                    // The ETag moved under us: a live writer (create or expired-replace) won.
-                    return false;
+                    // The ETag moved under us. That is either a live writer winning the id or the
+                    // TTL purge touching the expired document; only the next read can tell them
+                    // apart, so retry instead of conceding — a live occupant surfaces as an
+                    // unexpired read (false) on the next attempt, a purged one as a clean create.
+                    continue;
                 }
                 catch (CosmosException retryEx) when (retryEx.StatusCode == HttpStatusCode.NotFound)
                 {

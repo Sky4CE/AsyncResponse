@@ -59,6 +59,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   on the database server's clock, removing client clock-skew from lease takeover.
 - A shared raw-JSON response could be deserialized concurrently by racing dispatches of duplicate
   deliveries, corrupting its memoization; the cache is now synchronized.
+- The Cosmos DB flow store's expired-slot reclaim no longer concedes on a moved ETag — the TTL
+  purge itself can bump it mid-reclaim — and backs off briefly between attempts, so a purge race
+  heals instead of spuriously reporting the flow id as taken (markedly more likely on the Linux
+  emulator, but real on the service too).
 - MongoDB transport publishes stamped `available_at` with the client clock while the claim filter
   compares it against the server clock (`$$NOW`), so a client running ahead of the server briefly
   hid fresh messages from consumers; inserts now mark messages available immediately on arrival,
