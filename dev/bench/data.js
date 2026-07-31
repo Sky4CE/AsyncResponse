@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785494044339,
+  "lastUpdate": 1785494067359,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -45356,6 +45356,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2183.70553866338,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "e0927c8112ebe6e98b2850e05a3831da88ed84b9",
+          "message": "fix: pre-release hardening — close all verified review findings\n- shutdown budget: stock early-ACK config no longer throws at startup on any\n  transport (drain default 20s, close 5s where consumed, phantom ShutdownTimeout\n  removed on SqlServer/Kafka/Redis/NATS/SQS; one shared budget validator)\n- close silent-loss races: lost-subscriber re-check before empty-state return,\n  Redis register-before-subscribe + tombstone warn log, channel cleanup always\n  runs local teardown, in-memory transport quiesces so follow-up jobs enqueued\n  during drain still execute\n- ASB lock renewal cancellable end-to-end, drain bounded by ShutdownTimeout\n- ingress: retry transient response-publish failures before SetException;\n  propagate double-faults so transport redelivery applies\n- authorizer now covers IDurableFlowExecutor (allowlist includes it by default,\n  AllowDurableFlowExecutor to opt out); security docs updated\n- durable flows: lease poll aborts on host shutdown for redelivery, Mongo create\n  stamps the server clock, Cosmos lease writes preserve remaining ttl\n- SQS renewal sweep no longer overwrites RedeliveryDelay; backoff gains half-jitter\n- rename AckAfterReceive -> AckAfterEnqueue (ASB/NATS/PG) to match the other seven\n- vacuous regression tests made distinguishing; stock-config startup tests for all\n  10 transports; clock-authority docs column; CHANGELOG updated",
+          "timestamp": "2026-07-31T12:17:05+02:00",
+          "tree_id": "5804e15ec5e290743d75f685d60f13c0169cbd89",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/e0927c8112ebe6e98b2850e05a3831da88ed84b9"
+        },
+        "date": 1785494067044,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 134311.33474843757,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 107295.21635007425,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 81865.19029890947,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 272937.6828682475,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 424924.36346330354,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 311775.1228393984,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 340469.57563872094,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 235278.6169381782,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 267792.1076310039,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 272729.25621277245,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 301066.9813820179,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 252591.589710429,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 435608.37065045047,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 213599.26726907358,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 63590.287270394554,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 57435.561894399434,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 20815.70936607006,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4803.893074947938,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 174431.17992227347,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 78451.06222738256,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1508864.5794039986,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2357.171439530255,
             "unit": "flows/s"
           }
         ]
