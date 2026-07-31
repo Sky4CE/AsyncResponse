@@ -15,7 +15,16 @@ public enum FlowRunStatus
     /// The run was terminally failed — by a <see cref="DurableFlowFailedException"/>, or by the
     /// lost-subscriber failure route of an awaited step.
     /// </summary>
-    Failed = 2
+    Failed = 2,
+
+    /// <summary>
+    /// The run is parked by an operator. Wake-ups, recoveries, resumes, and failure signals are
+    /// all ignored while suspended, so a dead-lettered run cannot be resurrected or terminally
+    /// failed behind the operator's back by a late response. Not terminal: set the status back to
+    /// <see cref="Running"/> and call <c>IDurableFlowExecutor.ResumeAsync</c> to replay the run
+    /// from its checkpoints. A parent awaiting a suspended child keeps waiting.
+    /// </summary>
+    Suspended = 3
 }
 
 /// <summary>

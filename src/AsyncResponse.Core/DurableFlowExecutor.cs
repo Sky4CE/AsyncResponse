@@ -295,6 +295,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
         var checkpointed = false;
         var running = false;
+        var lastStatus = FlowRunStatus.Running;
 
         var found = await FlowStateConcurrency.MutateAsync(
             store,
@@ -303,6 +304,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             state =>
             {
                 checkpointed = false;
+                lastStatus = state.Status;
                 running = state.Status == FlowRunStatus.Running;
                 if (!running || state.Steps is null)
                     return false;
@@ -333,7 +335,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         {
             if (!running)
             {
-                _logger.LogDebug("Durable flow {FlowId} is already terminal; ignoring recovered correlationId {CorrelationId}.", flowId, correlationId);
+                _logger.LogDebug("Durable flow {FlowId} is {Status}; ignoring recovered correlationId {CorrelationId}.", flowId, lastStatus, correlationId);
                 return;
             }
 
@@ -503,6 +505,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private Task NotifyParentAsync(FlowState state)
     {
         if (string.IsNullOrWhiteSpace(state.ParentFlowId))
+            return Task.CompletedTask;
+
+        // A suspended child cannot unblock its parent — the parent would only re-attach and go
+        // back to waiting. The terminal transition after an operator un-suspends notifies then.
+        if (state.Status == FlowRunStatus.Suspended)
             return Task.CompletedTask;
 
         var parentFlowId = state.ParentFlowId;

@@ -833,9 +833,9 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             await sql.EnsureCreatedAsync();
             await sql.EnsureCreatedAsync();
 
-            var subscription1 = Subscription(typeof(SqlServerAsyncResponseChannel), "SqlServerSubscription`1", channel, _ => new ValueTask<bool>(true));
-            var subscription2 = Subscription(typeof(SqlServerAsyncResponseChannel), "SqlServerSubscription`1", channel, _ => new ValueTask<bool>(true));
-            var subscription3 = Subscription(typeof(SqlServerAsyncResponseChannel), "SqlServerSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription1 = Subscription(typeof(SqlServerAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription2 = Subscription(typeof(SqlServerAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription3 = Subscription(typeof(SqlServerAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
             
             SetField(subscription1.Instance, "_dropped", true);
 
@@ -878,7 +878,7 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             var message2 = new SqlServerChannelMessage(messageId2, "corr", "{}", DateTimeOffset.UtcNow);
             var dispatchMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             
-            var subInterfaceType = typeof(SqlServerAsyncResponseChannel).GetNestedType("ISqlServerSubscription", BindingFlags.NonPublic)!;
+            var subInterfaceType = typeof(SqlServerAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
             var subArray = Array.CreateInstance(subInterfaceType, 3);
             subArray.SetValue(subscription1.Instance, 0); // Dropped
             subArray.SetValue(subscription2.Instance, 1); // Already seen
@@ -887,7 +887,7 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             await (Task)dispatchMethod.Invoke(channel, [message2, subArray, CancellationToken.None])!;
 
             // Start dispatcher to cover its background task dispose/cancellation
-            var ensureDispatcherStartedMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("EnsureDispatcherStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var ensureDispatcherStartedMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("EnsureListenerStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
             ensureDispatcherStartedMethod.Invoke(channel, null);
 
             await channel.DisposeAsync();
@@ -902,7 +902,7 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
         Func<OperationResult, ValueTask<bool>> predicate)
     {
         var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+        var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
             .MakeGenericType(typeof(OperationResult));
         var instance = Activator.CreateInstance(
             type,

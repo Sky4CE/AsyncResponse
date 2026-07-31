@@ -71,10 +71,15 @@ owns the full story — this page is the map, not the territory.
 
 - **Symptom:** a startup warning about delivery attempts, or a failing message that redelivers
   endlessly instead of dead-lettering.
-- **Cause:** the broker does not count plain `basic.nack` requeues, so `MaxDeliveryAttempts`
-  values above 2 need the TTL-retry dead-letter cycle to make attempts countable.
-- **Fix:** let the package declare the cycle (`DeclareTopology` on), declare it in your own
-  topology when infra owns it, or keep `MaxDeliveryAttempts` at 2 or below. See
+- **Cause:** `MaxDeliveryAttempts` defaults to `0` (unlimited): a persistently failing message
+  requeues forever rather than being silently dropped — deliberate for a durability-focused
+  default, but it means poison protection is opt-in. Additionally, the broker does not count
+  plain `basic.nack` requeues, so `MaxDeliveryAttempts` values above 2 need the TTL-retry
+  dead-letter cycle to make attempts countable.
+- **Fix:** for production, set a positive `MaxDeliveryAttempts` **and** configure
+  `DeadLetterExchange` (so capped-out messages are preserved, not dropped); let the package
+  declare the cycle (`DeclareTopology` on), declare it in your own topology when infra owns it,
+  or keep `MaxDeliveryAttempts` at 2 or below. See
   [transport options](configuration.md#transport-options).
 
 ## Durable flows

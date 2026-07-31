@@ -13,6 +13,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Added
 
+- `FlowRunStatus.Suspended` — operator parking for durable flow runs. A suspended run ignores
+  wake-ups, recoveries, resumes, and failure signals (a parent awaiting a suspended child keeps
+  waiting), so a dead-lettered `Running` run can be taken under manual control without a late
+  response resurrecting it. Set the status back to `Running` and call `ResumeAsync` to replay.
 - `AsyncResponseCallbackAllowList.AllowDurableFlowExecutor` (default `true`): the allowlist
   authorizer now covers `IDurableFlowExecutor` explicitly instead of the reflection layer exempting
   it from authorization. Custom `IAsyncResponseCallbackAuthorizer` implementations must allow
@@ -48,6 +52,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   still finalize immediately.
 - Retry backoff (subscriber reconnect loops, ingress retries) now applies half-jitter so replicas
   don't reconnect in lockstep waves after a broker blip.
+- The PostgreSQL, SQL Server, and MongoDB response channels now share one source-included
+  implementation of the provider-agnostic machinery (dispatch, heartbeat, delivery confirmation,
+  cleanup, subscriptions) — previously three ~1,150-line near-copies, now thin provider classes
+  over a single shared base. Internal only: no public API or behavior change, and per-message
+  paths keep direct (non-virtual) store calls.
 - The SQL Server transport's receive spans are renamed to `asyncresponse.sqlserver.receive`
   (previously `asyncresponse.worker.receive` / `asyncresponse.response.receive`), matching every
   other transport's naming; the role still travels as a span tag.

@@ -718,7 +718,7 @@ public sealed class MongoDbChannelCoverageTests
         {
             var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             var nested = typeof(MongoDbAsyncResponseChannel)
-                .GetNestedType("MongoDbSubscription`1", BindingFlags.NonPublic)!
+                .BaseType!.GetNestedType("DbSubscription`1", BindingFlags.NonPublic)!
                 .MakeGenericType(typeof(OperationResult));
             var instance = Activator.CreateInstance(
                 nested,
@@ -742,7 +742,7 @@ public sealed class MongoDbChannelCoverageTests
 
     private static async Task DispatchAsync(MongoDbAsyncResponseChannel channel, MongoDbChannelMessage message, params object[] subscriptions)
     {
-        var interfaceType = typeof(MongoDbAsyncResponseChannel).GetNestedType("IMongoDbSubscription", BindingFlags.NonPublic)!;
+        var interfaceType = typeof(MongoDbAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
         var array = Array.CreateInstance(interfaceType, subscriptions.Length);
         for (var index = 0; index < subscriptions.Length; index++)
             array.SetValue(subscriptions[index], index);

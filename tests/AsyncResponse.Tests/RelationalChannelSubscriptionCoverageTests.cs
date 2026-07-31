@@ -46,11 +46,11 @@ public sealed class RelationalChannelSubscriptionCoverageTests
 
         await ExerciseAsync(
             typeof(SqlServerAsyncResponseChannel),
-            "SqlServerSubscription`1",
+            "DbSubscription`1",
             channel,
             json => new SqlServerChannelMessage(Guid.NewGuid(), "corr", json, DateTimeOffset.UtcNow));
 
-        var nestedType = typeof(SqlServerAsyncResponseChannel).GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
+        var nestedType = typeof(SqlServerAsyncResponseChannel).BaseType!.GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
         var confirmation = Activator.CreateInstance(nestedType, [channel, Guid.NewGuid(), new TaskCompletionSource<bool>()])!;
         ((IDisposable)confirmation).Dispose();
 
@@ -77,11 +77,11 @@ public sealed class RelationalChannelSubscriptionCoverageTests
 
         await ExerciseAsync(
             typeof(PostgreSqlAsyncResponseChannel),
-            "PostgreSqlSubscription`1",
+            "DbSubscription`1",
             channel,
             json => new PostgreSqlChannelMessage(Guid.NewGuid(), "corr", json, DateTimeOffset.UtcNow));
 
-        var nestedType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
+        var nestedType = typeof(PostgreSqlAsyncResponseChannel).BaseType!.GetNestedType("PendingConfirmation", BindingFlags.NonPublic)!;
         var confirmation = Activator.CreateInstance(nestedType, [channel, Guid.NewGuid(), new TaskCompletionSource<bool>()])!;
         ((IDisposable)confirmation).Dispose();
 
@@ -139,7 +139,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         Func<OperationResult, ValueTask<bool>> predicate)
     {
         var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+        var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
             .MakeGenericType(typeof(OperationResult));
         var instance = Activator.CreateInstance(
             type,
@@ -304,13 +304,13 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             new FakeDebugLogger<SqlServerAsyncResponseChannel>());
 
         // 1. Test DispatchMessageToSubscribersAsync with subscription marked dropped or seen
-        var subscription = Subscription(typeof(SqlServerAsyncResponseChannel), "SqlServerSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription = Subscription(typeof(SqlServerAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
         SetField(subscription.Instance, "_dropped", true);
 
         var message = new SqlServerChannelMessage(Guid.NewGuid(), "corr", "null", DateTimeOffset.UtcNow);
         var dispatchMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
 
-        var subInterfaceType = typeof(SqlServerAsyncResponseChannel).GetNestedType("ISqlServerSubscription", BindingFlags.NonPublic)!;
+        var subInterfaceType = typeof(SqlServerAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
         var subArray = Array.CreateInstance(subInterfaceType, 1);
         subArray.SetValue(subscription.Instance, 0);
 
@@ -386,13 +386,13 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             new FakeDebugLogger<PostgreSqlAsyncResponseChannel>());
 
         // 1. Test DispatchMessageToSubscribersAsync with subscription marked dropped or seen
-        var subscription = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription = Subscription(typeof(PostgreSqlAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
         SetField(subscription.Instance, "_dropped", true);
 
         var message = new PostgreSqlChannelMessage(Guid.NewGuid(), "corr", "null", DateTimeOffset.UtcNow);
         var dispatchMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
 
-        var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("IPostgreSqlSubscription", BindingFlags.NonPublic)!;
+        var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
         var subArray = Array.CreateInstance(subInterfaceType, 1);
         subArray.SetValue(subscription.Instance, 0);
 

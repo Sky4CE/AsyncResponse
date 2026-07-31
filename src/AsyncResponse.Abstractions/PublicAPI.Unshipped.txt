@@ -38,6 +38,7 @@ AsyncResponse.FlowRunStatus
 AsyncResponse.FlowRunStatus.Failed = 2 -> AsyncResponse.FlowRunStatus
 AsyncResponse.FlowRunStatus.Running = 0 -> AsyncResponse.FlowRunStatus
 AsyncResponse.FlowRunStatus.Succeeded = 1 -> AsyncResponse.FlowRunStatus
+AsyncResponse.FlowRunStatus.Suspended = 3 -> AsyncResponse.FlowRunStatus
 AsyncResponse.FlowState
 AsyncResponse.FlowState.Attempts.get -> int
 AsyncResponse.FlowState.Attempts.set -> void

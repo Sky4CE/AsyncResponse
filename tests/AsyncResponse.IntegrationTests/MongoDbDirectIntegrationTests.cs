@@ -542,9 +542,9 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         await store.EnsureCreatedAsync();
         await store.EnsureCreatedAsync();
 
-        var subscription1 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
-        var subscription2 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
-        var subscription3 = Subscription(typeof(MongoDbAsyncResponseChannel), "MongoDbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription1 = Subscription(typeof(MongoDbAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription2 = Subscription(typeof(MongoDbAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+        var subscription3 = Subscription(typeof(MongoDbAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
 
         SetField(subscription1.Instance, "_dropped", true);
 
@@ -585,7 +585,7 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         var message2 = new MongoDbChannelMessage(messageId2, "corr", "{}", DateTimeOffset.UtcNow);
         var dispatchMethod = typeof(MongoDbAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
 
-        var subInterfaceType = typeof(MongoDbAsyncResponseChannel).GetNestedType("IMongoDbSubscription", BindingFlags.NonPublic)!;
+        var subInterfaceType = typeof(MongoDbAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
         var subArray = Array.CreateInstance(subInterfaceType, 3);
         subArray.SetValue(subscription1.Instance, 0); // Dropped
         subArray.SetValue(subscription2.Instance, 1); // Already seen
@@ -608,7 +608,7 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         Func<OperationResult, ValueTask<bool>> predicate)
     {
         var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+        var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
             .MakeGenericType(typeof(OperationResult));
         var instance = Activator.CreateInstance(
             type,

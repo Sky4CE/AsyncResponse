@@ -899,9 +899,9 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             // Cover HeartbeatSubscribersAsync empty collection fast return
             await sql.HeartbeatSubscribersAsync("instance", [], TimeSpan.FromMinutes(1), CancellationToken.None);
 
-            var subscription1 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
-            var subscription2 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
-            var subscription3 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "PostgreSqlSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription1 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription2 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
+            var subscription3 = Subscription(typeof(PostgreSqlAsyncResponseChannel), "DbSubscription`1", channel, _ => new ValueTask<bool>(true));
             
             SetField(subscription1.Instance, "_dropped", true);
 
@@ -942,7 +942,7 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             var message2 = new PostgreSqlChannelMessage(messageId2, "corr", "{}", DateTimeOffset.UtcNow);
             var dispatchMethod = typeof(PostgreSqlAsyncResponseChannel).GetMethod("DispatchMessageToSubscribersAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             
-            var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).GetNestedType("IPostgreSqlSubscription", BindingFlags.NonPublic)!;
+            var subInterfaceType = typeof(PostgreSqlAsyncResponseChannel).BaseType!.GetNestedType("IDbSubscription", BindingFlags.NonPublic)!;
             var subArray = Array.CreateInstance(subInterfaceType, 3);
             subArray.SetValue(subscription1.Instance, 0); // Dropped
             subArray.SetValue(subscription2.Instance, 1); // Already seen
@@ -966,7 +966,7 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
         Func<OperationResult, ValueTask<bool>> predicate)
     {
         var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var type = channelType.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
+        var type = channelType.BaseType!.GetNestedType(nestedTypeName, BindingFlags.NonPublic)!
             .MakeGenericType(typeof(OperationResult));
         var instance = Activator.CreateInstance(
             type,

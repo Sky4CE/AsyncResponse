@@ -15,6 +15,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\DbChannelShared.cs" Link="DbChannelShared.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
   </ItemGroup>
 

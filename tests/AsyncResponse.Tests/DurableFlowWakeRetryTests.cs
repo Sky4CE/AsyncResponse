@@ -47,22 +47,25 @@ public sealed class DurableFlowWakeRetryTests
         var state = RunnableState("live-holder-flow");
         await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
 
-        // A live holder: keeps renewing its lease the whole time the waiter polls.
-        Assert.True(await store.TryAcquireLeaseAsync(state.FlowId!, "live-holder", TimeSpan.FromMilliseconds(300)));
+        // A live holder: keeps renewing its lease the whole time the waiter polls. The 1s lease
+        // against a 50ms renew cadence gives a ~20x starvation margin so a loaded test runner
+        // cannot let the lease lapse mid-poll (a lapse would make the retrier's takeover correct
+        // behavior and fail the assertions below for the wrong reason).
+        Assert.True(await store.TryAcquireLeaseAsync(state.FlowId!, "live-holder", TimeSpan.FromSeconds(1)));
         using var renewals = new CancellationTokenSource();
         var renewLoop = Task.Run(async () =>
         {
             while (!renewals.IsCancellationRequested)
             {
-                await store.TryRenewLeaseAsync(state.FlowId!, "live-holder", TimeSpan.FromMilliseconds(300));
+                await store.TryRenewLeaseAsync(state.FlowId!, "live-holder", TimeSpan.FromSeconds(1));
                 await Task.Delay(50);
             }
         });
 
         await using var harness = CreateHarness(store, new DurableFlowOptions
         {
-            ExecutionLeaseDuration = TimeSpan.FromMilliseconds(300),
-            ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(100)
+            ExecutionLeaseDuration = TimeSpan.FromSeconds(1),
+            ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(200)
         });
 
         var waited = System.Diagnostics.Stopwatch.StartNew();
@@ -79,11 +82,11 @@ public sealed class DurableFlowWakeRetryTests
         }
         waited.Stop();
 
-        // The give-up must come AFTER the full proving window (duration 300ms + renew 100ms), not
+        // The give-up must come AFTER the full proving window (duration 1s + renew 200ms), not
         // instantly — an instant return is the old at-most-once hole this file guards against.
         Assert.True(
-            waited.Elapsed >= TimeSpan.FromMilliseconds(300),
-            $"Gave up after {waited.ElapsedMilliseconds}ms; expected to poll through the ~400ms lease-proving window.");
+            waited.Elapsed >= TimeSpan.FromSeconds(1),
+            $"Gave up after {waited.ElapsedMilliseconds}ms; expected to poll through the ~1.2s lease-proving window.");
 
         var final = await store.LoadAsync(state.FlowId!);
         Assert.Equal(FlowRunStatus.Running, final!.Status);
@@ -110,6 +113,54 @@ public sealed class DurableFlowWakeRetryTests
         harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
             It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
             It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task RecoverAsync_SuspendedFlow_IgnoresRecovery_WithoutCheckpointOrReenqueue()
+    {
+        // Operator parking: a dead-lettered-but-Running run set to Suspended must not be
+        // resurrected (or mutated) behind the operator's back by a late recovered response.
+        var store = new InMemoryFlowStateStore();
+        var state = RunnableState("suspended-flow");
+        state.Status = FlowRunStatus.Suspended;
+        state.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
+        {
+            ["step"] = new FlowStepState { PendingCorrelationId = "cid-parked" }
+        };
+        await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        await using var harness = CreateHarness(store, new DurableFlowOptions());
+
+        await harness.Executor.RecoverAsync(state.FlowId!, new OperationResult(), "cid-parked");
+
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        var reloaded = await store.LoadAsync(state.FlowId!);
+        Assert.Equal(FlowRunStatus.Suspended, reloaded!.Status);
+        Assert.False(reloaded.Steps!["step"].Completed);
+        Assert.Equal("cid-parked", reloaded.Steps["step"].PendingCorrelationId);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_SuspendedFlow_SkipsWithoutExecuting_AndWithoutWakingParent()
+    {
+        var store = new InMemoryFlowStateStore();
+        var state = RunnableState("suspended-child");
+        state.Status = FlowRunStatus.Suspended;
+        state.ParentFlowId = "parent-flow";
+        state.ParentStepName = "await-child";
+        await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5));
+        await using var harness = CreateHarness(store, new DurableFlowOptions());
+
+        await harness.Executor.ExecuteAsync(state.FlowId!);
+
+        // A suspended child cannot unblock its parent — waking it would only re-suspend.
+        harness.Builder.Verify(instance => instance.EnqueueWorkerAsync(
+            It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        var reloaded = await store.LoadAsync(state.FlowId!);
+        Assert.Equal(FlowRunStatus.Suspended, reloaded!.Status);
+        Assert.Equal(0, reloaded.Attempts);
     }
 
     [Fact]
