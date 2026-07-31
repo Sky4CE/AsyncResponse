@@ -1,0 +1,511 @@
+Summary - AsyncResponse
+  Generated on: 07/31/2026 - 14:49:37
+  Parser: MultiReport (3x Cobertura)
+  Assemblies: 27
+  Classes: 438
+  Files: 199
+  Line coverage: 98.2%
+  Covered lines: 23117
+  Uncovered lines: 420
+  Coverable lines: 23537
+  Total lines: 36307
+  Branch coverage: 94.8% (7958 of 8388)
+  Covered branches: 7958
+  Total branches: 8388
+  Method coverage: 98.8% (2688 of 2718)
+  Full method coverage: 94.4% (2566 of 2718)
+  Covered methods: 2688
+  Fully covered methods: 2566
+  Total methods: 2718
+
+AsyncResponse.Abstractions                                                                                            100%
+  AsyncResponse.AsyncResponseContext                                                                                  100%
+  AsyncResponse.AsyncResponseContext.ContextScope                                                                     100%
+  AsyncResponse.AsyncResponseContext.CorrelationScope                                                                 100%
+  AsyncResponse.AsyncResponseDomainFailureException                                                                   100%
+  AsyncResponse.AsyncResponsePayloadReflection                                                                        100%
+  AsyncResponse.AsyncResponseReplyTarget                                                                              100%
+  AsyncResponse.AsyncResponseRequestContext                                                                           100%
+  AsyncResponse.CallbackParam                                                                                         100%
+  AsyncResponse.DurableFlowFailedException                                                                            100%
+  AsyncResponse.FlowState                                                                                             100%
+  AsyncResponse.FlowStateSchema                                                                                       100%
+  AsyncResponse.IAsyncResponsePayload                                                                                 100%
+  AsyncResponse.Placeholder                                                                                           100%
+  AsyncResponse.RecoveryState                                                                                         100%
+  AsyncResponse.RecoveryStateSchema                                                                                   100%
+  AsyncResponse.WorkerJobEnvelope                                                                                     100%
+  AsyncResponse.WorkerJobEnvelopeSchema                                                                               100%
+
+AsyncResponse.Channels.MongoDB                                                                                       99.2%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                   100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                                100%
+  AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument                                                          100%
+  AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument                                                       100%
+  AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannel                                                         73.8%
+  AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions                                                   100%
+  AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseWaiter<T>                                                        100%
+  AsyncResponse.Channels.MongoDB.MongoDbChannelStore                                                                 99.6%
+  AsyncResponse.Channels.MongoDB.MongoDbChannelStore<TDocument>                                                      99.6%
+  AsyncResponse.Channels.MongoDB.MongoDbRecoveryStateStore                                                            100%
+  AsyncResponse.Channels.MongoDB.MongoRecoveryStateDocument                                                          33.3%
+  Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions                     100%
+
+AsyncResponse.Channels.NATS                                                                                            96%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel                                                               93.9%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel<T>                                                            93.9%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions                                                         100%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseWaiter<T>                                                              100%
+  AsyncResponse.Channels.NATS.NatsKvStoreAdapter                                                                      100%
+  AsyncResponse.Channels.NATS.NatsRawRequester                                                                        100%
+  AsyncResponse.Channels.NATS.NatsRecoveryStateStore                                                                  100%
+  AsyncResponse.Channels.NATS.NatsResponseChannelClient                                                               100%
+  AsyncResponse.Channels.NATS.NatsResponseChannelClient.NatsChannelSubscription                                       100%
+  AsyncResponse.Channels.NATS.NatsSubjectSchema                                                                       100%
+  Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions                        100%
+
+AsyncResponse.Channels.PostgreSQL                                                                                    99.6%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.4%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.4%
+  AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                                    100%
+  AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                             100%
+  AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
+  AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql                                                              100%
+  AsyncResponse.Channels.PostgreSQL.PostgreSqlRecoveryStateStore                                                      100%
+  Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions                  100%
+
+AsyncResponse.Channels.Redis                                                                                         95.6%
+  AsyncResponse.Channels.Redis.RedisAsyncResponseChannel                                                             94.6%
+  AsyncResponse.Channels.Redis.RedisAsyncResponseChannel<T>                                                          94.6%
+  AsyncResponse.Channels.Redis.RedisAsyncResponseOptions                                                              100%
+  AsyncResponse.Channels.Redis.RedisAsyncResponseWaiter<T>                                                            100%
+  AsyncResponse.Channels.Redis.RedisChannelMessageQueueSubscriber                                                     100%
+  AsyncResponse.Channels.Redis.RedisChannelMessageQueueSubscriber.Subscription                                        100%
+  AsyncResponse.Channels.Redis.RedisKeySchema                                                                         100%
+  AsyncResponse.Channels.Redis.RedisRecoveryStateStore                                                                100%
+  Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions                              100%
+
+AsyncResponse.Channels.SqlServer                                                                                     99.7%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.6%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.6%
+  AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel                                                      100%
+  AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions                                               100%
+  AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseWaiter<T>                                                    100%
+  AsyncResponse.Channels.SqlServer.SqlServerChannelSql                                                               99.7%
+  AsyncResponse.Channels.SqlServer.SqlServerRecoveryStateStore                                                        100%
+  AsyncResponse.Channels.SqlServer.SqlServerTransientFaults                                                           100%
+  Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions                   100%
+
+AsyncResponse.Core                                                                                                   98.3%
+  AsyncResponse.AsyncResponseBuilder                                                                                  100%
+  AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
+  AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
+  AsyncResponse.AsyncResponseBuilderBase                                                                             97.5%
+  AsyncResponse.AsyncResponseChannelMarker                                                                            100%
+  AsyncResponse.AsyncResponseChannelOptions                                                                           100%
+  AsyncResponse.AsyncResponseContextPropagation                                                                       100%
+  AsyncResponse.AsyncResponseContextPropagation.CompositeScope                                                        100%
+  AsyncResponse.AsyncResponseContextPropagation.CompositeScope2                                                       100%
+  AsyncResponse.AsyncResponseContextPropagation.LazyCapturingCarrier                                                  100%
+  AsyncResponse.AsyncResponseContextPropagation.NullScope                                                             100%
+  AsyncResponse.AsyncResponseDiagnostics                                                                              100%
+  AsyncResponse.AsyncResponseDurableFlowStoreMarker                                                                   100%
+  AsyncResponse.AsyncResponseEnvelope<T>                                                                              100%
+  AsyncResponse.AsyncResponseEnvelopeConverter<T>                                                                     100%
+  AsyncResponse.AsyncResponseEnvelopeJson                                                                             100%
+  AsyncResponse.AsyncResponseEnvelopeOptions.EnvelopeResolver<T>                                                      100%
+  AsyncResponse.AsyncResponseEnvelopeOptions<T>                                                                       100%
+  AsyncResponse.AsyncResponseEnvelopeSchema                                                                           100%
+  AsyncResponse.AsyncResponseIngress                                                                                  100%
+  AsyncResponse.AsyncResponseJson                                                                                     100%
+  AsyncResponse.AsyncResponseJson.ChainResolver                                                                       100%
+  AsyncResponse.AsyncResponseJsonSerialization                                                                        100%
+  AsyncResponse.AsyncResponseOptions                                                                                  100%
+  AsyncResponse.AsyncResponseRecoveryHealthCheck                                                                      100%
+  AsyncResponse.AsyncResponseRecoveryStats                                                                            100%
+  AsyncResponse.AsyncResponseRetry                                                                                    100%
+  AsyncResponse.AsyncResponseRetry<T>                                                                                 100%
+  AsyncResponse.AsyncResponseStaleRecoveryEntry                                                                       100%
+  AsyncResponse.AsyncResponseStartupValidator                                                                         100%
+  AsyncResponse.AsyncResponseTransportMarker                                                                          100%
+  AsyncResponse.AsyncResponseTypeResolution                                                                           100%
+  AsyncResponse.AsyncResponseWatchdog                                                                                 100%
+  AsyncResponse.AsyncResponseWatchdogOptions                                                                          100%
+  AsyncResponse.AsyncResponseWatchdogReport                                                                           100%
+  AsyncResponse.AsyncResponseWatchdogSnapshot                                                                         100%
+  AsyncResponse.AsyncResponseWatchdogState                                                                            100%
+  AsyncResponse.CallbackExpressionConverter                                                                          98.1%
+  AsyncResponse.CallbackExpressionConverter.MethodCallGuard                                                           100%
+  AsyncResponse.CallbackExpressionConverter.ParameterGuard                                                            100%
+  AsyncResponse.CallbackExpressionConverter<TService>                                                                98.1%
+  AsyncResponse.ChannelSerialExecutor                                                                                 100%
+  AsyncResponse.DurableAsyncResponseChannelOptions                                                                    100%
+  AsyncResponse.DurableFlowContext                                                                                   95.6%
+  AsyncResponse.DurableFlowContext<TFlow, TInput>                                                                    95.6%
+  AsyncResponse.DurableFlowContext<TResponse>                                                                        95.6%
+  AsyncResponse.DurableFlowContext<TResult>                                                                          95.6%
+  AsyncResponse.DurableFlowExecutor                                                                                  97.3%
+  AsyncResponse.DurableFlowOptions                                                                                    100%
+  AsyncResponse.DurableFlowService                                                                                    100%
+  AsyncResponse.DurableFlowService<TFlow, TInput>                                                                     100%
+  AsyncResponse.DurableFlowSuspendedException                                                                         100%
+  AsyncResponse.FlowExecutionLease                                                                                    100%
+  AsyncResponse.FlowStateConcurrency                                                                                  100%
+  AsyncResponse.FlowStateJson                                                                                         100%
+  AsyncResponse.InMemoryAsyncResponseChannel                                                                         98.8%
+  AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
+  AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase                                                        97.9%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>                                                97.9%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup                                                       93.1%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot                                                     100%
+  AsyncResponse.InMemoryAsyncResponseChannel<T>                                                                      98.8%
+  AsyncResponse.InMemoryAsyncResponseOptions                                                                          100%
+  AsyncResponse.InMemoryAsyncResponseWaiter<T>                                                                        100%
+  AsyncResponse.InMemoryFlowStateStore                                                                                100%
+  AsyncResponse.InMemoryFlowStateStore.Entry                                                                          100%
+  AsyncResponse.InMemoryRecoveryStateStore                                                                           96.1%
+  AsyncResponse.InMemoryRecoveryStateStore.Entry                                                                      100%
+  AsyncResponse.InMemoryRecoveryStateStore.EntryBucket                                                               92.8%
+  AsyncResponse.InMemoryWorkerHost                                                                                     90%
+  AsyncResponse.InMemoryWorkerTransport                                                                               100%
+  AsyncResponse.InMemoryWorkerTransportOptions                                                                        100%
+  AsyncResponse.JsonSafety                                                                                            100%
+  AsyncResponse.LostSubscriberCallbackDispatcher                                                                     98.6%
+  AsyncResponse.LostSubscriberCallbackDispatcher<T>                                                                  98.6%
+  AsyncResponse.PayloadRecoveryClassifier                                                                             100%
+  AsyncResponse.RawJsonResponse                                                                                       100%
+  AsyncResponse.RecoverableAsyncResponseBuilder                                                                       100%
+  AsyncResponse.RecoverableAsyncResponseBuilder<T>                                                                    100%
+  AsyncResponse.RecoveryStateObservation                                                                              100%
+  AsyncResponse.ReflectionExtensions                                                                                  100%
+  AsyncResponse.ReflectionExtensions.ConversionPlan                                                                   100%
+  AsyncResponse.ReflectionExtensions.InvocationPlan                                                                   100%
+  AsyncResponse.ReflectionExtensions<T>                                                                               100%
+  AsyncResponse.RemoteStackTrace                                                                                      100%
+  AsyncResponse.SerialExecutorRegistry                                                                                 99%
+  AsyncResponse.SerialExecutorRegistry.ExecutorEntry                                                                  100%
+  AsyncResponse.ShutdownBudgetValidator                                                                               100%
+  AsyncResponse.WorkerJobExecutor                                                                                     100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList                                             100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowListAuthorizer                         100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions                               100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions                               100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions<TFlow, TInput>                100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions<TFlowStateStore, TOptions>    100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseHealthCheckExtensions                                         100%
+  Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder                                           100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions                                                          100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache                                                 100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3, T4, T5>                         100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3, T4, T5>                         100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3, T4>                             100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3, T4>                             100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3>                                 100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2, T3>                                 100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2>                                     100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1, T2>                                     100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1>                                         100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0, T1>                                         100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0>                                             100%
+  Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0>                                             100%
+
+AsyncResponse.DurableFlows.Cosmos                                                                                    96.7%
+  AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions                                                          100%
+  AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateDocument                                                           100%
+  AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore                                                             96.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
+  Microsoft.Extensions.DependencyInjection.CosmosDurableFlowServiceCollectionExtensions                               100%
+
+AsyncResponse.DurableFlows.DynamoDB                                                                                  98.6%
+  AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions                                                      100%
+  AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore                                                         99.2%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
+  Microsoft.Extensions.DependencyInjection.DynamoDbDurableFlowServiceCollectionExtensions                             100%
+
+AsyncResponse.DurableFlows.EFCore                                                                                    96.1%
+  AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord                                                            100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions                                           100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions                                                          100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.ContextLease<TContext>                                       100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.ContextLease<TContext>                                       100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.StateRow<TContext>                                           100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                    100%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                   99.2%
+  AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                   99.2%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         91.1%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions                               100%
+
+AsyncResponse.DurableFlows.MongoDB                                                                                    100%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
+  AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions                                                        100%
+  AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore                                                            100%
+  AsyncResponse.DurableFlows.MongoDB.MongoFlowStateDocument                                                           100%
+  Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionExtensions                                100%
+
+AsyncResponse.DurableFlows.MySql                                                                                     94.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions                                                            100%
+  AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore                                                               99.3%
+  Microsoft.Extensions.DependencyInjection.MySqlDurableFlowServiceCollectionExtensions                                100%
+
+AsyncResponse.DurableFlows.Oracle                                                                                    94.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions                                                          100%
+  AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore                                                             98.8%
+  Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions                               100%
+
+AsyncResponse.DurableFlows.PostgreSQL                                                                                93.9%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         91.1%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions                                                  100%
+  AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore                                                     98.1%
+  Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions                           100%
+
+AsyncResponse.DurableFlows.Sqlite                                                                                    98.8%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
+  AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions                                                          100%
+  AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore                                                              100%
+  Microsoft.Extensions.DependencyInjection.SqliteDurableFlowServiceCollectionExtensions                               100%
+
+AsyncResponse.DurableFlows.SqlServer                                                                                   95%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions                                                    100%
+  AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore                                                       99.4%
+  Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollectionExtensions                            100%
+
+AsyncResponse.ServiceDefaults                                                                                        96.9%
+  Extensions                                                                                                         96.9%
+
+AsyncResponse.Transports.AzureServiceBus                                                                             97.7%
+  AsyncResponse.Transports.AzureServiceBus.AwaitingAzureServiceBusMessageDispatcher                                   100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions                                        100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureContext                                    100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientAdapter                                               100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientResolver                                              100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusCorrelationIdExtractor                                     98.4%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher                                           100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOptionsValidator                                            100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOutboundMessage                                             100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReceiverAdapter                                             100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetOptions                                          100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReplyTargetProvider                                         100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusResponseIngressSubscriber                                   100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSenderAdapter                                               100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions                                           100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberService                                          85.8%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberService.BatchProgress                             100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusTransportDelivery                                           100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerSubscriber                                            100%
+  AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport                                             100%
+  AsyncResponse.Transports.AzureServiceBus.QueuedAzureServiceBusMessageDispatcher                                     100%
+  Microsoft.Extensions.DependencyInjection.AzureServiceBusAsyncResponseServiceCollectionExtensions                    100%
+
+AsyncResponse.Transports.GooglePubSub                                                                                99.8%
+  AsyncResponse.Transports.GooglePubSub.AwaitingGooglePubSubMessageDispatcher                                         100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubAsyncResponseOptions                                              100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubBackgroundFailureContext                                          100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubCorrelationIdExtractor                                            100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubMessageDispatcher                                                 100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubOptionsValidator                                                  100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubPublisherClientAdapter                                            100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetOptions                                                100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubReplyTargetProvider                                               100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubResponseIngressSubscriber                                         100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberClientAdapter                                           100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberOptions                                                 100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubSubscriberService                                                98.4%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerSubscriber                                                  100%
+  AsyncResponse.Transports.GooglePubSub.GooglePubSubWorkerTransport                                                   100%
+  AsyncResponse.Transports.GooglePubSub.QueuedGooglePubSubMessageDispatcher                                           100%
+  Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions                       100%
+
+AsyncResponse.Transports.Kafka                                                                                        100%
+  AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher                                                       100%
+  AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions                                                   100%
+  AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext                                                        100%
+  AsyncResponse.Transports.Kafka.KafkaConsumerClientAdapter                                                           100%
+  AsyncResponse.Transports.Kafka.KafkaConsumerClientFactory                                                           100%
+  AsyncResponse.Transports.Kafka.KafkaCorrelationIdExtractor                                                          100%
+  AsyncResponse.Transports.Kafka.KafkaDelivery                                                                        100%
+  AsyncResponse.Transports.Kafka.KafkaIncomingMessage                                                                 100%
+  AsyncResponse.Transports.Kafka.KafkaMessageDispatcher                                                               100%
+  AsyncResponse.Transports.Kafka.KafkaProducerClientAdapter                                                           100%
+  AsyncResponse.Transports.Kafka.KafkaPublishResult                                                                   100%
+  AsyncResponse.Transports.Kafka.KafkaReplyTargetOptions                                                              100%
+  AsyncResponse.Transports.Kafka.KafkaReplyTargetProvider                                                             100%
+  AsyncResponse.Transports.Kafka.KafkaResponseIngressSubscriber                                                       100%
+  AsyncResponse.Transports.Kafka.KafkaSubscriberOptions                                                               100%
+  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                               100%
+  AsyncResponse.Transports.Kafka.KafkaTransportClientDefaults                                                         100%
+  AsyncResponse.Transports.Kafka.KafkaTransportHeader                                                                 100%
+  AsyncResponse.Transports.Kafka.KafkaTransportOptionsValidator                                                       100%
+  AsyncResponse.Transports.Kafka.KafkaTransportRetry                                                                  100%
+  AsyncResponse.Transports.Kafka.KafkaTransportTopicSchema                                                            100%
+  AsyncResponse.Transports.Kafka.KafkaWorkerSubscriber                                                                100%
+  AsyncResponse.Transports.Kafka.KafkaWorkerTransport                                                                 100%
+  AsyncResponse.Transports.Kafka.QueuedKafkaMessageDispatcher                                                         100%
+  Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions                     100%
+
+AsyncResponse.Transports.MongoDB                                                                                     94.9%
+  AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions                                               100%
+  AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext                                                    100%
+  AsyncResponse.Transports.MongoDB.MongoDbCorrelationIdExtractor                                                      100%
+  AsyncResponse.Transports.MongoDB.MongoDbMessageDispatcher                                                          88.9%
+  AsyncResponse.Transports.MongoDB.MongoDbReplyTargetOptions                                                          100%
+  AsyncResponse.Transports.MongoDB.MongoDbReplyTargetProvider                                                         100%
+  AsyncResponse.Transports.MongoDB.MongoDbResponseIngressSubscriber                                                   100%
+  AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions                                                           100%
+  AsyncResponse.Transports.MongoDB.MongoDbSubscriberService                                                          84.1%
+  AsyncResponse.Transports.MongoDB.MongoDbTransportDelivery                                                           100%
+  AsyncResponse.Transports.MongoDB.MongoDbTransportOptionsValidator                                                   100%
+  AsyncResponse.Transports.MongoDB.MongoDbTransportRetry                                                              100%
+  AsyncResponse.Transports.MongoDB.MongoDbTransportStore                                                             96.2%
+  AsyncResponse.Transports.MongoDB.MongoDbWorkerSubscriber                                                            100%
+  AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport                                                             100%
+  AsyncResponse.Transports.MongoDB.MongoTransportMessageDocument                                                      100%
+  Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions                  97.1%
+
+AsyncResponse.Transports.NATS                                                                                         100%
+  AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions                                                     100%
+  AsyncResponse.Transports.NATS.NatsBackgroundFailureContext                                                          100%
+  AsyncResponse.Transports.NATS.NatsCorrelationIdExtractor                                                            100%
+  AsyncResponse.Transports.NATS.NatsJetStreamTransportAdapter                                                         100%
+  AsyncResponse.Transports.NATS.NatsJobDelivery                                                                       100%
+  AsyncResponse.Transports.NATS.NatsMessageDispatcher                                                                 100%
+  AsyncResponse.Transports.NATS.NatsReplyTargetOptions                                                                100%
+  AsyncResponse.Transports.NATS.NatsReplyTargetProvider                                                               100%
+  AsyncResponse.Transports.NATS.NatsResponseIngressSubscriber                                                         100%
+  AsyncResponse.Transports.NATS.NatsSubscriberOptions                                                                 100%
+  AsyncResponse.Transports.NATS.NatsSubscriberService                                                                 100%
+  AsyncResponse.Transports.NATS.NatsTransportOptionsValidator                                                         100%
+  AsyncResponse.Transports.NATS.NatsTransportRetry                                                                    100%
+  AsyncResponse.Transports.NATS.NatsTransportSubjectSchema                                                            100%
+  AsyncResponse.Transports.NATS.NatsWorkerSubscriber                                                                  100%
+  AsyncResponse.Transports.NATS.NatsWorkerTransport                                                                   100%
+  Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions                      100%
+
+AsyncResponse.Transports.PostgreSQL                                                                                  96.5%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions                                         100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlBackgroundFailureContext                                              100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlCorrelationIdExtractor                                                100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlMessageDispatcher                                                    92.4%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetOptions                                                    100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlReplyTargetProvider                                                   100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlResponseIngressSubscriber                                             100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions                                                     100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberService                                                    98.6%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery                                                     100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator                                             100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry                                                        100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore                                                       94.3%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerSubscriber                                                      100%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport                                                       100%
+  Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions                100%
+
+AsyncResponse.Transports.RabbitMQ                                                                                    98.8%
+  AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher                                                 100%
+  AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher                                                   100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions                                                      100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqBackgroundFailureContext                                                  100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqChannelAdapter                                                            100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqConnectionAdapter                                                         100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqConnectionFactoryAdapter                                                  100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqCorrelationIdExtractor                                                    100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqDelivery                                                                  100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqMessageDispatcher                                                         100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqOptionsValidator                                                          100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions                                                        100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetProvider                                                       100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqResponseIngressSubscriber                                                 100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions                                                         100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberService                                                        88.2%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqTopology                                                                  100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerSubscriber                                                          100%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport                                                           100%
+  Microsoft.Extensions.DependencyInjection.RabbitMqAsyncResponseServiceCollectionExtensions                           100%
+
+AsyncResponse.Transports.Redis                                                                                        100%
+  AsyncResponse.Transports.Redis.AwaitingRedisMessageDispatcher                                                       100%
+  AsyncResponse.Transports.Redis.QueuedRedisMessageDispatcher                                                         100%
+  AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions                                                   100%
+  AsyncResponse.Transports.Redis.RedisBackgroundFailureContext                                                        100%
+  AsyncResponse.Transports.Redis.RedisCorrelationIdExtractor                                                          100%
+  AsyncResponse.Transports.Redis.RedisMessageDispatcher                                                               100%
+  AsyncResponse.Transports.Redis.RedisReplyTargetOptions                                                              100%
+  AsyncResponse.Transports.Redis.RedisReplyTargetProvider                                                             100%
+  AsyncResponse.Transports.Redis.RedisResponseIngressSubscriber                                                       100%
+  AsyncResponse.Transports.Redis.RedisStreamDatabaseAdapter                                                           100%
+  AsyncResponse.Transports.Redis.RedisStreamDatabaseAdapter<T>                                                        100%
+  AsyncResponse.Transports.Redis.RedisStreamDelivery                                                                  100%
+  AsyncResponse.Transports.Redis.RedisSubscriberOptions                                                               100%
+  AsyncResponse.Transports.Redis.RedisSubscriberService                                                               100%
+  AsyncResponse.Transports.Redis.RedisTransportKeySchema                                                              100%
+  AsyncResponse.Transports.Redis.RedisTransportOptionsValidator                                                       100%
+  AsyncResponse.Transports.Redis.RedisTransportRetry                                                                  100%
+  AsyncResponse.Transports.Redis.RedisWorkerSubscriber                                                                100%
+  AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
+  Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
+
+AsyncResponse.Transports.SqlServer                                                                                   95.6%
+  AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
+  AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext                                                100%
+  AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor                                                  100%
+  AsyncResponse.Transports.SqlServer.SqlServerMessageDispatcher                                                      88.2%
+  AsyncResponse.Transports.SqlServer.SqlServerReplyTargetOptions                                                      100%
+  AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
+  AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
+  AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
+  AsyncResponse.Transports.SqlServer.SqlServerTransportRetry                                                          100%
+  AsyncResponse.Transports.SqlServer.SqlServerTransportStore                                                         93.2%
+  AsyncResponse.Transports.SqlServer.SqlServerWorkerSubscriber                                                        100%
+  AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport                                                         100%
+  Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportServiceCollectionExtensions                 100%
+
+AsyncResponse.Transports.SQS                                                                                         98.7%
+  AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher                                                           100%
+  AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher                                                              99%
+  AsyncResponse.Transports.SQS.SqsAsyncResponseOptions                                                                100%
+  AsyncResponse.Transports.SQS.SqsBackgroundFailureContext                                                            100%
+  AsyncResponse.Transports.SQS.SqsClientAdapter                                                                       100%
+  AsyncResponse.Transports.SQS.SqsClientFactory                                                                       100%
+  AsyncResponse.Transports.SQS.SqsClientResolver                                                                      100%
+  AsyncResponse.Transports.SQS.SqsCorrelationIdExtractor                                                              100%
+  AsyncResponse.Transports.SQS.SqsMessageDispatcher                                                                  98.9%
+  AsyncResponse.Transports.SQS.SqsOptionsValidator                                                                    100%
+  AsyncResponse.Transports.SQS.SqsOutboundMessage                                                                     100%
+  AsyncResponse.Transports.SQS.SqsQueueAddress                                                                        100%
+  AsyncResponse.Transports.SQS.SqsQueueProvisioningService                                                           98.2%
+  AsyncResponse.Transports.SQS.SqsQueueProvisioningService<T>                                                        98.2%
+  AsyncResponse.Transports.SQS.SqsReceiveRequest                                                                      100%
+  AsyncResponse.Transports.SQS.SqsReplyTargetOptions                                                                  100%
+  AsyncResponse.Transports.SQS.SqsReplyTargetProvider                                                                 100%
+  AsyncResponse.Transports.SQS.SqsResponseIngressSubscriber                                                           100%
+  AsyncResponse.Transports.SQS.SqsSubscriberOptions                                                                   100%
+  AsyncResponse.Transports.SQS.SqsSubscriberService                                                                  93.9%
+  AsyncResponse.Transports.SQS.SqsSubscriberService.BatchProgress                                                     100%
+  AsyncResponse.Transports.SQS.SqsTransportDelivery                                                                   100%
+  AsyncResponse.Transports.SQS.SqsWorkerSubscriber                                                                    100%
+  AsyncResponse.Transports.SQS.SqsWorkerTransport                                                                     100%
+  Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionExtensions                                100%
