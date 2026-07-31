@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785515824698,
+  "lastUpdate": 1785515847146,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -49328,6 +49328,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2082.721707391929,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "acf95f60b00c7c61000809e3364265c75bd83bd1",
+          "message": "fix: close all verified findings\n- waiter dispose now cancels ResponseTask on Redis/NATS/PostgreSQL/SqlServer/MongoDB\n  (channel DisposeAsync at shutdown no longer hangs in-flight WaitAsync callers);\n  new conformance fact pins dispose-before-terminal on all six derivations\n- startup vetoes early ACK on the worker queue: flow wake-ups lose broker redelivery,\n  stranding crashed runs undiscoverably; DurableFlowOptions.AllowEarlyAckWorkerSubscriber\n  accepts the risk explicitly, response-queue early ACK warns; sample/README/itest\n  early-ack configs now opt in\n- callback authorization runs before type resolution (no assembly scan for unauthorized\n  names); unresolvable names get a bounded negative cache invalidated on assembly load\n  and resolver registration\n- rejected flow checkpoints diagnose revision conflict vs real lease loss and keep the\n  original failure as inner exception instead of discarding it\n- watchdog scan reuses the public Evaluate classifier (duplicate logic removed); dedupe\n  keeps the oldest registration per correlation id so scan order can't mask stale entries\n- DB channel same-process fast path uses the server-stamped created_at returned by\n  InsertMessageAsync — app-clock skew >1s used to silently disable it; idle dispatch\n  loop no longer accumulates abandoned poll waiters\n- StateExpiry default 7d -> 14d, de-tying the 7-day default step-timeout chain\n- lost-subscriber failure callbacks get bounded in-process retry before the deliberate\n  swallow; unroutable no-correlation-id responses log at Error + new\n  asyncresponse.ingress.unroutable_responses counter\n- consolidate the PostgreSQL/SqlServer/MongoDB transport dispatchers and correlation-id\n  extractors into shared source (~1,150 copied lines removed; rendered logs and\n  telemetry byte-identical)\n- drop dead code (unused ExecutionContext ctor param, unreachable group-empty branch)\n- verified: 3118/3118 unit tests (net8+net10), 88/88 conformance/direct integration\n  tests against real Redis/NATS/PG/SqlServer/Mongo; CHANGELOG and docs updated",
+          "timestamp": "2026-07-31T18:24:42+02:00",
+          "tree_id": "923b330e98ecb29cb39e8ed9e7da39cbafdfe643",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/acf95f60b00c7c61000809e3364265c75bd83bd1"
+        },
+        "date": 1785515846759,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 183180.51193824032,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 135612.34397799824,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 112672.29847883382,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 277623.54247640196,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 685213.1012744964,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 389165.6288916563,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 475855.1116356092,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 336378.6816646708,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 286670.94761948445,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 316083.5977899435,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 355811.1069995161,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 517534.05374073616,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 555012.87629873,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 220433.28366236674,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 112045.32009107045,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 67015.86399532498,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 36040.39984661206,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4831.280803944451,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 165802.28409226565,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 82402.73181536514,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1078923.2346118572,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2697.091585894168,
             "unit": "flows/s"
           }
         ]
