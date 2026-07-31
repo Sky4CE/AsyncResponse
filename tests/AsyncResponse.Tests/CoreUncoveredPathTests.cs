@@ -81,7 +81,12 @@ public sealed class CoreUncoveredPathTests
                 {
                     Enabled = true,
                     StartupDelay = TimeSpan.Zero,
-                    Interval = TimeSpan.FromMilliseconds(20),
+                    // The first scan runs immediately after StartupDelay; Interval only paces the
+                    // SECOND. Keep it far beyond the test's lifetime so exactly one scan can ever
+                    // run — with a 20 ms interval, a loaded runner could squeeze a second scan in
+                    // before StopAsync, and the exactly-one activity assertion below flaked
+                    // (observed on CI's macos-latest).
+                    Interval = TimeSpan.FromMinutes(5),
                     StaleAfter = StaleAfter
                 }
             }),
