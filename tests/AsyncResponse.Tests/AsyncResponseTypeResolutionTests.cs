@@ -31,4 +31,36 @@ public class AsyncResponseTypeResolutionTests : IDisposable
         Assert.Throws<ArgumentNullException>(() => AsyncResponseTypeResolution.RegisterResolver(null!));
         Assert.Throws<ArgumentNullException>(() => AsyncResponseTypeResolution.RegisterAssembly(null!));
     }
+
+    [Fact]
+    public void ResolveServiceType_CachesUnresolvableNames_ConsultsResolversOnce()
+    {
+        // Without the negative cache, every attempt on an unresolvable name (a poisoned recovery
+        // row, a renamed type) re-walks every loaded assembly and the resolver chain.
+        var name = $"Missing.Namespace.Type{Guid.NewGuid():N}";
+        var probes = 0;
+        AsyncResponseTypeResolution.RegisterResolver(candidate =>
+        {
+            if (candidate == name)
+                Interlocked.Increment(ref probes);
+            return null;
+        });
+
+        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+
+        Assert.Equal(1, probes);
+    }
+
+    [Fact]
+    public void RegisterResolver_InvalidatesCachedMisses()
+    {
+        // A plugin registering its resolver after a name already missed must not stay blacklisted.
+        var name = $"Missing.Namespace.Type{Guid.NewGuid():N}";
+        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+
+        AsyncResponseTypeResolution.RegisterResolver(candidate => candidate == name ? typeof(OperationResult) : null);
+
+        Assert.Equal(typeof(OperationResult), ReflectionExtensions.ResolveServiceType(name));
+    }
 }

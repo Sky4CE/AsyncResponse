@@ -38,7 +38,19 @@ public static class RedisAsyncResponseTransportServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<RedisWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, RedisReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker("Redis"));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<RedisAsyncResponseTransportOptions>>().Value;
+            return new AsyncResponseTransportMarker("Redis")
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == RedisAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == RedisAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<RedisWorkerSubscriber>();
         services.AddHostedService<RedisResponseIngressSubscriber>();

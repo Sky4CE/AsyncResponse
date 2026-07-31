@@ -203,9 +203,11 @@ internal sealed class PostgreSqlChannelSql
     /// <summary>
     /// Inserts a response envelope row and notifies listeners. The caller supplies the message id so
     /// the insert is idempotent under retry (<c>ON CONFLICT DO NOTHING</c>); the NOTIFY still fires so
-    /// a retried publish never strands an active waiter.
+    /// a retried publish never strands an active waiter. Returns the row's server-stamped
+    /// <c>created_at</c> (the original row's on a duplicate) so the same-process fast path compares
+    /// against subscription watermarks on the server clock rather than the app clock.
     /// </summary>
-    public Task InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             IsTransient,
@@ -214,7 +216,7 @@ internal sealed class PostgreSqlChannelSql
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<bool> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastMessagePruneTicks))
@@ -222,12 +224,21 @@ internal sealed class PostgreSqlChannelSql
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // Single statement: the final SELECT both fires the NOTIFY exactly once and returns the
+        // server-stamped created_at — the fresh row's via RETURNING, or the original row's when
+        // the idempotent insert hit a duplicate.
         command.CommandText =
             $"""
-            INSERT INTO {MessageTable} (id, correlation_id, envelope_json, expires_at)
-            VALUES (@id, @correlation_id, @envelope_json, now() + @retention)
-            ON CONFLICT (id) DO NOTHING;
-            SELECT pg_notify(@channel, @payload);
+            WITH inserted AS (
+                INSERT INTO {MessageTable} (id, correlation_id, envelope_json, expires_at)
+                VALUES (@id, @correlation_id, @envelope_json, now() + @retention)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING created_at
+            )
+            SELECT COALESCE(
+                       (SELECT created_at FROM inserted),
+                       (SELECT created_at FROM {MessageTable} WHERE id = @id)) AS created_at,
+                   pg_notify(@channel, @payload);
             """;
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("correlation_id", correlationId);
@@ -235,8 +246,12 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.AddWithValue("retention", retention);
         command.Parameters.AddWithValue("channel", NotificationChannel);
         command.Parameters.AddWithValue("payload", NotifyPayload(correlationId));
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        return true;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+
+        // NULL only when a duplicate raced the pruner deleting the original row — the app clock is
+        // a fine approximation for a message that old.
+        return reader.IsDBNull(0) ? DateTimeOffset.UtcNow : reader.GetFieldValue<DateTimeOffset>(0);
     }
 
     public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesAsync(

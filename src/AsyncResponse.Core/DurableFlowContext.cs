@@ -320,10 +320,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // the faulted step is not discarded by the takeover signal.
             _lease.ThrowIfLost(ex);
             // Timeout, trigger failure, or a faulted wait: record it so the next execution
-            // restarts this step fresh instead of re-attaching to a dead correlation id.
+            // restarts this step fresh instead of re-attaching to a dead correlation id. The
+            // original failure rides along as `cause` so a rejected save cannot displace it.
             checkpoint.Faulted = true;
             checkpoint.Message = ex.Message;
-            await SaveAsync(CancellationToken.None).ConfigureAwait(false);
+            await SaveAsync(CancellationToken.None, cause: ex).ConfigureAwait(false);
             throw;
         }
         finally
@@ -489,10 +490,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     internal Task FlushProgressAsync()
         => _progressDirty ? SaveAsync(CancellationToken.None) : Task.CompletedTask;
 
-    private async Task SaveAsync(CancellationToken cancellationToken)
+    private async Task SaveAsync(CancellationToken cancellationToken, Exception? cause = null)
     {
         _state.UpdatedAtUtc = DateTime.UtcNow;
-        await _lease.SaveAsync(_state, _options.StateExpiry, cancellationToken).ConfigureAwait(false);
+        await _lease.SaveAsync(_state, _options.StateExpiry, cancellationToken, cause).ConfigureAwait(false);
 
         _progressDirty = false;
         _lastPersistenceUtc = DateTime.UtcNow;

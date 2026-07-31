@@ -34,7 +34,19 @@ public static class GooglePubSubAsyncResponseServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<GooglePubSubWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, GooglePubSubReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker("GooglePubSub"));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<GooglePubSubAsyncResponseOptions>>().Value;
+            return new AsyncResponseTransportMarker("GooglePubSub")
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == GooglePubSubAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == GooglePubSubAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<GooglePubSubWorkerSubscriber>();
         services.AddHostedService<GooglePubSubResponseIngressSubscriber>();

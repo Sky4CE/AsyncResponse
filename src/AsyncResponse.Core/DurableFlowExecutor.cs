@@ -148,7 +148,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             // Terminal by declaration: mark failed and swallow so the transport acks the job.
             state.Status = FlowRunStatus.Failed;
             state.LastMessage = ex.Message;
-            await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
+            await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
 
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);
@@ -161,7 +161,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         catch (Exception ex)
         {
             state.LastMessage = ex.Message;
-            await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
+            await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
 
             AsyncResponseDiagnostics.SetError(activity, ex);
 

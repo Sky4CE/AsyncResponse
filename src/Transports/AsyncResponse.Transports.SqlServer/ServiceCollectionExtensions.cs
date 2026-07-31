@@ -29,7 +29,19 @@ public static class SqlServerAsyncResponseTransportServiceCollectionExtensions
         services.TryAddSingleton<SqlServerWorkerTransport>();
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider => provider.GetRequiredService<SqlServerWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, SqlServerReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker(SqlServerAsyncResponseTransportOptions.TransportName));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<SqlServerAsyncResponseTransportOptions>>().Value;
+            return new AsyncResponseTransportMarker(SqlServerAsyncResponseTransportOptions.TransportName)
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == SqlServerAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == SqlServerAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<SqlServerWorkerSubscriber>();
         services.AddHostedService<SqlServerResponseIngressSubscriber>();

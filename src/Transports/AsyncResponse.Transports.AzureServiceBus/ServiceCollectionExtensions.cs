@@ -36,7 +36,19 @@ public static class AzureServiceBusAsyncResponseServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<AzureServiceBusWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, AzureServiceBusReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker(AzureServiceBusAsyncResponseOptions.TransportName));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AzureServiceBusAsyncResponseOptions>>().Value;
+            return new AsyncResponseTransportMarker(AzureServiceBusAsyncResponseOptions.TransportName)
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == AzureServiceBusAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == AzureServiceBusAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<AzureServiceBusWorkerSubscriber>();
         services.AddHostedService<AzureServiceBusResponseIngressSubscriber>();

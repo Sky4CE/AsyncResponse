@@ -595,6 +595,32 @@ public class DurableFlowTests
         return Assert.IsType<FlowExecutionLease>(lease);
     }
 
+    [Fact]
+    public async Task LeaseSave_RejectedByConcurrentWrite_ReportsRevisionConflictWithCause()
+    {
+        // A rejected checkpoint used to be reported unconditionally as "lost its execution lease";
+        // a revision conflict from a lease-bypassing writer (RecoverAsync, FailAsync, operator
+        // parking) must be diagnosed as such, with the failure that triggered the save attached.
+        var state = new FlowState { FlowId = "conflict-flow" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+
+        var concurrent = await store.LoadAsync("conflict-flow");
+        Assert.NotNull(concurrent);
+        var concurrentRevision = concurrent.Revision;
+        concurrent.Revision = concurrentRevision + 1;
+        Assert.True(await store.TryUpdateAsync("conflict-flow", concurrent, concurrentRevision, TimeSpan.FromMinutes(5)));
+
+        var cause = new TimeoutException("step wait failed");
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => lease.SaveAsync(state, TimeSpan.FromMinutes(5), cause: cause));
+
+        Assert.Contains("concurrent write advanced the ledger", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("lost its execution lease", ex.Message, StringComparison.Ordinal);
+        Assert.Same(cause, ex.InnerException);
+        Assert.True(lease.LostToken.IsCancellationRequested);
+    }
+
     private sealed class RecordingFlowStateStore : IFlowStateStore
     {
         private readonly InMemoryFlowStateStore _inner = new();

@@ -41,7 +41,19 @@ public static class SqsAsyncResponseServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<SqsWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, SqsReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker(SqsAsyncResponseOptions.TransportName));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<SqsAsyncResponseOptions>>().Value;
+            return new AsyncResponseTransportMarker(SqsAsyncResponseOptions.TransportName)
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == SqsAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == SqsAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         // Registered before the subscribers: hosted services start in registration order, so
         // CreateQueues provisioning completes before the first ReceiveMessage loop begins.

@@ -204,16 +204,17 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_FailureCallbackThrows_IsSwallowedAndRecoveryStateIsKept()
+    public async Task SetResponse_FailureCallbackThrows_IsRetriedThenSwallowedAndRecoveryStateIsKept()
     {
         ArmRecoveryState();
         _spy.FailureCallbackError = new InvalidOperationException("handler exploded");
 
         // Must not throw: rethrowing would loop back through the ingress's SetException safety
-        // net and invoke the same failure callback a second time.
+        // net and invoke the same failure callback a second time. A persistently failing callback
+        // is retried in-process (bounded, mirroring the ingress policy) before the swallow.
         await Publisher.SetResponse(new OperationResult { Status = OperationStatus.Failed }, CorrelationId);
 
-        Assert.Single(_spy.Failures);
+        Assert.Equal(4, _spy.Failures.Count);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
     }
 

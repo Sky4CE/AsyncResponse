@@ -81,7 +81,7 @@ that same options object.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `StateExpiry` | 7 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. |
+| `StateExpiry` | 14 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. Deliberately double the 7-day default step-timeout chain so a silent step faults before its ledger expires. |
 | `DefaultStepTimeout` | `null` (channel default) | Default timeout for `AwaitStepAsync` steps that don't pass one explicitly. |
 | `ExecutionLeaseDuration` | 1 minute | How long one store lease owns a flow execution before another replica may take over after owner loss. |
 | `ExecutionLeaseRenewInterval` | 20 seconds | Renewal cadence; must be positive and shorter than `ExecutionLeaseDuration`. |
@@ -155,12 +155,13 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 | `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
 | `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
 
-**Clock note for the database channels** (PostgreSQL, SQL Server, MongoDB): stored envelopes are
-stamped on the database clock while each waiter's delivery watermark uses the app clock, with a 1 s
-tolerance between them. Keep hosts NTP-synchronized within ~1 s of the database. Larger skew never
-loses a response — a delivery that misses the watermark window is routed through lost-subscriber
-recovery instead of live delivery — but that means recovery callbacks doing work live waiters
-should have done.
+**Clock note for the database channels** (PostgreSQL, SQL Server, MongoDB): stored envelopes and
+each waiter's delivery watermark are both stamped on the *database* clock — the publish path
+returns the server-stamped `created_at` so even the same-process fast path compares like clocks —
+which keeps app-host clock skew out of the delivery decision entirely. The 1 s watermark tolerance
+covers the database clock's own granularity across statements, not app↔database skew. App clocks
+only stamp non-delivery metadata (e.g. recovery-registration age for the watchdog's staleness
+report), where ordinary NTP sync is ample.
 
 ## Transport options
 
@@ -204,7 +205,7 @@ The in-memory transport is configured directly on registration:
 | `WorkerSubscriber.LockRenewalInterval` | Azure Service Bus | Peek-lock renewal cadence for received-but-unsettled messages while a batch is processed (default 30 s; `null` disables). Keeps slow handlers from losing their lock mid-batch — see the lock-budget note below. |
 | `WorkerSubscriber.VisibilityRenewalInterval` | SQS | Opt-in visibility heartbeat for received-but-unprocessed batch messages (default `null` = off; requires `VisibilityTimeout` set and a shorter interval). Off by default because extending visibility overrides queue-tuned redrive timing, and on FIFO queues an extended message keeps its whole message group blocked if the consumer wedges. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
-| `WorkerSubscriber.UseAckAfterEnqueue(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Every broker transport exposes the same method name; the message is ACKed once it is accepted into the bounded in-process queue, before the handler runs. |
+| `WorkerSubscriber.UseAckAfterEnqueue(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Every broker transport exposes the same method name; the message is ACKed once it is accepted into the bounded in-process queue, before the handler runs. Durable-flow wake-ups ride this queue and lose broker redelivery under early ACK, so startup throws unless `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` explicitly accepts the risk (see [transport-semantics.md](transport-semantics.md)). |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub and SQS | Redeliveries before dead-lettering. Google Pub/Sub and SQS perform redelivery natively — bound attempts with the subscription's `DeadLetterPolicy` (Pub/Sub) or the queue's redrive policy `maxReceiveCount` (SQS, provisioned by `CreateQueues` or your infra). On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
 | `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub, SQS | Bounded backoff for restarting a failed hosted subscriber (streaming-pull/long-poll fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |

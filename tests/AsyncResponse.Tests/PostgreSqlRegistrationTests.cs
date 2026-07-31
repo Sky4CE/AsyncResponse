@@ -119,6 +119,66 @@ public sealed class PostgreSqlRegistrationTests
         await validator.StopAsync(CancellationToken.None);
     }
 
+    [Fact]
+    public async Task WorkerEarlyAck_WithDurableFlows_FailsFastAtStartup()
+    {
+        // Durable-flow wake-ups ride the worker queue and rely on broker redelivery for crash
+        // recovery; early ACK on that queue strands crashed runs undiscoverably, so startup vetoes
+        // the combination unless the risk is explicitly accepted.
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithPostgreSqlTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64))
+            .WithInMemoryDurableFlows());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
+            provider.GetServices<DurableFlowOptions>());
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
+        Assert.Contains("PostgreSqlAsyncResponseTransportOptions.WorkerSubscriber.AckMode", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(DurableFlowOptions.AllowEarlyAckWorkerSubscriber), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task WorkerEarlyAck_WithExplicitOptOut_PassesStartup()
+    {
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithPostgreSqlTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64))
+            .WithInMemoryDurableFlows(options => options.AllowEarlyAckWorkerSubscriber = true));
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
+            provider.GetServices<DurableFlowOptions>());
+
+        await validator.StartAsync(CancellationToken.None);
+        await validator.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task ResponseEarlyAck_WithoutWorkerEarlyAck_PassesStartup()
+    {
+        // A lost response only delays failover (the waiter burns its timeout, then recovery routing
+        // applies) — the response queue warns instead of failing startup.
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithPostgreSqlTransport(options => options.ResponseSubscriber.UseAckAfterEnqueue(2, 64))
+            .WithInMemoryDurableFlows());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>>(),
+            provider.GetServices<DurableFlowOptions>());
+
+        await validator.StartAsync(CancellationToken.None);
+        await validator.StopAsync(CancellationToken.None);
+    }
+
     private static ServiceProvider Build(Action<AsyncResponseRegistrationBuilder> configure)
     {
         var services = new ServiceCollection();

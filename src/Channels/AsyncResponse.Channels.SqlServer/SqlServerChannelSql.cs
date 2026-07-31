@@ -223,9 +223,12 @@ internal sealed class SqlServerChannelSql
     /// <summary>
     /// Inserts a response envelope row. The caller supplies the message id so the insert is
     /// idempotent under retry — a duplicate insert (lost WHERE NOT EXISTS race or an outer retry)
-    /// is treated as success, so a retried publish never duplicates a response.
+    /// is treated as success, so a retried publish never duplicates a response. Returns the row's
+    /// server-stamped <c>created_at</c> (the original row's on a duplicate) so the same-process
+    /// fast path compares against subscription watermarks on the server clock rather than the
+    /// app clock.
     /// </summary>
-    public Task InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             IsTransient,
@@ -234,7 +237,7 @@ internal sealed class SqlServerChannelSql
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<bool> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         if (ShouldPrune(ref _lastMessagePruneTicks))
@@ -245,6 +248,7 @@ internal sealed class SqlServerChannelSql
         command.CommandText =
             $"""
             INSERT INTO {MessageTable} (id, correlation_id, envelope_json, expires_at)
+            OUTPUT inserted.created_at
             SELECT @id, @correlation_id, @envelope_json, {AddMilliseconds("@retention_ms")}
             WHERE NOT EXISTS (SELECT 1 FROM {MessageTable} WITH (UPDLOCK, HOLDLOCK) WHERE id = @id);
             """;
@@ -253,15 +257,30 @@ internal sealed class SqlServerChannelSql
         command.Parameters.AddWithValue("@envelope_json", envelopeJson);
         command.Parameters.AddWithValue("@retention_ms", (long)retention.TotalMilliseconds);
 
+        object? createdAt = null;
         try
         {
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            createdAt = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (SqlException ex) when (ex.Number is PrimaryKeyViolation or UniqueIndexViolation)
         {
         }
 
-        return true;
+        if (createdAt is DateTime insertedCreatedAt)
+            return new DateTimeOffset(insertedCreatedAt, TimeSpan.Zero);
+
+        // Duplicate insert (WHERE NOT EXISTS suppressed it, or the key-violation race lost):
+        // return the original row's server-stamped created_at.
+        await using var lookup = connection.CreateCommand();
+        lookup.CommandText = $"SELECT created_at FROM {MessageTable} WHERE id = @id;";
+        lookup.Parameters.AddWithValue("@id", id);
+        var existing = await lookup.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+
+        // NULL only when a duplicate raced the pruner deleting the original row — the app clock is
+        // a fine approximation for a message that old.
+        return existing is DateTime existingCreatedAt
+            ? new DateTimeOffset(existingCreatedAt, TimeSpan.Zero)
+            : DateTimeOffset.UtcNow;
     }
 
     public async Task<IReadOnlyList<SqlServerChannelMessage>> LoadMessagesAsync(

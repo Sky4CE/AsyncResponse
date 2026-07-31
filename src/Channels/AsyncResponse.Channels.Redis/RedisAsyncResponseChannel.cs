@@ -155,6 +155,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
                 return;
 
+            // A waiter disposed before any terminal signal must not leave ResponseTask pending
+            // forever for callers that hold it directly — the timeout dies with this cleanup, so
+            // nothing else could ever complete the task. Cancellation is a no-op after a normal
+            // completion, timeout, or fault.
+            tcs.TrySetCanceled();
+
             try
             {
                 try
@@ -370,9 +376,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
             // waiter would still let the trigger fire the remote operation with no registration
-            // left to receive (or recover) its response. Cleanup leaves nothing behind, and the
-            // response task is cancelled rather than faulted so no unobserved fault lingers.
-            tcs.TrySetCanceled();
+            // left to receive (or recover) its response. Cleanup leaves nothing behind and cancels
+            // the response task rather than faulting it, so no unobserved fault lingers.
             throw;
         }
 

@@ -21,6 +21,12 @@ if ! command -v reportgenerator >/dev/null 2>&1; then
   exit 1
 fi
 
+# What produced the numbers, stamped into the report heading. Coverage totals are not comparable
+# across build configurations — a Release build instruments thousands fewer lines than a Debug one
+# — so an open report has to say which it is rather than leave the reader to guess.
+TITLE="AsyncResponse"
+[[ -n "${COVERAGE_LABEL:-}" ]] && TITLE="AsyncResponse (${COVERAGE_LABEL})"
+
 # The glob is deliberately non-recursive at the call sites: --report-trx also copies each coverage
 # file into its attachment folder, and a recursive glob would parse every one of them twice.
 # Filters keep the report to shipped code — test, benchmark and sample assemblies and generated
@@ -30,7 +36,7 @@ reportgenerator \
   -targetdir:"$TARGET_DIR" \
   ${HISTORY_DIR:+-historydir:"$HISTORY_DIR"} \
   -reporttypes:"Html;TextSummary;JsonSummary;MarkdownSummaryGithub" \
-  -title:"AsyncResponse" \
+  -title:"$TITLE" \
   -assemblyfilters:"+AsyncResponse*;-AsyncResponse.Tests;-AsyncResponse.IntegrationTests*;-AsyncResponse.LoadTests;-AsyncResponse.Sample*" \
   -filefilters:"-*/obj/*;-*.g.cs;-*.Designer.cs"
 

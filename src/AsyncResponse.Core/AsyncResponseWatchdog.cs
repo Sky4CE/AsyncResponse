@@ -94,46 +94,43 @@ public sealed record AsyncResponseWatchdogReport(
         DateTime utcNow,
         TimeSpan staleAfter)
     {
-        var totalEntries = 0;
-        var entriesWithActiveWaiter = 0;
-        var unknownAgeEntries = 0;
-        HashSet<string>? seenCorrelationIds = null;
-
-        // Single pass: classify each entry once and collect the stale ones inline. The previous
-        // implementation walked the collection twice (once to count, once to materialize the list)
-        // and recomputed the staleness subtraction on every visited entry both times. Here the
-        // timestamp arithmetic runs at most once per entry and the result list is allocated lazily,
-        // so the common healthy snapshot — no stale entries — allocates nothing at all.
-        List<RecoveryStateObservation>? staleEntries = null;
+        // Dedupe keeps the OLDEST registration per correlation id. Sibling registrations share a
+        // correlation id by design (fan-out waiters, a flow re-attaching after a crash), and the
+        // scanner contract deliberately promises no ordering — preferring the oldest makes the
+        // verdict order-independent, so a young sibling can never mask an older stale one.
+        // Entries without a correlation id cannot be grouped and are classified individually.
+        // Structures stay lazily allocated: an empty snapshot allocates nothing.
+        Dictionary<string, RecoveryStateObservation>? byCorrelationId = null;
+        List<RecoveryStateObservation>? ungrouped = null;
 
         foreach (var entry in entries)
         {
-            if (!string.IsNullOrEmpty(entry.CorrelationId)
-                && !(seenCorrelationIds ??= new HashSet<string>(entries.Count, StringComparer.Ordinal)).Add(entry.CorrelationId))
+            if (string.IsNullOrEmpty(entry.CorrelationId))
             {
+                (ungrouped ??= []).Add(entry);
                 continue;
             }
 
-            totalEntries++;
-            var activeSubscribers = entry.ActiveSubscribers;
-            if (activeSubscribers > 0)
-            {
-                entriesWithActiveWaiter++;
-                continue;
-            }
+            byCorrelationId ??= new Dictionary<string, RecoveryStateObservation>(entries.Count, StringComparer.Ordinal);
+            if (!byCorrelationId.TryGetValue(entry.CorrelationId, out var kept) || IsOlder(entry, kept))
+                byCorrelationId[entry.CorrelationId] = entry;
+        }
 
-            // Negative liveness means it could not be probed; never flag those as stale.
-            if (activeSubscribers != 0)
-                continue;
+        var totalEntries = 0;
+        var entriesWithActiveWaiter = 0;
+        var unknownAgeEntries = 0;
+        List<RecoveryStateObservation>? staleEntries = null;
 
-            if (entry.RegisteredAtUtc is not { } registeredAtUtc)
-            {
-                unknownAgeEntries++;
-                continue;
-            }
+        if (byCorrelationId is not null)
+        {
+            foreach (var entry in byCorrelationId.Values)
+                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref staleEntries);
+        }
 
-            if (utcNow - registeredAtUtc >= staleAfter)
-                (staleEntries ??= []).Add(entry);
+        if (ungrouped is not null)
+        {
+            foreach (var entry in ungrouped)
+                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref staleEntries);
         }
 
         return new AsyncResponseWatchdogReport(
@@ -141,6 +138,42 @@ public sealed record AsyncResponseWatchdogReport(
             entriesWithActiveWaiter,
             staleEntries ?? [],
             unknownAgeEntries);
+    }
+
+    /// <summary>Prefers the entry with the oldest known registration; a known age beats an unknown one.</summary>
+    internal static bool IsOlder(RecoveryStateObservation candidate, RecoveryStateObservation kept)
+        => candidate.RegisteredAtUtc is { } candidateRegistered
+           && (kept.RegisteredAtUtc is not { } keptRegistered || candidateRegistered < keptRegistered);
+
+    private static void Classify(
+        RecoveryStateObservation entry,
+        DateTime utcNow,
+        TimeSpan staleAfter,
+        ref int totalEntries,
+        ref int entriesWithActiveWaiter,
+        ref int unknownAgeEntries,
+        ref List<RecoveryStateObservation>? staleEntries)
+    {
+        totalEntries++;
+        var activeSubscribers = entry.ActiveSubscribers;
+        if (activeSubscribers > 0)
+        {
+            entriesWithActiveWaiter++;
+            return;
+        }
+
+        // Negative liveness means it could not be probed; never flag those as stale.
+        if (activeSubscribers != 0)
+            return;
+
+        if (entry.RegisteredAtUtc is not { } registeredAtUtc)
+        {
+            unknownAgeEntries++;
+            return;
+        }
+
+        if (utcNow - registeredAtUtc >= staleAfter)
+            (staleEntries ??= []).Add(entry);
     }
 }
 
@@ -237,57 +270,63 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
         try
         {
-            var totalEntries = 0;
-            var entriesWithActiveWaiter = 0;
-            var unknownAgeEntries = 0;
-            List<RecoveryStateObservation>? staleEntries = null;
-            HashSet<string>? seenCorrelationIds = null;
-            var utcNow = DateTime.UtcNow;
+            // Phase 1 — stream the scan and dedupe, keeping the OLDEST registration per
+            // correlation id (see Evaluate for why oldest). Only the fields the classifier needs
+            // are buffered, not whole recovery states. Buffering before probing also lets the
+            // scanner's enumeration (a long-lived reader connection on the relational stores)
+            // finish before the per-id probe connections open.
+            Dictionary<string, (DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? byCorrelationId = null;
+            List<(string? CorrelationId, DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? ungrouped = null;
 
             await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
             {
                 if (entry is null)
                     continue;
 
-                if (!string.IsNullOrEmpty(entry.CorrelationId)
-                    && !(seenCorrelationIds ??= new HashSet<string>(StringComparer.Ordinal)).Add(entry.CorrelationId))
+                if (string.IsNullOrEmpty(entry.CorrelationId))
                 {
+                    (ungrouped ??= []).Add((entry.CorrelationId, entry.RegisteredAtUtc, entry.PayloadTypeFullName));
                     continue;
                 }
 
-                var activeSubscribers = await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false);
-                totalEntries++;
-
-                if (activeSubscribers > 0)
+                byCorrelationId ??= new Dictionary<string, (DateTime?, string?)>(StringComparer.Ordinal);
+                if (!byCorrelationId.TryGetValue(entry.CorrelationId, out var kept)
+                    || (entry.RegisteredAtUtc is { } candidate && (kept.RegisteredAtUtc is not { } existing || candidate < existing)))
                 {
-                    entriesWithActiveWaiter++;
-                    continue;
+                    byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
                 }
-
-                if (activeSubscribers != 0)
-                    continue;
-
-                if (entry.RegisteredAtUtc is null)
-                {
-                    unknownAgeEntries++;
-                    continue;
-                }
-
-                if (utcNow - entry.RegisteredAtUtc.Value < _options.StaleAfter)
-                    continue;
-
-                (staleEntries ??= []).Add(new RecoveryStateObservation(
-                    entry.CorrelationId,
-                    entry.RegisteredAtUtc,
-                    activeSubscribers,
-                    entry.PayloadTypeFullName));
             }
 
-            var report = new AsyncResponseWatchdogReport(
-                totalEntries,
-                entriesWithActiveWaiter,
-                staleEntries ?? [],
-                unknownAgeEntries);
+            // Phase 2 — one liveness probe per unique correlation id, then the same pure
+            // classifier the report type exposes publicly, so this scan and Evaluate (the tested
+            // and benchmarked surface) can never drift apart again.
+            var observations = new List<RecoveryStateObservation>((byCorrelationId?.Count ?? 0) + (ungrouped?.Count ?? 0));
+
+            if (byCorrelationId is not null)
+            {
+                foreach (var (correlationId, entry) in byCorrelationId)
+                {
+                    observations.Add(new RecoveryStateObservation(
+                        correlationId,
+                        entry.RegisteredAtUtc,
+                        await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false),
+                        entry.PayloadTypeFullName));
+                }
+            }
+
+            if (ungrouped is not null)
+            {
+                foreach (var entry in ungrouped)
+                {
+                    observations.Add(new RecoveryStateObservation(
+                        entry.CorrelationId,
+                        entry.RegisteredAtUtc,
+                        await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false),
+                        entry.PayloadTypeFullName));
+                }
+            }
+
+            var report = AsyncResponseWatchdogReport.Evaluate(observations, DateTime.UtcNow, _options.StaleAfter);
             activity?.SetTag("asyncresponse.watchdog.total_entries", report.TotalEntries);
             activity?.SetTag("asyncresponse.watchdog.active_waiters", report.EntriesWithActiveWaiter);
             activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);

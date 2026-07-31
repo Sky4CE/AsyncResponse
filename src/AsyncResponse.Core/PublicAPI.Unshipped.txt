@@ -86,6 +86,8 @@ AsyncResponse.DurableAsyncResponseChannelOptions.IncludeRemoteStackTrace.set -> 
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.get -> int
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.set -> void
 AsyncResponse.DurableFlowOptions
+AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.get -> bool
+AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.set -> void
 AsyncResponse.DurableFlowOptions.DefaultStepTimeout.get -> System.TimeSpan?
 AsyncResponse.DurableFlowOptions.DefaultStepTimeout.set -> void
 AsyncResponse.DurableFlowOptions.DurableFlowOptions() -> void

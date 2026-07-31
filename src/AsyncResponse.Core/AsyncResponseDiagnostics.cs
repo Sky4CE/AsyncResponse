@@ -50,6 +50,10 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.type_resolution.unresolved", unit: "{failure}",
             description: "Persisted service/payload type names that could not be resolved; the callback may silently fail to route.");
 
+    private static readonly Counter<long> UnroutableResponsesCounter =
+        Meter.CreateCounter<long>("asyncresponse.ingress.unroutable_responses", unit: "{message}",
+            description: "Inbound response messages acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them).");
+
     private static int _watchdogGaugesRegistered;
 
     internal static Activity? StartActivity(
@@ -159,6 +163,16 @@ public static class AsyncResponseDiagnostics
     {
         if (TypeResolutionFailures.Enabled)
             TypeResolutionFailures.Add(1, new KeyValuePair<string, object?>("kind", kind));
+    }
+
+    /// <summary>
+    /// Records an inbound response acknowledged without routing because it carried no correlation
+    /// id — every occurrence is a producer-side contract violation worth alerting on.
+    /// </summary>
+    internal static void RecordUnroutableResponse()
+    {
+        if (UnroutableResponsesCounter.Enabled)
+            UnroutableResponsesCounter.Add(1);
     }
 
     /// <summary>

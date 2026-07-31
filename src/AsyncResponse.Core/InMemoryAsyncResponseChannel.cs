@@ -459,16 +459,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                         continue;
 
                     _many.RemoveAt(i);
+                    // _many is only ever created with two entries and collapses to _single at one,
+                    // so it can never reach zero here — the group-empty signal is produced solely
+                    // by the _single removal path above.
                     if (_many.Count == 1)
                     {
                         _single = _many[0];
                         _many = null;
-                    }
-                    else if (_many.Count == 0)
-                    {
-                        _many = null;
-                        _closed = true;
-                        return true;
                     }
 
                     return false;

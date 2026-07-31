@@ -133,9 +133,9 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
     }
 
-    public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default, Exception? cause = null)
     {
-        ThrowIfLost();
+        ThrowIfLost(cause);
         var expectedRevision = state.Revision;
         state.Revision = checked(expectedRevision + 1);
         state.UpdatedAtUtc = DateTime.UtcNow;
@@ -155,12 +155,51 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         {
             state.Revision = expectedRevision;
             MarkLost();
+
+            // The store exception propagates; keep the failure this save was recording from
+            // vanishing with it.
+            if (cause is not null)
+                _logger.LogWarning(cause, "Durable flow '{FlowId}' failed to checkpoint; the failure it was recording is attached here and the store error propagates.", _flowId);
             throw;
         }
 
         state.Revision = expectedRevision;
         MarkLost();
-        ThrowIfLost();
+        throw await CreateSaveRejectedExceptionAsync(expectedRevision, cause, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds the exception for a rejected checkpoint write. The store's compare-and-swap only
+    /// returns <c>false</c>, so the reason is diagnosed with a best-effort re-read: a revision
+    /// conflict — a concurrent lease-bypassing writer such as <c>RecoverAsync</c>, <c>FailAsync</c>,
+    /// or an operator parking the run — is reported as such instead of as a lost lease, which sent
+    /// operators hunting phantom lease problems. Behavior is unchanged either way: the lease is
+    /// abandoned (<see cref="MarkLost"/> already ran) and the delivery retries from the last
+    /// checkpoint; <paramref name="cause"/> rides along as the inner exception so the failure that
+    /// triggered the save is not discarded.
+    /// </summary>
+    private async Task<InvalidOperationException> CreateSaveRejectedExceptionAsync(
+        long expectedRevision,
+        Exception? cause,
+        CancellationToken cancellationToken)
+    {
+        var reason = "its execution lease was no longer held (expired or taken over)";
+        try
+        {
+            var current = await _store.LoadAsync(_flowId, cancellationToken).ConfigureAwait(false);
+            if (current is null)
+                reason = "its ledger entry is gone (expired or deleted)";
+            else if (current.Revision != expectedRevision)
+                reason = $"a concurrent write advanced the ledger (revision {expectedRevision} -> {current.Revision}: a recovery, failure signal, or operator status change won the race)";
+        }
+        catch
+        {
+            // Best-effort diagnosis only — the rejection itself is what matters.
+        }
+
+        return new InvalidOperationException(
+            $"Durable flow '{_flowId}' could not checkpoint because {reason}; the worker abandons this execution and the delivery retries from the last checkpoint.",
+            cause);
     }
 
     private async Task RenewLoopAsync()

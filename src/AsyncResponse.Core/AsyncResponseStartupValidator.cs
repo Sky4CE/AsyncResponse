@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace AsyncResponse;
@@ -21,6 +22,22 @@ internal sealed class AsyncResponseChannelMarker(string name)
 internal sealed class AsyncResponseTransportMarker(string name)
 {
     public string Name { get; } = name;
+
+    /// <summary>
+    /// Whether the transport's worker subscriber resolved to early ACK (<c>AckAfterEnqueue</c>).
+    /// Declared by the transport's registration from its bound options so the startup validator
+    /// can veto the combination with durable flows without referencing transport types.
+    /// </summary>
+    public bool WorkerSubscriberUsesEarlyAck { get; init; }
+
+    /// <summary>Worker ack-mode option path, shown in the startup error.</summary>
+    public string? WorkerAckModePath { get; init; }
+
+    /// <summary>Whether the transport's response subscriber resolved to early ACK.</summary>
+    public bool ResponseSubscriberUsesEarlyAck { get; init; }
+
+    /// <summary>Response ack-mode option path, shown in the startup warning.</summary>
+    public string? ResponseAckModePath { get; init; }
 }
 
 /// <summary>Internal marker registered by each durable-flow state-store registration.</summary>
@@ -40,7 +57,9 @@ internal sealed class AsyncResponseStartupValidator(
     IEnumerable<AsyncResponseChannelMarker> _channels,
     IEnumerable<AsyncResponseTransportMarker> _transports,
     IEnumerable<AsyncResponseDurableFlowStoreMarker> _flowStores,
-    IOptions<AsyncResponseOptions> _options) : IHostedService
+    IOptions<AsyncResponseOptions> _options,
+    IEnumerable<DurableFlowOptions>? _flowOptions = null,
+    ILogger<AsyncResponseStartupValidator>? _logger = null) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
@@ -90,7 +109,53 @@ internal sealed class AsyncResponseStartupValidator(
                 "Register exactly one durable-flow store.");
         }
 
+        ValidateEarlyAckDeclarations();
+
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Fails fast when a transport's worker subscriber is configured for early ACK: durable-flow
+    /// wake-ups ride the worker queue and rely on broker redelivery for crash recovery (the
+    /// executor's lease poll deliberately delegates dead-holder liveness to redelivery of the
+    /// holder's own job). With early ACK, a crash between the ACK and the handler strands the run
+    /// as Running — no lease, no queued job, and no store enumeration API to even discover it.
+    /// A flow store is always registered (validated above), so the veto is unconditional unless
+    /// the operator accepts the risk via <see cref="DurableFlowOptions.AllowEarlyAckWorkerSubscriber"/>.
+    /// Early ACK on the response queue only delays failover (a lost response burns the waiter's
+    /// timeout before recovery routing takes over), so it warns instead of throwing.
+    /// </summary>
+    private void ValidateEarlyAckDeclarations()
+    {
+        var flowOptions = _flowOptions?.FirstOrDefault();
+        foreach (var transport in _transports)
+        {
+            if (transport.ResponseSubscriberUsesEarlyAck)
+            {
+                _logger?.LogWarning(
+                    "The {Transport} response subscriber uses early ACK ({AckModePath} = AckAfterEnqueue): a crash after the ACK loses the buffered response, and its waiter burns the full timeout before failing over. Prefer AckAfterHandlerCompletes for the response queue.",
+                    transport.Name,
+                    transport.ResponseAckModePath);
+            }
+
+            if (!transport.WorkerSubscriberUsesEarlyAck)
+                continue;
+
+            if (flowOptions?.AllowEarlyAckWorkerSubscriber == true)
+            {
+                _logger?.LogWarning(
+                    "The {Transport} worker subscriber uses early ACK with {OptOut} enabled: a crash after an ACK but before execution strands Running durable-flow runs until an operator resumes them.",
+                    transport.Name,
+                    $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.AllowEarlyAckWorkerSubscriber)}");
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"The {transport.Name} worker subscriber is configured for early ACK ({transport.WorkerAckModePath} = AckAfterEnqueue), and durable-flow wake-ups ride the worker queue. " +
+                "Flow execution relies on broker redelivery for crash recovery: a process crash after an early ACK but before the handler runs strands the run as Running with no lease, no queued job, and no discovery API. " +
+                $"Keep the worker subscriber on AckAfterHandlerCompletes (the default), or set {nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.AllowEarlyAckWorkerSubscriber)} = true to accept that a crash can strand flow runs until an operator resumes them " +
+                "(see docs/durable-flows.md and docs/transport-semantics.md).");
+        }
     }
 
     /// <summary>

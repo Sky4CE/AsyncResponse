@@ -614,7 +614,7 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null, null],
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
             culture: null)!;
         SetField(instance, "_cleanupStarted", 1);
         return (instance, completion);

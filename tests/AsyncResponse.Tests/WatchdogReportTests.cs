@@ -106,4 +106,19 @@ public class WatchdogReportTests
             Now - registeredAgo,
             activeSubscribers,
             typeof(OperationResult).FullName);
+
+    [Fact]
+    public void Evaluate_DuplicateCorrelationIds_KeepsOldestRegistration()
+    {
+        // The scanner contract promises no ordering: a young sibling yielded first must not mask
+        // an older stale one, so dedupe prefers the oldest registration per correlation id.
+        var young = Entry(registeredAgo: TimeSpan.FromMinutes(5), activeSubscribers: 0, correlationId: "cid");
+        var oldStale = Entry(registeredAgo: TimeSpan.FromDays(2), activeSubscribers: 0, correlationId: "cid");
+
+        var report = AsyncResponseWatchdogReport.Evaluate([young, oldStale], Now, StaleAfter);
+
+        Assert.Equal(1, report.TotalEntries);
+        var stale = Assert.Single(report.StaleEntries);
+        Assert.Equal(oldStale.RegisteredAtUtc, stale.RegisteredAtUtc);
+    }
 }

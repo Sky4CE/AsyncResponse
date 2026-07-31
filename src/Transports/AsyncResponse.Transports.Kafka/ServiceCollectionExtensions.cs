@@ -49,7 +49,19 @@ public static class KafkaAsyncResponseTransportServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<KafkaWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, KafkaReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker("Kafka"));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<KafkaAsyncResponseTransportOptions>>().Value;
+            return new AsyncResponseTransportMarker("Kafka")
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == KafkaAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == KafkaAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<KafkaWorkerSubscriber>();
         services.AddHostedService<KafkaResponseIngressSubscriber>();

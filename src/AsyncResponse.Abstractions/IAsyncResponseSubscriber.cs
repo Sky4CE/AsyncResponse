@@ -9,7 +9,8 @@ public interface IAsyncResponseSubscriber
     /// <summary>
     /// Subscribes to the response channel associated with <paramref name="correlationId"/>,
     /// and returns a disposable <see cref="IAsyncResponseWaiter{T}"/> for manual lifetime control.
-    /// Disposing the waiter cancels the subscription and clears the stored recovery state.
+    /// Disposing the waiter cancels the subscription, clears the stored recovery state, and — when
+    /// no terminal signal was observed yet — cancels <see cref="IAsyncResponseWaiter{T}.ResponseTask"/>.
     /// </summary>
     /// <typeparam name="T">The expected response payload type.</typeparam>
     /// <param name="correlationId">The unique identifier linking the request to its response channel.</param>

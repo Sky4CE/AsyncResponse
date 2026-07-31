@@ -542,23 +542,34 @@ asyncResponse
 
 // Exactly one durable-flow store (enforced at host startup), independent from waiter recovery
 // state. The sample defaults to process-local state; choose SQLite or MongoDB for restart durability.
+// AllowEarlyAckWorkerSubscriber acknowledges the early-ACK trade-off for the sample's opt-in
+// early-ACK modes: durable-flow wake-ups ride the worker queue, and a crash after an early ACK
+// strands the run until an operator resumes it — startup refuses the combination without this
+// explicit acceptance (see docs/transport-semantics.md).
 var durableFlowStore = builder.Configuration["AsyncResponse:DurableFlowStore"]
     ?? Environment.GetEnvironmentVariable("ASYNCRESPONSE_SAMPLE_DURABLE_STORE");
 if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase))
 {
     var flowDatabasePath = Path.Combine(Path.GetTempPath(), "asyncresponse-sample-flow-state.db");
-    asyncResponse.WithSqliteDurableFlows(options => options.ConnectionString = $"Data Source={flowDatabasePath}");
+    asyncResponse.WithSqliteDurableFlows(options =>
+    {
+        options.ConnectionString = $"Data Source={flowDatabasePath}";
+        options.AllowEarlyAckWorkerSubscriber = true;
+    });
 }
 else if (string.Equals(durableFlowStore, "mongodb", StringComparison.OrdinalIgnoreCase))
 {
     // Persists flow ledgers with the AsyncResponse.DurableFlows.MongoDB package, reusing the shared
     // IMongoDatabase registered above — the same server backs channel, transport, and flow state.
     asyncResponse.WithMongoDbDurableFlows(options =>
-        options.CollectionName = builder.Configuration["MongoDB:FlowStateCollection"] ?? options.CollectionName);
+    {
+        options.CollectionName = builder.Configuration["MongoDB:FlowStateCollection"] ?? options.CollectionName;
+        options.AllowEarlyAckWorkerSubscriber = true;
+    });
 }
 else
 {
-    asyncResponse.WithInMemoryDurableFlows();
+    asyncResponse.WithInMemoryDurableFlows(options => options.AllowEarlyAckWorkerSubscriber = true);
 }
 
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();

@@ -120,6 +120,11 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         => ((ICollection<KeyValuePair<string, EntryBucket>>)_entries)
             .Remove(new KeyValuePair<string, EntryBucket>(correlationId, bucket));
 
+    // Deliberately not a flat ConcurrentDictionary<(correlationId, registrationId), Entry>: the
+    // hot-path lookup is GetAllAsync(correlationId) — every lost-subscriber dispatch — which needs
+    // all of one correlation id's registrations in O(1)+small-array, and TTL pruning is per-bucket.
+    // A flat tuple key would make both O(total entries). The reference-identity Equals below is
+    // what lets a prune+mutate publish atomically via TryUpdate's compare operand.
     private readonly struct EntryBucket : IEquatable<EntryBucket>
     {
         private readonly Entry? _single;

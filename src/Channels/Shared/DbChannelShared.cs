@@ -197,7 +197,6 @@ internal abstract class DbAsyncResponseChannelBase :
             startedAtUtc,
             completionPredicate,
             tcs,
-            capturedContext,
             activity);
 
         var timeoutCts = new CancellationTokenSource();
@@ -264,7 +263,6 @@ internal abstract class DbAsyncResponseChannelBase :
             // waiter would still let the trigger fire the remote operation with no registration
             // left to receive (or recover) its response. Cleanup cancels the response task, so no
             // pending task is left behind.
-            tcs.TrySetCanceled();
             throw;
         }
 
@@ -654,9 +652,14 @@ internal abstract class DbAsyncResponseChannelBase :
     /// </summary>
     private protected async Task<HashSet<string>?> CollectDispatchScopeAsync(CancellationToken cancellationToken)
     {
-        var delay = Task.Delay(CurrentPollInterval(), cancellationToken);
-        var signal = _signals.Reader.WaitToReadAsync(cancellationToken).AsTask();
+        // The WhenAny loser is cancelled via the per-iteration linked source: an abandoned
+        // WaitToReadAsync would otherwise stay parked in the channel's blocked-reader list until
+        // the next signal — one per poll interval, accumulating without bound on an idle channel.
+        using var iteration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var delay = Task.Delay(CurrentPollInterval(), iteration.Token);
+        var signal = _signals.Reader.WaitToReadAsync(iteration.Token).AsTask();
         var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
+        iteration.Cancel();
         if (completed == delay)
             return null;
 
@@ -733,11 +736,15 @@ internal abstract class DbAsyncResponseChannelBase :
     {
         // The insert itself carries the remote wake where the provider has one (a NOTIFY rides the
         // PostgreSQL insert; MongoDB change streams observe it) and the SQL Server sweep polls it
-        // up. Only the local fast path and a targeted local signal are needed on top.
-        await _store.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
+        // up. Only the local fast path and a targeted local signal are needed on top. The store
+        // returns the SERVER-stamped created_at for the local fast-path message: subscription
+        // watermarks are server-clock, and an app-clock timestamp here silently disabled the fast
+        // path whenever the app clock ran more than the 1s tolerance behind the database — delivery
+        // then quietly degraded to sweep latency on every publish.
+        var createdAtUtc = await _store.InsertMessageAsync(messageId, correlationId, envelopeJson, _options.MessageRetention, cancellationToken)
             .ConfigureAwait(false);
         await TryDispatchLocalSubscribersAsync(
-            new DbChannelMessage(messageId, correlationId, envelopeJson, DateTimeOffset.UtcNow),
+            new DbChannelMessage(messageId, correlationId, envelopeJson, createdAtUtc),
             cancellationToken).ConfigureAwait(false);
         SignalDispatcher(correlationId);
     }
@@ -1078,7 +1085,6 @@ internal abstract class DbAsyncResponseChannelBase :
             DateTimeOffset startedAtUtc,
             Func<T, ValueTask<bool>> completionPredicate,
             TaskCompletionSource<T> tcs,
-            ExecutionContext? _,
             Activity? activity)
         {
             _owner = owner;
@@ -1191,6 +1197,14 @@ internal abstract class DbAsyncResponseChannelBase :
         {
             if (Interlocked.Exchange(ref _cleanupStarted, 1) != 0)
                 return;
+
+            // A waiter disposed before any terminal signal must not leave ResponseTask pending
+            // forever for callers that hold it directly — the timeout dies with this cleanup, so
+            // nothing else could ever complete the task. This also covers channel DisposeAsync at
+            // host shutdown, which runs this cleanup over every in-flight subscription and would
+            // otherwise hang still-awaiting WaitAsync callers. Cancellation is a no-op after a
+            // normal completion, timeout, or fault.
+            _tcs.TrySetCanceled();
 
             try
             {

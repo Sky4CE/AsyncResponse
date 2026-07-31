@@ -10,9 +10,13 @@ public class DurableFlowOptions
     /// <summary>
     /// How long persisted flow state lives; the TTL is refreshed on every checkpoint, so it bounds
     /// the *idle* time of a run, not its total duration. Must comfortably exceed the longest gap
-    /// between checkpoints (typically the longest awaited step). Default: 7 days.
+    /// between checkpoints (typically the longest awaited step) — the default is deliberately
+    /// double the 7-day default step-timeout chain (<see cref="DefaultStepTimeout"/> →
+    /// channel <c>DefaultTimeout</c> → <c>RecoveryStateExpiry</c>), so a step that waits out the
+    /// full default timeout still faults and checkpoints before its ledger can expire, instead of
+    /// racing it. Default: 14 days.
     /// </summary>
-    public TimeSpan StateExpiry { get; set; } = TimeSpan.FromDays(7);
+    public TimeSpan StateExpiry { get; set; } = TimeSpan.FromDays(14);
 
     /// <summary>
     /// Default timeout for awaited steps that don't pass one explicitly. <c>null</c> uses the
@@ -38,4 +42,14 @@ public class DurableFlowOptions
     /// checkpoint or flow outcome. Set to zero to persist every report. Default: 1 second.
     /// </summary>
     public TimeSpan ProgressPersistenceInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Accepts the risk of running the worker subscriber in early ACK (<c>AckAfterEnqueue</c>)
+    /// while durable flows are registered, suppressing the startup error. Durable-flow wake-ups
+    /// ride the worker queue and rely on broker redelivery for crash recovery; with early ACK, a
+    /// process crash after the ACK but before execution strands the run as <c>Running</c> with no
+    /// lease and no queued job, and only an operator <c>ResumeAsync(flowId)</c> can revive it.
+    /// Leave <c>false</c> (the default) unless that loss mode is acceptable. Default: false.
+    /// </summary>
+    public bool AllowEarlyAckWorkerSubscriber { get; set; }
 }

@@ -50,6 +50,24 @@ public class CallbackAuthorizationTests
     }
 
     [Fact]
+    public async Task UnauthorizedTarget_IsRejectedBeforeTypeResolution()
+    {
+        // The name is deliberately unresolvable: before the ordering fix this path failed with
+        // "Type ... not found" — a full assembly scan spent on an attacker-supplied name. The
+        // authorization error proves the string-based gate now runs before any resolution.
+        var (provider, _) = BuildProvider(b => b.AuthorizeCallbacks(_ => { }));
+        var dto = new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = $"Missing.Namespace.IUnresolvable{Guid.NewGuid():N}",
+            MethodName = "RunAsync",
+            Params = []
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(dto));
+        Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Allowlist_AllowsRegisteredType()
     {
         var (provider, target) = BuildProvider(b => b.AuthorizeCallbacks(a => a.Allow<ICallbackTarget>()));

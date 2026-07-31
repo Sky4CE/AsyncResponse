@@ -21,6 +21,14 @@ These hold for every transport in the matrix, verified per package:
   method on all ten:
   `UseAckAfterEnqueue(backgroundWorkerCount, backgroundQueueCapacity, backgroundDrainTimeout = null)`
   — both counts must be explicit positive values, there are no defaults to fall into.
+- **Early ACK on the worker queue is vetoed at startup.** Durable-flow wake-ups ride the worker
+  queue and rely on broker redelivery for crash recovery, so a crash after an early ACK but
+  before execution strands the run as `Running` with nothing left to wake it (see
+  [durable flows — what happens when things die](durable-flows.md#what-happens-when-things-die)).
+  Startup throws for `WorkerSubscriber` early ACK unless
+  `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` accepts the risk; `ResponseSubscriber`
+  early ACK logs a startup warning instead (a lost response burns the waiter's timeout before
+  failover, but nothing strands).
 - **`OnBackgroundFailure`.** Every subscriber options type exposes
   `Func<<Transport>BackgroundFailureContext, ValueTask>? OnBackgroundFailure`, invoked when a
   handler fails after the message was already settled (see the

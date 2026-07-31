@@ -24,8 +24,14 @@ internal sealed class AsyncResponseIngress(
 
         if (string.IsNullOrWhiteSpace(correlationId))
         {
-            _logger.LogWarning("Ingress received a response message with no correlation id; cannot route it.");
+            // Deliberately acknowledged, not thrown: without a correlation id the message can
+            // never route, so redelivery would retry it forever (RabbitMQ's default
+            // MaxDeliveryAttempts = 0 has no cap) or burn dead-letter attempts on brokers that do.
+            // Error-level log + counter make the drop loud — every occurrence is a producer-side
+            // contract violation.
+            _logger.LogError("Ingress received a response message with no correlation id; it cannot be routed and is acknowledged without dispatch. Message: {Message}", messageJson);
             AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "No correlation id on the inbound response message.");
+            AsyncResponseDiagnostics.RecordUnroutableResponse();
             return;
         }
 

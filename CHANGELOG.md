@@ -13,6 +13,17 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Added
 
+- Startup validation vetoes early ACK (`AckAfterEnqueue`) on the worker subscriber: durable-flow
+  wake-ups ride the worker queue and rely on broker redelivery for crash recovery, so a crash
+  after an early ACK stranded the run as `Running` with no lease, no queued job, and no discovery
+  API. `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` explicitly accepts the risk;
+  early ACK on the response subscriber logs a startup warning instead (a lost response only delays
+  failover through the waiter's timeout).
+- `asyncresponse.ingress.unroutable_responses` counter (plus an Error-level log): inbound
+  responses with no correlation id are acknowledged by design — redelivery could never route
+  them — and each occurrence is now loud instead of a Warning-level whisper.
+- Channel-conformance fact: disposing a waiter before any terminal signal must cancel its public
+  `ResponseTask` (see Fixed).
 - `FlowRunStatus.Suspended` — operator parking for durable flow runs. A suspended run ignores
   wake-ups, recoveries, resumes, and failure signals (a parent awaiting a suspended child keeps
   waiting), so a dead-lettered `Running` run can be taken under manual control without a late
@@ -43,6 +54,29 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- `DurableFlowOptions.StateExpiry` default raised from 7 to 14 days — deliberately double the
+  7-day default step-timeout chain (`DefaultStepTimeout` → channel `DefaultTimeout` →
+  `RecoveryStateExpiry`), so a step that silently waits out the full default timeout faults and
+  checkpoints before its ledger can expire instead of racing it.
+- Callback authorization now runs **before** type resolution: an unauthorized
+  service/method name is rejected string-first, without spending a full assembly scan on
+  attacker-supplied input. Unresolvable type names are additionally negative-cached (bounded, and
+  invalidated when an assembly loads or a custom resolver registers), so a poisoned recovery row
+  no longer re-walks every loaded assembly on every delivery.
+- The recovery watchdog's scan now feeds the same pure `AsyncResponseWatchdogReport.Evaluate`
+  classifier it exposes publicly (the two had drifted into duplicate logic), and duplicate
+  registrations for one correlation id keep the **oldest** — the scanner contract promises no
+  ordering, so a young sibling yielded first can no longer mask an older stale one.
+- Rejected durable-flow checkpoints are diagnosed before being reported: a ledger revision
+  advanced by a concurrent lease-bypassing writer (`RecoverAsync`, `FailAsync`, operator parking)
+  is reported as a concurrent write instead of a phantom "lost its execution lease", and the
+  failure the checkpoint was recording travels as the inner exception instead of being discarded.
+- Lost-subscriber **failure** callbacks are retried in-process (bounded, jittered — same policy as
+  ingress) before the deliberate swallow, so a transient dependency blip no longer silently drops
+  the only delivery of a domain-failure signal.
+- The PostgreSQL, SQL Server, and MongoDB transport message dispatchers and correlation-id
+  extractors now share one source-included implementation (previously three ~280-line and three
+  ~106-line near-verbatim copies). Internal only: rendered log text and telemetry are unchanged.
 - Shutdown-budget defaults now fit the .NET host's 30 s `HostOptions.ShutdownTimeout` out of the
   box: `BackgroundDrainTimeout` defaults dropped from 30 s to 20 s on all transports, transport
   `ShutdownTimeout` defaults dropped from 15 s to 5 s where the value is actually consumed (Azure
@@ -73,6 +107,18 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- Disposing a waiter before any terminal signal now cancels its public `ResponseTask` on the
+  Redis, NATS, PostgreSQL, SQL Server, and MongoDB channels, matching the in-memory reference —
+  it used to stay pending forever (the disposal also destroyed the timeout, so nothing could ever
+  complete it). On the database channels this also covers channel `DisposeAsync` at host
+  shutdown, which runs the same cleanup over every in-flight subscription and used to hang
+  still-awaiting `WaitAsync` callers.
+- The database channels' same-process fast path now uses the server-stamped `created_at` returned
+  by the insert instead of the app clock; an app clock more than 1 s behind the database used to
+  silently disable the fast path on every publish, degrading same-process delivery to sweep
+  latency.
+- The database channels' dispatch loop no longer accumulates an abandoned channel-read waiter per
+  poll interval on idle channels.
 - Database channels (PostgreSQL, SQL Server, MongoDB) no longer redeliver an already-delivered
   response to a new waiter that reuses the correlation id within the delivery watermark's 1 s
   clock-skew tolerance — the new waiter used to complete instantly with the previous waiter's

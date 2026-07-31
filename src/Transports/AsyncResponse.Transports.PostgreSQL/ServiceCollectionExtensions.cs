@@ -28,7 +28,19 @@ public static class PostgreSqlAsyncResponseTransportServiceCollectionExtensions
         services.TryAddSingleton<PostgreSqlWorkerTransport>();
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider => provider.GetRequiredService<PostgreSqlWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, PostgreSqlReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker(PostgreSqlAsyncResponseTransportOptions.TransportName));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseTransportOptions>>().Value;
+            return new AsyncResponseTransportMarker(PostgreSqlAsyncResponseTransportOptions.TransportName)
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == PostgreSqlAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == PostgreSqlAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<PostgreSqlWorkerSubscriber>();
         services.AddHostedService<PostgreSqlResponseIngressSubscriber>();

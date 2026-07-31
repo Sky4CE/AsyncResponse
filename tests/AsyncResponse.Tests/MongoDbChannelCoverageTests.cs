@@ -786,7 +786,7 @@ public sealed class MongoDbChannelCoverageTests
                 nested,
                 BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                 binder: null,
-                [Channel, correlationId, Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null, null],
+                [Channel, correlationId, Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
                 culture: null)!;
             return (instance, completion);
         }

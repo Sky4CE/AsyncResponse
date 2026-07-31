@@ -13,7 +13,9 @@ public interface IAsyncResponseWaiter<T> : IAsyncDisposable where T : IAsyncResp
 {
     /// <summary>
     /// A task that completes with the response payload when it is published to the channel,
-    /// or faults if an error envelope arrives or the wait times out.
+    /// faults if an error envelope arrives or the wait times out, or is canceled when the waiter
+    /// is disposed before any terminal signal — so a caller holding this task directly never
+    /// waits forever on an abandoned subscription.
     /// </summary>
     Task<T> ResponseTask { get; }
 }

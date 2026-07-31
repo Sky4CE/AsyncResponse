@@ -34,7 +34,19 @@ public static class RabbitMqAsyncResponseServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider =>
             provider.GetRequiredService<RabbitMqWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, RabbitMqReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker("RabbitMQ"));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<RabbitMqAsyncResponseOptions>>().Value;
+            return new AsyncResponseTransportMarker("RabbitMQ")
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == RabbitMqAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == RabbitMqAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<RabbitMqWorkerSubscriber>();
         services.AddHostedService<RabbitMqResponseIngressSubscriber>();

@@ -411,6 +411,11 @@ jobs:
       - name: Render report
         # Filters, report types and badge thresholds live in the script, shared with the local
         # scripts/coverage.sh, so a contributor's report and this badge measure the same thing.
+        # COVERAGE_LABEL records what was built: totals are not comparable across configurations
+        # (Release instruments thousands fewer lines than Debug), and the published report is the
+        # one people compare against, so it has to state its own shape.
+        env:
+          COVERAGE_LABEL: Release / net8.0+net10.0 / unit+integration
         run: ./scripts/coverage-report.sh "coverage-input/*.cobertura.xml" coverage-report
 
       - name: Job summary

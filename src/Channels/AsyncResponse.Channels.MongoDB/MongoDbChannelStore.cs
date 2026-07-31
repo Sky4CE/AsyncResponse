@@ -196,7 +196,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// dispatch watermarks never mix client and server clocks. The insert itself is the wake signal:
     /// every process's change stream observes it.
     /// </summary>
-    public Task InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
             IsTransient,
@@ -205,15 +205,23 @@ internal sealed class MongoDbChannelStore : IDisposable
             _options.PublishRetryMaxDelay,
             cancellationToken);
 
-    private async Task<bool> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
+    private async Task<DateTimeOffset> InsertMessageOnceAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        await _messages.UpdateOneAsync(
+
+        // findOneAndUpdate instead of updateOne so the returned document carries the
+        // server-stamped ($$NOW) created_at — the original document's on a publish retry, per the
+        // pipeline's $ifNull — for the same-process fast path's watermark comparison.
+        var document = await _messages.FindOneAndUpdateAsync(
             Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, id),
             BuildInsertMessagePipeline(correlationId, envelopeJson, retention),
-            new UpdateOptions { IsUpsert = true },
+            new FindOneAndUpdateOptions<MongoChannelMessageDocument>
+            {
+                IsUpsert = true,
+                ReturnDocument = ReturnDocument.After
+            },
             cancellationToken).ConfigureAwait(false);
-        return true;
+        return new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero);
     }
 
     /// <summary>

@@ -329,7 +329,21 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         try
         {
-            await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+            // Bounded in-process retry, mirroring the ingress's transient-fault policy: a failure
+            // callback is re-invocable by contract (broker redelivery re-invokes it the same way),
+            // and a one-shot invoke turned a transient dependency blip into a silently dropped
+            // domain-failure signal that nothing ever revisited (the watchdog is report-only).
+            await AsyncResponseRetry.ExecuteAsync(
+                async _ =>
+                {
+                    await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
+                    return true;
+                },
+                isTransient: static _ => true,
+                maxAttempts: 4,
+                baseDelay: TimeSpan.FromMilliseconds(250),
+                maxDelay: TimeSpan.FromSeconds(2),
+                CancellationToken.None).ConfigureAwait(false);
 
             _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
 
@@ -337,9 +351,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
         }
         catch (Exception ex)
         {
-            // Deliberately not rethrown: an exception would bubble up to the broker ingress, which
-            // reacts with SetException — and that would invoke this same failure callback a second
-            // time. The domain failure has already been dispatched.
+            // Deliberately not rethrown once the retries are exhausted: an exception would bubble
+            // up to the broker ingress, which reacts with SetException — and that would invoke
+            // this same failure callback a second time. The domain failure has already been
+            // dispatched.
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
             return false;

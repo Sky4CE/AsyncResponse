@@ -32,6 +32,9 @@ public static class AsyncResponseTypeResolution
         {
             _resolvers = [.. _resolvers, resolver];
         }
+
+        // A new resolver can turn previously-unresolvable names into hits; drop the negative cache.
+        ReflectionExtensions.InvalidateUnresolvableServiceTypes();
     }
 
     /// <summary>
@@ -72,5 +75,7 @@ public static class AsyncResponseTypeResolution
         {
             _resolvers = [];
         }
+
+        ReflectionExtensions.InvalidateUnresolvableServiceTypes();
     }
 }

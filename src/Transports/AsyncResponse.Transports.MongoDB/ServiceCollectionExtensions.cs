@@ -61,7 +61,19 @@ public static class MongoDbAsyncResponseTransportServiceCollectionExtensions
             provider.GetRequiredService<MongoDbTransportStore>()));
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider => provider.GetRequiredService<MongoDbWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, MongoDbReplyTargetProvider>());
-        services.AddSingleton(new AsyncResponseTransportMarker(MongoDbAsyncResponseTransportOptions.TransportName));
+        services.AddSingleton(provider =>
+        {
+            // Resolved ack modes declared to the Core startup validator, which vetoes early ACK on
+            // the worker queue durable-flow wake-ups ride (see AsyncResponseStartupValidator).
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<MongoDbAsyncResponseTransportOptions>>().Value;
+            return new AsyncResponseTransportMarker(MongoDbAsyncResponseTransportOptions.TransportName)
+            {
+                WorkerSubscriberUsesEarlyAck = options.WorkerSubscriber.AckMode == MongoDbAckMode.AckAfterEnqueue,
+                WorkerAckModePath = $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(options.WorkerSubscriber)}.{nameof(options.WorkerSubscriber.AckMode)}",
+                ResponseSubscriberUsesEarlyAck = options.ResponseSubscriber.AckMode == MongoDbAckMode.AckAfterEnqueue,
+                ResponseAckModePath = $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(options.ResponseSubscriber)}.{nameof(options.ResponseSubscriber.AckMode)}"
+            };
+        });
 
         services.AddHostedService<MongoDbWorkerSubscriber>();
         services.AddHostedService<MongoDbResponseIngressSubscriber>();

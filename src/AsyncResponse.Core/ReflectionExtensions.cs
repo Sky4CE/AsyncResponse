@@ -16,6 +16,19 @@ internal static class ReflectionExtensions
     private delegate ValueTask AsyncMethodInvoker(object service, object?[] args);
 
     private static readonly ConcurrentDictionary<string, Type> ServiceTypes = new(StringComparer.Ordinal);
+
+    // Names that already failed a full assembly scan. Capacity-bounded so hostile inputs cannot
+    // grow it without limit, and invalidated on the only events that can turn a miss into a hit —
+    // a new assembly loading, or a custom resolver registering. At capacity, novel unresolvable
+    // names fall back to scanning; correctness never depends on this cache.
+    private static readonly ConcurrentDictionary<string, byte> UnresolvableServiceTypes = new(StringComparer.Ordinal);
+    private const int UnresolvableServiceTypeCacheCapacity = 1024;
+
+    static ReflectionExtensions()
+        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => UnresolvableServiceTypes.Clear();
+
+    /// <summary>Drops the negative type-resolution cache (a new resolver may resolve cached misses).</summary>
+    internal static void InvalidateUnresolvableServiceTypes() => UnresolvableServiceTypes.Clear();
     private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
     private static readonly ConcurrentDictionary<InvocationPlanKey, InvocationPlan> InvocationPlans = new();
     private static readonly MethodInfo ToValueTaskMethod = typeof(ReflectionExtensions)
@@ -46,15 +59,11 @@ internal static class ReflectionExtensions
     {
         try
         {
-            // 1) Load the service type by full name
-            var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
-
-            if (serviceType == null)
-                throw new InvalidOperationException(
-                    $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
-
-            // 1b) Opt-in authorization: when an IAsyncResponseCallbackAuthorizer is registered, only
-            // allowed (service, method) pairs may be invoked — defense-in-depth even if the recovery
+            // 1) Opt-in authorization — deliberately BEFORE any type resolution: the check is
+            // string-based, so an unauthorized name is rejected without paying the assembly scan
+            // (otherwise attacker-reachable work under the very threat model the authorizer
+            // exists for). When an IAsyncResponseCallbackAuthorizer is registered, only allowed
+            // (service, method) pairs may be invoked — defense-in-depth even if the recovery
             // store or worker transport is compromised. No authorizer registered ⇒ allow all. The
             // built-in flow executor gets no exemption: RecoverAsync carries an attacker-choosable
             // payload that is checkpointed into the flow ledger, so under the stated threat model it
@@ -69,20 +78,27 @@ internal static class ReflectionExtensions
                     $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
             }
 
-            // 2) Resolve the service instance
+            // 2) Load the service type by full name
+            var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
+
+            if (serviceType == null)
+                throw new InvalidOperationException(
+                    $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
+
+            // 3) Resolve the service instance
             var service = provider.GetService(serviceType)
                        ?? throw new InvalidOperationException(
                             $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
 
-            // 3) Resolve and cache method metadata + compiled invocation delegate.
+            // 4) Resolve and cache method metadata + compiled invocation delegate.
             var plan = InvocationPlans.GetOrAdd(
                 new InvocationPlanKey(serviceType, dto.MethodName, dto.Params.Length),
                 static key => CreateInvocationPlan(key));
 
-            // 4) Convert only the arguments that need conversion, keeping already-typed arrays hot.
+            // 5) Convert only the arguments that need conversion, keeping already-typed arrays hot.
             var invocationArgs = plan.ConvertArguments(dto.Params);
 
-            // 5) Invoke through the compiled delegate and await Task/ValueTask results.
+            // 6) Invoke through the compiled delegate and await Task/ValueTask results.
             var pending = plan.Invoke(service, invocationArgs);
             return pending.IsCompletedSuccessfully ? Task.CompletedTask : AwaitSlow(pending);
         }
@@ -110,6 +126,15 @@ internal static class ReflectionExtensions
             return cached;
         }
 
+        // Fail fast on a name that already failed a full scan: without this, every delivery naming
+        // an unresolvable type (a poisoned recovery row, a renamed class) re-walks every loaded
+        // assembly on every attempt.
+        if (UnresolvableServiceTypes.ContainsKey(serviceInterfaceFullName))
+        {
+            AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
+            return null;
+        }
+
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
             var resolved = assembly.GetType(serviceInterfaceFullName, throwOnError: false);
@@ -127,6 +152,9 @@ internal static class ReflectionExtensions
             ServiceTypes.TryAdd(serviceInterfaceFullName, custom);
             return custom;
         }
+
+        if (UnresolvableServiceTypes.Count < UnresolvableServiceTypeCacheCapacity)
+            UnresolvableServiceTypes.TryAdd(serviceInterfaceFullName, 0);
 
         AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
         return null;

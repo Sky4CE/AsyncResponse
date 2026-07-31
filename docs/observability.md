@@ -81,6 +81,7 @@ builder.Services.AddOpenTelemetry()
 | `asyncresponse.lost_subscriber.dispatches` | counter | `kind` = `response`\|`exception`, `route` = `resume`\|`failure`\|`unclassified`, `invoked` = bool | The core "how often does recovery fire" SLO — every late response that found nobody listening, classified by how it was routed and whether a callback was actually invoked. |
 | `asyncresponse.waiter.timeouts` | counter | `channel` | Waiters that hit their timeout before a terminal response. |
 | `asyncresponse.worker.jobs` | counter | `outcome` = `executed`\|`failed`\|`rejected` | Worker job dispatch outcomes. |
+| `asyncresponse.ingress.unroutable_responses` | counter | — | Inbound responses acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them). Alert on any non-zero rate: each one is a producer-side contract violation. |
 | `asyncresponse.recovery.outstanding` | observable gauge | — | Persisted recovery-state entries (from the watchdog scan). |
 | `asyncresponse.recovery.active_waiters` | observable gauge | — | Entries that still have a live waiter. |
 | `asyncresponse.recovery.stale` | observable gauge | — | Entries that are old and have no live waiter — probably stuck flows. |

@@ -381,6 +381,28 @@ public abstract class ChannelConformanceSuite
         Assert.Empty(harness.Spy.Failures);
     }
 
+    // ----- m. Manual waiter disposal -----
+
+    [Fact]
+    public async Task Contract_DisposeBeforeTerminalSignal_CancelsResponseTask()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("dispose");
+
+        var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        var responseTask = waiter.ResponseTask;
+
+        await waiter.DisposeAsync();
+
+        // Disposal tears down the subscription AND the timeout, so nothing else could ever
+        // complete the task — a caller holding ResponseTask directly (manual lifetime control,
+        // or any in-flight wait when the channel itself is disposed at host shutdown) must
+        // observe cancellation instead of hanging forever.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => responseTask.WaitAsync(WaitBudget));
+        Assert.True(responseTask.IsCanceled);
+    }
+
     // ----- helpers -----
 
     /// <summary>
