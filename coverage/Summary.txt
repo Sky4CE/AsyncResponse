@@ -1,21 +1,21 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 07/31/2026 - 16:37:49
+  Generated on: 07/31/2026 - 22:52:27
   Parser: MultiReport (3x Cobertura)
   Assemblies: 27
   Classes: 444
   Files: 200
-  Line coverage: 98.1%
-  Covered lines: 23405
-  Uncovered lines: 433
-  Coverable lines: 23838
-  Total lines: 36138
-  Branch coverage: 94.6% (8012 of 8468)
-  Covered branches: 8012
-  Total branches: 8468
-  Method coverage: 98.9% (2703 of 2733)
-  Full method coverage: 94.2% (2577 of 2733)
-  Covered methods: 2703
-  Fully covered methods: 2577
+  Line coverage: 98.5%
+  Covered lines: 23523
+  Uncovered lines: 335
+  Coverable lines: 23858
+  Total lines: 36195
+  Branch coverage: 95.7% (8116 of 8472)
+  Covered branches: 8116
+  Total branches: 8472
+  Method coverage: 99.8% (2729 of 2733)
+  Full method coverage: 95.8% (2619 of 2733)
+  Covered methods: 2729
+  Fully covered methods: 2619
   Total methods: 2733
 
 AsyncResponse.Abstractions                                                                                            100%
@@ -67,12 +67,12 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                                       100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions                        100%
 
-AsyncResponse.Channels.PostgreSQL                                                                                    99.6%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.4%
+AsyncResponse.Channels.PostgreSQL                                                                                    99.7%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.6%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.4%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.6%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                                    100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                             100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
@@ -91,12 +91,12 @@ AsyncResponse.Channels.Redis                                                    
   AsyncResponse.Channels.Redis.RedisRecoveryStateStore                                                                100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions                              100%
 
-AsyncResponse.Channels.SqlServer                                                                                     99.6%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.4%
+AsyncResponse.Channels.SqlServer                                                                                     99.7%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.6%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.4%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.6%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel                                                      100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions                                               100%
   AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseWaiter<T>                                                    100%
@@ -105,7 +105,7 @@ AsyncResponse.Channels.SqlServer                                                
   AsyncResponse.Channels.SqlServer.SqlServerTransientFaults                                                           100%
   Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions                   100%
 
-AsyncResponse.Core                                                                                                   98.2%
+AsyncResponse.Core                                                                                                   98.5%
   AsyncResponse.AsyncResponseBuilder                                                                                  100%
   AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
   AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
@@ -138,9 +138,9 @@ AsyncResponse.Core                                                              
   AsyncResponse.AsyncResponseStartupValidator                                                                         100%
   AsyncResponse.AsyncResponseTransportMarker                                                                          100%
   AsyncResponse.AsyncResponseTypeResolution                                                                           100%
-  AsyncResponse.AsyncResponseWatchdog                                                                                89.4%
+  AsyncResponse.AsyncResponseWatchdog                                                                                 100%
   AsyncResponse.AsyncResponseWatchdogOptions                                                                          100%
-  AsyncResponse.AsyncResponseWatchdogReport                                                                          90.9%
+  AsyncResponse.AsyncResponseWatchdogReport                                                                           100%
   AsyncResponse.AsyncResponseWatchdogSnapshot                                                                         100%
   AsyncResponse.AsyncResponseWatchdogState                                                                            100%
   AsyncResponse.CallbackExpressionConverter                                                                          98.1%
@@ -173,9 +173,9 @@ AsyncResponse.Core                                                              
   AsyncResponse.InMemoryAsyncResponseWaiter<T>                                                                        100%
   AsyncResponse.InMemoryFlowStateStore                                                                                100%
   AsyncResponse.InMemoryFlowStateStore.Entry                                                                          100%
-  AsyncResponse.InMemoryRecoveryStateStore                                                                           96.1%
+  AsyncResponse.InMemoryRecoveryStateStore                                                                           96.7%
   AsyncResponse.InMemoryRecoveryStateStore.Entry                                                                      100%
-  AsyncResponse.InMemoryRecoveryStateStore.EntryBucket                                                               92.8%
+  AsyncResponse.InMemoryRecoveryStateStore.EntryBucket                                                                 94%
   AsyncResponse.InMemoryWorkerHost                                                                                     90%
   AsyncResponse.InMemoryWorkerTransport                                                                               100%
   AsyncResponse.InMemoryWorkerTransportOptions                                                                        100%
@@ -192,7 +192,7 @@ AsyncResponse.Core                                                              
   AsyncResponse.ReflectionExtensions.InvocationPlan                                                                   100%
   AsyncResponse.ReflectionExtensions<T>                                                                               100%
   AsyncResponse.RemoteStackTrace                                                                                      100%
-  AsyncResponse.SerialExecutorRegistry                                                                                 99%
+  AsyncResponse.SerialExecutorRegistry                                                                                100%
   AsyncResponse.SerialExecutorRegistry.ExecutorEntry                                                                  100%
   AsyncResponse.ShutdownBudgetValidator                                                                               100%
   AsyncResponse.WorkerJobExecutor                                                                                     100%
@@ -219,22 +219,22 @@ AsyncResponse.Core                                                              
   Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0>                                             100%
   Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions.LogCache<T0>                                             100%
 
-AsyncResponse.DurableFlows.Cosmos                                                                                    96.7%
+AsyncResponse.DurableFlows.Cosmos                                                                                    97.6%
   AsyncResponse.DurableFlows.Cosmos.CosmosDurableFlowOptions                                                          100%
   AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateDocument                                                           100%
   AsyncResponse.DurableFlows.Cosmos.CosmosFlowStateStore                                                             96.5%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
   AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   Microsoft.Extensions.DependencyInjection.CosmosDurableFlowServiceCollectionExtensions                               100%
 
-AsyncResponse.DurableFlows.DynamoDB                                                                                  98.6%
+AsyncResponse.DurableFlows.DynamoDB                                                                                  99.4%
   AsyncResponse.DurableFlows.DynamoDB.DynamoDbDurableFlowOptions                                                      100%
   AsyncResponse.DurableFlows.DynamoDB.DynamoDbFlowStateStore                                                         99.2%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
   AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   Microsoft.Extensions.DependencyInjection.DynamoDbDurableFlowServiceCollectionExtensions                             100%
 
-AsyncResponse.DurableFlows.EFCore                                                                                    96.1%
+AsyncResponse.DurableFlows.EFCore                                                                                    99.4%
   AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord                                                            100%
   AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions                                           100%
   AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions                                                          100%
@@ -244,8 +244,8 @@ AsyncResponse.DurableFlows.EFCore                                               
   AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                    100%
   AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                   99.2%
   AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>                                                   99.2%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         91.1%
-  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions                               100%
 
 AsyncResponse.DurableFlows.MongoDB                                                                                    100%
@@ -256,37 +256,37 @@ AsyncResponse.DurableFlows.MongoDB                                              
   AsyncResponse.DurableFlows.MongoDB.MongoFlowStateDocument                                                           100%
   Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionExtensions                                100%
 
-AsyncResponse.DurableFlows.MySql                                                                                     94.5%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
-  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+AsyncResponse.DurableFlows.MySql                                                                                     99.5%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions                                                            100%
   AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore                                                               99.3%
   Microsoft.Extensions.DependencyInjection.MySqlDurableFlowServiceCollectionExtensions                                100%
 
-AsyncResponse.DurableFlows.Oracle                                                                                    94.5%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
-  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+AsyncResponse.DurableFlows.Oracle                                                                                    99.2%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.Oracle.OracleDurableFlowOptions                                                          100%
   AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore                                                             98.8%
   Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions                               100%
 
-AsyncResponse.DurableFlows.PostgreSQL                                                                                93.9%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         91.1%
-  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+AsyncResponse.DurableFlows.PostgreSQL                                                                                98.8%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions                                                  100%
   AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore                                                     98.1%
   Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions                           100%
 
-AsyncResponse.DurableFlows.Sqlite                                                                                    98.8%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         95.5%
+AsyncResponse.DurableFlows.Sqlite                                                                                     100%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
   AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.Sqlite.SqliteDurableFlowOptions                                                          100%
   AsyncResponse.DurableFlows.Sqlite.SqliteFlowStateStore                                                              100%
   Microsoft.Extensions.DependencyInjection.SqliteDurableFlowServiceCollectionExtensions                               100%
 
-AsyncResponse.DurableFlows.SqlServer                                                                                   95%
-  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                         92.6%
-  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                        0%
+AsyncResponse.DurableFlows.SqlServer                                                                                 99.6%
+  AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
+  AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions                                                    100%
   AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore                                                       99.4%
   Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollectionExtensions                            100%
@@ -364,7 +364,7 @@ AsyncResponse.Transports.Kafka                                                  
   AsyncResponse.Transports.Kafka.QueuedKafkaMessageDispatcher                                                        99.1%
   Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.MongoDB                                                                                     94.9%
+AsyncResponse.Transports.MongoDB                                                                                     96.5%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
   AsyncResponse.Transports.DbMessageDispatcherBase                                                                   88.6%
   AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions                                               100%
@@ -375,7 +375,7 @@ AsyncResponse.Transports.MongoDB                                                
   AsyncResponse.Transports.MongoDB.MongoDbReplyTargetProvider                                                         100%
   AsyncResponse.Transports.MongoDB.MongoDbResponseIngressSubscriber                                                   100%
   AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions                                                           100%
-  AsyncResponse.Transports.MongoDB.MongoDbSubscriberService                                                          84.1%
+  AsyncResponse.Transports.MongoDB.MongoDbSubscriberService                                                           100%
   AsyncResponse.Transports.MongoDB.MongoDbTransportDelivery                                                           100%
   AsyncResponse.Transports.MongoDB.MongoDbTransportOptionsValidator                                                   100%
   AsyncResponse.Transports.MongoDB.MongoDbTransportRetry                                                              100%
@@ -468,9 +468,9 @@ AsyncResponse.Transports.Redis                                                  
   AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.SqlServer                                                                                   95.9%
+AsyncResponse.Transports.SqlServer                                                                                   95.2%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
-  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   88.6%
+  AsyncResponse.Transports.DbMessageDispatcherBase                                                                     88%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
   AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext                                                100%
   AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor                                                  100%
@@ -479,7 +479,7 @@ AsyncResponse.Transports.SqlServer                                              
   AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
   AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
   AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
-  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                        92%
   AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
