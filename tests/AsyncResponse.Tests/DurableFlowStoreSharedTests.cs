@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using AsyncResponse.DurableFlows.Cosmos;
 using AsyncResponse.DurableFlows.DynamoDB;
@@ -70,6 +71,69 @@ public sealed class DurableFlowStoreSharedTests
         var lockKey = Assert.IsType<long>(Invoke(shared, "SchemaLockKey", "custom_schema"));
         Assert.Equal(lockKey, Assert.IsType<long>(Invoke(shared, "SchemaLockKey", "custom_schema")));
         Assert.NotEqual(lockKey, Assert.IsType<long>(Invoke(shared, "SchemaLockKey", "other_schema")));
+    }
+
+    /// <summary>
+    /// The size guard, the read-side identity mirror and the saturating clock helpers, exercised in
+    /// every store assembly. The shared source is compiled per package, so a helper only some
+    /// providers happen to call is otherwise dead code in the rest of them — this walks all nine.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProviderOptionTypes))]
+    public void SharedHelpers_BoundSizeReadStateAndSaturateClocks(Type providerOptionsType)
+    {
+        var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
+        var state = CreateState("flow");
+        var json = Assert.IsType<string>(Invoke(shared, "Serialize", state));
+
+        // No budget configured, and a budget the ledger fits inside, both serialize unchanged.
+        Assert.Equal(json, Invoke(shared, "SerializeBounded", "flow", state, null, "provider"));
+        Assert.Equal(json, Invoke(shared, "SerializeBounded", "flow", state, (long?)json.Length * 4, "provider"));
+
+        // Over budget names the cause instead of leaving the provider to reject opaque bytes.
+        var tooLarge = AssertInner<InvalidOperationException>(
+            shared, "SerializeBounded", "flow", state, (long?)1, "provider");
+        Assert.Equal("FlowStateTooLargeException", tooLarge.GetType().Name);
+        Assert.Equal("flow", tooLarge.GetType().GetProperty("FlowId")!.GetValue(tooLarge));
+        Assert.Equal(1L, tooLarge.GetType().GetProperty("MaxStateBytes")!.GetValue(tooLarge));
+        Assert.Equal(
+            (long)Encoding.UTF8.GetByteCount(json),
+            tooLarge.GetType().GetProperty("SerializedSizeBytes")!.GetValue(tooLarge));
+        Assert.Contains("exceeding the provider MaxStateBytes limit of 1 bytes", tooLarge.Message);
+
+        // ReadState: only a readable ledger whose revision AND identity match loads as present.
+        Assert.Equal("flow", Assert.IsType<FlowState>(Invoke(shared, "ReadState", "flow", json, 0L)).FlowId);
+        Assert.Null(Invoke(shared, "ReadState", "flow", "{", 0L));         // unreadable
+        Assert.Null(Invoke(shared, "ReadState", "flow", json, 7L));        // revision mismatch
+        Assert.Null(Invoke(shared, "ReadState", "other", json, 0L));       // identity mismatch
+
+        // Saturating adds: an absurd expiry means "never" rather than an overflow on every write.
+        var instant = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        Assert.Equal(
+            instant.AddMinutes(5),
+            InvokeOverload(shared, "AddSaturating", [typeof(DateTime), typeof(TimeSpan)], instant, TimeSpan.FromMinutes(5)));
+        Assert.Equal(
+            DateTime.MaxValue,
+            InvokeOverload(shared, "AddSaturating", [typeof(DateTime), typeof(TimeSpan)], instant, TimeSpan.MaxValue));
+
+        var offset = new DateTimeOffset(instant);
+        Assert.Equal(
+            offset.AddMinutes(5),
+            InvokeOverload(shared, "AddSaturating", [typeof(DateTimeOffset), typeof(TimeSpan)], offset, TimeSpan.FromMinutes(5)));
+        Assert.Equal(
+            DateTimeOffset.MaxValue,
+            InvokeOverload(shared, "AddSaturating", [typeof(DateTimeOffset), typeof(TimeSpan)], offset, TimeSpan.MaxValue));
+
+        // Server-clock TTLs clamp at ~68 years so DATEADD/year-9999 arithmetic cannot overflow.
+        var clamp = TimeSpan.FromSeconds(int.MaxValue);
+        Assert.Equal(TimeSpan.FromMinutes(5), Invoke(shared, "ServerClockTtl", TimeSpan.FromMinutes(5)));
+        Assert.Equal(clamp, Invoke(shared, "ServerClockTtl", TimeSpan.MaxValue));
+        Assert.Equal(
+            (long)TimeSpan.FromMinutes(5).TotalMilliseconds,
+            Invoke(shared, "ServerClockTtlMilliseconds", TimeSpan.FromMinutes(5)));
+        Assert.Equal(
+            (long)clamp.TotalMilliseconds,
+            Invoke(shared, "ServerClockTtlMilliseconds", TimeSpan.MaxValue));
     }
 
     public static TheoryData<Type> ProviderOptionTypes =>
@@ -190,6 +254,20 @@ public sealed class DurableFlowStoreSharedTests
     private static object? Invoke(Type shared, string methodName, params object?[] arguments)
         => shared.GetMethod(methodName, BindingFlags.Public | BindingFlags.Static)!.Invoke(null, arguments);
 
+    /// <summary>Invoke by explicit signature, for the overloaded helpers (<c>AddSaturating</c>).</summary>
+    private static object? InvokeOverload(
+        Type shared,
+        string methodName,
+        Type[] parameterTypes,
+        params object?[] arguments)
+        => shared.GetMethod(methodName, BindingFlags.Public | BindingFlags.Static, binder: null, parameterTypes, modifiers: null)!
+            .Invoke(null, arguments);
+
+    /// <remarks>
+    /// Matches derived exceptions too: the shared source's <c>FlowStateTooLargeException</c> is
+    /// internal to each store assembly, so tests can only name its <see cref="InvalidOperationException"/>
+    /// base — which xUnit's exact-match <c>IsType</c> would reject.
+    /// </remarks>
     private static TException AssertInner<TException>(
         Type shared,
         string methodName,
@@ -197,6 +275,6 @@ public sealed class DurableFlowStoreSharedTests
         where TException : Exception
     {
         var exception = Assert.Throws<TargetInvocationException>(() => Invoke(shared, methodName, arguments));
-        return Assert.IsType<TException>(exception.InnerException);
+        return Assert.IsAssignableFrom<TException>(exception.InnerException);
     }
 }
