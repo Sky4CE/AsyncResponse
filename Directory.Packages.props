@@ -31,10 +31,10 @@
     <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.36.0" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.0.2" />
     <PackageVersion Include="MongoDB.Driver" Version="3.10.0" />
-    <PackageVersion Include="NATS.Net" Version="3.0.1" />
+    <PackageVersion Include="NATS.Net" Version="3.1.0" />
     <PackageVersion Include="Npgsql" Version="10.0.3" />
     <PackageVersion Include="RabbitMQ.Client" Version="7.2.1" />
-    <PackageVersion Include="StackExchange.Redis" Version="3.0.17" />
+    <PackageVersion Include="StackExchange.Redis" Version="3.1.0" />
   </ItemGroup>
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
