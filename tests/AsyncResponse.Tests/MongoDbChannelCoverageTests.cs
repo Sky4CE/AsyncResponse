@@ -592,6 +592,68 @@ public sealed class MongoDbChannelCoverageTests
     }
 
     [Fact]
+    public async Task Dispatch_SkipsMessageAckedInTheSameClockTickAsTheSubscriptionWatermark()
+    {
+        // Correlation-id reuse: waiter #2 registers so soon after waiter #1's ack that the server
+        // clock cannot separate them, so acked_at == started_at exactly. That tie is routine, not
+        // measure-zero — server clocks are far coarser than their column precision (SQL Server's
+        // SYSUTCDATETIME is datetime2(7) but advances in ~5ms steps; Mongo's $$NOW is 1ms) — and a
+        // non-strict watermark hands waiter #2 the response waiter #1 already consumed.
+        var fixture = new ChannelFixture();
+        var reuse = fixture.Subscription(_ => new ValueTask<bool>(true));
+        var startedAt = (DateTimeOffset)reuse.Instance.GetType()
+            .GetProperty("StartedAtUtc", BindingFlags.Instance | BindingFlags.Public)!
+            .GetValue(reuse.Instance)!;
+
+        // Created inside the 1s creation tolerance, so the ack comparison is the only thing that
+        // can exclude it — exactly the state the previous waiter's message is left in.
+        var stale = new MongoDbChannelMessage(
+            Guid.NewGuid(), "corr", "null", startedAt.AddMilliseconds(-5), startedAt);
+
+        await DispatchAsync(fixture.Channel, stale, reuse.Instance);
+
+        Assert.False(reuse.Completion.Task.IsCompleted);
+        Assert.False(Invoke<bool>(reuse.Instance, "HasSeen", stale.Id));
+
+        await fixture.Channel.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Dispatch_DeliversMessageAckedAfterTheSubscriptionWatermark()
+    {
+        // The other side of the strict comparison: an ack stamped after this waiter registered is a
+        // live cross-process fan-out delivery, not history, and must still reach it. Pins that the
+        // stale-redelivery fix did not simply mute every already-acked message.
+        var fixture = new ChannelFixture();
+        var live = fixture.Subscription(_ => new ValueTask<bool>(true));
+        var startedAt = (DateTimeOffset)live.Instance.GetType()
+            .GetProperty("StartedAtUtc", BindingFlags.Instance | BindingFlags.Public)!
+            .GetValue(live.Instance)!;
+
+        var fanOut = new MongoDbChannelMessage(
+            Guid.NewGuid(),
+            "corr",
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"fan-out"}}""",
+            startedAt.AddMilliseconds(-5),
+            startedAt.AddMilliseconds(5));
+
+        await DispatchAsync(fixture.Channel, fanOut, live.Instance);
+
+        // The delivery claim is what separates "inside the watermark" from "excluded": the skip
+        // path returns before ever touching the collection. Asserting on HasSeen instead would pass
+        // either way, because losing the claim also marks the message seen.
+        fixture.Messages.Verify(
+            c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Once);
+
+        await fixture.Channel.DisposeAsync();
+    }
+
+    [Fact]
     public async Task WaiterRegistration_WritesSubscriberBeforeRecoveryState()
     {
         // "Recovery state visible ⇒ subscription visible": the lost-subscriber dispatcher's live

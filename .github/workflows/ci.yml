@@ -51,6 +51,7 @@ jobs:
             --report-trx \
             --coverage \
             --coverage-output-format cobertura \
+            --coverage-output unit-net8.0.cobertura.xml \
             --results-directory "${{ github.workspace }}/TestResults"
 
       - name: Test (unit, net10.0)
@@ -60,6 +61,7 @@ jobs:
             --report-trx \
             --coverage \
             --coverage-output-format cobertura \
+            --coverage-output unit-net10.0.cobertura.xml \
             --results-directory "${{ github.workspace }}/TestResults"
 
       - name: Upload test results
@@ -68,6 +70,16 @@ jobs:
         with:
           name: test-results
           path: ${{ github.workspace }}/TestResults
+
+      # Coverage alone, for the `coverage` job to merge with the integration suite's. The glob is
+      # non-recursive on purpose: --report-trx also copies each file into its attachment folder,
+      # and a recursive pattern would ship — and then double-count — both copies.
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-unit
+          path: ${{ github.workspace }}/TestResults/*.cobertura.xml
+          if-no-files-found: error
 
       - name: Pack (validation only)
         # Solution-level pack: every non-src project sets IsPackable=false, so this packs exactly
@@ -267,6 +279,9 @@ jobs:
             dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
               --configuration Release --no-build \
               --report-trx \
+              --coverage \
+              --coverage-output-format cobertura \
+              --coverage-output integration.cobertura.xml \
               --results-directory "${{ github.workspace }}/TestResults/Integration" \
               2>&1 | tee itest-console.log
             return "${PIPESTATUS[0]}"
@@ -286,6 +301,15 @@ jobs:
         with:
           name: integration-test-results
           path: ${{ github.workspace }}/TestResults/Integration
+
+      # The container-backed suite is most of the coverage: the database and broker paths it drives
+      # are unreachable from the unit suite, which alone reads ~16 points lower.
+      - name: Upload integration coverage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-integration
+          path: ${{ github.workspace }}/TestResults/Integration/*.cobertura.xml
+          if-no-files-found: error
 
   redis-compat:
     # Validates that the Redis channel + transport (RESP via StackExchange.Redis) run unchanged on
@@ -350,3 +374,88 @@ jobs:
         with:
           name: integration-test-results-${{ matrix.server }}
           path: ${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}
+
+  coverage:
+    # Merges the unit and integration cobertura reports into the published coverage report and the
+    # two README badges. Depends on both suites, so a red build never republishes a number.
+    if: github.event_name != 'schedule'
+    needs: [build-and-test, integration-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Only this job writes; the workflow default stays contents: read.
+    permissions:
+      contents: write
+    # Shared with the benchmark and load-test workflows: all three commit to gh-pages, and
+    # concurrent pushes to the same branch fail on a non-fast-forward.
+    concurrency:
+      group: benchmark-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download coverage
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+          path: coverage-input
+
+      - name: Install ReportGenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool --version 5.5.10
+
+      - name: Render report
+        # Filters, report types and badge thresholds live in the script, shared with the local
+        # scripts/coverage.sh, so a contributor's report and this badge measure the same thing.
+        run: ./scripts/coverage-report.sh "coverage-input/*.cobertura.xml" coverage-report
+
+      - name: Job summary
+        run: cat coverage-report/SummaryGithub.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: coverage-report
+
+      # Pull requests (including forks, which have no write token) stop at the artifact and the job
+      # summary above. Only main republishes what the README badges read.
+      - name: Publish to gh-pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          # Each attempt rebuilds the commit on the current remote tip instead of rebasing a local
+          # one: actions/checkout clones shallow, where `pull --rebase` is unreliable, and a
+          # rebuilt commit is correct regardless of what landed in between. The concurrency group
+          # makes a collision with the benchmark workflows unlikely; the retry covers a manual push.
+          publish() {
+            git fetch origin gh-pages
+            git worktree remove --force ../gh-pages 2>/dev/null || true
+            git worktree add --detach ../gh-pages origin/gh-pages
+            # Replace the coverage tree wholesale so pages for deleted classes do not linger, and
+            # touch nothing else — dev/bench on this branch belongs to the benchmark workflow.
+            rm -rf ../gh-pages/coverage
+            cp -r coverage-report ../gh-pages/coverage
+            git -C ../gh-pages add coverage
+            if git -C ../gh-pages diff --staged --quiet; then
+              echo "Coverage unchanged; nothing to publish."
+              return 0
+            fi
+            git -C ../gh-pages commit -m "coverage: ${GITHUB_SHA::7}"
+            git -C ../gh-pages push origin HEAD:gh-pages
+          }
+          for attempt in 1 2 3; do
+            if publish; then exit 0; fi
+            echo "::warning::gh-pages publish attempt ${attempt} failed; retrying."
+            sleep $((attempt * 5))
+          done
+          exit 1

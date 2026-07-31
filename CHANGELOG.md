@@ -79,7 +79,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   stale payload. A message acked before a subscription existed is now excluded from its
   deliveries, while cross-process fan-out (waiters registered before the ack) is preserved.
   Found by the new channel-contract conformance suite; in-memory, Redis, and NATS already
-  behaved correctly.
+  behaved correctly. The watermark's ack comparison is strict (`>`), which is load-bearing: server
+  clocks are far coarser than their column precision — SQL Server's `SYSUTCDATETIME()` is
+  `datetime2(7)` but advances in ~5 ms ticks, and MongoDB's `$$NOW` is millisecond-resolution — so
+  a waiter re-registering within one tick of the previous ack lands on exactly `acked_at`, and a
+  non-strict comparison let the stale response through on roughly 1 in 8 reuses against SQL Server.
 - Durable-flow wake delivery is retried through a crashed executor's lease window, fixing flows
   that could stay `Running` forever when their only wake arrived while the dead holder's lease was
   still unexpired and was silently dropped.

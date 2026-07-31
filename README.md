@@ -11,6 +11,8 @@ subscribe-before-send safety, and optional crash recovery and checkpointed flows
 
 <p align="center">
   <a href="https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml"><img src="https://github.com/Sky4CE/AsyncResponse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://sky4ce.github.io/AsyncResponse/coverage/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fsky4ce.github.io%2FAsyncResponse%2Fcoverage%2Fbadge-line.json" alt="Line coverage"></a>
+  <a href="https://sky4ce.github.io/AsyncResponse/coverage/"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fsky4ce.github.io%2FAsyncResponse%2Fcoverage%2Fbadge-branch.json" alt="Branch coverage"></a>
   <a href="https://www.nuget.org/packages/AsyncResponse.Core"><img src="https://img.shields.io/nuget/v/AsyncResponse.Core.svg" alt="NuGet"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
 </p>
@@ -590,7 +592,7 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **1,600+ unit tests, run on each target framework** (~3,300 executions across .NET 8 and .NET 10), including
+- **1,550+ unit tests, run on each target framework** (~3,100 executions across .NET 8 and .NET 10), including
   concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
   duplicate-execution detection.
 - **230+ integration test cases** drive the shipped sample app black-box over HTTP against **real

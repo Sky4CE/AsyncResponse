@@ -203,13 +203,29 @@ public class AotSerializationSeamTests
 
     private sealed class TrackingResolver : IJsonTypeInfoResolver
     {
-        public List<Type> SeenTypes { get; } = [];
+        private readonly List<Type> _seenTypes = [];
+
+        /// <summary>
+        /// A snapshot taken under the lock, not the live list. <see cref="AsyncResponseJsonSerialization"/>
+        /// holds registered resolvers in a process-global static, so for as long as this one is
+        /// registered every test running in parallel serializes through it on another thread —
+        /// asserting against the live list races those <c>Add</c> calls and throws
+        /// "Collection was modified; enumeration operation may not execute."
+        /// </summary>
+        public IReadOnlyList<Type> SeenTypes
+        {
+            get
+            {
+                lock (_seenTypes)
+                    return [.. _seenTypes];
+            }
+        }
 
         public JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
         {
-            lock (SeenTypes)
+            lock (_seenTypes)
             {
-                SeenTypes.Add(type);
+                _seenTypes.Add(type);
             }
 
             return null;

@@ -803,10 +803,23 @@ internal abstract class DbAsyncResponseChannelBase :
     /// whose registration raced another process's in-flight ack keep waiting for its own response,
     /// whereas a tolerance would re-open the stale-redelivery window this check closes.
     /// </para>
+    /// <para>
+    /// The comparison must be STRICTLY greater, and that is load-bearing rather than stylistic: a
+    /// server clock's resolution is far coarser than its column precision, so equal timestamps are
+    /// routine, not a measure-zero tie. SQL Server stamps <c>datetime2(7)</c> from
+    /// <c>SYSUTCDATETIME()</c> — 100ns precision, but the clock behind it advances in ~5ms ticks
+    /// (measured: 30,344 samples over 300ms yielded 61 distinct values, mean gap 4.9ms), and
+    /// MongoDB's <c>$$NOW</c> is millisecond-resolution. A waiter that reuses a correlation id
+    /// within one tick of the previous waiter's ack therefore registers at exactly
+    /// <c>acked_at</c>, and a non-strict comparison hands it the response its predecessor already
+    /// consumed. Registration is ordered strictly after that ack in real time and the clock is
+    /// non-decreasing, so <c>acked_at &lt;= started_at</c> always holds for history and the strict
+    /// form excludes it deterministically — not probabilistically.
+    /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)
         => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1)
-           && (message.AckedAtUtc is null || message.AckedAtUtc >= subscription.StartedAtUtc);
+           && (message.AckedAtUtc is null || message.AckedAtUtc > subscription.StartedAtUtc);
 
     private async Task TryDispatchLocalSubscribersAsync(DbChannelMessage message, CancellationToken cancellationToken)
     {
