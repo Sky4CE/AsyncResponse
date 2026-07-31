@@ -7,7 +7,8 @@ internal readonly record struct SqlServerChannelMessage(
     Guid Id,
     string CorrelationId,
     string EnvelopeJson,
-    DateTimeOffset CreatedAtUtc);
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? AckedAtUtc = null);
 
 /// <summary>SQL helper for the SQL Server channel tables.</summary>
 internal sealed class SqlServerChannelSql
@@ -276,7 +277,7 @@ internal sealed class SqlServerChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json, created_at
+            SELECT id, correlation_id, envelope_json, created_at, acked_at
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -301,7 +302,12 @@ internal sealed class SqlServerChannelSql
         var messages = new List<SqlServerChannelMessage>(batchSize);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            messages.Add(new SqlServerChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2), new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero)));
+            messages.Add(new SqlServerChannelMessage(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
+                reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)));
         return messages;
     }
 

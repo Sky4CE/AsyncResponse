@@ -10,7 +10,8 @@ internal readonly record struct MongoDbChannelMessage(
     Guid Id,
     string CorrelationId,
     string EnvelopeJson,
-    DateTimeOffset CreatedAtUtc);
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? AckedAtUtc = null);
 
 /// <summary>Document adapter for the MongoDB channel collections and change-stream wake.</summary>
 internal sealed class MongoDbChannelStore : IDisposable
@@ -274,7 +275,8 @@ internal sealed class MongoDbChannelStore : IDisposable
                 document.Id,
                 document.CorrelationId,
                 document.EnvelopeJson,
-                new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero)));
+                new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero),
+                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null));
         return messages;
     }
 

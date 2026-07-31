@@ -76,6 +76,9 @@ required, and the flow store is independent of the response channel and worker t
 
 **Clock authority** is who evaluates lease and expiry comparisons. *Database* stores run that math
 on the database server's clock, so worker clock skew cannot fence two nodes onto the same lease.
+(For MongoDB this includes flow creation, which reads the server clock via the `hello` command —
+the store's effective server floor is therefore mongod 4.2.10 / 4.4.2 or newer, matching the
+`$$NOW` requirement of 4.2+.)
 *App* stores (Cosmos, DynamoDB, EFCore) compare against `DateTime.UtcNow` on the worker because
 their storage APIs offer no usable server-clock expression — a deliberate, documented trade-off in
 each store's source. Multi-node deployments on an app-clock store must keep worker clocks

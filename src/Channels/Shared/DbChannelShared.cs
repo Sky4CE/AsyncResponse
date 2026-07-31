@@ -792,9 +792,21 @@ internal abstract class DbAsyncResponseChannelBase :
     /// Per-subscription delivery watermark. The sweep queries with the OLDEST waiter's watermark on
     /// a shared correlation id, so without this filter a late-joining waiter would receive retained
     /// messages created before it registered. Same 1s tolerance as the query watermark.
+    /// <para>
+    /// The creation-time tolerance alone re-admits history: a message created inside the 1s skew
+    /// window may have already been delivered and acked for a PREVIOUS waiter that reused the
+    /// correlation id, and per-subscription seen-tracking cannot dedupe what a different
+    /// subscription processed. A message acked before this subscription existed is history, not
+    /// delivery — waiters that legitimately participate in a delivery (including cross-process
+    /// fan-out) were registered before its claim stamped <c>acked_at</c>. The acked comparison is
+    /// deliberately strict, with no skew tolerance: under skew, strictness can only make a waiter
+    /// whose registration raced another process's in-flight ack keep waiting for its own response,
+    /// whereas a tolerance would re-open the stale-redelivery window this check closes.
+    /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)
-        => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1);
+        => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1)
+           && (message.AckedAtUtc is null || message.AckedAtUtc >= subscription.StartedAtUtc);
 
     private async Task TryDispatchLocalSubscribersAsync(DbChannelMessage message, CancellationToken cancellationToken)
     {

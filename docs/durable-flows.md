@@ -241,6 +241,7 @@ property makes every failure mode collapse into "run it again":
 | The **parent's ledger expired** while suspended | Same sizing rule — `StateExpiry` bounds the idle time of a suspended parent too. An expired run cannot be resumed: the executor logs a warning and no-ops |
 | A step keeps failing | The exception propagates; the worker transport redelivers the run with bounded attempts, then **dead-letters it — that's your "run is stuck" alarm** |
 | The flow decides it's hopeless | Throw `DurableFlowFailedException`: the run is marked `Failed` terminally, with no redelivery |
+| The **parent fails (or is failed) while a child still runs** | The child is deliberately independent: it keeps running to completion — its side effects happen — and its terminal notification to the already-terminal parent is a no-op. There is no cascade-cancel. If the child's work must not continue, act on the child explicitly: park it (`FlowRunStatus.Suspended`) or fail it (`IDurableFlowExecutor.FailAsync`). Policy modes (cascade cancel/park on parent failure) are on the roadmap |
 
 Two exception semantics, deliberately: **any ordinary exception is retriable** (transport
 redelivery will re-run the flow), **`DurableFlowFailedException` is terminal**. Domain failures

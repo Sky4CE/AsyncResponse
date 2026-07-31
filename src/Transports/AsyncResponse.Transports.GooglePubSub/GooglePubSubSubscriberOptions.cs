@@ -78,7 +78,9 @@ public sealed class GooglePubSubSubscriberOptions
     /// <summary>
     /// Maximum number of messages waiting in the background queue for
     /// <see cref="GooglePubSubAckMode.AckAfterEnqueue"/>. Must be explicitly set to a positive value.
-    /// When full, the Pub/Sub callback returns NACK so the message can be redelivered.
+    /// When full, the Pub/Sub callback parks awaiting queue space and ACKs once the message is
+    /// accepted — it does not NACK on a full queue; NACK is returned only when the write fails
+    /// (shutdown/disposal), so the message is redelivered rather than lost.
     /// </summary>
     public int BackgroundQueueCapacity { get; set; }
 

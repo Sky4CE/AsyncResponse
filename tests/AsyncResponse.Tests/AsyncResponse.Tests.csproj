@@ -40,6 +40,13 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
   </ItemGroup>
 
+  <!-- Channel-contract conformance suite shared with AsyncResponse.IntegrationTests (mirrors the
+       src/Channels/Shared pattern): the abstract suite lives once, each project derives it for the
+       channels it can reach (in-memory here; the container-backed channels over there). -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ChannelConformanceSuite.cs" Link="Shared\ChannelConformanceSuite.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />

@@ -87,19 +87,20 @@ Google Pub/Sub ≈ 1.2k LOC, the PostgreSQL channel+transport pair ≈ 3.2k LOC 
 The 2026-07-28 full-codebase review produced a wave of correctness fixes — wake retry for stuck
 flows, registration-failure rethrow, SQS early-ACK gating, unified drain, heartbeat upserts,
 server-clock lease math, and friends — tracked in [CHANGELOG.md](../CHANGELOG.md) under
-*Unreleased*. Two structural follow-ups (both 🔴) close the review's systemic findings rather
-than its individual bugs:
+*Unreleased*. Two structural follow-ups closed the review's systemic findings rather than its
+individual bugs; both have landed:
 
-- **Channel-contract conformance suite.** The in-memory channel is the de-facto behavioral spec,
-  and the review found three database ports that had drifted from it in different ways. One
-  shared test suite, run against every `IAsyncResponseChannel` implementation, turns "the
-  in-memory channel happens to be the reference" into an enforced contract — the same move the
-  flow stores already made with the atomic store contract tests.
-- **Per-transport semantics matrix.** Drain behavior on shutdown, what happens when a handler
+- **Channel-contract conformance suite (unit + integration derivations).** 🟢 The in-memory
+  channel is the de-facto behavioral spec, and the review found three database ports that had
+  drifted from it in different ways. One shared test suite, run against every
+  `IAsyncResponseChannel` implementation, turns "the in-memory channel happens to be the
+  reference" into an enforced contract — the same move the flow stores already made with the
+  atomic store contract tests.
+- **Per-transport semantics matrix.** 🟢 Drain behavior on shutdown, what happens when a handler
   fails *after* an early ACK, and how delivery attempts are counted differ per transport for
-  good reasons — but today those differences live in prose scattered across
-  `configuration.md`. A single documented matrix (and a conformance test where the contract is
-  testable) makes the differences deliberate instead of incidental.
+  good reasons — those differences are now documented in one place,
+  [transport-semantics.md](transport-semantics.md), derived from the transport source rather
+  than prose scattered across `configuration.md`.
 
 ---
 

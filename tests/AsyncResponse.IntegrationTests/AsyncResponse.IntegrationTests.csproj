@@ -29,6 +29,13 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
   </ItemGroup>
 
+  <!-- Channel-contract conformance suite shared with AsyncResponse.Tests (mirrors the
+       src/Channels/Shared pattern): the abstract suite lives once, each project derives it for the
+       channels it can reach (the container-backed channels here; in-memory over there). -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ChannelConformanceSuite.cs" Link="Shared\ChannelConformanceSuite.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- The AppHost orchestrates the SUT (Projects.AsyncResponse_IntegrationTests_AppHost). The sample app *is* the
          SUT: it provides the shared DTO types (OperationResult / OperationStatus / FlowCall) and its Program entry
@@ -36,7 +43,9 @@
     <ProjectReference Include="..\AsyncResponse.IntegrationTests.AppHost\AsyncResponse.IntegrationTests.AppHost.csproj" />
     <ProjectReference Include="..\..\samples\AsyncResponse.Sample\AsyncResponse.Sample.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
+    <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.Redis\AsyncResponse.Channels.Redis.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.SqlServer\AsyncResponse.Channels.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.Cosmos\AsyncResponse.DurableFlows.Cosmos.csproj" />
     <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.DynamoDB\AsyncResponse.DurableFlows.DynamoDB.csproj" />

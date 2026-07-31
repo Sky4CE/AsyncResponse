@@ -40,6 +40,10 @@ public sealed class IntegrationFixture : IAsyncLifetime
     public HttpClient RedisTransportEarlyAckClient { get; private set; } = null!;
     public HttpClient NatsClient { get; private set; } = null!;
     public HttpClient NatsEarlyAckClient { get; private set; } = null!;
+    /// <summary>StackExchange.Redis configuration for the fixture's Redis (used by Direct-style tests).</summary>
+    public string RedisConnectionString { get; private set; } = null!;
+    /// <summary>NATS URL for the fixture's JetStream-enabled NATS server (used by Direct-style tests).</summary>
+    public string NatsConnectionString { get; private set; } = null!;
     public HttpClient PostgreSqlClient { get; private set; } = null!;
     public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
     public string PostgreSqlConnectionString { get; private set; } = null!;
@@ -164,6 +168,13 @@ public sealed class IntegrationFixture : IAsyncLifetime
         SqlServerEarlyAckClient = _app.CreateHttpClient("itest-app-sqlserver-early-ack");
         MongoDbClient = _app.CreateHttpClient("itest-app-mongodb");
         MongoDbEarlyAckClient = _app.CreateHttpClient("itest-app-mongodb-early-ack");
+
+        // AddRedis is a full Aspire resource, so ask it for its connection string (it may carry a
+        // password); the NATS container is a raw AddContainer, so compose its URL from the endpoint.
+        RedisConnectionString = await _app.GetConnectionStringAsync("redis")
+            ?? throw new InvalidOperationException("The Aspire 'redis' resource reported no connection string.");
+        var natsEndpoint = _app.GetEndpoint("nats", "nats");
+        NatsConnectionString = $"nats://{natsEndpoint.Host}:{natsEndpoint.Port}";
 
         var postgresEndpoint = _app.GetEndpoint("postgres", "postgres");
         PostgreSqlConnectionString =

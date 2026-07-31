@@ -155,6 +155,13 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 | `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
 | `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
 
+**Clock note for the database channels** (PostgreSQL, SQL Server, MongoDB): stored envelopes are
+stamped on the database clock while each waiter's delivery watermark uses the app clock, with a 1 s
+tolerance between them. Keep hosts NTP-synchronized within ~1 s of the database. Larger skew never
+loses a response — a delivery that misses the watermark window is routed through lost-subscriber
+recovery instead of live delivery — but that means recovery callbacks doing work live waiters
+should have done.
+
 ## Transport options
 
 Transport options are set through the transport registration callback. Each transport package owns
@@ -205,7 +212,7 @@ The in-memory transport is configured directly on registration:
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
 | `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / SQS / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / MongoDB / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition; on FIFO SQS queues it becomes the `MessageGroupId` with the same per-flow ordering effect. |
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL, SQL Server, and MongoDB also unwrap nested JSON strings at those paths. |
-| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / MongoDB / Kafka | Whether poison messages are preserved and, for PostgreSQL, SQL Server, and MongoDB, how long dead-letter rows/documents are retained. |
+| `DeadLetterEnabled` / `DeadLetterRetention` | Redis / NATS / PostgreSQL / SQL Server / MongoDB / Kafka | Whether poison messages are preserved. `DeadLetterRetention` exists only on PostgreSQL, SQL Server, and MongoDB (row/document retention); Redis and NATS bound their dead-letter streams via `DeadLetterStreamMaxLength` / `DeadLetterStreamMaxMessages` instead, and Kafka's `.deadletter` topic uses broker retention. See [transport-semantics.md](transport-semantics.md) for the full per-transport dead-letter matrix. |
 
 A worker handler failure propagates out of the ingress to the transport dispatcher, which owns the
 retry decision: in `AckAfterHandlerCompletes` the delivery is NACKed/abandoned and redelivered up

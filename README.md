@@ -650,6 +650,7 @@ the right page. The pages:
 
 - **[Configuration](docs/configuration.md)** — `AddAsyncResponse` wiring and a consolidated options
   reference (engine, channel, and transport options).
+- **[Transport semantics](docs/transport-semantics.md)** — the per-transport matrix: ack modes, attempt counting, dead-letter destinations, early-ACK failure handling, shutdown drain budgets, and lock/lease renewal.
 - **[Provider examples](docs/provider-examples.md)** — copy/paste registration for every channel and
   every worker transport, plus links to every durable-flow store example.
 - **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `ShouldResumeOnRecovery`, the

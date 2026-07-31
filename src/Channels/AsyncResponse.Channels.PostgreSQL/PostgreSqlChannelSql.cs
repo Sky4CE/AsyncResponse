@@ -8,7 +8,8 @@ internal readonly record struct PostgreSqlChannelMessage(
     Guid Id,
     string CorrelationId,
     string EnvelopeJson,
-    DateTimeOffset CreatedAtUtc);
+    DateTimeOffset CreatedAtUtc,
+    DateTimeOffset? AckedAtUtc = null);
 
 /// <summary>SQL helper for the PostgreSQL channel tables and notification channel.</summary>
 internal sealed class PostgreSqlChannelSql
@@ -251,7 +252,7 @@ internal sealed class PostgreSqlChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json::text, created_at
+            SELECT id, correlation_id, envelope_json::text, created_at, acked_at
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -272,7 +273,12 @@ internal sealed class PostgreSqlChannelSql
         var messages = new List<PostgreSqlChannelMessage>(batchSize);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            messages.Add(new PostgreSqlChannelMessage(reader.GetGuid(0), reader.GetString(1), reader.GetString(2), reader.GetFieldValue<DateTimeOffset>(3)));
+            messages.Add(new PostgreSqlChannelMessage(
+                reader.GetGuid(0),
+                reader.GetString(1),
+                reader.GetString(2),
+                reader.GetFieldValue<DateTimeOffset>(3),
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4)));
         return messages;
     }
 

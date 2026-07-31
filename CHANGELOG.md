@@ -21,6 +21,15 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   authorizer now covers `IDurableFlowExecutor` explicitly instead of the reflection layer exempting
   it from authorization. Custom `IAsyncResponseCallbackAuthorizer` implementations must allow
   `IDurableFlowExecutor` when durable flows are enabled.
+- Channel-contract conformance suite: one shared behavioral suite (live delivery, `Until`
+  predicates, remote exceptions, timeouts, correlation isolation, lost-subscriber resume/failure
+  routing, raw-JSON ingress, correlation-id reuse, subscriber counts, late-response recovery) runs
+  against the in-memory reference in unit tests and against real Redis, NATS, PostgreSQL,
+  SQL Server, and MongoDB in the integration suite — the in-memory channel's behavior is now an
+  enforced contract rather than a de-facto spec.
+- `docs/transport-semantics.md`: a per-transport semantics matrix — ack modes, delivery-attempt
+  counting, dead-letter destinations, early-ACK failure handling, shutdown-drain budgets, and
+  lock/lease renewal — replacing prose scattered across `configuration.md`.
 - `HostShutdownTimeout` on the NATS, PostgreSQL, SQL Server, and MongoDB transports, matching the
   broker transports that already had it, so early-ACK drain budgets can be validated against host
   shutdown on every transport.
@@ -64,6 +73,13 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- Database channels (PostgreSQL, SQL Server, MongoDB) no longer redeliver an already-delivered
+  response to a new waiter that reuses the correlation id within the delivery watermark's 1 s
+  clock-skew tolerance — the new waiter used to complete instantly with the previous waiter's
+  stale payload. A message acked before a subscription existed is now excluded from its
+  deliveries, while cross-process fan-out (waiters registered before the ack) is preserved.
+  Found by the new channel-contract conformance suite; in-memory, Redis, and NATS already
+  behaved correctly.
 - Durable-flow wake delivery is retried through a crashed executor's lease window, fixing flows
   that could stay `Running` forever when their only wake arrived while the dead holder's lease was
   still unexpired and was silently dropped.
