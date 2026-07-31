@@ -77,6 +77,17 @@ const string MongoDbDatabase = "asyncresponse_itest";
 const string MongoDbEarlyAckDatabase = "asyncresponse_itest_earlyack";
 const string OracleAppUser = "asyncresponse";
 
+static bool SkipOracleCosmos()
+{
+    var configured = Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "auto");
+    if (string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase))
+        return true;
+    if (string.Equals(configured, "false", StringComparison.OrdinalIgnoreCase))
+        return false;
+    return OperatingSystem.IsMacOS()
+        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
+}
+
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
 
@@ -238,8 +249,12 @@ var mongodb = builder.AddContainer("mongodb", "mongo", "7")
 
 // Oracle and Cosmos back the durable-flow store contract tests, which run in default CI. They are
 // not part of the broker/load-test SUT, so workflows that don't need them (load tests, the weekly
-// redis-compat matrix) skip their heavyweight containers via this flag.
-if (!string.Equals(Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"), "true", StringComparison.OrdinalIgnoreCase))
+// redis-compat matrix) skip their heavyweight containers via this flag. Unset means "auto": skip
+// on Apple-silicon macOS, where the amd64-only Oracle image and the Cosmos emulator cannot run
+// and would fail the WHOLE AppHost boot — turning an IDE "run all tests" (which never sets the
+// flag) into a wall of fixture failures. CI pins "true"/"false" explicitly; the affected
+// store-contract tests Assert.Skip when the containers are absent.
+if (!SkipOracleCosmos())
 {
     var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");
     var oracle = builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")

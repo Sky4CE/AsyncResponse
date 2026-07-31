@@ -1,5 +1,13 @@
 using AsyncResponse.Channels.Redis;
+using AsyncResponse.Transports.AzureServiceBus;
 using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.Kafka;
+using AsyncResponse.Transports.MongoDB;
+using AsyncResponse.Transports.NATS;
+using AsyncResponse.Transports.PostgreSQL;
+using AsyncResponse.Transports.RabbitMQ;
+using AsyncResponse.Transports.SQS;
+using AsyncResponse.Transports.SqlServer;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -61,6 +69,72 @@ public class ChannelTransportRegistrationTests
         Assert.Null(provider.GetService<IDurableFlowExecutor>());
         Assert.Null(provider.GetService<IFlowStateStore>());
         Assert.Empty(provider.GetServices<AsyncResponseDurableFlowStoreMarker>());
+    }
+
+    [Theory]
+    [InlineData("PostgreSQL")]
+    [InlineData("SqlServer")]
+    [InlineData("MongoDB")]
+    [InlineData("Kafka")]
+    [InlineData("RabbitMQ")]
+    [InlineData("Redis")]
+    [InlineData("NATS")]
+    [InlineData("AzureServiceBus")]
+    [InlineData("GooglePubSub")]
+    [InlineData("SQS")]
+    public void EveryBrokerTransport_DeclaresWorkerEarlyAckOnItsMarker(string transport)
+    {
+        // The startup validator's early-ACK-vs-durable-flows veto is only as strong as each
+        // transport's marker declaration; this pins the resolved-options factory wiring on all
+        // ten so a mis-wired declaration cannot silently disarm the guard.
+        var provider = Build(builder => RegisterTransportWithWorkerEarlyAck(builder, transport));
+
+        var marker = provider.GetRequiredService<AsyncResponseTransportMarker>();
+        Assert.True(marker.WorkerSubscriberUsesEarlyAck);
+        Assert.False(marker.ResponseSubscriberUsesEarlyAck);
+        Assert.NotNull(marker.WorkerAckModePath);
+        Assert.Contains("WorkerSubscriber", marker.WorkerAckModePath, StringComparison.Ordinal);
+        Assert.NotNull(marker.ResponseAckModePath);
+        Assert.Contains("ResponseSubscriber", marker.ResponseAckModePath, StringComparison.Ordinal);
+    }
+
+    private static void RegisterTransportWithWorkerEarlyAck(AsyncResponseRegistrationBuilder builder, string transport)
+    {
+        switch (transport)
+        {
+            case "PostgreSQL":
+                builder.WithPostgreSqlTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "SqlServer":
+                builder.WithSqlServerTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "MongoDB":
+                builder.WithMongoDbTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "Kafka":
+                builder.WithKafkaTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "RabbitMQ":
+                builder.WithRabbitMqTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "Redis":
+                builder.WithRedisTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "NATS":
+                builder.WithNatsTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "AzureServiceBus":
+                builder.WithAzureServiceBusTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "GooglePubSub":
+                builder.WithGooglePubSubTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            case "SQS":
+                builder.WithSqsTransport(options => options.WorkerSubscriber.UseAckAfterEnqueue(2, 64));
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(transport), transport, "Unknown transport case.");
+        }
     }
 
     [Fact]

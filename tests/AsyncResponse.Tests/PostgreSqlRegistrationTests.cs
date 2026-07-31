@@ -162,8 +162,9 @@ public sealed class PostgreSqlRegistrationTests
     [Fact]
     public async Task ResponseEarlyAck_WithoutWorkerEarlyAck_PassesStartup()
     {
-        // A lost response only delays failover (the waiter burns its timeout, then recovery routing
-        // applies) — the response queue warns instead of failing startup.
+        // Response-queue early ACK is at-most-once response delivery (a lost response times the
+        // waiter out; a flow restarts the step, re-sending its idempotent trigger) — it warns
+        // instead of failing startup because nothing strands.
         var provider = Build(builder => builder
             .WithInMemoryChannel()
             .WithPostgreSqlTransport(options => options.ResponseSubscriber.UseAckAfterEnqueue(2, 64))

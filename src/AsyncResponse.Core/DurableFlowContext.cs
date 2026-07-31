@@ -314,11 +314,23 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), cancellationToken).ConfigureAwait(false);
             return response;
         }
+        catch (OperationCanceledException ex)
+        {
+            // A lost lease surfaces as cancellation of the linked wait; convert it with the wait
+            // failure attached so the takeover signal does not discard the real cause.
+            _lease.ThrowIfLost(ex);
+
+            // Cancellation is infrastructure, not a step verdict: the channel cancels in-flight
+            // waiters when it is disposed at host shutdown, and the caller's token means "stop
+            // this execution", not "the step failed" — the remote operation is still in flight.
+            // The persisted breadcrumb must survive untouched so the redelivered execution
+            // RE-ATTACHES to the same correlation id; marking the checkpoint faulted here turned
+            // every graceful shutdown mid-await into a fresh-correlation restart that re-sent the
+            // remote request. (A response that never arrives still faults via the step timeout.)
+            throw;
+        }
         catch (Exception ex)
         {
-            // A lost lease throws with the wait failure attached as inner, so the real cause of
-            // the faulted step is not discarded by the takeover signal.
-            _lease.ThrowIfLost(ex);
             // Timeout, trigger failure, or a faulted wait: record it so the next execution
             // restarts this step fresh instead of re-attaching to a dead correlation id. The
             // original failure rides along as `cause` so a rejected save cannot displace it.

@@ -122,8 +122,11 @@ internal sealed class AsyncResponseStartupValidator(
     /// as Running — no lease, no queued job, and no store enumeration API to even discover it.
     /// A flow store is always registered (validated above), so the veto is unconditional unless
     /// the operator accepts the risk via <see cref="DurableFlowOptions.AllowEarlyAckWorkerSubscriber"/>.
-    /// Early ACK on the response queue only delays failover (a lost response burns the waiter's
-    /// timeout before recovery routing takes over), so it warns instead of throwing.
+    /// Early ACK on the response queue is at-most-once response delivery — a crash after the ACK
+    /// destroys the broker's only copy, the waiter burns its full timeout and fails, and a durable
+    /// flow then restarts the timed-out step fresh (re-sending its request; triggers must be
+    /// idempotent, which the recovery contract already requires). Nothing strands, so it warns
+    /// instead of throwing.
     /// </summary>
     private void ValidateEarlyAckDeclarations()
     {
@@ -133,7 +136,7 @@ internal sealed class AsyncResponseStartupValidator(
             if (transport.ResponseSubscriberUsesEarlyAck)
             {
                 _logger?.LogWarning(
-                    "The {Transport} response subscriber uses early ACK ({AckModePath} = AckAfterEnqueue): a crash after the ACK loses the buffered response, and its waiter burns the full timeout before failing over. Prefer AckAfterHandlerCompletes for the response queue.",
+                    "The {Transport} response subscriber uses early ACK ({AckModePath} = AckAfterEnqueue): a crash after the ACK destroys the broker's only copy of the response — at-most-once delivery. The affected waiter burns its full timeout and fails, and a durable flow then restarts the timed-out step and re-sends its request (idempotent triggers required). Prefer AckAfterHandlerCompletes for the response queue.",
                     transport.Name,
                     transport.ResponseAckModePath);
             }

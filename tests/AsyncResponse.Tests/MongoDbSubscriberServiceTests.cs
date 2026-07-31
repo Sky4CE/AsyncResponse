@@ -315,7 +315,12 @@ public sealed class MongoDbSubscriberServiceTests
                     }
 
                     lock (_gate)
-                        return Task.FromResult(_pending.Count > 0 ? _pending.Dequeue() : null);
+                    {
+                        // The driver's FindOneAndUpdateAsync return is non-null-annotated, but a
+                        // null document IS the real empty-queue result — forgive it deliberately
+                        // instead of widening the mock signature (which trips CS8619).
+                        return Task.FromResult(_pending.Count > 0 ? _pending.Dequeue() : null!);
+                    }
                 });
 
             // Acks delete the document; nothing else in these tests inspects the result.

@@ -772,6 +772,16 @@ internal abstract class DbAsyncResponseChannelBase :
         // Take the message for live delivery. The claim sets acked_at unless the publisher already
         // routed it to recovery (recovery_claimed); losing the claim means recovery owns it, so it is
         // not delivered to the waiter and handled a second time.
+        //
+        // Claim-then-dispatch is deliberate — keep this ordering. The in-process handoff is
+        // at-most-once by design: a crash between the claim and the waiter's continuation can only
+        // lose delivery to waiters in THIS dying process, which no ordering could save (their
+        // continuations die with it), while pre-registered fan-out waiters in other processes
+        // still receive the acked message (IsWithinWatermark admits acked_at > started_at).
+        // Dispatch-then-ack behind an expiring claim would re-open the stale-redelivery wrong-data
+        // bug the strict acked exclusion in IsWithinWatermark closes. Durability across process
+        // death belongs to the layer above: flow re-execution, publish-time recovery routing, and
+        // the step timeout.
         if (!await _store.TryClaimForDeliveryAsync(message.Id, cancellationToken).ConfigureAwait(false))
         {
             foreach (var subscription in subscriptions)

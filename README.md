@@ -605,7 +605,7 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **1,550+ unit tests, run on each target framework** (~3,100 executions across .NET 8 and .NET 10), including
+- **1,600+ unit tests, run on each target framework** (~3,200 executions across .NET 8 and .NET 10), including
   concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
   duplicate-execution detection.
 - **240+ integration test cases** drive the shipped sample app black-box over HTTP against **real

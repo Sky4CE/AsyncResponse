@@ -351,10 +351,13 @@ internal sealed class LostSubscriberCallbackDispatcher(
         }
         catch (Exception ex)
         {
-            // Deliberately not rethrown once the retries are exhausted: an exception would bubble
-            // up to the broker ingress, which reacts with SetException — and that would invoke
-            // this same failure callback a second time. The domain failure has already been
-            // dispatched.
+            // Deliberately not rethrown once the retries are exhausted — keep the swallow. An
+            // exception would bubble up to the broker ingress, which reacts with SetException and
+            // would invoke this same failure callback a second time; routing it to transport
+            // redelivery instead would hot-loop a permanently-throwing callback on RabbitMQ's
+            // unbounded default. The domain failure has already been dispatched (and retried
+            // above), and the kept recovery row is surfaced by the watchdog's staleness report,
+            // so the drop is operator-visible rather than silent.
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
             return false;

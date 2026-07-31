@@ -173,6 +173,13 @@ public class CallbackAuthorizationTests
 /// default AssemblyLoadContext (plugin scenarios) can be resolved via a registered resolver, and an
 /// unresolvable type name is surfaced via a metric instead of failing silently.
 /// </summary>
+/// <remarks>
+/// Collection-serialized with <c>AsyncResponseTypeResolutionTests</c>: both classes mutate the
+/// process-global resolver registry, and that class's per-test <c>Reset()</c> wiped this class's
+/// just-registered resolver when xunit ran them in parallel — an intermittent
+/// "Type ... not found" failure here.
+/// </remarks>
+[Collection("AsyncResponseTypeResolutionRegistry")]
 public class TypeResolutionTests
 {
     public interface IPluginService { Task RunAsync(string value); }

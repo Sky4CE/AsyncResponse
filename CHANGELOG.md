@@ -60,9 +60,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   checkpoints before its ledger can expire instead of racing it.
 - Callback authorization now runs **before** type resolution: an unauthorized
   service/method name is rejected string-first, without spending a full assembly scan on
-  attacker-supplied input. Unresolvable type names are additionally negative-cached (bounded, and
-  invalidated when an assembly loads or a custom resolver registers), so a poisoned recovery row
-  no longer re-walks every loaded assembly on every delivery.
+  attacker-supplied input. Unresolvable type names are additionally negative-cached (bounded;
+  entries are generation-stamped and self-invalidate when an assembly loads or a custom resolver
+  registers, so an in-flight miss racing a registration can never poison the cache), and a
+  poisoned recovery row no longer re-walks every loaded assembly on every delivery.
 - The recovery watchdog's scan now feeds the same pure `AsyncResponseWatchdogReport.Evaluate`
   classifier it exposes publicly (the two had drifted into duplicate logic), and duplicate
   registrations for one correlation id keep the **oldest** — the scanner contract promises no
@@ -113,6 +114,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   complete it). On the database channels this also covers channel `DisposeAsync` at host
   shutdown, which runs the same cleanup over every in-flight subscription and used to hang
   still-awaiting `WaitAsync` callers.
+- A durable-flow step whose wait is cancelled — the channel disposing its waiter at host
+  shutdown, or the execution's own cancellation token — no longer marks the step faulted: the
+  remote operation is still in flight, so the persisted breadcrumb survives and the redelivered
+  execution **re-attaches to the same correlation id** instead of restarting the step and
+  re-sending the remote request on every graceful shutdown. Timeouts and real faults still
+  restart the step fresh.
 - The database channels' same-process fast path now uses the server-stamped `created_at` returned
   by the insert instead of the app clock; an app clock more than 1 s behind the database used to
   silently disable the fast path on every publish, degrading same-process delivery to sweep

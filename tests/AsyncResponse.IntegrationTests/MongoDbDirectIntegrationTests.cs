@@ -133,11 +133,18 @@ public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : 
         Assert.True((DateTimeOffset.UtcNow - since).Duration() < TimeSpan.FromMinutes(5));
 
         var messageId = Guid.NewGuid();
-        await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
-        await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+        var firstCreatedAt = await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+        var duplicateCreatedAt = await store.InsertMessageAsync(messageId, messageCorrelation, """{"Success":true}""", TimeSpan.FromMinutes(5), CancellationToken.None);
+
+        // The insert returns the document's server-stamped ($$NOW) created_at — the ORIGINAL
+        // document's on a duplicate, per the pipeline's $ifNull — so the same-process fast path
+        // compares like clocks under app-clock skew.
+        Assert.Equal(firstCreatedAt, duplicateCreatedAt);
+
         var messages = await store.LoadMessagesAsync(messageCorrelation, since.AddSeconds(-1), 16, null, null, CancellationToken.None);
         var message = Assert.Single(messages);
         Assert.Equal(messageId, message.Id);
+        Assert.Equal(firstCreatedAt, message.CreatedAtUtc);
 
         // Live delivery claims the message; recovery must then lose the arbitration.
         Assert.True(await store.TryClaimForDeliveryAsync(messageId, CancellationToken.None));

@@ -191,11 +191,10 @@ public sealed class IntegrationFixture : IAsyncLifetime
         MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}/?directConnection=true";
 
         // The AppHost omits the Oracle and Cosmos containers when ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS
-        // is set (their endpoints then don't exist), and a user-supplied connection string always wins
-        // over the container-derived one. When neither var ends up set, the opt-in durable-flow store
-        // contract tests Assert.Skip.
-        var skipOracleCosmos = string.Equals(
-            Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"), "true", StringComparison.OrdinalIgnoreCase);
+        // resolves to skip (their endpoints then don't exist), and a user-supplied connection string
+        // always wins over the container-derived one. When neither var ends up set, the opt-in
+        // durable-flow store contract tests Assert.Skip.
+        var skipOracleCosmos = SkipOracleCosmos();
 
         if (!skipOracleCosmos && string.IsNullOrEmpty(_previousOracleConnectionString))
         {
@@ -280,6 +279,23 @@ public sealed class IntegrationFixture : IAsyncLifetime
             Environment.SetEnvironmentVariable(OracleConnectionStringEnvironmentVariable, _previousOracleConnectionString);
             Environment.SetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable, _previousCosmosConnectionString);
         }
+    }
+
+    /// <summary>
+    /// Mirrors the AppHost's decision — the two must agree, because the endpoints only exist when
+    /// the AppHost created the containers. Unset means "auto": skip on Apple-silicon macOS, where
+    /// the amd64-only Oracle image and the Cosmos emulator cannot run and would fail the whole
+    /// AppHost boot (an IDE "run all tests" never sets the flag). CI pins "true"/"false" explicitly.
+    /// </summary>
+    private static bool SkipOracleCosmos()
+    {
+        var configured = Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "auto");
+        if (string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (string.Equals(configured, "false", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return OperatingSystem.IsMacOS()
+            && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
     }
 
     private static string Env(string name, string fallback)

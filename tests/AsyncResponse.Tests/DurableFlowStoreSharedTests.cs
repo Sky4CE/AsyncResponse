@@ -91,7 +91,7 @@ public sealed class DurableFlowStoreSharedTests
         Assert.Equal(json, Invoke(shared, "SerializeBounded", "flow", state, (long?)json.Length * 4, "provider"));
 
         // Over budget names the cause instead of leaving the provider to reject opaque bytes.
-        var tooLarge = AssertInner<InvalidOperationException>(
+        var tooLarge = AssertInnerAssignable<InvalidOperationException>(
             shared, "SerializeBounded", "flow", state, (long?)1, "provider");
         Assert.Equal("FlowStateTooLargeException", tooLarge.GetType().Name);
         Assert.Equal("flow", tooLarge.GetType().GetProperty("FlowId")!.GetValue(tooLarge));
@@ -263,12 +263,27 @@ public sealed class DurableFlowStoreSharedTests
         => shared.GetMethod(methodName, BindingFlags.Public | BindingFlags.Static, binder: null, parameterTypes, modifiers: null)!
             .Invoke(null, arguments);
 
-    /// <remarks>
-    /// Matches derived exceptions too: the shared source's <c>FlowStateTooLargeException</c> is
-    /// internal to each store assembly, so tests can only name its <see cref="InvalidOperationException"/>
-    /// base — which xUnit's exact-match <c>IsType</c> would reject.
-    /// </remarks>
+    /// <summary>
+    /// Exact-type inner-exception assertion — the default, so an <c>ArgumentNullException</c> can
+    /// never silently satisfy an <c>ArgumentException</c> expectation.
+    /// </summary>
     private static TException AssertInner<TException>(
+        Type shared,
+        string methodName,
+        params object?[] arguments)
+        where TException : Exception
+    {
+        var exception = Assert.Throws<TargetInvocationException>(() => Invoke(shared, methodName, arguments));
+        return Assert.IsType<TException>(exception.InnerException);
+    }
+
+    /// <remarks>
+    /// Matches derived exceptions — ONLY for throws the test cannot name exactly: the shared
+    /// source's <c>FlowStateTooLargeException</c> is internal to each store assembly, so tests can
+    /// only name its <see cref="InvalidOperationException"/> base, which the exact-match helper
+    /// above would reject. Every other assertion uses <see cref="AssertInner{TException}"/>.
+    /// </remarks>
+    private static TException AssertInnerAssignable<TException>(
         Type shared,
         string methodName,
         params object?[] arguments)

@@ -27,8 +27,10 @@ These hold for every transport in the matrix, verified per package:
   [durable flows — what happens when things die](durable-flows.md#what-happens-when-things-die)).
   Startup throws for `WorkerSubscriber` early ACK unless
   `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` accepts the risk; `ResponseSubscriber`
-  early ACK logs a startup warning instead (a lost response burns the waiter's timeout before
-  failover, but nothing strands).
+  early ACK logs a startup warning instead — it is at-most-once response delivery: a crash after
+  the ACK destroys the broker's only copy, the waiter burns its full timeout and fails, and a
+  durable flow then restarts the timed-out step and re-sends its request (idempotent triggers
+  required, which the recovery contract already demands). Nothing strands.
 - **`OnBackgroundFailure`.** Every subscriber options type exposes
   `Func<<Transport>BackgroundFailureContext, ValueTask>? OnBackgroundFailure`, invoked when a
   handler fails after the message was already settled (see the

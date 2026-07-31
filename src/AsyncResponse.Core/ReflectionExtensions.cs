@@ -21,14 +21,29 @@ internal static class ReflectionExtensions
     // grow it without limit, and invalidated on the only events that can turn a miss into a hit —
     // a new assembly loading, or a custom resolver registering. At capacity, novel unresolvable
     // names fall back to scanning; correctness never depends on this cache.
-    private static readonly ConcurrentDictionary<string, byte> UnresolvableServiceTypes = new(StringComparer.Ordinal);
+    //
+    // Entries are stamped with the invalidation GENERATION observed before their failed scan, not
+    // just stored: a plain clear-on-register has a race — an in-flight miss that started against
+    // the old resolver set can insert AFTER the clear, permanently poisoning the name. A stale
+    // stamp (generation advanced mid-scan) makes the entry a non-hit, so the next lookup rescans
+    // with the new resolvers.
+    private static readonly ConcurrentDictionary<string, int> UnresolvableServiceTypes = new(StringComparer.Ordinal);
     private const int UnresolvableServiceTypeCacheCapacity = 1024;
+    private static int _unresolvableGeneration;
 
     static ReflectionExtensions()
-        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => UnresolvableServiceTypes.Clear();
+        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => InvalidateUnresolvableServiceTypes();
 
-    /// <summary>Drops the negative type-resolution cache (a new resolver may resolve cached misses).</summary>
-    internal static void InvalidateUnresolvableServiceTypes() => UnresolvableServiceTypes.Clear();
+    /// <summary>
+    /// Invalidates the negative type-resolution cache (a new resolver or assembly may resolve
+    /// cached misses). The generation bump is what guarantees correctness for in-flight scans;
+    /// the clear just reclaims memory.
+    /// </summary>
+    internal static void InvalidateUnresolvableServiceTypes()
+    {
+        Interlocked.Increment(ref _unresolvableGeneration);
+        UnresolvableServiceTypes.Clear();
+    }
     private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
     private static readonly ConcurrentDictionary<InvocationPlanKey, InvocationPlan> InvocationPlans = new();
     private static readonly MethodInfo ToValueTaskMethod = typeof(ReflectionExtensions)
@@ -128,12 +143,16 @@ internal static class ReflectionExtensions
 
         // Fail fast on a name that already failed a full scan: without this, every delivery naming
         // an unresolvable type (a poisoned recovery row, a renamed class) re-walks every loaded
-        // assembly on every attempt.
-        if (UnresolvableServiceTypes.ContainsKey(serviceInterfaceFullName))
+        // assembly on every attempt. Only a CURRENT-generation entry counts — a stale stamp means
+        // the miss may have raced a resolver registration or assembly load, so it rescans.
+        if (UnresolvableServiceTypes.TryGetValue(serviceInterfaceFullName, out var missGeneration)
+            && missGeneration == Volatile.Read(ref _unresolvableGeneration))
         {
             AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
             return null;
         }
+
+        var generationBeforeScan = Volatile.Read(ref _unresolvableGeneration);
 
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
@@ -153,8 +172,10 @@ internal static class ReflectionExtensions
             return custom;
         }
 
+        // Stamped with the generation observed BEFORE the scan: if a resolver registered while
+        // this scan ran, the stamp is already stale and the entry never blocks a re-resolve.
         if (UnresolvableServiceTypes.Count < UnresolvableServiceTypeCacheCapacity)
-            UnresolvableServiceTypes.TryAdd(serviceInterfaceFullName, 0);
+            UnresolvableServiceTypes[serviceInterfaceFullName] = generationBeforeScan;
 
         AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
         return null;

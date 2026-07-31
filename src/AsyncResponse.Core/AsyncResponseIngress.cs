@@ -1,5 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace AsyncResponse;
 
@@ -28,8 +30,14 @@ internal sealed class AsyncResponseIngress(
             // never route, so redelivery would retry it forever (RabbitMQ's default
             // MaxDeliveryAttempts = 0 has no cap) or burn dead-letter attempts on brokers that do.
             // Error-level log + counter make the drop loud — every occurrence is a producer-side
-            // contract violation.
-            _logger.LogError("Ingress received a response message with no correlation id; it cannot be routed and is acknowledged without dispatch. Message: {Message}", messageJson);
+            // contract violation. Only metadata is logged: response payloads may carry PII and
+            // stay out of logs by policy (docs/security.md); the byte length and hash prefix are
+            // enough to correlate with broker-side capture tooling.
+            var payloadBytes = Encoding.UTF8.GetBytes(messageJson);
+            _logger.LogError(
+                "Ingress received a response message with no correlation id; it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                payloadBytes.Length,
+                Convert.ToHexString(SHA256.HashData(payloadBytes).AsSpan(0, 8)));
             AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "No correlation id on the inbound response message.");
             AsyncResponseDiagnostics.RecordUnroutableResponse();
             return;

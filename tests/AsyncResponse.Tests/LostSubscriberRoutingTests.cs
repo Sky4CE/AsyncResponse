@@ -178,6 +178,21 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
+    public async Task Ingress_NoCorrelationId_AcknowledgesWithoutDispatchOrThrow()
+    {
+        ArmRecoveryState();
+
+        // Deliberate poison guard: an unroutable response can never route, so it is acknowledged
+        // (the handler returns normally instead of throwing into transport redelivery) and nothing
+        // is dispatched — only the Error-level metadata log and the unroutable counter fire.
+        await Ingress.HandleResponseMessageAsync("""{"Status":1}""", correlationId: null);
+        await Ingress.HandleResponseMessageAsync("""{"Status":1}""", correlationId: "   ");
+
+        Assert.Empty(_spy.ResumedPayloads);
+        Assert.Empty(_spy.Failures);
+    }
+
+    [Fact]
     public async Task Ingress_UnclassifiableRawJsonWithoutStoredType_FailsConservatively()
     {
         // No stored payload type → the payload cannot be asked whether to resume, so it takes the

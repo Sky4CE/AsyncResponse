@@ -429,8 +429,107 @@ public class DurableFlowTests
             timeout: TimeSpan.FromMinutes(1),
             cancellationToken: cancellation.Token));
 
-        Assert.True(state.Steps!["remote"].Faulted);
+        // Cancellation is not a step verdict: the remote operation is still in flight, so the
+        // breadcrumb survives and the redelivered execution re-attaches instead of re-sending.
+        Assert.False(state.Steps!["remote"].Faulted);
+        Assert.NotNull(state.Steps!["remote"].PendingCorrelationId);
         waiter.Verify(instance => instance.DisposeAsync(), Times.Once);
+    }
+
+    [Fact]
+    public async Task AwaitStep_WaiterCanceledByShutdown_ReattachesOnRedeliveryWithoutResending()
+    {
+        // Execution 1: the channel is disposed at host shutdown, which cancels the in-flight
+        // waiter's ResponseTask. The step must NOT be marked faulted — the trigger already ran.
+        var canceledWait = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        canceledWait.TrySetCanceled();
+        var requestedCorrelationIds = new List<string>();
+        var triggeredCorrelationIds = new List<string>();
+
+        var state = new FlowState { FlowId = "shutdown-flow" };
+        var store = new InMemoryFlowStateStore();
+
+        await using (var lease = await CreateLeaseAsync(store, state))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                SubscriberReturning(canceledWait.Task, requestedCorrelationIds),
+                recoverableSubscriber: null,
+                NullLogger.Instance,
+                lease);
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.AwaitStepAsync<OperationResult>(
+                "external-step",
+                correlationId => { triggeredCorrelationIds.Add(correlationId); return Task.CompletedTask; }));
+        }
+
+        var step = state.Steps!["external-step"];
+        Assert.False(step.Faulted);
+        Assert.NotNull(step.PendingCorrelationId);
+
+        // Execution 2 (redelivery after restart): re-attaches to the SAME correlation id and does
+        // not run the trigger again — no duplicate remote request.
+        var completedWait = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        completedWait.TrySetResult(new OperationResult { Status = OperationStatus.Completed });
+
+        await using (var lease = await AcquireExistingLeaseAsync(store, state))
+        {
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                SubscriberReturning(completedWait.Task, requestedCorrelationIds),
+                recoverableSubscriber: null,
+                NullLogger.Instance,
+                lease);
+
+            var result = await context.AwaitStepAsync<OperationResult>(
+                "external-step",
+                correlationId => { triggeredCorrelationIds.Add(correlationId); return Task.CompletedTask; });
+
+            Assert.Equal(OperationStatus.Completed, result.Status);
+        }
+
+        var triggered = Assert.Single(triggeredCorrelationIds);
+        Assert.Equal(2, requestedCorrelationIds.Count);
+        Assert.Equal(triggered, requestedCorrelationIds[0]);
+        Assert.Equal(triggered, requestedCorrelationIds[1]);
+    }
+
+    private static IAsyncResponseSubscriber SubscriberReturning(
+        Task<OperationResult> responseTask,
+        List<string> requestedCorrelationIds)
+    {
+        var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
+        waiter.SetupGet(instance => instance.ResponseTask).Returns(responseTask);
+        waiter.Setup(instance => instance.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        var subscriber = new Mock<IAsyncResponseSubscriber>();
+        subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .Callback<string, Func<OperationResult, ValueTask<bool>>?, TimeSpan?>(
+                (correlationId, _, _) => requestedCorrelationIds.Add(correlationId))
+            .ReturnsAsync(waiter.Object);
+        return subscriber.Object;
+    }
+
+    /// <summary>Re-acquires a lease on an existing ledger (the state already exists in the store).</summary>
+    private static async Task<FlowExecutionLease> AcquireExistingLeaseAsync(IFlowStateStore store, FlowState state)
+    {
+        var lease = await FlowStateConcurrency.TryAcquireExecutionLeaseAsync(
+            store,
+            state.FlowId!,
+            new DurableFlowOptions(),
+            NullLogger.Instance);
+        return Assert.IsType<FlowExecutionLease>(lease);
     }
 
     [Fact]
@@ -593,6 +692,40 @@ public class DurableFlowTests
             new DurableFlowOptions(),
             NullLogger.Instance);
         return Assert.IsType<FlowExecutionLease>(lease);
+    }
+
+    [Fact]
+    public void StateExpiryDefault_ComfortablyExceedsTheDefaultStepTimeoutChain()
+    {
+        // The default step-timeout chain (DefaultStepTimeout -> channel DefaultTimeout ->
+        // RecoveryStateExpiry) bottoms out at 7 days. The ledger TTL must not tie it: equal
+        // defaults let a step that silently waits out the full timeout race its own state expiry,
+        // and a TTL win makes the run unrecoverable.
+        var flowDefaults = new DurableFlowOptions();
+        var channelDefaults = new PlainChannelOptions();
+
+        Assert.Equal(TimeSpan.FromDays(14), flowDefaults.StateExpiry);
+        Assert.Null(flowDefaults.DefaultStepTimeout);
+        Assert.Null(channelDefaults.DefaultTimeout);
+        Assert.True(flowDefaults.StateExpiry >= channelDefaults.RecoveryStateExpiry * 2);
+    }
+
+    private sealed class PlainChannelOptions : AsyncResponseChannelOptions;
+
+    [Fact]
+    public async Task LeaseSave_AfterLedgerDeleted_ReportsStateGone()
+    {
+        var state = new FlowState { FlowId = "gone-flow" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+
+        Assert.True(await store.TryDeleteAsync("gone-flow"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => lease.SaveAsync(state, TimeSpan.FromMinutes(5)));
+
+        Assert.Contains("gone", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("lost its execution lease", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

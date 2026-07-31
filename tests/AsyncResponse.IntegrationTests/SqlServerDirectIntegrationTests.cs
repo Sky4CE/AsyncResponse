@@ -116,13 +116,18 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
 
             var startedAt = await sql.GetServerTimeUtcAsync(CancellationToken.None);
             var messageId = Guid.NewGuid();
-            await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
-            await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("duplicate"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            var firstCreatedAt = await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            var duplicateCreatedAt = await sql.InsertMessageAsync(messageId, "message-correlation", SuccessEnvelope("duplicate"), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+            // The insert returns the row's server-stamped created_at — the ORIGINAL row's on a
+            // duplicate — so the same-process fast path compares like clocks under app-clock skew.
+            Assert.Equal(firstCreatedAt, duplicateCreatedAt);
 
             var messages = await sql.LoadMessagesAsync("message-correlation", startedAt.AddSeconds(-5), 10, null, null, CancellationToken.None);
             var message = Assert.Single(messages);
             Assert.Equal(messageId, message.Id);
             Assert.Equal("message-correlation", message.CorrelationId);
+            Assert.Equal(firstCreatedAt, message.CreatedAtUtc);
             Assert.False(await sql.IsMessageAcknowledgedAsync(messageId, CancellationToken.None));
             Assert.True(await sql.TryClaimForDeliveryAsync(messageId, CancellationToken.None));
             Assert.True(await sql.IsMessageAcknowledgedAsync(messageId, CancellationToken.None));

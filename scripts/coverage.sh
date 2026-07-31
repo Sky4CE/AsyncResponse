@@ -156,7 +156,15 @@ if [[ ${#FAILED_RUNS[@]} -gt 0 ]]; then
 fi
 
 if [[ $OPEN_REPORT -eq 1 ]]; then
-  open "$REPORT_DIR/index.html"
+  # Platform-portable open: `open` is macOS, Linux/WSL have xdg-open, and anywhere else just
+  # print the path — under `set -e` a missing opener must not turn a green run red.
+  if command -v open >/dev/null 2>&1; then
+    open "$REPORT_DIR/index.html"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$REPORT_DIR/index.html"
+  else
+    echo "Coverage report: $REPORT_DIR/index.html"
+  fi
 fi
 
 # Exit red if any suite failed, so the numbers are never read as a green run.
