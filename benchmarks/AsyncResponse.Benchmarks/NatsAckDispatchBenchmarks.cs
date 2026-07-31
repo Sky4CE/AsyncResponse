@@ -45,7 +45,7 @@ public class NatsAckDispatchBenchmarks
             (_, _) => Task.CompletedTask,
             jetStream,
             options,
-            new NatsSubscriberOptions().UseAckAfterReceive(
+            new NatsSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: BackgroundWorkers,
                 backgroundQueueCapacity: 16_384,
                 backgroundDrainTimeout: TimeSpan.FromSeconds(30)),
@@ -67,7 +67,7 @@ public class NatsAckDispatchBenchmarks
         => _awaiting.HandleAsync(Delivery(), CancellationToken.None);
 
     [Benchmark]
-    public Task AckAfterReceive_Callback()
+    public Task AckAfterEnqueue_Callback()
         => _queued.HandleAsync(Delivery(), CancellationToken.None);
 
     private static NatsJobDelivery Delivery()

@@ -75,13 +75,17 @@ public sealed class AzureServiceBusAsyncResponseOptions
     /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers and cached senders are allowed to close gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// Bounds receiver/sender close and the lock-renewal task join while a hosted subscriber
+    /// stops. These complete in milliseconds when healthy; when they do not, the work is abandoned
+    /// anyway, so keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// The hosting shutdown budget that must contain Service Bus receiver/sender shutdown plus
     /// <see cref="AzureServiceBusSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="AzureServiceBusAckMode.AckAfterReceive"/>.
+    /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
@@ -121,7 +125,7 @@ public enum AzureServiceBusAckMode
     /// queue. Handler failures are logged and reported through <see cref="AzureServiceBusSubscriberOptions.OnBackgroundFailure"/>
     /// because the original Service Bus lock has already been completed.
     /// </summary>
-    AckAfterReceive = 1
+    AckAfterEnqueue = 1
 }
 
 /// <summary>Describes a handler failure that happened after a Service Bus message was already completed.</summary>
@@ -186,25 +190,25 @@ public sealed class AzureServiceBusSubscriberOptions
     /// locks of later batch messages expire and cause systematic duplicate processing. Renewal
     /// failures are logged and processing continues — the message simply redelivers, preserving
     /// at-least-once semantics. Set to <c>null</c> to disable renewal. Ignored in
-    /// <see cref="AzureServiceBusAckMode.AckAfterReceive"/> (messages are already completed).
+    /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/> (messages are already completed).
     /// Default: <c>30 seconds</c>.
     /// </summary>
     public TimeSpan? LockRenewalInterval { get; set; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>Number of background workers used by <see cref="AzureServiceBusAckMode.AckAfterReceive"/>.</summary>
+    /// <summary>Number of background workers used by <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>.</summary>
     public int BackgroundWorkerCount { get; set; }
 
     /// <summary>Maximum number of completed messages waiting in the background queue.</summary>
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while stopping.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Optional callback invoked when a background handler fails after the message was already completed.</summary>
     public Func<AzureServiceBusBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 
-    /// <summary>Explicitly opts this subscriber into complete-after-receive behavior.</summary>
-    public AzureServiceBusSubscriberOptions UseAckAfterReceive(
+    /// <summary>Explicitly opts this subscriber into complete-after-enqueue behavior.</summary>
+    public AzureServiceBusSubscriberOptions UseAckAfterEnqueue(
         int backgroundWorkerCount,
         int backgroundQueueCapacity,
         TimeSpan? backgroundDrainTimeout = null)
@@ -214,7 +218,7 @@ public sealed class AzureServiceBusSubscriberOptions
         if (backgroundDrainTimeout is { } timeout && timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(backgroundDrainTimeout), timeout, "Drain timeout must be positive.");
 
-        AckMode = AzureServiceBusAckMode.AckAfterReceive;
+        AckMode = AzureServiceBusAckMode.AckAfterEnqueue;
         BackgroundWorkerCount = backgroundWorkerCount;
         BackgroundQueueCapacity = backgroundQueueCapacity;
         if (backgroundDrainTimeout is not null)

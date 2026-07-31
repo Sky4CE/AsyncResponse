@@ -1,7 +1,7 @@
 #nullable enable
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
-AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AddReplyTarget(string! name, string! queue) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AzureServiceBusAsyncResponseOptions() -> void
@@ -68,7 +68,7 @@ AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.OnBack
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.OnBackgroundFailure.set -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.PrefetchCount.get -> int
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.PrefetchCount.set -> void
-AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions!
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.AzureServiceBusWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! options) -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask

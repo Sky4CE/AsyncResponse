@@ -41,26 +41,26 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterReceive_RequiresPositiveBackgroundWorkerCount()
+    public void ValidateOptions_AckAfterEnqueue_RequiresPositiveBackgroundWorkerCount()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AzureServiceBusMessageDispatcher.ValidateOptions(
                 new AzureServiceBusAsyncResponseOptions(),
-                new AzureServiceBusSubscriberOptions { AckMode = AzureServiceBusAckMode.AckAfterReceive },
+                new AzureServiceBusSubscriberOptions { AckMode = AzureServiceBusAckMode.AckAfterEnqueue },
                 AzureServiceBusSubscriberRole.Worker));
 
         Assert.Contains(nameof(AzureServiceBusSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterReceive_RequiresPositiveBackgroundQueueCapacity()
+    public void ValidateOptions_AckAfterEnqueue_RequiresPositiveBackgroundQueueCapacity()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AzureServiceBusMessageDispatcher.ValidateOptions(
                 new AzureServiceBusAsyncResponseOptions(),
                 new AzureServiceBusSubscriberOptions
                 {
-                    AckMode = AzureServiceBusAckMode.AckAfterReceive,
+                    AckMode = AzureServiceBusAckMode.AckAfterEnqueue,
                     BackgroundWorkerCount = 2
                 },
                 AzureServiceBusSubscriberRole.Worker));
@@ -69,7 +69,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterReceive_RejectsDrainPlusShutdownExceedingHostBudget()
+    public void ValidateOptions_AckAfterEnqueue_RejectsDrainPlusShutdownExceedingHostBudget()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AzureServiceBusMessageDispatcher.ValidateOptions(
@@ -78,21 +78,33 @@ public sealed class AzureServiceBusDispatcherTests
                     ShutdownTimeout = TimeSpan.FromSeconds(20),
                     HostShutdownTimeout = TimeSpan.FromSeconds(25)
                 },
-                new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(10)),
+                new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10)),
                 AzureServiceBusSubscriberRole.Worker));
 
         Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterReceive_RequiresPositiveDrainTimeout()
+    public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (5s ShutdownTimeout + 20s BackgroundDrainTimeout vs HostShutdownTimeout 30s)
+        // must not fail startup.
+        AzureServiceBusMessageDispatcher.ValidateOptions(
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            AzureServiceBusSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_AckAfterEnqueue_RequiresPositiveDrainTimeout()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AzureServiceBusMessageDispatcher.ValidateOptions(
                 new AzureServiceBusAsyncResponseOptions(),
                 new AzureServiceBusSubscriberOptions
                 {
-                    AckMode = AzureServiceBusAckMode.AckAfterReceive,
+                    AckMode = AzureServiceBusAckMode.AckAfterEnqueue,
                     BackgroundWorkerCount = 1,
                     BackgroundQueueCapacity = 8,
                     BackgroundDrainTimeout = TimeSpan.Zero
@@ -103,40 +115,40 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterReceive_RequiresPositiveHostShutdownTimeoutWhenSet()
+    public void ValidateOptions_AckAfterEnqueue_RequiresPositiveHostShutdownTimeoutWhenSet()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             AzureServiceBusMessageDispatcher.ValidateOptions(
                 new AzureServiceBusAsyncResponseOptions { HostShutdownTimeout = TimeSpan.Zero },
-                new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8),
+                new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8),
                 AzureServiceBusSubscriberRole.Worker));
 
         Assert.Contains(nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void UseAckAfterReceive_WhenDrainTimeoutIsOmitted_KeepsDefaultDrainTimeout()
+    public void UseAckAfterEnqueue_WhenDrainTimeoutIsOmitted_KeepsDefaultDrainTimeout()
     {
         var options = new AzureServiceBusSubscriberOptions();
 
-        var returned = options.UseAckAfterReceive(2, 16);
+        var returned = options.UseAckAfterEnqueue(2, 16);
 
         Assert.Same(options, returned);
-        Assert.Equal(AzureServiceBusAckMode.AckAfterReceive, options.AckMode);
+        Assert.Equal(AzureServiceBusAckMode.AckAfterEnqueue, options.AckMode);
         Assert.Equal(2, options.BackgroundWorkerCount);
         Assert.Equal(16, options.BackgroundQueueCapacity);
-        Assert.Equal(TimeSpan.FromSeconds(30), options.BackgroundDrainTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(20), options.BackgroundDrainTimeout);
     }
 
     [Fact]
-    public void UseAckAfterReceive_RejectsInvalidArguments()
+    public void UseAckAfterEnqueue_RejectsInvalidArguments()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(0, 1));
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(0, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 0));
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 0));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.Zero));
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.Zero));
     }
 
     [Fact]
@@ -234,7 +246,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_CompletesBeforeHandlerFinishes()
+    public async Task AckAfterEnqueue_CompletesBeforeHandlerFinishes()
     {
         var calls = new SettlementCalls();
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -249,7 +261,7 @@ public sealed class AzureServiceBusDispatcherTests
                 handlerCompleted.TrySetResult();
             },
             new AzureServiceBusAsyncResponseOptions(),
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -265,7 +277,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailure_InvokesCallback()
+    public async Task AckAfterEnqueue_BackgroundFailure_InvokesCallback()
     {
         var calls = new SettlementCalls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -284,7 +296,7 @@ public sealed class AzureServiceBusDispatcherTests
                     failureReported.TrySetResult(context);
                     return ValueTask.CompletedTask;
                 }
-            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -303,7 +315,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailureCallbackExceptionsAreSwallowed()
+    public async Task AckAfterEnqueue_BackgroundFailureCallbackExceptionsAreSwallowed()
     {
         var calls = new SettlementCalls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -317,7 +329,7 @@ public sealed class AzureServiceBusDispatcherTests
             new AzureServiceBusSubscriberOptions
             {
                 OnBackgroundFailure = _ => throw new InvalidOperationException("callback boom")
-            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -330,7 +342,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_WhenCompleteFails_DoesNotAbandonEnqueuedDelivery()
+    public async Task AckAfterEnqueue_WhenCompleteFails_DoesNotAbandonEnqueuedDelivery()
     {
         var calls = new SettlementCalls { CompleteException = new InvalidOperationException("complete failed") };
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -341,7 +353,7 @@ public sealed class AzureServiceBusDispatcherTests
                 return Task.CompletedTask;
             },
             new AzureServiceBusAsyncResponseOptions(),
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -360,7 +372,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_Overflow_AbandonsForRetry()
+    public async Task AckAfterEnqueue_Overflow_AbandonsForRetry()
     {
         var calls = new SettlementCalls();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -372,7 +384,7 @@ public sealed class AzureServiceBusDispatcherTests
                 await release.Task.ConfigureAwait(false);
             },
             new AzureServiceBusAsyncResponseOptions(),
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.FromSeconds(5)),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -387,7 +399,7 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_DisposeTimesOutAndSecondDisposeIsNoOp()
+    public async Task AckAfterEnqueue_DisposeTimesOutAndSecondDisposeIsNoOp()
     {
         var calls = new SettlementCalls();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -399,7 +411,7 @@ public sealed class AzureServiceBusDispatcherTests
                 await release.Task.ConfigureAwait(false);
             },
             new AzureServiceBusAsyncResponseOptions(),
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(10)),
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(10)),
             NullLogger.Instance,
             "workers",
             AzureServiceBusSubscriberRole.Worker);
@@ -451,7 +463,7 @@ public sealed class AzureServiceBusDispatcherTests
                 calls.DeadLetterDescription = description;
                 return ValueTask.CompletedTask;
             },
-            () =>
+            _ =>
             {
                 calls.RenewLock++;
                 return ValueTask.CompletedTask;

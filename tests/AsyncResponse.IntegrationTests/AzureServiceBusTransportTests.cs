@@ -25,7 +25,7 @@ public sealed class AzureServiceBusTransportTests(IntegrationFixture fixture) : 
 
         Assert.Equal("Redis", earlyAckConfig.Channel);
         Assert.Equal("AzureServiceBus", earlyAckConfig.Transport);
-        Assert.Equal("AckAfterReceive", earlyAckConfig.AzureServiceBus!.WorkerAckMode);
+        Assert.Equal("AckAfterEnqueue", earlyAckConfig.AzureServiceBus!.WorkerAckMode);
         Assert.Equal(4, earlyAckConfig.AzureServiceBus.WorkerBackgroundWorkerCount);
         Assert.Equal(256, earlyAckConfig.AzureServiceBus.WorkerBackgroundQueueCapacity);
         Assert.Equal("AckAfterHandlerCompletes", earlyAckConfig.AzureServiceBus.ResponseAckMode);
@@ -68,7 +68,7 @@ public sealed class AzureServiceBusTransportTests(IntegrationFixture fixture) : 
     }
 
     [Fact]
-    public async Task WorkerJob_RoundTripsThroughAzureServiceBus_WithAckAfterReceiveWorkerSubscriber()
+    public async Task WorkerJob_RoundTripsThroughAzureServiceBus_WithAckAfterEnqueueWorkerSubscriber()
     {
         var token = NewId("asb-early-token");
         var trace = NewId("asb-early-trace");

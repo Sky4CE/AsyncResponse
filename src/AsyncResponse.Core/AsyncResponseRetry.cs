@@ -32,11 +32,16 @@ internal static class AsyncResponseRetry
         }
     }
 
-    /// <summary>Computes the retry backoff delay.</summary>
+    /// <summary>Computes the retry backoff delay: exponential with half-jitter.</summary>
     public static TimeSpan Backoff(int completedAttempts, TimeSpan baseDelay, TimeSpan maxDelay)
     {
-        var multiplier = 1 << Math.Min(completedAttempts - 1, 10);
+        var multiplier = 1 << Math.Min(Math.Max(completedAttempts, 1) - 1, 10);
         var milliseconds = Math.Min(maxDelay.TotalMilliseconds, baseDelay.TotalMilliseconds * multiplier);
+
+        // Half-jitter: keep at least half the exponential step so backoff still backs off, and
+        // randomize the rest — a broker blip fails many waiters across many replicas at once, and
+        // un-jittered exponential delays would send them all reconnecting in lockstep waves.
+        milliseconds = milliseconds / 2 + Random.Shared.NextDouble() * (milliseconds / 2);
         return TimeSpan.FromMilliseconds(Math.Max(1, milliseconds));
     }
 }

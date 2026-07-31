@@ -57,7 +57,7 @@ The transport uses one queue table, `asyncresponse_transport_messages`, with a l
 
 Subscribers claim work with `FOR UPDATE SKIP LOCKED`, increment `attempts`, and set a row-local
 `lock_id`/`locked_until`. `AckAfterHandlerCompletes` deletes the row after the handler succeeds and
-releases it for redelivery on failure. `AckAfterReceive` deletes the row after it enters a bounded
+releases it for redelivery on failure. `AckAfterEnqueue` deletes the row after it enters a bounded
 background queue; if the handler later fails, the original row is already acknowledged, so the
 dispatcher writes a dead-letter row and invokes `OnBackgroundFailure`.
 
@@ -97,7 +97,7 @@ builder.Services.AddAsyncResponse()
         options.WorkerQueue = "worker";
         options.ResponseQueue = "response";
         options.DeadLetterQueue = "deadletter";
-        options.WorkerSubscriber.UseAckAfterReceive(4, 256);
+        options.WorkerSubscriber.UseAckAfterEnqueue(4, 256);
     })
     .WithPostgreSqlDurableFlows(options =>
     {

@@ -1,7 +1,7 @@
 #nullable enable
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
-AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
+AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAckMode
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.AddReplyTarget(string! name, string! responseQueue) -> AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions!
 AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions.AutoCreateSchema.get -> bool
@@ -79,7 +79,7 @@ AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.OnBackgroundFail
 AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.PostgreSqlSubscriberOptions() -> void
 AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
 AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.RedeliveryDelay.set -> void
-AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions!
+AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.PostgreSQL.PostgreSqlSubscriberOptions!
 AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport
 AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport.PostgreSqlWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions!>! options, Npgsql.NpgsqlDataSource! dataSource) -> void
 AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!

@@ -55,19 +55,19 @@ internal static class AzureServiceBusOptionsValidator
             case AzureServiceBusAckMode.AckAfterHandlerCompletes:
                 return;
 
-            case AzureServiceBusAckMode.AckAfterReceive:
+            case AzureServiceBusAckMode.AckAfterEnqueue:
                 if (subscriberOptions.BackgroundWorkerCount <= 0)
                 {
                     throw new InvalidOperationException(
                         $"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundWorkerCount)} must be explicitly configured " +
-                        $"when {nameof(AzureServiceBusSubscriberOptions.AckMode)} is {nameof(AzureServiceBusAckMode.AckAfterReceive)}.");
+                        $"when {nameof(AzureServiceBusSubscriberOptions.AckMode)} is {nameof(AzureServiceBusAckMode.AckAfterEnqueue)}.");
                 }
 
                 if (subscriberOptions.BackgroundQueueCapacity <= 0)
                 {
                     throw new InvalidOperationException(
                         $"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundQueueCapacity)} must be explicitly configured " +
-                        $"when {nameof(AzureServiceBusSubscriberOptions.AckMode)} is {nameof(AzureServiceBusAckMode.AckAfterReceive)}.");
+                        $"when {nameof(AzureServiceBusSubscriberOptions.AckMode)} is {nameof(AzureServiceBusAckMode.AckAfterEnqueue)}.");
                 }
 
                 if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
@@ -76,27 +76,14 @@ internal static class AzureServiceBusOptionsValidator
                         $"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
                 }
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    if (hostShutdownTimeout <= TimeSpan.Zero)
-                    {
-                        throw new InvalidOperationException(
-                            $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)} must be positive when set.");
-                    }
-
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)}, " +
-                            "or reduce the Azure Service Bus shutdown/drain timeouts.");
-                    }
-                }
+                // Service Bus spends the background drain plus receiver close / renewal-task join
+                // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
+                ShutdownBudgetValidator.Validate(
+                    "Azure Service Bus",
+                    $"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
+                    ($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(AzureServiceBusAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
 
                 return;
 

@@ -86,13 +86,13 @@ public sealed class PostgreSqlRegistrationTests
             {
                 options.SchemaName = "orders";
                 options.MessageTable = "orders_transport";
-                options.WorkerSubscriber.UseAckAfterReceive(2, 64);
+                options.WorkerSubscriber.UseAckAfterEnqueue(2, 64);
             }));
 
         var options = provider.GetRequiredService<IOptions<PostgreSqlAsyncResponseTransportOptions>>().Value;
         Assert.Equal("orders", options.SchemaName);
         Assert.Equal("orders_transport", options.MessageTable);
-        Assert.Equal(PostgreSqlAckMode.AckAfterReceive, options.WorkerSubscriber.AckMode);
+        Assert.Equal(PostgreSqlAckMode.AckAfterEnqueue, options.WorkerSubscriber.AckMode);
         Assert.Equal(2, options.WorkerSubscriber.BackgroundWorkerCount);
         Assert.Equal(64, options.WorkerSubscriber.BackgroundQueueCapacity);
     }

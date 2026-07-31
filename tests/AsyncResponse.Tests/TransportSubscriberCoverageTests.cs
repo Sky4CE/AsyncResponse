@@ -258,7 +258,7 @@ public sealed class TransportSubscriberCoverageTests
             () => ValueTask.CompletedTask,
             () => ValueTask.CompletedTask,
             (_, _) => ValueTask.CompletedTask,
-            () => ValueTask.CompletedTask);
+            _ => ValueTask.CompletedTask);
 
         var method = typeof(AzureServiceBusMessageDispatcher).GetMethod("NotifyBackgroundFailureAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
         var task = (ValueTask)method.Invoke(dispatcher, [delivery, new Exception("boom"), "queue", AzureServiceBusSubscriberRole.Worker])!;

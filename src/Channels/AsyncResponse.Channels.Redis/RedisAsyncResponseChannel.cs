@@ -157,29 +157,55 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
             try
             {
-                // Delete the recovery state BEFORE unsubscribing. In the reverse order a publish
-                // landing in the window sees "no subscriber, state present" and fires a spurious
-                // recovery callback for a wait that already reached a terminal state. In this
-                // order the window shows a subscriber that drops the message — a late or duplicate
-                // terminal message is droppable; a resurrected recovery callback is not.
-                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
-                if (subscription is not null)
-                    await subscription.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    // Delete the recovery state BEFORE unsubscribing. In the reverse order a publish
+                    // landing in the window sees "no subscriber, state present" and fires a spurious
+                    // recovery callback for a wait that already reached a terminal state. In this
+                    // order the window shows a subscriber that drops the message — a late or duplicate
+                    // terminal message is droppable; a resurrected recovery callback is not.
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Best-effort: the state expires on its own, and a transient store failure must
+                    // not skip the unsubscribe and executor teardown below.
+                    _logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", correlationId);
+                }
+
+                try
+                {
+                    if (subscription is not null)
+                        await subscription.DisposeAsync().ConfigureAwait(false);
+                    _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", channel.ToString()!);
+                }
+            }
+            finally
+            {
+                // Purely local teardown runs no matter which network call above failed — the
+                // cleanup latch is already set, so anything skipped here would leak until process
+                // exit.
                 if (executorRegistered)
                     _executors.OnSubscriptionRetired(channel.ToString()!);
 
                 // Schedule the disposal on the thread pool; do not await directly to prevent
                 // deadlocks with work currently running on the executor.
-                _ = Task.Run(async () => await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false));
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", channel.ToString()!);
+                    }
+                });
 
-                _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", channel.ToString()!);
-            }
-            finally
-            {
                 await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 cancellationTokenSource.Dispose();
                 activity?.Dispose();
@@ -314,9 +340,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         try
         {
-            subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
+            // Register the executor channel BEFORE the server-side SUBSCRIBE completes: the
+            // subscriber attaches its message pump inside SubscribeAsync, so deliveries can start
+            // before it returns, and on a correlation id reused within the tombstone lifetime the
+            // registry would silently drop them as retirement stragglers until this registration
+            // is visible. The subscribe-failure path below retires it again.
             _executors.OnSubscriptionRegistered(channel.ToString()!);
             executorRegistered = true;
+            subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
             var recoveryState = new RecoveryState
             {
                 RegistrationId = registrationId,

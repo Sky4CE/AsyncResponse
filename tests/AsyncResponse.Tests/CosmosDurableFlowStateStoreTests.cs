@@ -314,6 +314,43 @@ public sealed class CosmosDurableFlowStateStoreTests
     }
 
     [Fact]
+    public async Task Store_LeaseWritesRewriteTtlToRemainingLogicalWindow()
+    {
+        using var harness = new CosmosHarness();
+        var state = CreateState("flow");
+        var document = Document(state, DateTime.UtcNow.AddMinutes(10));
+        // The stored ttl still carries the full window stamped at creation. Every replace
+        // refreshes _ts (the server TTL anchor), so a lease write persisting that value unchanged
+        // would restart the whole physical-retention countdown on each heartbeat.
+        document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
+        harness.Reads(document);
+        CosmosFlowStateDocument? replaced = null;
+        harness.ReplacesSuccessfully(written => replaced = written);
+
+        Assert.True(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
+        Assert.NotNull(replaced?.Ttl);
+        Assert.InRange(replaced!.Ttl!.Value, 540, 601); // the ~10 minutes left, never the stored 7200
+
+        // Release replaces too and must realign the same way.
+        document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(10);
+        document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
+        replaced = null;
+        await harness.Store.ReleaseLeaseAsync("flow", "owner");
+        Assert.NotNull(replaced);
+        Assert.Null(replaced!.LeaseId);
+        Assert.InRange(replaced.Ttl!.Value, 540, 601);
+
+        // An already-due ledger collapses to the 1-second floor (Cosmos rejects 0) instead of the
+        // release granting it a fresh retention window.
+        document.LeaseId = "owner";
+        document.ExpiresAtUtc = DateTime.UtcNow.AddMinutes(-5);
+        document.Ttl = (int)TimeSpan.FromHours(2).TotalSeconds;
+        replaced = null;
+        await harness.Store.ReleaseLeaseAsync("flow", "owner");
+        Assert.Equal(1, replaced!.Ttl);
+    }
+
+    [Fact]
     public async Task Store_ProvisioningGateIsSharedAcrossConcurrentCallers()
     {
         var client = new Mock<CosmosClient>();
@@ -452,7 +489,7 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<CancellationToken>()))
                 .ThrowsAsync(CosmosError(statusCode));
 
-        public void ReplacesSuccessfully()
+        public void ReplacesSuccessfully(Action<CosmosFlowStateDocument>? onReplace = null)
             => Container
                 .Setup(item => item.ReplaceItemAsync(
                     It.IsAny<CosmosFlowStateDocument>(),
@@ -460,6 +497,8 @@ public sealed class CosmosDurableFlowStateStoreTests
                     It.IsAny<PartitionKey?>(),
                     It.IsAny<ItemRequestOptions>(),
                     It.IsAny<CancellationToken>()))
+                .Callback<CosmosFlowStateDocument, string, PartitionKey?, ItemRequestOptions, CancellationToken>(
+                    (document, _, _, _, _) => onReplace?.Invoke(document))
                 .ReturnsAsync(Mock.Of<ItemResponse<CosmosFlowStateDocument>>());
 
         public void Dispose() => Store.Dispose();

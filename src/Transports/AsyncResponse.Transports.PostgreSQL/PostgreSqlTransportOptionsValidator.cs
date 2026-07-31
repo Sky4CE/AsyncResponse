@@ -50,27 +50,17 @@ internal static class PostgreSqlTransportOptionsValidator
     {
         ValidateSubscriber(subscriber, role);
 
-        if (subscriber.AckMode is not PostgreSqlAckMode.AckAfterReceive)
+        if (subscriber.AckMode is not PostgreSqlAckMode.AckAfterEnqueue)
             return;
 
-        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-        {
-            if (hostShutdownTimeout <= TimeSpan.Zero)
-                throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
-
-            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
-            if (requiredShutdownBudget > hostShutdownTimeout)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
-                    $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
-                    $"requires {requiredShutdownBudget}, which exceeds " +
-                    $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
-                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                    $"and mirror that value in {nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
-                    "or reduce the PostgreSQL shutdown/drain timeouts.");
-            }
-        }
+        // PostgreSQL spends the background drain plus the LISTEN-task join (ShutdownTimeout)
+        // at shutdown; both must fit inside the host budget or ACKed work is truncated.
+        ShutdownBudgetValidator.Validate(
+            "PostgreSQL",
+            $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+            transportOptions.HostShutdownTimeout,
+            ($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout),
+            ($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
     }
 
     public static void ValidateSubscriber(PostgreSqlSubscriberOptions subscriber, string role)
@@ -87,11 +77,11 @@ internal static class PostgreSqlTransportOptionsValidator
         {
             case PostgreSqlAckMode.AckAfterHandlerCompletes:
                 return;
-            case PostgreSqlAckMode.AckAfterReceive:
+            case PostgreSqlAckMode.AckAfterEnqueue:
                 if (subscriber.BackgroundWorkerCount <= 0)
-                    throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterReceive.");
+                    throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
-                    throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterReceive.");
+                    throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
                 Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
             default:

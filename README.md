@@ -391,7 +391,7 @@ builder.Services.AddAsyncResponse()
 ```
 
 Need more throughput than ack-per-handler? Opt into early ACK with
-`options.WorkerSubscriber.UseAckAfterReceive(backgroundWorkerCount: 4, backgroundQueueCapacity: 256)`
+`options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 4, backgroundQueueCapacity: 256)`
 — messages are completed after bounded enqueue and processed by background workers, with failures
 reported through `OnBackgroundFailure`.
 
@@ -440,7 +440,7 @@ builder.Services.AddAsyncResponse()
     .WithPostgreSqlTransport(options =>
     {
         options.SchemaName = "public";
-        options.WorkerSubscriber.UseAckAfterReceive(
+        options.WorkerSubscriber.UseAckAfterEnqueue(
             backgroundWorkerCount: 4,
             backgroundQueueCapacity: 256);
     })

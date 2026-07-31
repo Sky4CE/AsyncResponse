@@ -56,10 +56,12 @@ internal static class ReflectionExtensions
             // 1b) Opt-in authorization: when an IAsyncResponseCallbackAuthorizer is registered, only
             // allowed (service, method) pairs may be invoked — defense-in-depth even if the recovery
             // store or worker transport is compromised. No authorizer registered ⇒ allow all. The
-            // built-in flow executor is implicitly allowed: durable flows register it as their
-            // resume/failure target, and its methods accept only a flow id (and an exception).
-            if (dto.ServiceInterfaceFullName != typeof(IDurableFlowExecutor).FullName
-                && provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
+            // built-in flow executor gets no exemption: RecoverAsync carries an attacker-choosable
+            // payload that is checkpointed into the flow ledger, so under the stated threat model it
+            // must be gated like every other target. The AuthorizeCallbacks allowlist includes it by
+            // default (see AsyncResponseCallbackAllowList.AllowDurableFlowExecutor); custom
+            // authorizers must allow it explicitly when durable flows are enabled.
+            if (provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
                 && !authorizer.IsAllowed(dto.ServiceInterfaceFullName, dto.MethodName))
             {
                 throw new InvalidOperationException(

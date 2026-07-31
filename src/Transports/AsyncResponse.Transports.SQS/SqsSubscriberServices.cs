@@ -128,7 +128,7 @@ internal abstract class SqsSubscriberService : BackgroundService
         // (still unprocessed) messages lapse and a competing consumer processes them a second time.
         // While the batch is in flight, a heartbeat resets every unsettled message's invisibility to
         // the configured visibility timeout.
-        var progress = new BatchProgress();
+        var progress = new BatchProgress(deliveries.Count);
         using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var renewalTask = RenewVisibilityLoopAsync(
             deliveries,
@@ -139,11 +139,26 @@ internal abstract class SqsSubscriberService : BackgroundService
             renewalCancellation.Token);
         try
         {
-            foreach (var delivery in deliveries)
+            for (var index = 0; index < deliveries.Count; index++)
             {
+                var delivery = deliveries[index];
+                var batchIndex = index;
+                // The dispatcher's failure path shortens visibility to RedeliveryDelay while the
+                // heartbeat still counts the message as unsettled (MarkSettled runs only after
+                // HandleAsync returns). Routing the dispatcher's visibility changes through a
+                // suppression mark — set before the change itself — keeps a racing heartbeat from
+                // stretching that fast retry back out to the full visibility timeout.
+                var tracked = delivery with
+                {
+                    ChangeVisibilityAsync = timeout =>
+                    {
+                        progress.SuppressRenewal(batchIndex);
+                        return delivery.ChangeVisibilityAsync(timeout);
+                    }
+                };
                 try
                 {
-                    await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+                    await dispatcher.HandleAsync(tracked, stoppingToken).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -173,10 +188,19 @@ internal abstract class SqsSubscriberService : BackgroundService
                 await Task.Delay(renewalInterval, cancellationToken).ConfigureAwait(false);
 
                 // Renew from the first unsettled message onward: that covers the message currently in
-                // the handler plus everything still waiting its turn. A renewal racing a just-settled
-                // message merely fails and is logged; SQS redelivery keeps at-least-once intact.
+                // the handler plus everything still waiting its turn. Two settle paths race this
+                // sweep, and only one of them is harmless. A handled message was deleted, so a late
+                // renewal merely fails and is logged — SQS redelivery keeps at-least-once intact. A
+                // failed message was NOT deleted (its receipt handle stays live) and already carries
+                // the failure path's shortened RedeliveryDelay, so a late renewal here would SUCCEED
+                // and stretch that fast retry back out to the full visibility timeout — the
+                // suppression mark and the per-message re-read of the settled prefix keep the sweep
+                // away from it.
                 for (var i = progress.SettledCount; i < deliveries.Count; i++)
                 {
+                    if (i < progress.SettledCount || progress.IsRenewalSuppressed(i))
+                        continue;
+
                     var delivery = deliveries[i];
                     try
                     {
@@ -201,11 +225,22 @@ internal abstract class SqsSubscriberService : BackgroundService
 
     private sealed class BatchProgress
     {
+        // One slot per batch message. Settled and suppressed only ever transition false→true, so
+        // monotonic volatile writes/reads are enough — no lock, and a stale read only delays a
+        // skip by one sweep pass.
+        private readonly bool[] _renewalSuppressed;
         private int _settledCount;
+
+        public BatchProgress(int batchSize) => _renewalSuppressed = new bool[batchSize];
 
         public int SettledCount => Volatile.Read(ref _settledCount);
 
         public void MarkSettled() => Interlocked.Increment(ref _settledCount);
+
+        /// <summary>Marks the message at <paramref name="index"/> as owning its own visibility; the renewal sweep must leave it alone.</summary>
+        public void SuppressRenewal(int index) => Volatile.Write(ref _renewalSuppressed[index], true);
+
+        public bool IsRenewalSuppressed(int index) => Volatile.Read(ref _renewalSuppressed[index]);
     }
 }
 

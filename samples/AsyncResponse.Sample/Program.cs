@@ -1029,7 +1029,7 @@ static void ConfigureAzureServiceBusSubscriber(
         return;
     }
 
-    if (mode is not AzureServiceBusAckMode.AckAfterReceive)
+    if (mode is not AzureServiceBusAckMode.AckAfterEnqueue)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -1044,7 +1044,7 @@ static void ConfigureAzureServiceBusSubscriber(
         drainTimeout = TimeSpan.FromSeconds(seconds);
     }
 
-    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigureSqsSubscriber(
@@ -1281,7 +1281,7 @@ static void ConfigureNatsSubscriber(
         return;
     }
 
-    if (mode is not NatsAckMode.AckAfterReceive)
+    if (mode is not NatsAckMode.AckAfterEnqueue)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -1296,7 +1296,7 @@ static void ConfigureNatsSubscriber(
         drainTimeout = TimeSpan.FromSeconds(seconds);
     }
 
-    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigureSqlServerSubscriber(
@@ -1367,7 +1367,7 @@ static void ConfigurePostgreSqlSubscriber(
         return;
     }
 
-    if (mode is not PostgreSqlAckMode.AckAfterReceive)
+    if (mode is not PostgreSqlAckMode.AckAfterEnqueue)
         throw new InvalidOperationException($"{prefix}:AckMode has unsupported value '{rawMode}'.");
 
     var workerCount = ReadRequiredPositiveInt(configuration, $"{prefix}:BackgroundWorkerCount");
@@ -1382,7 +1382,7 @@ static void ConfigurePostgreSqlSubscriber(
         drainTimeout = TimeSpan.FromSeconds(seconds);
     }
 
-    subscriberOptions.UseAckAfterReceive(workerCount, queueCapacity, drainTimeout);
+    subscriberOptions.UseAckAfterEnqueue(workerCount, queueCapacity, drainTimeout);
 }
 
 static void ConfigureMongoDbSubscriber(

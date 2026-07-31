@@ -118,8 +118,12 @@ public sealed class RabbitMqAsyncResponseOptions
         "DagJsonParameters.CorrelationId"
     ];
 
-    /// <summary>How long hosted consumers/publishers are allowed to shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// Bounds the connection close while hosted consumers/publishers stop. The close completes in
+    /// milliseconds when healthy; when it does not, the connection is abandoned anyway, so keep
+    /// this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// The hosting shutdown budget that must contain RabbitMQ channel shutdown plus

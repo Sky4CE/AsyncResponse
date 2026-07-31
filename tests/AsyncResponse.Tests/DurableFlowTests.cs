@@ -528,13 +528,15 @@ public class DurableFlowTests
     }
 
     [Fact]
-    public async Task FlowExecutorCallbacks_AreImplicitlyAuthorized_EvenWithDenyAllAllowlist()
+    public async Task FlowExecutorCallbacks_AreAuthorizedByDefault_WithAnOtherwiseEmptyAllowlist()
     {
-        await using var provider = CreateProvider(services => services.AddSingleton<IAsyncResponseCallbackAuthorizer>(
-            new DenyAllAuthorizer()));
+        // The allowlist admits the executor by default (AllowDurableFlowExecutor = true), so users
+        // never have to allowlist a library-internal type to keep flow recovery working. A CUSTOM
+        // authorizer gets no such implicit entry — that contract is pinned in
+        // CallbackAuthorizationTests.CustomAuthorizer_GatesDurableFlowExecutorTargets.
+        await using var provider = CreateProvider(services => services.AddSingleton(
+            new AsyncResponseCallbackAllowList().Build()));
 
-        // The executor's methods are the durable resume/failure targets behind every flow — they
-        // must work without users having to allowlist a library-internal type.
         Expression<Func<IDurableFlowExecutor, Task>> resume = executor => executor.ResumeAsync("missing-flow");
         var dto = CallbackExpressionConverter.ToReflectionCall(resume);
         var invocation = ReflectionExtensions.ResolveCallback(dto, payload: null, exception: null, correlationId: "missing-flow");
@@ -545,11 +547,6 @@ public class DurableFlowTests
         var otherDto = CallbackExpressionConverter.ToReflectionCall(other);
         var otherInvocation = ReflectionExtensions.ResolveCallback(otherDto, payload: null, exception: null, correlationId: "x");
         await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(otherInvocation));
-    }
-
-    private sealed class DenyAllAuthorizer : IAsyncResponseCallbackAuthorizer
-    {
-        public bool IsAllowed(string serviceInterfaceFullName, string methodName) => false;
     }
 
     private sealed class ScopedStoreDependency;

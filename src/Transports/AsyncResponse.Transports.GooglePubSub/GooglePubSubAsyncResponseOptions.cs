@@ -75,8 +75,12 @@ public sealed class GooglePubSubAsyncResponseOptions
     /// <summary>Maximum delay between restarts of a repeatedly failing hosted subscriber.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers/publishers are allowed to shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// Bounds the subscriber-client stop and publisher shutdown while hosted services stop. These
+    /// complete in milliseconds when healthy; when they do not, the client is abandoned anyway, so
+    /// keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// The hosting shutdown budget that must contain Pub/Sub client shutdown plus

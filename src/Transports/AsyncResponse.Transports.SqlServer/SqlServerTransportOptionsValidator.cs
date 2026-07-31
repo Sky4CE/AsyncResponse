@@ -32,7 +32,6 @@ internal static class SqlServerTransportOptionsValidator
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
         Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
         Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
 
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
@@ -53,24 +52,13 @@ internal static class SqlServerTransportOptionsValidator
         if (subscriber.AckMode is not SqlServerAckMode.AckAfterEnqueue)
             return;
 
-        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-        {
-            if (hostShutdownTimeout <= TimeSpan.Zero)
-                throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
-
-            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
-            if (requiredShutdownBudget > hostShutdownTimeout)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
-                    $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
-                    $"requires {requiredShutdownBudget}, which exceeds " +
-                    $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
-                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                    $"and mirror that value in {nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
-                    "or reduce the SQL Server shutdown/drain timeouts.");
-            }
-        }
+        // SQL Server subscribers spend only the background drain at shutdown; the polling loop
+        // stops with the host token and holds no connection that needs a bounded close.
+        ShutdownBudgetValidator.Validate(
+            "SQL Server",
+            $"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+            transportOptions.HostShutdownTimeout,
+            ($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout));
     }
 
     public static void ValidateSubscriber(SqlServerSubscriberOptions subscriber, string role)

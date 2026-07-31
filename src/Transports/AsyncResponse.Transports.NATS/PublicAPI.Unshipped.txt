@@ -1,7 +1,7 @@
 #nullable enable
 AsyncResponse.Transports.NATS.NatsAckMode
 AsyncResponse.Transports.NATS.NatsAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.NATS.NatsAckMode
-AsyncResponse.Transports.NATS.NatsAckMode.AckAfterReceive = 1 -> AsyncResponse.Transports.NATS.NatsAckMode
+AsyncResponse.Transports.NATS.NatsAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.NATS.NatsAckMode
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.AckWait.get -> System.TimeSpan
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.AckWait.set -> void
@@ -39,8 +39,6 @@ AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseStream.s
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubject.get -> string?
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubject.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
-AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
-AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.ShutdownTimeout.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.get -> long?
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.StreamMaxMessages.set -> void
 AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions.SubjectPrefix.get -> string!
@@ -88,7 +86,7 @@ AsyncResponse.Transports.NATS.NatsSubscriberOptions.OnBackgroundFailure.get -> S
 AsyncResponse.Transports.NATS.NatsSubscriberOptions.OnBackgroundFailure.set -> void
 AsyncResponse.Transports.NATS.NatsSubscriberOptions.RedeliveryDelay.get -> System.TimeSpan
 AsyncResponse.Transports.NATS.NatsSubscriberOptions.RedeliveryDelay.set -> void
-AsyncResponse.Transports.NATS.NatsSubscriberOptions.UseAckAfterReceive(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
+AsyncResponse.Transports.NATS.NatsSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.NATS.NatsSubscriberOptions!
 AsyncResponse.Transports.NATS.NatsWorkerTransport
 AsyncResponse.Transports.NATS.NatsWorkerTransport.NatsWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions!>! options, NATS.Client.Core.INatsConnection! connection) -> void
 AsyncResponse.Transports.NATS.NatsWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!

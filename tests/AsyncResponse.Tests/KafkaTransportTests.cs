@@ -398,7 +398,6 @@ public class KafkaTransportTests
             { options => options.PublishRetryBaseDelay = TimeSpan.Zero, nameof(KafkaAsyncResponseTransportOptions.PublishRetryBaseDelay) },
             { options => options.PublishRetryBaseDelay = TimeSpan.FromSeconds(5), nameof(KafkaAsyncResponseTransportOptions.PublishRetryBaseDelay) },
             { options => options.SubscriberRetryBaseDelay = TimeSpan.FromSeconds(30), nameof(KafkaAsyncResponseTransportOptions.SubscriberRetryBaseDelay) },
-            { options => options.ShutdownTimeout = TimeSpan.Zero, nameof(KafkaAsyncResponseTransportOptions.ShutdownTimeout) },
             { options => options.TopicNumPartitions = 0, nameof(KafkaAsyncResponseTransportOptions.TopicNumPartitions) },
             { options => options.TopicNumPartitions = -2, nameof(KafkaAsyncResponseTransportOptions.TopicNumPartitions) },
             { options => options.TopicReplicationFactor = 0, nameof(KafkaAsyncResponseTransportOptions.TopicReplicationFactor) },

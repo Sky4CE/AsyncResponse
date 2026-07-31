@@ -144,7 +144,22 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         finally
         {
             renewalCancellation.Cancel();
-            await renewalTask.ConfigureAwait(false);
+            try
+            {
+                // Cancellation exits the sweep between messages and interrupts the in-flight renew
+                // call, so this normally completes immediately. The bound is the hard backstop: an
+                // unbounded await here would let a degraded namespace hold the receive loop (and, at
+                // shutdown, the whole host budget) hostage for the SDK retry budget per message.
+                await renewalTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                Logger.LogWarning(
+                    "Azure Service Bus lock renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
+                    queue,
+                    SubscriberRole,
+                    Options.ShutdownTimeout);
+            }
         }
     }
 
@@ -166,10 +181,20 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
                 // message merely fails and is logged; redelivery keeps at-least-once intact.
                 for (var i = progress.SettledCount; i < messages.Count; i++)
                 {
+                    // The batch finished or the subscriber is stopping: exit quietly between messages
+                    // instead of spending up to a full SDK retry budget on each remaining renew.
+                    if (cancellationToken.IsCancellationRequested)
+                        return;
+
                     var message = messages[i];
                     try
                     {
-                        await message.RenewLockAsync().ConfigureAwait(false);
+                        await message.RenewLockAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        // Our token interrupted the in-flight renew; not a renewal failure.
+                        return;
                     }
                     catch (Exception ex)
                     {

@@ -196,7 +196,9 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     public int FlushCount;
 
     private FakeSubscription? _subscription;
+    private int _subscriptionDisposeCount;
     public bool HasSubscription => _subscription is not null;
+    public int SubscriptionDisposeCount => Volatile.Read(ref _subscriptionDisposeCount);
 
     public Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -217,7 +219,7 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     public Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
     {
         SubscribedSubjects.Add(subject);
-        _subscription = new FakeSubscription();
+        _subscription = new FakeSubscription(this);
         return Task.FromResult<INatsChannelSubscription>(_subscription);
     }
 
@@ -237,7 +239,7 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     /// <summary>Faults the live subscription's read loop with <paramref name="exception"/>.</summary>
     public void FailSubscription(Exception exception) => _subscription!.Fail(exception);
 
-    private sealed class FakeSubscription : INatsChannelSubscription
+    private sealed class FakeSubscription(FakeNatsResponseChannelClient owner) : INatsChannelSubscription
     {
         private readonly Channel<NatsInboundResponse> _channel = Channel.CreateUnbounded<NatsInboundResponse>();
 
@@ -253,6 +255,7 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 
         public ValueTask DisposeAsync()
         {
+            Interlocked.Increment(ref owner._subscriptionDisposeCount);
             _channel.Writer.TryComplete();
             return ValueTask.CompletedTask;
         }

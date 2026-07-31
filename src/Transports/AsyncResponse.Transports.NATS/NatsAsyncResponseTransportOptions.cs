@@ -120,13 +120,10 @@ public sealed class NatsAsyncResponseTransportOptions
     /// <summary>Maximum delay after repeated subscriber consume-loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
-
     /// <summary>
-    /// The hosting shutdown budget that must contain NATS subscriber shutdown plus
+    /// The hosting shutdown budget that must contain
     /// <see cref="NatsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="NatsAckMode.AckAfterReceive"/>. Defaults to the Generic Host default of
+    /// <see cref="NatsAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
     /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);

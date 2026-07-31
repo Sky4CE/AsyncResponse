@@ -151,21 +151,13 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
                 if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
                     throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)}, " +
-                            "or reduce the Redis shutdown/drain timeouts.");
-                    }
-                }
+                // Redis subscribers spend only the background drain at shutdown; the read loop
+                // stops with the host token and the multiplexer teardown is not separately bounded.
+                ShutdownBudgetValidator.Validate(
+                    "Redis",
+                    $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
 
                 return;
 

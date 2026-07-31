@@ -27,7 +27,7 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
 
         Assert.Equal("PostgreSQL", earlyAckConfig.Channel);
         Assert.Equal("PostgreSQL", earlyAckConfig.Transport);
-        Assert.Equal("AckAfterReceive", earlyAckConfig.Postgres!.WorkerAckMode);
+        Assert.Equal("AckAfterEnqueue", earlyAckConfig.Postgres!.WorkerAckMode);
         Assert.Equal(4, earlyAckConfig.Postgres.WorkerBackgroundWorkerCount);
         Assert.Equal(256, earlyAckConfig.Postgres.WorkerBackgroundQueueCapacity);
         Assert.Equal("AckAfterHandlerCompletes", earlyAckConfig.Postgres.ResponseAckMode);
@@ -84,7 +84,7 @@ public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : Int
     }
 
     [Fact]
-    public async Task WorkerJob_RoundTripsThroughPostgreSql_WithAckAfterReceiveWorkerSubscriber()
+    public async Task WorkerJob_RoundTripsThroughPostgreSql_WithAckAfterEnqueueWorkerSubscriber()
     {
         var token = NewId("postgres-early-token");
         var trace = NewId("postgres-early-trace");

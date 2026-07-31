@@ -39,7 +39,7 @@ public class AzureServiceBusAckDispatchBenchmarks
         _queued = AzureServiceBusMessageDispatcher.Create(
             (_, _) => Task.CompletedTask,
             options,
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: BackgroundWorkers,
                 backgroundQueueCapacity: 16_384,
                 backgroundDrainTimeout: TimeSpan.FromSeconds(30)),
@@ -60,7 +60,7 @@ public class AzureServiceBusAckDispatchBenchmarks
         => _awaiting.HandleAsync(Delivery(), CancellationToken.None);
 
     [Benchmark]
-    public Task AckAfterReceive_Callback()
+    public Task AckAfterEnqueue_Callback()
         => _queued.HandleAsync(Delivery(), CancellationToken.None);
 
     private static AzureServiceBusTransportDelivery Delivery()
@@ -75,5 +75,5 @@ public class AzureServiceBusAckDispatchBenchmarks
             () => ValueTask.CompletedTask,
             () => ValueTask.CompletedTask,
             (_, _) => ValueTask.CompletedTask,
-            () => ValueTask.CompletedTask);
+            _ => ValueTask.CompletedTask);
 }

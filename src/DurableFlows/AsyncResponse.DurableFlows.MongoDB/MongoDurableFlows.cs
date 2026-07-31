@@ -90,6 +90,7 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
 /// <summary>MongoDB implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 {
+    private readonly IMongoDatabase _database;
     private readonly IMongoCollection<MongoFlowStateDocument> _collection;
     private readonly MongoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -100,6 +101,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     {
         _options = options.Value;
         _options.Validate();
+        _database = database;
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
         _ownedClient = ownedClient;
     }
@@ -142,10 +144,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             return true;
 
         // Step 2: the id was absent (or the expired document was TTL-purged after step 1 looked):
-        // insert a fresh ledger. The initial timestamps are assignment-only app-clock stamps (no
-        // comparison happens on them here); every later expiry/lease decision and refresh runs on
-        // the server clock. A duplicate key means a live ledger owns the id.
-        var now = DateTime.UtcNow;
+        // insert a fresh ledger. A plain insert has no aggregation context, so $$NOW is
+        // unavailable — instead the server clock is read with one cheap `hello` round-trip and
+        // stamped client-side. Creation then uses the same authority as every $$NOW comparison
+        // and refresh below, so app clock skew can never mint a ledger that is born expired or
+        // outlives its TTL window. A duplicate key means a live ledger owns the id.
+        var serverNow = await ReadServerNowAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             await _collection.InsertOneAsync(
@@ -153,8 +157,8 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
                 {
                     FlowId = flowId,
                     StateJson = stateJson,
-                    ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, ttl),
-                    UpdatedAtUtc = now,
+                    ExpiresAtUtc = DurableFlowStoreShared.AddSaturating(serverNow, ttl),
+                    UpdatedAtUtc = serverNow,
                     Revision = state.Revision
                 },
                 options: null,
@@ -244,6 +248,26 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         {
             _ensureGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Server clock for the one write that cannot compute it in place: plain inserts evaluate no
+    /// pipeline, so <c>$$NOW</c> is out of reach. <c>hello</c> is answered by every supported
+    /// server (the 4.2+ floor the <c>$$NOW</c> filters already require) and carries the node's
+    /// <c>localTime</c>; reading it from the primary keeps the authority the same node whose
+    /// <c>$$NOW</c> the filters evaluate against.
+    /// </summary>
+    private async Task<DateTime> ReadServerNowAsync(CancellationToken cancellationToken)
+    {
+        var reply = await _database.RunCommandAsync<BsonDocument>(
+            new BsonDocument("hello", 1),
+            ReadPreference.Primary,
+            cancellationToken).ConfigureAwait(false);
+        // Defensive: a mongo-compatible endpoint omitting localTime falls back to the app clock —
+        // the pre-server-clock behavior — instead of failing every create.
+        return reply.TryGetValue("localTime", out var localTime)
+            ? localTime.ToUniversalTime()
+            : DateTime.UtcNow;
     }
 
     private async Task<bool> UpdateLeaseAsync(

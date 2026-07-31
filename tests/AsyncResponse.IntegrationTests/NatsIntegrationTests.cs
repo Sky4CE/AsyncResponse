@@ -26,7 +26,7 @@ public sealed class NatsIntegrationTests(IntegrationFixture fixture) : Integrati
         Assert.EndsWith(".transport.response", defaultConfig.Nats.ResponseSubject, StringComparison.Ordinal);
 
         Assert.Equal("NATS", earlyAckConfig.Channel);
-        Assert.Equal("AckAfterReceive", earlyAckConfig.Nats!.WorkerAckMode);
+        Assert.Equal("AckAfterEnqueue", earlyAckConfig.Nats!.WorkerAckMode);
         Assert.Equal(4, earlyAckConfig.Nats.WorkerBackgroundWorkerCount);
         Assert.Equal(256, earlyAckConfig.Nats.WorkerBackgroundQueueCapacity);
         Assert.Equal("AckAfterHandlerCompletes", earlyAckConfig.Nats.ResponseAckMode);
@@ -49,7 +49,7 @@ public sealed class NatsIntegrationTests(IntegrationFixture fixture) : Integrati
     }
 
     [Fact]
-    public async Task WorkerJob_RoundTripsThroughNats_WithAckAfterReceiveWorkerSubscriber()
+    public async Task WorkerJob_RoundTripsThroughNats_WithAckAfterEnqueueWorkerSubscriber()
     {
         var token = NewId("nats-early-token");
         var trace = NewId("nats-early-trace");

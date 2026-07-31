@@ -75,4 +75,80 @@ public sealed class InMemoryWorkerTransportDrainTests
         Assert.Equal(jobCount, probe.Executed);
         await provider.DisposeAsync();
     }
+
+    public interface IChainProbe
+    {
+        Task RunAsync();
+    }
+
+    private sealed class ChainProbe : IChainProbe
+    {
+        private int _executed;
+
+        public InMemoryWorkerTransport? Transport { get; set; }
+        public int Executed => Volatile.Read(ref _executed);
+        public TaskCompletionSource FirstStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirst { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task RunAsync()
+        {
+            if (Interlocked.Increment(ref _executed) > 1)
+                return;
+
+            FirstStarted.TrySetResult();
+            await ReleaseFirst.Task;
+
+            // Published while the host is already stopping: exactly what a durable-flow child does
+            // when it wakes its parent, or a recovery path does when it re-enqueues a run.
+            await Transport!.PublishAsync(new WorkerJobEnvelope
+            {
+                Call = new ReflectionCallDto
+                {
+                    ServiceInterfaceFullName = typeof(IChainProbe).FullName!,
+                    MethodName = nameof(IChainProbe.RunAsync),
+                    Params = []
+                },
+                CorrelationId = "chain-follow-up"
+            });
+        }
+    }
+
+    [Fact]
+    public async Task StopAsync_JobEnqueuedDuringDrain_StillExecutes()
+    {
+        var probe = new ChainProbe();
+        var provider = new ServiceCollection()
+            .AddSingleton<IChainProbe>(probe)
+            .BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        probe.Transport = transport;
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        await host.StartAsync(CancellationToken.None);
+
+        await transport.PublishAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IChainProbe).FullName!,
+                MethodName = nameof(IChainProbe.RunAsync),
+                Params = []
+            },
+            CorrelationId = "chain-first"
+        });
+
+        // Begin stopping while the first job runs, then let it publish its follow-up mid-drain.
+        // Completing the writer at stop-begin made this publish throw ChannelClosedException and
+        // silently lose the follow-up (a stuck parent flow, in durable-flow terms).
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stop = host.StopAsync(CancellationToken.None);
+        probe.ReleaseFirst.TrySetResult();
+        await stop.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(2, probe.Executed);
+        await provider.DisposeAsync();
+    }
 }

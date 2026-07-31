@@ -163,6 +163,18 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (5s ShutdownTimeout + 20s BackgroundDrainTimeout vs HostShutdownTimeout 30s)
+        // must not fail startup.
+        RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            RabbitMqSubscriberRole.Worker);
+    }
+
+    [Fact]
     public void ValidateOptions_UnsupportedAckMode_Throws()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>

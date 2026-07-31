@@ -104,7 +104,7 @@ public sealed class SqsSubscriberOptions
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while stopping.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// Optional callback invoked when a background handler fails after the message was already

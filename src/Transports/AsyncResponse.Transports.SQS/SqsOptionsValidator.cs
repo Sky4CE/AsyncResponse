@@ -51,7 +51,6 @@ internal static class SqsOptionsValidator
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
         Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
         Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
 
         if (options.PublishRetryBaseDelay > options.PublishRetryMaxDelay)
             throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{nameof(options.PublishRetryBaseDelay)} cannot exceed {nameof(options.PublishRetryMaxDelay)}.");
@@ -131,27 +130,13 @@ internal static class SqsOptionsValidator
                         $"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
                 }
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    if (hostShutdownTimeout <= TimeSpan.Zero)
-                    {
-                        throw new InvalidOperationException(
-                            $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)} must be positive when set.");
-                    }
-
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)}, " +
-                            "or reduce the SQS shutdown/drain timeouts.");
-                    }
-                }
+                // SQS subscribers spend only the background drain at shutdown; the receive loop
+                // stops with the host token and the SDK client needs no bounded close.
+                ShutdownBudgetValidator.Validate(
+                    "SQS",
+                    $"{nameof(SqsAsyncResponseOptions)}.{nameof(SqsAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
 
                 return;
 

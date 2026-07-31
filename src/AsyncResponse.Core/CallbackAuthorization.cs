@@ -12,6 +12,17 @@ public sealed class AsyncResponseCallbackAllowList
     private readonly HashSet<string> _allowedTypes = new(StringComparer.Ordinal);
     private readonly List<Func<string, string, bool>> _predicates = [];
 
+    /// <summary>
+    /// Whether the built-in <see cref="IDurableFlowExecutor"/> is allowed as a callback target.
+    /// Defaults to <c>true</c>: durable flows persist its methods as their resume/recover/fail
+    /// targets, and rejecting them would break flow recovery. Note the security trade-off — an
+    /// attacker with write access to the recovery store or worker transport can then invoke
+    /// flow-executor methods (bounded to flow ids, terminal failure, and checkpointing a payload
+    /// into a flow's ledger; see docs/security.md). Hosts that do not use durable flows, or that
+    /// accept re-registering the executor themselves, can set this to <c>false</c>.
+    /// </summary>
+    public bool AllowDurableFlowExecutor { get; set; } = true;
+
     /// <summary>Allows every callback method on the given service type.</summary>
     public AsyncResponseCallbackAllowList Allow(Type serviceType)
     {
@@ -41,7 +52,14 @@ public sealed class AsyncResponseCallbackAllowList
     }
 
     internal IAsyncResponseCallbackAuthorizer Build()
-        => new AllowListAuthorizer(_allowedTypes, _predicates);
+    {
+        // Materialized at build time (not special-cased in IsAllowed) so the executor shows up in
+        // the same allowlist mechanism as every other target and stays overridable by config.
+        if (AllowDurableFlowExecutor && typeof(IDurableFlowExecutor).FullName is { } executorName)
+            _allowedTypes.Add(executorName);
+
+        return new AllowListAuthorizer(_allowedTypes, _predicates);
+    }
 
     private sealed class AllowListAuthorizer(HashSet<string> allowedTypes, List<Func<string, string, bool>> predicates)
         : IAsyncResponseCallbackAuthorizer
@@ -84,7 +102,12 @@ public static class AsyncResponseCallbackAuthorizationExtensions
         return builder;
     }
 
-    /// <summary>Registers a custom <see cref="IAsyncResponseCallbackAuthorizer"/>.</summary>
+    /// <summary>
+    /// Registers a custom <see cref="IAsyncResponseCallbackAuthorizer"/>. Unlike the allowlist
+    /// overload, nothing is allowed implicitly: when durable flows are enabled the authorizer must
+    /// allow <see cref="IDurableFlowExecutor"/>, whose methods are persisted as every flow's
+    /// resume/recover/fail targets — rejecting them breaks flow recovery.
+    /// </summary>
     public static AsyncResponseRegistrationBuilder AuthorizeCallbacks(
         this AsyncResponseRegistrationBuilder builder,
         IAsyncResponseCallbackAuthorizer authorizer)

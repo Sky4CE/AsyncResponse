@@ -16,7 +16,7 @@ internal enum NatsSubscriberRole
 /// <item><description><see cref="NatsAckMode.AckAfterHandlerCompletes"/>: run the handler, then ACK;
 /// on failure NAK for redelivery until <see cref="NatsSubscriberOptions.MaxDeliveryAttempts"/>, then
 /// dead-letter and terminate.</description></item>
-/// <item><description><see cref="NatsAckMode.AckAfterReceive"/>: enqueue to a bounded background
+/// <item><description><see cref="NatsAckMode.AckAfterEnqueue"/>: enqueue to a bounded background
 /// queue and ACK immediately; background handler failures are dead-lettered and reported.</description></item>
 /// </list>
 /// </summary>
@@ -57,7 +57,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         _role = role;
         _consumer = consumer;
 
-        if (subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
+        if (subscriberOptions.AckMode is NatsAckMode.AckAfterEnqueue)
         {
             _backgroundQueue = Channel.CreateBounded<NatsJobDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
             {
@@ -75,7 +75,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
-        if (_subscriberOptions.AckMode is NatsAckMode.AckAfterReceive)
+        if (_subscriberOptions.AckMode is NatsAckMode.AckAfterEnqueue)
         {
             await HandleEarlyAckAsync(delivery, cancellationToken).ConfigureAwait(false);
             return;

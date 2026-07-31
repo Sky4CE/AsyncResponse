@@ -222,7 +222,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
     private int _runningCount;
     private int _disposeStarted;
 
-    /// <summary>Creates an ACK-after-receive dispatcher with a bounded background queue.</summary>
+    /// <summary>Creates an ACK-after-enqueue dispatcher with a bounded background queue.</summary>
     public QueuedAzureServiceBusMessageDispatcher(
         Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
         AzureServiceBusAsyncResponseOptions transportOptions,
@@ -249,7 +249,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
             .ToArray();
 
         Logger.LogInformation(
-            "Created Azure Service Bus ACK-after-receive dispatcher for {Queue} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
+            "Created Azure Service Bus ACK-after-enqueue dispatcher for {Queue} with {WorkerCount} worker(s), queue capacity {QueueCapacity}, drain timeout {DrainTimeout}.",
             _queueName,
             subscriberOptions.BackgroundWorkerCount,
             subscriberOptions.BackgroundQueueCapacity,
@@ -321,7 +321,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
             return;
 
         Logger.LogInformation(
-            "Draining Azure Service Bus ACK-after-receive dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}.",
+            "Draining Azure Service Bus ACK-after-enqueue dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}.",
             _queueName,
             PendingCount,
             RunningCount);
@@ -337,7 +337,7 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
             _drainCancellation.Cancel();
             Logger.LogWarning(
                 ex,
-                "Timed out while draining Azure Service Bus ACK-after-receive dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}. Already-completed work may be interrupted by host shutdown.",
+                "Timed out while draining Azure Service Bus ACK-after-enqueue dispatcher for {Queue}. Pending={PendingCount}, Running={RunningCount}. Already-completed work may be interrupted by host shutdown.",
                 _queueName,
                 PendingCount,
                 RunningCount);

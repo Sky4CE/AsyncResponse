@@ -37,7 +37,6 @@ internal static class RedisTransportOptionsValidator
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
         Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
         Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
         PositiveOrNull(options.StreamMaxLength, nameof(options.StreamMaxLength));
         PositiveOrNull(options.DeadLetterStreamMaxLength, nameof(options.DeadLetterStreamMaxLength));
 

@@ -103,19 +103,29 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterEnqueue_RejectsDrainPlusShutdownExceedingHostBudget()
+    public void ValidateOptions_AckAfterEnqueue_RejectsDrainExceedingHostBudget()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             SqsMessageDispatcher.ValidateOptions(
                 new SqsAsyncResponseOptions
                 {
-                    ShutdownTimeout = TimeSpan.FromSeconds(20),
                     HostShutdownTimeout = TimeSpan.FromSeconds(25)
                 },
-                new SqsSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10)),
+                new SqsSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(26)),
                 SqsSubscriberRole.Worker));
 
         Assert.Contains(nameof(SqsAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (BackgroundDrainTimeout 20s vs HostShutdownTimeout 30s) must not fail startup.
+        SqsMessageDispatcher.ValidateOptions(
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            SqsSubscriberRole.Worker);
     }
 
     [Fact]
@@ -141,7 +151,7 @@ public sealed class SqsDispatcherTests
         Assert.Equal(SqsAckMode.AckAfterEnqueue, options.AckMode);
         Assert.Equal(2, options.BackgroundWorkerCount);
         Assert.Equal(16, options.BackgroundQueueCapacity);
-        Assert.Equal(TimeSpan.FromSeconds(30), options.BackgroundDrainTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(20), options.BackgroundDrainTimeout);
     }
 
     [Fact]

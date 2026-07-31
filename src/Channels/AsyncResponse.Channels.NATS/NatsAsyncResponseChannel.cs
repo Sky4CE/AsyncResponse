@@ -128,6 +128,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // Local: CleanupOnceAsync — disposes the subscription (which ends the consume loop), deletes
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
+        var subscriptionTornDown = false;
         async ValueTask CleanupOnceAsync()
         {
             if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
@@ -135,15 +136,26 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             try
             {
-                // Delete the recovery state BEFORE disposing the subscription. In the reverse
-                // order a publish landing in the window sees "no responders, state present" and
-                // fires a spurious recovery callback for a wait that already reached a terminal
-                // state. In this order the window shows a subscriber that drops the message — a
-                // late or duplicate terminal message is droppable; a resurrected recovery callback
-                // is not.
-                await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                try
+                {
+                    // Delete the recovery state BEFORE disposing the subscription. In the reverse
+                    // order a publish landing in the window sees "no responders, state present" and
+                    // fires a spurious recovery callback for a wait that already reached a terminal
+                    // state. In this order the window shows a subscriber that drops the message — a
+                    // late or duplicate terminal message is droppable; a resurrected recovery callback
+                    // is not.
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Best-effort: the KV entry expires on its own, and a transient store failure
+                    // must not skip the subscription teardown below.
+                    _logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", correlationId);
+                }
+
                 if (subscription is not null)
                     await subscription.DisposeAsync().ConfigureAwait(false);
+                subscriptionTornDown = true;
                 _logger.LogDebug("Unsubscribed from subject {Subject}.", subject);
             }
             catch (Exception ex)
@@ -153,6 +165,16 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             finally
             {
                 await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
+                if (!subscriptionTornDown)
+                {
+                    // DisposeAsync did not complete, so the server-side subscription may still be
+                    // pumping messages. Its lifetime is bound to this token (SubscribeAsync received
+                    // it), and disposing a CTS never cancels — an explicit cancel is the backstop
+                    // that ends the consume loop. Safe only after the timeout registration above is
+                    // gone, or the cancel would fire a spurious waiter timeout.
+                    cancellationTokenSource.Cancel();
+                }
+
                 cancellationTokenSource.Dispose();
                 activity?.Dispose();
             }

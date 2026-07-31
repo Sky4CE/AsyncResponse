@@ -67,7 +67,7 @@ public class NatsMessageDispatcherTests
     {
         using var collector = new AsyncResponseActivityCollector();
         var processed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => { processed.TrySetResult(); return Task.CompletedTask; }, subscriber);
 
         var rec = new RecordingDelivery();
@@ -80,7 +80,7 @@ public class NatsMessageDispatcherTests
         await WaitUntilAsync(() => collector.Count("asyncresponse.nats.receive") == 1);
         var activity = collector.Single("asyncresponse.nats.receive", "asyncresponse.transport", "nats");
         Assert.Equal(ActivityKind.Consumer, activity.Kind);
-        Assert.Equal(nameof(NatsAckMode.AckAfterReceive), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.ack_mode"));
+        Assert.Equal(nameof(NatsAckMode.AckAfterEnqueue), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.nats.ack_mode"));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)
@@ -158,7 +158,7 @@ public class NatsMessageDispatcherTests
     public async Task EarlyAck_AcksImmediately_AndProcessesInBackground()
     {
         var processed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((delivery, _) => { processed.TrySetResult(delivery.Payload); return Task.CompletedTask; }, subscriber);
 
         var rec = new RecordingDelivery();
@@ -173,7 +173,7 @@ public class NatsMessageDispatcherTests
     {
         var failure = new TaskCompletionSource<NatsBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
         var subscriber = new NatsSubscriberOptions { OnBackgroundFailure = ctx => { failure.TrySetResult(ctx); return ValueTask.CompletedTask; } }
-            .UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+            .UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("bg-boom"), subscriber);
 
         var rec = new RecordingDelivery();
@@ -194,7 +194,7 @@ public class NatsMessageDispatcherTests
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher(async (_, _) => { started.TrySetResult(); await gate.Task; }, subscriber);
 
         var first = new RecordingDelivery();
@@ -230,7 +230,7 @@ public class NatsMessageDispatcherTests
         var subscriber = new NatsSubscriberOptions
         {
             RedeliveryDelay = TimeSpan.FromSeconds(3)
-        }.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        }.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher(async (_, _) => { started.TrySetResult(); await gate.Task; }, subscriber);
 
         var first = new RecordingDelivery();
@@ -281,7 +281,7 @@ public class NatsMessageDispatcherTests
                 callbackInvoked.TrySetResult();
                 throw new InvalidOperationException("callback boom");
             }
-        }.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        }.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("bg"), subscriber);
 
         var rec = new RecordingDelivery();
@@ -296,7 +296,7 @@ public class NatsMessageDispatcherTests
     {
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(
             backgroundWorkerCount: 1,
             backgroundQueueCapacity: 4,
             backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
@@ -324,7 +324,7 @@ public class NatsMessageDispatcherTests
                 failure.TrySetResult(ctx);
                 return ValueTask.CompletedTask;
             }
-        }.UseAckAfterReceive(
+        }.UseAckAfterEnqueue(
             backgroundWorkerCount: 1,
             backgroundQueueCapacity: 4,
             backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
@@ -361,7 +361,7 @@ public class NatsMessageDispatcherTests
                 Interlocked.Increment(ref failures);
                 return ValueTask.CompletedTask;
             }
-        }.UseAckAfterReceive(
+        }.UseAckAfterEnqueue(
             backgroundWorkerCount: 1,
             backgroundQueueCapacity: 4,
             backgroundDrainTimeout: TimeSpan.FromMilliseconds(50));
@@ -391,7 +391,7 @@ public class NatsMessageDispatcherTests
     [Fact]
     public async Task DisposeAsync_DisposesCancellationSourceWhenWorkerAggregationFaults()
     {
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(1, 4, TimeSpan.FromSeconds(1));
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(1, 4, TimeSpan.FromSeconds(1));
         var dispatcher = CreateDispatcher((_, _) => Task.CompletedTask, subscriber);
         var workersField = typeof(NatsMessageDispatcher)
             .GetField("_backgroundWorkers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;

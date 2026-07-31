@@ -158,24 +158,14 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 if (transportOptions.ShutdownTimeout <= TimeSpan.Zero)
                     throw new InvalidOperationException($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} must be positive.");
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    if (hostShutdownTimeout <= TimeSpan.Zero)
-                        throw new InvalidOperationException($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)} must be positive when set.");
-
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)}, " +
-                            "or reduce the RabbitMQ shutdown/drain timeouts.");
-                    }
-                }
+                // RabbitMQ spends the background drain plus the bounded connection close
+                // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
+                ShutdownBudgetValidator.Validate(
+                    "RabbitMQ",
+                    $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
+                    ($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
 
                 return;
 

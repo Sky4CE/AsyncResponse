@@ -33,7 +33,24 @@ internal sealed class AsyncResponseIngress(
         {
             _logger.LogDebug("Ingress received inbound response message: {Message}", messageJson);
 
-            await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
+            // A transient infrastructure fault (channel store briefly unreachable, recovery-state
+            // read hiccup, resume-callback dependency blip) must not finalize the waiter on the
+            // first attempt — that would convert a recoverable response into a permanent business
+            // failure. Retry briefly in-process before escalating. Parse failures are excluded:
+            // an unparseable message never becomes parseable, so it escalates immediately.
+            // Recovery resume callbacks may be re-invoked by these retries, which matches their
+            // contract — broker redelivery re-invokes them the same way.
+            await AsyncResponseRetry.ExecuteAsync(
+                async _ =>
+                {
+                    await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
+                    return true;
+                },
+                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException),
+                maxAttempts: 4,
+                baseDelay: TimeSpan.FromMilliseconds(250),
+                maxDelay: TimeSpan.FromSeconds(2),
+                CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -46,6 +63,12 @@ internal sealed class AsyncResponseIngress(
             catch (Exception innerEx)
             {
                 _logger.LogError(innerEx, "Ingress failed to publish the exception for the inbound message (original error: {OriginalError}).", ex.Message);
+
+                // Both the publish and the SetException escalation failed, so returning normally
+                // would ack a response that now exists nowhere. Propagate instead: the transport's
+                // redelivery/dead-letter policy retries the whole pipeline, and the recovery
+                // registration stays valid for the redelivered attempt.
+                throw;
             }
         }
     }

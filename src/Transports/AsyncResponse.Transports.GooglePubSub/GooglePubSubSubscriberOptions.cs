@@ -85,7 +85,7 @@ public sealed class GooglePubSubSubscriberOptions
     /// <summary>
     /// Maximum time to wait for queued/running background handlers while the hosted subscriber stops.
     /// </summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// Optional callback invoked when a background handler fails after the message was already ACKed.

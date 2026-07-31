@@ -140,12 +140,12 @@ public sealed class PostgreSqlOptionsTests
     public void TransportSubscriberOptions_ValidateEarlyAckAndFailureSettings()
     {
         Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
-            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterReceive },
+            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterEnqueue },
             "Worker"));
         Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateSubscriber(
             new PostgreSqlSubscriberOptions
             {
-                AckMode = PostgreSqlAckMode.AckAfterReceive,
+                AckMode = PostgreSqlAckMode.AckAfterEnqueue,
                 BackgroundWorkerCount = 1,
                 BackgroundQueueCapacity = 0
             },
@@ -163,20 +163,20 @@ public sealed class PostgreSqlOptionsTests
             new PostgreSqlSubscriberOptions { AckMode = (PostgreSqlAckMode)999 },
             "Worker"));
 
-        var subscriber = new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 8, TimeSpan.FromSeconds(3));
+        var subscriber = new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(3));
         PostgreSqlTransportOptionsValidator.ValidateSubscriber(subscriber, "Worker");
-        Assert.Equal(PostgreSqlAckMode.AckAfterReceive, subscriber.AckMode);
+        Assert.Equal(PostgreSqlAckMode.AckAfterEnqueue, subscriber.AckMode);
         Assert.Equal(2, subscriber.BackgroundWorkerCount);
         Assert.Equal(8, subscriber.BackgroundQueueCapacity);
         Assert.Equal(TimeSpan.FromSeconds(3), subscriber.BackgroundDrainTimeout);
     }
 
     [Fact]
-    public void UseAckAfterReceive_RejectsInvalidArguments()
+    public void UseAckAfterEnqueue_RejectsInvalidArguments()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(0, 8));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 0));
-        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterReceive(2, 8, TimeSpan.Zero));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(0, 8));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(2, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.Zero));
     }
 
     [Fact]

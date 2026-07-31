@@ -42,7 +42,6 @@ internal static class NatsTransportOptionsValidator
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
         Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
         Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
         PositiveOrNull(options.StreamMaxMessages, nameof(options.StreamMaxMessages));
         PositiveOrNull(options.DeadLetterStreamMaxMessages, nameof(options.DeadLetterStreamMaxMessages));
 
@@ -68,27 +67,16 @@ internal static class NatsTransportOptionsValidator
     {
         ValidateSubscriber(subscriber, role);
 
-        if (subscriber.AckMode is not NatsAckMode.AckAfterReceive)
+        if (subscriber.AckMode is not NatsAckMode.AckAfterEnqueue)
             return;
 
-        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-        {
-            if (hostShutdownTimeout <= TimeSpan.Zero)
-                throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
-
-            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
-            if (requiredShutdownBudget > hostShutdownTimeout)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
-                    $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
-                    $"requires {requiredShutdownBudget}, which exceeds " +
-                    $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
-                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                    $"and mirror that value in {nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
-                    "or reduce the NATS shutdown/drain timeouts.");
-            }
-        }
+        // NATS subscribers spend only the background drain at shutdown; the consume loop stops
+        // with the host token and the connection teardown is not separately bounded.
+        ShutdownBudgetValidator.Validate(
+            "NATS",
+            $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+            transportOptions.HostShutdownTimeout,
+            ($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout));
     }
 
     /// <summary>Validates the supplied options.</summary>
@@ -107,11 +95,11 @@ internal static class NatsTransportOptionsValidator
             case NatsAckMode.AckAfterHandlerCompletes:
                 return;
 
-            case NatsAckMode.AckAfterReceive:
+            case NatsAckMode.AckAfterEnqueue:
                 if (subscriber.BackgroundWorkerCount <= 0)
-                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterReceive.");
+                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
-                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterReceive.");
+                    throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
                 Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
 

@@ -69,7 +69,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundHandlerStillEmitsReceiveSpan()
+    public async Task AckAfterEnqueue_BackgroundHandlerStillEmitsReceiveSpan()
     {
         using var collector = new AsyncResponseActivityCollector();
         var calls = new Calls();
@@ -81,7 +81,7 @@ public sealed class PostgreSqlDispatcherTests
                 return Task.CompletedTask;
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -94,7 +94,7 @@ public sealed class PostgreSqlDispatcherTests
         await WaitUntilAsync(() => collector.Count("asyncresponse.postgresql.receive") == 1);
         var activity = collector.Single("asyncresponse.postgresql.receive", "asyncresponse.transport", "postgresql");
         Assert.Equal(ActivityKind.Consumer, activity.Kind);
-        Assert.Equal(nameof(PostgreSqlAckMode.AckAfterReceive), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.ack_mode"));
+        Assert.Equal(nameof(PostgreSqlAckMode.AckAfterEnqueue), AsyncResponseActivityCollector.Tag(activity, "asyncresponse.postgresql.ack_mode"));
     }
 
     [Fact]
@@ -190,7 +190,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_AcksOnReceive_WithoutWaitingForHandler()
+    public async Task AckAfterEnqueue_AcksOnReceive_WithoutWaitingForHandler()
     {
         var calls = new Calls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -202,13 +202,13 @@ public sealed class PostgreSqlDispatcherTests
                 return Task.CompletedTask;
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
 
-        // AckAfterReceive acks the row as part of accepting it into the background queue, so it is
+        // AckAfterEnqueue acks the row as part of accepting it into the background queue, so it is
         // already acknowledged the moment HandleAsync returns — without waiting for the handler. The
         // handler runs on the background worker and may execute concurrently with the ack, so the test
         // must not assert their relative ordering (asserting calls.Ack inside the handler was the
@@ -220,7 +220,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailure_DeadLettersWithoutDeletingOriginal_AndInvokesCallback()
+    public async Task AckAfterEnqueue_BackgroundFailure_DeadLettersWithoutDeletingOriginal_AndInvokesCallback()
     {
         var calls = new Calls();
         PostgreSqlBackgroundFailureContext? callback = null;
@@ -239,7 +239,7 @@ public sealed class PostgreSqlDispatcherTests
                     callback = context;
                     return ValueTask.CompletedTask;
                 }
-            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -262,7 +262,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailureCallbackExceptionsAreSwallowed()
+    public async Task AckAfterEnqueue_BackgroundFailureCallbackExceptionsAreSwallowed()
     {
         var calls = new Calls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -276,7 +276,7 @@ public sealed class PostgreSqlDispatcherTests
             new PostgreSqlSubscriberOptions
             {
                 OnBackgroundFailure = _ => throw new InvalidOperationException("callback boom")
-            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -288,7 +288,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_Overflow_ReleasesRowForRetry()
+    public async Task AckAfterEnqueue_Overflow_ReleasesRowForRetry()
     {
         var calls = new Calls();
         using var entered = new ManualResetEventSlim();
@@ -301,7 +301,7 @@ public sealed class PostgreSqlDispatcherTests
                 return Task.CompletedTask;
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.FromSeconds(5)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -317,7 +317,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailureWithoutCallback_DeadLetters()
+    public async Task AckAfterEnqueue_BackgroundFailureWithoutCallback_DeadLetters()
     {
         var calls = new Calls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -328,7 +328,7 @@ public sealed class PostgreSqlDispatcherTests
                 throw new InvalidOperationException("background boom");
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.ResponseIngress);
 
@@ -340,7 +340,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundOperationCanceled_DeadLettersLikeHandlerFailure()
+    public async Task AckAfterEnqueue_BackgroundOperationCanceled_DeadLettersLikeHandlerFailure()
     {
         var calls = new Calls();
         var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -351,7 +351,7 @@ public sealed class PostgreSqlDispatcherTests
                 throw new OperationCanceledException();
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -375,7 +375,7 @@ public sealed class PostgreSqlDispatcherTests
                 await release.Task;
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(1)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(1)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -399,7 +399,7 @@ public sealed class PostgreSqlDispatcherTests
                 await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken);
             },
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(50)),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -420,7 +420,7 @@ public sealed class PostgreSqlDispatcherTests
         var ex = Assert.Throws<InvalidOperationException>(() => new PostgreSqlMessageDispatcher(
             (_, _) => Task.CompletedTask,
             new PostgreSqlAsyncResponseTransportOptions(),
-            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterReceive },
+            new PostgreSqlSubscriberOptions { AckMode = PostgreSqlAckMode.AckAfterEnqueue },
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker));
 
@@ -435,7 +435,7 @@ public sealed class PostgreSqlDispatcherTests
             ShutdownTimeout = TimeSpan.FromSeconds(20),
             HostShutdownTimeout = TimeSpan.FromSeconds(25)
         };
-        var subscriber = new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(10));
+        var subscriber = new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10));
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
             PostgreSqlTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
@@ -457,10 +457,22 @@ public sealed class PostgreSqlDispatcherTests
         var ex = Assert.Throws<InvalidOperationException>(() =>
             PostgreSqlTransportOptionsValidator.ValidateSubscriber(
                 new PostgreSqlAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.Zero },
-                new PostgreSqlSubscriberOptions().UseAckAfterReceive(1, 8),
+                new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8),
                 "Worker"));
 
         Assert.Contains(nameof(PostgreSqlAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+    }
+
+    [Fact]
+    public void ValidateSubscriber_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (5s ShutdownTimeout + 20s BackgroundDrainTimeout vs HostShutdownTimeout 30s)
+        // must not fail startup.
+        PostgreSqlTransportOptionsValidator.ValidateSubscriber(
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            "Worker");
     }
 
     [Fact]
@@ -531,7 +543,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterReceive_BackgroundFailureWithFailedDeadLetterWrite_StillInvokesCallback()
+    public async Task AckAfterEnqueue_BackgroundFailureWithFailedDeadLetterWrite_StillInvokesCallback()
     {
         var calls = new Calls { DeadLetterResult = false };
         var failureReported = new TaskCompletionSource<PostgreSqlBackgroundFailureContext>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -545,7 +557,7 @@ public sealed class PostgreSqlDispatcherTests
                     failureReported.TrySetResult(context);
                     return ValueTask.CompletedTask;
                 }
-            }.UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(5)),
+            }.UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
             NullLogger.Instance,
             PostgreSqlSubscriberRole.Worker);
 
@@ -571,7 +583,7 @@ public sealed class PostgreSqlDispatcherTests
                 Interlocked.Increment(ref failures);
                 return ValueTask.CompletedTask;
             }
-        }.UseAckAfterReceive(1, 8, TimeSpan.FromMilliseconds(50));
+        }.UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(50));
         var dispatcher = new PostgreSqlMessageDispatcher(
             async (_, cancellationToken) =>
             {

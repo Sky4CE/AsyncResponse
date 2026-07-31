@@ -47,8 +47,6 @@ AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseConsum
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.Kafka.KafkaSubscriberOptions!
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseTopic.get -> string?
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ResponseTopic.set -> void
-AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
-AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.ShutdownTimeout.set -> void
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryBaseDelay.set -> void
 AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan

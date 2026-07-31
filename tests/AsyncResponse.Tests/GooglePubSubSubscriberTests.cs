@@ -662,6 +662,18 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public void DispatcherValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (5s ShutdownTimeout + 20s BackgroundDrainTimeout vs HostShutdownTimeout 30s)
+        // must not fail startup.
+        GooglePubSubMessageDispatcher.ValidateOptions(
+            new GooglePubSubAsyncResponseOptions(),
+            new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            GooglePubSubSubscriberRole.Worker);
+    }
+
+    [Fact]
     public async Task DispatcherCreate_ReturnsConfiguredDispatcherTypes()
     {
         await using var awaiting = GooglePubSubMessageDispatcher.Create(
@@ -1007,7 +1019,7 @@ public class GooglePubSubSubscriberTests
 
         options.UseAckAfterEnqueue(2, 32);
 
-        Assert.Equal(TimeSpan.FromSeconds(30), options.BackgroundDrainTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(20), options.BackgroundDrainTimeout);
     }
 
     [Fact]

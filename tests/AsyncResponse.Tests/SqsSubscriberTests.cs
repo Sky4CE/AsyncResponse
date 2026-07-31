@@ -266,6 +266,80 @@ public sealed class SqsSubscriberTests
         Assert.Equal(1, secondCalls.Delete);
     }
 
+    [Fact]
+    public async Task WorkerSubscriber_FailedMessageRedeliveryDelay_IsNotOverwrittenByRenewalHeartbeat()
+    {
+        var client = new FakeSqsClient();
+        var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSweep = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () => await releaseFirstHandler.Task);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m2-body")).ThrowsAsync(new InvalidOperationException("handler failed"));
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        options.WorkerSubscriber.RedeliveryDelay = TimeSpan.FromSeconds(3);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        // One batch of two. The heartbeat's sweep blocks inside m1's renewal while both messages
+        // are still unsettled — a sweep pass that started from a stale settled prefix. m1 then
+        // completes and m2's handler throws, so the failure path shortens m2's visibility to the
+        // 3s RedeliveryDelay (its receipt handle stays live: the message was never deleted). Only
+        // afterwards does the blocked sweep resume and reach m2 — pre-fix it would overwrite the
+        // fast retry with the full 45s timeout.
+        client.Enqueue(new SqsTransportDelivery(
+            FakeSqsClient.UrlFor("workers"),
+            "m1-body",
+            "m1",
+            "m1-receipt",
+            1,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            () =>
+            {
+                firstCalls.Delete++;
+                firstCalls.Deleted.TrySetResult();
+                return ValueTask.CompletedTask;
+            },
+            async delay =>
+            {
+                firstCalls.RecordVisibilityChange(delay);
+                sweepBlocked.TrySetResult();
+                await releaseSweep.Task;
+            }));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+
+        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        releaseFirstHandler.TrySetResult();
+        // The failure path must have applied the redelivery delay before the sweep gets to move on
+        // toward m2.
+        await WaitUntilAsync(() => secondCalls.VisibilityChanges.Count >= 1);
+        releaseSweep.TrySetResult();
+
+        // The receive loop only issues its next receive after the batch and its renewal loop fully
+        // completed, so another receive attempt proves the sweep drained past m2.
+        await WaitUntilAsync(() => client.ReceiveAttempts >= 2);
+        await subscriber.StopAsync(CancellationToken.None);
+
+        var visibilityChange = Assert.Single(secondCalls.VisibilityChanges);
+        Assert.Equal(TimeSpan.FromSeconds(3), visibilityChange);
+        Assert.Equal(0, secondCalls.Delete);
+        Assert.Equal(1, firstCalls.Delete);
+        Assert.All(firstCalls.VisibilityChanges, delay => Assert.Equal(TimeSpan.FromSeconds(45), delay));
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));

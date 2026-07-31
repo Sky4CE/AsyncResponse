@@ -13,6 +13,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Added
 
+- `AsyncResponseCallbackAllowList.AllowDurableFlowExecutor` (default `true`): the allowlist
+  authorizer now covers `IDurableFlowExecutor` explicitly instead of the reflection layer exempting
+  it from authorization. Custom `IAsyncResponseCallbackAuthorizer` implementations must allow
+  `IDurableFlowExecutor` when durable flows are enabled.
 - `HostShutdownTimeout` on the NATS, PostgreSQL, SQL Server, and MongoDB transports, matching the
   broker transports that already had it, so early-ACK drain budgets can be validated against host
   shutdown on every transport.
@@ -26,6 +30,24 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Changed
 
+- Shutdown-budget defaults now fit the .NET host's 30 s `HostOptions.ShutdownTimeout` out of the
+  box: `BackgroundDrainTimeout` defaults dropped from 30 s to 20 s on all transports, transport
+  `ShutdownTimeout` defaults dropped from 15 s to 5 s where the value is actually consumed (Azure
+  Service Bus, RabbitMQ, Google Pub/Sub, PostgreSQL, MongoDB), and the property was removed on the
+  five transports where nothing consumed it (SQL Server, Kafka, Redis, NATS, SQS). The documented
+  early-ACK opt-in (`UseAckAfterEnqueue(workers, capacity)` with stock defaults) previously failed
+  the startup budget validation on every transport. The check itself is now one shared
+  implementation that sums only the components a transport actually spends during shutdown.
+- The early-ACK mode is named `AckAfterEnqueue` on every transport: Azure Service Bus, NATS, and
+  PostgreSQL renamed `AckAfterReceive` → `AckAfterEnqueue` (and `UseAckAfterReceive()` →
+  `UseAckAfterEnqueue()`) to match the other seven transports — the semantics were already
+  identical (acknowledge after acceptance into the bounded in-process background queue).
+- Response ingress retries transient infrastructure failures in-process (jittered backoff) before
+  finalizing the waiter through `SetException`, and propagates when even that escalation fails so
+  the transport's redelivery/dead-letter policy gets to retry the delivery; unparseable messages
+  still finalize immediately.
+- Retry backoff (subscriber reconnect loops, ingress retries) now applies half-jitter so replicas
+  don't reconnect in lockstep waves after a broker blip.
 - The SQL Server transport's receive spans are renamed to `asyncresponse.sqlserver.receive`
   (previously `asyncresponse.worker.receive` / `asyncresponse.response.receive`), matching every
   other transport's naming; the role still travels as a span tag.

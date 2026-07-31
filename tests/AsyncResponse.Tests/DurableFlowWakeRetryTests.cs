@@ -65,6 +65,7 @@ public sealed class DurableFlowWakeRetryTests
             ExecutionLeaseRenewInterval = TimeSpan.FromMilliseconds(100)
         });
 
+        var waited = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             // A lease that stays held for duration + renew interval proves the holder alive; the
@@ -76,6 +77,13 @@ public sealed class DurableFlowWakeRetryTests
             renewals.Cancel();
             await renewLoop;
         }
+        waited.Stop();
+
+        // The give-up must come AFTER the full proving window (duration 300ms + renew 100ms), not
+        // instantly — an instant return is the old at-most-once hole this file guards against.
+        Assert.True(
+            waited.Elapsed >= TimeSpan.FromMilliseconds(300),
+            $"Gave up after {waited.ElapsedMilliseconds}ms; expected to poll through the ~400ms lease-proving window.");
 
         var final = await store.LoadAsync(state.FlowId!);
         Assert.Equal(FlowRunStatus.Running, final!.Status);

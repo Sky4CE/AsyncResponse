@@ -50,6 +50,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private readonly DurableFlowOptions _options;
     private readonly ILogger<DurableFlowExecutor> _logger;
     private readonly Dictionary<string, DurableFlowRegistration> _registrations;
+    private readonly CancellationToken _hostStopping;
 
     /// <summary>Creates the flow executor.</summary>
     public DurableFlowExecutor(
@@ -60,7 +61,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         AsyncResponseContextPropagation propagation,
         DurableFlowOptions options,
         ILogger<DurableFlowExecutor> logger,
-        IEnumerable<DurableFlowRegistration>? registrations = null)
+        IEnumerable<DurableFlowRegistration>? registrations = null,
+        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
     {
         _scopeFactory = scopeFactory;
         _builder = builder;
@@ -70,6 +72,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
+        _hostStopping = hostLifetime?.ApplicationStopping ?? CancellationToken.None;
         _registrations = new Dictionary<string, DurableFlowRegistration>(StringComparer.Ordinal);
         foreach (var registration in registrations ?? [])
         {
@@ -230,7 +233,18 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (DateTime.UtcNow >= deadline)
                 break;
 
-            await Task.Delay(pollDelay).ConfigureAwait(false);
+            try
+            {
+                await Task.Delay(pollDelay, _hostStopping).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Host shutdown must not leave this delivery parked in the poll — but acking it
+                // would silently drop the flow's only wake-up. Propagate as cancellation so the
+                // transport treats the job as not executed and redelivers it after restart.
+                throw new OperationCanceledException(
+                    $"Host is stopping; durable flow '{flowId}' wake-up is abandoned for redelivery.");
+            }
         }
 
         // The lease survived a full duration + renew window, so the holder is alive and renewing.

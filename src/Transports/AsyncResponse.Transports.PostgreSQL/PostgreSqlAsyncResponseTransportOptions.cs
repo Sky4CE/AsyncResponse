@@ -90,13 +90,17 @@ public sealed class PostgreSqlAsyncResponseTransportOptions
     /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// Bounds the wait for the LISTEN task to join while a hosted subscriber stops. The join
+    /// completes in milliseconds when healthy; when it does not, the task is abandoned anyway, so
+    /// keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// The hosting shutdown budget that must contain PostgreSQL subscriber shutdown plus
     /// <see cref="PostgreSqlSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
-    /// <see cref="PostgreSqlAckMode.AckAfterReceive"/>. Defaults to the Generic Host default of
+    /// <see cref="PostgreSqlAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
     /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
     /// </summary>
     public TimeSpan? HostShutdownTimeout { get; set; } = TimeSpan.FromSeconds(30);
@@ -136,7 +140,7 @@ public enum PostgreSqlAckMode
     /// Handler failures are logged, reported, and dead-lettered when enabled because the row has
     /// already been acknowledged.
     /// </summary>
-    AckAfterReceive = 1
+    AckAfterEnqueue = 1
 }
 
 /// <summary>Describes a handler failure that happened after a PostgreSQL row was already acknowledged.</summary>
@@ -177,7 +181,7 @@ public sealed class PostgreSqlSubscriberOptions
     /// Maximum rows claimed per subscriber loop pass. In the default
     /// <see cref="PostgreSqlAckMode.AckAfterHandlerCompletes"/> mode the claimed rows are handled
     /// one at a time, so this bounds claim round-trips, not handler concurrency. Use
-    /// <see cref="PostgreSqlAckMode.AckAfterReceive"/> (or run multiple subscriber instances) to
+    /// <see cref="PostgreSqlAckMode.AckAfterEnqueue"/> (or run multiple subscriber instances) to
     /// process messages in parallel. Default: <c>16</c>.
     /// </summary>
     public int BatchSize { get; set; } = 16;
@@ -194,20 +198,20 @@ public sealed class PostgreSqlSubscriberOptions
     /// <summary>Delay after an empty poll before checking again. Default: <c>250ms</c>.</summary>
     public TimeSpan EmptyPollDelay { get; set; } = TimeSpan.FromMilliseconds(250);
 
-    /// <summary>Number of background workers used by <see cref="PostgreSqlAckMode.AckAfterReceive"/>.</summary>
+    /// <summary>Number of background workers used by <see cref="PostgreSqlAckMode.AckAfterEnqueue"/>.</summary>
     public int BackgroundWorkerCount { get; set; }
 
     /// <summary>Maximum number of ACKed rows waiting in the background queue.</summary>
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while stopping.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Optional callback invoked when a background handler fails after the row was already acknowledged.</summary>
     public Func<PostgreSqlBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 
-    /// <summary>Explicitly opts this subscriber into ACK-after-receive behavior.</summary>
-    public PostgreSqlSubscriberOptions UseAckAfterReceive(
+    /// <summary>Explicitly opts this subscriber into ACK-after-enqueue behavior.</summary>
+    public PostgreSqlSubscriberOptions UseAckAfterEnqueue(
         int backgroundWorkerCount,
         int backgroundQueueCapacity,
         TimeSpan? backgroundDrainTimeout = null)
@@ -217,7 +221,7 @@ public sealed class PostgreSqlSubscriberOptions
         if (backgroundDrainTimeout is { } timeout && timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(backgroundDrainTimeout), timeout, "Drain timeout must be positive.");
 
-        AckMode = PostgreSqlAckMode.AckAfterReceive;
+        AckMode = PostgreSqlAckMode.AckAfterEnqueue;
         BackgroundWorkerCount = backgroundWorkerCount;
         BackgroundQueueCapacity = backgroundQueueCapacity;
         if (backgroundDrainTimeout is not null)

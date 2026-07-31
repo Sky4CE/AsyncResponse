@@ -34,7 +34,7 @@ internal sealed class PostgreSqlMessageDispatcher : IAsyncDisposable
         _logger = logger;
         _role = role;
 
-        if (subscriberOptions.AckMode is PostgreSqlAckMode.AckAfterReceive)
+        if (subscriberOptions.AckMode is PostgreSqlAckMode.AckAfterEnqueue)
         {
             _backgroundQueue = Channel.CreateBounded<PostgreSqlTransportDelivery>(new BoundedChannelOptions(subscriberOptions.BackgroundQueueCapacity)
             {
@@ -52,7 +52,7 @@ internal sealed class PostgreSqlMessageDispatcher : IAsyncDisposable
     /// <summary>Handles one claimed row.</summary>
     public async Task HandleAsync(PostgreSqlTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        if (_subscriberOptions.AckMode is PostgreSqlAckMode.AckAfterReceive)
+        if (_subscriberOptions.AckMode is PostgreSqlAckMode.AckAfterEnqueue)
         {
             await HandleEarlyAckAsync(delivery).ConfigureAwait(false);
             return;

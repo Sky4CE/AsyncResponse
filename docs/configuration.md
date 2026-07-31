@@ -197,11 +197,11 @@ The in-memory transport is configured directly on registration:
 | `WorkerSubscriber.LockRenewalInterval` | Azure Service Bus | Peek-lock renewal cadence for received-but-unsettled messages while a batch is processed (default 30 s; `null` disables). Keeps slow handlers from losing their lock mid-batch — see the lock-budget note below. |
 | `WorkerSubscriber.VisibilityRenewalInterval` | SQS | Opt-in visibility heartbeat for received-but-unprocessed batch messages (default `null` = off; requires `VisibilityTimeout` set and a shorter interval). Off by default because extending visibility overrides queue-tuned redrive timing, and on FIFO queues an extended message keeps its whole message group blocked if the consumer wedges. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
-| `WorkerSubscriber.UseAckAfterEnqueue(...)` / `UseAckAfterReceive(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Each transport exposes exactly one of the two, named for when the early ACK happens: `UseAckAfterReceive` on Azure Service Bus, NATS, and PostgreSQL; `UseAckAfterEnqueue` on Kafka, RabbitMQ, Redis, Google Pub/Sub, SQS, SQL Server, and MongoDB. |
+| `WorkerSubscriber.UseAckAfterEnqueue(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Every broker transport exposes the same method name; the message is ACKed once it is accepted into the bounded in-process queue, before the handler runs. |
 | `WorkerSubscriber.MaxDeliveryAttempts` | all broker transports except Google Pub/Sub and SQS | Redeliveries before dead-lettering. Google Pub/Sub and SQS perform redelivery natively — bound attempts with the subscription's `DeadLetterPolicy` (Pub/Sub) or the queue's redrive policy `maxReceiveCount` (SQS, provisioned by `CreateQueues` or your infra). On RabbitMQ, values above 2 require a TTL-retry dead-letter cycle (plain `basic.nack` requeues are not counted by the broker) and log a startup warning otherwise. On Kafka, attempts are in-process retries with backoff (`HandlerRetryBaseDelay`/`HandlerRetryMaxDelay`) counted per process delivery — offsets cannot NACK a single message. |
 | `SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` | Google Pub/Sub, SQS | Bounded backoff for restarting a failed hosted subscriber (streaming-pull/long-poll fault, transient auth/startup errors). |
 | `WorkerSubscriber.OnBackgroundFailure` | all broker transports | Hook for operator-visible metrics, alerting, or a durable dead-letter path when a background handler fails after early ACK. |
-| `HostShutdownTimeout` | all broker transports | Must accommodate `ShutdownTimeout + BackgroundDrainTimeout`; mirror any custom `HostOptions.ShutdownTimeout`. |
+| `HostShutdownTimeout` | all broker transports | Must accommodate the transport's shutdown spend: `BackgroundDrainTimeout` (default 20 s), plus `ShutdownTimeout` (default 5 s) on the transports that bound a close/listen join with it (Azure Service Bus, RabbitMQ, Google Pub/Sub, PostgreSQL, MongoDB). Stock defaults fit the .NET host's 30 s default; mirror any custom `HostOptions.ShutdownTimeout` here so startup validation checks the real budget. |
 | `DeclareTopology` | RabbitMQ | Declare durable exchanges/queues/bindings (`true`) or leave topology to your infra team (`false`). |
 | `CorrelationIdAttribute` / `CorrelationIdHeader` / `CorrelationIdProperty` | Pub/Sub / SQS / RabbitMQ / Kafka / NATS / PostgreSQL / SQL Server / MongoDB / Azure Service Bus | Broker metadata key used to resolve the correlation id before falling back to JSON body paths. On Kafka the correlation id also becomes the message key, keeping one flow's jobs ordered within a partition; on FIFO SQS queues it becomes the `MessageGroupId` with the same per-flow ordering effect. |
 | `CorrelationIdJsonPaths` | broker transports | JSON paths inspected when metadata does not carry the correlation id. PostgreSQL, SQL Server, and MongoDB also unwrap nested JSON strings at those paths. |
@@ -216,7 +216,7 @@ error handling when the flow should fail fast instead of waiting out its timeout
 
 Azure Service Bus uses peek-lock settlement. In `AckAfterHandlerCompletes`, a successful handler
 completes the message, failures abandon it until `MaxDeliveryAttempts`, then dead-letter it through
-Service Bus. In `AckAfterReceive`, the message is completed as soon as it enters the bounded
+Service Bus. In `AckAfterEnqueue`, the message is completed as soon as it enters the bounded
 background queue; later handler failures cannot be broker-dead-lettered because the lock is gone, so
 use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path. Mind the peek-lock
 budget: a receive batch is processed sequentially, so the last message in a batch waits up to
@@ -282,7 +282,7 @@ later failures through `OnBackgroundFailure`.
 NATS JetStream uses explicit acknowledgement. A successful handler `ACK`s; a failure `NAK`s with a
 delay so JetStream redelivers after a backoff, and a message that reaches `MaxDeliveryAttempts` is
 written to the dead-letter stream. Consumers are durable, so a restarted subscriber resumes from its
-last acknowledged position. `AckAfterReceive` ACKs as soon as the message enters the bounded queue;
+last acknowledged position. `AckAfterEnqueue` ACKs as soon as the message enters the bounded queue;
 when that queue is full the consume loop pauses until capacity frees (a NAK is sent only on
 shutdown/cancellation, so backpressure does not churn redeliveries).
 

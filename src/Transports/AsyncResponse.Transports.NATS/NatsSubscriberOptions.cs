@@ -18,12 +18,12 @@ public enum NatsAckMode
     /// <see cref="NatsSubscriberOptions.OnBackgroundFailure"/>, and dead-lettered when enabled because
     /// JetStream has already been ACKed.
     /// </summary>
-    AckAfterReceive = 1
+    AckAfterEnqueue = 1
 }
 
 /// <summary>
 /// Describes a handler failure that happened after a NATS JetStream message was already ACKed by
-/// <see cref="NatsAckMode.AckAfterReceive"/>.
+/// <see cref="NatsAckMode.AckAfterEnqueue"/>.
 /// </summary>
 public sealed class NatsBackgroundFailureContext
 {
@@ -80,19 +80,19 @@ public sealed class NatsSubscriberOptions
     /// <summary>Delay requested when NAKing a failed message, so redelivery is not immediate. Default: <c>5s</c>.</summary>
     public TimeSpan RedeliveryDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>Number of background workers used by <see cref="NatsAckMode.AckAfterReceive"/>. Must be positive for early ACK.</summary>
+    /// <summary>Number of background workers used by <see cref="NatsAckMode.AckAfterEnqueue"/>. Must be positive for early ACK.</summary>
     public int BackgroundWorkerCount { get; set; }
 
     /// <summary>
     /// Maximum number of messages waiting in the background queue for
-    /// <see cref="NatsAckMode.AckAfterReceive"/>. When full, the consume loop pauses pulling new
+    /// <see cref="NatsAckMode.AckAfterEnqueue"/>. When full, the consume loop pauses pulling new
     /// messages until a background worker frees capacity; a message caught waiting when the
     /// subscriber stops is NAKed so JetStream redelivers it.
     /// </summary>
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while the hosted subscriber stops.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// Optional callback invoked when a background handler fails after the JetStream message was
@@ -100,8 +100,8 @@ public sealed class NatsSubscriberOptions
     /// </summary>
     public Func<NatsBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }
 
-    /// <summary>Explicitly opts this subscriber into ACK-after-receive (early ACK) behavior.</summary>
-    public NatsSubscriberOptions UseAckAfterReceive(
+    /// <summary>Explicitly opts this subscriber into ACK-after-enqueue (early ACK) behavior.</summary>
+    public NatsSubscriberOptions UseAckAfterEnqueue(
         int backgroundWorkerCount,
         int backgroundQueueCapacity,
         TimeSpan? backgroundDrainTimeout = null)
@@ -112,7 +112,7 @@ public sealed class NatsSubscriberOptions
         if (backgroundDrainTimeout is { } timeout && timeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(backgroundDrainTimeout), timeout, "Drain timeout must be positive.");
 
-        AckMode = NatsAckMode.AckAfterReceive;
+        AckMode = NatsAckMode.AckAfterEnqueue;
         BackgroundWorkerCount = backgroundWorkerCount;
         BackgroundQueueCapacity = backgroundQueueCapacity;
 

@@ -126,27 +126,14 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
                         $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)} must be positive.");
                 }
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    if (hostShutdownTimeout <= TimeSpan.Zero)
-                    {
-                        throw new InvalidOperationException(
-                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)} must be positive when set.");
-                    }
-
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)}, " +
-                            "or reduce the Pub/Sub shutdown/drain timeouts.");
-                    }
-                }
+                // Pub/Sub spends the background drain plus the bounded subscriber-client stop
+                // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
+                ShutdownBudgetValidator.Validate(
+                    "Pub/Sub",
+                    $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout),
+                    ($"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
 
                 return;
 

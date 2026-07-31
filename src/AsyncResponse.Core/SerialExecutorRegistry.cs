@@ -85,7 +85,14 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
                     // With a subscription still registered the recreate is legitimate (its own
                     // cleanup retires the new executor), so the tombstone does not apply.
                     if (!_registrations.ContainsKey(channel) && IsTombstonedUnderLock(channel))
+                    {
+                        // Deliberate, but never silent: if this fires for a live waiter, its channel
+                        // registered the subscription only after the transport began delivering.
+                        _logger.LogWarning(
+                            "Suppressed a delivery for channel {Channel}: the channel is tombstoned and has no registered subscription.",
+                            channel);
                         return;
+                    }
 
                     current = new ExecutorEntry(new ChannelSerialExecutor(_logger, channel));
                     _executors[channel] = current;

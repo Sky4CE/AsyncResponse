@@ -57,22 +57,31 @@ registrations are in [provider-examples.md](provider-examples.md).
 
 ## Choose a store
 
-| Provider | NuGet package | Registration | Best fit |
-|---|---|---|---|
-| In-memory | `AsyncResponse.Core` | `WithInMemoryDurableFlows()` | Tests, development, one process; state is lost on restart |
-| SQL Server | `AsyncResponse.DurableFlows.SqlServer` | `WithSqlServerDurableFlows(...)` | Existing SQL Server applications |
-| PostgreSQL | `AsyncResponse.DurableFlows.PostgreSQL` | `WithPostgreSqlDurableFlows(...)` | Existing PostgreSQL applications |
-| MySQL / MariaDB | `AsyncResponse.DurableFlows.MySql` | `WithMySqlDurableFlows(...)` | Existing MySQL or MariaDB applications |
-| SQLite | `AsyncResponse.DurableFlows.Sqlite` | `WithSqliteDurableFlows(...)` | One-node services that need restart durability |
-| Oracle | `AsyncResponse.DurableFlows.Oracle` | `WithOracleDurableFlows(...)` | Existing Oracle applications |
-| MongoDB | `AsyncResponse.DurableFlows.MongoDB` | `WithMongoDbDurableFlows(...)` | Document-store applications; native TTL cleanup |
-| Azure Cosmos DB | `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | Cosmos-native applications; per-item TTL |
-| DynamoDB | `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | AWS-native applications; conditional writes and native TTL |
-| Entity Framework Core | `AsyncResponse.DurableFlows.EFCore` | `WithEFCoreDurableFlows<TDbContext>()` | Put the ledger in an existing relational `DbContext` and migration pipeline |
-| Application-owned | `AsyncResponse.Core` | `WithDurableFlows<TStore>()` | A storage system not covered above |
+| Provider | NuGet package | Registration | Clock authority | Best fit |
+|---|---|---|---|---|
+| In-memory | `AsyncResponse.Core` | `WithInMemoryDurableFlows()` | App (one process) | Tests, development, one process; state is lost on restart |
+| SQL Server | `AsyncResponse.DurableFlows.SqlServer` | `WithSqlServerDurableFlows(...)` | Database | Existing SQL Server applications |
+| PostgreSQL | `AsyncResponse.DurableFlows.PostgreSQL` | `WithPostgreSqlDurableFlows(...)` | Database | Existing PostgreSQL applications |
+| MySQL / MariaDB | `AsyncResponse.DurableFlows.MySql` | `WithMySqlDurableFlows(...)` | Database | Existing MySQL or MariaDB applications |
+| SQLite | `AsyncResponse.DurableFlows.Sqlite` | `WithSqliteDurableFlows(...)` | App (single node) | One-node services that need restart durability |
+| Oracle | `AsyncResponse.DurableFlows.Oracle` | `WithOracleDurableFlows(...)` | Database | Existing Oracle applications |
+| MongoDB | `AsyncResponse.DurableFlows.MongoDB` | `WithMongoDbDurableFlows(...)` | Database | Document-store applications; native TTL cleanup |
+| Azure Cosmos DB | `AsyncResponse.DurableFlows.Cosmos` | `WithCosmosDurableFlows(...)` | App — sync worker clocks | Cosmos-native applications; per-item TTL |
+| DynamoDB | `AsyncResponse.DurableFlows.DynamoDB` | `WithDynamoDbDurableFlows(...)` | App — sync worker clocks | AWS-native applications; conditional writes and native TTL |
+| Entity Framework Core | `AsyncResponse.DurableFlows.EFCore` | `WithEFCoreDurableFlows<TDbContext>()` | App — sync worker clocks | Put the ledger in an existing relational `DbContext` and migration pipeline |
+| Application-owned | `AsyncResponse.Core` | `WithDurableFlows<TStore>()` | Your choice | A storage system not covered above |
 
 Prefer the database your application already operates. A separate workflow database is not
 required, and the flow store is independent of the response channel and worker transport.
+
+**Clock authority** is who evaluates lease and expiry comparisons. *Database* stores run that math
+on the database server's clock, so worker clock skew cannot fence two nodes onto the same lease.
+*App* stores (Cosmos, DynamoDB, EFCore) compare against `DateTime.UtcNow` on the worker because
+their storage APIs offer no usable server-clock expression — a deliberate, documented trade-off in
+each store's source. Multi-node deployments on an app-clock store must keep worker clocks
+NTP-synchronized well inside `ExecutionLeaseDuration`; if you cannot guarantee that, prefer a
+database-clock store. SQLite and in-memory are single-node by nature, so the app clock is exact
+there.
 
 ## The safety model is mandatory
 

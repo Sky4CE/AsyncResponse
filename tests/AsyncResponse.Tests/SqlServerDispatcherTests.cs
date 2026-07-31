@@ -399,9 +399,8 @@ public sealed class SqlServerDispatcherTests
     public void ValidateSubscriber_DrainBudgetExceedingHostShutdownBudget_Throws()
     {
         var options = Options();
-        options.ShutdownTimeout = TimeSpan.FromSeconds(20);
         options.HostShutdownTimeout = TimeSpan.FromSeconds(25);
-        var subscriber = new SqlServerSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(10));
+        var subscriber = new SqlServerSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(26));
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
             SqlServerTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
@@ -414,6 +413,17 @@ public sealed class SqlServerDispatcherTests
         var awaiting = Options();
         awaiting.HostShutdownTimeout = TimeSpan.FromSeconds(1);
         SqlServerTransportOptionsValidator.ValidateSubscriber(awaiting, new SqlServerSubscriberOptions(), "Worker");
+    }
+
+    [Fact]
+    public void ValidateSubscriber_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (BackgroundDrainTimeout 20s vs HostShutdownTimeout 30s) must not fail startup.
+        SqlServerTransportOptionsValidator.ValidateSubscriber(
+            Options(),
+            new SqlServerSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            "Worker");
     }
 
     [Fact]

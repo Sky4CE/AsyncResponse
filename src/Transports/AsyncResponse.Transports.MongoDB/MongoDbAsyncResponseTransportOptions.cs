@@ -101,8 +101,12 @@ public sealed class MongoDbAsyncResponseTransportOptions
     /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
+    /// <summary>
+    /// Bounds the wait for the change-stream listen task to join while a hosted subscriber stops.
+    /// The join completes in milliseconds when healthy; when it does not, the task is abandoned
+    /// anyway, so keep this short — it counts against the host's shutdown budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// The hosting shutdown budget that must contain MongoDB subscriber shutdown plus
@@ -213,7 +217,7 @@ public sealed class MongoDbSubscriberOptions
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while stopping.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Optional callback invoked when a background handler fails after the document was already acknowledged.</summary>
     public Func<MongoDbBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }

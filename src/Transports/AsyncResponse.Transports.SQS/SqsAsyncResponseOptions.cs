@@ -132,11 +132,8 @@ public sealed class SqsAsyncResponseOptions
     /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
-
     /// <summary>
-    /// The hosting shutdown budget that must contain subscriber shutdown plus
+    /// The hosting shutdown budget that must contain
     /// <see cref="SqsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
     /// <see cref="SqsAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of 30 seconds.
     /// Set to <c>null</c> only when this budget is validated externally.

@@ -51,24 +51,14 @@ internal static class MongoDbTransportOptionsValidator
         if (subscriber.AckMode is not MongoDbAckMode.AckAfterEnqueue)
             return;
 
-        if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-        {
-            if (hostShutdownTimeout <= TimeSpan.Zero)
-                throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} must be positive when set.");
-
-            var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriber.BackgroundDrainTimeout;
-            if (requiredShutdownBudget > hostShutdownTimeout)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role}) plus " +
-                    $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)} " +
-                    $"requires {requiredShutdownBudget}, which exceeds " +
-                    $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)} " +
-                    $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                    $"and mirror that value in {nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}, " +
-                    "or reduce the MongoDB shutdown/drain timeouts.");
-            }
-        }
+        // MongoDB spends the background drain plus the change-stream listen-task join
+        // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
+        ShutdownBudgetValidator.Validate(
+            "MongoDB",
+            $"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.HostShutdownTimeout)}",
+            transportOptions.HostShutdownTimeout,
+            ($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundDrainTimeout)} ({role})", subscriber.BackgroundDrainTimeout),
+            ($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(transportOptions.ShutdownTimeout)}", transportOptions.ShutdownTimeout));
     }
 
     public static void ValidateSubscriber(MongoDbSubscriberOptions subscriber, string role)

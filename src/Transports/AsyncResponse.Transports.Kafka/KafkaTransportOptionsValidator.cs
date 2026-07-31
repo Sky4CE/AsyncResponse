@@ -34,7 +34,6 @@ internal static class KafkaTransportOptionsValidator
         Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
         Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
         Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
 
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");

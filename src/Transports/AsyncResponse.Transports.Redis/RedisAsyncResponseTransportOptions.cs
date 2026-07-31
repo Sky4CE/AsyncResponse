@@ -140,11 +140,8 @@ public sealed class RedisAsyncResponseTransportOptions
     /// <summary>Maximum delay after repeated subscriber loop Redis failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
-
     /// <summary>
-    /// The hosting shutdown budget that must contain subscriber shutdown plus
+    /// The hosting shutdown budget that must contain
     /// <see cref="RedisSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
     /// <see cref="RedisAckMode.AckAfterEnqueue"/>.
     /// </summary>

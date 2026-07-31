@@ -101,18 +101,23 @@ public sealed class AzureServiceBusTransportTests
             .Setup(r => r.DeadLetterMessageAsync(received, "reason", "description", It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         receiver
+            .Setup(r => r.RenewMessageLockAsync(received, It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        receiver
             .Setup(r => r.CloseAsync(It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         receiver
             .Setup(r => r.DisposeAsync())
             .Returns(ValueTask.CompletedTask);
         var adapter = new AzureServiceBusReceiverAdapter(receiver.Object, queueOverride: "responses");
+        using var renewCancellation = new CancellationTokenSource();
 
         var deliveries = await adapter.ReceiveMessagesAsync(16, TimeSpan.FromSeconds(1));
         var delivery = Assert.Single(deliveries);
         await delivery.CompleteAsync();
         await delivery.AbandonAsync();
         await delivery.DeadLetterAsync("reason", "description");
+        await delivery.RenewLockAsync(renewCancellation.Token);
         await adapter.CloseAsync();
         await adapter.DisposeAsync();
 
@@ -126,6 +131,9 @@ public sealed class AzureServiceBusTransportTests
         receiver.Verify(r => r.CompleteMessageAsync(received, It.IsAny<CancellationToken>()), Times.Once);
         receiver.Verify(r => r.AbandonMessageAsync(received, null, It.IsAny<CancellationToken>()), Times.Once);
         receiver.Verify(r => r.DeadLetterMessageAsync(received, "reason", "description", It.IsAny<CancellationToken>()), Times.Once);
+        // Renewal must forward the caller's token (not CancellationToken.None) so a stuck renew can
+        // be interrupted when the batch settles or the subscriber stops.
+        receiver.Verify(r => r.RenewMessageLockAsync(received, renewCancellation.Token), Times.Once);
         receiver.Verify(r => r.CloseAsync(It.IsAny<CancellationToken>()), Times.Once);
         receiver.Verify(r => r.DisposeAsync(), Times.Once);
     }
@@ -708,7 +716,7 @@ public sealed class AzureServiceBusTransportTests
             ResponseQueue = "responses",
             ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
         };
-        options.WorkerSubscriber.UseAckAfterReceive(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
+        options.WorkerSubscriber.UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5));
         var firstCalls = new SettlementCalls();
         var secondCalls = new SettlementCalls();
         var thirdCalls = new SettlementCalls();
@@ -749,18 +757,14 @@ public sealed class AzureServiceBusTransportTests
         var receiver = new FakeReceiver();
         var client = new FakeServiceBusClient { Receiver = receiver };
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var first = true;
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var ingress = new Mock<IAsyncResponseIngress>();
-        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("gate"))
             .Returns(async () =>
             {
-                if (first)
-                {
-                    first = false;
-                    firstStarted.TrySetResult();
-                    await release.Task;
-                }
+                secondStarted.TrySetResult();
+                await release.Task;
             });
         var options = new AzureServiceBusAsyncResponseOptions
         {
@@ -771,31 +775,44 @@ public sealed class AzureServiceBusTransportTests
         options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(50);
         var firstCalls = new SettlementCalls();
         var secondCalls = new SettlementCalls();
+        var thirdCalls = new SettlementCalls();
         var subscriber = new AzureServiceBusWorkerSubscriber(
             Options.Create(options),
             client,
             ingress.Object,
             NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
 
-        // Both messages arrive in one batch; the first blocks in the handler while the second waits
-        // its turn. The heartbeat must renew both (the in-handler one and the queued one).
+        // All three arrive in one batch; m1's handler completes instantly, m2 blocks in the handler
+        // and m3 waits its turn. While the batch is in flight the heartbeat must renew both unsettled
+        // messages (the in-handler one and the queued one) and skip the already-settled m1.
         receiver.Enqueue(Delivery(firstCalls, queue: "workers", messageId: "m1"));
-        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2"));
+        receiver.Enqueue(Delivery(secondCalls, queue: "workers", messageId: "m2", body: "gate"));
+        receiver.Enqueue(Delivery(thirdCalls, queue: "workers", messageId: "m3"));
         await subscriber.StartAsync(CancellationToken.None);
 
-        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        await WaitUntilAsync(() => Volatile.Read(ref firstCalls.RenewLock) >= 2 && Volatile.Read(ref secondCalls.RenewLock) >= 2);
+        // m2's handler running means m1 was already settled, so every sweep starting from here on
+        // must skip it. A sweep visits messages in order, so once m2 gains a renewal any pass that
+        // raced m1's settlement has already made its (benign, documented) m1 renew; snapshot m1
+        // after that flush, let several more beats renew the unsettled two, and require the settled
+        // one to stay frozen — pinning the settled-prefix skip while the renewal loop is
+        // demonstrably alive (checking after StopAsync would be vacuous).
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var secondRenewalsAtGate = Volatile.Read(ref secondCalls.RenewLock);
+        var thirdRenewalsAtGate = Volatile.Read(ref thirdCalls.RenewLock);
+        await WaitUntilAsync(() => Volatile.Read(ref secondCalls.RenewLock) >= secondRenewalsAtGate + 1);
+        var firstRenewalsAfterSettle = Volatile.Read(ref firstCalls.RenewLock);
+        await WaitUntilAsync(() =>
+            Volatile.Read(ref secondCalls.RenewLock) >= secondRenewalsAtGate + 3
+            && Volatile.Read(ref thirdCalls.RenewLock) >= thirdRenewalsAtGate + 3);
+        Assert.Equal(firstRenewalsAfterSettle, Volatile.Read(ref firstCalls.RenewLock));
 
         release.TrySetResult();
-        await secondCalls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await thirdCalls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await subscriber.StopAsync(CancellationToken.None);
 
-        // After both are settled, renewal stops.
-        var renewalsAfterSettle = firstCalls.RenewLock + secondCalls.RenewLock;
-        await Task.Delay(200);
-        Assert.Equal(renewalsAfterSettle, firstCalls.RenewLock + secondCalls.RenewLock);
         Assert.Equal(1, firstCalls.Complete);
         Assert.Equal(1, secondCalls.Complete);
+        Assert.Equal(1, thirdCalls.Complete);
     }
 
     [Fact]
@@ -803,8 +820,15 @@ public sealed class AzureServiceBusTransportTests
     {
         var receiver = new FakeReceiver();
         var client = new FakeServiceBusClient { Receiver = receiver };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var ingress = new Mock<IAsyncResponseIngress>();
-        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            });
         var options = new AzureServiceBusAsyncResponseOptions
         {
             WorkerQueue = "workers",
@@ -821,10 +845,75 @@ public sealed class AzureServiceBusTransportTests
 
         await subscriber.StartAsync(CancellationToken.None);
         receiver.Enqueue(Delivery(calls, queue: "workers"));
+
+        // Hold the batch open long enough to span several beats of any plausible small renewal
+        // interval and require that no renewal ever fires: with interval = null no renewal loop may
+        // be started at all. (A regression to the 30s default interval is inherently unobservable
+        // in-test without a clock abstraction; the blocked-handler window is the strongest signal
+        // available — an instantly settled message would assert nothing.)
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await Task.Delay(300);
+        Assert.Equal(0, Volatile.Read(ref calls.RenewLock));
+
+        release.TrySetResult();
         await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Equal(0, calls.RenewLock);
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_StuckLockRenewal_IsCancelledPromptlyWhenBatchSettles()
+    {
+        var receiver = new FakeReceiver();
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async () =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            });
+        var options = new AzureServiceBusAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.LockRenewalInterval = TimeSpan.FromMilliseconds(50);
+        // Pinned well above every wait cap below so a resume can only come from genuine
+        // cancellation, never from the shutdown backstop firing.
+        options.ShutdownTimeout = TimeSpan.FromSeconds(15);
+        var calls = new SettlementCalls { RenewLockBlocksUntilCancelled = true };
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        receiver.Enqueue(Delivery(calls, queue: "workers"));
+        await subscriber.StartAsync(CancellationToken.None);
+
+        // Get a renewal pass mid-flight: the handler is blocked, so the sweep runs and its renew
+        // call sticks the way a degraded namespace holds it inside the SDK retry pipeline.
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await calls.RenewStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var receivesWhileBatchInFlight = receiver.ReceiveAttempts;
+
+        // Settling the batch must interrupt the stuck renew through its token: the batch finally
+        // (and with it the receive loop) resumes promptly instead of waiting out the SDK retry
+        // budget. ShutdownTimeout is pinned at 15s above, so resuming within the 5s wait cap
+        // proves genuine cancellation of the in-flight call rather than the drain backstop firing.
+        release.TrySetResult();
+        await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => receiver.ReceiveAttempts > receivesWhileBatchInFlight);
+
+        await subscriber.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(Volatile.Read(ref calls.RenewLock) >= 1);
+        Assert.Equal(1, calls.Complete);
     }
 
     [Fact]
@@ -921,10 +1010,14 @@ public sealed class AzureServiceBusTransportTests
                 calls.DeadLettered.TrySetResult();
                 return ValueTask.CompletedTask;
             },
-            () =>
+            async cancellationToken =>
             {
                 calls.RenewLock++;
-                return ValueTask.CompletedTask;
+                calls.RenewStarted.TrySetResult();
+                if (calls.RenewLockBlocksUntilCancelled)
+                    // Behaves like ServiceBusReceiver.RenewMessageLockAsync stuck in the SDK retry
+                    // pipeline on a degraded namespace: only the caller's token gets it back.
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             });
     }
 
@@ -934,11 +1027,13 @@ public sealed class AzureServiceBusTransportTests
         public int Abandon;
         public int DeadLetter;
         public int RenewLock;
+        public bool RenewLockBlocksUntilCancelled;
         public string? DeadLetterReason;
         public string? DeadLetterDescription;
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Abandoned { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource RenewStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     private sealed class FakeServiceBusClient : IAzureServiceBusClient

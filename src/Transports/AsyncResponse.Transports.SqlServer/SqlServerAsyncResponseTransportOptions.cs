@@ -93,11 +93,8 @@ public sealed class SqlServerAsyncResponseTransportOptions
     /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>How long hosted subscribers are allowed to drain and shut down gracefully.</summary>
-    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(15);
-
     /// <summary>
-    /// The hosting shutdown budget that must contain SQL Server subscriber shutdown plus
+    /// The hosting shutdown budget that must contain
     /// <see cref="SqlServerSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
     /// <see cref="SqlServerAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of
     /// 30 seconds. Set to <c>null</c> only when this budget is validated externally.
@@ -208,7 +205,7 @@ public sealed class SqlServerSubscriberOptions
     public int BackgroundQueueCapacity { get; set; }
 
     /// <summary>Maximum time to wait for queued/running background handlers while stopping.</summary>
-    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan BackgroundDrainTimeout { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Optional callback invoked when a background handler fails after the row was already acknowledged.</summary>
     public Func<SqlServerBackgroundFailureContext, ValueTask>? OnBackgroundFailure { get; set; }

@@ -80,16 +80,15 @@ public class RedisDispatcherTests
     }
 
     [Fact]
-    public void ValidateOptions_AckAfterEnqueue_RejectsDrainPlusShutdownExceedingHostBudget()
+    public void ValidateOptions_AckAfterEnqueue_RejectsDrainExceedingHostBudget()
     {
         var ex = Assert.Throws<InvalidOperationException>(() =>
             RedisMessageDispatcher.ValidateOptions(
                 new RedisAsyncResponseTransportOptions
                 {
-                    ShutdownTimeout = TimeSpan.FromSeconds(20),
                     HostShutdownTimeout = TimeSpan.FromSeconds(25)
                 },
-                EnqueueSubscriber(drain: TimeSpan.FromSeconds(10)),
+                EnqueueSubscriber(drain: TimeSpan.FromSeconds(26)),
                 RedisSubscriberRole.Worker));
 
         Assert.Contains(nameof(RedisAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
@@ -101,10 +100,20 @@ public class RedisDispatcherTests
         RedisMessageDispatcher.ValidateOptions(
             new RedisAsyncResponseTransportOptions
             {
-                ShutdownTimeout = TimeSpan.FromSeconds(20),
                 HostShutdownTimeout = null
             },
-            EnqueueSubscriber(drain: TimeSpan.FromSeconds(10)),
+            EnqueueSubscriber(drain: TimeSpan.FromSeconds(31)),
+            RedisSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (BackgroundDrainTimeout 20s vs HostShutdownTimeout 30s) must not fail startup.
+        RedisMessageDispatcher.ValidateOptions(
+            new RedisAsyncResponseTransportOptions(),
+            new RedisSubscriberOptions().UseAckAfterEnqueue(4, 256),
             RedisSubscriberRole.Worker);
     }
 

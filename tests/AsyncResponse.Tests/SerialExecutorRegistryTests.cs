@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -275,6 +276,46 @@ public class SerialExecutorRegistryTests
         await ran.Task.WaitAsync(TimeSpan.FromSeconds(5));
         registry.OnSubscriptionRetired("cid");
         await registry.RemoveAsync("cid");
+    }
+
+    [Fact]
+    public async Task EnqueueDroppedByTombstone_LogsAWarning()
+    {
+        // The tombstone drop is deliberate (see EnqueueAfterRetirement_WithoutRegistration_
+        // IsDroppedByTombstone), but it must not be silent: the warning is the only trace an
+        // upstream ordering bug — a delivery arriving before the channel registered its
+        // subscription — would leave behind.
+        var logger = new CapturingLogger();
+        var registry = new SerialExecutorRegistry(logger);
+        await registry.EnqueueAsync("cid", () => Task.CompletedTask);
+        await registry.RemoveAsync("cid");
+
+        var ran = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", () => { ran.TrySetResult(); return Task.CompletedTask; });
+
+        Assert.False(ran.Task.IsCompleted);
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Contains("cid", warning.Message);
+    }
+
+    /// <summary>Captures log entries so a test can assert a drop was reported rather than silent.</summary>
+    private sealed class CapturingLogger : ILogger
+    {
+        private readonly List<(LogLevel Level, string Message)> _entries = [];
+
+        public IReadOnlyList<(LogLevel Level, string Message)> Entries
+        {
+            get { lock (_entries) return _entries.ToArray(); }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (_entries)
+                _entries.Add((logLevel, formatter(state, exception)));
+        }
     }
 
     [Fact]

@@ -95,6 +95,55 @@ public class CallbackAuthorizationTests
         Assert.Throws<ArgumentNullException>(() => builder.AuthorizeCallbacks((IAsyncResponseCallbackAuthorizer)null!));
     }
 
+    [Fact]
+    public void Allowlist_IncludesDurableFlowExecutorByDefault()
+    {
+        var services = new ServiceCollection();
+        services.AddAsyncResponse().AuthorizeCallbacks(a => a.Allow("Some.Other.Service"));
+        using var provider = services.BuildServiceProvider();
+
+        var authorizer = provider.GetRequiredService<IAsyncResponseCallbackAuthorizer>();
+
+        // Durable flows persist executor methods as their recovery targets, so the built allowlist
+        // admits them by default — visibly, through the same mechanism as every other entry.
+        Assert.True(authorizer.IsAllowed(typeof(IDurableFlowExecutor).FullName!, nameof(IDurableFlowExecutor.ExecuteAsync)));
+        Assert.False(authorizer.IsAllowed("Unlisted.Service", "Run"));
+    }
+
+    [Fact]
+    public void Allowlist_CanExcludeDurableFlowExecutor()
+    {
+        var services = new ServiceCollection();
+        services.AddAsyncResponse().AuthorizeCallbacks(a =>
+        {
+            a.AllowDurableFlowExecutor = false;
+            a.Allow("Some.Other.Service");
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var authorizer = provider.GetRequiredService<IAsyncResponseCallbackAuthorizer>();
+
+        Assert.False(authorizer.IsAllowed(typeof(IDurableFlowExecutor).FullName!, nameof(IDurableFlowExecutor.RecoverAsync)));
+    }
+
+    [Fact]
+    public async Task CustomAuthorizer_GatesDurableFlowExecutorTargets()
+    {
+        // The executor gets no exemption: RecoverAsync carries an attacker-choosable payload, so a
+        // custom authorizer that rejects it must win even for the built-in flow executor.
+        var (provider, _) = BuildProvider(b => b.AuthorizeCallbacks(new StaticAuthorizer(allowed: false)));
+
+        var executorCall = new ReflectionInvocationDto
+        {
+            ServiceInterfaceFullName = typeof(IDurableFlowExecutor).FullName!,
+            MethodName = nameof(IDurableFlowExecutor.ExecuteAsync),
+            Params = ["flow-1"]
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(executorCall));
+        Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
+    }
+
     private sealed class StaticAuthorizer(bool allowed) : IAsyncResponseCallbackAuthorizer
     {
         public bool IsAllowed(string serviceInterfaceFullName, string methodName) => allowed;

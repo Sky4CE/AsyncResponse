@@ -17,9 +17,11 @@ public interface IAsyncResponseIngress
 {
     /// <summary>
     /// Handles an inbound response message (raw JSON) for the given correlation id.
-    /// Never throws: handling failures are escalated through
+    /// Transient handling failures are retried in-process, then escalated through
     /// <see cref="IAsyncResponsePublisher.SetException"/> so the registered failure callback
-    /// runs, keeping broker subscription loops alive.
+    /// runs, keeping broker subscription loops alive. It throws only when that escalation
+    /// itself fails — the response would otherwise be acknowledged while existing nowhere —
+    /// so the transport's redelivery/dead-letter policy gets to retry the delivery.
     /// </summary>
     /// <param name="messageJson">The raw message body.</param>
     /// <param name="correlationId">
@@ -33,8 +35,9 @@ public interface IAsyncResponseIngress
     /// <summary>
     /// Handles an inbound worker-job message (a serialized <see cref="WorkerJobEnvelope"/>):
     /// restores the correlation context and executes the described service method via the DI
-    /// container. Never throws: execution failures are logged so broker subscription loops
-    /// stay alive.
+    /// container. Execution failures are logged and then propagated — the transport dispatcher
+    /// owns the retry/dead-letter decision, so swallowing here would acknowledge failed jobs
+    /// as successes and disable redelivery.
     /// </summary>
     /// <param name="messageJson">The raw message body.</param>
     Task HandleWorkerMessageAsync(string messageJson);

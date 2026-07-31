@@ -21,6 +21,8 @@ namespace AsyncResponse;
 public sealed class InMemoryWorkerTransport : IWorkerTransport
 {
     private readonly Channel<QueuedJob> _queue;
+    private int _outstanding;
+    private volatile bool _draining;
 
     /// <summary>Creates a transport with default bounded-queue options.</summary>
     public InMemoryWorkerTransport()
@@ -46,10 +48,34 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     internal InMemoryWorkerTransportOptions Options { get; }
 
     /// <summary>
-    /// Stops accepting new jobs. Called by <see cref="InMemoryWorkerHost"/> on shutdown so the
-    /// workers can drain everything already accepted instead of dropping it.
+    /// Begins the shutdown drain. Called by <see cref="InMemoryWorkerHost"/> when the host starts
+    /// stopping. The writer is deliberately NOT completed while anything is queued or running:
+    /// accepted jobs were promised in-process execution, and a draining job may legitimately
+    /// enqueue follow-up work (a durable-flow parent wake-up, a recovery re-enqueue) that must not
+    /// hit a closed channel — losing it would strand the dependent flow with no redelivery to
+    /// recover it. The last finishing job completes the writer instead, once the transport is idle.
     /// </summary>
-    internal void CompleteForShutdown() => _queue.Writer.TryComplete();
+    internal void BeginShutdownDrain()
+    {
+        _draining = true;
+        // Interlocked read pairs with the increment in PublishAsync: either this sees the
+        // publisher's count (the finishing job completes the writer) or the publisher's write
+        // lands before completion. Only a publish initiated after the transport is already idle
+        // and draining can observe a completed channel.
+        if (Interlocked.CompareExchange(ref _outstanding, 0, 0) == 0)
+            _queue.Writer.TryComplete();
+    }
+
+    /// <summary>
+    /// Called by the worker host after a dequeued job finished (successfully or not). A job counts
+    /// as outstanding from publish until here, so follow-up publishes made while it runs always
+    /// find the writer open during the drain.
+    /// </summary>
+    internal void OnJobFinished()
+    {
+        if (Interlocked.Decrement(ref _outstanding) == 0 && _draining)
+            _queue.Writer.TryComplete();
+    }
 
     /// <inheritdoc/>
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
@@ -64,12 +90,14 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
         AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
         AsyncResponseDiagnostics.SetWorker(activity, job.Call);
 
+        Interlocked.Increment(ref _outstanding);
         try
         {
             await _queue.Writer.WriteAsync(new QueuedJob(job, ExecutionContext.Capture()), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
+            Interlocked.Decrement(ref _outstanding);
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -111,11 +139,12 @@ internal sealed class InMemoryWorkerHost(
     /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Shutdown completes the writer instead of cancelling the readers: accepted jobs were
-        // promised in-process execution, so the workers drain the remaining queue to completion
-        // (bounded, because the queue is bounded) before exiting.
+        // Shutdown quiesces instead of cancelling the readers: accepted jobs were promised
+        // in-process execution, so the workers drain the queue — including follow-up work those
+        // jobs enqueue while draining — and the writer completes only once the transport is idle.
+        // The drain is bounded because the queue is bounded and each job's follow-ups are finite.
         using var stopRegistration = stoppingToken.Register(static state =>
-            ((InMemoryWorkerTransport)state!).CompleteForShutdown(), _transport);
+            ((InMemoryWorkerTransport)state!).BeginShutdownDrain(), _transport);
 
         try
         {
@@ -146,6 +175,10 @@ internal sealed class InMemoryWorkerHost(
             catch (Exception ex)
             {
                 _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+            }
+            finally
+            {
+                _transport.OnJobFinished();
             }
         }
     }

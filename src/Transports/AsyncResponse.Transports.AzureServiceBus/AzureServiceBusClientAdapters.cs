@@ -132,7 +132,12 @@ internal sealed class AzureServiceBusReceiverAdapter(
                 deadLetterReason: reason,
                 deadLetterErrorDescription: description,
                 cancellationToken: CancellationToken.None)),
-            () => new ValueTask(inner.RenewMessageLockAsync(message, CancellationToken.None)));
+            // Settlement deliberately ignores cancellation so an in-flight message still settles
+            // during shutdown. Lock renewal is a background courtesy and honors the caller's token:
+            // on a degraded namespace each renew otherwise burns the SDK's full retry budget, and
+            // the renewal loop must be interruptible mid-call for the batch (and shutdown) to
+            // complete promptly.
+            cancellationToken => new ValueTask(inner.RenewMessageLockAsync(message, cancellationToken)));
 
     /// <summary>Closes the receiver link.</summary>
     public Task CloseAsync(CancellationToken cancellationToken = default)
@@ -159,4 +164,4 @@ internal sealed record AzureServiceBusTransportDelivery(
     Func<ValueTask> CompleteAsync,
     Func<ValueTask> AbandonAsync,
     Func<string, string?, ValueTask> DeadLetterAsync,
-    Func<ValueTask> RenewLockAsync);
+    Func<CancellationToken, ValueTask> RenewLockAsync);

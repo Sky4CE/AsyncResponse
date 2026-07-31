@@ -7,17 +7,67 @@ namespace AsyncResponse.Tests;
 public class AsyncResponseIngressErrorTests
 {
     [Fact]
-    public async Task HandleResponseMessageAsync_WhenRawPublishFails_PublishesExceptionAndSwallowsFallbackFailure()
+    public async Task HandleResponseMessageAsync_ParseFailure_FinalizesViaSetException_WithoutRetrying()
     {
         var original = new InvalidDataException("bad payload");
         var rawPublisher = new ThrowingRawPublisher(original);
-        var publisher = new RecordingPublisher(new InvalidOperationException("fallback failed"));
+        var publisher = new RecordingPublisher();
         var ingress = CreateIngress(rawPublisher, publisher);
 
         await ingress.HandleResponseMessageAsync("<html>bad gateway</html>", "corr-a");
 
+        // An unparseable message never becomes parseable: exactly one attempt, then escalation.
+        Assert.Equal(1, rawPublisher.RawJsonCalls);
         Assert.Same(original, publisher.Exception);
         Assert.Equal("corr-a", publisher.CorrelationId);
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_TransientFailure_RetriesInProcess_WithoutFinalizing()
+    {
+        var rawPublisher = new ThrowingRawPublisher(new TimeoutException("store blip"), _failures: 1);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-b");
+
+        // A transient infrastructure fault must not convert the response into a permanent
+        // business failure on the first attempt.
+        Assert.Equal(2, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_PersistentTransientFailure_FinalizesAfterRetryBudget()
+    {
+        var original = new TimeoutException("store down");
+        var rawPublisher = new ThrowingRawPublisher(original);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-c");
+
+        Assert.Equal(4, rawPublisher.RawJsonCalls);
+        Assert.Same(original, publisher.Exception);
+        Assert.Equal("corr-c", publisher.CorrelationId);
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_WhenEscalationAlsoFails_Propagates_SoTransportRedelivers()
+    {
+        var original = new InvalidDataException("bad payload");
+        var fallbackFailure = new InvalidOperationException("fallback failed");
+        var rawPublisher = new ThrowingRawPublisher(original);
+        var publisher = new RecordingPublisher(fallbackFailure);
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        // Returning normally here would ack a response that now exists nowhere; the double fault
+        // must reach the transport so its redelivery/dead-letter policy retries the pipeline.
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ingress.HandleResponseMessageAsync("<html>bad gateway</html>", "corr-d"));
+
+        Assert.Same(fallbackFailure, thrown);
+        Assert.Same(original, publisher.Exception);
     }
 
     [Fact]
@@ -57,7 +107,7 @@ public class AsyncResponseIngressErrorTests
             NullLogger<AsyncResponseIngress>.Instance);
     }
 
-    private sealed class ThrowingRawPublisher(Exception? _exception = null) : IRawAsyncResponsePublisher
+    private sealed class ThrowingRawPublisher(Exception? _exception = null, int _failures = int.MaxValue) : IRawAsyncResponsePublisher
     {
         public int RawJsonCalls { get; private set; }
 
@@ -67,7 +117,7 @@ public class AsyncResponseIngressErrorTests
         public Task SetRawResponseJson(string responseJson, string? correlationId, CancellationToken cancellationToken = default)
         {
             RawJsonCalls++;
-            return _exception is null ? Task.CompletedTask : Task.FromException(_exception);
+            return _exception is null || RawJsonCalls > _failures ? Task.CompletedTask : Task.FromException(_exception);
         }
     }
 

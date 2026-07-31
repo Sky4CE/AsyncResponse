@@ -63,6 +63,27 @@ When an incoming descriptor names a (service, method) pair the authorizer reject
 refused rather than executed. Use this as defense-in-depth: even if a malicious or corrupted entry
 reaches the store, only an explicitly allowlisted surface can be driven.
 
+### The durable-flow executor and the allowlist
+
+Durable flows persist `IDurableFlowExecutor` methods (`ExecuteAsync`, `ResumeAsync`, `RecoverAsync`,
+`FailAsync`) as every flow's resume/recover/fail targets, so the **allowlist builder admits the
+executor by default** — rejecting it would break flow recovery. This is a deliberate, visible
+trade-off: an attacker with write access to the recovery store or worker transport can then drive
+those four methods, which is bounded to waking/failing flows by id and checkpointing a chosen
+payload into a flow's pending step (`RecoverAsync`) — not arbitrary service invocation. If you do
+not use durable flows, or want to gate the executor yourself, opt out:
+
+```csharp
+.AuthorizeCallbacks(a =>
+{
+    a.AllowDurableFlowExecutor = false;   // executor targets now need explicit allowance
+    a.Allow<IOrderFlow>();
+})
+```
+
+A **custom** `IAsyncResponseCallbackAuthorizer` gets no implicit entries: when durable flows are
+enabled it must allow `IDurableFlowExecutor` itself, or flow recovery callbacks will be refused.
+
 > Default = no authorizer = allow all = unchanged behavior. The authorizer is type-level; it does
 > **not** read per-method attributes.
 

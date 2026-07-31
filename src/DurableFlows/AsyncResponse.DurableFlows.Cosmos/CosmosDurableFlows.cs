@@ -279,6 +279,12 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
                 current.Resource.LeaseId = null;
                 current.Resource.LeaseExpiresAtUtc = null;
+                // Every replace refreshes _ts — the anchor the server-side TTL counts from — so
+                // re-persisting the stored full-window ttl would restart the physical-retention
+                // countdown and decouple it from the logical ExpiresAtUtc. Rewrite it from the
+                // remaining logical window instead. (Checkpoints recompute both together in
+                // TryUpdateAsync; only the lease paths replace without moving ExpiresAtUtc.)
+                current.Resource.Ttl = CosmosTtlSeconds(current.Resource.ExpiresAtUtc, DateTime.UtcNow);
                 await container.ReplaceItemAsync(
                     current.Resource,
                     flowId,
@@ -454,6 +460,10 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
 
                 document.LeaseId = leaseId;
                 document.LeaseExpiresAtUtc = DurableFlowStoreShared.AddSaturating(now, leaseDuration);
+                // Same _ts realignment as ReleaseLeaseAsync: a lease heartbeat replaces the
+                // document without moving ExpiresAtUtc, so it must not restart the server TTL's
+                // full retention window.
+                document.Ttl = CosmosTtlSeconds(document.ExpiresAtUtc, now);
                 await container.ReplaceItemAsync(
                     document,
                     flowId,
@@ -491,6 +501,15 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     /// <summary>Per-item TTL in whole seconds, rounded up and saturated at int.MaxValue (~68 years) for absurd expiries.</summary>
     private static int CosmosTtlSeconds(TimeSpan ttl)
         => (int)Math.Min(Math.Ceiling(ttl.TotalSeconds), int.MaxValue);
+
+    /// <summary>
+    /// Remaining per-item TTL in whole seconds until <paramref name="expiresAtUtc"/>, rounded up
+    /// and floored at 1 (Cosmos rejects 0). Used by replaces that keep the logical expiry in place:
+    /// an already-due document collapses to the shortest legal TTL so the next sweep purges it
+    /// instead of the replace granting it a fresh retention window.
+    /// </summary>
+    private static int CosmosTtlSeconds(DateTime expiresAtUtc, DateTime now)
+        => (int)Math.Min(Math.Max(Math.Ceiling((expiresAtUtc - now).TotalSeconds), 1), int.MaxValue);
 
     /// <summary>Disposes the Cosmos client when the store created (and therefore owns) it.</summary>
     public void Dispose()

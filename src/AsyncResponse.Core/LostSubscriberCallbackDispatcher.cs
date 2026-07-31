@@ -63,15 +63,19 @@ internal sealed class LostSubscriberCallbackDispatcher(
         Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
         var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
-        if (recoveryStates.Count == 0)
-            return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
 
-        // A waiter registers its subscription before saving its recovery state, so a state that is
-        // visible here implies its subscription is visible too. If the caller can now see a live
-        // subscriber, the "nobody listening" premise was a snapshot race — hand the response back
-        // for live delivery instead of consuming the registration and stranding the waiter.
+        // A waiter registers its subscription before saving its recovery state, so the snapshot
+        // race has two shapes — and the re-check must run before the empty-state early return:
+        // a recovery state visible here implies its subscription is visible too, and, inversely, a
+        // freshly registered subscription may not have saved its state yet, in which case
+        // recoveryStates is empty precisely because the waiter is about to go live. Either way a
+        // live subscriber means the "nobody listening" premise was stale — hand the response back
+        // for live delivery instead of consuming registrations or dropping it unrecoverably.
         if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
             return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
+
+        if (recoveryStates.Count == 0)
+            return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
 
         var callbackInvoked = false;
         bool? shouldResume = null;
@@ -129,14 +133,16 @@ internal sealed class LostSubscriberCallbackDispatcher(
         Func<ValueTask<bool>>? hasLiveSubscriber = null)
     {
         var recoveryStates = await recoveryStateStore.GetAllAsync(correlationId, cancellationToken).ConfigureAwait(false);
-        if (recoveryStates.Count == 0)
-            return new LostSubscriberDispatchResult(false, await DispatchLostException(null, exception, channel).ConfigureAwait(false));
 
-        // Same snapshot-race re-check as DispatchLostResponses: a registration that is visible here
-        // implies its subscription is visible too, so a live subscriber means the exception should
-        // be delivered live instead of consuming the registration.
+        // Same snapshot-race re-check as DispatchLostResponses, and for the same reason it must
+        // precede the empty-state early return: an empty snapshot may mean the waiter registered
+        // its subscription but has not saved its recovery state yet. A live subscriber means the
+        // exception should be delivered live instead of consumed here.
         if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
             return new LostSubscriberDispatchResult(false, false) { RetryLive = true };
+
+        if (recoveryStates.Count == 0)
+            return new LostSubscriberDispatchResult(false, await DispatchLostException(null, exception, channel).ConfigureAwait(false));
 
         var callbackInvoked = false;
         ExceptionDispatchInfo? firstException = null;

@@ -465,6 +465,18 @@ public sealed class MongoDbDispatcherTests
     }
 
     [Fact]
+    public void ValidateSubscriber_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (5s ShutdownTimeout + 20s BackgroundDrainTimeout vs HostShutdownTimeout 30s)
+        // must not fail startup.
+        MongoDbTransportOptionsValidator.ValidateSubscriber(
+            new MongoDbAsyncResponseTransportOptions(),
+            new MongoDbSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            "Worker");
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_SlowHandler_RenewsLeaseUntilHandlerFinishes()
     {
         var calls = new Calls();

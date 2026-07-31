@@ -6,6 +6,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using StackExchange.Redis;
 using System.Net;
+using System.Reflection;
 using System.Text.Json;
 using Xunit;
 
@@ -47,6 +48,7 @@ public class RedisAsyncResponseChannelWaiterTests
         public Exception? SubscribeException { get; set; }
         public Exception? UnsubscribeException { get; set; }
         public RedisValue? InvokeOnSubscribe { get; set; }
+        public Action<RedisChannel>? OnSubscribe { get; set; }
         public int UnsubscribeCount => Volatile.Read(ref _unsubscribeCount);
 
         public async Task<IRedisChannelSubscription> SubscribeAsync(RedisChannel channel, Func<RedisChannel, RedisValue, Task> onMessage)
@@ -54,6 +56,7 @@ public class RedisAsyncResponseChannelWaiterTests
             if (SubscribeException is not null)
                 throw SubscribeException;
 
+            OnSubscribe?.Invoke(channel);
             SubscribedChannel = channel;
             Handler = onMessage;
             if (InvokeOnSubscribe is { } message)
@@ -429,6 +432,62 @@ public class RedisAsyncResponseChannelWaiterTests
             channel.SetException(new InvalidOperationException("remote failure"), "corr-a"));
 
         Assert.Same(failure, ex);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_RegistersExecutorChannelBeforeSubscribing()
+    {
+        // The subscriber can start delivering before SubscribeAsync returns, and on a correlation
+        // id reused within the registry's tombstone lifetime those deliveries are silently dropped
+        // for an unregistered channel — so the registration must already be visible when the
+        // subscribe call begins.
+        var channel = CreateChannel();
+        var registry = GetExecutorRegistry(channel);
+        bool? registeredAtSubscribeTime = null;
+        _channelSubscriber.OnSubscribe = subscribed =>
+            registeredAtSubscribeTime = HasExecutorRegistration(registry, subscribed.ToString()!);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-order",
+            timeout: TimeSpan.FromSeconds(5));
+
+        Assert.True(registeredAtSubscribeTime);
+    }
+
+    [Fact]
+    public async Task RedisWaiter_CleanupStillUnsubscribesAndRetires_WhenRecoveryDeleteThrows()
+    {
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("recovery store down"));
+        var channel = CreateChannel();
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-store-down",
+            timeout: TimeSpan.FromSeconds(5));
+        await waiter.DisposeAsync();
+
+        // A failed recovery-state delete is a network fault; it must not skip the local teardown:
+        // the pub/sub subscription is still disposed and the executor channel retired.
+        Assert.Equal(1, _channelSubscriber.UnsubscribeCount);
+        var registry = GetExecutorRegistry(channel);
+        Assert.False(HasExecutorRegistration(registry, _channelSubscriber.SubscribedChannel.ToString()!));
+    }
+
+    private static object GetExecutorRegistry(RedisAsyncResponseChannel channel)
+        => typeof(RedisAsyncResponseChannel)
+            .GetField("_executors", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(channel)!;
+
+    private static bool HasExecutorRegistration(object registry, string channelName)
+    {
+        var registryType = registry.GetType();
+        var gate = registryType.GetField("_gate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(registry)!;
+        var registrations = (Dictionary<string, int>)registryType
+            .GetField("_registrations", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(registry)!;
+        lock (gate)
+            return registrations.ContainsKey(channelName);
     }
 
     [Fact]

@@ -126,11 +126,11 @@ internal static class StressRunner
         failures += await GooglePubSubAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RabbitMqAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RedisAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
-        failures += await NatsAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
-        failures += await PostgreSqlAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await NatsAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await PostgreSqlAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await SqlServerAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await MongoDbAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
-        failures += await AzureServiceBusAckAfterReceiveDispatchStorm(concurrency, Math.Max(1, count / 10));
+        failures += await AzureServiceBusAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await SqsAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await KafkaAckAfterEnqueueDispatchStorm(concurrency, Math.Max(1, count / 10));
         failures += await RaceBurst(concurrency, count);
@@ -489,10 +489,10 @@ internal static class StressRunner
             ("missing", count - Volatile.Read(ref processed)));
     }
 
-    // 3e) NATS JetStream ACK-after-receive dispatch storm. This bypasses a live NATS server and
+    // 3e) NATS JetStream ACK-after-enqueue dispatch storm. This bypasses a live NATS server and
     //     hammers the subscriber callback dispatcher directly: every ACKed delivery must be processed
     //     exactly once.
-    private static async Task<int> NatsAckAfterReceiveDispatchStorm(int concurrency, int count)
+    private static async Task<int> NatsAckAfterEnqueueDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
         var jetStream = new BenchmarkNatsJetStreamTransport();
@@ -534,7 +534,7 @@ internal static class StressRunner
             },
             jetStream,
             options,
-            new NatsSubscriberOptions().UseAckAfterReceive(
+            new NatsSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: workerCount,
                 backgroundQueueCapacity: Math.Max(count, concurrency),
                 backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
@@ -582,9 +582,9 @@ internal static class StressRunner
             ("missing", count - Volatile.Read(ref processed)));
     }
 
-    // 3f) PostgreSQL ACK-after-receive dispatch storm. This bypasses a live PostgreSQL server and
+    // 3f) PostgreSQL ACK-after-enqueue dispatch storm. This bypasses a live PostgreSQL server and
     //     hammers the queue-row callback dispatcher directly: every ACKed row must be processed once.
-    private static async Task<int> PostgreSqlAckAfterReceiveDispatchStorm(int concurrency, int count)
+    private static async Task<int> PostgreSqlAckAfterEnqueueDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
         var options = new PostgreSqlAsyncResponseTransportOptions
@@ -623,7 +623,7 @@ internal static class StressRunner
                 return Task.CompletedTask;
             },
             options,
-            new PostgreSqlSubscriberOptions().UseAckAfterReceive(
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: workerCount,
                 backgroundQueueCapacity: Math.Max(count, concurrency),
                 backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
@@ -851,10 +851,10 @@ internal static class StressRunner
             ("missing", count - Volatile.Read(ref processed)));
     }
 
-    // 3g) Azure Service Bus ACK-after-receive dispatch storm. This bypasses a live Service Bus
+    // 3g) Azure Service Bus ACK-after-enqueue dispatch storm. This bypasses a live Service Bus
     //     namespace and hammers the callback dispatcher directly: every completed message must be
     //     processed once.
-    private static async Task<int> AzureServiceBusAckAfterReceiveDispatchStorm(int concurrency, int count)
+    private static async Task<int> AzureServiceBusAckAfterEnqueueDispatchStorm(int concurrency, int count)
     {
         var workerCount = Math.Clamp(Environment.ProcessorCount, 1, 16);
         var options = new AzureServiceBusAsyncResponseOptions
@@ -893,7 +893,7 @@ internal static class StressRunner
                 return Task.CompletedTask;
             },
             options,
-            new AzureServiceBusSubscriberOptions().UseAckAfterReceive(
+            new AzureServiceBusSubscriberOptions().UseAckAfterEnqueue(
                 backgroundWorkerCount: workerCount,
                 backgroundQueueCapacity: Math.Max(count, concurrency),
                 backgroundDrainTimeout: TimeSpan.FromSeconds(60)),
@@ -917,7 +917,7 @@ internal static class StressRunner
                 () => { Interlocked.Increment(ref completes); return ValueTask.CompletedTask; },
                 () => { Interlocked.Increment(ref abandons); return ValueTask.CompletedTask; },
                 (_, _) => { Interlocked.Increment(ref deadLetters); return ValueTask.CompletedTask; },
-                () => ValueTask.CompletedTask),
+                _ => ValueTask.CompletedTask),
                 CancellationToken.None).ConfigureAwait(false);
         });
 

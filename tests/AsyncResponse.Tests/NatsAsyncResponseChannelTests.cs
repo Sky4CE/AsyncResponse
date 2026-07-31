@@ -515,6 +515,21 @@ public class NatsAsyncResponseChannelTests
         Assert.Equal("ok", result.Message);
     }
 
+    [Fact]
+    public async Task Waiter_CleanupStillDisposesSubscription_WhenRecoveryDeleteThrows()
+    {
+        _store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("kv store down"));
+        var channel = CreateChannel();
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-kv-down", timeout: TimeSpan.FromSeconds(5));
+
+        await waiter.DisposeAsync();
+
+        // A failed recovery-state delete is a network fault; it must not skip the subscription
+        // teardown, or the consume loop would keep running until the process exits.
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
+    }
+
     private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,

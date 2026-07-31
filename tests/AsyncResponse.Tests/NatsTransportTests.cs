@@ -36,10 +36,10 @@ public class NatsTransportOptionsAndSchemaTests
     [Fact]
     public void ValidateSubscriber_RequiresBackgroundSettingsForEarlyAck()
     {
-        var subscriber = new NatsSubscriberOptions { AckMode = NatsAckMode.AckAfterReceive };
+        var subscriber = new NatsSubscriberOptions { AckMode = NatsAckMode.AckAfterEnqueue };
         Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(subscriber, "Worker"));
 
-        subscriber.UseAckAfterReceive(backgroundWorkerCount: 2, backgroundQueueCapacity: 8);
+        subscriber.UseAckAfterEnqueue(backgroundWorkerCount: 2, backgroundQueueCapacity: 8);
         NatsTransportOptionsValidator.ValidateSubscriber(subscriber, "Worker"); // now valid
     }
 
@@ -47,11 +47,11 @@ public class NatsTransportOptionsAndSchemaTests
     public void EarlyAckAndOptionalLimits_CoverValidAndInvalidBoundaries()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            new NatsSubscriberOptions().UseAckAfterReceive(1, 1, TimeSpan.Zero));
+            new NatsSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.Zero));
         Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateSubscriber(
             new NatsSubscriberOptions
             {
-                AckMode = NatsAckMode.AckAfterReceive,
+                AckMode = NatsAckMode.AckAfterEnqueue,
                 BackgroundWorkerCount = 1,
                 BackgroundQueueCapacity = 0
             },
@@ -74,10 +74,9 @@ public class NatsTransportOptionsAndSchemaTests
     {
         var options = new NatsAsyncResponseTransportOptions
         {
-            ShutdownTimeout = TimeSpan.FromSeconds(20),
             HostShutdownTimeout = TimeSpan.FromSeconds(25)
         };
-        var subscriber = new NatsSubscriberOptions().UseAckAfterReceive(1, 8, TimeSpan.FromSeconds(10));
+        var subscriber = new NatsSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(26));
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
             NatsTransportOptionsValidator.ValidateSubscriber(options, subscriber, "Worker"));
@@ -99,10 +98,21 @@ public class NatsTransportOptionsAndSchemaTests
         var ex = Assert.Throws<InvalidOperationException>(() =>
             NatsTransportOptionsValidator.ValidateSubscriber(
                 new NatsAsyncResponseTransportOptions { HostShutdownTimeout = TimeSpan.Zero },
-                new NatsSubscriberOptions().UseAckAfterReceive(1, 8),
+                new NatsSubscriberOptions().UseAckAfterEnqueue(1, 8),
                 "Worker"));
 
         Assert.Contains(nameof(NatsAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message);
+    }
+
+    [Fact]
+    public void ValidateSubscriber_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (BackgroundDrainTimeout 20s vs HostShutdownTimeout 30s) must not fail startup.
+        NatsTransportOptionsValidator.ValidateSubscriber(
+            new NatsAsyncResponseTransportOptions(),
+            new NatsSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            "Worker");
     }
 
     [Fact]
@@ -141,11 +151,6 @@ public class NatsTransportOptionsAndSchemaTests
     public void ValidateCommon_Throws_ForNonPositivePublishAttempts()
         => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
             new NatsAsyncResponseTransportOptions { PublishMaxAttempts = 0 }));
-
-    [Fact]
-    public void ValidateCommon_Throws_ForNonPositiveShutdownTimeout()
-        => Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
-            new NatsAsyncResponseTransportOptions { ShutdownTimeout = TimeSpan.Zero }));
 
     [Fact]
     public void ValidateCommon_Throws_ForNegativeStreamMaxMessages()
@@ -389,15 +394,26 @@ public class NatsWorkerTransportTests
 public class NatsTransportRetryTests
 {
     [Fact]
-    public void Backoff_GrowsExponentially_AndIsCapped()
+    public void Backoff_GrowsExponentially_WithHalfJitter_AndIsCapped()
     {
         var baseDelay = TimeSpan.FromMilliseconds(100);
         var maxDelay = TimeSpan.FromSeconds(1);
 
-        Assert.Equal(TimeSpan.FromMilliseconds(100), AsyncResponseRetry.Backoff(1, baseDelay, maxDelay));
-        Assert.Equal(TimeSpan.FromMilliseconds(200), AsyncResponseRetry.Backoff(2, baseDelay, maxDelay));
-        Assert.Equal(maxDelay, AsyncResponseRetry.Backoff(10, baseDelay, maxDelay));
+        // Half-jitter keeps each delay within [step/2, step] of the exponential step, so the
+        // assertions pin the envelope rather than exact values.
+        for (var i = 0; i < 20; i++)
+        {
+            Assert.InRange(AsyncResponseRetry.Backoff(1, baseDelay, maxDelay).TotalMilliseconds, 50, 100);
+            Assert.InRange(AsyncResponseRetry.Backoff(2, baseDelay, maxDelay).TotalMilliseconds, 100, 200);
+            Assert.InRange(AsyncResponseRetry.Backoff(10, baseDelay, maxDelay).TotalMilliseconds, 500, 1000);
+        }
     }
+
+    [Fact]
+    public void Backoff_ToleratesNonPositiveAttempts()
+        => Assert.InRange(
+            AsyncResponseRetry.Backoff(0, TimeSpan.FromMilliseconds(100), TimeSpan.FromSeconds(1)).TotalMilliseconds,
+            1, 100);
 
     [Fact]
     public void IsTransient_ClassifiesTimeoutAsTransient_AndCancellationAsNot()

@@ -158,21 +158,13 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
                 if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
                     throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
 
-                if (transportOptions.HostShutdownTimeout is { } hostShutdownTimeout)
-                {
-                    var requiredShutdownBudget = transportOptions.ShutdownTimeout + subscriberOptions.BackgroundDrainTimeout;
-                    if (requiredShutdownBudget > hostShutdownTimeout)
-                    {
-                        throw new InvalidOperationException(
-                            $"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)} plus " +
-                            $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ShutdownTimeout)} " +
-                            $"requires {requiredShutdownBudget}, which exceeds " +
-                            $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout)} " +
-                            $"({hostShutdownTimeout}). Increase Microsoft.Extensions.Hosting.HostOptions.ShutdownTimeout " +
-                            $"and mirror that value in {nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout)}, " +
-                            "or reduce the Kafka shutdown/drain timeouts.");
-                    }
-                }
+                // Kafka subscribers spend only the background drain at shutdown; the poll loop
+                // stops with the host token and the consumer close is not separately bounded.
+                ShutdownBudgetValidator.Validate(
+                    "Kafka",
+                    $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout)}",
+                    transportOptions.HostShutdownTimeout,
+                    ($"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)}", subscriberOptions.BackgroundDrainTimeout));
 
                 return;
 

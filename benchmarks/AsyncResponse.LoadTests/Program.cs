@@ -110,7 +110,7 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
         if (existingAzureServiceBusEarlyAckUrl is not null)
         {
             azureServiceBusEarlyAckBaseAddress = new Uri(existingAzureServiceBusEarlyAckUrl);
-            Console.WriteLine($"Load testing existing Azure Service Bus ACK-after-receive instance at {azureServiceBusEarlyAckBaseAddress}.");
+            Console.WriteLine($"Load testing existing Azure Service Bus ACK-after-enqueue instance at {azureServiceBusEarlyAckBaseAddress}.");
         }
     }
 
@@ -146,7 +146,7 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
     if (existingNatsEarlyAckUrl is not null)
     {
         natsEarlyAckBaseAddress = new Uri(existingNatsEarlyAckUrl);
-        Console.WriteLine($"Load testing existing NATS ACK-after-receive instance at {natsEarlyAckBaseAddress}.");
+        Console.WriteLine($"Load testing existing NATS ACK-after-enqueue instance at {natsEarlyAckBaseAddress}.");
     }
 
     postgreSqlBaseAddress = new Uri(existingPostgreSqlUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingKafkaUrl!);
@@ -154,7 +154,7 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
     if (existingPostgreSqlEarlyAckUrl is not null)
     {
         postgreSqlEarlyAckBaseAddress = new Uri(existingPostgreSqlEarlyAckUrl);
-        Console.WriteLine($"Load testing existing PostgreSQL ACK-after-receive instance at {postgreSqlEarlyAckBaseAddress}.");
+        Console.WriteLine($"Load testing existing PostgreSQL ACK-after-enqueue instance at {postgreSqlEarlyAckBaseAddress}.");
     }
 
     kafkaBaseAddress = new Uri(existingKafkaUrl ?? existingUrl ?? existingAzureServiceBusUrl ?? existingRabbitMqUrl ?? existingRedisUrl ?? existingNatsUrl ?? existingPostgreSqlUrl ?? existingSqlServerUrl!);
@@ -252,7 +252,7 @@ else
     Console.WriteLine($"Stack ready; SUT at {baseAddress}.");
     Console.WriteLine($"ACK-after-enqueue SUT at {earlyAckBaseAddress}.");
     Console.WriteLine($"Azure Service Bus SUT at {azureServiceBusBaseAddress}.");
-    Console.WriteLine($"Azure Service Bus ACK-after-receive SUT at {azureServiceBusEarlyAckBaseAddress}.");
+    Console.WriteLine($"Azure Service Bus ACK-after-enqueue SUT at {azureServiceBusEarlyAckBaseAddress}.");
     Console.WriteLine($"SQS SUT at {sqsBaseAddress}.");
     Console.WriteLine($"SQS ACK-after-enqueue SUT at {sqsEarlyAckBaseAddress}.");
     Console.WriteLine($"RabbitMQ SUT at {rabbitMqBaseAddress}.");
@@ -260,9 +260,9 @@ else
     Console.WriteLine($"Redis transport SUT at {redisBaseAddress}.");
     Console.WriteLine($"Redis transport ACK-after-enqueue SUT at {redisEarlyAckBaseAddress}.");
     Console.WriteLine($"NATS SUT at {natsBaseAddress}.");
-    Console.WriteLine($"NATS ACK-after-receive SUT at {natsEarlyAckBaseAddress}.");
+    Console.WriteLine($"NATS ACK-after-enqueue SUT at {natsEarlyAckBaseAddress}.");
     Console.WriteLine($"PostgreSQL SUT at {postgreSqlBaseAddress}.");
-    Console.WriteLine($"PostgreSQL ACK-after-receive SUT at {postgreSqlEarlyAckBaseAddress}.");
+    Console.WriteLine($"PostgreSQL ACK-after-enqueue SUT at {postgreSqlEarlyAckBaseAddress}.");
     Console.WriteLine($"Kafka SUT at {kafkaBaseAddress}.");
     Console.WriteLine($"Kafka ACK-after-enqueue SUT at {kafkaEarlyAckBaseAddress}.");
     Console.WriteLine($"SQL Server SUT at {sqlServerBaseAddress}.");

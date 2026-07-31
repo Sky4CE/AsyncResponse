@@ -117,13 +117,12 @@ public class KafkaDispatcherTests
     public void ValidateOptions_AckAfterEnqueue_RejectsDrainBudgetExceedingHostShutdown()
     {
         var options = KafkaTestData.NewOptions();
-        options.ShutdownTimeout = TimeSpan.FromSeconds(20);
         options.HostShutdownTimeout = TimeSpan.FromSeconds(30);
 
         var ex = Assert.Throws<InvalidOperationException>(() =>
             KafkaMessageDispatcher.ValidateOptions(
                 options,
-                new KafkaSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(15)),
+                new KafkaSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(31)),
                 KafkaSubscriberRole.Worker));
 
         Assert.Contains(nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
@@ -133,13 +132,54 @@ public class KafkaDispatcherTests
     public void ValidateOptions_AckAfterEnqueue_AllowsDrainBudgetWithinHostShutdown()
     {
         var options = KafkaTestData.NewOptions();
-        options.ShutdownTimeout = TimeSpan.FromSeconds(10);
         options.HostShutdownTimeout = TimeSpan.FromSeconds(60);
 
         KafkaMessageDispatcher.ValidateOptions(
             options,
             new KafkaSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(15)),
             KafkaSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_DocumentedEarlyAckDefaults_Pass()
+    {
+        // Regression: the documented two-arg early-ACK opt-in with stock defaults
+        // (BackgroundDrainTimeout 20s vs HostShutdownTimeout 30s) must not fail startup.
+        KafkaMessageDispatcher.ValidateOptions(
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(4, 256),
+            KafkaSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_ShutdownBudget_BoundaryIsInclusive()
+    {
+        // A budget exactly equal to HostShutdownTimeout completes within the host's grant, so it
+        // passes; one tick over is a guaranteed truncation and throws the itemized message.
+        var options = KafkaTestData.NewOptions();
+        options.HostShutdownTimeout = TimeSpan.FromSeconds(30);
+
+        KafkaMessageDispatcher.ValidateOptions(
+            options,
+            new KafkaSubscriberOptions().UseAckAfterEnqueue(2, 8, TimeSpan.FromSeconds(30)),
+            KafkaSubscriberRole.Worker);
+
+        var oneTickOver = TimeSpan.FromSeconds(30) + TimeSpan.FromTicks(1);
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                options,
+                new KafkaSubscriberOptions().UseAckAfterEnqueue(2, 8, oneTickOver),
+                KafkaSubscriberRole.Worker));
+
+        Assert.Contains(
+            $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.WorkerSubscriber)}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)} ({oneTickOver})",
+            ex.Message,
+            StringComparison.Ordinal);
+        Assert.Contains($"requires a shutdown budget of {oneTickOver}", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout)} ({TimeSpan.FromSeconds(30)})",
+            ex.Message,
+            StringComparison.Ordinal);
     }
 
     [Fact]

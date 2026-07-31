@@ -41,8 +41,6 @@ AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseConsum
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseStream.get -> string?
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseStream.set -> void
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ResponseSubscriber.get -> AsyncResponse.Transports.Redis.RedisSubscriberOptions!
-AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ShutdownTimeout.get -> System.TimeSpan
-AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.ShutdownTimeout.set -> void
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.StreamMaxLength.get -> long?
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.StreamMaxLength.set -> void
 AsyncResponse.Transports.Redis.RedisAsyncResponseTransportOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan

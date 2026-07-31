@@ -480,9 +480,14 @@ internal sealed class SqlServerAsyncResponseChannel :
 
     private void AddSubscription(string correlationId, ISqlServerSubscription subscription)
     {
+        // Register with the executor registry BEFORE publishing into the subscription map: every
+        // dispatch path consults the map and then enqueues, so a delivery racing a visible-but-
+        // unregistered subscription on a correlation id reused within the tombstone lifetime would
+        // be silently dropped. In the reversed window (registered, not yet visible) the delivery
+        // just waits for the next sweep or falls back to lost-subscriber recovery.
+        _executors.OnSubscriptionRegistered(ChannelName(correlationId));
         var group = _subscriptions.GetOrAdd(correlationId, _ => new ConcurrentDictionary<Guid, ISqlServerSubscription>());
         group[subscription.Id] = subscription;
-        _executors.OnSubscriptionRegistered(ChannelName(correlationId));
     }
 
     private void RemoveSubscription(string correlationId, Guid registrationId)
@@ -868,7 +873,18 @@ internal sealed class SqlServerAsyncResponseChannel :
         TaskCompletionSource<T> tcs) : IWaiterTimeoutState where T : IAsyncResponsePayload
     {
         public void Schedule()
-            => _ = Task.Run(() => owner.HandleWaiterTimeoutAsync(subscription, activity, correlationId, tcs));
+            => _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await owner.HandleWaiterTimeoutAsync(subscription, activity, correlationId, tcs).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
+                    owner._logger.LogError(ex, "Error handling SQL Server waiter timeout for correlationId {CorrelationId}.", correlationId);
+                }
+            });
     }
 
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
@@ -1097,30 +1113,58 @@ internal sealed class SqlServerAsyncResponseChannel :
             {
                 _dropped = true;
 
-                // Delete the recovery state BEFORE removing the subscription (locally and in the
-                // subscriber table). In the reverse order a publish landing in the window sees
-                // "no subscriber, state present" and fires a spurious recovery callback for a wait
-                // that already reached a terminal state. In this order the window shows a
-                // subscriber that drops the message — a late or duplicate terminal message is
-                // droppable; a resurrected recovery callback is not. (Shutdown/redeploy paths pass
-                // deleteRecoveryState: false and keep the state for lost-subscriber recovery.)
-                if (deleteRecoveryState)
-                    await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
+                try
+                {
+                    // Delete the recovery state BEFORE removing the subscription (locally and in the
+                    // subscriber table). In the reverse order a publish landing in the window sees
+                    // "no subscriber, state present" and fires a spurious recovery callback for a wait
+                    // that already reached a terminal state. In this order the window shows a
+                    // subscriber that drops the message — a late or duplicate terminal message is
+                    // droppable; a resurrected recovery callback is not. (Shutdown/redeploy paths pass
+                    // deleteRecoveryState: false and keep the state for lost-subscriber recovery.)
+                    if (deleteRecoveryState)
+                        await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Best-effort: the state expires on its own, and a transient store failure must
+                    // not skip the local teardown below.
+                    _owner._logger.LogError(ex, "Failed to delete SQL Server recovery state for correlationId {CorrelationId}.", _correlationId);
+                }
+
+                try
+                {
+                    await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Best-effort: an orphaned subscriber row ages out via the heartbeat timeout.
+                    _owner._logger.LogError(ex, "Failed to delete SQL Server subscriber row for correlationId {CorrelationId}.", _correlationId);
+                }
+            }
+            finally
+            {
+                // Purely local teardown runs no matter which network call above failed — the
+                // cleanup latch is already set, so a skipped removal would leak the subscription
+                // map entry and the executor until process exit.
                 _owner.RemoveSubscription(_correlationId, Id);
-                await _owner._sql.DeleteSubscriberAsync(_correlationId, Id, CancellationToken.None).ConfigureAwait(false);
 
                 // Schedule the executor retirement on the thread pool; do not await directly —
                 // dispatch-loop deliveries run this cleanup ON the executor, and RemoveAsync waits
                 // for the executor's drain loop to finish, which would be a circular await.
                 var channelName = _owner.ChannelName(_correlationId);
-                _ = Task.Run(async () => await _owner._executors.RemoveAsync(channelName).ConfigureAwait(false));
-            }
-            catch (Exception ex)
-            {
-                _owner._logger.LogError(ex, "Error during SQL Server waiter cleanup for correlationId {CorrelationId}.", _correlationId);
-            }
-            finally
-            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _owner._executors.RemoveAsync(channelName).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _owner._logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", channelName);
+                    }
+                });
+
                 if (TimeoutRegistration is not null)
                     await TimeoutRegistration().ConfigureAwait(false);
                 TimeoutCancellation?.Dispose();
