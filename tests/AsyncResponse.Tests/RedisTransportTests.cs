@@ -200,8 +200,10 @@ public class RedisTransportTests
     [Fact]
     public void RedisTransportRetry_ClassifiesTransientExceptions()
     {
-        Assert.True(RedisTransportRetry.IsTransient(new RedisConnectionException(ConnectionFailureType.UnableToConnect, "down")));
-        Assert.True(RedisTransportRetry.IsTransient(new RedisTimeoutException("timeout", CommandStatus.Unknown)));
+        Assert.True(RedisTransportRetry.IsTransient(new RedisConnectionException(
+            ConnectionFailureType.UnableToConnect, CommandFlags.None, "down", null, CommandStatus.Unknown)));
+        Assert.True(RedisTransportRetry.IsTransient(new RedisTimeoutException(
+            CommandFlags.None, "timeout", CommandStatus.Unknown)));
         Assert.True(RedisTransportRetry.IsTransient(new TimeoutException()));
         // Cancellation is intentional, not transient: a cancelled command must propagate, not be retried.
         Assert.False(RedisTransportRetry.IsTransient(new OperationCanceledException()));
@@ -531,7 +533,8 @@ public class RedisTransportTests
         {
             AddAttempts++;
             if (AddAttempts <= TransientAddFailuresBeforeSuccess)
-                throw new RedisConnectionException(ConnectionFailureType.UnableToConnect, "transient");
+                throw new RedisConnectionException(
+                    ConnectionFailureType.UnableToConnect, CommandFlags.None, "transient", null, CommandStatus.Unknown);
             if (AddException is not null)
                 throw AddException;
 

@@ -548,7 +548,8 @@ public class RedisDispatcherTests
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase
         {
-            AckException = new RedisConnectionException(ConnectionFailureType.UnableToConnect, "ack failed")
+            AckException = new RedisConnectionException(
+                ConnectionFailureType.UnableToConnect, CommandFlags.None, "ack failed", null, CommandStatus.Unknown)
         };
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -628,7 +629,8 @@ public class RedisDispatcherTests
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase
         {
-            AddException = new RedisConnectionException(ConnectionFailureType.UnableToConnect, "deadletter failed")
+            AddException = new RedisConnectionException(
+                ConnectionFailureType.UnableToConnect, CommandFlags.None, "deadletter failed", null, CommandStatus.Unknown)
         };
         var failureReported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var options = EnqueueSubscriber();

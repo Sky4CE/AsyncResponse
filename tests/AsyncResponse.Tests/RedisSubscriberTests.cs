@@ -93,7 +93,15 @@ public class RedisSubscriberTests
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase
         {
+            // Deliberately the obsolete overload. The only alternative takes a RedisErrorKind, which
+            // StackExchange.Redis ships as experimental (SER007: "subject to change or removal"), and
+            // there is no BUSYGROUP kind to pass anyway. What this double must reproduce is the
+            // exception type plus the message — RedisSubscriberServices.CreateConsumerGroup catches
+            // RedisServerException and filters on "BUSYGROUP", never reading the kind — so taking a
+            // dependency on an evaluation-only API here would buy nothing and break on the next bump.
+#pragma warning disable CS0618 // Type or member is obsolete
             CreateConsumerGroupException = new RedisServerException("BUSYGROUP Consumer Group name already exists")
+#pragma warning restore CS0618
         };
         database.ReadBatches.Enqueue(
         [
