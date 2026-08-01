@@ -41,6 +41,20 @@ public sealed class MongoDbStoreQueryTests
         Assert.Contains(conditions, condition => condition.AsBsonDocument.Contains("fullDocument.queue") && condition["fullDocument.queue"] == "worker");
     }
 
+    /// <summary>
+    /// Fenced renewal extends locked_until from the server clock, so a renewal can never be stamped
+    /// from a skewed app clock the way a client-side timestamp would be.
+    /// </summary>
+    [Fact]
+    public void TransportRenewUpdate_ExtendsTheLeaseFromTheServerClock()
+    {
+        var rendered = MongoDbTransportStore.BuildRenewUpdate(TimeSpan.FromSeconds(30))
+            .Render(TransportRenderArgs());
+
+        var set = rendered.AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal(new BsonArray { "$$NOW", 30000d }, set["locked_until"]["$add"].AsBsonArray);
+    }
+
     [Fact]
     public void TransportClaimFilter_GatesOnQueueAvailabilityAndLockExpiry_UsingServerClock()
     {

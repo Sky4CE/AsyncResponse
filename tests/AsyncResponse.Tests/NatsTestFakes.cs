@@ -191,6 +191,13 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     public NatsDeliveryOutcome NextOutcome { get; set; } = NatsDeliveryOutcome.Replied;
     public Func<bool, NatsDeliveryOutcome>? OutcomeForProbe { get; set; }
     public Exception? RequestException { get; set; }
+
+    /// <summary>
+    /// Per-call outcomes for non-probe deliveries, consumed in order before falling back to
+    /// <see cref="NextOutcome"/>. Needed for the re-publish path, where the first delivery finds no
+    /// responders and the retry after the live-subscriber re-check has to behave differently.
+    /// </summary>
+    public readonly Queue<NatsDeliveryOutcome> DeliveryOutcomes = new();
     public readonly List<(string Subject, string? Payload, bool Probe)> Requests = new();
     public readonly List<string> SubscribedSubjects = new();
     public int FlushCount;
@@ -208,7 +215,9 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
         Requests.Add((subject, payload, probe));
         var outcome = OutcomeForProbe is not null && probe
             ? OutcomeForProbe(probe)
-            : NextOutcome;
+            : !probe && DeliveryOutcomes.Count > 0
+                ? DeliveryOutcomes.Dequeue()
+                : NextOutcome;
 
         if (!probe && outcome != NatsDeliveryOutcome.NoResponders && _subscription is not null && payload is not null)
             _subscription.Push(new NatsInboundResponse(payload, false, () => ValueTask.CompletedTask));

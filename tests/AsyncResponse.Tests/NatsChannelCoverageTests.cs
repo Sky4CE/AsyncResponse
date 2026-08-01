@@ -1,0 +1,301 @@
+using AsyncResponse.Channels.NATS;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Moq;
+using Xunit;
+
+namespace AsyncResponse.Tests;
+
+/// <summary>
+/// NATS channel paths the main suite leaves untouched: the re-publish taken when a waiter subscribes
+/// between the failed delivery and the recovery-state read, the cleanup fallbacks when tearing a
+/// subscription down fails, and the diagnostics tagging on every publish entry point.
+/// </summary>
+public sealed class NatsChannelCoverageTests
+{
+    private readonly FakeNatsResponseChannelClient _client = new();
+    private readonly Mock<IRecoveryStateStore> _store = new();
+    private readonly ServiceProvider _services;
+
+    public NatsChannelCoverageTests()
+    {
+        _store.Setup(store => store.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<RecoveryState>());
+        _store.Setup(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        _services = services.BuildServiceProvider();
+    }
+
+    /// <summary>
+    /// "No responders" plus a probe that finds a live subscriber means the snapshot was stale: the
+    /// publish is retried live, and a successful retry consumes no recovery registration.
+    /// </summary>
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_RetriesLiveWhenAWaiterRaced_AndStopsOnceItLands(PublishKind kind)
+    {
+        // A listener is attached so the delivery/recovery tags inside the retry block are exercised.
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+        // First delivery finds nobody; the probe says a waiter is live; the retry then lands.
+        _client.DeliveryOutcomes.Enqueue(NatsDeliveryOutcome.NoResponders);
+        _client.DeliveryOutcomes.Enqueue(NatsDeliveryOutcome.Replied);
+        _client.OutcomeForProbe = _ => NatsDeliveryOutcome.Replied;
+
+        await PublishAsync(channel, kind, "corr-retry-lands");
+
+        // Two non-probe deliveries: the original and the retry.
+        Assert.Equal(2, _client.Requests.Count(request => !request.Probe));
+        // The dispatcher reads the recovery state once before its live re-check; because the retry
+        // landed, it is never read a second time and the registration is left intact.
+        _store.Verify(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    /// <summary>
+    /// A retry that also finds no responders means the waiter really is gone: only then is the
+    /// recovery registration consumed.
+    /// </summary>
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_ConsumesRecoveryOnlyAfterASecondNoResponders(PublishKind kind)
+    {
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+        _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
+        // The probe reports a live subscriber once — enough to force the retry — then agrees the
+        // waiter is gone, so the second dispatch consumes the registration.
+        var probes = 0;
+        _client.OutcomeForProbe = _ => probes++ == 0 ? NatsDeliveryOutcome.Replied : NatsDeliveryOutcome.NoResponders;
+
+        await PublishAsync(channel, kind, "corr-retry-fails");
+
+        Assert.Equal(2, _client.Requests.Count(request => !request.Probe));
+        _store.Verify(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    /// <summary>
+    /// Every publish entry point opens an activity and tags the channel, the delivery outcome and
+    /// (for exceptions) the exception type.
+    /// </summary>
+    [Fact]
+    public async Task PublishPaths_TagTheirActivityWhenAListenerIsAttached()
+    {
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "corr-tags");
+        await ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", "corr-tags");
+        await channel.SetException(new InvalidOperationException("boom"), "corr-tags");
+
+        foreach (var name in new[] { "asyncresponse.set_response", "asyncresponse.ingress.raw_response", "asyncresponse.set_exception" })
+            activities.Single(name, "asyncresponse.channel", "nats");
+
+        var setException = activities.Single("asyncresponse.set_exception", "asyncresponse.channel", "nats");
+        Assert.Equal(
+            typeof(InvalidOperationException).FullName,
+            AsyncResponseActivityCollector.Tag(setException, "asyncresponse.exception_type"));
+    }
+
+    /// <summary>
+    /// The waiter's own activity is tagged at registration, including the effective timeout.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponseWaiter_TagsTheWaitActivity()
+    {
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-wait-tags", timeout: TimeSpan.FromSeconds(7));
+        // The wait activity is only reported once it stops, which is part of the waiter's cleanup.
+        await waiter.DisposeAsync();
+
+        var activity = activities.Single("asyncresponse.wait", "asyncresponse.channel", "nats");
+        Assert.Equal(7d, AsyncResponseActivityCollector.Tag(activity, "asyncresponse.timeout_seconds"));
+    }
+
+    /// <summary>
+    /// A subscription teardown that throws is logged and must not skip the fallback cancel: the
+    /// server-side subscription is still pumping, and only cancelling its token ends the consume loop.
+    /// </summary>
+    [Fact]
+    public async Task Cleanup_CancelsTheSubscriptionTokenWhenTeardownThrows()
+    {
+        var subscription = new ThrowingSubscription();
+        var client = new Mock<INatsResponseChannelClient>();
+        // The subscription's lifetime is bound to the token handed to SubscribeAsync; that is the
+        // token the fallback cancel has to trip.
+        var subscriptionToken = CancellationToken.None;
+        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Callback<string, CancellationToken>((_, token) => subscriptionToken = token)
+            .ReturnsAsync(subscription);
+        client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var channel = new NatsAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            client.Object,
+            _store.Object,
+            Options.Create(new NatsAsyncResponseChannelOptions { DefaultTimeout = TimeSpan.FromSeconds(5) }),
+            new AsyncResponseContextPropagation([]),
+            logger);
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-teardown");
+        await waiter.DisposeAsync();
+
+        Assert.Contains(logger.Messages, message => message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal));
+        // The teardown failed, so the consume loop is ended by cancelling its token instead.
+        Assert.True(subscriptionToken.IsCancellationRequested);
+    }
+
+    /// <summary>
+    /// A subscription that faults after the waiter already completed cannot fault the task twice;
+    /// the loser is logged rather than lost.
+    /// </summary>
+    /// <remarks>
+    /// The ordering is carried by the iterator itself — terminal envelope, then throw — rather than
+    /// by the test faulting the stream after the fact. Doing it from the outside races the waiter's
+    /// own cleanup, which tears the subscription down the moment the response lands, so the fault
+    /// would usually arrive with no reader left to observe it.
+    /// </remarks>
+    [Fact]
+    public async Task SubscriptionFailure_AfterCompletion_IsLoggedNotSwallowed()
+    {
+        var terminal = System.Text.Json.JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed }
+            },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        var client = new Mock<INatsResponseChannelClient>();
+        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new TerminalThenFaultSubscription(terminal));
+        client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var channel = new NatsAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            client.Object,
+            _store.Object,
+            Options.Create(new NatsAsyncResponseChannelOptions { DefaultTimeout = TimeSpan.FromSeconds(5) }),
+            new AsyncResponseContextPropagation([]),
+            logger);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-late-failure");
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+
+        await Eventually(() => logger.Messages.Any(
+            message => message.StartsWith("TaskCompletionSource already completed", StringComparison.Ordinal)));
+    }
+
+    /// <summary>Registration that fails mid-way rethrows rather than handing back a doomed waiter.</summary>
+    [Fact]
+    public async Task CreateResponseWaiter_RethrowsWhenTheRecoveryStateCannotBeSaved()
+    {
+        _store.Setup(store => store.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("kv store down"));
+        var channel = CreateChannel();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => channel.CreateResponseWaiter<OperationResult>("corr-save-fails", timeout: TimeSpan.FromSeconds(5)));
+    }
+
+    public enum PublishKind
+    {
+        Response,
+        RawJson,
+        Exception
+    }
+
+    private static Task PublishAsync(NatsAsyncResponseChannel channel, PublishKind kind, string correlationId)
+        => kind switch
+        {
+            PublishKind.Response => channel.SetResponse(new OperationResult { Status = OperationStatus.Completed }, correlationId),
+            PublishKind.RawJson => ((IRawAsyncResponsePublisher)channel).SetRawResponseJson("""{"Status":2}""", correlationId),
+            _ => channel.SetException(new InvalidOperationException("boom"), correlationId)
+        };
+
+    private NatsAsyncResponseChannel CreateChannel() => new(
+        _services.GetRequiredService<IServiceScopeFactory>(),
+        _client,
+        _store.Object,
+        Options.Create(new NatsAsyncResponseChannelOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }),
+        new AsyncResponseContextPropagation([]),
+        new TestLogger<NatsAsyncResponseChannel>());
+
+    private static async Task Eventually(Func<bool> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        while (!condition())
+            await Task.Delay(10, timeout.Token);
+    }
+
+    /// <summary>
+    /// Hands over one terminal envelope and then faults, in that order. Yielding before throwing is
+    /// what makes the "stream died after the waiter completed" sequence deterministic.
+    /// </summary>
+    private sealed class TerminalThenFaultSubscription(string terminalEnvelopeJson) : INatsChannelSubscription
+    {
+        public async IAsyncEnumerable<NatsInboundResponse> ReadAsync(
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            yield return new NatsInboundResponse(terminalEnvelopeJson, IsProbe: false, () => ValueTask.CompletedTask);
+            await Task.Yield();
+            throw new InvalidOperationException("stream died");
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>A subscription that never yields and whose teardown always fails.</summary>
+    private sealed class ThrowingSubscription : INatsChannelSubscription
+    {
+        public async IAsyncEnumerable<NatsInboundResponse> ReadAsync(
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            yield break;
+        }
+
+        public ValueTask DisposeAsync() => throw new InvalidOperationException("teardown failed");
+    }
+
+    private sealed class CollectingLogger<T> : ILogger<T>
+    {
+        private readonly List<string> _messages = [];
+        private readonly object _gate = new();
+
+        public IReadOnlyList<string> Messages
+        {
+            get { lock (_gate) return _messages.ToArray(); }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (_gate) _messages.Add(formatter(state, exception));
+        }
+    }
+}

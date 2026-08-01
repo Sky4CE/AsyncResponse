@@ -30,14 +30,16 @@ TITLE="AsyncResponse"
 # The glob is deliberately non-recursive at the call sites: --report-trx also copies each coverage
 # file into its attachment folder, and a recursive glob would parse every one of them twice.
 # Filters keep the report to shipped code — test, benchmark and sample assemblies and generated
-# sources are not the thing being measured.
+# sources are not the thing being measured. ServiceDefaults is named explicitly because it lives in
+# samples/ but does not match the -AsyncResponse.Sample* pattern, so it was being measured as if it
+# shipped.
 reportgenerator \
   -reports:"$REPORTS" \
   -targetdir:"$TARGET_DIR" \
   ${HISTORY_DIR:+-historydir:"$HISTORY_DIR"} \
   -reporttypes:"Html;TextSummary;JsonSummary;MarkdownSummaryGithub" \
   -title:"$TITLE" \
-  -assemblyfilters:"+AsyncResponse*;-AsyncResponse.Tests;-AsyncResponse.IntegrationTests*;-AsyncResponse.LoadTests;-AsyncResponse.Sample*" \
+  -assemblyfilters:"+AsyncResponse*;-AsyncResponse.Tests;-AsyncResponse.IntegrationTests*;-AsyncResponse.LoadTests;-AsyncResponse.Sample*;-AsyncResponse.ServiceDefaults" \
   -filefilters:"-*/obj/*;-*.g.cs;-*.Designer.cs"
 
 # shields.io endpoint badges, one per metric, written next to the report so publishing the report
