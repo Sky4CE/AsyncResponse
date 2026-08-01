@@ -31,10 +31,22 @@ internal static class ReflectionExtensions
     private const int UnresolvableServiceTypeCacheCapacity = 1024;
     private static int _unresolvableGeneration;
 
-    // The AssemblyLoad subscription lives in ReflectionExtensionsModuleInitializer (end of file),
-    // NOT a static constructor: an explicit static ctor forfeits beforefieldinit, adding a
-    // class-initialization check to every static access — including the hand-tuned
-    // ConvertTo/As<T> hot path this file is benchmarked for.
+    // The AssemblyLoad invalidation hook is registered on first use (EnsureAssemblyLoadInvalidation
+    // below), NOT from a static constructor and NOT from a module initializer: an explicit static
+    // ctor forfeits beforefieldinit, adding a class-initialization check to every static access —
+    // including the hand-tuned ConvertTo/As<T> hot path this file is benchmarked for — and
+    // [ModuleInitializer] is analyzer-banned in library code (CA2255). First-call registration
+    // costs one volatile read per type resolution, off the conversion hot path entirely.
+    private static int _assemblyLoadHooked;
+
+    private static void EnsureAssemblyLoadInvalidation()
+    {
+        if (Volatile.Read(ref _assemblyLoadHooked) != 0)
+            return;
+
+        if (Interlocked.Exchange(ref _assemblyLoadHooked, 1) == 0)
+            AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => InvalidateUnresolvableServiceTypes();
+    }
 
     /// <summary>
     /// Invalidates the negative type-resolution cache (a new resolver or assembly may resolve
@@ -138,6 +150,10 @@ internal static class ReflectionExtensions
                         "resolved fails closed with an actionable error and a type-resolution-failure diagnostic instead of misbehaving.")]
     internal static Type? ResolveServiceType(string serviceInterfaceFullName)
     {
+        // Must precede any cache consult/populate: a miss cached without the invalidation hook
+        // active could outlive a later assembly load that makes the name resolvable.
+        EnsureAssemblyLoadInvalidation();
+
         if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
         {
             return cached;
@@ -398,16 +414,4 @@ internal static class ReflectionExtensions
             return System.Convert.ChangeType(value, _conversionType);
         }
     }
-}
-
-/// <summary>
-/// Hooks negative-cache invalidation to assembly loads from a module initializer instead of a
-/// static constructor on <see cref="ReflectionExtensions"/> — an explicit static ctor there would
-/// forfeit <c>beforefieldinit</c> and tax every static access with an initialization check.
-/// </summary>
-internal static class ReflectionExtensionsModuleInitializer
-{
-    [System.Runtime.CompilerServices.ModuleInitializer]
-    internal static void SubscribeAssemblyLoad()
-        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => ReflectionExtensions.InvalidateUnresolvableServiceTypes();
 }
