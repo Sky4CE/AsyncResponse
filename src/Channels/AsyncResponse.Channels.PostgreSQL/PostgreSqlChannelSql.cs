@@ -249,9 +249,15 @@ internal sealed class PostgreSqlChannelSql
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
 
-        // NULL only when a duplicate raced the pruner deleting the original row — the app clock is
-        // a fine approximation for a message that old.
-        return reader.IsDBNull(0) ? DateTimeOffset.UtcNow : reader.GetFieldValue<DateTimeOffset>(0);
+        // NULL means the idempotent duplicate's original row is already gone (pruned mid-publish):
+        // the message is not persisted, so reporting success with a fabricated app-clock timestamp
+        // would both lie about persistence and feed a client clock into the server-clock
+        // watermark. Fail instead, so the publisher's error handling runs.
+        if (reader.IsDBNull(0))
+            throw new InvalidOperationException(
+                $"PostgreSQL response insert for message {id} returned no created_at: the duplicate's original row no longer exists (pruned). The response is not persisted.");
+
+        return reader.GetFieldValue<DateTimeOffset>(0);
     }
 
     public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesAsync(

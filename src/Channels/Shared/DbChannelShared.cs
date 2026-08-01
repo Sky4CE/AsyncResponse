@@ -842,7 +842,11 @@ internal abstract class DbAsyncResponseChannelBase :
     /// self-heals) is chosen over the wrong-data redelivery a tolerant comparison re-opens. No
     /// timestamp can separate the two same-tick cases; only an identity carried on the claim (the
     /// claiming registration id, or a monotonic sequence) could — a possible store-schema
-    /// evolution if the trade ever bites in practice.
+    /// evolution if the trade ever bites in practice. The recovery asymmetry is worth naming for
+    /// the eventual triager: excluded HISTORY re-subscribes and proceeds immediately, while an
+    /// excluded fan-out waiter stalls for its full timeout first — a durable-flow step's default
+    /// is 7 days, and a plain waiter surfaces a TimeoutException to its caller. "Bites in
+    /// practice" looks like a long stall, not a quick retry.
     /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)

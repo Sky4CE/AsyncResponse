@@ -222,11 +222,13 @@ internal sealed class MongoDbChannelStore : IDisposable
             },
             cancellationToken).ConfigureAwait(false);
 
-        // Upsert + ReturnDocument.After cannot return null from a healthy server; guard anyway to
-        // match the store's defensive posture — the app clock is a fine approximation if a driver
-        // anomaly ever surfaces one.
+        // Upsert + ReturnDocument.After cannot return null from a healthy server. If a driver
+        // anomaly ever surfaces one, persistence is UNKNOWN — reporting success with a fabricated
+        // app-clock timestamp would both lie about it and feed a client clock into the
+        // server-clock watermark. Fail instead, so the retry/error path runs.
         return document is null
-            ? DateTimeOffset.UtcNow
+            ? throw new InvalidOperationException(
+                $"MongoDB response upsert for message {id} returned no document despite IsUpsert + ReturnDocument.After; persistence is unknown.")
             : new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero);
     }
 

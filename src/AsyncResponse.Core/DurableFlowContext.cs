@@ -313,7 +313,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
-            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), cancellationToken).ConfigureAwait(false);
+            // Deliberately NOT the caller's token: once the response is claimed from the channel
+            // it exists nowhere else, so the completion checkpoint must not be interruptible — a
+            // cancellation here used to leave `pending` set with the response already consumed,
+            // and the redelivered execution re-attached to a correlation id nothing could answer.
+            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), CancellationToken.None).ConfigureAwait(false);
             return response;
         }
         catch (OperationCanceledException ex) when (triggerCompleted && !waiter.ResponseTask.IsFaulted)
@@ -322,13 +326,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // failure attached so the takeover signal does not discard the real cause.
             _lease.ThrowIfLost(ex);
 
-            // WAIT-SIDE cancellation is infrastructure, not a step verdict: the channel cancels
-            // in-flight waiters when it is disposed at host shutdown, and the caller's token means
-            // "stop this execution", not "the step failed" — the remote operation is still in
-            // flight. The persisted breadcrumb must survive untouched so the redelivered execution
-            // RE-ATTACHES to the same correlation id; marking the checkpoint faulted here turned
-            // every graceful shutdown mid-await into a fresh-correlation restart that re-sent the
-            // remote request. (A response that never arrives still faults via the step timeout.)
+            if (waiter.ResponseTask.IsCompletedSuccessfully)
+            {
+                // The cancellation RACED a delivered response: Task.WaitAsync can complete as
+                // canceled even though the source task finished first. The channel has already
+                // claimed and acked that message — it exists nowhere else, and re-attaching to
+                // its consumed correlation id would park the run until the step timeout. The
+                // checkpoint therefore wins over the cancellation: persist the received payload
+                // and return it; the caller's token gets its say again at the next step boundary.
+                var received = waiter.ResponseTask.Result;
+                checkpoint.PendingCorrelationId = null;
+                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None).ConfigureAwait(false);
+                return received;
+            }
+
+            // WAIT-SIDE cancellation with nothing delivered is infrastructure, not a step
+            // verdict: the channel cancels in-flight waiters when it is disposed at host
+            // shutdown, and the caller's token means "stop this execution", not "the step
+            // failed" — the remote operation is still in flight. The persisted breadcrumb must
+            // survive untouched so the redelivered execution RE-ATTACHES to the same correlation
+            // id; marking the checkpoint faulted here turned every graceful shutdown mid-await
+            // into a fresh-correlation restart that re-sent the remote request. (A response that
+            // never arrives still faults via the step timeout.)
             //
             // The filter is what keeps this narrow: cancellation thrown BY THE TRIGGER (an
             // HttpClient timeout surfaces as TaskCanceledException) means the request may never

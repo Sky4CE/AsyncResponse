@@ -106,6 +106,18 @@ public class RecoveryHealthCheckTests
         Assert.Equal(HealthStatus.Healthy, entry.Value.Status);
     }
 
+    [Fact]
+    public async Task TruncatedScanWithZeroStale_ReportsDegraded()
+    {
+        // Zero stale entries in a truncated scan is not a verdict — arbitrarily many stale
+        // entries can sit past the buffer cap, so the check must not attest Healthy.
+        var result = await CheckAsync(state => state.Publish(Snapshot(
+            CleanReport(totalEntries: 2, withWaiter: 2) with { Truncated = true })));
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("truncated", result.Description!, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<HealthCheckResult> CheckAsync(Action<AsyncResponseWatchdogState> arrange)
     {
         var state = new AsyncResponseWatchdogState();

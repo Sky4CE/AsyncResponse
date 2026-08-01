@@ -191,6 +191,17 @@ public class TypeResolutionTests
     }
 
     [Fact]
+    public void ReflectionExtensions_KeepsBeforeFieldInit()
+    {
+        // Deliberate performance shape, enforced: the AssemblyLoad invalidation hook is
+        // first-call-registered precisely so ReflectionExtensions never has an explicit static
+        // constructor — one (or a field initializer that forces one) would forfeit
+        // beforefieldinit and tax every static access on the hand-tuned ConvertTo/As<T> path
+        // with an initialization check. If this fails, someone added a static ctor.
+        Assert.True(typeof(ReflectionExtensions).Attributes.HasFlag(System.Reflection.TypeAttributes.BeforeFieldInit));
+    }
+
+    [Fact]
     public async Task CustomResolver_ResolvesNameInvisibleToDefaultContext()
     {
         const string aliasName = "Plugin.AsyncResponse.IAliasedFoo.Unique";

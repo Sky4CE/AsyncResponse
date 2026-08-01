@@ -37,15 +37,26 @@ internal static class ReflectionExtensions
     // including the hand-tuned ConvertTo/As<T> hot path this file is benchmarked for — and
     // [ModuleInitializer] is analyzer-banned in library code (CA2255). First-call registration
     // costs one volatile read per type resolution, off the conversion hot path entirely.
-    private static int _assemblyLoadHooked;
+    private static readonly object _assemblyLoadGate = new();
+    private static bool _assemblyLoadHooked;
 
     private static void EnsureAssemblyLoadInvalidation()
     {
-        if (Volatile.Read(ref _assemblyLoadHooked) != 0)
+        if (Volatile.Read(ref _assemblyLoadHooked))
             return;
 
-        if (Interlocked.Exchange(ref _assemblyLoadHooked, 1) == 0)
+        // Attach-then-publish under a gate: publishing the flag before the handler was attached
+        // let a concurrent thread proceed past the fast path, cache a miss, and race an assembly
+        // load into the unhooked window — a false negative that nothing would ever invalidate.
+        // The lock is cold-path only; the steady state is the single volatile read above.
+        lock (_assemblyLoadGate)
+        {
+            if (_assemblyLoadHooked)
+                return;
+
             AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => InvalidateUnresolvableServiceTypes();
+            Volatile.Write(ref _assemblyLoadHooked, true);
+        }
     }
 
     /// <summary>

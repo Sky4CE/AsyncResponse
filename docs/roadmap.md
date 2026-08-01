@@ -234,6 +234,17 @@ the durable asset either way.
 
 ---
 
+### 5.4 Claim-sequence delivery watermark for the DB channels 🟡
+
+The DB channels' delivery watermark is timestamp-based, and a same-tick tie between a waiter's
+registration and another process's claim is deliberately resolved toward exclusion (at-most-once;
+see the `IsWithinWatermark` XML doc for the full trade — the excluded waiter stalls out its
+timeout). No timestamp can separate that tie; the durable fix is an identity: a monotonic
+sequence shared by registrations and claims (PG/SQL Server sequence, MongoDB counter collection),
+with the watermark comparing sequence numbers instead of clocks. Schema + query change across all
+three stores; do it in one train with a store-schema version bump, only if the trade shows up in
+practice.
+
 ## 6. Cheap 2025-26 feature uptake
 
 Small items (XS–S each) that keep shipped packages current with their platforms:

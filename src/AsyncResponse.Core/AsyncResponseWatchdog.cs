@@ -30,8 +30,11 @@ public sealed class AsyncResponseWatchdogOptions
     /// <summary>
     /// Upper bound on the recovery entries one scan buffers (the scan dedupes in memory before
     /// probing liveness). When the store holds more, the scan stops enumerating at the cap,
-    /// reports the buffered subset, and logs a warning — bounding scan memory on very large
-    /// stores at the cost of an incomplete staleness report. Default: 100 000.
+    /// reports the buffered subset (<see cref="AsyncResponseWatchdogReport.Truncated"/> is set,
+    /// the health check degrades), and logs a warning — bounding scan memory on very large
+    /// stores at the cost of an incomplete staleness report. The count is a MEMORY bound, not a
+    /// flow count: grouped entries occupy one slot per unique correlation id, correlation-less
+    /// entries one slot per row. Default: 100 000.
     /// </summary>
     public int MaxScanEntries { get; set; } = 100_000;
 }
@@ -83,11 +86,17 @@ public sealed class AsyncResponseWatchdogState
 }
 
 /// <summary>Result of evaluating a snapshot of the persisted recovery state.</summary>
+/// <param name="Truncated">
+/// Whether the scan stopped at <see cref="AsyncResponseWatchdogOptions.MaxScanEntries"/> before
+/// exhausting the store — the counts and stale list then describe the buffered subset only, and
+/// the health check degrades rather than attesting a staleness verdict it cannot back.
+/// </param>
 public sealed record AsyncResponseWatchdogReport(
     int TotalEntries,
     int EntriesWithActiveWaiter,
     IReadOnlyList<RecoveryStateObservation> StaleEntries,
-    int UnknownAgeEntries)
+    int UnknownAgeEntries,
+    bool Truncated = false)
 {
     /// <summary>
     /// Pure evaluation: an entry is <em>stale</em> when nobody is subscribed to its channel
@@ -358,6 +367,10 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
             if (truncated)
             {
+                // Carried on the report itself, not just telemetry: the health check and gauges
+                // read the report, and a silently truncated scan would otherwise attest a
+                // staleness verdict it never actually computed.
+                report = report with { Truncated = true };
                 activity?.SetTag("asyncresponse.watchdog.truncated", true);
                 _logger.LogWarning(
                     "Recovery watchdog scan stopped at the {MaxScanEntries}-entry buffer cap; staleness is reported for that subset only. Raise AsyncResponseOptions.Watchdog.MaxScanEntries to cover more (scan memory scales with the cap).",

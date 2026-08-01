@@ -437,6 +437,83 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task AwaitStep_CancellationDuringCompletionSave_StillCheckpointsTheReceivedResponse()
+    {
+        // The completion checkpoint runs with CancellationToken.None: once the response is
+        // claimed from the channel it exists nowhere else, so a token firing mid-save must not
+        // leave `pending` set with the response already consumed — the redelivered execution
+        // would re-attach to a correlation id nothing can answer.
+        using var cancellation = new CancellationTokenSource();
+        var store = new CancelOnSecondUpdateStore(cancellation);
+        var state = new FlowState { FlowId = "cancel-mid-save-flow" };
+        await using var lease = await CreateLeaseAsync(store, state);
+
+        var completed = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        completed.TrySetResult(new OperationResult { Status = OperationStatus.Completed });
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            SubscriberReturning(completed.Task, []),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        var result = await context.AwaitStepAsync<OperationResult>(
+            "external-step",
+            _ => Task.CompletedTask,
+            cancellationToken: cancellation.Token);
+
+        Assert.Equal(OperationStatus.Completed, result.Status);
+        Assert.True(cancellation.IsCancellationRequested);
+        var step = state.Steps!["external-step"];
+        Assert.True(step.Completed);
+        Assert.Null(step.PendingCorrelationId);
+        Assert.False(step.Faulted);
+    }
+
+    /// <summary>
+    /// Cancels the provided source when the SECOND state update (the completion save) starts,
+    /// then honours whatever token that update carries — the breadcrumb save is update #1.
+    /// </summary>
+    private sealed class CancelOnSecondUpdateStore(CancellationTokenSource _cancellation) : IFlowStateStore
+    {
+        private readonly InMemoryFlowStateStore _inner = new();
+        private int _updates;
+
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => _inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => _inner.LoadAsync(flowId, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _updates) == 2)
+            {
+                _cancellation.Cancel();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            return _inner.TryUpdateAsync(flowId, state, expectedRevision, ttl, leaseId, cancellationToken);
+        }
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => _inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => _inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => _inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => _inner.TryDeleteAsync(flowId, cancellationToken);
+    }
+
+    [Fact]
     public async Task AwaitStep_TriggerThrowsCancellation_FaultsTheStepForFreshRestart()
     {
         // An HttpClient timeout inside the trigger surfaces as TaskCanceledException. The request

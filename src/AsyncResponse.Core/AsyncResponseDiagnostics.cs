@@ -196,5 +196,8 @@ public static class AsyncResponseDiagnostics
         Meter.CreateObservableGauge("asyncresponse.recovery.stale",
             () => (long)(state.Latest?.Report?.StaleEntries.Count ?? 0), unit: "{entry}",
             description: "Stale recovery registrations (no live waiter, past the threshold) at the last watchdog scan.");
+        Meter.CreateObservableGauge("asyncresponse.recovery.scan_truncated",
+            () => state.Latest?.Report?.Truncated == true ? 1L : 0L, unit: "{scan}",
+            description: "1 when the last watchdog scan stopped at the MaxScanEntries buffer cap — outstanding/stale then describe the buffered subset only.");
     }
 }

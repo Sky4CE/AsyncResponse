@@ -53,8 +53,8 @@ AsyncResponse.AsyncResponseWatchdogOptions.StartupDelay.get -> System.TimeSpan
 AsyncResponse.AsyncResponseWatchdogOptions.StartupDelay.set -> void
 AsyncResponse.AsyncResponseWatchdogReport
 AsyncResponse.AsyncResponseWatchdogReport.<Clone>$() -> AsyncResponse.AsyncResponseWatchdogReport!
-AsyncResponse.AsyncResponseWatchdogReport.AsyncResponseWatchdogReport(int TotalEntries, int EntriesWithActiveWaiter, System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, int UnknownAgeEntries) -> void
-AsyncResponse.AsyncResponseWatchdogReport.Deconstruct(out int TotalEntries, out int EntriesWithActiveWaiter, out System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, out int UnknownAgeEntries) -> void
+AsyncResponse.AsyncResponseWatchdogReport.AsyncResponseWatchdogReport(int TotalEntries, int EntriesWithActiveWaiter, System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, int UnknownAgeEntries, bool Truncated = false) -> void
+AsyncResponse.AsyncResponseWatchdogReport.Deconstruct(out int TotalEntries, out int EntriesWithActiveWaiter, out System.Collections.Generic.IReadOnlyList<AsyncResponse.RecoveryStateObservation!>! StaleEntries, out int UnknownAgeEntries, out bool Truncated) -> void
 AsyncResponse.AsyncResponseWatchdogReport.EntriesWithActiveWaiter.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.EntriesWithActiveWaiter.init -> void
 AsyncResponse.AsyncResponseWatchdogReport.Equals(AsyncResponse.AsyncResponseWatchdogReport? other) -> bool
@@ -62,6 +62,8 @@ AsyncResponse.AsyncResponseWatchdogReport.StaleEntries.get -> System.Collections
 AsyncResponse.AsyncResponseWatchdogReport.StaleEntries.init -> void
 AsyncResponse.AsyncResponseWatchdogReport.TotalEntries.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.TotalEntries.init -> void
+AsyncResponse.AsyncResponseWatchdogReport.Truncated.get -> bool
+AsyncResponse.AsyncResponseWatchdogReport.Truncated.init -> void
 AsyncResponse.AsyncResponseWatchdogReport.UnknownAgeEntries.get -> int
 AsyncResponse.AsyncResponseWatchdogReport.UnknownAgeEntries.init -> void
 AsyncResponse.AsyncResponseWatchdogSnapshot

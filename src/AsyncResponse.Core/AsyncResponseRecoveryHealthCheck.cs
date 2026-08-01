@@ -39,8 +39,9 @@ public sealed record AsyncResponseStaleRecoveryEntry(
 /// <list type="bullet">
 /// <item><description><b>Healthy</b> — last scan found no stale entries (or no scan has run yet:
 /// the watchdog starts with a delay, and readiness must not block on it).</description></item>
-/// <item><description><b>Degraded</b> — stale entries exist, the last scan failed, or the
-/// watchdog stopped publishing (snapshot older than twice the scan interval).</description></item>
+/// <item><description><b>Degraded</b> — stale entries exist, the last scan failed, the last scan
+/// was truncated at the buffer cap (its verdict covers a subset only), or the watchdog stopped
+/// publishing (snapshot older than twice the scan interval).</description></item>
 /// </list>
 /// </summary>
 public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState _state) : IHealthCheck
@@ -84,6 +85,15 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
                 data: BuildData(snapshot));
         }
 
+        if (report.Truncated)
+        {
+            // Zero stale entries in a truncated scan is not a verdict — arbitrarily many stale
+            // entries can sit past the buffer cap. "The scan was incomplete" is a health fact.
+            return HealthCheckResult.Degraded(
+                "Async-response watchdog scan was truncated at the MaxScanEntries buffer cap; staleness was assessed for the buffered subset only. Raise AsyncResponseOptions.Watchdog.MaxScanEntries to restore full coverage.",
+                data: BuildData(snapshot));
+        }
+
         return HealthCheckResult.Healthy(
             "No stale async-response recovery state.",
             BuildData(snapshot));
@@ -99,6 +109,8 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
 
         if (snapshot.Report is not { } report)
             return data;
+
+        data["truncated"] = report.Truncated;
 
         data["stats"] = new AsyncResponseRecoveryStats(
             report.TotalEntries,

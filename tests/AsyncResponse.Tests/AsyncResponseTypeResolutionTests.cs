@@ -42,20 +42,29 @@ public class AsyncResponseTypeResolutionTests : IDisposable
     public void ResolveServiceType_CachesUnresolvableNames_ConsultsResolversOnce()
     {
         // Without the negative cache, every attempt on an unresolvable name (a poisoned recovery
-        // row, a renamed type) re-walks every loaded assembly and the resolver chain.
-        var name = $"Missing.Namespace.Type{Guid.NewGuid():N}";
-        var probes = 0;
-        AsyncResponseTypeResolution.RegisterResolver(candidate =>
+        // row, a renamed type) re-walks every loaded assembly and the resolver chain. An AMBIENT
+        // assembly load between the two lookups legitimately invalidates the cache (that is the
+        // product behavior, and lazy loads do happen mid-run), so assert the steady state: within
+        // a few attempts, a scanned miss must be served from the cache on the immediate retry.
+        for (var attempt = 0; ; attempt++)
         {
-            if (candidate == name)
-                Interlocked.Increment(ref probes);
-            return null;
-        });
+            var name = $"Missing.Namespace.Type{Guid.NewGuid():N}";
+            var probes = 0;
+            AsyncResponseTypeResolution.RegisterResolver(candidate =>
+            {
+                if (candidate == name)
+                    Interlocked.Increment(ref probes);
+                return null;
+            });
 
-        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
-        Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+            Assert.Null(ReflectionExtensions.ResolveServiceType(name));
+            Assert.Null(ReflectionExtensions.ResolveServiceType(name));
 
-        Assert.Equal(1, probes);
+            if (Volatile.Read(ref probes) == 1)
+                return;
+
+            Assert.True(attempt < 4, $"Negative cache never held across two lookups ({probes} probes on final attempt).");
+        }
     }
 
     [Fact]

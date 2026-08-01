@@ -155,6 +155,8 @@ public sealed class CoreUncoveredPathTests
             var snapshot = Assert.IsType<AsyncResponseWatchdogSnapshot>(state.Latest);
             var report = Assert.IsType<AsyncResponseWatchdogReport>(snapshot.Report);
             Assert.Equal(2, report.TotalEntries);
+            // The incompleteness travels ON the report, so the health check and gauges see it.
+            Assert.True(report.Truncated);
         }
         finally
         {

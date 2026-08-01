@@ -276,11 +276,14 @@ internal sealed class SqlServerChannelSql
         lookup.Parameters.AddWithValue("@id", id);
         var existing = await lookup.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
 
-        // NULL only when a duplicate raced the pruner deleting the original row — the app clock is
-        // a fine approximation for a message that old.
+        // A missing row means the idempotent duplicate's original is already gone (pruned
+        // mid-publish): the message is not persisted, so reporting success with a fabricated
+        // app-clock timestamp would both lie about persistence and feed a client clock into the
+        // server-clock watermark. Fail instead, so the publisher's error handling runs.
         return existing is DateTime existingCreatedAt
             ? new DateTimeOffset(existingCreatedAt, TimeSpan.Zero)
-            : DateTimeOffset.UtcNow;
+            : throw new InvalidOperationException(
+                $"SQL Server response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.");
     }
 
     public async Task<IReadOnlyList<SqlServerChannelMessage>> LoadMessagesAsync(
