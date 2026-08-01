@@ -148,7 +148,7 @@ public sealed class RedisChannelCoverageTests
         // A probe that throws is logged and treated as "no information", not propagated.
         _server.Setup(instance => instance.IsConnected).Returns(true);
         _server.Setup(instance => instance.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Throws(new RedisTimeoutException("probe timed out", CommandStatus.Unknown));
+            .Throws(new RedisTimeoutException(CommandFlags.None, "probe timed out", CommandStatus.Unknown));
         Assert.Equal(0L, await channel.CountActiveSubscribersAsync("corr-probe-fails"));
 
         // A blank correlation id short-circuits before any endpoint is touched.
