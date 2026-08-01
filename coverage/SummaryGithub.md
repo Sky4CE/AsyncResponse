@@ -3,18 +3,18 @@
 
 |||
 |:---|:---|
-| Generated on: | 07/31/2026 - 22:52:27 |
+| Generated on: | 08/01/2026 - 11:22:15 |
 | Parser: | MultiReport (3x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 444 |
 | Files: | 200 |
-| **Line coverage:** | 98.5% (23523 of 23858) |
-| Covered lines: | 23523 |
-| Uncovered lines: | 335 |
+| **Line coverage:** | 98.6% (23524 of 23858) |
+| Covered lines: | 23524 |
+| Uncovered lines: | 334 |
 | Coverable lines: | 23858 |
 | Total lines: | 36195 |
-| **Branch coverage:** | 95.7% (8116 of 8472) |
-| Covered branches: | 8116 |
+| **Branch coverage:** | 95.5% (8099 of 8472) |
+| Covered branches: | 8099 |
 | Total branches: | 8472 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
@@ -142,7 +142,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Core**|**98.5%**|**94.1%**|
+|**AsyncResponse.Core**|**98.5%**|**93.7%**|
 |AsyncResponse.AsyncResponseBuilder|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
@@ -154,7 +154,7 @@
 |AsyncResponse.AsyncResponseContextPropagation.CompositeScope2|100%|100%|
 |AsyncResponse.AsyncResponseContextPropagation.LazyCapturingCarrier|100%|91.6%|
 |AsyncResponse.AsyncResponseContextPropagation.NullScope|100%||
-|AsyncResponse.AsyncResponseDiagnostics|98.6%|94.2%|
+|AsyncResponse.AsyncResponseDiagnostics|98.6%|92.3%|
 |AsyncResponse.AsyncResponseDurableFlowStoreMarker|100%|50%|
 |AsyncResponse.AsyncResponseEnvelope<T>|100%||
 |AsyncResponse.AsyncResponseEnvelopeConverter<T>|100%|100%|
@@ -198,14 +198,14 @@
 |AsyncResponse.FlowExecutionLease|96.7%|85.7%|
 |AsyncResponse.FlowStateConcurrency|100%|100%|
 |AsyncResponse.FlowStateJson|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel|99.5%|95.6%|
+|AsyncResponse.InMemoryAsyncResponseChannel|99.5%|92.9%|
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase|97.9%|89.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>|97.9%|89.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel<T>|99.5%|95.6%|
+|AsyncResponse.InMemoryAsyncResponseChannel<T>|99.5%|92.9%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%||
 |AsyncResponse.InMemoryAsyncResponseWaiter<T>|100%||
 |AsyncResponse.InMemoryFlowStateStore|100%|96%|
@@ -435,11 +435,11 @@
 |Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCo<br/>llectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.Kafka - 99.8%</summary>
+<details><summary>AsyncResponse.Transports.Kafka - 100%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.Kafka**|**99.8%**|**98.7%**|
+|**AsyncResponse.Transports.Kafka**|**100%**|**99.1%**|
 |AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext|100%||
@@ -463,7 +463,7 @@
 |AsyncResponse.Transports.Kafka.KafkaTransportTopicSchema|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaWorkerSubscriber|100%||
 |AsyncResponse.Transports.Kafka.KafkaWorkerTransport|100%|100%|
-|AsyncResponse.Transports.Kafka.QueuedKafkaMessageDispatcher|99.1%|87.5%|
+|AsyncResponse.Transports.Kafka.QueuedKafkaMessageDispatcher|100%|100%|
 |Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportService<br/>CollectionExtensions|100%|100%|
 
 </details>
@@ -600,7 +600,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SqlServer**|**95.2%**|**99.5%**|
+|**AsyncResponse.Transports.SqlServer**|**95.2%**|**99.1%**|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.DbMessageDispatcherBase|88%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions|100%||
@@ -616,7 +616,7 @@
 |AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransportRetry|100%|100%|
-|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|94%|97.6%|
+|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|94%|95.2%|
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerSubscriber|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport|100%|100%|
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportSer<br/>viceCollectionExtensions|100%|100%|
@@ -626,7 +626,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SQS**|**98.8%**|**96.2%**|
+|**AsyncResponse.Transports.SQS**|**98.8%**|**94.9%**|
 |AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher|99%|100%|
 |AsyncResponse.Transports.SQS.SqsAsyncResponseOptions|100%||
@@ -650,7 +650,7 @@
 |AsyncResponse.Transports.SQS.SqsSubscriberService.BatchProgress|100%||
 |AsyncResponse.Transports.SQS.SqsTransportDelivery|100%||
 |AsyncResponse.Transports.SQS.SqsWorkerSubscriber|100%||
-|AsyncResponse.Transports.SQS.SqsWorkerTransport|100%|100%|
+|AsyncResponse.Transports.SQS.SqsWorkerTransport|100%|90%|
 |Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionE<br/>xtensions|100%|100%|
 
 </details>
