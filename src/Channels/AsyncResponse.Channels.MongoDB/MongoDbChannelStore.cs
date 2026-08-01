@@ -221,7 +221,13 @@ internal sealed class MongoDbChannelStore : IDisposable
                 ReturnDocument = ReturnDocument.After
             },
             cancellationToken).ConfigureAwait(false);
-        return new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero);
+
+        // Upsert + ReturnDocument.After cannot return null from a healthy server; guard anyway to
+        // match the store's defensive posture — the app clock is a fine approximation if a driver
+        // anomaly ever surfaces one.
+        return document is null
+            ? DateTimeOffset.UtcNow
+            : new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero);
     }
 
     /// <summary>

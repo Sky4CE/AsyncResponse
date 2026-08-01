@@ -17,8 +17,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   wake-ups ride the worker queue and rely on broker redelivery for crash recovery, so a crash
   after an early ACK stranded the run as `Running` with no lease, no queued job, and no discovery
   API. `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` explicitly accepts the risk;
-  early ACK on the response subscriber logs a startup warning instead (a lost response only delays
-  failover through the waiter's timeout).
+  early ACK on the response subscriber logs a startup warning instead (at-most-once response
+  delivery: the waiter times out and a durable flow restarts the step, re-sending its idempotent
+  trigger). **This changes startup behavior** for configurations written against earlier
+  pre-release commits — migration is one line: drop `UseAckAfterEnqueue` from the worker
+  subscriber (the safe default), or set `AllowEarlyAckWorkerSubscriber = true` on the flow-store
+  registration.
 - `asyncresponse.ingress.unroutable_responses` counter (plus an Error-level log): inbound
   responses with no correlation id are acknowledged by design — redelivery could never route
   them — and each occurrence is now loud instead of a Warning-level whisper.
@@ -77,7 +81,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   the only delivery of a domain-failure signal.
 - The PostgreSQL, SQL Server, and MongoDB transport message dispatchers and correlation-id
   extractors now share one source-included implementation (previously three ~280-line and three
-  ~106-line near-verbatim copies). Internal only: rendered log text and telemetry are unchanged.
+  ~106-line near-verbatim copies). Internal only: rendered log text and telemetry are unchanged,
+  but structured log **message templates** did change (the provider name and queue-item noun now
+  arrive as `{Provider}`/`{Unit}` properties on the same rendered text) — re-pin any
+  template-matched alerts or Serilog/Seq groupings.
 - Shutdown-budget defaults now fit the .NET host's 30 s `HostOptions.ShutdownTimeout` out of the
   box: `BackgroundDrainTimeout` defaults dropped from 30 s to 20 s on all transports, transport
   `ShutdownTimeout` defaults dropped from 15 s to 5 s where the value is actually consumed (Azure

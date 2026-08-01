@@ -177,6 +177,9 @@ internal sealed class AsyncResponseStartupValidator(
         if (watchdog.StartupDelay < TimeSpan.Zero)
             throw new InvalidOperationException(
                 $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.StartupDelay)} cannot be negative.");
+        if (watchdog.MaxScanEntries <= 0)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.MaxScanEntries)} must be positive.");
     }
 
     /// <summary>Stops this service.</summary>

@@ -31,8 +31,10 @@ internal static class ReflectionExtensions
     private const int UnresolvableServiceTypeCacheCapacity = 1024;
     private static int _unresolvableGeneration;
 
-    static ReflectionExtensions()
-        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => InvalidateUnresolvableServiceTypes();
+    // The AssemblyLoad subscription lives in ReflectionExtensionsModuleInitializer (end of file),
+    // NOT a static constructor: an explicit static ctor forfeits beforefieldinit, adding a
+    // class-initialization check to every static access — including the hand-tuned
+    // ConvertTo/As<T> hot path this file is benchmarked for.
 
     /// <summary>
     /// Invalidates the negative type-resolution cache (a new resolver or assembly may resolve
@@ -396,4 +398,16 @@ internal static class ReflectionExtensions
             return System.Convert.ChangeType(value, _conversionType);
         }
     }
+}
+
+/// <summary>
+/// Hooks negative-cache invalidation to assembly loads from a module initializer instead of a
+/// static constructor on <see cref="ReflectionExtensions"/> — an explicit static ctor there would
+/// forfeit <c>beforefieldinit</c> and tax every static access with an initialization check.
+/// </summary>
+internal static class ReflectionExtensionsModuleInitializer
+{
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void SubscribeAssemblyLoad()
+        => AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => ReflectionExtensions.InvalidateUnresolvableServiceTypes();
 }

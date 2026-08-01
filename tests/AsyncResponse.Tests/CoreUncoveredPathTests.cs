@@ -116,6 +116,52 @@ public sealed class CoreUncoveredPathTests
         activities.Single("asyncresponse.watchdog.scan", "asyncresponse.watchdog.total_entries", 2);
     }
 
+    /// <summary>
+    /// The scan buffer cap stops enumeration and reports only the buffered subset (with a
+    /// truncation warning), bounding memory on very large recovery stores.
+    /// </summary>
+    [Fact]
+    public async Task Scan_TruncatesAtMaxScanEntries()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = new AsyncResponseWatchdog(
+            [new FakeScanner(
+                new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "one", RegisteredAtUtc = DateTime.UtcNow.AddDays(-3) },
+                new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "two", RegisteredAtUtc = DateTime.UtcNow.AddDays(-3) },
+                new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "three", RegisteredAtUtc = DateTime.UtcNow.AddDays(-3) },
+                new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "four", RegisteredAtUtc = DateTime.UtcNow.AddDays(-3) })],
+            [new FakeProbe(0)],
+            state,
+            Options.Create(new AsyncResponseOptions
+            {
+                Watchdog = new AsyncResponseWatchdogOptions
+                {
+                    Enabled = true,
+                    StartupDelay = TimeSpan.Zero,
+                    Interval = TimeSpan.FromMinutes(5),
+                    StaleAfter = StaleAfter,
+                    MaxScanEntries = 2
+                }
+            }),
+            NullLogger<AsyncResponseWatchdog>.Instance);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (state.Latest is null && DateTime.UtcNow < deadline)
+                await Task.Delay(15);
+
+            var snapshot = Assert.IsType<AsyncResponseWatchdogSnapshot>(state.Latest);
+            var report = Assert.IsType<AsyncResponseWatchdogReport>(snapshot.Report);
+            Assert.Equal(2, report.TotalEntries);
+        }
+        finally
+        {
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+    }
+
     /// <summary>Retiring a subscription the registry never saw is a no-op, not a throw.</summary>
     [Fact]
     public void OnSubscriptionRetired_IgnoresAnUnknownChannel()

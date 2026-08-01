@@ -437,6 +437,62 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task AwaitStep_TriggerThrowsCancellation_FaultsTheStepForFreshRestart()
+    {
+        // An HttpClient timeout inside the trigger surfaces as TaskCanceledException. The request
+        // may never have left the process, so this must NOT preserve the re-attach breadcrumb —
+        // redelivery would park the run on a correlation id nobody answers until the step timeout.
+        var pendingWait = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var state = new FlowState { FlowId = "trigger-cancel-flow" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            SubscriberReturning(pendingWait.Task, []),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.AwaitStepAsync<OperationResult>(
+            "external-step",
+            _ => throw new TaskCanceledException("simulated HttpClient timeout")));
+
+        Assert.True(state.Steps!["external-step"].Faulted);
+    }
+
+    [Fact]
+    public async Task AwaitStep_ResponseWaitFaultedWithCancellation_FaultsTheStepForFreshRestart()
+    {
+        // A wait that FAULTED with a cancellation (e.g. a throwing Until predicate) consumed its
+        // message; re-attaching to that correlation id could never complete. Restart fresh.
+        var faultedWait = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        faultedWait.TrySetException(new OperationCanceledException("predicate threw"));
+        var state = new FlowState { FlowId = "faulted-wait-flow" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            SubscriberReturning(faultedWait.Task, []),
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.AwaitStepAsync<OperationResult>(
+            "external-step",
+            _ => Task.CompletedTask));
+
+        Assert.True(state.Steps!["external-step"].Faulted);
+    }
+
+    [Fact]
     public async Task AwaitStep_WaiterCanceledByShutdown_ReattachesOnRedeliveryWithoutResending()
     {
         // Execution 1: the channel is disposed at host shutdown, which cancels the in-flight

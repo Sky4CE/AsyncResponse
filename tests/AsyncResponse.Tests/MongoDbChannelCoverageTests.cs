@@ -623,7 +623,10 @@ public sealed class MongoDbChannelCoverageTests
     {
         // The other side of the strict comparison: an ack stamped after this waiter registered is a
         // live cross-process fan-out delivery, not history, and must still reach it. Pins that the
-        // stale-redelivery fix did not simply mute every already-acked message.
+        // stale-redelivery fix did not simply mute every already-acked message. (At exact equality
+        // the sibling test above wins deliberately: a same-tick tie is indistinguishable from
+        // history, so even genuine fan-out is excluded there and recovers via the step timeout —
+        // see the IsWithinWatermark XML doc for the full trade.)
         var fixture = new ChannelFixture();
         var live = fixture.Subscription(_ => new ValueTask<bool>(true));
         var startedAt = (DateTimeOffset)live.Instance.GetType()

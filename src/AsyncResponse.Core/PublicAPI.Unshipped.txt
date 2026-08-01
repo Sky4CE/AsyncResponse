@@ -45,6 +45,8 @@ AsyncResponse.AsyncResponseWatchdogOptions.Enabled.get -> bool
 AsyncResponse.AsyncResponseWatchdogOptions.Enabled.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.Interval.get -> System.TimeSpan
 AsyncResponse.AsyncResponseWatchdogOptions.Interval.set -> void
+AsyncResponse.AsyncResponseWatchdogOptions.MaxScanEntries.get -> int
+AsyncResponse.AsyncResponseWatchdogOptions.MaxScanEntries.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.StaleAfter.get -> System.TimeSpan
 AsyncResponse.AsyncResponseWatchdogOptions.StaleAfter.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.StartupDelay.get -> System.TimeSpan

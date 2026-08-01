@@ -286,6 +286,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         var stepTimeout = timeout ?? _options.DefaultStepTimeout;
 
         var waiter = await CreateWaiterAsync(correlationId, until, stepTimeout, name).ConfigureAwait(false);
+        var triggerCompleted = reattach;
         try
         {
             if (!reattach)
@@ -300,6 +301,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 await SaveAsync(cancellationToken).ConfigureAwait(false);
 
                 await trigger(correlationId).ConfigureAwait(false);
+                triggerCompleted = true;
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
             {
@@ -314,26 +316,34 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), cancellationToken).ConfigureAwait(false);
             return response;
         }
-        catch (OperationCanceledException ex)
+        catch (OperationCanceledException ex) when (triggerCompleted && !waiter.ResponseTask.IsFaulted)
         {
             // A lost lease surfaces as cancellation of the linked wait; convert it with the wait
             // failure attached so the takeover signal does not discard the real cause.
             _lease.ThrowIfLost(ex);
 
-            // Cancellation is infrastructure, not a step verdict: the channel cancels in-flight
-            // waiters when it is disposed at host shutdown, and the caller's token means "stop
-            // this execution", not "the step failed" — the remote operation is still in flight.
-            // The persisted breadcrumb must survive untouched so the redelivered execution
+            // WAIT-SIDE cancellation is infrastructure, not a step verdict: the channel cancels
+            // in-flight waiters when it is disposed at host shutdown, and the caller's token means
+            // "stop this execution", not "the step failed" — the remote operation is still in
+            // flight. The persisted breadcrumb must survive untouched so the redelivered execution
             // RE-ATTACHES to the same correlation id; marking the checkpoint faulted here turned
             // every graceful shutdown mid-await into a fresh-correlation restart that re-sent the
             // remote request. (A response that never arrives still faults via the step timeout.)
+            //
+            // The filter is what keeps this narrow: cancellation thrown BY THE TRIGGER (an
+            // HttpClient timeout surfaces as TaskCanceledException) means the request may never
+            // have left the process — re-attaching would park the run on a correlation id nobody
+            // answers — and a response task that FAULTED with a cancellation (a throwing Until
+            // predicate) already consumed its message. Both fall through to the fault path below
+            // and restart the idempotent step fresh.
             throw;
         }
         catch (Exception ex)
         {
-            // Timeout, trigger failure, or a faulted wait: record it so the next execution
-            // restarts this step fresh instead of re-attaching to a dead correlation id. The
-            // original failure rides along as `cause` so a rejected save cannot displace it.
+            // Timeout, trigger failure (including trigger-thrown cancellation), or a faulted
+            // wait: record it so the next execution restarts this step fresh instead of
+            // re-attaching to a dead correlation id. The original failure rides along as `cause`
+            // so a rejected save cannot displace it.
             checkpoint.Faulted = true;
             checkpoint.Message = ex.Message;
             await SaveAsync(CancellationToken.None, cause: ex).ConfigureAwait(false);

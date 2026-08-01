@@ -833,6 +833,17 @@ internal abstract class DbAsyncResponseChannelBase :
     /// non-decreasing, so <c>acked_at &lt;= started_at</c> always holds for history and the strict
     /// form excludes it deterministically — not probabilistically.
     /// </para>
+    /// <para>
+    /// The tie is symmetric, and its resolution is deliberate: the same equality can also be a
+    /// genuine cross-process fan-out delivery (this waiter registered and another process's claim
+    /// stamped <c>acked_at</c> inside one clock tick), and the strict form then excludes the
+    /// waiter from its own response — it recovers through its step timeout and the
+    /// idempotent-restart contract. That at-most-once cost (a rare missed delivery that
+    /// self-heals) is chosen over the wrong-data redelivery a tolerant comparison re-opens. No
+    /// timestamp can separate the two same-tick cases; only an identity carried on the claim (the
+    /// claiming registration id, or a monotonic sequence) could — a possible store-schema
+    /// evolution if the trade ever bites in practice.
+    /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)
         => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1)

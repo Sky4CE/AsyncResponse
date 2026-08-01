@@ -26,6 +26,14 @@ public sealed class AsyncResponseWatchdogOptions
 
     /// <summary>Delay before the first scan, so startup is never blocked. Default: 5 minutes.</summary>
     public TimeSpan StartupDelay { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Upper bound on the recovery entries one scan buffers (the scan dedupes in memory before
+    /// probing liveness). When the store holds more, the scan stops enumerating at the cap,
+    /// reports the buffered subset, and logs a warning — bounding scan memory on very large
+    /// stores at the cost of an incomplete staleness report. Default: 100 000.
+    /// </summary>
+    public int MaxScanEntries { get; set; } = 100_000;
 }
 
 /// <summary>
@@ -277,6 +285,8 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             // finish before the per-id probe connections open.
             Dictionary<string, (DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? byCorrelationId = null;
             List<(string? CorrelationId, DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>? ungrouped = null;
+            var truncated = false;
+            int BufferedCount() => (byCorrelationId?.Count ?? 0) + (ungrouped?.Count ?? 0);
 
             await foreach (var entry in _scanner!.ScanAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -285,14 +295,32 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
                 if (string.IsNullOrEmpty(entry.CorrelationId))
                 {
+                    // The cap gates growth only — replacing an already-buffered correlation id
+                    // with an older sibling costs nothing, so oldest-wins keeps working at the cap.
+                    if (BufferedCount() >= _options.MaxScanEntries)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
                     (ungrouped ??= []).Add((entry.CorrelationId, entry.RegisteredAtUtc, entry.PayloadTypeFullName));
                     continue;
                 }
 
                 byCorrelationId ??= new Dictionary<string, (DateTime?, string?)>(StringComparer.Ordinal);
-                if (!byCorrelationId.TryGetValue(entry.CorrelationId, out var kept)
-                    || (entry.RegisteredAtUtc is { } candidate && (kept.RegisteredAtUtc is not { } existing || candidate < existing)))
+                if (byCorrelationId.TryGetValue(entry.CorrelationId, out var kept))
                 {
+                    if (entry.RegisteredAtUtc is { } candidate && (kept.RegisteredAtUtc is not { } existing || candidate < existing))
+                        byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
+                }
+                else
+                {
+                    if (BufferedCount() >= _options.MaxScanEntries)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
                     byCorrelationId[entry.CorrelationId] = (entry.RegisteredAtUtc, entry.PayloadTypeFullName);
                 }
             }
@@ -327,6 +355,15 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             }
 
             var report = AsyncResponseWatchdogReport.Evaluate(observations, DateTime.UtcNow, _options.StaleAfter);
+
+            if (truncated)
+            {
+                activity?.SetTag("asyncresponse.watchdog.truncated", true);
+                _logger.LogWarning(
+                    "Recovery watchdog scan stopped at the {MaxScanEntries}-entry buffer cap; staleness is reported for that subset only. Raise AsyncResponseOptions.Watchdog.MaxScanEntries to cover more (scan memory scales with the cap).",
+                    _options.MaxScanEntries);
+            }
+
             activity?.SetTag("asyncresponse.watchdog.total_entries", report.TotalEntries);
             activity?.SetTag("asyncresponse.watchdog.active_waiters", report.EntriesWithActiveWaiter);
             activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);

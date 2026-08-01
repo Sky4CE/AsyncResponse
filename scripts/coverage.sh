@@ -157,11 +157,12 @@ fi
 
 if [[ $OPEN_REPORT -eq 1 ]]; then
   # Platform-portable open: `open` is macOS, Linux/WSL have xdg-open, and anywhere else just
-  # print the path — under `set -e` a missing opener must not turn a green run red.
+  # print the path. Under `set -e`, neither a MISSING opener nor a FAILING one (headless session,
+  # no display) may turn a green coverage run red — hence the || fallbacks.
   if command -v open >/dev/null 2>&1; then
-    open "$REPORT_DIR/index.html"
+    open "$REPORT_DIR/index.html" || echo "Coverage report: $REPORT_DIR/index.html"
   elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$REPORT_DIR/index.html"
+    xdg-open "$REPORT_DIR/index.html" || echo "Coverage report: $REPORT_DIR/index.html"
   else
     echo "Coverage report: $REPORT_DIR/index.html"
   fi
