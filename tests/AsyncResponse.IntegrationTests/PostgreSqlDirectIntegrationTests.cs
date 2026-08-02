@@ -18,31 +18,6 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
-    public async Task InsertMessage_ConcurrentSameId_BothResolveTheStoredCreatedAt()
-    {
-        // Two publishers racing the same idempotent message id: ON CONFLICT sees the winner's row
-        // against latest data while the same-statement fallback reads an older snapshot and gets
-        // NULL — the loser must resolve it with a fresh-statement re-read, never throw. The loop
-        // gives the statement-snapshot race repeated chances to land.
-        await WithDataSourceAsync("concurrent_insert", async (schema, dataSource) =>
-        {
-            var options = ChannelOptions(schema);
-            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
-            await sql.EnsureCreatedAsync();
-
-            for (var i = 0; i < 40; i++)
-            {
-                var id = Guid.NewGuid();
-                var first = sql.InsertMessageAsync(id, "concurrent-corr", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
-                var second = sql.InsertMessageAsync(id, "concurrent-corr", SuccessEnvelope("second"), TimeSpan.FromSeconds(30), CancellationToken.None);
-
-                var stamps = await Task.WhenAll(first, second);
-                Assert.Equal(stamps[0], stamps[1]);
-            }
-        });
-    }
-
-    [Fact]
     public async Task InsertMessage_LosingAnUncommittedConflict_ResolvesAfterCommitViaFreshRead()
     {
         // Deterministically forces the stale-snapshot NULL path the fresh-statement re-read
@@ -72,10 +47,31 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             winnerInsert.Parameters.Add("envelope_json", NpgsqlTypes.NpgsqlDbType.Jsonb).Value = SuccessEnvelope("winner");
             var winnerStamp = Assert.IsType<DateTime>(await winnerInsert.ExecuteScalarAsync());
 
+            await using var winnerPidQuery = winnerConnection.CreateCommand();
+            winnerPidQuery.Transaction = winnerTransaction;
+            winnerPidQuery.CommandText = "SELECT pg_backend_pid();";
+            var winnerPid = Assert.IsType<int>(await winnerPidQuery.ExecuteScalarAsync());
+
             var competing = sql.InsertMessageAsync(
                 id, "conflict-corr", SuccessEnvelope("loser"), TimeSpan.FromSeconds(30), CancellationToken.None);
-            await Task.Delay(250);
-            Assert.False(competing.IsCompleted); // parked on the winner's uncommitted conflict
+
+            // Server-observed block barrier: commit only after PostgreSQL itself reports a backend
+            // blocked on the winner's transaction. A timing sleep could elapse before the competing
+            // statement even started — and then the pre-fix implementation would pass too.
+            await using (var monitor = await dataSource.OpenConnectionAsync())
+            {
+                await using var blocked = monitor.CreateCommand();
+                blocked.CommandText = "SELECT count(*) FROM pg_stat_activity WHERE @winner_pid = ANY (pg_blocking_pids(pid));";
+                blocked.Parameters.AddWithValue("winner_pid", winnerPid);
+                var deadline = DateTime.UtcNow.AddSeconds(15);
+                while (Assert.IsType<long>(await blocked.ExecuteScalarAsync()) == 0)
+                {
+                    Assert.True(DateTime.UtcNow < deadline, "the competing insert never blocked on the winner's transaction");
+                    await Task.Delay(25);
+                }
+            }
+
+            Assert.False(competing.IsCompleted); // provably parked on the winner's uncommitted conflict
 
             await winnerTransaction.CommitAsync();
             var resolved = await competing.WaitAsync(TimeSpan.FromSeconds(10));

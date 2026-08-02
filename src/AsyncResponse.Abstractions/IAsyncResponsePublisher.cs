@@ -2,9 +2,11 @@ namespace AsyncResponse;
 
 /// <summary>
 /// Broadcasts asynchronous responses (payloads or failures) on the response channel identified
-/// by a correlation id. Active waiters receive them; when nobody is listening, the
-/// lost-subscriber fallback routes them through the <see cref="RecoveryState"/> callbacks stored
-/// in the configured <see cref="IRecoveryStateStore"/>.
+/// by a correlation id. Active waiters receive them (subject on the database channels to the
+/// same-tick registration/claim tie documented in <c>docs/recovery.md</c>, which is resolved as
+/// at-most-once); when nobody is listening, the lost-subscriber fallback routes them through the
+/// <see cref="RecoveryState"/> callbacks stored in the configured
+/// <see cref="IRecoveryStateStore"/>.
 /// </summary>
 public interface IAsyncResponsePublisher
 {
@@ -34,7 +36,9 @@ public interface IAsyncResponsePublisher
 
     /// <summary>
     /// Publishes a <em>technical</em> failure on the channel associated with the specified
-    /// correlation id. Every active subscriber's wait faults with <paramref name="exception"/>; with
+    /// correlation id. Active subscribers' waits fault with <paramref name="exception"/> — the
+    /// database channels' exceptions travel through the same delivery watermark as responses, so
+    /// the same-tick registration/claim tie (see <c>docs/recovery.md</c>) applies here too; with
     /// no subscribers, the persisted failure callback is invoked.
     /// <para>
     /// <b>Reserve this for genuinely exceptional, unexpected conditions</b> (a dependency is down, a

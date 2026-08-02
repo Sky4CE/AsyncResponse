@@ -100,7 +100,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             _logger.LogError(ex, "Failed to create in-memory waiter for correlationId {CorrelationId}.", correlationId);
             AsyncResponseDiagnostics.SetError(activity, ex);
-            await subscription.CleanupOnceAsync().ConfigureAwait(false);
+            await subscription.DisposeCleanupAsync().ConfigureAwait(false);
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -110,7 +110,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             throw;
         }
 
-        return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.CleanupOnceAsync);
+        return new InMemoryAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.DisposeCleanupAsync);
     }
 
     /// <inheritdoc />
@@ -695,6 +695,23 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return cleanupTask.IsCompletedSuccessfully
                 ? ValueTask.CompletedTask
                 : new ValueTask(cleanupTask);
+        }
+
+        /// <summary>
+        /// Dispose-path cleanup: DRAINS any in-flight dispatch before settling. A delivery may be
+        /// mid <c>Until</c>-predicate holding a claimed terminal message; queueing a no-op through
+        /// the per-waiter dispatch gate completes only after that delivery settled the task (or
+        /// released the gate), so the cleanup's cancel afterwards is a genuine settlement — never
+        /// a cancellation stealing an already-consumed response. Must NOT be called from dispatch
+        /// code (which holds the gate): dispatch-triggered cleanup uses
+        /// <see cref="CleanupOnceAsync"/> directly, with its task already settled.
+        /// </summary>
+        public async ValueTask DisposeCleanupAsync()
+        {
+            if (Volatile.Read(ref _cleanupStarted) == 0)
+                await DispatchSerialAsync(0, static (_, _) => Task.CompletedTask).ConfigureAwait(false);
+
+            await CleanupOnceAsync().ConfigureAwait(false);
         }
 
         private async Task StartCleanupAsync()

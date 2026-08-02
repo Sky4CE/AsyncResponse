@@ -129,16 +129,72 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
         var subscriptionTornDown = false;
-        async ValueTask CleanupOnceAsync()
-        {
-            if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
-                return;
+        var cleanupGate = new object();
+        Task? cleanupTask = null;
+        var consumeLoop = Task.CompletedTask;
 
-            // A waiter disposed before any terminal signal must not leave ResponseTask pending
-            // forever for callers that hold it directly — the timeout dies with this cleanup, so
-            // nothing else could ever complete the task. Cancellation is a no-op after a normal
-            // completion, timeout, or fault.
-            tcs.TrySetCanceled();
+        // Task-latched so EVERY caller completes only when the one real cleanup has finished —
+        // the previous fire-once int latch let a second caller (a disposing waiter racing the
+        // timeout) return before the task was settled. The core itself never waits on the consume
+        // loop: draining happens BEFORE the latch (DrainThenCleanupAsync), because the loop's own
+        // finally also enters this latch — a join inside the core would make the loop await a core
+        // that is joining the loop.
+        ValueTask CleanupOnceAsync()
+        {
+            Task task;
+            lock (cleanupGate)
+            {
+                task = cleanupTask ??= CleanupCoreAsync();
+            }
+
+            return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
+        }
+
+        // Dispose-path cleanup: DRAINS the in-flight delivery before settling. The consume loop
+        // may be mid Until-predicate holding a claimed terminal message; ending the stream and
+        // joining the loop (bounded, so a wedged client library cannot hang disposal) guarantees
+        // that by the time the latched core cancels, the task is either settled by that delivery
+        // or genuinely undelivered. Never called from the loop itself — loop-invoked cleanup uses
+        // CleanupOnceAsync directly, its task already settled by the terminal dispatch.
+        async ValueTask DrainThenCleanupAsync()
+        {
+            if (Volatile.Read(ref cleanupStarted) == 0)
+            {
+                try
+                {
+                    if (subscription is not null)
+                        await subscription.DisposeAsync().ConfigureAwait(false);
+                    else
+                        cancellationTokenSource.Cancel();
+                }
+                catch (Exception drainEx)
+                {
+                    _logger.LogDebug(drainEx, "Ending the subscription before the drain join failed for subject {Subject}; proceeding.", subject);
+                    try
+                    {
+                        cancellationTokenSource.Cancel();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
+
+                try
+                {
+                    await consumeLoop.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                }
+                catch (Exception joinEx)
+                {
+                    _logger.LogDebug(joinEx, "Consume-loop join before settlement failed for subject {Subject}; proceeding.", subject);
+                }
+            }
+
+            await CleanupOnceAsync().ConfigureAwait(false);
+        }
+
+        async Task CleanupCoreAsync()
+        {
+            Interlocked.Exchange(ref cleanupStarted, 1);
 
             try
             {
@@ -180,6 +236,12 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     // gone, or the cancel would fire a spurious waiter timeout.
                     cancellationTokenSource.Cancel();
                 }
+
+                // A waiter disposed before any terminal signal must not leave ResponseTask pending
+                // forever for callers that hold it directly — the timeout died above, so nothing
+                // else could ever complete the task. A no-op after a normal completion, timeout,
+                // fault, or a delivery drained by DrainThenCleanupAsync.
+                tcs.TrySetCanceled();
 
                 cancellationTokenSource.Dispose();
                 activity?.Dispose();
@@ -322,14 +384,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                 AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                await CleanupOnceAsync().ConfigureAwait(false);
+                await DrainThenCleanupAsync().ConfigureAwait(false);
             });
         });
 
         try
         {
             subscription = await _client.SubscribeAsync(subject, cancellationTokenSource.Token).ConfigureAwait(false);
-            _ = Task.Run(() => ConsumeLoopAsync(subscription));
+            consumeLoop = Task.Run(() => ConsumeLoopAsync(subscription));
 
             var recoveryState = new RecoveryState
             {
@@ -353,7 +415,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         {
             _logger.LogError(ex, "Failed to subscribe to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            await CleanupOnceAsync().ConfigureAwait(false);
+            await DrainThenCleanupAsync().ConfigureAwait(false);
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -373,7 +435,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // A response completed and cleaned up between the check and CancelAfter.
         }
 
-        return new NatsAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
+        return new NatsAsyncResponseWaiter<T>(tcs.Task, DrainThenCleanupAsync);
     }
 
     // ---------------------------------------------------------------------------------------

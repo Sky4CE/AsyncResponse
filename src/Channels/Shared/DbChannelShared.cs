@@ -256,7 +256,7 @@ internal abstract class DbAsyncResponseChannelBase :
         {
             _logger.LogError(ex, "Failed to create {Provider} waiter for correlationId {CorrelationId}.", _providerName, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
+            await subscription.DrainThenCleanupAsync(deleteRecoveryState: true).ConfigureAwait(false);
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -272,7 +272,7 @@ internal abstract class DbAsyncResponseChannelBase :
         AddSubscription(correlationId, subscription);
         SignalDispatcher(correlationId);
 
-        return CreateWaiter<T>(tcs.Task, () => subscription.CleanupOnceAsync(deleteRecoveryState: true));
+        return CreateWaiter<T>(tcs.Task, () => subscription.DrainThenCleanupAsync(deleteRecoveryState: true));
     }
 
     /// <inheritdoc />
@@ -966,7 +966,7 @@ internal abstract class DbAsyncResponseChannelBase :
         AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
         AsyncResponseDiagnostics.RecordWaiterTimeout(_activityTag);
         tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-        await subscription.CleanupOnceAsync(deleteRecoveryState: true).ConfigureAwait(false);
+        await subscription.DrainThenCleanupAsync(deleteRecoveryState: true).ConfigureAwait(false);
     }
 
     private interface IWaiterTimeoutState
@@ -1060,7 +1060,7 @@ internal abstract class DbAsyncResponseChannelBase :
         foreach (var (correlationId, group) in _subscriptions.ToArray())
         {
             foreach (var subscription in group.Values.ToArray())
-                await subscription.CleanupOnceAsync(deleteRecoveryState: false).ConfigureAwait(false);
+                await subscription.DrainThenCleanupAsync(deleteRecoveryState: false).ConfigureAwait(false);
             await _executors.RemoveAsync(ChannelName(correlationId)).ConfigureAwait(false);
         }
     }
@@ -1087,6 +1087,7 @@ internal abstract class DbAsyncResponseChannelBase :
         void PruneSeen(DateTimeOffset cutoffUtc);
         Task ProcessAsync(DbChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
+        ValueTask DrainThenCleanupAsync(bool deleteRecoveryState);
         ValueTask DropLocalAsync(CancellationToken cancellationToken);
     }
 
@@ -1102,6 +1103,8 @@ internal abstract class DbAsyncResponseChannelBase :
         private readonly object _seenGate = new();
         private int _cleanupStarted;
         private volatile bool _dropped;
+        private readonly object _cleanupGate = new();
+        private Task? _cleanupTask;
 
         public DbSubscription(
             DbAsyncResponseChannelBase owner,
@@ -1218,8 +1221,60 @@ internal abstract class DbAsyncResponseChannelBase :
             }
         }
 
-        public async ValueTask CleanupOnceAsync(bool deleteRecoveryState)
+        /// <summary>
+        /// Task-latched so EVERY caller completes only when the one real cleanup has finished —
+        /// a fire-once flag alone would let a disposing waiter racing the timeout return before
+        /// the response task was settled.
+        /// </summary>
+        public ValueTask CleanupOnceAsync(bool deleteRecoveryState)
         {
+            Task task;
+            lock (_cleanupGate)
+            {
+                task = _cleanupTask ??= CleanupCoreAsync(deleteRecoveryState);
+            }
+
+            return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
+        }
+
+        /// <summary>
+        /// Dispose-path cleanup: DRAINS the per-correlation serial executor before settling. A
+        /// delivery may be mid <c>Until</c>-predicate holding a message the claim already acked;
+        /// the marker work item completes only after that in-flight item finished, so by the time
+        /// cleanup cancels, the task is either settled by the delivery or genuinely undelivered —
+        /// never a cancellation stealing a consumed response. Must NOT be called from dispatch
+        /// code (which runs ON the executor): the dispatch-triggered cleanup calls
+        /// <see cref="CleanupOnceAsync"/> directly, its task already settled. The drain is
+        /// bounded: an enqueue suppressed by the registry's tombstone (nothing in flight then)
+        /// must not hang disposal.
+        /// </summary>
+        public async ValueTask DrainThenCleanupAsync(bool deleteRecoveryState)
+        {
+            if (Volatile.Read(ref _cleanupStarted) == 0)
+            {
+                var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                try
+                {
+                    await _owner._executors.EnqueueAsync(_owner.ChannelName(_correlationId), () =>
+                    {
+                        drained.TrySetResult();
+                        return Task.CompletedTask;
+                    }).ConfigureAwait(false);
+                    await drained.Task.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                }
+                catch (Exception drainEx)
+                {
+                    _owner._logger.LogDebug(drainEx, "Dispatch drain before cleanup failed for correlationId {CorrelationId}; proceeding.", _correlationId);
+                }
+            }
+
+            await CleanupOnceAsync(deleteRecoveryState).ConfigureAwait(false);
+        }
+
+        private async Task CleanupCoreAsync(bool deleteRecoveryState)
+        {
+            // The flag is kept alongside the task latch: dispatch cores and white-box tests gate
+            // on it, and a pre-set flag (test isolation) must keep skipping the network cleanup.
             if (Interlocked.Exchange(ref _cleanupStarted, 1) != 0)
                 return;
 
@@ -1228,7 +1283,7 @@ internal abstract class DbAsyncResponseChannelBase :
             // nothing else could ever complete the task. This also covers channel DisposeAsync at
             // host shutdown, which runs this cleanup over every in-flight subscription and would
             // otherwise hang still-awaiting WaitAsync callers. Cancellation is a no-op after a
-            // normal completion, timeout, or fault.
+            // normal completion, timeout, fault, or a delivery drained by DrainThenCleanupAsync.
             _tcs.TrySetCanceled();
 
             try

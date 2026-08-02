@@ -403,6 +403,39 @@ public abstract class ChannelConformanceSuite
         Assert.True(responseTask.IsCanceled);
     }
 
+    [Fact]
+    public async Task Contract_DisposeDuringInFlightDelivery_SettlesAsDelivered()
+    {
+        // Disposal must DRAIN an in-flight delivery before settling: the channel has already
+        // claimed the terminal message when the Until predicate runs, so a dispose racing that
+        // delivery must observe the delivered payload — cancelling would make the consumed
+        // response vanish (the strand a re-attaching flow then waits a full step timeout for).
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("drain");
+        using var predicateEntered = new SemaphoreSlim(0);
+        using var releasePredicate = new SemaphoreSlim(0);
+
+        var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId,
+            async _ =>
+            {
+                predicateEntered.Release();
+                await releasePredicate.WaitAsync(WaitBudget);
+                return true;
+            },
+            timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "drained"), correlationId);
+        Assert.True(await predicateEntered.WaitAsync(WaitBudget), "the delivery never reached the Until predicate");
+
+        var disposal = Task.Run(() => waiter.DisposeAsync().AsTask());
+        releasePredicate.Release();
+        await disposal.WaitAsync(WaitBudget);
+
+        var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("drained", result.Message);
+    }
+
     // ----- helpers -----
 
     /// <summary>

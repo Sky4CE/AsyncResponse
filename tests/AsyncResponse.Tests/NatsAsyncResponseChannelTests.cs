@@ -526,8 +526,10 @@ public class NatsAsyncResponseChannelTests
         await waiter.DisposeAsync();
 
         // A failed recovery-state delete is a network fault; it must not skip the subscription
-        // teardown, or the consume loop would keep running until the process exits.
-        Assert.Equal(1, _client.SubscriptionDisposeCount);
+        // teardown, or the consume loop would keep running until the process exits. At LEAST
+        // once, not exactly once: the dispose path also ends the stream up front to DRAIN the
+        // in-flight delivery before settling, and subscription disposal is idempotent.
+        Assert.True(_client.SubscriptionDisposeCount >= 1);
     }
 
     private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false) => new(

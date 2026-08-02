@@ -150,15 +150,61 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
         // happen once no matter whether completion, timeout, or waiter disposal got there first.
         int cleanupStarted = 0;
-        async ValueTask CleanupOnceAsync()
+        var cleanupGate = new object();
+        Task? cleanupTask = null;
+
+        // Task-latched so EVERY caller completes only when the one real cleanup has finished —
+        // the previous fire-once int latch let a second caller (a disposing waiter racing the
+        // timeout) return before the task was settled.
+        ValueTask CleanupOnceAsync()
         {
-            if (Interlocked.Exchange(ref cleanupStarted, 1) != 0)
-                return;
+            Task task;
+            lock (cleanupGate)
+            {
+                task = cleanupTask ??= CleanupCoreAsync();
+            }
+
+            return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
+        }
+
+        // Dispose-path cleanup: DRAINS the per-channel serial executor before settling. A delivery
+        // may be mid Until-predicate holding a claimed terminal message; the marker work item
+        // completes only after that in-flight item finished, so by the time cleanup cancels, the
+        // task is either settled by the delivery or genuinely undelivered — never a cancellation
+        // stealing a consumed response. Must NOT be called from dispatch code (which runs ON the
+        // executor): the dispatch-triggered cleanup uses CleanupOnceAsync directly, its task
+        // already settled.
+        async ValueTask DrainThenCleanupAsync()
+        {
+            if (Volatile.Read(ref cleanupStarted) == 0 && executorRegistered)
+            {
+                var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                try
+                {
+                    await _executors.EnqueueAsync(channel.ToString()!, () =>
+                    {
+                        drained.TrySetResult();
+                        return Task.CompletedTask;
+                    }).ConfigureAwait(false);
+                    await drained.Task.ConfigureAwait(false);
+                }
+                catch (Exception drainEx)
+                {
+                    _logger.LogDebug(drainEx, "Dispatch drain before cleanup failed for channel {Channel}; proceeding.", channel.ToString()!);
+                }
+            }
+
+            await CleanupOnceAsync().ConfigureAwait(false);
+        }
+
+        async Task CleanupCoreAsync()
+        {
+            Interlocked.Exchange(ref cleanupStarted, 1);
 
             // A waiter disposed before any terminal signal must not leave ResponseTask pending
             // forever for callers that hold it directly — the timeout dies with this cleanup, so
             // nothing else could ever complete the task. Cancellation is a no-op after a normal
-            // completion, timeout, or fault.
+            // completion, timeout, or fault (and after a delivery drained by DrainThenCleanupAsync).
             tcs.TrySetCanceled();
 
             try
@@ -340,7 +386,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                 AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
                 tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                await CleanupOnceAsync().ConfigureAwait(false);
+                await DrainThenCleanupAsync().ConfigureAwait(false);
             });
         });
 
@@ -371,7 +417,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         {
             _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            await CleanupOnceAsync().ConfigureAwait(false);
+            await DrainThenCleanupAsync().ConfigureAwait(false);
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -391,7 +437,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // A response completed and cleaned up between the check and CancelAfter.
         }
 
-        return new RedisAsyncResponseWaiter<T>(tcs.Task, CleanupOnceAsync);
+        return new RedisAsyncResponseWaiter<T>(tcs.Task, DrainThenCleanupAsync);
     }
 
     // ---------------------------------------------------------------------------------------
