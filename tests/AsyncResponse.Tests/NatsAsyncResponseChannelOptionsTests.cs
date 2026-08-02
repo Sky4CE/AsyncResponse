@@ -50,6 +50,13 @@ public class NatsAsyncResponseChannelOptionsTests
         // Shared-base knob: enforced via ValidateShared — the bespoke validator accepted
         // TimeSpan.Zero here, defeating the promised disposal bound.
         AssertInvalid(o => o.DisposalDrainTimeout = TimeSpan.Zero);
+        // The ~49.7-day BCL timer ceiling: every one of these knobs arms a timer the runtime
+        // rejects above uint.MaxValue - 1 ms, and RecoveryStateExpiry doubles as the
+        // waiter-timeout fallback — over-ceiling values used to throw only at arming, AFTER the
+        // subscription and recovery state existed.
+        AssertInvalid(o => o.RecoveryStateExpiry = TimeSpan.FromDays(50));
+        AssertInvalid(o => o.DefaultTimeout = TimeSpan.FromDays(50));
+        AssertInvalid(o => o.DisposalDrainTimeout = TimeSpan.FromDays(50));
         AssertInvalid(o => o.DeliveryConfirmationTimeout = TimeSpan.Zero);
         AssertInvalid(o => o.PresenceProbeTimeout = TimeSpan.FromSeconds(-1));
         AssertInvalid(o => o.DefaultTimeout = TimeSpan.Zero);

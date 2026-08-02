@@ -100,6 +100,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // anyway. Timing out routes the flow through its normal failure handling instead of
         // leaving it stuck forever.
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
+        // BEFORE any side effect: an unsupported resolved timeout (negative, or past the ~49.7-day
+        // BCL timer ceiling) used to throw only at timer arming — after the subscription and
+        // recovery state existed, leaking both.
+        AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
         var storedCorrelationId = correlationId;
         // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
@@ -283,7 +287,12 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 // End the stream if the drain has not already — dispatch-triggered cleanup (a
                 // terminal delivery, a loop fault) reaches here without a drain. The helper's
                 // once-latch keeps the teardown single no matter which path got here first.
-                await EndStreamOnceAsync().ConfigureAwait(false);
+                // Bounded like the drain: this latched core is what a disposing waiter awaits
+                // when terminal delivery started cleanup first (the drain skips itself on
+                // cleanupStarted), so an unbudgeted teardown here let a wedged client library
+                // hold DisposeAsync hostage past DisposalDrainTimeout. On the bound lapsing, the
+                // catch below logs and the finally's backstop cancel still ends the consume loop.
+                await EndStreamOnceAsync().AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                 if (subscription is null)
                     subscriptionTornDown = true;
             }

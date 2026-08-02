@@ -496,6 +496,28 @@ public abstract class ChannelConformanceSuite
         await publish.WaitAsync(WaitBudget);
     }
 
+    [Fact]
+    public async Task Contract_TimeoutBeyondTimerCeiling_FailsFastWithoutSideEffects()
+    {
+        // ~49.7 days (uint.MaxValue - 1 ms) is the ceiling of every BCL timer the waiters arm.
+        // Anything above must be rejected BEFORE the subscription and recovery state exist — the
+        // runtime rejects it only at timer arming, which used to surface AFTER those side
+        // effects and leak both.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("ceiling");
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            harness.Subscriber.CreateResponseWaiter<ConformanceResult>(correlationId, timeout: TimeSpan.FromDays(50)));
+
+        Assert.Empty(await harness.RecoveryStateStore.GetAllAsync(correlationId));
+
+        // The correlation id is fully usable afterwards — nothing half-registered lingers.
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "after"), correlationId);
+        Assert.Equal("after", (await waiter.ResponseTask.WaitAsync(WaitBudget)).Message);
+    }
+
     // ----- helpers -----
 
     /// <summary>

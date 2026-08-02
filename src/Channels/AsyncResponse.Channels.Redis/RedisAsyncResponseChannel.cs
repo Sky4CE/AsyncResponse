@@ -119,6 +119,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // anyway. Timing out routes the flow through its normal failure handling instead of
         // leaving it stuck forever.
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
+        // BEFORE any side effect: an unsupported resolved timeout (negative, or past the ~49.7-day
+        // BCL timer ceiling) used to throw only at timer arming — after the subscription and
+        // recovery state existed, leaking both.
+        AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
         var storedCorrelationId = correlationId;
         // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
@@ -252,8 +256,12 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
                 try
                 {
+                    // Bounded like the drain: this latched core is what a disposing waiter awaits
+                    // when terminal delivery started cleanup first, so an unbudgeted unsubscribe
+                    // would let a wedged client library hold DisposeAsync hostage past
+                    // DisposalDrainTimeout.
                     if (subscription is not null)
-                        await subscription.DisposeAsync().ConfigureAwait(false);
+                        await subscription.DisposeAsync().AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                     _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
                 }
                 catch (Exception ex)

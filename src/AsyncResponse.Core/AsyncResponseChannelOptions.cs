@@ -36,20 +36,66 @@ public abstract class AsyncResponseChannelOptions
     public TimeSpan DisposalDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// The largest delay the BCL's timer plumbing accepts: <see cref="CancellationTokenSource"/>
+    /// timers, <see cref="Task.Delay(TimeSpan)"/>, and <c>Task.WaitAsync</c> all reject anything
+    /// above <c>uint.MaxValue - 1</c> milliseconds (~49.7 days). Every knob below arms exactly
+    /// such a timer — <see cref="RecoveryStateExpiry"/> doubles as the waiter-timeout fallback —
+    /// so an over-ceiling value must fail at validation (or waiter creation), not surface as an
+    /// <see cref="ArgumentOutOfRangeException"/> at timer arming AFTER the subscription and
+    /// recovery state already exist.
+    /// </summary>
+    internal static readonly TimeSpan MaxTimerBackedTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
+    /// <summary>
+    /// Guards a RESOLVED per-waiter timeout (explicit, <see cref="DefaultTimeout"/>, or the
+    /// <see cref="RecoveryStateExpiry"/> fallback) immediately before any subscribe/persist side
+    /// effect. Negative values arm a never-firing (-1 ms sentinel) or runtime-rejected timer, and
+    /// values above the BCL ceiling used to throw only at arming — after the subscription and
+    /// recovery state were created, leaking both.
+    /// </summary>
+    internal static void EnsureWaiterTimeoutSupported(TimeSpan timeout)
+    {
+        if (timeout < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout), timeout, "Waiter timeout must not be negative.");
+        if (timeout > MaxTimerBackedTimeout)
+            throw new ArgumentOutOfRangeException(
+                nameof(timeout),
+                timeout,
+                $"Waiter timeout must not exceed {MaxTimerBackedTimeout.TotalDays:0.#} days — the largest timer-backed wait .NET supports.");
+    }
+
+    /// <summary>
     /// Validates the shared channel settings, throwing an actionable
     /// <see cref="InvalidOperationException"/> on misconfiguration. Concrete channels call this from
     /// their own <c>Validate()</c> so every channel fails fast at registration/startup instead of
     /// misbehaving at the first wait (a non-positive expiry silently disables recovery; a
-    /// non-positive default timeout faults every waiter).
+    /// non-positive default timeout faults every waiter; an over-ceiling value is rejected by the
+    /// runtime's timer plumbing only after waiter-registration side effects).
     /// </summary>
     internal void ValidateShared(string optionsName)
     {
         if (RecoveryStateExpiry <= TimeSpan.Zero)
             throw new InvalidOperationException($"{optionsName}.{nameof(RecoveryStateExpiry)} must be positive.");
-        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionsName}.{nameof(DefaultTimeout)} must be positive when configured.");
+        if (RecoveryStateExpiry > MaxTimerBackedTimeout)
+            throw new InvalidOperationException(
+                $"{optionsName}.{nameof(RecoveryStateExpiry)} must not exceed {MaxTimerBackedTimeout.TotalDays:0.#} days " +
+                "(it is also the waiter-timeout fallback, and .NET timers reject longer delays).");
+        if (DefaultTimeout is { } defaultTimeout)
+        {
+            if (defaultTimeout <= TimeSpan.Zero)
+                throw new InvalidOperationException($"{optionsName}.{nameof(DefaultTimeout)} must be positive when configured.");
+            if (defaultTimeout > MaxTimerBackedTimeout)
+                throw new InvalidOperationException(
+                    $"{optionsName}.{nameof(DefaultTimeout)} must not exceed {MaxTimerBackedTimeout.TotalDays:0.#} days " +
+                    "(.NET timers reject longer delays).");
+        }
+
         if (DisposalDrainTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException($"{optionsName}.{nameof(DisposalDrainTimeout)} must be positive.");
+        if (DisposalDrainTimeout > MaxTimerBackedTimeout)
+            throw new InvalidOperationException(
+                $"{optionsName}.{nameof(DisposalDrainTimeout)} must not exceed {MaxTimerBackedTimeout.TotalDays:0.#} days " +
+                "(.NET timers reject longer delays).");
     }
 }
 

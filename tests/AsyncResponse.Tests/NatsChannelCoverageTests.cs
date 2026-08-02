@@ -132,34 +132,19 @@ public sealed class NatsChannelCoverageTests
     [Fact]
     public async Task Cleanup_CancelsTheSubscriptionTokenWhenTeardownThrows()
     {
-        var client = new Mock<INatsResponseChannelClient>();
-        // The subscription's lifetime is bound to the token handed to SubscribeAsync; that is the
-        // token the fallback cancel has to trip (and the token that ends the fake's read).
-        var subscriptionToken = CancellationToken.None;
-        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns((string _, CancellationToken token) =>
-            {
-                subscriptionToken = token;
-                return Task.FromResult<INatsChannelSubscription>(new ThrowingSubscription(token));
-            });
-        client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-
+        var client = new FakeNatsResponseChannelClient
+        {
+            SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
+        };
         var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = new NatsAsyncResponseChannel(
-            _services.GetRequiredService<IServiceScopeFactory>(),
-            client.Object,
-            _store.Object,
-            Options.Create(new NatsAsyncResponseChannelOptions { DefaultTimeout = TimeSpan.FromSeconds(5) }),
-            new AsyncResponseContextPropagation([]),
-            logger);
+        var channel = CreateChannel(client, logger);
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-teardown");
         await waiter.DisposeAsync();
 
         Assert.Contains(logger.Messages, message => message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal));
         // The teardown failed, so the consume loop is ended by cancelling its token instead.
-        Assert.True(subscriptionToken.IsCancellationRequested);
+        Assert.True(client.SubscriptionLifetime.IsCancellationRequested);
     }
 
     [Fact]
@@ -170,29 +155,12 @@ public sealed class NatsChannelCoverageTests
         // settlement it must fault as indeterminate — the generic teardown-throw path used to
         // shortcut straight to the cleanup's cancel, telling a re-attaching flow "nothing was
         // delivered" about a message the stream had already handed over.
-        var subscription = new WedgeableThrowingDisposeSubscription();
-        var client = new Mock<INatsResponseChannelClient>();
-        client.Setup(instance => instance.SubscribeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .Returns((string _, CancellationToken token) =>
-            {
-                subscription.BindLifetime(token);
-                return Task.FromResult<INatsChannelSubscription>(subscription);
-            });
-        client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-
+        var client = new FakeNatsResponseChannelClient
+        {
+            SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
+        };
         var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = new NatsAsyncResponseChannel(
-            _services.GetRequiredService<IServiceScopeFactory>(),
-            client.Object,
-            _store.Object,
-            Options.Create(new NatsAsyncResponseChannelOptions
-            {
-                DefaultTimeout = TimeSpan.FromMinutes(1),
-                DisposalDrainTimeout = TimeSpan.FromMilliseconds(200)
-            }),
-            new AsyncResponseContextPropagation([]),
-            logger);
+        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
 
         using var predicateEntered = new SemaphoreSlim(0);
         using var releasePredicate = new SemaphoreSlim(0);
@@ -204,13 +172,7 @@ public sealed class NatsChannelCoverageTests
                 return await releasePredicate.WaitAsync(TimeSpan.FromSeconds(30));
             });
 
-        subscription.Push(System.Text.Json.JsonSerializer.Serialize(
-            new AsyncResponseEnvelope<OperationResult>
-            {
-                Success = true,
-                Payload = new OperationResult { Status = OperationStatus.Completed, Message = "wedged" }
-            },
-            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        client.Push(TerminalEnvelope("wedged"));
         Assert.True(await predicateEntered.WaitAsync(TimeSpan.FromSeconds(5)), "the delivery never reached the Until predicate");
 
         await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
@@ -225,6 +187,59 @@ public sealed class NatsChannelCoverageTests
 
         releasePredicate.Release();
     }
+
+    /// <summary>
+    /// Terminal delivery starts cleanup first, so a disposing waiter awaits the LATCHED core —
+    /// the drain skips itself once <c>cleanupStarted</c> is set. The core's teardown must
+    /// therefore carry the same <c>DisposalDrainTimeout</c> bound: a hanging client-library
+    /// dispose used to hold <c>waiter.DisposeAsync()</c> pending indefinitely.
+    /// </summary>
+    [Fact]
+    public async Task TerminalCleanup_HangingTeardown_KeepsDisposalBounded()
+    {
+        var hang = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeNatsResponseChannelClient
+        {
+            SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
+        };
+        var channel = CreateChannel(client, new CollectingLogger<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hang");
+        client.Push(TerminalEnvelope("done"));
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("done", result.Message);
+
+        // The delivered response settled the task; disposal joins the terminal cleanup, whose
+        // hanging teardown must be abandoned at the budget — not hold DisposeAsync hostage.
+        await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+
+        hang.TrySetResult();
+    }
+
+    private NatsAsyncResponseChannel CreateChannel(
+        FakeNatsResponseChannelClient client,
+        ILogger<NatsAsyncResponseChannel> logger,
+        TimeSpan? drainTimeout = null) => new(
+        _services.GetRequiredService<IServiceScopeFactory>(),
+        client,
+        _store.Object,
+        Options.Create(new NatsAsyncResponseChannelOptions
+        {
+            DefaultTimeout = TimeSpan.FromMinutes(1),
+            DisposalDrainTimeout = drainTimeout ?? TimeSpan.FromSeconds(30)
+        }),
+        new AsyncResponseContextPropagation([]),
+        logger);
+
+    private static string TerminalEnvelope(string? message = null)
+        => System.Text.Json.JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed, Message = message }
+            },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
 
     /// <summary>
     /// A subscription that faults after the waiter already completed cannot fault the task twice;
@@ -332,67 +347,7 @@ public sealed class NatsChannelCoverageTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
-    /// <summary>A subscription that never yields and whose teardown always fails.</summary>
-    private sealed class ThrowingSubscription(CancellationToken _lifetime) : INatsChannelSubscription
-    {
-        public async IAsyncEnumerable<NatsInboundResponse> ReadAsync(
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            // Idle until the subscription's lifetime token (handed to SubscribeAsync) ends the
-            // stream, then complete GRACEFULLY — the real adapter's read does not throw when the
-            // subscription is ended. That graceful end is what lets a teardown-throw drain PROVE
-            // settlement via the loop join instead of waiting out the whole drain budget.
-            try
-            {
-                await Task.Delay(Timeout.Infinite, _lifetime).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-            }
 
-            yield break;
-        }
-
-        public ValueTask DisposeAsync() => throw new InvalidOperationException("teardown failed");
-    }
-
-    /// <summary>
-    /// Delivers pushed messages like the real adapter (read ends gracefully when the lifetime
-    /// token ends the subscription) but throws on <see cref="DisposeAsync"/> — the shape of the
-    /// round-9 probe: teardown failure while a delivery is mid-predicate.
-    /// </summary>
-    private sealed class WedgeableThrowingDisposeSubscription : INatsChannelSubscription
-    {
-        private readonly System.Threading.Channels.Channel<NatsInboundResponse> _messages =
-            System.Threading.Channels.Channel.CreateUnbounded<NatsInboundResponse>();
-        private CancellationToken _lifetime;
-
-        public void BindLifetime(CancellationToken lifetime) => _lifetime = lifetime;
-
-        public void Push(string payload)
-            => _messages.Writer.TryWrite(new NatsInboundResponse(payload, false, () => ValueTask.CompletedTask));
-
-        public async IAsyncEnumerable<NatsInboundResponse> ReadAsync(
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            while (true)
-            {
-                NatsInboundResponse message;
-                try
-                {
-                    message = await _messages.Reader.ReadAsync(_lifetime).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    yield break;
-                }
-
-                yield return message;
-            }
-        }
-
-        public ValueTask DisposeAsync() => throw new InvalidOperationException("teardown failed");
-    }
 
     private sealed class CollectingLogger<T> : ILogger<T>
     {

@@ -72,6 +72,11 @@ public sealed class PostgreSqlOptionsTests
         AssertChannelInvalid(
             options => options.DisposalDrainTimeout = TimeSpan.Zero,
             nameof(PostgreSqlAsyncResponseChannelOptions.DisposalDrainTimeout));
+        // Over the ~49.7-day BCL timer ceiling: the runtime rejects the value at timer arming,
+        // which used to surface only AFTER waiter-registration side effects.
+        AssertChannelInvalid(
+            options => options.DefaultTimeout = TimeSpan.FromDays(50),
+            nameof(PostgreSqlAsyncResponseChannelOptions.DefaultTimeout));
         AssertChannelInvalid(
             options => options.MaxRemoteStackTraceLength = -1,
             nameof(PostgreSqlAsyncResponseChannelOptions.MaxRemoteStackTraceLength));

@@ -207,6 +207,16 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     public bool HasSubscription => _subscription is not null;
     public int SubscriptionDisposeCount => Volatile.Read(ref _subscriptionDisposeCount);
 
+    /// <summary>
+    /// Replaces the subscription's default teardown (complete the stream) so a test can make it
+    /// throw or hang without a bespoke <see cref="INatsChannelSubscription"/> implementation. The
+    /// dispose count still increments, so exactly-once teardown stays assertable.
+    /// </summary>
+    public Func<ValueTask>? SubscriptionDisposeOverride { get; set; }
+
+    /// <summary>The lifetime token the channel handed to the live subscription.</summary>
+    public CancellationToken SubscriptionLifetime { get; private set; }
+
     public Task<NatsDeliveryOutcome> RequestAsync(string subject, string? payload, bool probe, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (RequestException is not null)
@@ -228,7 +238,8 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     public Task<INatsChannelSubscription> SubscribeAsync(string subject, CancellationToken cancellationToken)
     {
         SubscribedSubjects.Add(subject);
-        _subscription = new FakeSubscription(this);
+        SubscriptionLifetime = cancellationToken;
+        _subscription = new FakeSubscription(this, cancellationToken);
         return Task.FromResult<INatsChannelSubscription>(_subscription);
     }
 
@@ -248,7 +259,7 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     /// <summary>Faults the live subscription's read loop with <paramref name="exception"/>.</summary>
     public void FailSubscription(Exception exception) => _subscription!.Fail(exception);
 
-    private sealed class FakeSubscription(FakeNatsResponseChannelClient owner) : INatsChannelSubscription
+    private sealed class FakeSubscription(FakeNatsResponseChannelClient owner, CancellationToken lifetime) : INatsChannelSubscription
     {
         private readonly Channel<NatsInboundResponse> _channel = Channel.CreateUnbounded<NatsInboundResponse>();
 
@@ -258,13 +269,43 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 
         public async IAsyncEnumerable<NatsInboundResponse> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            await foreach (var message in _channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
-                yield return message;
+            // Like the real adapter: the read also ends — GRACEFULLY, not by throwing — when the
+            // lifetime token handed to SubscribeAsync ends the subscription (the channel's
+            // backstop cancel when teardown failed or hung). Fail(exception) still propagates.
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime, cancellationToken);
+            var reader = _channel.Reader.ReadAllAsync(linked.Token).GetAsyncEnumerator(CancellationToken.None);
+            try
+            {
+                while (true)
+                {
+                    bool moved;
+                    try
+                    {
+                        moved = await reader.MoveNextAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        yield break;
+                    }
+
+                    if (!moved)
+                        yield break;
+
+                    yield return reader.Current;
+                }
+            }
+            finally
+            {
+                await reader.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         public ValueTask DisposeAsync()
         {
             Interlocked.Increment(ref owner._subscriptionDisposeCount);
+            if (owner.SubscriptionDisposeOverride is { } teardown)
+                return teardown();
+
             _channel.Writer.TryComplete();
             return ValueTask.CompletedTask;
         }
