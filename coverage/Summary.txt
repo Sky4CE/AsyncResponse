@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/02/2026 - 09:48:46
+  Generated on: 08/02/2026 - 10:42:34
   Parser: MultiReport (3x Cobertura)
   Assemblies: 26
   Classes: 443
   Files: 199
   Line coverage: 99%
-  Covered lines: 23729
-  Uncovered lines: 222
-  Coverable lines: 23951
-  Total lines: 36320
-  Branch coverage: 96.4% (8225 of 8528)
-  Covered branches: 8225
-  Total branches: 8528
-  Method coverage: 99.8% (2728 of 2731)
-  Full method coverage: 96.5% (2638 of 2731)
-  Covered methods: 2728
-  Fully covered methods: 2638
-  Total methods: 2731
+  Covered lines: 24009
+  Uncovered lines: 228
+  Coverable lines: 24237
+  Total lines: 36500
+  Branch coverage: 96.1% (8292 of 8622)
+  Covered branches: 8292
+  Total branches: 8622
+  Method coverage: 99.8% (2758 of 2761)
+  Full method coverage: 96.4% (2662 of 2761)
+  Covered methods: 2758
+  Fully covered methods: 2662
+  Total methods: 2761
 
 AsyncResponse.Abstractions                                                                                            100%
   AsyncResponse.AsyncResponseContext                                                                                  100%
@@ -37,12 +37,12 @@ AsyncResponse.Abstractions                                                      
   AsyncResponse.WorkerJobEnvelope                                                                                     100%
   AsyncResponse.WorkerJobEnvelopeSchema                                                                               100%
 
-AsyncResponse.Channels.MongoDB                                                                                       99.2%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                   100%
+AsyncResponse.Channels.MongoDB                                                                                       99.1%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.8%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                98.8%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                                100%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.8%
   AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument                                                          100%
   AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument                                                       100%
   AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannel                                                         73.8%
@@ -54,9 +54,9 @@ AsyncResponse.Channels.MongoDB                                                  
   AsyncResponse.Channels.MongoDB.MongoRecoveryStateDocument                                                          33.3%
   Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions                     100%
 
-AsyncResponse.Channels.NATS                                                                                           100%
-  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel                                                                100%
-  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel<T>                                                             100%
+AsyncResponse.Channels.NATS                                                                                          99.6%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel                                                               99.4%
+  AsyncResponse.Channels.NATS.NatsAsyncResponseChannel<T>                                                            99.4%
   AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions                                                         100%
   AsyncResponse.Channels.NATS.NatsAsyncResponseWaiter<T>                                                              100%
   AsyncResponse.Channels.NATS.NatsKvStoreAdapter                                                                      100%
@@ -164,8 +164,8 @@ AsyncResponse.Core                                                              
   AsyncResponse.InMemoryAsyncResponseChannel                                                                         99.5%
   AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
   AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
-  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase                                                        97.9%
-  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>                                                97.9%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase                                                          98%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>                                                  98%
   AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup                                                        100%
   AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot                                                     100%
   AsyncResponse.InMemoryAsyncResponseChannel<T>                                                                      99.5%
@@ -334,7 +334,7 @@ AsyncResponse.Transports.GooglePubSub                                           
   AsyncResponse.Transports.GooglePubSub.QueuedGooglePubSubMessageDispatcher                                           100%
   Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions                       100%
 
-AsyncResponse.Transports.Kafka                                                                                       99.7%
+AsyncResponse.Transports.Kafka                                                                                       99.8%
   AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher                                                       100%
   AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions                                                   100%
   AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext                                                        100%
@@ -350,7 +350,7 @@ AsyncResponse.Transports.Kafka                                                  
   AsyncResponse.Transports.Kafka.KafkaReplyTargetProvider                                                             100%
   AsyncResponse.Transports.Kafka.KafkaResponseIngressSubscriber                                                       100%
   AsyncResponse.Transports.Kafka.KafkaSubscriberOptions                                                               100%
-  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                              99.1%
+  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                               100%
   AsyncResponse.Transports.Kafka.KafkaTransportClientDefaults                                                         100%
   AsyncResponse.Transports.Kafka.KafkaTransportHeader                                                                 100%
   AsyncResponse.Transports.Kafka.KafkaTransportOptionsValidator                                                       100%
