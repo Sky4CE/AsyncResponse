@@ -23,6 +23,19 @@ public abstract class AsyncResponseChannelOptions
     public TimeSpan? DefaultTimeout { get; set; }
 
     /// <summary>
+    /// How long disposing a waiter may DRAIN an in-flight delivery before abandoning it. Disposal
+    /// settles the response task only after a dispatch that already claimed a message — an
+    /// <c>Until</c> predicate running user code — has finished, so a delivered response is never
+    /// reported as canceled. If that dispatch is still running when this budget lapses, the
+    /// response task is faulted with <see cref="AsyncResponseIndeterminateDeliveryException"/>
+    /// rather than canceled: the delivery outcome is unknown, and a cancellation would invite
+    /// re-attaching to a correlation id whose response may already be consumed (durable flows
+    /// instead restart the idempotent step fresh). Default: 30 seconds — comfortably above any
+    /// healthy predicate, well below a stuck one holding host shutdown hostage.
+    /// </summary>
+    public TimeSpan DisposalDrainTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// Validates the shared channel settings, throwing an actionable
     /// <see cref="InvalidOperationException"/> on misconfiguration. Concrete channels call this from
     /// their own <c>Validate()</c> so every channel fails fast at registration/startup instead of
@@ -35,6 +48,8 @@ public abstract class AsyncResponseChannelOptions
             throw new InvalidOperationException($"{optionsName}.{nameof(RecoveryStateExpiry)} must be positive.");
         if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
             throw new InvalidOperationException($"{optionsName}.{nameof(DefaultTimeout)} must be positive when configured.");
+        if (DisposalDrainTimeout <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{optionsName}.{nameof(DisposalDrainTimeout)} must be positive.");
     }
 }
 

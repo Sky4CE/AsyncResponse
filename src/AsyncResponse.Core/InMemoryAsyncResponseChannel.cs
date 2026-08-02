@@ -705,11 +705,36 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         /// a cancellation stealing an already-consumed response. Must NOT be called from dispatch
         /// code (which holds the gate): dispatch-triggered cleanup uses
         /// <see cref="CleanupOnceAsync"/> directly, with its task already settled.
+        /// <para>
+        /// The drain is bounded by <c>DisposalDrainTimeout</c>. A lapsed budget must not fall back
+        /// to the cleanup's cancel — the wedged delivery holds a message the channel already
+        /// claimed, and "canceled" would tell a re-attaching caller nothing was delivered — so it
+        /// faults the task with the explicit indeterminate contract instead, routing durable flows
+        /// to a fresh idempotent restart. The abandoned no-op marker runs harmlessly whenever the
+        /// wedged dispatch finally releases the gate.
+        /// </para>
         /// </summary>
         public async ValueTask DisposeCleanupAsync()
         {
             if (Volatile.Read(ref _cleanupStarted) == 0)
-                await DispatchSerialAsync(0, static (_, _) => Task.CompletedTask).ConfigureAwait(false);
+            {
+                var drainTimeout = _owner._options.DisposalDrainTimeout;
+                try
+                {
+                    await DispatchSerialAsync(0, static (_, _) => Task.CompletedTask)
+                        .WaitAsync(drainTimeout).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    _owner._logger.LogWarning(
+                        "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        CorrelationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
+                    // A TrySetResult from the late-finishing dispatch loses against this and is
+                    // dropped; its cleanup call is a no-op behind the latch.
+                    TrySetException(new AsyncResponseIndeterminateDeliveryException(CorrelationId, drainTimeout));
+                }
+            }
 
             await CleanupOnceAsync().ConfigureAwait(false);
         }

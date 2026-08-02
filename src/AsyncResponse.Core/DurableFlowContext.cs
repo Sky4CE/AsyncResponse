@@ -350,12 +350,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             if (waiter.ResponseTask.IsFaulted)
             {
-                // The wait FAULTED (a throwing Until predicate) — possibly between the catch
-                // filter and the settlement — and its message was consumed: restart the
-                // idempotent step fresh, exactly like the general fault path below.
+                // The wait FAULTED — a throwing Until predicate (possibly between the catch
+                // filter and the settlement), or the disposal drain abandoning a wedged delivery
+                // as AsyncResponseIndeterminateDeliveryException. Either way the message may be
+                // consumed: restart the idempotent step fresh, exactly like the general fault
+                // path below. The checkpoint records the fault's own message (not the
+                // cancellation's) so the ledger says WHY the step restarts.
+                var fault = waiter.ResponseTask.Exception?.GetBaseException();
                 checkpoint.Faulted = true;
-                checkpoint.Message = ex.Message;
-                await SaveAsync(CancellationToken.None, cause: ex).ConfigureAwait(false);
+                checkpoint.Message = fault?.Message ?? ex.Message;
+                await SaveAsync(CancellationToken.None, cause: fault ?? ex).ConfigureAwait(false);
                 throw;
             }
 

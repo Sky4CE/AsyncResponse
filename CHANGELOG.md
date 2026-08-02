@@ -26,8 +26,13 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - `asyncresponse.ingress.unroutable_responses` counter (plus an Error-level log): inbound
   responses with no correlation id are acknowledged by design — redelivery could never route
   them — and each occurrence is now loud instead of a Warning-level whisper.
-- Channel-conformance fact: disposing a waiter before any terminal signal must cancel its public
-  `ResponseTask` (see Fixed).
+- Channel-conformance facts for the waiter-disposal contract (see Fixed): disposing before any
+  terminal signal cancels the public `ResponseTask`; disposing during an in-flight delivery
+  drains it and settles as delivered; a drain outliving `DisposalDrainTimeout` faults as
+  indeterminate.
+- `AsyncResponseChannelOptions.DisposalDrainTimeout` (default 30 s) — the bound on how long
+  waiter disposal drains an in-flight delivery — and `AsyncResponseIndeterminateDeliveryException`,
+  the explicit contract for a delivery abandoned mid-flight whose outcome is unknowable.
 - `FlowRunStatus.Suspended` — operator parking for durable flow runs. A suspended run ignores
   wake-ups, recoveries, resumes, and failure signals (a parent awaiting a suspended child keeps
   waiting), so a dead-lettered `Running` run can be taken under manual control without a late
@@ -120,7 +125,14 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   it used to stay pending forever (the disposal also destroyed the timeout, so nothing could ever
   complete it). On the database channels this also covers channel `DisposeAsync` at host
   shutdown, which runs the same cleanup over every in-flight subscription and used to hang
-  still-awaiting `WaitAsync` callers.
+  still-awaiting `WaitAsync` callers. Disposal first **drains** a delivery already in flight
+  (every channel implementation): a response mid-`Until`-predicate has already been claimed from
+  the channel, so it settles the task as *delivered* — never a cancellation stealing a consumed
+  response — and if the drain budget (`DisposalDrainTimeout`) lapses with the delivery still
+  running, the task faults with `AsyncResponseIndeterminateDeliveryException` instead of
+  cancelling, because "canceled" would promise nothing was consumed and invite a durable flow to
+  re-attach to a correlation id nothing can answer. Durable flows route that fault to a fresh
+  restart of the idempotent step.
 - A durable-flow step whose wait is cancelled — the channel disposing its waiter at host
   shutdown, or the execution's own cancellation token — no longer marks the step faulted: the
   remote operation is still in flight, so the persisted breadcrumb survives and the redelivered

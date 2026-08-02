@@ -15,7 +15,12 @@ public interface IAsyncResponseWaiter<T> : IAsyncDisposable where T : IAsyncResp
     /// A task that completes with the response payload when it is published to the channel,
     /// faults if an error envelope arrives or the wait times out, or is canceled when the waiter
     /// is disposed before any terminal signal — so a caller holding this task directly never
-    /// waits forever on an abandoned subscription.
+    /// waits forever on an abandoned subscription. Disposal first DRAINS a delivery already in
+    /// flight (bounded by the channel's <c>DisposalDrainTimeout</c>): a response mid-<c>Until</c>
+    /// predicate settles this task as delivered rather than canceled, and if the drain budget
+    /// lapses with the delivery still running, the task faults with
+    /// <see cref="AsyncResponseIndeterminateDeliveryException"/> — cancellation would falsely
+    /// promise that nothing was consumed.
     /// </summary>
     Task<T> ResponseTask { get; }
 }

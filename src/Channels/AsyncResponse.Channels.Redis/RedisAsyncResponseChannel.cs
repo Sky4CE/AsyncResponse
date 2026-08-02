@@ -174,19 +174,41 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // stealing a consumed response. Must NOT be called from dispatch code (which runs ON the
         // executor): the dispatch-triggered cleanup uses CleanupOnceAsync directly, its task
         // already settled.
+        //
+        // The drain is bounded by DisposalDrainTimeout — one budget covering marker ADMISSION too
+        // (a full bounded queue behind a wedged item blocks the enqueue itself). A lapsed budget
+        // must not fall back to the cleanup's cancel: the wedged delivery holds a message already
+        // consumed from the stream, and "canceled" would tell a re-attaching caller nothing was
+        // delivered. It faults the task with the explicit indeterminate contract instead, routing
+        // durable flows to a fresh idempotent restart. A tombstone-suppressed enqueue is the
+        // opposite case — the retired executor finished everything it ever admitted, so nothing
+        // is in flight and the plain cancel is truthful.
         async ValueTask DrainThenCleanupAsync()
         {
             if (Volatile.Read(ref cleanupStarted) == 0 && executorRegistered)
             {
+                var drainTimeout = _options.DisposalDrainTimeout;
                 var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 try
                 {
-                    await _executors.EnqueueAsync(channel.ToString()!, () =>
+                    using var budget = new CancellationTokenSource(drainTimeout);
+                    var accepted = await _executors.EnqueueAsync(channel.ToString()!, () =>
                     {
                         drained.TrySetResult();
                         return Task.CompletedTask;
-                    }).ConfigureAwait(false);
-                    await drained.Task.ConfigureAwait(false);
+                    }, budget.Token).ConfigureAwait(false);
+                    if (accepted)
+                        await drained.Task.WaitAsync(budget.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        correlationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
+                    // A TrySetResult from the late-finishing dispatch loses against this and is
+                    // dropped; its cleanup call is a no-op behind the latch.
+                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
                 }
                 catch (Exception drainEx)
                 {

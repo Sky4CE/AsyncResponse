@@ -5,6 +5,9 @@ AsyncResponse.AsyncResponseDomainFailureException.AsyncResponseDomainFailureExce
 AsyncResponse.AsyncResponseDomainFailureException.CorrelationId.get -> string?
 AsyncResponse.AsyncResponseDomainFailureException.PayloadJson.get -> string?
 AsyncResponse.AsyncResponseDomainFailureException.PayloadTypeFullName.get -> string?
+AsyncResponse.AsyncResponseIndeterminateDeliveryException
+AsyncResponse.AsyncResponseIndeterminateDeliveryException.AsyncResponseIndeterminateDeliveryException(string? correlationId, System.TimeSpan drainTimeout) -> void
+AsyncResponse.AsyncResponseIndeterminateDeliveryException.CorrelationId.get -> string?
 AsyncResponse.AsyncResponsePayloadReflection
 AsyncResponse.AsyncResponseReplyTarget
 AsyncResponse.AsyncResponseReplyTarget.Address.get -> string!

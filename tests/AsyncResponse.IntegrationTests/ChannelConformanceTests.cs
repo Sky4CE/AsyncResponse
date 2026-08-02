@@ -27,7 +27,8 @@ public sealed class RedisChannelConformanceTests(IntegrationFixture fixture) : C
     // Broker round-trips over loopback: well under a second healthy; 5s absorbs CI noise.
     protected override TimeSpan Generous => TimeSpan.FromSeconds(5);
 
-    protected override async Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override async Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var multiplexer = await ConnectionMultiplexer.ConnectAsync(fixture.RedisConnectionString);
         var services = NewConformanceServices();
@@ -38,6 +39,7 @@ public sealed class RedisChannelConformanceTests(IntegrationFixture fixture) : C
             // reruns; recovery keys expire via their TTL.
             options.KeyPrefix = $"conformance:{Guid.NewGuid():N}";
             options.RecoveryStateExpiry = TimeSpan.FromMinutes(2);
+            configureChannel?.Invoke(options);
         });
         return new ChannelConformanceHarness(services.BuildServiceProvider(), () =>
         {
@@ -53,7 +55,8 @@ public sealed class NatsChannelConformanceTests(IntegrationFixture fixture) : Ch
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(5);
 
-    protected override async Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override async Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var connection = new NatsConnection(new NatsOpts { Url = fixture.NatsConnectionString });
         await connection.ConnectAsync();
@@ -68,6 +71,7 @@ public sealed class NatsChannelConformanceTests(IntegrationFixture fixture) : Ch
             options.SubjectPrefix = $"conformance.{runId}";
             options.RecoveryBucket = $"conformance-{runId}";
             options.RecoveryStateExpiry = TimeSpan.FromMinutes(2);
+            configureChannel?.Invoke(options);
         });
         return new ChannelConformanceHarness(
             services.BuildServiceProvider(),
@@ -82,7 +86,8 @@ public sealed class PostgreSqlChannelConformanceTests(IntegrationFixture fixture
     // Polling database channel under the loaded shared container: 15s budget.
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
 
-    protected override Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var schema = $"ar_conformance_{Guid.NewGuid():N}";
         var dataSource = NpgsqlDataSource.Create(fixture.PostgreSqlConnectionString);
@@ -103,6 +108,7 @@ public sealed class PostgreSqlChannelConformanceTests(IntegrationFixture fixture
             options.SubscriberHeartbeatInterval = TimeSpan.FromMilliseconds(50);
             options.SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(2);
             options.PruneInterval = TimeSpan.Zero;
+            configureChannel?.Invoke(options);
         });
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider(), async () =>
         {
@@ -127,7 +133,8 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
 
-    protected override Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var schema = $"ar_conformance_{Guid.NewGuid():N}";
         var services = NewConformanceServices();
@@ -144,6 +151,7 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
             options.SubscriberHeartbeatInterval = TimeSpan.FromMilliseconds(50);
             options.SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(2);
             options.PruneInterval = TimeSpan.Zero;
+            configureChannel?.Invoke(options);
         });
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider(), async () =>
         {
@@ -174,7 +182,8 @@ public sealed class MongoDbChannelConformanceTests(IntegrationFixture fixture) :
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
 
-    protected override Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var databaseName = $"conformance_{Guid.NewGuid():N}";
         var client = new MongoClient(fixture.MongoDbConnectionString);
@@ -191,6 +200,7 @@ public sealed class MongoDbChannelConformanceTests(IntegrationFixture fixture) :
             options.ListenerPollInterval = TimeSpan.FromMilliseconds(50);
             options.SubscriberHeartbeatInterval = TimeSpan.FromMilliseconds(100);
             options.SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(2);
+            configureChannel?.Invoke(options);
         });
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider(), async () =>
         {

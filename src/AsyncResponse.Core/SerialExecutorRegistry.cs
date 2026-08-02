@@ -64,8 +64,14 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
         }
     }
 
-    /// <summary>Asynchronously enqueues work, applying bounded per-channel backpressure.</summary>
-    public async ValueTask EnqueueAsync(string channel, Func<Task> work, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Asynchronously enqueues work, applying bounded per-channel backpressure. Returns <c>true</c>
+    /// once the work is accepted by a live executor; <c>false</c> when it was suppressed by a
+    /// tombstone (the executor was retired with no registration left — every dispatch it ever
+    /// admitted has fully completed, so a caller draining before disposal knows nothing is in
+    /// flight).
+    /// </summary>
+    public async ValueTask<bool> EnqueueAsync(string channel, Func<Task> work, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channel);
         ArgumentNullException.ThrowIfNull(work);
@@ -91,7 +97,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
                         _logger.LogWarning(
                             "Suppressed a delivery for channel {Channel}: the channel is tombstoned and has no registered subscription.",
                             channel);
-                        return;
+                        return false;
                     }
 
                     current = new ExecutorEntry(new ChannelSerialExecutor(_logger, channel));
@@ -132,7 +138,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
             }
 
             if (accepted)
-                return;
+                return true;
         }
     }
 

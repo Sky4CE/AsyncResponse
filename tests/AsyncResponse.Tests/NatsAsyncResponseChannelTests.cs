@@ -526,20 +526,58 @@ public class NatsAsyncResponseChannelTests
         await waiter.DisposeAsync();
 
         // A failed recovery-state delete is a network fault; it must not skip the subscription
-        // teardown, or the consume loop would keep running until the process exits. At LEAST
-        // once, not exactly once: the dispose path also ends the stream up front to DRAIN the
-        // in-flight delivery before settling, and subscription disposal is idempotent.
-        Assert.True(_client.SubscriptionDisposeCount >= 1);
+        // teardown, or the consume loop would keep running until the process exits. EXACTLY once:
+        // the drain and the latched cleanup both need the stream ended, but they share the
+        // once-latched EndStreamOnceAsync — a second teardown path would be a regression.
+        Assert.Equal(1, _client.SubscriptionDisposeCount);
     }
 
-    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false) => new(
+    [Fact]
+    public async Task Waiter_DisposeWithWedgedDelivery_FaultsIndeterminateAfterDrainBudget()
+    {
+        // A delivery wedged in the Until predicate past DisposalDrainTimeout: disposal must
+        // RETURN (a stuck predicate cannot hold shutdown hostage) but must NOT cancel — the
+        // consume loop holds a message already consumed from the stream, and "canceled" tells a
+        // re-attaching caller nothing was delivered. The explicit indeterminate fault routes
+        // durable flows to a fresh idempotent restart; the late TrySetResult loses and is dropped.
+        var channel = CreateChannel(drainTimeout: TimeSpan.FromMilliseconds(200));
+        using var predicateEntered = new SemaphoreSlim(0);
+        using var releasePredicate = new SemaphoreSlim(0);
+        var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-wedged",
+            async _ =>
+            {
+                predicateEntered.Release();
+                return await releasePredicate.WaitAsync(TimeSpan.FromSeconds(30));
+            },
+            timeout: TimeSpan.FromMinutes(1));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "wedged" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        Assert.True(await predicateEntered.WaitAsync(TimeSpan.FromSeconds(5)), "the delivery never reached the Until predicate");
+
+        await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        var fault = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Equal("corr-wedged", fault.CorrelationId);
+        Assert.False(waiter.ResponseTask.IsCanceled);
+
+        releasePredicate.Release();
+    }
+
+    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,
         _store.Object,
         Options.Create(new NatsAsyncResponseChannelOptions
         {
             DefaultTimeout = useRecoveryExpiry ? null : TimeSpan.FromSeconds(5),
-            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+            DisposalDrainTimeout = drainTimeout ?? TimeSpan.FromSeconds(30)
         }),
         new AsyncResponseContextPropagation([]),
         new TestLogger<NatsAsyncResponseChannel>());

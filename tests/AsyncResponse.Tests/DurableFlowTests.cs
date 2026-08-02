@@ -543,108 +543,102 @@ public class DurableFlowTests
     }
 
     [Fact]
-    public async Task AwaitStep_ResponseRacingCancellation_NeverStrandsTheLedger()
+    public async Task AwaitStep_CancellationTearingTheBreadcrumbSave_AbandonsTheLeaseForFreshRestart()
     {
-        // Drives the genuine WaitAsync race — the response completing versus the token cancelling
-        // — many times per run. Whichever side wins, the PERSISTED ledger must land in one of
-        // exactly two legal states: (a) the response is returned and the step is Completed, or
-        // (b) OperationCanceledException propagates and the breadcrumb survives un-faulted for
-        // re-attach. Pinned against the two illegal states: pending cleared without completion
-        // (a lost response) and a fresh-restart shape that would re-send the request.
-        for (var i = 0; i < 200; i++)
+        // The one interleave a since-deleted 200-iteration scheduler lottery kept surfacing, now
+        // pinned deterministically (the other two legal outcomes of cancellation-vs-response have
+        // their own deterministic facts above): the token fires INSIDE the breadcrumb write
+        // itself. Whether the store applied the torn write is unknowable, so the lease is
+        // conservatively abandoned (store-throw => MarkLost) and the surfaced failure carries the
+        // cancellation as its cause. The trigger never ran — nothing was sent — so the
+        // redelivered execution starting the step FRESH is contract-correct, and nothing may be
+        // persisted that would make it re-attach instead.
+        using var cancellation = new CancellationTokenSource();
+        var store = new CancelInsideBreadcrumbSaveStore(cancellation);
+        var state = new FlowState { FlowId = "torn-breadcrumb-flow" };
+        await using var lease = await CreateLeaseAsync(store, state);
+
+        var response = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
+        waiter.SetupGet(instance => instance.ResponseTask).Returns(response.Task);
+        waiter.Setup(instance => instance.DisposeAsync()).Returns(() =>
         {
-            using var cancellation = new CancellationTokenSource();
-            var response = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-            using var subscribed = new SemaphoreSlim(0);
+            response.TrySetCanceled();
+            return ValueTask.CompletedTask;
+        });
+        var subscriber = new Mock<IAsyncResponseSubscriber>();
+        subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .ReturnsAsync(waiter.Object);
 
-            var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
-            waiter.SetupGet(instance => instance.ResponseTask).Returns(response.Task);
-            // Emulate the channel contract: disposal cancels the response task unless something
-            // completed it first — that settlement is what makes the outcome model below total.
-            waiter.Setup(instance => instance.DisposeAsync()).Returns(() =>
-            {
-                response.TrySetCanceled();
-                return ValueTask.CompletedTask;
-            });
-            var subscriber = new Mock<IAsyncResponseSubscriber>();
-            subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
-                    It.IsAny<string>(),
-                    It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
-                    It.IsAny<TimeSpan?>()))
-                .Callback(() => subscribed.Release())
-                .ReturnsAsync(waiter.Object);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            subscriber.Object,
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
 
-            var state = new FlowState { FlowId = $"race-flow-{i}" };
-            var store = new InMemoryFlowStateStore();
-            await using var lease = await CreateLeaseAsync(store, state);
-            var context = new DurableFlowContext(
-                state,
-                store,
-                Mock.Of<IAsyncResponseBuilder>(),
-                new AsyncResponseContextPropagation([]),
-                new DurableFlowOptions(),
-                subscriber.Object,
-                recoverableSubscriber: null,
-                NullLogger.Instance,
-                lease);
+        var triggerRan = false;
+        var surfaced = await Assert.ThrowsAsync<InvalidOperationException>(() => context.AwaitStepAsync<OperationResult>(
+            "torn-step",
+            _ =>
+            {
+                triggerRan = true;
+                return Task.CompletedTask;
+            },
+            cancellationToken: cancellation.Token));
 
-            var awaitStep = Task.Run(() => context.AwaitStepAsync<OperationResult>(
-                "race-step",
-                _ => Task.CompletedTask,
-                cancellationToken: cancellation.Token));
-            Assert.True(await subscribed.WaitAsync(TimeSpan.FromSeconds(5)));
+        // Takeover-shaped failure with the cancellation attached — the caller can tell WHY the
+        // lease was abandoned.
+        Assert.IsAssignableFrom<OperationCanceledException>(surfaced.InnerException);
+        // The breadcrumb save precedes the send, so the torn write cannot have double-sent.
+        Assert.False(triggerRan);
 
-            await Task.WhenAll(
-                Task.Run(cancellation.Cancel),
-                Task.Run(() => response.TrySetResult(new OperationResult { Status = OperationStatus.Completed })));
+        // Fresh-restart shape: the persisted ledger never saw the step — no breadcrumb to
+        // re-attach to, no fault marker (the fault save was refused by the lost lease).
+        var persisted = await store.LoadAsync("torn-breadcrumb-flow");
+        Assert.NotNull(persisted);
+        Assert.True(persisted!.Steps is null || !persisted.Steps.ContainsKey("torn-step"));
+    }
 
-            OperationResult? returned = null;
-            var leaseAbandoned = false;
-            try
-            {
-                returned = await awaitStep;
-            }
-            catch (OperationCanceledException)
-            {
-                // Legal outcome (b); asserted against the persisted ledger below.
-            }
-            catch (InvalidOperationException ex) when (ex.InnerException is OperationCanceledException)
-            {
-                // Legal outcome (c): the cancellation landed inside the BREADCRUMB save itself.
-                // The store may or may not have persisted the write, so the lease is
-                // conservatively abandoned (store-throw => MarkLost) and the delivery retries —
-                // nothing was sent yet, so a fresh restart is contract-correct.
-                leaseAbandoned = true;
-            }
+    /// <summary>
+    /// Throws the caller's cancellation out of every state update — the first being the
+    /// breadcrumb save — emulating a store that honours its token mid-write, where whether the
+    /// row actually landed is unknowable. Lease operations pass through untouched.
+    /// </summary>
+    private sealed class CancelInsideBreadcrumbSaveStore(CancellationTokenSource _cancellation) : IFlowStateStore
+    {
+        private readonly InMemoryFlowStateStore _inner = new();
 
-            var persisted = await store.LoadAsync(state.FlowId!);
-            Assert.NotNull(persisted);
-            var step = persisted!.Steps is { } steps && steps.TryGetValue("race-step", out var found) ? found : null;
-            if (returned is not null)
-            {
-                Assert.Equal(OperationStatus.Completed, returned.Status);
-                Assert.NotNull(step);
-                Assert.True(step!.Completed);
-                Assert.Null(step.PendingCorrelationId);
-            }
-            else if (step is not null)
-            {
-                // Re-attach shape: breadcrumb preserved, never faulted, never half-completed —
-                // and only legal when cancellation genuinely WON the settlement (the response
-                // task ended canceled). A successfully delivered response may never coexist with
-                // a preserved breadcrumb: that is precisely the consumed-response strand.
-                Assert.False(step.Completed);
-                Assert.False(step.Faulted);
-                Assert.NotNull(step.PendingCorrelationId);
-                Assert.True(response.Task.IsCanceled);
-            }
-            else
-            {
-                // Nothing persisted at all is only legal when the breadcrumb save was the
-                // casualty — the redelivered execution then starts the step fresh.
-                Assert.True(leaseAbandoned);
-            }
+        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+            => _inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
+
+        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
+            => _inner.LoadAsync(flowId, cancellationToken);
+
+        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
+        {
+            _cancellation.Cancel();
+            throw new OperationCanceledException(_cancellation.Token);
         }
+
+        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => _inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+            => _inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
+
+        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
+            => _inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
+
+        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
+            => _inner.TryDeleteAsync(flowId, cancellationToken);
     }
 
     /// <summary>

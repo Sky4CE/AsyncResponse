@@ -59,9 +59,12 @@ public abstract class ChannelConformanceSuite
     /// <see cref="NewConformanceServices"/> (which registers the null logger and the recovery spy),
     /// add whatever client singletons the channel requires, and hand any external teardown
     /// (dropping a schema/database, disposing a connection) to the harness. Called once per fact —
-    /// every fact runs against a fresh, isolated channel.
+    /// every fact runs against a fresh, isolated channel. <paramref name="configureChannel"/> is
+    /// applied LAST inside the channel's options lambda, so a fact can tighten a shared knob (e.g.
+    /// <see cref="AsyncResponseChannelOptions.DisposalDrainTimeout"/>) on any derivation.
     /// </summary>
-    protected abstract Task<ChannelConformanceHarness> CreateHarnessAsync();
+    protected abstract Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null);
 
     /// <summary>Bound applied when awaiting a response that must arrive.</summary>
     private TimeSpan WaitBudget => Generous * 2;
@@ -420,20 +423,77 @@ public abstract class ChannelConformanceSuite
             async _ =>
             {
                 predicateEntered.Release();
-                await releasePredicate.WaitAsync(WaitBudget);
+                // Asserted, not ignored: a silently-lapsed wait once let the predicate finish
+                // early and the fact "passed" against an already-settled waiter.
+                Assert.True(await releasePredicate.WaitAsync(WaitBudget), "the blocked predicate was never released");
                 return true;
             },
             timeout: WaiterTimeout);
 
-        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "drained"), correlationId);
+        // Publish WITHOUT awaiting: the in-memory publisher dispatches inline, so awaiting it
+        // would serialize the whole delivery (blocked predicate included) BEFORE the dispose and
+        // the fact would exercise no overlap at all.
+        var publish = harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "drained"), correlationId);
         Assert.True(await predicateEntered.WaitAsync(WaitBudget), "the delivery never reached the Until predicate");
 
-        var disposal = Task.Run(() => waiter.DisposeAsync().AsTask());
+        // Dispose directly on this thread — a Task.Run lambda is not guaranteed to have started
+        // by the time the predicate is released, which would reorder dispose after delivery.
+        var disposal = waiter.DisposeAsync().AsTask();
+
+        // The claimed delivery still holds the dispatch pipeline, so a DRAINING disposal cannot
+        // have finished yet; completing here means it settled without waiting for the in-flight
+        // message.
+        await Task.Delay(SettleDelay);
+        Assert.False(disposal.IsCompleted, "disposal completed while a claimed delivery was still in flight — it did not drain");
+
         releasePredicate.Release();
         await disposal.WaitAsync(WaitBudget);
 
         var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
         Assert.Equal("drained", result.Message);
+        await publish.WaitAsync(WaitBudget);
+    }
+
+    [Fact]
+    public async Task Contract_DisposeDrainBudgetExhausted_FaultsAsIndeterminate()
+    {
+        // When the in-flight delivery outlives DisposalDrainTimeout, disposal must NOT fall back
+        // to cancellation: the wedged predicate holds a message the channel already claimed, and
+        // a canceled task tells a re-attaching caller "nothing was delivered". The explicit
+        // indeterminate fault routes durable flows to a fresh idempotent restart instead.
+        await using var harness = await CreateHarnessAsync(
+            options => options.DisposalDrainTimeout = TimeSpan.FromSeconds(1));
+        var correlationId = NewCorrelationId("indeterminate");
+        using var predicateEntered = new SemaphoreSlim(0);
+        using var releasePredicate = new SemaphoreSlim(0);
+
+        var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId,
+            async _ =>
+            {
+                predicateEntered.Release();
+                // Wedged until the fact releases it — well past the 1s drain budget. Returns
+                // terminal only when genuinely released; the late TrySetResult must lose to the
+                // indeterminate fault and be dropped.
+                return await releasePredicate.WaitAsync(WaitBudget);
+            },
+            timeout: WaiterTimeout);
+
+        var publish = harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "wedged"), correlationId);
+        Assert.True(await predicateEntered.WaitAsync(WaitBudget), "the delivery never reached the Until predicate");
+
+        // Disposal must RETURN once the budget lapses (a wedged predicate cannot hold host
+        // shutdown hostage) — but with the indeterminate fault, never a cancellation.
+        var disposal = waiter.DisposeAsync().AsTask();
+        await disposal.WaitAsync(WaitBudget);
+
+        var fault = await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(WaitBudget));
+        Assert.Equal(correlationId, fault.CorrelationId);
+        Assert.False(waiter.ResponseTask.IsCanceled);
+
+        releasePredicate.Release();
+        await publish.WaitAsync(WaitBudget);
     }
 
     // ----- helpers -----

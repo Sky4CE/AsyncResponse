@@ -153,6 +153,7 @@ Every channel has a complete registration in [provider-examples.md](provider-exa
 | `SubscriberHeartbeatInterval` / `SubscriberHeartbeatTimeout` | PostgreSQL, SQL Server, MongoDB | 10s / 30s | Heartbeat cadence and liveness window. One channel-level loop batches the process's current active registrations per interval; abandoned rows/documents are not renewed. |
 | `RecoveryStateExpiry` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | 7 days | How long durable recovery state survives. Also the default wait timeout backstop. Don't set below your longest flow duration. |
 | `DefaultTimeout` | all | `RecoveryStateExpiry` | Default per-waiter timeout when a flow doesn't call `WithTimeout`. |
+| `DisposalDrainTimeout` | all | 30 seconds | How long waiter disposal drains a delivery already in flight (an `Until` predicate mid-run) before abandoning it. A drained delivery settles the waiter as delivered; a lapsed budget faults it with `AsyncResponseIndeterminateDeliveryException` — never a cancellation, which would invite re-attaching to a possibly-consumed correlation id. |
 | `IncludeRemoteStackTrace` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `true` | Whether the remote exception's stack trace travels on the wire (`Exception.Data["RemoteStackTrace"]`). See [security.md](security.md). |
 | `MaxRemoteStackTraceLength` | Redis, NATS, PostgreSQL, SQL Server, MongoDB | `16384` | Length cap (chars) applied to the remote stack trace on both publish and receive. |
 

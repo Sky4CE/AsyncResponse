@@ -14,10 +14,11 @@ public sealed class InMemoryChannelConformanceTests : ChannelConformanceSuite
     // The in-memory channel completes in-process and synchronously; 2s is already generous.
     protected override TimeSpan Generous => TimeSpan.FromSeconds(2);
 
-    protected override Task<ChannelConformanceHarness> CreateHarnessAsync()
+    protected override Task<ChannelConformanceHarness> CreateHarnessAsync(
+        Action<AsyncResponseChannelOptions>? configureChannel = null)
     {
         var services = NewConformanceServices();
-        services.AddAsyncResponse().WithInMemoryChannel();
+        services.AddAsyncResponse().WithInMemoryChannel(options => configureChannel?.Invoke(options));
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider()));
     }
 }

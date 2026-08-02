@@ -1244,23 +1244,45 @@ internal abstract class DbAsyncResponseChannelBase :
         /// cleanup cancels, the task is either settled by the delivery or genuinely undelivered —
         /// never a cancellation stealing a consumed response. Must NOT be called from dispatch
         /// code (which runs ON the executor): the dispatch-triggered cleanup calls
-        /// <see cref="CleanupOnceAsync"/> directly, its task already settled. The drain is
-        /// bounded: an enqueue suppressed by the registry's tombstone (nothing in flight then)
-        /// must not hang disposal.
+        /// <see cref="CleanupOnceAsync"/> directly, its task already settled.
+        /// <para>
+        /// The drain is bounded by <c>DisposalDrainTimeout</c> — a single budget covering marker
+        /// ADMISSION too, since a full bounded queue behind a wedged item blocks the enqueue
+        /// itself. A lapsed budget must not fall back to the cleanup's cancel: the wedged delivery
+        /// holds a message the claim already consumed, and "canceled" would tell a re-attaching
+        /// caller nothing was delivered. It faults the task with the explicit indeterminate
+        /// contract instead, routing durable flows to a fresh idempotent restart. An enqueue
+        /// suppressed by the registry's tombstone is the opposite case — the retired executor
+        /// finished everything it ever admitted, so nothing is in flight and the plain cancel
+        /// below is truthful.
+        /// </para>
         /// </summary>
         public async ValueTask DrainThenCleanupAsync(bool deleteRecoveryState)
         {
             if (Volatile.Read(ref _cleanupStarted) == 0)
             {
+                var drainTimeout = _owner._options.DisposalDrainTimeout;
                 var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 try
                 {
-                    await _owner._executors.EnqueueAsync(_owner.ChannelName(_correlationId), () =>
+                    using var budget = new CancellationTokenSource(drainTimeout);
+                    var accepted = await _owner._executors.EnqueueAsync(_owner.ChannelName(_correlationId), () =>
                     {
                         drained.TrySetResult();
                         return Task.CompletedTask;
-                    }).ConfigureAwait(false);
-                    await drained.Task.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+                    }, budget.Token).ConfigureAwait(false);
+                    if (accepted)
+                        await drained.Task.WaitAsync(budget.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    _owner._logger.LogWarning(
+                        "Disposal drain for {Provider} correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        _owner._providerName, _correlationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
+                    // A TrySetResult from the late-finishing dispatch loses against this and is
+                    // dropped; its cleanup call is a no-op behind the latch.
+                    _tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout));
                 }
                 catch (Exception drainEx)
                 {

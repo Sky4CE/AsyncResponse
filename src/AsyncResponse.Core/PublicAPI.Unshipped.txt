@@ -3,6 +3,8 @@ AsyncResponse.AsyncResponseChannelOptions
 AsyncResponse.AsyncResponseChannelOptions.AsyncResponseChannelOptions() -> void
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.get -> System.TimeSpan?
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.set -> void
+AsyncResponse.AsyncResponseChannelOptions.DisposalDrainTimeout.get -> System.TimeSpan
+AsyncResponse.AsyncResponseChannelOptions.DisposalDrainTimeout.set -> void
 AsyncResponse.AsyncResponseChannelOptions.RecoveryStateExpiry.get -> System.TimeSpan
 AsyncResponse.AsyncResponseChannelOptions.RecoveryStateExpiry.set -> void
 AsyncResponse.AsyncResponseDiagnostics
