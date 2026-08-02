@@ -195,14 +195,15 @@ public sealed class NatsChannelCoverageTests
     /// dispose used to hold <c>waiter.DisposeAsync()</c> pending indefinitely.
     /// </summary>
     [Fact]
-    public async Task TerminalCleanup_HangingTeardown_KeepsDisposalBounded()
+    public async Task TerminalCleanup_HangingTeardown_KeepsDisposalBounded_AndLogsTheLateOutcome()
     {
         var hang = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var client = new FakeNatsResponseChannelClient
         {
             SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
         };
-        var channel = CreateChannel(client, new CollectingLogger<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hang");
         client.Push(TerminalEnvelope("done"));
@@ -214,7 +215,13 @@ public sealed class NatsChannelCoverageTests
         // hanging teardown must be abandoned at the budget — not hold DisposeAsync hostage.
         await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
 
-        hang.TrySetResult();
+        // The abandoned teardown finally FAILS: the latched, never-faulting teardown must log
+        // that late outcome — it used to die as a TaskScheduler.UnobservedTaskException that
+        // never reached the channel logger.
+        hang.TrySetException(new InvalidOperationException("late teardown boom"));
+        using var logDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!logger.Messages.Any(message => message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal)))
+            await Task.Delay(10, logDeadline.Token);
     }
 
     private NatsAsyncResponseChannel CreateChannel(

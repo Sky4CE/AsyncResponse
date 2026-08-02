@@ -259,9 +259,20 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     /// <summary>Faults the live subscription's read loop with <paramref name="exception"/>.</summary>
     public void FailSubscription(Exception exception) => _subscription!.Fail(exception);
 
-    private sealed class FakeSubscription(FakeNatsResponseChannelClient owner, CancellationToken lifetime) : INatsChannelSubscription
+    private sealed class FakeSubscription : INatsChannelSubscription
     {
+        private readonly FakeNatsResponseChannelClient _owner;
         private readonly Channel<NatsInboundResponse> _channel = Channel.CreateUnbounded<NatsInboundResponse>();
+
+        public FakeSubscription(FakeNatsResponseChannelClient owner, CancellationToken lifetime)
+        {
+            _owner = owner;
+            // Like the real adapter: the read ends GRACEFULLY when the lifetime token handed to
+            // SubscribeAsync ends the subscription (the channel's backstop cancel when teardown
+            // failed or hung). Completing the channel ends ReadAllAsync without throwing;
+            // Fail(exception) still propagates because its faulted completion wins first.
+            lifetime.Register(() => _channel.Writer.TryComplete());
+        }
 
         public void Push(NatsInboundResponse message) => _channel.Writer.TryWrite(message);
 
@@ -269,41 +280,14 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
 
         public async IAsyncEnumerable<NatsInboundResponse> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            // Like the real adapter: the read also ends — GRACEFULLY, not by throwing — when the
-            // lifetime token handed to SubscribeAsync ends the subscription (the channel's
-            // backstop cancel when teardown failed or hung). Fail(exception) still propagates.
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime, cancellationToken);
-            var reader = _channel.Reader.ReadAllAsync(linked.Token).GetAsyncEnumerator(CancellationToken.None);
-            try
-            {
-                while (true)
-                {
-                    bool moved;
-                    try
-                    {
-                        moved = await reader.MoveNextAsync().ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        yield break;
-                    }
-
-                    if (!moved)
-                        yield break;
-
-                    yield return reader.Current;
-                }
-            }
-            finally
-            {
-                await reader.DisposeAsync().ConfigureAwait(false);
-            }
+            await foreach (var message in _channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+                yield return message;
         }
 
         public ValueTask DisposeAsync()
         {
-            Interlocked.Increment(ref owner._subscriptionDisposeCount);
-            if (owner.SubscriptionDisposeOverride is { } teardown)
+            Interlocked.Increment(ref _owner._subscriptionDisposeCount);
+            if (_owner.SubscriptionDisposeOverride is { } teardown)
                 return teardown();
 
             _channel.Writer.TryComplete();

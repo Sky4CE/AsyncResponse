@@ -100,9 +100,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // anyway. Timing out routes the flow through its normal failure handling instead of
         // leaving it stuck forever.
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
-        // BEFORE any side effect: an unsupported resolved timeout (negative, or past the ~49.7-day
-        // BCL timer ceiling) used to throw only at timer arming — after the subscription and
-        // recovery state existed, leaking both.
+        // BEFORE any side effect: an unsupported resolved timeout (non-positive, or past the
+        // ~49.7-day BCL timer ceiling) used to throw only at timer arming — after the
+        // subscription and recovery state existed, leaking both — and zero used to slip through
+        // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
         var storedCorrelationId = correlationId;
@@ -132,27 +133,43 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // Local: CleanupOnceAsync — ends the stream (which ends the consume loop), deletes
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
-        int streamEndStarted = 0;
         var subscriptionTornDown = false;
         var cleanupGate = new object();
         Task? cleanupTask = null;
+        var streamEndGate = new object();
+        Task? streamEndTask = null;
         var consumeLoop = Task.CompletedTask;
 
         // The ONE place the server-side subscription is disposed — the drain and the latched
         // cleanup both need the stream ended (whichever runs first), and having each dispose it
-        // independently doubled the teardown for no benefit. A failed dispose leaves
-        // subscriptionTornDown false, and the cleanup core's backstop token cancel (safe only
-        // after the timeout registration is gone) still ends the consume loop.
-        async ValueTask EndStreamOnceAsync()
+        // independently doubled the teardown for no benefit. TASK-latched and NEVER-faulting:
+        // its failure is logged here exactly once, no matter how many latched callers observe
+        // the task — and a caller that abandoned its bounded wait still gets the late outcome
+        // recorded instead of it dying as a TaskScheduler.UnobservedTaskException. Callers read
+        // "completed with subscriptionTornDown false" as teardown failure and backstop-cancel
+        // (the cleanup core's finally, safe only after the timeout registration is gone).
+        Task EndStreamOnce()
         {
-            if (Interlocked.Exchange(ref streamEndStarted, 1) != 0)
+            lock (streamEndGate)
+            {
+                return streamEndTask ??= EndStreamCoreAsync();
+            }
+        }
+
+        async Task EndStreamCoreAsync()
+        {
+            if (subscription is null)
                 return;
 
-            if (subscription is not null)
+            try
             {
                 await subscription.DisposeAsync().ConfigureAwait(false);
                 subscriptionTornDown = true;
                 _logger.LogDebug("Unsubscribed from subject {Subject}.", subject);
+            }
+            catch (Exception teardownEx)
+            {
+                _logger.LogError(teardownEx, "Error during cleanup for subject {Subject}.", subject);
             }
         }
 
@@ -183,12 +200,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // One DisposalDrainTimeout budget covers BOTH steps — a wedged client library can hang
         // the subscription dispose just as a wedged Until predicate can hang the loop join. The
         // core's cancel is only truthful once the JOIN below has proven the loop ended; any
-        // drain outcome short of that — budget lapse, teardown throw with the loop still
-        // running, anything unforeseen — leaves a delivery possibly mid-predicate holding a
-        // message already consumed from the stream, and "canceled" would tell a re-attaching
-        // caller nothing was delivered. Those paths fault the task with the explicit
-        // indeterminate contract instead (routing durable flows to a fresh idempotent restart)
-        // and cancel the subscription token so the loop still ends once the predicate returns.
+        // drain outcome short of that — budget lapse, anything unforeseen — leaves a delivery
+        // possibly mid-predicate holding a message already consumed from the stream, and
+        // "canceled" would tell a re-attaching caller nothing was delivered. Those paths fault
+        // the task with the explicit indeterminate contract instead (routing durable flows to a
+        // fresh idempotent restart) and cancel the subscription token so the loop still ends
+        // once the predicate returns. (A teardown FAILURE no longer throws — the latched
+        // teardown logs it and leaves subscriptionTornDown false — so it backstop-cancels and
+        // still proves settlement through the join.)
         async ValueTask DrainThenCleanupAsync()
         {
             if (Volatile.Read(ref cleanupStarted) == 0)
@@ -197,27 +216,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 try
                 {
                     using var budget = new CancellationTokenSource(drainTimeout);
-                    try
-                    {
-                        await EndStreamOnceAsync().AsTask().WaitAsync(budget.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // Budget lapsed mid-teardown: not a teardown ERROR — rethrow past the
-                        // catch below so it faults as indeterminate without a misleading log.
-                        throw;
-                    }
-                    catch (Exception teardownEx)
-                    {
-                        // The subscription teardown threw. This is the ONE teardown attempt — the
-                        // latched core will not retry it — so keep the failure at Error, matching
-                        // the observability contract the core used to provide. Then backstop-cancel
-                        // and FALL THROUGH to the join: a failed teardown proves nothing about a
-                        // delivery mid-predicate, and skipping the join here let cleanup cancel a
-                        // response the stream had already handed over.
-                        _logger.LogError(teardownEx, "Error during cleanup for subject {Subject}.", subject);
+                    await EndStreamOnce().WaitAsync(budget.Token).ConfigureAwait(false);
+
+                    // A failed teardown surfaces as "completed, subscriptionTornDown false" (the
+                    // latched core logged it): backstop-cancel so the loop still ends, then FALL
+                    // THROUGH to the join — a failed teardown proves nothing about a delivery
+                    // mid-predicate, and skipping the join here let cleanup cancel a response the
+                    // stream had already handed over.
+                    if (!subscriptionTornDown && subscription is not null)
                         await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
-                    }
 
                     // Settlement is PROVEN only by the loop having ended within the remaining
                     // budget — either it settled the task with the in-flight delivery, or it
@@ -285,14 +292,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
 
                 // End the stream if the drain has not already — dispatch-triggered cleanup (a
-                // terminal delivery, a loop fault) reaches here without a drain. The helper's
-                // once-latch keeps the teardown single no matter which path got here first.
-                // Bounded like the drain: this latched core is what a disposing waiter awaits
-                // when terminal delivery started cleanup first (the drain skips itself on
-                // cleanupStarted), so an unbudgeted teardown here let a wedged client library
-                // hold DisposeAsync hostage past DisposalDrainTimeout. On the bound lapsing, the
-                // catch below logs and the finally's backstop cancel still ends the consume loop.
-                await EndStreamOnceAsync().AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+                // terminal delivery, a loop fault) reaches here without a drain. The task-latch
+                // keeps the teardown single no matter which path got here first. Bounded like the
+                // drain: this latched core is what a disposing waiter awaits when terminal
+                // delivery started cleanup first (the drain skips itself on cleanupStarted), so
+                // an unbudgeted teardown here let a wedged client library hold DisposeAsync
+                // hostage past DisposalDrainTimeout. On the bound lapsing, the catch below logs
+                // and the finally's backstop cancel still ends the consume loop; the abandoned
+                // teardown task never faults (it logs its own late outcome).
+                await EndStreamOnce().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                 if (subscription is null)
                     subscriptionTornDown = true;
             }

@@ -169,12 +169,11 @@ internal abstract class DbAsyncResponseChannelBase :
 
         completionPredicate ??= _ => new ValueTask<bool>(true);
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
-        // BEFORE any side effect: an unsupported resolved timeout (negative, or past the ~49.7-day
-        // BCL timer ceiling) used to throw only at timer arming — after the subscription and
-        // recovery state existed, leaking both.
+        // BEFORE any side effect: an unsupported resolved timeout (non-positive, or past the
+        // ~49.7-day BCL timer ceiling) used to throw only at timer arming — after the
+        // subscription and recovery state existed, leaking both — and zero used to slip through
+        // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
-        if (timeout <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be greater than zero.");
 
         await _store.EnsureCreatedAsync().ConfigureAwait(false);
         EnsureListenerStarted();

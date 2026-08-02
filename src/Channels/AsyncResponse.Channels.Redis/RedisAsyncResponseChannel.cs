@@ -119,9 +119,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // anyway. Timing out routes the flow through its normal failure handling instead of
         // leaving it stuck forever.
         timeout ??= _options.DefaultTimeout ?? _options.RecoveryStateExpiry;
-        // BEFORE any side effect: an unsupported resolved timeout (negative, or past the ~49.7-day
-        // BCL timer ceiling) used to throw only at timer arming — after the subscription and
-        // recovery state existed, leaking both.
+        // BEFORE any side effect: an unsupported resolved timeout (non-positive, or past the
+        // ~49.7-day BCL timer ceiling) used to throw only at timer arming — after the
+        // subscription and recovery state existed, leaking both — and zero used to slip through
+        // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
         var storedCorrelationId = correlationId;
@@ -259,14 +260,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     // Bounded like the drain: this latched core is what a disposing waiter awaits
                     // when terminal delivery started cleanup first, so an unbudgeted unsubscribe
                     // would let a wedged client library hold DisposeAsync hostage past
-                    // DisposalDrainTimeout.
+                    // DisposalDrainTimeout. The quiet wrapper logs its own failure — including
+                    // one that completes AFTER this wait was abandoned, which previously died as
+                    // a TaskScheduler.UnobservedTaskException nobody logged.
                     if (subscription is not null)
-                        await subscription.DisposeAsync().AsTask().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
-                    _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
+                        await UnsubscribeQuietlyAsync(subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                 }
-                catch (Exception ex)
+                catch (TimeoutException)
                 {
-                    _logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", channel.ToString()!);
+                    _logger.LogError(
+                        "Unsubscribe for channel {Channel} did not finish within {DisposalDrainTimeout}; abandoning the wait (its outcome is logged when it completes).",
+                        channel.ToString()!, _options.DisposalDrainTimeout);
                 }
             }
             finally
@@ -294,6 +298,22 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
                 cancellationTokenSource.Dispose();
                 activity?.Dispose();
+            }
+        }
+
+        // Never faults: the unsubscribe outcome is logged HERE, so a teardown outliving the
+        // bounded wait above still records its failure instead of surfacing as an unobserved
+        // task exception.
+        async Task UnsubscribeQuietlyAsync(IRedisChannelSubscription liveSubscription)
+        {
+            try
+            {
+                await liveSubscription.DisposeAsync().ConfigureAwait(false);
+                _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", channel.ToString()!);
             }
         }
 
