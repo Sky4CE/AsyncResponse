@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785661431818,
+  "lastUpdate": 1785661455797,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -54624,6 +54624,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 3766.362585616954,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "2051dd9efcb121795cd6ed8521ca8bc11e65b83b",
+          "message": "fix: round-5 review — concurrent PG idempotent inserts, cancellation-race coverage - a concurrent same-id publish no longer throws: ON CONFLICT sees the competitor's row but the CTE fallback reads an older statement snapshot (reproduced on PG 16), so a NULL now triggers a fresh-statement re-read and only genuine prunes throw; SqlServer's immunity documented; 40-pair racing itest added - recovery.md narrows the fan-out promise with the same-tick at-most-once exception (roadmap 5.6, renumbered from a duplicate 5.4) - cancellation-vs-response coverage: persisted-ledger assertions plus a 200-iteration property test that pins the three legal outcome shapes (it immediately surfaced - and now models - the legal lease-abandon interleave when cancellation lands inside the breadcrumb save) - docs: scan_truncated gauge + degraded-health wording for MaxScanEntries",
+          "timestamp": "2026-08-02T10:46:59+02:00",
+          "tree_id": "fa63a3f45f312f72dfd9a7bd446fe2b14f4d9c9f",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/2051dd9efcb121795cd6ed8521ca8bc11e65b83b"
+        },
+        "date": 1785661454955,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 136824.13665338012,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 115396.1550001154,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 76670.70056779253,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 257910.102854549,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 450815.976918222,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 357879.0655061842,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 407763.8231936063,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 323235.4576367609,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 326170.6263780709,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 317440.1625293632,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 334810.9657287495,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 472652.33584784373,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 464658.10456665984,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 204569.92854781536,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 72704.00744489036,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 49356.93832199045,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 20665.905059178887,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4818.724406549995,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 176047.659622413,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 70105.18582080555,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1520103.367028958,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2172.1507681159546,
             "unit": "flows/s"
           }
         ]
