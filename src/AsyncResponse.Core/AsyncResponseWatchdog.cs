@@ -86,6 +86,10 @@ public sealed class AsyncResponseWatchdogState
 }
 
 /// <summary>Result of evaluating a snapshot of the persisted recovery state.</summary>
+/// <param name="TotalEntries">Recovery registrations observed, deduplicated per correlation id.</param>
+/// <param name="EntriesWithActiveWaiter">Observed entries with at least one live subscriber.</param>
+/// <param name="StaleEntries">Entries with no live waiter registered longer ago than the staleness threshold.</param>
+/// <param name="UnknownAgeEntries">Entries with no live waiter and no registration timestamp — reported separately, never flagged stale.</param>
 /// <param name="Truncated">
 /// Whether the scan stopped at <see cref="AsyncResponseWatchdogOptions.MaxScanEntries"/> before
 /// exhausting the store — the counts and stale list then describe the buffered subset only, and
