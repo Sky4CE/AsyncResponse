@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/02/2026 - 10:42:34 |
+| Generated on: | 08/02/2026 - 19:09:59 |
 | Parser: | MultiReport (3x Cobertura) |
 | Assemblies: | 26 |
-| Classes: | 443 |
-| Files: | 199 |
-| **Line coverage:** | 99% (24009 of 24237) |
-| Covered lines: | 24009 |
-| Uncovered lines: | 228 |
-| Coverable lines: | 24237 |
-| Total lines: | 36500 |
-| **Branch coverage:** | 96.1% (8292 of 8622) |
-| Covered branches: | 8292 |
-| Total branches: | 8622 |
+| Classes: | 444 |
+| Files: | 200 |
+| **Line coverage:** | 99% (24197 of 24424) |
+| Covered lines: | 24197 |
+| Uncovered lines: | 227 |
+| Coverable lines: | 24424 |
+| Total lines: | 36671 |
+| **Branch coverage:** | 96.1% (8344 of 8678) |
+| Covered branches: | 8344 |
+| Total branches: | 8678 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -30,6 +30,7 @@
 |AsyncResponse.AsyncResponseContext.ContextScope|100%|100%|
 |AsyncResponse.AsyncResponseContext.CorrelationScope|100%|100%|
 |AsyncResponse.AsyncResponseDomainFailureException|100%||
+|AsyncResponse.AsyncResponseIndeterminateDeliveryException|100%||
 |AsyncResponse.AsyncResponsePayloadReflection|100%|100%|
 |AsyncResponse.AsyncResponseReplyTarget|100%||
 |AsyncResponse.AsyncResponseRequestContext|100%||
@@ -52,7 +53,7 @@
 |**AsyncResponse.Channels.MongoDB**|**99.1%**|**98.7%**|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase|99.8%|98.2%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|98.8%|100%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|98.9%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation|100%||
 |AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.8%|98.2%|
 |AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument|100%||
@@ -67,13 +68,13 @@
 |Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelService<br/>CollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.NATS - 99.6%</summary>
+<details><summary>AsyncResponse.Channels.NATS - 100%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.NATS**|**99.6%**|**97.2%**|
-|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel|99.4%|96.3%|
-|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel<T>|99.4%|96.3%|
+|**AsyncResponse.Channels.NATS**|**100%**|**97.2%**|
+|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel|100%|96.3%|
+|AsyncResponse.Channels.NATS.NatsAsyncResponseChannel<T>|100%|96.3%|
 |AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.NATS.NatsAsyncResponseWaiter<T>|100%||
 |AsyncResponse.Channels.NATS.NatsKvStoreAdapter|100%|90%|
@@ -85,16 +86,16 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 99.7%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 99.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**99.7%**|**99.2%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.6%|99.1%|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
+|**AsyncResponse.Channels.PostgreSQL**|**99.6%**|**99.2%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.5%|99.1%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|98.9%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation|100%||
-|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.6%|99.1%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.5%|99.1%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>|100%||
@@ -142,7 +143,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Core**|**98.4%**|**93.4%**|
+|**AsyncResponse.Core**|**98.4%**|**93.3%**|
 |AsyncResponse.AsyncResponseBuilder|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
@@ -186,10 +187,10 @@
 |AsyncResponse.CallbackExpressionConverter<TService>|98.1%|88.6%|
 |AsyncResponse.ChannelSerialExecutor|100%|100%|
 |AsyncResponse.DurableAsyncResponseChannelOptions|100%||
-|AsyncResponse.DurableFlowContext|95.5%|86%|
-|AsyncResponse.DurableFlowContext<TFlow, TInput>|95.5%|86%|
-|AsyncResponse.DurableFlowContext<TResponse>|95.5%|86%|
-|AsyncResponse.DurableFlowContext<TResult>|95.5%|86%|
+|AsyncResponse.DurableFlowContext|95.5%|83.3%|
+|AsyncResponse.DurableFlowContext<TFlow, TInput>|95.5%|83.3%|
+|AsyncResponse.DurableFlowContext<TResponse>|95.5%|83.3%|
+|AsyncResponse.DurableFlowContext<TResult>|95.5%|83.3%|
 |AsyncResponse.DurableFlowExecutor|97.3%|91%|
 |AsyncResponse.DurableFlowOptions|100%||
 |AsyncResponse.DurableFlowService|100%|100%|
@@ -198,14 +199,14 @@
 |AsyncResponse.FlowExecutionLease|96.7%|85.7%|
 |AsyncResponse.FlowStateConcurrency|100%|100%|
 |AsyncResponse.FlowStateJson|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel|99.5%|93.1%|
+|AsyncResponse.InMemoryAsyncResponseChannel|99.5%|95.6%|
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase|98%|90.4%|
-|AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>|98%|90.4%|
+|AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase|98.1%|90.4%|
+|AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>|98.1%|90.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel<T>|99.5%|93.1%|
+|AsyncResponse.InMemoryAsyncResponseChannel<T>|99.5%|95.6%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%||
 |AsyncResponse.InMemoryAsyncResponseWaiter<T>|100%||
 |AsyncResponse.InMemoryFlowStateStore|100%|96%|
