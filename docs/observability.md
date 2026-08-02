@@ -85,6 +85,7 @@ builder.Services.AddOpenTelemetry()
 | `asyncresponse.recovery.outstanding` | observable gauge | — | Persisted recovery-state entries (from the watchdog scan). |
 | `asyncresponse.recovery.active_waiters` | observable gauge | — | Entries that still have a live waiter. |
 | `asyncresponse.recovery.stale` | observable gauge | — | Entries that are old and have no live waiter — probably stuck flows. |
+| `asyncresponse.recovery.scan_truncated` | observable gauge | — | `1` when the last watchdog scan stopped at the `MaxScanEntries` buffer cap: `outstanding`/`stale` then describe the buffered subset only, and the recovery health check reports **Degraded**. Alert on it — a capped scan cannot attest staleness. |
 | `asyncresponse.type_resolution.unresolved` | counter | `kind` = `service`\|`payload` | Callback/payload type names that could not be resolved (see [security.md](security.md)). |
 
 The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or

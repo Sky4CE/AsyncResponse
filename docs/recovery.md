@@ -210,8 +210,14 @@ worker with a shape it does not understand.
 
 ## Shared-correlation recovery
 
-Multiple recoverable waiters may share one correlation id. Live delivery still fans out to every
-active waiter; if all waiters are lost, the recovery store keeps one registration per waiter and a
+Multiple recoverable waiters may share one correlation id. Live delivery fans out to every active
+waiter, with one deliberate exception on the database channels: a waiter whose registration lands
+in the **same server-clock tick** as another process's delivery claim is indistinguishable from a
+finished predecessor reusing the correlation id, and the tie is resolved toward exclusion — the
+waiter misses that delivery and recovers through its timeout (at-most-once for the tie; wrong-data
+redelivery would be the alternative). See the `IsWithinWatermark` documentation in the DB channel
+source for the full trade, and roadmap §5.6 for the sequence-based design that would remove the
+tie entirely. If all waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
 

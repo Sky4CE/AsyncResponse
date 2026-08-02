@@ -246,18 +246,38 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.AddWithValue("retention", retention);
         command.Parameters.AddWithValue("channel", NotificationChannel);
         command.Parameters.AddWithValue("payload", NotifyPayload(correlationId));
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        DateTimeOffset? createdAt;
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            createdAt = reader.IsDBNull(0) ? null : reader.GetFieldValue<DateTimeOffset>(0);
+        }
 
-        // NULL means the idempotent duplicate's original row is already gone (pruned mid-publish):
-        // the message is not persisted, so reporting success with a fabricated app-clock timestamp
-        // would both lie about persistence and feed a client clock into the server-clock
-        // watermark. Fail instead, so the publisher's error handling runs.
-        if (reader.IsDBNull(0))
-            throw new InvalidOperationException(
-                $"PostgreSQL response insert for message {id} returned no created_at: the duplicate's original row no longer exists (pruned). The response is not persisted.");
+        if (createdAt is { } stamped)
+            return stamped;
 
-        return reader.GetFieldValue<DateTimeOffset>(0);
+        // NULL is (almost always) a CONCURRENT idempotent publish, not a missing row: ON CONFLICT
+        // detects the other transaction's row against latest data, but the same-statement fallback
+        // subquery reads under this statement's snapshot, which predates that commit — so the row
+        // exists and is invisible here (reproduced on PostgreSQL 16). A fresh statement gets a
+        // fresh read-committed snapshot and resolves it deterministically; no retry loop needed.
+        await using var lookup = connection.CreateCommand();
+        lookup.CommandText = $"SELECT created_at FROM {MessageTable} WHERE id = @id;";
+        lookup.Parameters.AddWithValue("id", id);
+        var existing = await lookup.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+
+        return existing switch
+        {
+            DateTimeOffset offset => offset,
+            DateTime dateTime => new DateTimeOffset(dateTime, TimeSpan.Zero),
+
+            // Only reachable when the duplicate's original row is genuinely gone (pruned
+            // mid-publish): the message is not persisted, and reporting success with a fabricated
+            // app-clock timestamp would both lie about persistence and feed a client clock into
+            // the server-clock watermark.
+            _ => throw new InvalidOperationException(
+                $"PostgreSQL response insert for message {id} found no row after a duplicate: the original no longer exists (pruned). The response is not persisted.")
+        };
     }
 
     public async Task<IReadOnlyList<PostgreSqlChannelMessage>> LoadMessagesAsync(

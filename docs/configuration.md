@@ -60,7 +60,7 @@ Configured through the `AddAsyncResponse(options => …)` callback.
 | `Watchdog.Enabled` | `true` | Run the recovery watchdog in this host. Disable in all but one host when several share one store, so its scan and warnings aren't duplicated. |
 | `Watchdog.Interval` | 6 hours | How often the watchdog scans persisted recovery state. |
 | `Watchdog.StaleAfter` | 24 hours | Age at which an entry with no live waiter is reported stale. |
-| `Watchdog.MaxScanEntries` | 100 000 | Upper bound on recovery entries one scan buffers before probing. Larger stores are reported for the buffered subset only, with a truncation warning — bounds scan memory. |
+| `Watchdog.MaxScanEntries` | 100 000 | Upper bound on recovery entries one scan buffers before probing (unique correlation ids + individual correlation-less entries — a memory bound, not a flow count). Larger stores are reported for the buffered subset only: the report carries `Truncated`, the recovery health check degrades, the `asyncresponse.recovery.scan_truncated` gauge reads 1, and a warning is logged. |
 | `Watchdog.StartupDelay` | 5 minutes | Delay before the first scan after host start. |
 
 The watchdog values in the [example above](#configuration) are exactly these defaults — shown so

@@ -18,6 +18,31 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task InsertMessage_ConcurrentSameId_BothResolveTheStoredCreatedAt()
+    {
+        // Two publishers racing the same idempotent message id: ON CONFLICT sees the winner's row
+        // against latest data while the same-statement fallback reads an older snapshot and gets
+        // NULL — the loser must resolve it with a fresh-statement re-read, never throw. The loop
+        // gives the statement-snapshot race repeated chances to land.
+        await WithDataSourceAsync("concurrent_insert", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            for (var i = 0; i < 40; i++)
+            {
+                var id = Guid.NewGuid();
+                var first = sql.InsertMessageAsync(id, "concurrent-corr", SuccessEnvelope("first"), TimeSpan.FromSeconds(30), CancellationToken.None);
+                var second = sql.InsertMessageAsync(id, "concurrent-corr", SuccessEnvelope("second"), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+                var stamps = await Task.WhenAll(first, second);
+                Assert.Equal(stamps[0], stamps[1]);
+            }
+        });
+    }
+
+    [Fact]
     public async Task ChannelSql_RoundTripsRecoverySubscribersMessagesClaimsAndListen()
     {
         await WithDataSourceAsync("channel_sql", async (schema, dataSource) =>

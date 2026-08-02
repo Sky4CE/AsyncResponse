@@ -234,7 +234,7 @@ the durable asset either way.
 
 ---
 
-### 5.4 Claim-sequence delivery watermark for the DB channels 🟡
+### 5.6 Claim-sequence delivery watermark for the DB channels 🟡
 
 The DB channels' delivery watermark is timestamp-based, and a same-tick tie between a waiter's
 registration and another process's claim is deliberately resolved toward exclusion (at-most-once;

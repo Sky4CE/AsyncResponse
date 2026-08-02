@@ -472,6 +472,109 @@ public class DurableFlowTests
         Assert.True(step.Completed);
         Assert.Null(step.PendingCorrelationId);
         Assert.False(step.Faulted);
+
+        // The in-memory state is necessary but not sufficient — assert the PERSISTED ledger too,
+        // since that is what a redelivered execution actually reloads.
+        var persisted = await store.LoadAsync("cancel-mid-save-flow");
+        Assert.NotNull(persisted);
+        var persistedStep = persisted!.Steps!["external-step"];
+        Assert.True(persistedStep.Completed);
+        Assert.Null(persistedStep.PendingCorrelationId);
+    }
+
+    [Fact]
+    public async Task AwaitStep_ResponseRacingCancellation_NeverStrandsTheLedger()
+    {
+        // Drives the genuine WaitAsync race — the response completing versus the token cancelling
+        // — many times per run. Whichever side wins, the PERSISTED ledger must land in one of
+        // exactly two legal states: (a) the response is returned and the step is Completed, or
+        // (b) OperationCanceledException propagates and the breadcrumb survives un-faulted for
+        // re-attach. Pinned against the two illegal states: pending cleared without completion
+        // (a lost response) and a fresh-restart shape that would re-send the request.
+        for (var i = 0; i < 200; i++)
+        {
+            using var cancellation = new CancellationTokenSource();
+            var response = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var subscribed = new SemaphoreSlim(0);
+
+            var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
+            waiter.SetupGet(instance => instance.ResponseTask).Returns(response.Task);
+            waiter.Setup(instance => instance.DisposeAsync()).Returns(ValueTask.CompletedTask);
+            var subscriber = new Mock<IAsyncResponseSubscriber>();
+            subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
+                    It.IsAny<string>(),
+                    It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                    It.IsAny<TimeSpan?>()))
+                .Callback(() => subscribed.Release())
+                .ReturnsAsync(waiter.Object);
+
+            var state = new FlowState { FlowId = $"race-flow-{i}" };
+            var store = new InMemoryFlowStateStore();
+            await using var lease = await CreateLeaseAsync(store, state);
+            var context = new DurableFlowContext(
+                state,
+                store,
+                Mock.Of<IAsyncResponseBuilder>(),
+                new AsyncResponseContextPropagation([]),
+                new DurableFlowOptions(),
+                subscriber.Object,
+                recoverableSubscriber: null,
+                NullLogger.Instance,
+                lease);
+
+            var awaitStep = Task.Run(() => context.AwaitStepAsync<OperationResult>(
+                "race-step",
+                _ => Task.CompletedTask,
+                cancellationToken: cancellation.Token));
+            Assert.True(await subscribed.WaitAsync(TimeSpan.FromSeconds(5)));
+
+            await Task.WhenAll(
+                Task.Run(cancellation.Cancel),
+                Task.Run(() => response.TrySetResult(new OperationResult { Status = OperationStatus.Completed })));
+
+            OperationResult? returned = null;
+            var leaseAbandoned = false;
+            try
+            {
+                returned = await awaitStep;
+            }
+            catch (OperationCanceledException)
+            {
+                // Legal outcome (b); asserted against the persisted ledger below.
+            }
+            catch (InvalidOperationException ex) when (ex.InnerException is OperationCanceledException)
+            {
+                // Legal outcome (c): the cancellation landed inside the BREADCRUMB save itself.
+                // The store may or may not have persisted the write, so the lease is
+                // conservatively abandoned (store-throw => MarkLost) and the delivery retries —
+                // nothing was sent yet, so a fresh restart is contract-correct.
+                leaseAbandoned = true;
+            }
+
+            var persisted = await store.LoadAsync(state.FlowId!);
+            Assert.NotNull(persisted);
+            var step = persisted!.Steps is { } steps && steps.TryGetValue("race-step", out var found) ? found : null;
+            if (returned is not null)
+            {
+                Assert.Equal(OperationStatus.Completed, returned.Status);
+                Assert.NotNull(step);
+                Assert.True(step!.Completed);
+                Assert.Null(step.PendingCorrelationId);
+            }
+            else if (step is not null)
+            {
+                // Re-attach shape: breadcrumb preserved, never faulted, never half-completed.
+                Assert.False(step.Completed);
+                Assert.False(step.Faulted);
+                Assert.NotNull(step.PendingCorrelationId);
+            }
+            else
+            {
+                // Nothing persisted at all is only legal when the breadcrumb save was the
+                // casualty — the redelivered execution then starts the step fresh.
+                Assert.True(leaseAbandoned);
+            }
+        }
     }
 
     /// <summary>

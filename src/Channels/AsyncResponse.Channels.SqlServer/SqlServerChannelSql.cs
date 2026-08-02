@@ -270,7 +270,11 @@ internal sealed class SqlServerChannelSql
             return new DateTimeOffset(insertedCreatedAt, TimeSpan.Zero);
 
         // Duplicate insert (WHERE NOT EXISTS suppressed it, or the key-violation race lost):
-        // return the original row's server-stamped created_at.
+        // return the original row's server-stamped created_at. Unlike PostgreSQL's single-statement
+        // CTE, this fallback is already a SEPARATE statement, so a concurrent same-id publish is
+        // resolved here deterministically: the HOLDLOCK range lock on the first statement
+        // serializes against the competing insert, and this second statement reads its own fresh
+        // snapshot/locks and sees the committed row.
         await using var lookup = connection.CreateCommand();
         lookup.CommandText = $"SELECT created_at FROM {MessageTable} WHERE id = @id;";
         lookup.Parameters.AddWithValue("@id", id);
