@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785667301327,
+  "lastUpdate": 1785667326106,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -55948,6 +55948,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 3801.490427542984,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "f388907569fb2dc0f4bed75274639766cc526103",
+          "message": "fix: round-7 review — drain-then-settle channel disposal\n- disposal now DRAINS in-flight dispatch before settling the response task in\n  all four channel implementations (dispatch-gate marker on InMemory, serial-\n  executor marker on Redis + the DB base, stream-end + consume-loop join on\n  NATS, both bounded): an async Until predicate holding a claimed terminal\n  message can no longer lose to dispose-cancel — new conformance fact green on\n  all six derivations against real containers\n- the drain lives BEFORE the cleanup latch everywhere (dispatch paths also\n  enter the latch; an in-core join deadlocked NATS until bounded), and the\n  fire-once cleanup latches became task-latches so a disposing waiter racing a\n  timeout can no longer return before the task is settled\n- PG conflict regression now commits only after pg_blocking_pids reports the\n  competing insert parked on the winner (sleep-based check deleted with the\n  redundant 40-race loop); publisher interface + SetException docs carry the\n  same-tick watermark exception\n- verified: Release 0W/0E, unit x3 green, 94/94 conformance/direct itests on\n  real Redis/NATS/PG/SqlServer/Mongo",
+          "timestamp": "2026-08-02T12:22:59+02:00",
+          "tree_id": "cb040f92f95fdce0ac5a751f7993d1fd9ab63a35",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/f388907569fb2dc0f4bed75274639766cc526103"
+        },
+        "date": 1785667325327,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 159438.16541518335,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 103223.46228008241,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 78117.45678307938,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 235106.03282080218,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 397008.14660716837,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 281088.3741848437,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 346509.9517658147,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 277706.8082601113,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 278629.1446085261,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 282568.890295454,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 311355.76755423815,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 412228.3415229364,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 422432.8754160964,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 168331.80488054504,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 72704.66289901409,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 45097.9599847605,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 24345.93193111153,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4821.131210942811,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 170266.09184834058,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 71364.13980520444,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1388329.7005372837,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2279.696512210237,
             "unit": "flows/s"
           }
         ]
