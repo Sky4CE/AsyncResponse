@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785664086078,
+  "lastUpdate": 1785664106079,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -55286,6 +55286,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2172.1507681159546,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "f69a0b7433cc144c83aa49ee9033825281204071",
+          "message": "fix: round-6 review — settle-then-decide cancellation handoff, provable PG conflict path\n- the cancellation catch now DISPOSES the waiter to settle the response task\n  before deciding (disposal cancels it unless delivery already won), removing\n  the point-in-time check's TOCTOU: delivered -> checkpoint+return, faulted ->\n  fresh restart, canceled -> preserve breadcrumb; deterministic settlement test\n  added, property-test mock gains dispose-cancels semantics and now rejects\n  consumed-response-with-preserved-breadcrumb outright\n- deterministic PG regression: winner insert held uncommitted, competing\n  InsertMessageAsync asserted blocked, commit resolves its created_at via the\n  fresh-statement re-read (the old implementation threw here)\n- narrow the remaining fan-out promises (IAsyncResponsePublisher XML,\n  sample.md, operations.md) with the same-tick at-most-once exception; plain\n  waiters get TimeoutException, flows restart at step timeout (recovery.md)",
+          "timestamp": "2026-08-02T11:35:57+02:00",
+          "tree_id": "1ef645fab4259ca2d59900f7252a5a34cafa2857",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/f69a0b7433cc144c83aa49ee9033825281204071"
+        },
+        "date": 1785664105482,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 126472.39158280703,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 131071.21885747841,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 116212.58535814394,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 288098.09163824096,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 427051.12656087184,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 401890.4928785005,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 330416.8539028839,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 287412.4828989572,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 332384.92833780946,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 324793.4313776438,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 259129.11885734423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 392643.4326459456,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 379414.48756279313,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 214150.37125108362,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 128188.16792444896,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 84540.91577425276,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 42159.11321509445,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4852.648126477479,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 257580.59696879156,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 124636.06269692497,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1522463.9556658496,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 3801.490427542984,
             "unit": "flows/s"
           }
         ]
