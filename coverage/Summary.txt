@@ -1,21 +1,21 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/02/2026 - 19:09:59
+  Generated on: 08/02/2026 - 22:47:55
   Parser: MultiReport (3x Cobertura)
   Assemblies: 26
   Classes: 444
   Files: 200
   Line coverage: 99%
-  Covered lines: 24197
-  Uncovered lines: 227
-  Coverable lines: 24424
-  Total lines: 36671
-  Branch coverage: 96.1% (8344 of 8678)
-  Covered branches: 8344
-  Total branches: 8678
+  Covered lines: 24188
+  Uncovered lines: 225
+  Coverable lines: 24413
+  Total lines: 36702
+  Branch coverage: 96% (8349 of 8688)
+  Covered branches: 8349
+  Total branches: 8688
   Method coverage: 99.8% (2763 of 2766)
-  Full method coverage: 96.4% (2668 of 2766)
+  Full method coverage: 96.6% (2673 of 2766)
   Covered methods: 2763
-  Fully covered methods: 2668
+  Fully covered methods: 2673
   Total methods: 2766
 
 AsyncResponse.Abstractions                                                                                            100%
@@ -38,12 +38,12 @@ AsyncResponse.Abstractions                                                      
   AsyncResponse.WorkerJobEnvelope                                                                                     100%
   AsyncResponse.WorkerJobEnvelopeSchema                                                                               100%
 
-AsyncResponse.Channels.MongoDB                                                                                       99.1%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.8%
+AsyncResponse.Channels.MongoDB                                                                                       99.3%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                   100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                98.9%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.8%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                                100%
   AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument                                                          100%
   AsyncResponse.Channels.MongoDB.MongoChannelSubscriberDocument                                                       100%
   AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannel                                                         73.8%
@@ -68,12 +68,12 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                                       100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions                        100%
 
-AsyncResponse.Channels.PostgreSQL                                                                                    99.6%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.5%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                98.9%
+AsyncResponse.Channels.PostgreSQL                                                                                    99.7%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.6%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.5%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.6%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                                    100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                             100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
@@ -466,7 +466,7 @@ AsyncResponse.Transports.Redis                                                  
   AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.SqlServer                                                                                   97.7%
+AsyncResponse.Transports.SqlServer                                                                                   97.3%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
   AsyncResponse.Transports.DbMessageDispatcherBase                                                                   98.1%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
@@ -477,7 +477,7 @@ AsyncResponse.Transports.SqlServer                                              
   AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
   AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
   AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
-  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                      93.6%
   AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
