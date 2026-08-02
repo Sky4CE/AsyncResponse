@@ -67,18 +67,19 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
     /// </summary>
     public void Validate()
     {
+        // Shared channel knobs (RecoveryStateExpiry, DefaultTimeout, DisposalDrainTimeout) go
+        // through the ONE base guard set — a bespoke duplicate here silently missed every knob
+        // added to the base later (DisposalDrainTimeout was validated nowhere on this provider).
+        ValidateShared(nameof(NatsAsyncResponseChannelOptions));
+
         Required(SubjectPrefix, nameof(SubjectPrefix));
         Required(RecoveryBucket, nameof(RecoveryBucket));
 
         if (RecoveryBucketReplicas <= 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(RecoveryBucketReplicas)} must be positive.");
 
-        Positive(RecoveryStateExpiry, nameof(RecoveryStateExpiry));
         Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
         Positive(PresenceProbeTimeout, nameof(PresenceProbeTimeout));
-
-        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(DefaultTimeout)} must be positive when set.");
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");

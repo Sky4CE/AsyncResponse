@@ -108,6 +108,11 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     /// <summary>Validates the option values and throws on misconfiguration.</summary>
     public void Validate()
     {
+        // Shared channel knobs (RecoveryStateExpiry, DefaultTimeout, DisposalDrainTimeout) go
+        // through the ONE base guard set — a bespoke duplicate here silently missed every knob
+        // added to the base later (DisposalDrainTimeout was validated nowhere on this provider).
+        ValidateShared(nameof(MongoDbAsyncResponseChannelOptions));
+
         MongoDbChannelStore.ValidateCollectionName(RecoveryStateCollection, nameof(RecoveryStateCollection));
         MongoDbChannelStore.ValidateCollectionName(MessageCollection, nameof(MessageCollection));
         MongoDbChannelStore.ValidateCollectionName(SubscriberCollection, nameof(SubscriberCollection));
@@ -121,16 +126,12 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
                 $"{nameof(MessageCollection)}, and {nameof(SubscriberCollection)} must be distinct collections.");
         }
 
-        Positive(RecoveryStateExpiry, nameof(RecoveryStateExpiry));
         Positive(MessageRetention, nameof(MessageRetention));
         Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
         Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
         Positive(ListenerPollInterval, nameof(ListenerPollInterval));
         Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
         Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
-
-        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(DefaultTimeout)} must be positive when set.");
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");

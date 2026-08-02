@@ -67,6 +67,11 @@ public sealed class PostgreSqlOptionsTests
         AssertChannelInvalid(
             options => options.DefaultTimeout = TimeSpan.Zero,
             nameof(PostgreSqlAsyncResponseChannelOptions.DefaultTimeout));
+        // Shared-base knob: enforced via ValidateShared — a bespoke validator that skips the
+        // shared guards accepted TimeSpan.Zero here, defeating the promised disposal bound.
+        AssertChannelInvalid(
+            options => options.DisposalDrainTimeout = TimeSpan.Zero,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DisposalDrainTimeout));
         AssertChannelInvalid(
             options => options.MaxRemoteStackTraceLength = -1,
             nameof(PostgreSqlAsyncResponseChannelOptions.MaxRemoteStackTraceLength));

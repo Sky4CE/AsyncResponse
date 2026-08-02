@@ -128,8 +128,9 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   still-awaiting `WaitAsync` callers. Disposal first **drains** a delivery already in flight
   (every channel implementation): a response mid-`Until`-predicate has already been claimed from
   the channel, so it settles the task as *delivered* — never a cancellation stealing a consumed
-  response — and if the drain budget (`DisposalDrainTimeout`) lapses with the delivery still
-  running, the task faults with `AsyncResponseIndeterminateDeliveryException` instead of
+  response — and if the drain cannot PROVE settlement (the `DisposalDrainTimeout` budget lapses
+  with the delivery still running, or a broker teardown failure leaves the delivery loop's fate
+  unknown), the task faults with `AsyncResponseIndeterminateDeliveryException` instead of
   cancelling, because "canceled" would promise nothing was consumed and invite a durable flow to
   re-attach to a correlation id nothing can answer. Durable flows route that fault to a fresh
   restart of the idempotent step.

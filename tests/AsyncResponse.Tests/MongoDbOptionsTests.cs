@@ -78,6 +78,11 @@ public sealed class MongoDbOptionsTests
         AssertChannelInvalid(
             options => options.DefaultTimeout = TimeSpan.Zero,
             nameof(MongoDbAsyncResponseChannelOptions.DefaultTimeout));
+        // Shared-base knob: enforced via ValidateShared — a bespoke validator that skips the
+        // shared guards accepted TimeSpan.Zero here, defeating the promised disposal bound.
+        AssertChannelInvalid(
+            options => options.DisposalDrainTimeout = TimeSpan.Zero,
+            nameof(MongoDbAsyncResponseChannelOptions.DisposalDrainTimeout));
         AssertChannelInvalid(
             options => options.MaxRemoteStackTraceLength = -1,
             nameof(MongoDbAsyncResponseChannelOptions.MaxRemoteStackTraceLength));

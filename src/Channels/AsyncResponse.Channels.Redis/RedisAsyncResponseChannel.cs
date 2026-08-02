@@ -200,19 +200,22 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     if (accepted)
                         await drained.Task.WaitAsync(budget.Token).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning(
-                        "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
-                        correlationId, drainTimeout);
-                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
-                    // A TrySetResult from the late-finishing dispatch loses against this and is
-                    // dropped; its cleanup call is a no-op behind the latch.
-                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
-                }
                 catch (Exception drainEx)
                 {
-                    _logger.LogDebug(drainEx, "Dispatch drain before cleanup failed for channel {Channel}; proceeding.", channel.ToString()!);
+                    // Budget lapse — or an unforeseen drain failure: either way the marker never
+                    // ran, so an in-flight delivery cannot be ruled out (only accepted=false
+                    // proves the executor finished everything). Settlement unproven means the
+                    // cleanup's cancel below would be a false "nothing was delivered" — fault
+                    // with the explicit indeterminate contract instead. A TrySetResult from the
+                    // late-finishing dispatch loses against this and is dropped; its cleanup
+                    // call is a no-op behind the latch.
+                    _logger.LogWarning(
+                        "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        correlationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
+                    if (drainEx is not OperationCanceledException)
+                        _logger.LogDebug(drainEx, "Dispatch drain failed for channel {Channel}.", channel.ToString()!);
+                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
                 }
             }
 

@@ -106,22 +106,23 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
     /// <summary>Validates the option values and throws on misconfiguration.</summary>
     public void Validate()
     {
+        // Shared channel knobs (RecoveryStateExpiry, DefaultTimeout, DisposalDrainTimeout) go
+        // through the ONE base guard set — a bespoke duplicate here silently missed every knob
+        // added to the base later (DisposalDrainTimeout was validated nowhere on this provider).
+        ValidateShared(nameof(PostgreSqlAsyncResponseChannelOptions));
+
         PostgreSqlChannelSql.ValidateIdentifier(SchemaName, nameof(SchemaName));
         PostgreSqlChannelSql.ValidateIdentifier(RecoveryStateTable, nameof(RecoveryStateTable));
         PostgreSqlChannelSql.ValidateIdentifier(MessageTable, nameof(MessageTable));
         PostgreSqlChannelSql.ValidateIdentifier(SubscriberTable, nameof(SubscriberTable));
         PostgreSqlChannelSql.ValidateIdentifier(NotificationChannel, nameof(NotificationChannel));
 
-        Positive(RecoveryStateExpiry, nameof(RecoveryStateExpiry));
         Positive(MessageRetention, nameof(MessageRetention));
         Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
         Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
         Positive(ListenerPollInterval, nameof(ListenerPollInterval));
         Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
         Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
-
-        if (DefaultTimeout is { } defaultTimeout && defaultTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(DefaultTimeout)} must be positive when set.");
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");

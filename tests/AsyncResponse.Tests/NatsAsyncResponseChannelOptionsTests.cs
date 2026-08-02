@@ -47,6 +47,9 @@ public class NatsAsyncResponseChannelOptionsTests
     public void Validate_Throws_ForNonPositiveTimers()
     {
         AssertInvalid(o => o.RecoveryStateExpiry = TimeSpan.Zero);
+        // Shared-base knob: enforced via ValidateShared — the bespoke validator accepted
+        // TimeSpan.Zero here, defeating the promised disposal bound.
+        AssertInvalid(o => o.DisposalDrainTimeout = TimeSpan.Zero);
         AssertInvalid(o => o.DeliveryConfirmationTimeout = TimeSpan.Zero);
         AssertInvalid(o => o.PresenceProbeTimeout = TimeSpan.FromSeconds(-1));
         AssertInvalid(o => o.DefaultTimeout = TimeSpan.Zero);

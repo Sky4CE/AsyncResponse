@@ -447,7 +447,7 @@ public class DurableFlowTests
         // leave `pending` set with the response already consumed — the redelivered execution
         // would re-attach to a correlation id nothing can answer.
         using var cancellation = new CancellationTokenSource();
-        var store = new CancelOnSecondUpdateStore(cancellation);
+        var store = new CancelOnNthUpdateStore(cancellation, 2);
         var state = new FlowState { FlowId = "cancel-mid-save-flow" };
         await using var lease = await CreateLeaseAsync(store, state);
 
@@ -554,7 +554,7 @@ public class DurableFlowTests
         // redelivered execution starting the step FRESH is contract-correct, and nothing may be
         // persisted that would make it re-attach instead.
         using var cancellation = new CancellationTokenSource();
-        var store = new CancelInsideBreadcrumbSaveStore(cancellation);
+        var store = new CancelOnNthUpdateStore(cancellation, 1);
         var state = new FlowState { FlowId = "torn-breadcrumb-flow" };
         await using var lease = await CreateLeaseAsync(store, state);
 
@@ -607,45 +607,15 @@ public class DurableFlowTests
         Assert.True(persisted!.Steps is null || !persisted.Steps.ContainsKey("torn-step"));
     }
 
-    /// <summary>
-    /// Throws the caller's cancellation out of every state update — the first being the
-    /// breadcrumb save — emulating a store that honours its token mid-write, where whether the
-    /// row actually landed is unknowable. Lease operations pass through untouched.
-    /// </summary>
-    private sealed class CancelInsideBreadcrumbSaveStore(CancellationTokenSource _cancellation) : IFlowStateStore
-    {
-        private readonly InMemoryFlowStateStore _inner = new();
-
-        public Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)
-            => _inner.TryCreateAsync(flowId, state, ttl, cancellationToken);
-
-        public Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
-            => _inner.LoadAsync(flowId, cancellationToken);
-
-        public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
-        {
-            _cancellation.Cancel();
-            throw new OperationCanceledException(_cancellation.Token);
-        }
-
-        public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
-            => _inner.TryAcquireLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
-
-        public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
-            => _inner.TryRenewLeaseAsync(flowId, leaseId, leaseDuration, cancellationToken);
-
-        public Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
-            => _inner.ReleaseLeaseAsync(flowId, leaseId, cancellationToken);
-
-        public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
-            => _inner.TryDeleteAsync(flowId, cancellationToken);
-    }
 
     /// <summary>
-    /// Cancels the provided source when the SECOND state update (the completion save) starts,
-    /// then honours whatever token that update carries — the breadcrumb save is update #1.
+    /// Cancels the provided source when the Nth state update starts, then honours whatever token
+    /// that update carries. Update #1 is the breadcrumb save (it carries the caller's token, so
+    /// ordinal 1 tears the breadcrumb write itself); update #2 is the completion save (it runs
+    /// under <see cref="CancellationToken.None"/>, so ordinal 2 proves the completion checkpoint
+    /// is uninterruptible). Lease operations pass through untouched.
     /// </summary>
-    private sealed class CancelOnSecondUpdateStore(CancellationTokenSource _cancellation) : IFlowStateStore
+    private sealed class CancelOnNthUpdateStore(CancellationTokenSource _cancellation, int _updateOrdinal) : IFlowStateStore
     {
         private readonly InMemoryFlowStateStore _inner = new();
         private int _updates;
@@ -658,7 +628,7 @@ public class DurableFlowTests
 
         public Task<bool> TryUpdateAsync(string flowId, FlowState state, long expectedRevision, TimeSpan ttl, string? leaseId = null, CancellationToken cancellationToken = default)
         {
-            if (Interlocked.Increment(ref _updates) == 2)
+            if (Interlocked.Increment(ref _updates) == _updateOrdinal)
             {
                 _cancellation.Cancel();
                 cancellationToken.ThrowIfCancellationRequested();

@@ -177,12 +177,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // by the terminal dispatch.
         //
         // One DisposalDrainTimeout budget covers BOTH steps — a wedged client library can hang
-        // the subscription dispose just as a wedged Until predicate can hang the loop join. A
-        // lapsed budget must not fall back to the core's cancel: the loop may hold a message
-        // already consumed from the stream, and "canceled" would tell a re-attaching caller
-        // nothing was delivered. It faults the task with the explicit indeterminate contract
-        // instead (routing durable flows to a fresh idempotent restart) and cancels the
-        // subscription token so the loop still ends once the predicate returns.
+        // the subscription dispose just as a wedged Until predicate can hang the loop join. The
+        // core's cancel is only truthful once the JOIN below has proven the loop ended; any
+        // drain outcome short of that — budget lapse, teardown throw with the loop still
+        // running, anything unforeseen — leaves a delivery possibly mid-predicate holding a
+        // message already consumed from the stream, and "canceled" would tell a re-attaching
+        // caller nothing was delivered. Those paths fault the task with the explicit
+        // indeterminate contract instead (routing durable flows to a fresh idempotent restart)
+        // and cancel the subscription token so the loop still ends once the predicate returns.
         async ValueTask DrainThenCleanupAsync()
         {
             if (Volatile.Read(ref cleanupStarted) == 0)
@@ -191,27 +193,46 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 try
                 {
                     using var budget = new CancellationTokenSource(drainTimeout);
-                    await EndStreamOnceAsync().AsTask().WaitAsync(budget.Token).ConfigureAwait(false);
+                    try
+                    {
+                        await EndStreamOnceAsync().AsTask().WaitAsync(budget.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Budget lapsed mid-teardown: not a teardown ERROR — rethrow past the
+                        // catch below so it faults as indeterminate without a misleading log.
+                        throw;
+                    }
+                    catch (Exception teardownEx)
+                    {
+                        // The subscription teardown threw. This is the ONE teardown attempt — the
+                        // latched core will not retry it — so keep the failure at Error, matching
+                        // the observability contract the core used to provide. Then backstop-cancel
+                        // and FALL THROUGH to the join: a failed teardown proves nothing about a
+                        // delivery mid-predicate, and skipping the join here let cleanup cancel a
+                        // response the stream had already handed over.
+                        _logger.LogError(teardownEx, "Error during cleanup for subject {Subject}.", subject);
+                        await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
+                    }
+
+                    // Settlement is PROVEN only by the loop having ended within the remaining
+                    // budget — either it settled the task with the in-flight delivery, or it
+                    // ended with nothing in flight and the cleanup's cancel below is truthful.
                     await consumeLoop.WaitAsync(budget.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogWarning(
-                        "Disposal drain for correlationId {CorrelationId} did not finish within {DrainTimeout}; faulting the waiter as indeterminate.",
-                        correlationId, drainTimeout);
-                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain timed out with a delivery in flight.");
-                    // A TrySetResult from the late-finishing delivery loses against this and is
-                    // dropped; the loop's own cleanup call is a no-op behind the latch.
-                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
-                    await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
                 }
                 catch (Exception drainEx)
                 {
-                    // The subscription teardown threw (the join itself only ever throws the budget
-                    // cancellation handled above). This is the ONE teardown attempt now — the
-                    // latched core will not retry it — so keep the failure at Error, matching the
-                    // observability contract the core used to provide.
-                    _logger.LogError(drainEx, "Error during cleanup for subject {Subject}.", subject);
+                    _logger.LogWarning(
+                        "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        correlationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
+                    // A TrySetResult from the late-finishing delivery loses against this and is
+                    // dropped; the loop's own cleanup call is a no-op behind the latch. The
+                    // non-cancellation exception case is unforeseen infrastructure failure —
+                    // settlement is equally unproven there, so it must not fall back to cancel.
+                    if (drainEx is not OperationCanceledException)
+                        _logger.LogDebug(drainEx, "Disposal drain failed for subject {Subject}.", subject);
+                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
                     await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
                 }
             }
