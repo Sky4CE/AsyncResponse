@@ -214,8 +214,9 @@ Multiple recoverable waiters may share one correlation id. Live delivery fans ou
 waiter, with one deliberate exception on the database channels: a waiter whose registration lands
 in the **same server-clock tick** as another process's delivery claim is indistinguishable from a
 finished predecessor reusing the correlation id, and the tie is resolved toward exclusion — the
-waiter misses that delivery and recovers through its timeout (at-most-once for the tie; wrong-data
-redelivery would be the alternative). See the `IsWithinWatermark` documentation in the DB channel
+waiter misses that delivery. A durable-flow step then faults at its step timeout and restarts the
+idempotent step fresh; a plain waiter surfaces a `TimeoutException` to its caller (at-most-once
+for the tie; wrong-data redelivery would be the alternative). See the `IsWithinWatermark` documentation in the DB channel
 source for the full trade, and roadmap §5.6 for the sequence-based design that would remove the
 tie entirely. If all waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that

@@ -10,9 +10,12 @@ public interface IAsyncResponsePublisher
 {
     /// <summary>
     /// Publishes a response payload on the channel associated with the specified correlation id.
-    /// Any active subscriber awaiting this channel receives the payload — including payloads
+    /// Active subscribers awaiting this channel receive the payload — including payloads
     /// that describe a failed business state, which the waiter's <c>Until</c> predicate and flow
-    /// code interpret. With no subscribers, the payload's
+    /// code interpret. One deliberate exception on the database channels: a subscriber whose
+    /// registration lands in the same server-clock tick as another process's delivery claim is
+    /// excluded from that delivery and times out instead (at-most-once for the tie — see the
+    /// shared-correlation section of <c>docs/recovery.md</c>). With no subscribers, the payload's
     /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides between the persisted
     /// resume and failure callbacks.
     /// </summary>

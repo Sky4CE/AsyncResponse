@@ -43,6 +43,48 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
     }
 
     [Fact]
+    public async Task InsertMessage_LosingAnUncommittedConflict_ResolvesAfterCommitViaFreshRead()
+    {
+        // Deterministically forces the stale-snapshot NULL path the fresh-statement re-read
+        // exists for: the winner's insert is held UNCOMMITTED, so the competing statement blocks
+        // on the speculative conflict; on commit, ON CONFLICT suppresses the competing insert
+        // while its same-statement fallback still reads the pre-commit snapshot — only the
+        // fresh-statement re-read can resolve the timestamp. The previous implementation threw.
+        await WithDataSourceAsync("conflict_commit", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            var id = Guid.NewGuid();
+            await using var winnerConnection = await dataSource.OpenConnectionAsync();
+            await using var winnerTransaction = await winnerConnection.BeginTransactionAsync();
+            await using var winnerInsert = winnerConnection.CreateCommand();
+            winnerInsert.Transaction = winnerTransaction;
+            winnerInsert.CommandText =
+                $"""
+                INSERT INTO {sql.MessageTable} (id, correlation_id, envelope_json, expires_at)
+                VALUES (@id, @correlation_id, @envelope_json, now() + interval '30 seconds')
+                RETURNING created_at;
+                """;
+            winnerInsert.Parameters.AddWithValue("id", id);
+            winnerInsert.Parameters.AddWithValue("correlation_id", "conflict-corr");
+            winnerInsert.Parameters.Add("envelope_json", NpgsqlTypes.NpgsqlDbType.Jsonb).Value = SuccessEnvelope("winner");
+            var winnerStamp = Assert.IsType<DateTime>(await winnerInsert.ExecuteScalarAsync());
+
+            var competing = sql.InsertMessageAsync(
+                id, "conflict-corr", SuccessEnvelope("loser"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            await Task.Delay(250);
+            Assert.False(competing.IsCompleted); // parked on the winner's uncommitted conflict
+
+            await winnerTransaction.CommitAsync();
+            var resolved = await competing.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(new DateTimeOffset(winnerStamp, TimeSpan.Zero), resolved);
+        });
+    }
+
+    [Fact]
     public async Task ChannelSql_RoundTripsRecoverySubscribersMessagesClaimsAndListen()
     {
         await WithDataSourceAsync("channel_sql", async (schema, dataSource) =>

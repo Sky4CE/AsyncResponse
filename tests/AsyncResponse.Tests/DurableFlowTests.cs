@@ -433,7 +433,10 @@ public class DurableFlowTests
         // breadcrumb survives and the redelivered execution re-attaches instead of re-sending.
         Assert.False(state.Steps!["remote"].Faulted);
         Assert.NotNull(state.Steps!["remote"].PendingCorrelationId);
-        waiter.Verify(instance => instance.DisposeAsync(), Times.Once);
+        // At least once, not exactly once: the cancellation catch disposes to SETTLE the handoff
+        // before deciding, and the finally disposes again — a no-op behind the channels'
+        // cleanup-once latch. Idempotent disposal is the contract, not a single call.
+        waiter.Verify(instance => instance.DisposeAsync(), Times.AtLeastOnce);
     }
 
     [Fact]
@@ -483,6 +486,63 @@ public class DurableFlowTests
     }
 
     [Fact]
+    public async Task AwaitStep_ResponseWinningTheDisposalSettlement_IsCheckpointedNotStranded()
+    {
+        // The race a point-in-time check missed: cancellation throws, the completed-successfully
+        // check would see a pending task, and the response lands DURING disposal. With
+        // settle-then-decide, the mock's DisposeAsync completing the task (delivery winning the
+        // settlement) must yield the response and a completed ledger — never a preserved
+        // breadcrumb for a consumed correlation id.
+        var response = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
+        waiter.SetupGet(instance => instance.ResponseTask).Returns(response.Task);
+        waiter.Setup(instance => instance.DisposeAsync()).Returns(() =>
+        {
+            response.TrySetResult(new OperationResult { Status = OperationStatus.Completed });
+            return ValueTask.CompletedTask;
+        });
+        var subscriber = new Mock<IAsyncResponseSubscriber>();
+        subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
+                It.IsAny<string>(),
+                It.IsAny<Func<OperationResult, ValueTask<bool>>?>(),
+                It.IsAny<TimeSpan?>()))
+            .ReturnsAsync(waiter.Object);
+
+        using var cancellation = new CancellationTokenSource();
+        var state = new FlowState { FlowId = "settlement-flow" };
+        var store = new InMemoryFlowStateStore();
+        await using var lease = await CreateLeaseAsync(store, state);
+        var context = new DurableFlowContext(
+            state,
+            store,
+            Mock.Of<IAsyncResponseBuilder>(),
+            new AsyncResponseContextPropagation([]),
+            new DurableFlowOptions(),
+            subscriber.Object,
+            recoverableSubscriber: null,
+            NullLogger.Instance,
+            lease);
+
+        // Cancel inside the trigger — after the breadcrumb save, before the wait — so the wait
+        // throws deterministically while the response task is still pending.
+        var result = await context.AwaitStepAsync<OperationResult>(
+            "external-step",
+            _ =>
+            {
+                cancellation.Cancel();
+                return Task.CompletedTask;
+            },
+            cancellationToken: cancellation.Token);
+
+        Assert.Equal(OperationStatus.Completed, result.Status);
+        var persisted = await store.LoadAsync("settlement-flow");
+        Assert.NotNull(persisted);
+        var step = persisted!.Steps!["external-step"];
+        Assert.True(step.Completed);
+        Assert.Null(step.PendingCorrelationId);
+    }
+
+    [Fact]
     public async Task AwaitStep_ResponseRacingCancellation_NeverStrandsTheLedger()
     {
         // Drives the genuine WaitAsync race — the response completing versus the token cancelling
@@ -499,7 +559,13 @@ public class DurableFlowTests
 
             var waiter = new Mock<IAsyncResponseWaiter<OperationResult>>();
             waiter.SetupGet(instance => instance.ResponseTask).Returns(response.Task);
-            waiter.Setup(instance => instance.DisposeAsync()).Returns(ValueTask.CompletedTask);
+            // Emulate the channel contract: disposal cancels the response task unless something
+            // completed it first — that settlement is what makes the outcome model below total.
+            waiter.Setup(instance => instance.DisposeAsync()).Returns(() =>
+            {
+                response.TrySetCanceled();
+                return ValueTask.CompletedTask;
+            });
             var subscriber = new Mock<IAsyncResponseSubscriber>();
             subscriber.Setup(instance => instance.CreateResponseWaiter<OperationResult>(
                     It.IsAny<string>(),
@@ -563,10 +629,14 @@ public class DurableFlowTests
             }
             else if (step is not null)
             {
-                // Re-attach shape: breadcrumb preserved, never faulted, never half-completed.
+                // Re-attach shape: breadcrumb preserved, never faulted, never half-completed —
+                // and only legal when cancellation genuinely WON the settlement (the response
+                // task ended canceled). A successfully delivered response may never coexist with
+                // a preserved breadcrumb: that is precisely the consumed-response strand.
                 Assert.False(step.Completed);
                 Assert.False(step.Faulted);
                 Assert.NotNull(step.PendingCorrelationId);
+                Assert.True(response.Task.IsCanceled);
             }
             else
             {
