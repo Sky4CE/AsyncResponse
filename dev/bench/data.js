@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785710832345,
+  "lastUpdate": 1785710846551,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -57272,6 +57272,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 2301.9125947214015,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "37c95405afab5003b46f84fb311b115c96d7c225",
+          "message": "fix: round-9 review — teardown-throw proves settlement, shared option validation everywhere\n- a NATS subscription-teardown failure no longer decides the settlement: the\n  round-8 single-try drain let a throwing DisposeAsync skip the consume-loop\n  join and fall to the cleanup's cancel, stealing a claimed delivery mid-\n  predicate (flows re-attached to a consumed cid). The teardown catch now logs\n  Error, backstop-cancels, and FALLS THROUGH to the join within the remaining\n  DisposalDrainTimeout; any drain outcome that cannot prove the loop ended\n  faults AsyncResponseIndeterminateDeliveryException — probe pinned as a unit\n  test, and the ThrowingSubscription fake now ends its read gracefully on the\n  lifetime token like the real adapter. DB/Redis generic drain catches take\n  the same unproven-settlement fault (only a tombstone-suppressed marker\n  proves nothing was in flight)\n- NATS/PG/SqlServer/Mongo bespoke validators now call ValidateShared first\n  (DisposalDrainTimeout previously accepted Zero on all four, defeating the\n  promised bound) and their duplicated RecoveryStateExpiry/DefaultTimeout\n  guards are deleted; zero-drain-timeout rejection cases added to all four\n  options-test files\n- the two IFlowStateStore pass-through fakes merged into one\n  CancelOnNthUpdateStore (n=2 completion-save, n=1 torn-breadcrumb; safe —\n  a lost lease short-circuits at SaveAsync entry, before the store)\n- verified: Release 0W/0E, unit 3324/3324 x3 both TFMs, 99/99 conformance/\n  direct itests on real Redis/NATS/PG/SqlServer/Mongo",
+          "timestamp": "2026-08-03T00:29:53+02:00",
+          "tree_id": "db52a907665d138b2c3bc464883814abe1dff313",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/37c95405afab5003b46f84fb311b115c96d7c225"
+        },
+        "date": 1785710845807,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 230161.2509724313,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 209070.30616255634,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 230492.07291662827,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 370474.65212430165,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 639549.7569710923,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 532175.3198373673,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 738486.9878592739,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 534359.3031954686,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 453794.6307019295,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 477254.0709772254,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 415918.01424103277,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 794533.608771651,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 855256.40587048,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 442228.1932855609,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 227804.13218471452,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 125533.7695882894,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 61268.38296562501,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4916.972010628527,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 317017.49936596496,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 155728.31016096077,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1917876.5271091848,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 4502.283378038005,
             "unit": "flows/s"
           }
         ]
