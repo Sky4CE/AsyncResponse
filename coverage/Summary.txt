@@ -1,21 +1,21 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/03/2026 - 00:04:37
+  Generated on: 08/03/2026 - 08:59:45
   Parser: MultiReport (3x Cobertura)
   Assemblies: 26
   Classes: 444
   Files: 200
   Line coverage: 99%
-  Covered lines: 24217
-  Uncovered lines: 227
-  Coverable lines: 24444
-  Total lines: 36790
-  Branch coverage: 96.1% (8342 of 8676)
-  Covered branches: 8342
-  Total branches: 8676
+  Covered lines: 24234
+  Uncovered lines: 221
+  Coverable lines: 24455
+  Total lines: 36813
+  Branch coverage: 96.3% (8365 of 8682)
+  Covered branches: 8365
+  Total branches: 8682
   Method coverage: 99.8% (2770 of 2773)
-  Full method coverage: 96.6% (2680 of 2773)
+  Full method coverage: 96.6% (2681 of 2773)
   Covered methods: 2770
-  Fully covered methods: 2680
+  Fully covered methods: 2681
   Total methods: 2773
 
 AsyncResponse.Abstractions                                                                                            100%
@@ -466,9 +466,9 @@ AsyncResponse.Transports.Redis                                                  
   AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.SqlServer                                                                                     97%
+AsyncResponse.Transports.SqlServer                                                                                   97.7%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
-  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   97.4%
+  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   98.1%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
   AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext                                                100%
   AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor                                                  100%
@@ -477,7 +477,7 @@ AsyncResponse.Transports.SqlServer                                              
   AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
   AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
   AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
-  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                        92%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
