@@ -74,6 +74,17 @@ public class NatsAsyncResponseChannelOptionsTests
         }.Validate();
 
     [Fact]
+    public void Validate_Throws_ForOverflowingRecoveryRetention()
+        // TimeSpan.MaxValue slipped past the conditional timer ceiling (DefaultTimeout set means
+        // the expiry is a pure TTL) but overflowed the "now + expiry" stamp at the first
+        // recovery-state save — the persistence bound catches it at startup instead.
+        => AssertInvalid(o =>
+        {
+            o.RecoveryStateExpiry = TimeSpan.MaxValue;
+            o.DefaultTimeout = TimeSpan.FromHours(12);
+        });
+
+    [Fact]
     public void Validate_Throws_ForNegativeRemoteStackTraceLength()
         => AssertInvalid(o => o.MaxRemoteStackTraceLength = -1);
 

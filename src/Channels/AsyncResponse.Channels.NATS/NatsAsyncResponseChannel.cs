@@ -133,6 +133,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // Local: CleanupOnceAsync — ends the stream (which ends the consume loop), deletes
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
+        int teardownBudgetSpent = 0;
         var subscriptionTornDown = false;
         var cleanupGate = new object();
         Task? cleanupTask = null;
@@ -213,6 +214,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             if (Volatile.Read(ref cleanupStarted) == 0)
             {
                 var drainTimeout = _options.DisposalDrainTimeout;
+                // ONE budget for the whole disposal: the latched cleanup below skips its own
+                // teardown wait when a drain already spent this budget on the same latched
+                // teardown task — a second full wait there made disposal cost double the
+                // configured DisposalDrainTimeout.
+                Volatile.Write(ref teardownBudgetSpent, 1);
                 try
                 {
                     using var budget = new CancellationTokenSource(drainTimeout);
@@ -299,8 +305,12 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 // an unbudgeted teardown here let a wedged client library hold DisposeAsync
                 // hostage past DisposalDrainTimeout. On the bound lapsing, the catch below logs
                 // and the finally's backstop cancel still ends the consume loop; the abandoned
-                // teardown task never faults (it logs its own late outcome).
-                await EndStreamOnce().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+                // teardown task never faults (it logs its own late outcome). When a DRAIN
+                // preceded this core, it already spent that budget on this same latched task —
+                // waiting a second one here made disposal cost double the configured bound, so
+                // the wait is skipped (the teardown is running and self-logging regardless).
+                if (Volatile.Read(ref teardownBudgetSpent) == 0)
+                    await EndStreamOnce().WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                 if (subscription is null)
                     subscriptionTornDown = true;
             }

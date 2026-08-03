@@ -45,6 +45,15 @@ public abstract class AsyncResponseChannelOptions
     internal static readonly TimeSpan MaxTimerBackedTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
 
     /// <summary>
+    /// Upper bound for persisted-TTL knobs (10 years): far beyond any practical retention, small
+    /// enough that the "now + TTL" expiry stamp every store computes can never overflow
+    /// <see cref="DateTime"/>/<see cref="DateTimeOffset"/> arithmetic — a
+    /// <see cref="TimeSpan.MaxValue"/> expiry used to pass validation and then throw
+    /// <see cref="ArgumentOutOfRangeException"/> at the first recovery-state save.
+    /// </summary>
+    internal static readonly TimeSpan MaxPersistenceTtl = TimeSpan.FromDays(3650);
+
+    /// <summary>
     /// Guards a RESOLVED per-waiter timeout (explicit, <see cref="DefaultTimeout"/>, or the
     /// <see cref="RecoveryStateExpiry"/> fallback) before any subscribe/persist side effect:
     /// positive (one rule for every channel — zero and the never-firing -1 ms sentinel included)
@@ -73,6 +82,10 @@ public abstract class AsyncResponseChannelOptions
 
         if (RecoveryStateExpiry <= TimeSpan.Zero)
             throw new InvalidOperationException($"{optionsName}.{nameof(RecoveryStateExpiry)} must be positive.");
+        if (RecoveryStateExpiry > MaxPersistenceTtl)
+            throw new InvalidOperationException(
+                $"{optionsName}.{nameof(RecoveryStateExpiry)} must be at most {MaxPersistenceTtl.TotalDays:0} days — " +
+                "expiry stamps are computed as \"now + expiry\", and larger values overflow at the first save.");
 
         // The ceiling applies to the expiry only in its TIMER-ARMED role — the waiter-timeout
         // fallback when DefaultTimeout is not configured. As a pure persistence TTL (with a

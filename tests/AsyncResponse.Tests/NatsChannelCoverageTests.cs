@@ -217,11 +217,47 @@ public sealed class NatsChannelCoverageTests
 
         // The abandoned teardown finally FAILS: the latched, never-faulting teardown must log
         // that late outcome — it used to die as a TaskScheduler.UnobservedTaskException that
-        // never reached the channel logger.
+        // never reached the channel logger. Asserted on the SPECIFIC exception: the core's own
+        // budget lapse already logs a TimeoutException-flavoured "Error during cleanup" entry
+        // before this point, which a message-only check mistook for proof.
         hang.TrySetException(new InvalidOperationException("late teardown boom"));
-        using var logDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        while (!logger.Messages.Any(message => message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal)))
-            await Task.Delay(10, logDeadline.Token);
+        await Eventually(() => logger.Entries.Any(entry =>
+            entry.Message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal)
+            && entry.Exception is InvalidOperationException { Message: "late teardown boom" }));
+    }
+
+    /// <summary>
+    /// A waiter disposed while the teardown hangs: the drain spends DisposalDrainTimeout on the
+    /// latched teardown task, and the latched cleanup must NOT spend a second full budget on the
+    /// same task — 200 ms configured used to cost ~410 ms, and the core's second lapse stamped a
+    /// spurious TimeoutException "Error during cleanup" entry.
+    /// </summary>
+    [Fact]
+    public async Task Dispose_HangingTeardown_SpendsTheBudgetOnce()
+    {
+        var hang = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new FakeNatsResponseChannelClient
+        {
+            SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
+        };
+        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+
+        var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-single-budget");
+        await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Settlement was unprovable within the budget (the teardown never finished, so the loop
+        // was never joined): indeterminate, per the drain contract.
+        await Assert.ThrowsAsync<AsyncResponseIndeterminateDeliveryException>(
+            () => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+
+        // The core skipped its second wait on the drain-budgeted teardown: no TimeoutException
+        // cleanup-error entry may exist (the teardown's own late outcome still logs when it
+        // completes — covered by the late-outcome fact above).
+        Assert.DoesNotContain(logger.Entries, entry =>
+            entry.Message.StartsWith("Error during cleanup for subject", StringComparison.Ordinal));
+
+        hang.TrySetResult();
     }
 
     private NatsAsyncResponseChannel CreateChannel(
@@ -358,12 +394,18 @@ public sealed class NatsChannelCoverageTests
 
     private sealed class CollectingLogger<T> : ILogger<T>
     {
-        private readonly List<string> _messages = [];
+        private readonly List<(string Message, Exception? Exception)> _entries = [];
         private readonly object _gate = new();
 
         public IReadOnlyList<string> Messages
         {
-            get { lock (_gate) return _messages.ToArray(); }
+            get { lock (_gate) return _entries.Select(entry => entry.Message).ToArray(); }
+        }
+
+        /// <summary>Message + attached exception — lets a test pin WHICH failure was logged.</summary>
+        public IReadOnlyList<(string Message, Exception? Exception)> Entries
+        {
+            get { lock (_gate) return _entries.ToArray(); }
         }
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
@@ -372,7 +414,7 @@ public sealed class NatsChannelCoverageTests
 
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            lock (_gate) _messages.Add(formatter(state, exception));
+            lock (_gate) _entries.Add((formatter(state, exception), exception));
         }
     }
 }
