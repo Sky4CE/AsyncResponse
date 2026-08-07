@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/03/2026 - 08:59:45
+  Generated on: 08/07/2026 - 15:23:03
   Parser: MultiReport (3x Cobertura)
   Assemblies: 26
   Classes: 444
   Files: 200
-  Line coverage: 99%
-  Covered lines: 24234
-  Uncovered lines: 221
-  Coverable lines: 24455
-  Total lines: 36813
-  Branch coverage: 96.3% (8365 of 8682)
-  Covered branches: 8365
-  Total branches: 8682
-  Method coverage: 99.8% (2770 of 2773)
-  Full method coverage: 96.6% (2681 of 2773)
-  Covered methods: 2770
-  Fully covered methods: 2681
-  Total methods: 2773
+  Line coverage: 99.1%
+  Covered lines: 24273
+  Uncovered lines: 213
+  Coverable lines: 24486
+  Total lines: 36884
+  Branch coverage: 96.4% (8387 of 8700)
+  Covered branches: 8387
+  Total branches: 8700
+  Method coverage: 99.8% (2771 of 2774)
+  Full method coverage: 96.9% (2690 of 2774)
+  Covered methods: 2771
+  Fully covered methods: 2690
+  Total methods: 2774
 
 AsyncResponse.Abstractions                                                                                            100%
   AsyncResponse.AsyncResponseContext                                                                                  100%
@@ -106,7 +106,7 @@ AsyncResponse.Channels.SqlServer                                                
   AsyncResponse.Channels.SqlServer.SqlServerTransientFaults                                                           100%
   Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions                   100%
 
-AsyncResponse.Core                                                                                                   98.4%
+AsyncResponse.Core                                                                                                   98.6%
   AsyncResponse.AsyncResponseBuilder                                                                                  100%
   AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
   AsyncResponse.AsyncResponseBuilder<T>                                                                               100%
@@ -162,36 +162,36 @@ AsyncResponse.Core                                                              
   AsyncResponse.FlowExecutionLease                                                                                   96.7%
   AsyncResponse.FlowStateConcurrency                                                                                  100%
   AsyncResponse.FlowStateJson                                                                                         100%
-  AsyncResponse.InMemoryAsyncResponseChannel                                                                         99.5%
+  AsyncResponse.InMemoryAsyncResponseChannel                                                                         99.7%
   AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
   AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>                                                          100%
-  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase                                                        98.1%
-  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>                                                98.1%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase                                                          99%
+  AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>                                                  99%
   AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup                                                        100%
   AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot                                                     100%
-  AsyncResponse.InMemoryAsyncResponseChannel<T>                                                                      99.5%
+  AsyncResponse.InMemoryAsyncResponseChannel<T>                                                                      99.7%
   AsyncResponse.InMemoryAsyncResponseOptions                                                                          100%
   AsyncResponse.InMemoryAsyncResponseWaiter<T>                                                                        100%
   AsyncResponse.InMemoryFlowStateStore                                                                                100%
   AsyncResponse.InMemoryFlowStateStore.Entry                                                                          100%
-  AsyncResponse.InMemoryRecoveryStateStore                                                                           96.7%
+  AsyncResponse.InMemoryRecoveryStateStore                                                                           98.7%
   AsyncResponse.InMemoryRecoveryStateStore.Entry                                                                      100%
-  AsyncResponse.InMemoryRecoveryStateStore.EntryBucket                                                                 94%
-  AsyncResponse.InMemoryWorkerHost                                                                                     90%
+  AsyncResponse.InMemoryRecoveryStateStore.EntryBucket                                                               97.6%
+  AsyncResponse.InMemoryWorkerHost                                                                                   96.6%
   AsyncResponse.InMemoryWorkerTransport                                                                               100%
   AsyncResponse.InMemoryWorkerTransportOptions                                                                        100%
   AsyncResponse.JsonSafety                                                                                            100%
-  AsyncResponse.LostSubscriberCallbackDispatcher                                                                     98.7%
-  AsyncResponse.LostSubscriberCallbackDispatcher<T>                                                                  98.7%
+  AsyncResponse.LostSubscriberCallbackDispatcher                                                                     98.8%
+  AsyncResponse.LostSubscriberCallbackDispatcher<T>                                                                  98.8%
   AsyncResponse.PayloadRecoveryClassifier                                                                             100%
   AsyncResponse.RawJsonResponse                                                                                       100%
   AsyncResponse.RecoverableAsyncResponseBuilder                                                                       100%
   AsyncResponse.RecoverableAsyncResponseBuilder<T>                                                                    100%
   AsyncResponse.RecoveryStateObservation                                                                              100%
-  AsyncResponse.ReflectionExtensions                                                                                 99.3%
+  AsyncResponse.ReflectionExtensions                                                                                  100%
   AsyncResponse.ReflectionExtensions.ConversionPlan                                                                   100%
   AsyncResponse.ReflectionExtensions.InvocationPlan                                                                   100%
-  AsyncResponse.ReflectionExtensions<T>                                                                              99.3%
+  AsyncResponse.ReflectionExtensions<T>                                                                               100%
   AsyncResponse.RemoteStackTrace                                                                                      100%
   AsyncResponse.SerialExecutorRegistry                                                                                100%
   AsyncResponse.SerialExecutorRegistry.ExecutorEntry                                                                  100%
@@ -466,9 +466,9 @@ AsyncResponse.Transports.Redis                                                  
   AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.SqlServer                                                                                   97.7%
+AsyncResponse.Transports.SqlServer                                                                                     97%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
-  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   98.1%
+  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   97.4%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
   AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext                                                100%
   AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor                                                  100%
@@ -477,7 +477,7 @@ AsyncResponse.Transports.SqlServer                                              
   AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
   AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
   AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
-  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                        92%
   AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
