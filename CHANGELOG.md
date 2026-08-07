@@ -77,7 +77,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   routing, raw-JSON ingress, correlation-id reuse, subscriber counts, late-response recovery) runs
   against the in-memory reference in unit tests and against real Redis, NATS, PostgreSQL,
   SQL Server, and MongoDB in the integration suite — the in-memory channel's behavior is now an
-  enforced contract rather than a de-facto spec.
+  enforced contract rather than a de-facto spec. Multi-response streams — the library's core
+  scenario — are pinned end to end: a live waiter riding out a whole checkpoint stream, the
+  raw-ingress lost path (materialized payloads, checkpoint retention, the full incident replay),
+  the crash-mid-stream interleaving (live checkpoint → crash → lost checkpoint → lost terminal),
+  and stragglers (duplicate terminals, late checkpoints) after completion on either path, with
+  correlation-id reuse intact.
 - `docs/transport-semantics.md`: a per-transport semantics matrix — ack modes, delivery-attempt
   counting, dead-letter destinations, early-ACK failure handling, shutdown-drain budgets, and
   lock/lease renewal — replacing prose scattered across `configuration.md`.
