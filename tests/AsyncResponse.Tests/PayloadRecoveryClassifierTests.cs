@@ -53,14 +53,38 @@ public class PayloadRecoveryClassifierTests
     }
 
     [Fact]
-    public void TypedPayload_AssignableToRegisteredBaseType_ReusesTheDerivedInstance()
+    public void TypedPayload_DerivedInstanceForRegisteredBaseType_RematerializesAsTheBaseType()
     {
-        var payload = new DerivedStepResult { Status = IncidentStepStatus.Succeeded, Extra = "kept" };
+        // Only an EXACT runtime-type match reuses the instance. A derived instance must be
+        // re-materialized as the registered base — exactly what the broker route would produce —
+        // so the routing verdict cannot depend on whether the response crossed a serialization
+        // boundary.
+        var payload = new DerivedStepResult { Status = IncidentStepStatus.Succeeded, Extra = "dropped" };
 
         var classification = PayloadRecoveryClassifier.Classify(payload, typeof(BaseStepResult).FullName);
 
         Assert.Equal(RecoveryAction.Resume, classification.Action);
-        Assert.Same(payload, classification.MaterializedPayload);
+        var materialized = Assert.IsType<BaseStepResult>(classification.MaterializedPayload);
+        Assert.NotSame(payload, materialized);
+        Assert.Equal(IncidentStepStatus.Succeeded, materialized.Status);
+    }
+
+    [Fact]
+    public void TypedPayload_DerivedOverridingOnRecovery_CannotDivergeFromTheWireRoute()
+    {
+        // The divergence this pins: base classifies Fail, derived overrides to Resume. The typed
+        // in-process route used to ask the derived instance (Resume) while the broker route
+        // materialized the registered base (Fail) — the same logical response resuming or failing
+        // the flow depending on which process happened to publish it. Both routes must agree on
+        // the registered type's verdict.
+        var typed = PayloadRecoveryClassifier.Classify(
+            new RoutingDerivedPayload(), typeof(RoutingBasePayload).FullName);
+        var wire = PayloadRecoveryClassifier.Classify(
+            JsonSerializer.Deserialize<object?>("""{}"""), typeof(RoutingBasePayload).FullName);
+
+        Assert.Equal(RecoveryAction.Fail, wire.Action);
+        Assert.Equal(wire.Action, typed.Action);
+        Assert.IsType<RoutingBasePayload>(typed.MaterializedPayload);
     }
 
     [Fact]
@@ -193,4 +217,15 @@ public class PayloadRecoveryClassifierTests
         Assert.Null(classification.Action);
         Assert.Null(classification.MaterializedPayload);
     }
+}
+
+/// <summary>Base payload whose recovery verdict is Fail; the derived override flips it to Resume.</summary>
+public class RoutingBasePayload : IAsyncResponsePayload
+{
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class RoutingDerivedPayload : RoutingBasePayload
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }

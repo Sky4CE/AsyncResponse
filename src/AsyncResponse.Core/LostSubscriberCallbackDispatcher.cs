@@ -112,7 +112,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     continue;
 
                 callbackInvoked = true;
-                await recoveryStateStore.TryDeleteAsync(correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -165,7 +165,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
                     continue;
 
                 callbackInvoked = true;
-                await recoveryStateStore.TryDeleteAsync(correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
+                await DeleteConsumedRegistrationAsync(recoveryStateStore, correlationId, recoveryState.RegistrationId, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -398,6 +398,35 @@ internal sealed class LostSubscriberCallbackDispatcher(
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogError(ex, "Failure callback failed for channel {Channel}.", channel);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes a registration whose callback has already been invoked successfully. Best-effort by
+    /// contract: the callback IS the outcome, and a cleanup fault must never be reinterpreted as a
+    /// failed response — rethrowing here made the ingress retry the whole delivery (re-invoking
+    /// the callback) and then publish the CLEANUP exception through SetException, invoking the
+    /// failure callback for a flow whose resume had already succeeded. A failed delete leaves the
+    /// registration to its TTL and the watchdog; recovery is at-least-once, so a later delivery
+    /// re-invoking the callback is within contract.
+    /// </summary>
+    private async Task DeleteConsumedRegistrationAsync(
+        IRecoveryStateStore recoveryStateStore,
+        string correlationId,
+        Guid registrationId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await recoveryStateStore.TryDeleteAsync(correlationId, registrationId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Recovery callback for correlationId {CorrelationId} succeeded but deleting its registration {RegistrationId} failed; the registration remains until its TTL or the next delivery.",
+                correlationId,
+                registrationId);
         }
     }
 

@@ -166,6 +166,45 @@ public class LostSubscriberRecoveryRegressionTests
         Assert.Equal(IncidentStepStatus.Succeeded, derived.Status);
     }
 
+    // ----- cleanup failures must never be reinterpreted as a failed response -----
+
+    [Fact]
+    public async Task Ingress_DeleteFailsAfterSuccessfulResume_DoesNotEscalateToFailureCallback()
+    {
+        // The registration delete that follows a SUCCESSFUL resume is bookkeeping, not the
+        // outcome. When it throws, the dispatch must not rethrow: rethrowing made the ingress
+        // retry the whole delivery four times (re-invoking the resume each time) and then publish
+        // the CLEANUP exception through SetException — invoking the failure callback for a flow
+        // whose resume had already succeeded.
+        await using var harness = Harness.Create(failDeletes: true);
+        await harness.ArmIncidentRegistrationAsync();
+
+        await harness.Ingress.HandleResponseMessageAsync(
+            """{"Status":2,"Message":"pipeline succeeded"}""", CorrelationId);
+
+        var (payload, _) = Assert.Single(harness.Spy.Resumed);
+        Assert.IsType<IncidentStepResult>(payload);
+        Assert.Empty(harness.Spy.Failed);
+        // The failed delete leaves the registration for its TTL — at-least-once, watchdog-visible.
+        Assert.NotEmpty(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
+    [Fact]
+    public async Task SetException_DeleteFailsAfterSuccessfulFailureCallback_DoesNotThrow()
+    {
+        await using var harness = Harness.Create(failDeletes: true);
+        await harness.ArmIncidentRegistrationAsync();
+
+        // Same rule on the exception route: the failure callback ran; a failed cleanup afterwards
+        // must not surface as a publish failure (which would loop the failure path).
+        await harness.Publisher.SetException(new InvalidOperationException("remote boom"), CorrelationId);
+
+        var (_, exception) = Assert.Single(harness.Spy.Failed);
+        Assert.Equal("remote boom", exception.Message);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.NotEmpty(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
     // ----- conservative paths that must keep working exactly as before -----
 
     [Fact]
@@ -277,7 +316,7 @@ public class LostSubscriberRecoveryRegressionTests
         public IAsyncResponsePublisher Publisher => _provider.GetRequiredService<IAsyncResponsePublisher>();
         public IRecoveryStateStore RecoveryStateStore => _provider.GetRequiredService<IRecoveryStateStore>();
 
-        public static Harness Create()
+        public static Harness Create(bool failDeletes = false)
         {
             var services = new ServiceCollection();
             services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
@@ -285,6 +324,12 @@ public class LostSubscriberRecoveryRegressionTests
             services.AddSingleton<IIncidentFlowSpy>(spy);
             services.AddSingleton<ITypedParameterFlowSpy>(spy);
             services.AddSingleton<IBaseParameterFlowSpy>(spy);
+            if (failDeletes)
+            {
+                // Registered BEFORE AddAsyncResponse: the library's TryAddSingleton yields to it.
+                services.AddSingleton<IRecoveryStateStore>(new DeleteFailingRecoveryStateStore());
+            }
+
             services.AddAsyncResponse().WithInMemoryChannel();
             return new Harness(services.BuildServiceProvider(), spy);
         }
@@ -382,6 +427,38 @@ public interface ITypedParameterFlowSpy
 public interface IBaseParameterFlowSpy
 {
     Task ResumeBase(BaseStepResult payload);
+}
+
+/// <summary>
+/// A working in-memory recovery store whose deletes always fail — the post-callback cleanup
+/// fault the dispatcher must treat as bookkeeping, never as a failed response.
+/// </summary>
+internal sealed class DeleteFailingRecoveryStateStore : IRecoveryStateStore
+{
+    private readonly Dictionary<string, List<RecoveryState>> _states = [];
+    private readonly object _gate = new();
+
+    public Task SaveAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+        {
+            if (!_states.TryGetValue(correlationId, out var list))
+                _states[correlationId] = list = [];
+            list.Add(state);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<RecoveryState>> GetAllAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
+            return Task.FromResult<IReadOnlyList<RecoveryState>>(
+                _states.TryGetValue(correlationId, out var list) ? [.. list] : []);
+    }
+
+    public Task<bool> TryDeleteAsync(string correlationId, Guid registrationId, CancellationToken cancellationToken = default)
+        => throw new InvalidOperationException("recovery store rejected the delete");
 }
 
 public sealed class IncidentFlowSpy : IIncidentFlowSpy, ITypedParameterFlowSpy, IBaseParameterFlowSpy

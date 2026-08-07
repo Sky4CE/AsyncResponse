@@ -916,7 +916,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             {
                 var payload = response is T typed
                     ? typed
-                    : response.As<T>();
+                    : MaterializeAs(response);
 
                 var completion = _completionPredicate(payload);
                 if (!completion.IsCompletedSuccessfully)
@@ -974,6 +974,17 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 return FaultAsync(ex);
             }
         }
+
+        // Wire parity for mixed-type shared-correlation fan-out: a payload published as a
+        // DIFFERENT CLR type than this waiter's T is re-materialized through the same JSON
+        // round-trip a broker envelope would take. The old Convert.ChangeType fallback faulted the
+        // waiter with an InvalidCastException for unrelated DTO types that broker channels
+        // deserialize without complaint. JsonElement/string/null payloads keep the existing
+        // conversion path.
+        private static T MaterializeAs(object? response)
+            => response is System.Text.Json.JsonElement or string or null
+                ? response.As<T>()
+                : AsyncResponseJson.Serialize(response, response.GetType()).As<T>();
 
         private Task FaultAsync(Exception exception)
         {

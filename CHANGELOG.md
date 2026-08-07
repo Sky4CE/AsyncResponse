@@ -25,9 +25,9 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   Both resume and failure callbacks now receive the instance the classifier materialized (the
   conservative unclassifiable path still attaches the raw payload). Classification is
   **per-registration**: each recovery registration is classified as the payload type IT registered
-  — for typed in-process publishes too (the publisher's runtime type is reused only when assignable
-  to the registered type, otherwise the response is re-materialized as that type via the same JSON
-  round-trip a broker delivery would take), so shared-correlation registrations with different
+  — for typed in-process publishes too (the published instance is reused only on an exact
+  runtime-type match, otherwise the response is re-materialized as the registered type via the
+  same JSON round-trip a broker delivery would take), so shared-correlation registrations with different
   payload types route independently instead of all inheriting the published instance's verdict.
   Pinned by channel-conformance facts on all six channel derivations plus ingress-level regression
   tests.
@@ -41,6 +41,26 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   `asyncresponse.recovery.liveness_contradiction` trace tag) instead of consuming it. The database
   channels are unchanged by design: their post-claim dispatch runs only after atomically winning
   the message for recovery, which already excludes live delivery.
+- **A post-callback cleanup fault is never reinterpreted as a failed response.** The registration
+  delete that follows a successfully invoked recovery callback ran inside the dispatch's
+  exception scope: a store fault on that delete rethrew, the ingress retried the whole delivery
+  (re-invoking the resume callback each attempt) and then published the CLEANUP exception through
+  `SetException` — invoking the failure callback for a flow whose resume had already succeeded.
+  The delete is now best-effort bookkeeping: a fault is logged, the registration stays until its
+  TTL or the next delivery (at-least-once, watchdog-visible), and the callback's outcome stands.
+  Same rule on the exception-dispatch route.
+- **Recovery classification cannot diverge across the serialization boundary.** A typed publish
+  whose runtime type merely DERIVED from the registered payload type reused the instance — its
+  `OnRecovery()` override could return `Resume` while the broker route, materializing the
+  registered base from JSON, returned `Fail` for the same logical response. The instance is now
+  reused only on an exact runtime-type match; any other match re-materializes as the registered
+  type, so the in-process and broker routes always agree.
+- **In-memory live fan-out matches broker channels for mixed payload types.** Two waiters with
+  different declared payload types sharing one correlation id: broker channels give each waiter
+  its own JSON materialization of the envelope, but the in-memory channel cast the publisher's
+  CLR instance (`Convert.ChangeType`), faulting the second waiter with an `InvalidCastException`.
+  Foreign CLR payloads now take the same JSON round-trip; pinned by a new conformance fact on all
+  six channel derivations.
 
 ### Added
 

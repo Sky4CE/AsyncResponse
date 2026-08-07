@@ -15,8 +15,9 @@ namespace AsyncResponse;
 /// </param>
 /// <param name="MaterializedPayload">
 /// The payload as an <see cref="IAsyncResponsePayload"/> instance of the REGISTERED type — the
-/// original instance when it is assignable to the registration's payload type, otherwise the
-/// instance materialized as that type (raw-JSON ingress, or a cross-type sibling registration).
+/// original instance only on an exact runtime-type match, otherwise the response materialized as
+/// the registered type (raw-JSON ingress, a derived instance, or a cross-type sibling
+/// registration), so the verdict never depends on a serialization boundary.
 /// <c>null</c> exactly when <paramref name="Action"/> is <c>null</c>. Callbacks must receive THIS
 /// instance, never the raw JSON: an <c>object</c>-/interface-/base-typed callback parameter
 /// otherwise gets a <see cref="JsonElement"/> and every type guard in the consuming flow silently
@@ -79,12 +80,18 @@ internal static class PayloadRecoveryClassifier
                     return new RecoveryClassification(null, null);
                 }
 
-                if (registeredType.IsInstanceOfType(typedPayload))
+                // Reuse the instance only for an EXACT runtime-type match. A derived instance
+                // must be re-materialized as the registered type like any other mismatch: asking
+                // the derived override directly let the same logical response resume on the typed
+                // in-process route while the broker route (which materializes the registered base
+                // from JSON) failed it — the verdict must not depend on whether the response
+                // crossed a serialization boundary.
+                if (typedPayload.GetType() == registeredType)
                 {
                     return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
                 }
 
-                // Cross-type registration: interpret the response as the registered type via the
+                // Any other registration: interpret the response as the registered type via the
                 // same JSON round-trip a broker delivery of this payload would take.
                 var json = AsyncResponseJson.Serialize((object)typedPayload, typedPayload.GetType());
                 return json.ConvertTo(registeredType) is IAsyncResponsePayload rematerialized

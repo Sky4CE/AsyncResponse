@@ -42,6 +42,14 @@ namespace AsyncResponse.Tests;
 /// <item><description><b>Activity tagging</b> is already public-surface (no reflection) and lives
 /// here only for the ×3-assembly matrix.</description></item>
 /// </list>
+/// <para>
+/// The ×3 provider matrix itself is also load-bearing, not ceremony: this shared source compiles
+/// separately into the MongoDB, PostgreSQL and SQL Server assemblies, and coverage is counted
+/// per assembly — running a seam against one provider leaves the same lines uncovered in the
+/// other two, which the integration suite cannot make up (real containers never fault on cue).
+/// Collapsing the matrix to one provider trades those covered lines away in the two dropped
+/// assemblies for nothing in return.
+/// </para>
 /// </summary>
 public sealed class DbChannelSharedCoverageTests
 {

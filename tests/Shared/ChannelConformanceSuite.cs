@@ -397,6 +397,32 @@ public abstract class ChannelConformanceSuite
     }
 
     [Fact]
+    public async Task Contract_LiveFanout_MixedPayloadTypes_EachWaiterReceivesItsDeclaredType()
+    {
+        // Shared-correlation fan-out with DIFFERENT declared payload types: broker channels give
+        // each waiter its own JSON materialization of the envelope, so a waiter never faults just
+        // because the publisher's CLR type differs from its own. The in-memory channel must match
+        // that contract instead of casting the publisher's instance across unrelated DTO types.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("mixed-fanout");
+
+        await using var resultWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await using var mirrorWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceMirrorResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "both"), correlationId);
+
+        var result = await resultWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal(ConformanceStatus.Completed, result.Status);
+        Assert.Equal("both", result.Message);
+
+        var mirror = await mirrorWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal(ConformanceStatus.Completed, mirror.Status);
+        Assert.Equal("both", mirror.Message);
+    }
+
+    [Fact]
     public async Task Contract_StragglersAfterLiveCompletion_AreDroppedAndCorrelationIdStaysReusable()
     {
         // Broker redelivery and slow remotes produce stragglers: a duplicate of the terminal
@@ -908,6 +934,25 @@ public sealed class ConformanceResult : IAsyncResponsePayload
     /// the registration on a progress message and let the real terminal response arrive with
     /// nothing to route against — the 292332 flow-deadlock shape.
     /// </summary>
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        ConformanceStatus.Completed => RecoveryAction.Resume,
+        ConformanceStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
+}
+
+/// <summary>
+/// A second payload type sharing <see cref="ConformanceResult"/>'s wire shape: what a sibling
+/// service waiting on the same correlation id would declare. Lets the suite pin mixed-type
+/// shared-correlation fan-out — every waiter receives its own declared type, however the
+/// publisher spelled the payload.
+/// </summary>
+public sealed class ConformanceMirrorResult : IAsyncResponsePayload
+{
+    public ConformanceStatus Status { get; set; }
+    public string? Message { get; set; }
+
     public RecoveryAction OnRecovery() => Status switch
     {
         ConformanceStatus.Completed => RecoveryAction.Resume,
