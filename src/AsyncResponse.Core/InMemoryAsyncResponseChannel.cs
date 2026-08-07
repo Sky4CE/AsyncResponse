@@ -160,8 +160,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;
@@ -218,8 +218,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;
@@ -279,7 +279,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 if (!result.RetryLive)
                 {
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, result.CallbackInvoked);
 
                     return;
                 }

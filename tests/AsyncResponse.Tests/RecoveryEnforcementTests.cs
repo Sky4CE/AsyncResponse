@@ -9,7 +9,7 @@ namespace AsyncResponse.Tests;
 
 /// <summary>
 /// The recovery-classification override and its durable-channel enforcement: the reflection helper
-/// that detects whether a payload overrides <c>ShouldResumeOnRecovery</c>, and the Redis channel's
+/// that detects whether a payload overrides <c>OnRecovery</c>, and the Redis channel's
 /// fail-fast when a recovery-enabled flow's payload would otherwise rely on the conservative
     /// default. The in-memory channel (which cannot survive a redeploy) does not expose the
     /// recoverable subscriber/builder capability. Also pins that the live path is untouched:
@@ -29,9 +29,9 @@ public class RecoveryEnforcementTests
     [Fact]
     public void OverrideDetection_DistinguishesOverriddenFromDefault()
     {
-        Assert.True(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(OperationResult)));
-        Assert.True(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(SuccessOnlyPayload)));
-        Assert.False(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(DefaultRecoveryPayload)));
+        Assert.True(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(OperationResult)));
+        Assert.True(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(SuccessOnlyPayload)));
+        Assert.False(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(DefaultRecoveryPayload)));
     }
 
     [Fact]
@@ -42,7 +42,7 @@ public class RecoveryEnforcementTests
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => subscriber.CreateRecoverableResponseWaiter<DefaultRecoveryPayload>(CorrelationId, resumeCallback: ResumeCallback()));
 
-        Assert.Contains(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(IAsyncResponsePayload.OnRecovery), ex.Message, StringComparison.Ordinal);
         Assert.Contains(typeof(DefaultRecoveryPayload).ToString(), ex.Message, StringComparison.Ordinal);
     }
 
@@ -103,7 +103,7 @@ public class RecoveryEnforcementTests
     }
 }
 
-/// <summary>A payload that does NOT override <c>ShouldResumeOnRecovery</c> (uses the conservative default).</summary>
+/// <summary>A payload that does NOT override <c>OnRecovery</c> (uses the conservative default).</summary>
 public sealed class DefaultRecoveryPayload : IAsyncResponsePayload
 {
     public string? Message { get; set; }

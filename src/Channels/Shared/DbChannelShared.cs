@@ -158,13 +158,14 @@ internal abstract class DbAsyncResponseChannelBase :
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the {_providerName} channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         completionPredicate ??= _ => new ValueTask<bool>(true);
@@ -319,8 +320,8 @@ internal abstract class DbAsyncResponseChannelBase :
                     .ConfigureAwait(false);
                 if (!dispatchResult.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                     return;
                 }
@@ -340,8 +341,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
         }
@@ -384,8 +385,8 @@ internal abstract class DbAsyncResponseChannelBase :
                     .ConfigureAwait(false);
                 if (!dispatchResult.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                     return;
                 }
@@ -404,8 +405,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
         }
@@ -452,7 +453,7 @@ internal abstract class DbAsyncResponseChannelBase :
                 if (!dispatchResult.RetryLive)
                 {
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
                     return;
                 }
 
@@ -480,7 +481,7 @@ internal abstract class DbAsyncResponseChannelBase :
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
         }
         catch (Exception ex)

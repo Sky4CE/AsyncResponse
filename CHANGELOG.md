@@ -11,7 +11,38 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lost-subscriber recovery callbacks now receive the materialized payload, never raw broker
+  JSON.** A response arriving through a broker ingress after the waiter died was classified by
+  materializing it as the registered payload type — and the materialized instance was then
+  discarded: the callback invocation bound the raw `JsonElement` to the callback's *declared*
+  parameter type. An `object`-typed parameter (the natural shape for one callback shared across
+  payload types) received a `JsonElement`, so every `payload is …` guard in the consuming flow
+  silently failed; an interface-typed parameter could not be invoked at all; a base-class parameter
+  silently sliced off derived state. This reproduced a production flow deadlock: duplicate resumed
+  workers, an unpersisted terminal success, and a re-attached wait on a consumed correlation id.
+  Both resume and failure callbacks now receive the instance the classifier materialized (the
+  conservative unclassifiable path still attaches the raw payload). Pinned by channel-conformance
+  facts on all six channel derivations plus ingress-level regression tests.
+
 ### Added
+
+- `RecoveryAction` and `IAsyncResponsePayload.OnRecovery()` — the tri-state lost-subscriber
+  classification that **replaces** the binary `ShouldResumeOnRecovery()`: `Resume`, `Fail`, or
+  `KeepWaiting` (default `Fail` — nothing resumes by omission). `KeepWaiting` is the recovery-side
+  mirror of an `Until` predicate skipping a progress message: a **non-terminal checkpoint**
+  arriving with no live waiter invokes no callback and **retains the recovery registration**, so
+  the terminal response that follows still routes. Previously a checkpoint had to classify as
+  resume (spawning one resumed worker per checkpoint and consuming the registration out from under
+  the terminal response, which was then dropped) or fail (failing a flow that was still running).
+  A bool cannot carry three outcomes, and the library deliberately supports response streams with
+  progress messages before the terminal result — so the payload contract is now the one method that
+  can. Migration: `ShouldResumeOnRecovery() => X` becomes
+  `OnRecovery() => X ? RecoveryAction.Resume : RecoveryAction.Fail`, plus `KeepWaiting` for
+  checkpoint states. The durable-channel fail-fast guard is
+  `AsyncResponsePayloadReflection.OverridesOnRecovery`. The lost-subscriber route tag/metric gains
+  a `keep_waiting` value.
 
 - Startup validation vetoes early ACK (`AckAfterEnqueue`) on the worker subscriber: durable-flow
   wake-ups ride the worker queue and rely on broker redelivery for crash recovery, so a crash

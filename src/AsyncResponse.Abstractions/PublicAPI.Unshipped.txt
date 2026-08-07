@@ -119,7 +119,7 @@ AsyncResponse.IAsyncResponseIngress
 AsyncResponse.IAsyncResponseIngress.HandleResponseMessageAsync(string! messageJson, string? correlationId) -> System.Threading.Tasks.Task!
 AsyncResponse.IAsyncResponseIngress.HandleWorkerMessageAsync(string! messageJson) -> System.Threading.Tasks.Task!
 AsyncResponse.IAsyncResponsePayload
-AsyncResponse.IAsyncResponsePayload.ShouldResumeOnRecovery() -> bool
+AsyncResponse.IAsyncResponsePayload.OnRecovery() -> AsyncResponse.RecoveryAction
 AsyncResponse.IAsyncResponsePublisher
 AsyncResponse.IAsyncResponsePublisher.SetException(System.Exception! exception, string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.IAsyncResponsePublisher.SetResponse<T>(T response, string! correlationId, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
@@ -202,6 +202,10 @@ AsyncResponse.PlaceholderType
 AsyncResponse.PlaceholderType.CorrelationId = 2 -> AsyncResponse.PlaceholderType
 AsyncResponse.PlaceholderType.Exception = 1 -> AsyncResponse.PlaceholderType
 AsyncResponse.PlaceholderType.Payload = 0 -> AsyncResponse.PlaceholderType
+AsyncResponse.RecoveryAction
+AsyncResponse.RecoveryAction.Fail = 0 -> AsyncResponse.RecoveryAction
+AsyncResponse.RecoveryAction.KeepWaiting = 2 -> AsyncResponse.RecoveryAction
+AsyncResponse.RecoveryAction.Resume = 1 -> AsyncResponse.RecoveryAction
 AsyncResponse.RecoveryState
 AsyncResponse.RecoveryState.Context.get -> System.Collections.Generic.Dictionary<string!, string!>?
 AsyncResponse.RecoveryState.Context.set -> void
@@ -265,9 +269,9 @@ static AsyncResponse.AsyncResponseContext.GenerateCorrelationId() -> string!
 static AsyncResponse.AsyncResponseContext.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?
 static AsyncResponse.AsyncResponseContext.SetCorrelationId(string! correlationId) -> void
 static AsyncResponse.AsyncResponseContext.SetReplyTarget(AsyncResponse.AsyncResponseReplyTarget! replyTarget) -> void
-static AsyncResponse.AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(System.Type! payloadType) -> bool
 static AsyncResponse.AsyncResponseRequestContext.operator !=(AsyncResponse.AsyncResponseRequestContext? left, AsyncResponse.AsyncResponseRequestContext? right) -> bool
 static AsyncResponse.AsyncResponseRequestContext.operator ==(AsyncResponse.AsyncResponseRequestContext? left, AsyncResponse.AsyncResponseRequestContext? right) -> bool
+static AsyncResponse.AsyncResponsePayloadReflection.OverridesOnRecovery(System.Type! payloadType) -> bool
 static AsyncResponse.CallbackParam.ForPlaceholder(AsyncResponse.PlaceholderType placeholder) -> AsyncResponse.CallbackParam!
 static AsyncResponse.CallbackParam.ForValue(object? value) -> AsyncResponse.CallbackParam!
 static AsyncResponse.FlowStateSchema.IsReadable(int entryVersion) -> bool

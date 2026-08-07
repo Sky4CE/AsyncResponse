@@ -200,9 +200,10 @@ public interface IRecoverableAsyncResponseAttachedBuilder<T> : IAsyncResponseAtt
 {
     /// <summary>
     /// Registers the lost-subscriber <em>resume</em> callback: invoked when a response payload whose
-    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returns <c>true</c> arrives while
-    /// no waiter is listening (typically after a redeploy). The callback usually resumes or
-    /// re-registers the flow.
+    /// <see cref="IAsyncResponsePayload.OnRecovery"/> returns <see cref="RecoveryAction.Resume"/>
+    /// arrives while no waiter is listening (typically after a redeploy). The callback usually
+    /// resumes or re-registers the flow, and receives the payload materialized as the registered
+    /// payload type — never raw broker JSON.
     /// </summary>
     [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
                               "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +
@@ -219,9 +220,10 @@ public interface IRecoverableAsyncResponseAttachedBuilder<T> : IAsyncResponseAtt
 
     /// <summary>
     /// Registers the lost-subscriber <em>failure</em> callback: invoked when an exception
-    /// envelope — or a payload whose <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
-    /// returns <c>false</c> (or that cannot be classified) — arrives while no waiter is listening.
-    /// Domain failures are delivered as <see cref="AsyncResponseDomainFailureException"/>.
+    /// envelope — or a payload whose <see cref="IAsyncResponsePayload.OnRecovery"/>
+    /// returns <see cref="RecoveryAction.Fail"/> (or that cannot be classified) — arrives while no
+    /// waiter is listening. Domain failures are delivered as
+    /// <see cref="AsyncResponseDomainFailureException"/>.
     /// </summary>
     [RequiresUnreferencedCode("The callback names its target service and method as strings, resolved by reflection when it fires after a " +
                               "subscriber loss; trimming may have removed them. Use the expression-based overload, which roots the service's " +

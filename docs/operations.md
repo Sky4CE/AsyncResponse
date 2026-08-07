@@ -19,11 +19,12 @@ end-to-end profiles).
 2. **Use reply targets for generic response topics.** If the remote system needs reply-to metadata,
    call `.WithReplyTarget()` and pass the `AsyncResponseRequestContext` into the trigger. Transport
    packages own how native destinations become reply targets.
-3. **Decide recovery routing honestly.** Override `ShouldResumeOnRecovery()` for any payload that can
-   carry a domain failure on a durable channel, returning `false` for the states that must not
-   resume. It's independent of your `Until` predicate (which owns live completion) — they answer
-   different questions: "is it a failure?" versus "is the operation done?". See
-   [recovery.md](recovery.md).
+3. **Decide recovery routing honestly.** Override `OnRecovery()` for any payload that can
+   carry a domain failure on a durable channel: `Fail` for the states that must not resume, and
+   `KeepWaiting` for non-terminal progress checkpoints so they don't consume the registration out
+   from under the terminal response. It's independent of your `Until` predicate (which owns live
+   completion) — they answer different questions: "what does this result do to the flow?" versus
+   "is the operation done?". See [recovery.md](recovery.md).
 4. **Register both recovery callbacks** for any flow that must survive redeploys. A failed payload
    with no failure callback is logged and dropped — never resumed — but dropped is still a stuck
    flow.

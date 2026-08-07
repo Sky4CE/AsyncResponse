@@ -16,8 +16,8 @@ namespace AsyncResponse.Channels.NATS;
 /// "no responders" signal reports precisely when nobody is listening.</description></item>
 /// <item><description>Persists <see cref="RecoveryState"/> in a JetStream Key-Value bucket so a
 /// response arriving after the waiter died (e.g. a redeploy) is routed through the lost-subscriber
-/// dispatcher, which asks the payload's ShouldResumeOnRecovery and invokes the resume or failure
-/// callback.</description></item>
+/// dispatcher, which asks the payload's OnRecovery and invokes the resume or failure
+/// callback with the materialized payload (or keeps the registration armed for a checkpoint).</description></item>
 /// </list>
 /// </summary>
 internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
@@ -83,13 +83,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // redeploy), so require the override rather than letting the conservative default silently
         // route every recovered response to the failure callback.
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the NATS channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         // default: first envelope completes the wait
@@ -596,8 +597,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         .ConfigureAwait(false);
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
@@ -662,8 +663,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         .ConfigureAwait(false);
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
@@ -739,7 +740,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 }
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
             {

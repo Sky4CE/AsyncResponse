@@ -369,7 +369,7 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     public void CompleteDeliveries() => _deliveries.Writer.TryComplete();
 }
 
-/// <summary>A payload that does not override <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>.</summary>
+/// <summary>A payload that does not override <see cref="IAsyncResponsePayload.OnRecovery"/>.</summary>
 internal sealed class UnclassifiedNatsPayload : IAsyncResponsePayload
 {
     public string? Message { get; set; }

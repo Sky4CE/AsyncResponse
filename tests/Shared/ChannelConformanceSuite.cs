@@ -260,6 +260,99 @@ public abstract class ChannelConformanceSuite
         Assert.Empty(harness.Spy.Resumed);
     }
 
+    // ----- f2/g2/h2. Lost-subscriber recovery over the raw ingress (incident 292332 regression) -----
+    //
+    // The production shape of the lost-subscriber path: the waiter's process died (redeploy), the
+    // response arrives through a broker ingress as raw JSON, and the payload type is known only
+    // from the persisted recovery registration. These facts pin the two guarantees whose absence
+    // deadlocked a real flow (Optimatic 292332/292683): the recovery callback must receive the
+    // MATERIALIZED payload (an object-typed callback parameter received a raw JsonElement, so
+    // every `is` guard in the flow silently failed), and a non-terminal checkpoint must not
+    // consume the recovery registration out from under the terminal response that follows it.
+
+    [Fact]
+    public async Task Contract_NoSubscriber_RawJsonResumablePayload_ResumeCallbackReceivesMaterializedPayload()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("lost-raw-typed");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"late raw resume"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the raw-JSON resumable payload routes to the resume callback");
+
+        // The callback parameter is declared `object` (the spy mirrors production flow services
+        // that share one callback across payload types). It must still receive the materialized
+        // payload type recorded in the recovery registration — not the ingress's raw JsonElement.
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal(ConformanceStatus.Completed, resumed.Status);
+        Assert.Equal("late raw resume", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+    }
+
+    [Fact]
+    public async Task Contract_NoSubscriber_NonTerminalCheckpoint_RetainsRegistrationForLaterTerminal()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("keep-waiting");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        // A non-terminal checkpoint (progress report) arrives after the waiter died. It must not
+        // resume, must not fail, and must NOT consume the registration — the flow's real outcome
+        // is still in flight.
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"still running"}""", correlationId);
+
+        await Task.Delay(SettleDelay);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Empty(harness.Spy.Failures);
+        Assert.NotEmpty(await harness.RecoveryStateStore.GetAllAsync(correlationId));
+
+        // The retained registration is live, not a leftover: the terminal response that follows
+        // must route through it with the materialized payload. (Timing-proof: even if the
+        // checkpoint's dispatch were still in flight above, a consumed registration here would
+        // drop the terminal response and this wait would fail.)
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"terminal after checkpoint"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the terminal response routes through the registration the checkpoint left armed");
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal("terminal after checkpoint", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+    }
+
+    [Fact]
+    public async Task Contract_NoSubscriber_CheckpointsThenTerminal_ResumesExactlyOnceWithTerminalPayload()
+    {
+        // The full 292332 message sequence: the waiter died mid-step; the remote side then
+        // publishes two in-progress checkpoints and the terminal success a few seconds later.
+        // Contract: exactly ONE resume, carrying the MATERIALIZED terminal payload — never three
+        // resumed workers, never a checkpoint payload, never a dropped terminal response.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("incident-replay");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"checkpoint-1"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"checkpoint-2"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"pipeline succeeded"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count >= 1),
+            "the terminal response resumes the flow");
+
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal(ConformanceStatus.Completed, resumed.Status);
+        Assert.Equal("pipeline succeeded", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+
+        // The terminal dispatch consumed the registration; nothing is left to fire again.
+        await EventuallyAsync(
+            async () => (await harness.RecoveryStateStore.GetAllAsync(correlationId)).Count == 0,
+            "the consumed registration is deleted");
+    }
+
     // ----- i. Raw JSON ingress path -----
 
     [Fact]
@@ -637,8 +730,19 @@ public sealed class ConformanceResult : IAsyncResponsePayload
     public ConformanceStatus Status { get; set; }
     public string? Message { get; set; }
 
-    /// <summary>Recovery routing only: resume on in-flight/successful states, fail otherwise.</summary>
-    public bool ShouldResumeOnRecovery() => Status is ConformanceStatus.Completed or ConformanceStatus.Running;
+    /// <summary>
+    /// Recovery routing only: resume on success, keep the registration armed on a non-terminal
+    /// checkpoint (<see cref="ConformanceStatus.Running"/> — the response stream reports progress
+    /// before its terminal message), fail otherwise. Classifying Running as resume would consume
+    /// the registration on a progress message and let the real terminal response arrive with
+    /// nothing to route against — the 292332 flow-deadlock shape.
+    /// </summary>
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        ConformanceStatus.Completed => RecoveryAction.Resume,
+        ConformanceStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
 }
 
 /// <summary>

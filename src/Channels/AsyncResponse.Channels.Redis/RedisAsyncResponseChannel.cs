@@ -16,7 +16,8 @@ namespace AsyncResponse.Channels.Redis;
 /// <item><description>Subscribes waiters to those channels with per-channel serialized handling.</description></item>
 /// <item><description>Persists <see cref="RecoveryState"/> so responses arriving after the waiter
 /// died (e.g. a redeploy) are routed through the lost-subscriber dispatcher, which asks the payload's
-/// ShouldResumeOnRecovery and invokes the resume or failure callback.</description></item>
+/// OnRecovery and invokes the resume or failure callback with the materialized payload
+/// (or keeps the registration armed for a checkpoint).</description></item>
 /// </list>
 /// </summary>
 internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
@@ -102,13 +103,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // route every recovered response to the failure callback. The in-memory channel, which
         // cannot recover across a process restart, is deliberately not subject to this check.
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the Redis channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         // default: first envelope completes the wait
@@ -566,8 +568,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         .ConfigureAwait(false);
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
@@ -637,8 +639,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         .ConfigureAwait(false);
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
@@ -717,7 +719,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }

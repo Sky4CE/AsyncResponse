@@ -18,8 +18,9 @@ public interface IAsyncResponsePublisher
     /// registration lands in the same server-clock tick as another process's delivery claim is
     /// excluded from that delivery and times out instead (at-most-once for the tie — see the
     /// shared-correlation section of <c>docs/recovery.md</c>). With no subscribers, the payload's
-    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides between the persisted
-    /// resume and failure callbacks.
+    /// <see cref="IAsyncResponsePayload.OnRecovery"/> decides between the persisted resume
+    /// and failure callbacks — or retains the registration for a non-terminal checkpoint
+    /// (<see cref="RecoveryAction.KeepWaiting"/>).
     /// </summary>
     /// <typeparam name="T">The payload type.</typeparam>
     /// <param name="response">The payload to publish.</param>
@@ -84,7 +85,7 @@ public interface IAsyncResponsePublisher
     /// and have the waiter inspect it. This keeps the fan-out on the cheap value path (no
     /// <see langword="throw"/>, no stack capture, minimal allocation), makes the failure a
     /// first-class part of your contract that survives serialization across brokers and process
-    /// restarts, and lets <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> drive
+    /// restarts, and lets <see cref="IAsyncResponsePayload.OnRecovery"/> drive
     /// recovery routing for it. Keep <c>SetException</c> for the failures you would genuinely want a
     /// stack trace and an <see langword="catch"/> block for.
     /// </para>

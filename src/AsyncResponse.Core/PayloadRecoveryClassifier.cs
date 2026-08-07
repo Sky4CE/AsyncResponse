@@ -5,12 +5,32 @@ using System.Text.Json;
 namespace AsyncResponse;
 
 /// <summary>
+/// Outcome of classifying a lost-subscriber response payload.
+/// </summary>
+/// <param name="Action">
+/// The recovery route the payload chose (<see cref="IAsyncResponsePayload.OnRecovery"/>),
+/// or <c>null</c> when it could not be classified — a <c>null</c> payload, missing/unresolvable
+/// type information, or a conversion failure. Callers must treat <c>null</c> conservatively as
+/// "do not resume", so a payload that cannot be understood never takes the happy path.
+/// </param>
+/// <param name="MaterializedPayload">
+/// The payload as an <see cref="IAsyncResponsePayload"/> instance of the registered type — the
+/// original instance for typed publishes, the materialized one for raw-JSON ingress. <c>null</c>
+/// exactly when <paramref name="Action"/> is <c>null</c>. Callbacks must receive THIS instance,
+/// never the raw JSON: an <c>object</c>-/interface-/base-typed callback parameter otherwise gets a
+/// <see cref="JsonElement"/> and every type guard in the consuming flow silently fails (the
+/// 292332 flow-deadlock incident).
+/// </param>
+internal readonly record struct RecoveryClassification(RecoveryAction? Action, object? MaterializedPayload);
+
+/// <summary>
 /// Resolves the lost-subscriber recovery route for a response payload by asking it
-/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>.
+/// <see cref="IAsyncResponsePayload.OnRecovery"/>.
 /// <para>
 /// Payloads arriving through a broker ingress are untyped (a raw <see cref="JsonElement"/> / JSON
 /// string), so the payload type the original waiter registered for (persisted in the recovery
-/// state) is used to materialize the payload before asking it.
+/// state) is used to materialize the payload before asking it — and the materialized instance is
+/// returned so the chosen callback receives it instead of the raw JSON.
 /// </para>
 /// </summary>
 internal static class PayloadRecoveryClassifier
@@ -18,8 +38,8 @@ internal static class PayloadRecoveryClassifier
     private static readonly ConcurrentDictionary<string, Type> PayloadTypes = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Attempts to decide whether <paramref name="payload"/> should resume the flow on the
-    /// lost-subscriber path.
+    /// Attempts to classify <paramref name="payload"/> for the lost-subscriber path: which route it
+    /// takes, and the materialized instance the route's callback must receive.
     /// </summary>
     /// <param name="payload">
     /// The payload as received by <c>SetResponse</c>: either an already-typed
@@ -29,43 +49,38 @@ internal static class PayloadRecoveryClassifier
     /// <param name="payloadTypeFullName">
     /// Full name of the payload type the waiter subscribed for, from the recovery state.
     /// </param>
-    /// <returns>
-    /// <c>true</c> to resume, <c>false</c> to fail, or <c>null</c> when the payload cannot be
-    /// classified — a <c>null</c> payload, missing/unresolvable type information, or a conversion
-    /// failure. Callers must treat <c>null</c> conservatively as "do not resume", so a payload that
-    /// cannot be understood never takes the happy path.
-    /// </returns>
-    public static bool? ShouldResume(object? payload, string? payloadTypeFullName)
+    public static RecoveryClassification Classify(object? payload, string? payloadTypeFullName)
     {
         try
         {
             // Typed payloads (published directly by in-process services) answer for themselves.
             if (payload is IAsyncResponsePayload typedPayload)
             {
-                return typedPayload.ShouldResumeOnRecovery();
+                return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
             }
 
             if (payload is null || string.IsNullOrWhiteSpace(payloadTypeFullName))
             {
-                return null;
+                return new RecoveryClassification(null, null);
             }
 
             var payloadType = ResolvePayloadType(payloadTypeFullName!);
             if (payloadType is null || !typeof(IAsyncResponsePayload).IsAssignableFrom(payloadType))
             {
-                return null;
+                return new RecoveryClassification(null, null);
             }
 
             return payload.ConvertTo(payloadType) is IAsyncResponsePayload materialized
-                ? materialized.ShouldResumeOnRecovery()
-                : null;
+                ? new RecoveryClassification(materialized.OnRecovery(), materialized)
+                : new RecoveryClassification(null, null);
         }
         catch
         {
-            // A payload that cannot be materialized as the registered type carries no usable domain
-            // state; treat it conservatively as "do not resume". The failure callback invocation
-            // performs the same conversion and surfaces the error through the existing path.
-            return null;
+            // A payload that cannot be materialized as the registered type (or whose classifier
+            // throws) carries no usable domain state; treat it conservatively as "do not resume".
+            // The failure route then carries the raw payload, exactly as before materialization
+            // existed, and the diagnostics on the resolution path surface the cause.
+            return new RecoveryClassification(null, null);
         }
     }
 

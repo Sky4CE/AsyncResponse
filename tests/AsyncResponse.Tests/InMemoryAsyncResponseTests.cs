@@ -910,7 +910,7 @@ public class InMemoryAsyncResponseTests
     {
         public SelfReferencingFailurePayload? Self { get; set; }
 
-        public bool ShouldResumeOnRecovery() => false;
+        public RecoveryAction OnRecovery() => RecoveryAction.Fail;
     }
 
     private sealed class RetryLiveRecoveryStore : IRecoveryStateStore

@@ -107,13 +107,16 @@ public static class AsyncResponseDiagnostics
         activity?.SetTag("asyncresponse.worker.method", call.MethodName);
     }
 
-    internal static void SetLostSubscriberRoute(Activity? activity, bool? shouldResume)
-        => activity?.SetTag("asyncresponse.lost_subscriber_route", shouldResume switch
-        {
-            true => "resume",
-            false => "failure",
-            _ => "unclassified"
-        });
+    internal static void SetLostSubscriberRoute(Activity? activity, RecoveryAction? action)
+        => activity?.SetTag("asyncresponse.lost_subscriber_route", LostSubscriberRouteName(action));
+
+    private static string LostSubscriberRouteName(RecoveryAction? action) => action switch
+    {
+        RecoveryAction.Resume => "resume",
+        RecoveryAction.Fail => "failure",
+        RecoveryAction.KeepWaiting => "keep_waiting",
+        _ => "unclassified"
+    };
 
     internal static void SetError(Activity? activity, Exception exception)
     {
@@ -128,16 +131,15 @@ public static class AsyncResponseDiagnostics
     }
 
     /// <summary>Records one lost-subscriber dispatch (the recovery path was entered for a publish).</summary>
-    internal static void RecordLostSubscriber(string kind, bool? shouldResume, bool callbackInvoked)
+    internal static void RecordLostSubscriber(string kind, RecoveryAction? action, bool callbackInvoked)
     {
         if (!LostSubscriberDispatches.Enabled)
             return;
 
-        var route = shouldResume switch { true => "resume", false => "failure", _ => "unclassified" };
         LostSubscriberDispatches.Add(
             1,
             new KeyValuePair<string, object?>("kind", kind),
-            new KeyValuePair<string, object?>("route", route),
+            new KeyValuePair<string, object?>("route", LostSubscriberRouteName(action)),
             new KeyValuePair<string, object?>("invoked", callbackInvoked));
     }
 

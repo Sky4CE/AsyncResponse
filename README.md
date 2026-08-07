@@ -40,8 +40,9 @@ around them.
 - **Progress is part of the wait.** `Until(...)` consumes intermediate messages and completes on
   the terminal payload without another queue or state machine.
 - **Late responses are domain-aware.** When a waiter disappeared during a restart,
-  `ShouldResumeOnRecovery()` routes the payload to a resume or failure callback instead of blindly
-  treating every response as success.
+  `OnRecovery()` routes the payload — materialized as the registered payload type, never raw
+  broker JSON — to a resume or failure callback, or keeps the registration armed for a non-terminal
+  checkpoint, instead of blindly treating every response as success.
 - **Infrastructure is replaceable.** Choose one response channel, one worker transport, and one
   flow-state store independently. Move any axis from in-memory to Redis, NATS, a database, Kafka,
   RabbitMQ, or a cloud service through DI while application and flow code stay the same.
@@ -150,11 +151,11 @@ Three layers, one decision each, made exactly where its deciding fact is knowabl
 |---|---|---|
 | **Ingress** (`IAsyncResponseIngress`) | "Does the message parse?" | Parses → deliver as payload, untyped and uninterpreted. Doesn't parse → report as exception. |
 | **Response channel** (`SetResponse`/`SetException`) | "Did any subscriber receive it?" | Delivered → the active waiter's `Until` and flow code interpret it. Nobody listening → hand to the dispatcher. |
-| **Lost-subscriber dispatcher** | "Should this late response resume the flow?" | `ShouldResumeOnRecovery()` true → resume callback. false (or unclassifiable) → failure callback. |
+| **Lost-subscriber dispatcher** | "What should this late response do to the flow?" | `OnRecovery()` Resume → resume callback. Fail (or unclassifiable) → failure callback. KeepWaiting (non-terminal checkpoint) → nothing fires; the registration stays armed for the terminal response. Callbacks receive the materialized payload. |
 
 A failed payload is **still a valid response** for an active waiter — your `Until` predicate and
 flow code want to see it (persist details, decide to retry, throw a rich domain error).
-`ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
+Recovery classification is consulted only when nobody is listening — which is exactly when
 somebody has to make the call. Full model: [docs/recovery.md](docs/recovery.md).
 
 ### Guarantees and boundaries
@@ -668,9 +669,9 @@ the right page. The pages:
 - **[Transport semantics](docs/transport-semantics.md)** — the per-transport matrix: ack modes, attempt counting, dead-letter destinations, early-ACK failure handling, shutdown drain budgets, and lock/lease renewal.
 - **[Provider examples](docs/provider-examples.md)** — copy/paste registration for every channel and
   every worker transport, plus links to every durable-flow store example.
-- **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `ShouldResumeOnRecovery`, the
-  watchdog and health check, recovery-state durability, wire/schema versioning, and the
-  shared-correlation recovery limitation.
+- **[Recovery](docs/recovery.md)** — lost-subscriber recovery, `OnRecovery`, non-terminal
+  checkpoints, payload materialization, the watchdog and health check, recovery-state durability,
+  wire/schema versioning, and the shared-correlation recovery limitation.
 - **[Durable flows](docs/durable-flows.md)** — first-class multi-step orchestration:
   `IDurableFlow<TInput>` with automatically checkpointed steps, crash-resume and re-attach,
   progress streaming, pluggable flow-state storage, explicit compensation, and an honest

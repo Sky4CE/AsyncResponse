@@ -78,7 +78,7 @@ builder.Services.AddOpenTelemetry()
 
 | Instrument | Type | Tags | What it tells you |
 |---|---|---|---|
-| `asyncresponse.lost_subscriber.dispatches` | counter | `kind` = `response`\|`exception`, `route` = `resume`\|`failure`\|`unclassified`, `invoked` = bool | The core "how often does recovery fire" SLO — every late response that found nobody listening, classified by how it was routed and whether a callback was actually invoked. |
+| `asyncresponse.lost_subscriber.dispatches` | counter | `kind` = `response`\|`exception`, `route` = `resume`\|`failure`\|`keep_waiting`\|`unclassified`, `invoked` = bool | The core "how often does recovery fire" SLO — every late response that found nobody listening, classified by how it was routed and whether a callback was actually invoked. |
 | `asyncresponse.waiter.timeouts` | counter | `channel` | Waiters that hit their timeout before a terminal response. |
 | `asyncresponse.worker.jobs` | counter | `outcome` = `executed`\|`failed`\|`rejected` | Worker job dispatch outcomes. |
 | `asyncresponse.ingress.unroutable_responses` | counter | — | Inbound responses acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them). Alert on any non-zero rate: each one is a producer-side contract violation. |
@@ -89,7 +89,10 @@ builder.Services.AddOpenTelemetry()
 | `asyncresponse.type_resolution.unresolved` | counter | `kind` = `service`\|`payload` | Callback/payload type names that could not be resolved (see [security.md](security.md)). |
 
 The lost-subscriber counter is the one to alert on: a nonzero `route=failure` or
-`route=unclassified` rate means flows are dying mid-wait and being failed on recovery, and a rising
+`route=unclassified` rate means flows are dying mid-wait and being failed on recovery (a
+`route=keep_waiting` rate is benign by itself — non-terminal checkpoints arriving while nobody
+listens — but pair it with the watchdog: a registration that keeps waiting and never resumes is a
+stuck flow), and a rising
 `asyncresponse.recovery.stale` gauge is your earliest signal of stuck flows.
 
 > **Not emitted:** broker/store-native queue depth and size (Redis key count, JetStream stream

@@ -5,31 +5,36 @@ namespace AsyncResponse.Tests;
 public class AsyncResponsePayloadReflectionTests
 {
     [Fact]
-    public void OverridesShouldResumeOnRecovery_RejectsNullType()
-        => Assert.Throws<ArgumentNullException>(() => AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(null!));
+    public void OverridesOnRecovery_RejectsNullType()
+        => Assert.Throws<ArgumentNullException>(() => AsyncResponsePayloadReflection.OverridesOnRecovery(null!));
 
     [Fact]
-    public void OverridesShouldResumeOnRecovery_ReturnsFalseForInterfaceAndNonPayloadTypes()
+    public void OverridesOnRecovery_ReturnsFalseForInterfaceAndNonPayloadTypes()
     {
-        Assert.False(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(IAsyncResponsePayload)));
-        Assert.False(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(string)));
+        Assert.False(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(IAsyncResponsePayload)));
+        Assert.False(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(string)));
     }
 
     [Fact]
-    public void OverridesShouldResumeOnRecovery_DetectsDefaultInterfaceImplementation()
-        => Assert.False(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(DefaultRecoveryPayload)));
+    public void OverridesOnRecovery_DetectsDefaultInterfaceImplementation()
+        => Assert.False(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(DefaultRecoveryPayload)));
 
     [Fact]
-    public void DefaultShouldResumeOnRecovery_ReturnsFalse()
+    public void DefaultOnRecovery_ReturnsFail()
     {
+        // The conservative default: a payload never resumes a flow by omission.
         IAsyncResponsePayload payload = new DefaultRecoveryPayload();
 
-        Assert.False(payload.ShouldResumeOnRecovery());
+        Assert.Equal(RecoveryAction.Fail, payload.OnRecovery());
     }
 
     [Fact]
-    public void OverridesShouldResumeOnRecovery_DetectsConcreteOverride()
-        => Assert.True(AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(OperationResult)));
+    public void OverridesOnRecovery_DetectsConcreteOverride()
+    {
+        Assert.True(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(OperationResult)));
+        Assert.True(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(IncidentStepResult)));
+        Assert.True(AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(SuccessOnlyPayload)));
+    }
 
     [Fact]
     public void DurableFlowFailedException_PreservesInnerException()

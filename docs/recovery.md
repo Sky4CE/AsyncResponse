@@ -5,7 +5,8 @@
 Every wait records *recovery state* for cleanup and watchdog visibility; durable channels (Redis,
 NATS, PostgreSQL, SQL Server, MongoDB) persist it beyond the process. When a response arrives after the waiter died
 (e.g. a redeploy), it is **classified by its domain outcome** and routed to the right callback:
-resume the flow, or fail it — never resume a failure.
+resume the flow, fail it — never resume a failure — or, for a non-terminal checkpoint, keep the
+registration armed and wait for the terminal response.
 
 The `OnLostSubscriber*` methods intentionally live only on `IRecoverableAsyncResponseBuilder` and
 its fluent builders. If an app is configured with `.WithInMemoryChannel()`, those methods are absent
@@ -15,7 +16,9 @@ inject `IRecoverableAsyncResponseBuilder` for durable recovery flows.
 
 **On this page**
 
-- [`ShouldResumeOnRecovery()`](#shouldresumeonrecovery)
+- [`OnRecovery()` — classifying recovered responses](#onrecovery--classifying-recovered-responses)
+- [Non-terminal checkpoints: `KeepWaiting`](#non-terminal-checkpoints-keepwaiting)
+- [Callbacks receive the materialized payload](#callbacks-receive-the-materialized-payload)
 - [Registering recovery callbacks](#registering-recovery-callbacks)
 - [Why recovery routing and `Until` stay separate](#why-recovery-routing-and-until-stay-separate)
 - [The recovery watchdog + health check](#the-recovery-watchdog--health-check)
@@ -23,12 +26,12 @@ inject `IRecoverableAsyncResponseBuilder` for durable recovery flows.
 - [Wire/schema versioning](#wireschema-versioning)
 - [Shared-correlation recovery](#shared-correlation-recovery)
 
-## `ShouldResumeOnRecovery()`
+## `OnRecovery()` — classifying recovered responses
 
-Override `ShouldResumeOnRecovery()` only when a payload can carry a *domain failure* and you use
-lost-subscriber recovery. It answers one question — *should a late response of this type resume the
-flow, or fail it?* — and is consulted **only** on the recovery path, never for live completion
-(which your `Until` predicate owns):
+Override `OnRecovery()` only when a payload can carry a *domain failure* and you use
+lost-subscriber recovery. It answers one question — *what should a late response of this type do to
+the flow: resume it, fail it, or keep waiting for the terminal response?* — and is consulted
+**only** on the recovery path, never for live completion (which your `Until` predicate owns):
 
 ```csharp
 public sealed class OrderResult : IAsyncResponsePayload
@@ -36,19 +39,67 @@ public sealed class OrderResult : IAsyncResponsePayload
     public OrderStatus Status { get; set; }
     public string? Message { get; set; }
 
-    // recovery routing only: fail on a failed result, resume otherwise.
-    public bool ShouldResumeOnRecovery() => Status != OrderStatus.Failed;
+    // Recovery routing only: resume on the terminal success, keep the registration armed on a
+    // progress checkpoint, fail otherwise.
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        OrderStatus.Completed => RecoveryAction.Resume,
+        OrderStatus.Processing => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
 }
 ```
 
-The default returns `false` (don't resume), so a failed response can never resume the happy path by
-omission. Durable channels require this override when you register recovery callbacks — they fail
-fast if it's missing; the in-memory channel, which can't survive a redeploy, doesn't.
+A payload whose response stream is strictly terminal (every message ends the operation) simply never
+returns `KeepWaiting` — e.g. `public RecoveryAction OnRecovery() => Status == OrderStatus.Failed ?
+RecoveryAction.Fail : RecoveryAction.Resume;`.
 
-`ShouldResumeOnRecovery()` is **independent of your `Until` predicate** (which owns live completion).
-They answer different questions: "is it a failure?" versus "is the operation done?". A failed payload
-is *still a valid response* for an active waiter — your `Until` and flow code want to see it. This is
-the [two-axes recovery model](#why-recovery-routing-and-until-stay-separate).
+The default (no override) is `Fail`, so a response can never resume the happy path by omission.
+Durable channels require the override when you register recovery callbacks — they fail fast at
+waiter creation if it is missing; the in-memory channel, which can't survive a redeploy, doesn't.
+
+Recovery classification is **independent of your `Until` predicate** (which owns live completion).
+They answer different questions: "what does this result do to the flow?" versus "is the operation
+done?". A failed payload is *still a valid response* for an active waiter — your `Until` and flow
+code want to see it. This is the
+[two-axes recovery model](#why-recovery-routing-and-until-stay-separate).
+
+## Non-terminal checkpoints: `KeepWaiting`
+
+Some remote systems report progress on the same correlation id before the terminal result — "still
+running" heartbeats, staged sub-results. A live waiter simply lets its `Until` predicate observe and
+skip them. On the lost-subscriber path the same message needs an explicit third route:
+`RecoveryAction.KeepWaiting` invokes **no callback** and **retains the recovery registration**, so
+the terminal response that follows still routes.
+
+This lane exists because both alternatives corrupt the flow (this is the production incident that
+motivated it — a deploy killed a waiter mid-step, and the remote side then published two
+"in progress" messages followed by a terminal success two seconds later):
+
+- Classifying a checkpoint as `Resume` spawns one resumed worker *per checkpoint*, consumes the
+  registration, and the terminal response then finds nothing to route against and is dropped — the
+  resumed workers re-attach to a correlation id nothing can answer and hang to their step timeout.
+- Classifying it as `Fail` fails a flow that is still running remotely, and equally consumes the
+  registration out from under the real result.
+
+A retained registration stays bounded by `RecoveryStateExpiry` and visible to the
+[watchdog](#the-recovery-watchdog--health-check); the lost-subscriber route metric/trace tag reports
+`keep_waiting` for these dispatches.
+
+## Callbacks receive the materialized payload
+
+A response that arrives through a broker ingress is raw JSON. The recovery path materializes it as
+the payload type recorded in the registration *before* classifying it, and the chosen callback
+receives **that materialized instance** — regardless of the callback parameter's declared type.
+Declaring the parameter as `object`, `IAsyncResponsePayload`, a base class, or the concrete type all
+work; guards like `payload is OrderResult` behave identically to the live path.
+
+This matters most for services that register **one callback for several payload types** (an
+`object`-typed parameter): binding the raw JSON to the *declared* parameter type used to hand such a
+callback a `JsonElement`, silently failing every type guard inside it. If the recorded payload type
+cannot be resolved or materialized (e.g. renamed/removed across a deploy), the response is routed
+conservatively to the failure callback with the raw payload attached, and the type-resolution
+failure is surfaced through diagnostics.
 
 ## Registering recovery callbacks
 
@@ -126,14 +177,15 @@ pending correlation id, subset runs, and compensation — is documented in
 
 ## Why recovery routing and `Until` stay separate
 
-`ShouldResumeOnRecovery()` is consulted only when nobody is listening — which is exactly when
+Recovery classification is consulted only when nobody is listening — which is exactly when
 somebody has to make the call. The two are deliberately two axes:
 
 - **`Until` (live)** — owns completion for an *active* waiter. A failed payload is a valid response
   here: your predicate and flow code can persist details, decide to retry, or throw a rich domain
   error.
-- **`ShouldResumeOnRecovery()` (recovery)** — owns routing for a response that arrives with *no
-  waiter alive*. It picks the resume callback or the failure callback.
+- **`OnRecovery()` (recovery)** — owns routing for a response that arrives with *no waiter
+  alive*. It picks the resume callback, the failure callback, or the keep-waiting lane — the
+  recovery-side mirror of `Until` skipping a non-terminal message.
 
 They can't be merged because they answer different questions at different times with different
 information available.

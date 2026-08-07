@@ -9,16 +9,18 @@ namespace AsyncResponse;
 /// <summary>
 /// Result of a lost-subscriber dispatch attempt.
 /// </summary>
-/// <param name="ShouldResume">
-/// The recovery route the payload reported (<see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>):
-/// <c>true</c> resume, <c>false</c> fail, or <c>null</c> when it could not be classified (no recovery
-/// state, missing payload type, null payload, conversion failure) — treated as "do not resume".
+/// <param name="Action">
+/// The recovery route the payload reported (<see cref="IAsyncResponsePayload.OnRecovery"/>):
+/// <see cref="RecoveryAction.Resume"/>, <see cref="RecoveryAction.Fail"/>,
+/// <see cref="RecoveryAction.KeepWaiting"/> (non-terminal checkpoint — nothing invoked, the
+/// registration stays armed), or <c>null</c> when it could not be classified (no recovery state,
+/// missing payload type, null payload, conversion failure) — treated as "do not resume".
 /// </param>
 /// <param name="CallbackInvoked">
 /// <c>true</c> when a callback was invoked successfully — the recovery state is consumed and the
 /// caller should delete it.
 /// </param>
-internal readonly record struct LostSubscriberDispatchResult(bool? ShouldResume, bool CallbackInvoked)
+internal readonly record struct LostSubscriberDispatchResult(RecoveryAction? Action, bool CallbackInvoked)
 {
     /// <summary>
     /// <c>true</c> when a live subscriber re-appeared between the caller's empty snapshot and the
@@ -34,10 +36,18 @@ internal readonly record struct LostSubscriberDispatchResult(bool? ShouldResume,
 /// dispatcher chooses and invokes the callback persisted in the <see cref="RecoveryState"/>.
 /// <para>
 /// For payload envelopes (<c>SetResponse</c>) the payload's
-/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides the route: <c>true</c> goes to
-/// the resume callback; <c>false</c> (and any unclassifiable payload, conservatively) goes to the
-/// failure callback wrapped in an <see cref="AsyncResponseDomainFailureException"/>. For exception
-/// envelopes (<c>SetException</c>) the failure callback is always used.
+/// <see cref="IAsyncResponsePayload.OnRecovery"/> decides the route:
+/// <see cref="RecoveryAction.Resume"/> goes to the resume callback;
+/// <see cref="RecoveryAction.Fail"/> (and any unclassifiable payload, conservatively) goes to the
+/// failure callback wrapped in an <see cref="AsyncResponseDomainFailureException"/>; and
+/// <see cref="RecoveryAction.KeepWaiting"/> — a non-terminal checkpoint — invokes nothing and
+/// leaves the registration armed for a later response. For exception envelopes
+/// (<c>SetException</c>) the failure callback is always used.
+/// </para>
+/// <para>
+/// The chosen callback receives the <em>materialized</em> payload (the registered payload type),
+/// not the raw broker JSON — an <c>object</c>-/interface-/base-typed callback parameter must get
+/// the concrete instance, or every type guard in the consuming flow silently fails.
 /// </para>
 /// <para>
 /// The publisher stays a plain transport: it only reports "published, but nobody was listening" and
@@ -78,7 +88,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
             return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
 
         var callbackInvoked = false;
-        bool? shouldResume = null;
+        RecoveryAction? action = null;
         var routeSet = false;
         var routeMixed = false;
         ExceptionDispatchInfo? firstException = null;
@@ -90,10 +100,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 var result = await DispatchLostResponse(recoveryState, response, channel).ConfigureAwait(false);
                 if (!routeSet)
                 {
-                    shouldResume = result.ShouldResume;
+                    action = result.Action;
                     routeSet = true;
                 }
-                else if (shouldResume != result.ShouldResume)
+                else if (action != result.Action)
                 {
                     routeMixed = true;
                 }
@@ -117,7 +127,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         firstException?.Throw();
 
-        return new LostSubscriberDispatchResult(routeMixed ? null : shouldResume, callbackInvoked);
+        return new LostSubscriberDispatchResult(routeMixed ? null : action, callbackInvoked);
     }
 
     /// <summary>
@@ -139,10 +149,10 @@ internal sealed class LostSubscriberCallbackDispatcher(
         // its subscription but has not saved its recovery state yet. A live subscriber means the
         // exception should be delivered live instead of consumed here.
         if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
-            return new LostSubscriberDispatchResult(false, false) { RetryLive = true };
+            return new LostSubscriberDispatchResult(RecoveryAction.Fail, false) { RetryLive = true };
 
         if (recoveryStates.Count == 0)
-            return new LostSubscriberDispatchResult(false, await DispatchLostException(null, exception, channel).ConfigureAwait(false));
+            return new LostSubscriberDispatchResult(RecoveryAction.Fail, await DispatchLostException(null, exception, channel).ConfigureAwait(false));
 
         var callbackInvoked = false;
         ExceptionDispatchInfo? firstException = null;
@@ -170,8 +180,8 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         firstException?.Throw();
 
-        // Exception envelopes always take the failure route, so ShouldResume is fixed at false.
-        return new LostSubscriberDispatchResult(false, callbackInvoked);
+        // Exception envelopes always take the failure route, so the action is fixed at Fail.
+        return new LostSubscriberDispatchResult(RecoveryAction.Fail, callbackInvoked);
     }
 
     /// <summary>Dispatches a successfully published payload that no subscriber received.</summary>
@@ -187,42 +197,64 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         try
         {
-            // The recovering process has no live Until predicate — the payload itself decides whether
-            // this late response resumes the flow or fails it. A null (unclassifiable) verdict is
-            // treated conservatively as "do not resume", so a payload that cannot be understood never
-            // takes the happy path.
-            var shouldResume = recoveryState is null
-                ? (bool?)null
-                : PayloadRecoveryClassifier.ShouldResume(response, recoveryState.PayloadTypeFullName);
-            AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, shouldResume);
+            // The recovering process has no live Until predicate — the payload itself decides
+            // whether this late response resumes the flow, fails it, or is a non-terminal
+            // checkpoint to wait past. Classification also MATERIALIZES the payload as the
+            // registered type; the chosen callback must receive that instance, never the raw
+            // broker JSON (an object-typed parameter otherwise gets a JsonElement and every type
+            // guard in the consuming flow silently fails). A null (unclassifiable) verdict is
+            // treated conservatively as "do not resume", so a payload that cannot be understood
+            // never takes the happy path.
+            var classification = recoveryState is null
+                ? default
+                : PayloadRecoveryClassifier.Classify(response, recoveryState.PayloadTypeFullName);
+            var action = classification.Action;
+            var callbackPayload = classification.MaterializedPayload ?? (object?)response;
+            AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, action);
 
-            if (shouldResume != true)
+            if (action == RecoveryAction.KeepWaiting)
+            {
+                // A non-terminal checkpoint (progress report) with nobody listening: invoking the
+                // resume callback here would spawn a worker per checkpoint, and the failure route
+                // would fail a flow that is still running — both consume the registration and
+                // leave the REAL terminal response with nothing to route against (the flow then
+                // deadlocks re-attached to a correlation id nothing can answer). Invoke nothing;
+                // the caller keeps the registration armed, bounded by its TTL and visible to the
+                // watchdog.
+                _logger.LogInformation(
+                    "No subscribers for channel {Channel}; payload is a non-terminal checkpoint (KeepWaiting) — recovery registration retained.",
+                    channel);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
+                return new LostSubscriberDispatchResult(action, false);
+            }
+
+            if (action != RecoveryAction.Resume)
             {
                 if (recoveryState is null)
                 {
                     _logger.LogWarning("No subscribers and no recovery state for channel {Channel}.", channel);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
-                    return new LostSubscriberDispatchResult(shouldResume, false);
+                    return new LostSubscriberDispatchResult(action, false);
                 }
 
-                var invoked = await DispatchToFailureCallback(recoveryState, response, channel, activity).ConfigureAwait(false);
+                var invoked = await DispatchToFailureCallback(recoveryState, callbackPayload, channel, activity).ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", invoked);
-                return new LostSubscriberDispatchResult(shouldResume, invoked);
+                return new LostSubscriberDispatchResult(action, invoked);
             }
 
-            // shouldResume == true implies recoveryState is non-null (the verdict is null otherwise).
+            // action == Resume implies recoveryState is non-null (the verdict is null otherwise).
             if (recoveryState!.ResumeCallback == null)
             {
                 _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
-                return new LostSubscriberDispatchResult(shouldResume, false);
+                return new LostSubscriberDispatchResult(action, false);
             }
 
             _logger.LogWarning("No subscribers for channel {Channel}; invoking resume callback.", channel);
 
             var invocation = ReflectionExtensions.ResolveCallback(
                 recoveryState.ResumeCallback,
-                payload: response,
+                payload: callbackPayload,
                 exception: null,
                 correlationId: recoveryState.CorrelationId
             );
@@ -235,7 +267,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
             _logger.LogInformation("Resume callback invoked for channel {Channel}.", channel);
             activity?.SetTag("asyncresponse.recovery.callback_invoked", true);
 
-            return new LostSubscriberDispatchResult(shouldResume, true);
+            return new LostSubscriberDispatchResult(action, true);
         }
         catch (Exception ex)
         {
@@ -253,7 +285,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         activity?.SetTag("asyncresponse.lost_subscriber.kind", "exception");
         activity?.SetTag("asyncresponse.channel_name", channel);
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
-        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, false);
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, RecoveryAction.Fail);
 
         try
         {
@@ -288,17 +320,22 @@ internal sealed class LostSubscriberCallbackDispatcher(
     }
 
     /// <summary>
-    /// Routes a payload that declined to resume (<see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/>
-    /// returned <c>false</c>, or it could not be classified) to the failure callback, wrapped in an
-    /// <see cref="AsyncResponseDomainFailureException"/> — so it takes the same path as a technical
-    /// <c>SetException</c>.
+    /// Routes a payload that declined to resume (<see cref="IAsyncResponsePayload.OnRecovery"/>
+    /// returned <see cref="RecoveryAction.Fail"/>, or it could not be classified) to the failure
+    /// callback, wrapped in an <see cref="AsyncResponseDomainFailureException"/> — so it takes the
+    /// same path as a technical <c>SetException</c>. <paramref name="response"/> is the
+    /// materialized payload when classification succeeded, the raw one otherwise.
     /// </summary>
-    private async Task<bool> DispatchToFailureCallback<T>(RecoveryState recoveryState, T response, string channel, Activity? activity)
+    private async Task<bool> DispatchToFailureCallback(RecoveryState recoveryState, object? response, string channel, Activity? activity)
     {
         string? payloadJson = null;
         try
         {
-            payloadJson = AsyncResponseJson.Serialize(response);
+            // Runtime-type serialization: the payload arrives boxed (materialized instance or raw
+            // JsonElement), and the diagnostic JSON must reflect what it actually is.
+            payloadJson = response is null
+                ? AsyncResponseJson.Serialize(response)
+                : AsyncResponseJson.Serialize(response, response.GetType());
         }
         catch (Exception)
         {

@@ -154,6 +154,7 @@ curl -X POST 'http://localhost:5000/publish?correlationId=<id>&exception=boom'  
 
 # Same recovery flow, composed into one endpoint:
 curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Completed'        # arm + drop this channel + late success → resume
+curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Running'          # arm + drop + late checkpoint (kept waiting, nothing fires) + late success → resume
 curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Failed'           # arm + drop this channel + late failed payload → fail
 curl -X POST 'http://localhost:5000/lost-subscriber-flow?outcome=Exception'        # arm + drop this channel + late SetException → fail
 ```
