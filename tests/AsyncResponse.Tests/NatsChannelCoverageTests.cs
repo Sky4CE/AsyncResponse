@@ -186,8 +186,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger);
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>());
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-teardown");
         await waiter.DisposeAsync();
@@ -209,8 +209,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         using var predicateEntered = new SemaphoreSlim(0);
         using var releasePredicate = new SemaphoreSlim(0);
@@ -252,8 +252,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hang");
         client.Push(TerminalEnvelope("done"));
@@ -290,8 +290,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-single-budget");
         await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
@@ -361,14 +361,14 @@ public sealed class NatsChannelCoverageTests
         client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var logger = new CollectingLogger();
         var channel = new NatsAsyncResponseChannel(
             _services.GetRequiredService<IServiceScopeFactory>(),
             client.Object,
             _store.Object,
             Options.Create(new NatsAsyncResponseChannelOptions { DefaultTimeout = TimeSpan.FromSeconds(5) }),
             new AsyncResponseContextPropagation([]),
-            logger);
+            logger.For<NatsAsyncResponseChannel>());
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-late-failure");
         Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
@@ -442,29 +442,4 @@ public sealed class NatsChannelCoverageTests
 
 
 
-    private sealed class CollectingLogger<T> : ILogger<T>
-    {
-        private readonly List<(string Message, Exception? Exception)> _entries = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _entries.Select(entry => entry.Message).ToArray(); }
-        }
-
-        /// <summary>Message + attached exception — lets a test pin WHICH failure was logged.</summary>
-        public IReadOnlyList<(string Message, Exception? Exception)> Entries
-        {
-            get { lock (_gate) return _entries.ToArray(); }
-        }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
-
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-        {
-            lock (_gate) _entries.Add((formatter(state, exception), exception));
-        }
-    }
 }

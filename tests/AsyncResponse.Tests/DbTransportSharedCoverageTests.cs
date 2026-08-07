@@ -201,28 +201,4 @@ public sealed class DbTransportSharedCoverageTests
         }
     }
 
-    private sealed class CollectingLogger : Microsoft.Extensions.Logging.ILogger
-    {
-        private readonly List<string> _messages = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _messages.ToArray(); }
-        }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
-
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            Microsoft.Extensions.Logging.LogLevel logLevel,
-            Microsoft.Extensions.Logging.EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
-            lock (_gate) _messages.Add(formatter(state, exception));
-        }
-    }
 }

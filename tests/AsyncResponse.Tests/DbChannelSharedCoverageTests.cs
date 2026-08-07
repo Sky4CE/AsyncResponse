@@ -20,6 +20,28 @@ namespace AsyncResponse.Tests;
 /// the MongoDB, PostgreSQL and SQL Server channel packages, so the base class compiles separately
 /// into each assembly and a path exercised through only one provider stays uncovered in the other
 /// two. Every fact here therefore runs against all three.
+/// <para>
+/// <b>Why this harness drives internals instead of the public conformance surface</b> (evaluated
+/// against a complexity-review proposal to replace it with <c>ChannelConformanceSuite</c> facts):
+/// the conformance suite's unit-side derivation is the in-memory channel, which never executes
+/// this file — its facts cover <c>DbChannelShared</c> only in the container-backed integration
+/// run. Every fact here exists for a branch the public surface cannot reach deterministically:
+/// </para>
+/// <list type="bullet">
+/// <item><description><b>Store-fault seams</b> (loop retry/teardown, cleanup double-fault): a
+/// failing store rejects <c>CreateResponseWaiter</c> at registration, so a live subscription can
+/// only exist alongside a faulted store by fabricating it — and integration containers never
+/// fail on cue.</description></item>
+/// <item><description><b>Race states</b> (all-dropped local subscriptions, the delivery
+/// watermark's skew window): reachable publicly only by losing a race; fabricated state makes the
+/// branch deterministic. The watermark BEHAVIOR is separately pinned on real containers by the
+/// conformance correlation-id-reuse facts.</description></item>
+/// <item><description><b>Signal-scope logic</b> (full sweep outranks targeted ids): observable
+/// publicly only through sweep timing side effects, which no assertion can await
+/// deterministically.</description></item>
+/// <item><description><b>Activity tagging</b> is already public-surface (no reflection) and lives
+/// here only for the ×3-assembly matrix.</description></item>
+/// </list>
 /// </summary>
 public sealed class DbChannelSharedCoverageTests
 {
@@ -514,52 +536,4 @@ public sealed class DbChannelSharedCoverageTests
     private static void SetField(object target, string name, object value)
         => target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(target, value);
 
-    /// <summary>Captures rendered log messages so a background loop's retry can be awaited rather than slept on.</summary>
-    private sealed class CollectingLogger
-    {
-        private readonly List<string> _messages = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _messages.ToArray(); }
-        }
-
-        public ILogger<T> For<T>() => new Typed<T>(this);
-
-        private void Add(string message)
-        {
-            lock (_gate) _messages.Add(message);
-        }
-
-        /// <summary>Polls until a loop has logged <paramref name="fragment"/>, or fails the test.</summary>
-        public async Task WaitForAsync(string fragment, int occurrences = 1)
-        {
-            var deadline = DateTime.UtcNow.AddSeconds(30);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (Messages.Count(message => message.Contains(fragment, StringComparison.Ordinal)) >= occurrences)
-                    return;
-                await Task.Delay(15);
-            }
-
-            Assert.Fail($"Timed out waiting for a log message containing '{fragment}'. Saw: {string.Join(" | ", Messages)}");
-        }
-
-        private sealed class Typed<T>(CollectingLogger owner) : ILogger<T>
-        {
-            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
-
-            // Debug stays enabled so the shared base's IsEnabled-guarded debug paths are taken too.
-            public bool IsEnabled(LogLevel logLevel) => true;
-
-            public void Log<TState>(
-                LogLevel logLevel,
-                EventId eventId,
-                TState state,
-                Exception? exception,
-                Func<TState, Exception?, string> formatter)
-                => owner.Add(formatter(state, exception));
-        }
-    }
 }
