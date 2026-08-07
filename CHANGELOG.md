@@ -23,8 +23,24 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   silently sliced off derived state. This reproduced a production flow deadlock: duplicate resumed
   workers, an unpersisted terminal success, and a re-attached wait on a consumed correlation id.
   Both resume and failure callbacks now receive the instance the classifier materialized (the
-  conservative unclassifiable path still attaches the raw payload). Pinned by channel-conformance
-  facts on all six channel derivations plus ingress-level regression tests.
+  conservative unclassifiable path still attaches the raw payload). Classification is
+  **per-registration**: each recovery registration is classified as the payload type IT registered
+  — for typed in-process publishes too (the publisher's runtime type is reused only when assignable
+  to the registered type, otherwise the response is re-materialized as that type via the same JSON
+  round-trip a broker delivery would take), so shared-correlation registrations with different
+  payload types route independently instead of all inheriting the published instance's verdict.
+  Pinned by channel-conformance facts on all six channel derivations plus ingress-level regression
+  tests.
+- **Lost-subscriber dispatch after a raced live retry re-checks liveness before consuming
+  recovery state.** On NATS, Redis, and the in-memory channel, when the first lost dispatch found a
+  live subscriber (the miss had raced a fresh registration) and the re-delivery ALSO missed, the
+  second dispatch ran without the liveness re-check — a delivery/probe contradiction (subscription
+  interest not yet visible server-side, a stale heartbeat, subscriber churn) then consumed a live
+  waiter's recovery registration. Every lost dispatch now carries the liveness probe; the retry is
+  bounded, and a persistent contradiction leaves all recovery state intact (warning +
+  `asyncresponse.recovery.liveness_contradiction` trace tag) instead of consuming it. The database
+  channels are unchanged by design: their post-claim dispatch runs only after atomically winning
+  the message for recovery, which already excludes live delivery.
 
 ### Added
 

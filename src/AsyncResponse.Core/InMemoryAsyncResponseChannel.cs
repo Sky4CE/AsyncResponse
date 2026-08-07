@@ -146,7 +146,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponses(
@@ -168,9 +168,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
             await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
@@ -204,7 +215,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponses(
@@ -226,9 +237,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
             await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
@@ -264,7 +286,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(
@@ -285,9 +307,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);

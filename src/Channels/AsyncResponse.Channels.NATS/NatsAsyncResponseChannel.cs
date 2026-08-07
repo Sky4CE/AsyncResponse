@@ -593,8 +593,27 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
@@ -659,8 +678,27 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
                 AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
@@ -735,8 +773,27 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, subject, cancellationToken)
+                        .DispatchLostExceptions(
+                            _recoveryStateStore,
+                            correlationId,
+                            exception,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);

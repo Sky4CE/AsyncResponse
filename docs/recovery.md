@@ -28,10 +28,13 @@ inject `IRecoverableAsyncResponseBuilder` for durable recovery flows.
 
 ## `OnRecovery()` — classifying recovered responses
 
-Override `OnRecovery()` only when a payload can carry a *domain failure* and you use
-lost-subscriber recovery. It answers one question — *what should a late response of this type do to
-the flow: resume it, fail it, or keep waiting for the terminal response?* — and is consulted
-**only** on the recovery path, never for live completion (which your `Until` predicate owns):
+Override `OnRecovery()` on **every payload type you use with lost-subscriber recovery
+callbacks** — durable channels fail fast at waiter creation without it. That includes payloads that
+can never fail (a success-only notification still needs `=> RecoveryAction.Resume`) and
+progress-only checkpoints (`=> RecoveryAction.KeepWaiting`), not just payloads that can carry a
+domain failure. It answers one question — *what should a late response of this type do to the flow:
+resume it, fail it, or keep waiting for the terminal response?* — and is consulted **only** on the
+recovery path, never for live completion (which your `Until` predicate owns):
 
 ```csharp
 public sealed class OrderResult : IAsyncResponsePayload

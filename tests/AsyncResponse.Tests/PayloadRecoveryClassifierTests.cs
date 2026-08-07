@@ -42,6 +42,69 @@ public class PayloadRecoveryClassifierTests
     }
 
     [Fact]
+    public void TypedPayload_AssignableToRegisteredType_ReusesTheInstance()
+    {
+        var payload = new OperationResult { Status = OperationStatus.Completed };
+
+        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(OperationResult).FullName);
+
+        Assert.Equal(RecoveryAction.Resume, classification.Action);
+        Assert.Same(payload, classification.MaterializedPayload);
+    }
+
+    [Fact]
+    public void TypedPayload_AssignableToRegisteredBaseType_ReusesTheDerivedInstance()
+    {
+        var payload = new DerivedStepResult { Status = IncidentStepStatus.Succeeded, Extra = "kept" };
+
+        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(BaseStepResult).FullName);
+
+        Assert.Equal(RecoveryAction.Resume, classification.Action);
+        Assert.Same(payload, classification.MaterializedPayload);
+    }
+
+    [Fact]
+    public void TypedPayload_MismatchedRegisteredType_MaterializesAsTheRegisteredType()
+    {
+        // Shared-correlation, mixed payload types: registration B registered AlwaysCheckpointProbe
+        // while the publisher published an IncidentStepResult. B's registration must be classified
+        // as B's type — via the same JSON round-trip a broker delivery would take — not by the
+        // publisher's runtime type (which spuriously resumed and consumed B's registration).
+        var payload = new IncidentStepResult { Status = IncidentStepStatus.Succeeded, Message = "done" };
+
+        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(AlwaysCheckpointProbe).FullName);
+
+        Assert.Equal(RecoveryAction.KeepWaiting, classification.Action);
+        var materialized = Assert.IsType<AlwaysCheckpointProbe>(classification.MaterializedPayload);
+        Assert.Equal("done", materialized.Message);
+    }
+
+    [Fact]
+    public void TypedPayload_UnresolvableRegisteredType_IsUnclassifiable()
+    {
+        // The registration named a type this process cannot load: the registered type governs, so
+        // classification stays conservative rather than letting the instance answer for a
+        // registration that asked for something else.
+        var payload = new OperationResult { Status = OperationStatus.Completed };
+
+        var classification = PayloadRecoveryClassifier.Classify(payload, "Does.Not.Exist.Type");
+
+        Assert.Null(classification.Action);
+        Assert.Null(classification.MaterializedPayload);
+    }
+
+    [Fact]
+    public void TypedPayload_NonPayloadRegisteredType_IsUnclassifiable()
+    {
+        var payload = new OperationResult { Status = OperationStatus.Completed };
+
+        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(string).FullName);
+
+        Assert.Null(classification.Action);
+        Assert.Null(classification.MaterializedPayload);
+    }
+
+    [Fact]
     public void RawJsonElement_MaterializesAsRegisteredTypeAndDecides()
     {
         // The redeploy scenario: a broker ingress deserializes the message as object?

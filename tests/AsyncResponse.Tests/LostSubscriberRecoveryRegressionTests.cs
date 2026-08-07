@@ -191,6 +191,32 @@ public class LostSubscriberRecoveryRegressionTests
     }
 
     [Fact]
+    public async Task TypedPublish_MixedRegistrations_ClassifiesEachRegistrationByItsOwnRegisteredType()
+    {
+        await using var harness = Harness.Create();
+        var keepWaitingRegistration = Guid.NewGuid();
+        await harness.ArmRegistrationAsync(typeof(IncidentStepResult).FullName, resume: IncidentResumeCallback());
+        await harness.ArmRegistrationAsync(
+            typeof(AlwaysCheckpointProbe).FullName,
+            resume: IncidentResumeCallback(),
+            registrationId: keepWaitingRegistration);
+
+        // The typed-publish sibling of the raw-JSON fact below: an in-process publish carries a
+        // live instance, but each registration must STILL be classified as the type IT registered
+        // — the publisher's runtime type must not speak for a sibling that registered a different
+        // type (that consumed the checkpoint sibling's registration and resumed it spuriously).
+        var published = new IncidentStepResult { Status = IncidentStepStatus.Succeeded, Message = "done" };
+        await harness.Publisher.SetResponse(published, CorrelationId);
+
+        var (payload, _) = Assert.Single(harness.Spy.Resumed);
+        var typed = Assert.IsType<IncidentStepResult>(payload);
+        Assert.Same(published, typed);
+        Assert.Empty(harness.Spy.Failed);
+        var remaining = Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+        Assert.Equal(keepWaitingRegistration, remaining.RegistrationId);
+    }
+
+    [Fact]
     public async Task Ingress_MixedRegistrations_KeepWaitingSiblingRetainedWhileResumeSiblingConsumed()
     {
         await using var harness = Harness.Create();
@@ -248,6 +274,7 @@ public class LostSubscriberRecoveryRegressionTests
 
         public IncidentFlowSpy Spy { get; }
         public IAsyncResponseIngress Ingress => _provider.GetRequiredService<IAsyncResponseIngress>();
+        public IAsyncResponsePublisher Publisher => _provider.GetRequiredService<IAsyncResponsePublisher>();
         public IRecoveryStateStore RecoveryStateStore => _provider.GetRequiredService<IRecoveryStateStore>();
 
         public static Harness Create()

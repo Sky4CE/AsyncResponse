@@ -14,12 +14,13 @@ namespace AsyncResponse;
 /// "do not resume", so a payload that cannot be understood never takes the happy path.
 /// </param>
 /// <param name="MaterializedPayload">
-/// The payload as an <see cref="IAsyncResponsePayload"/> instance of the registered type — the
-/// original instance for typed publishes, the materialized one for raw-JSON ingress. <c>null</c>
-/// exactly when <paramref name="Action"/> is <c>null</c>. Callbacks must receive THIS instance,
-/// never the raw JSON: an <c>object</c>-/interface-/base-typed callback parameter otherwise gets a
-/// <see cref="JsonElement"/> and every type guard in the consuming flow silently fails (the
-/// 292332 flow-deadlock incident).
+/// The payload as an <see cref="IAsyncResponsePayload"/> instance of the REGISTERED type — the
+/// original instance when it is assignable to the registration's payload type, otherwise the
+/// instance materialized as that type (raw-JSON ingress, or a cross-type sibling registration).
+/// <c>null</c> exactly when <paramref name="Action"/> is <c>null</c>. Callbacks must receive THIS
+/// instance, never the raw JSON: an <c>object</c>-/interface-/base-typed callback parameter
+/// otherwise gets a <see cref="JsonElement"/> and every type guard in the consuming flow silently
+/// fails (the 292332 flow-deadlock incident).
 /// </param>
 internal readonly record struct RecoveryClassification(RecoveryAction? Action, object? MaterializedPayload);
 
@@ -53,13 +54,45 @@ internal static class PayloadRecoveryClassifier
     {
         try
         {
-            // Typed payloads (published directly by in-process services) answer for themselves.
-            if (payload is IAsyncResponsePayload typedPayload)
+            if (payload is null)
             {
-                return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
+                return new RecoveryClassification(null, null);
             }
 
-            if (payload is null || string.IsNullOrWhiteSpace(payloadTypeFullName))
+            if (payload is IAsyncResponsePayload typedPayload)
+            {
+                // A typed publish with no registered type name: the instance is self-describing.
+                if (string.IsNullOrWhiteSpace(payloadTypeFullName))
+                {
+                    return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
+                }
+
+                // The REGISTRATION's payload type governs, never the publisher's runtime type:
+                // multiple registrations may share one correlation id with different payload types
+                // (shared-correlation recovery), and each must be classified as the type IT
+                // registered — letting the published instance answer for a sibling registration
+                // spuriously resumed (and consumed) registrations that classified the same
+                // response as a checkpoint or a failure.
+                var registeredType = ResolvePayloadType(payloadTypeFullName!);
+                if (registeredType is null || !typeof(IAsyncResponsePayload).IsAssignableFrom(registeredType))
+                {
+                    return new RecoveryClassification(null, null);
+                }
+
+                if (registeredType.IsInstanceOfType(typedPayload))
+                {
+                    return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
+                }
+
+                // Cross-type registration: interpret the response as the registered type via the
+                // same JSON round-trip a broker delivery of this payload would take.
+                var json = AsyncResponseJson.Serialize((object)typedPayload, typedPayload.GetType());
+                return json.ConvertTo(registeredType) is IAsyncResponsePayload rematerialized
+                    ? new RecoveryClassification(rematerialized.OnRecovery(), rematerialized)
+                    : new RecoveryClassification(null, null);
+            }
+
+            if (string.IsNullOrWhiteSpace(payloadTypeFullName))
             {
                 return new RecoveryClassification(null, null);
             }
