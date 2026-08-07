@@ -36,16 +36,16 @@
 <div class="card">
 <div class="card-header">Line coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar6">93%</div>
+<div class="large cardpercentagebar cardpercentagebar8">92%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="109">109</td>
+<td class="limit-width right" title="107">107</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
-<td class="limit-width right" title="7">7</td>
+<td class="limit-width right" title="9">9</td>
 </tr>
 <tr>
 <th>Coverable lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="109 of 116">93.9%</td>
+<td class="limit-width right" title="107 of 116">92.2%</td>
 </tr>
 </table>
 </div>
@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar4">95%</div>
+<div class="large cardpercentagebar cardpercentagebar8">91%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="23">23</td>
+<td class="limit-width right" title="22">22</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="23 of 24">95.8%</td>
+<td class="limit-width right" title="22 of 24">91.6%</td>
 </tr>
 </table>
 </div>
@@ -108,8 +108,8 @@
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
 <tr><td title=".ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.SQS.SqsAsyncResponseOptions&gt;, AsyncResponse.Transports.SQS.ISqsClient, Microsoft.Extensions.Logging.ILogger)"><a href="#file0_line11" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="ExecuteAsync()"><a href="#file0_line34" class="navigatetohash">ExecuteAsync()</a></td><td>50%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title="RunSubscriberAsync()"><a href="#file0_line71" class="navigatetohash">RunSubscriberAsync()</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
+<tr><td title="ExecuteAsync()"><a href="#file0_line34" class="navigatetohash">ExecuteAsync()</a></td><td>50%</td><td>2</td><td>2</td><td>95.45%</td></tr>
+<tr><td title="RunSubscriberAsync()"><a href="#file0_line71" class="navigatetohash">RunSubscriberAsync()</a></td><td>75%</td><td>4</td><td>4</td><td>96.3%</td></tr>
 <tr><td title="DispatchBatchAsync()"><a href="#file0_line115" class="navigatetohash">DispatchBatchAsync()</a></td><td>100%</td><td>12</td><td>12</td><td>100%</td></tr>
 <tr><td title="RenewVisibilityLoopAsync()"><a href="#file0_line186" class="navigatetohash">RenewVisibilityLoopAsync()</a></td><td>100%</td><td>8</td><td>6</td><td>61.11%</td></tr>
 <tr><td title=".ctor(int)"><a href="#file0_line234" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
@@ -168,7 +168,7 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line40"></a><code>40</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;try</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line41"></a><code>41</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line42"></a><code>42</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;await&nbsp;RunSubscriberAsync(queue,&nbsp;stoppingToken).ConfigureAwait(false);</code></td></tr>
-<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line43"></a><code>43</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return;</code></td></tr>
+<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line43"></a><code>43</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line44"></a><code>44</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line45"></a><code>45</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;catch&nbsp;(OperationCanceledException)&nbsp;when&nbsp;(stoppingToken.IsCancellationRequested)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line46"></a><code>46</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
@@ -214,7 +214,7 @@
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line86"></a><code>86</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SubscriberRole,</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line87"></a><code>87</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SubscriberOptions.AckMode);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line88"></a><code>88</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line89"></a><code>89</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;while&nbsp;(!stoppingToken.IsCancellationRequested)</code></td></tr>
+<tr class="coverableline" title="Partially covered (3 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line89"></a><code>89</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;while&nbsp;(!stoppingToken.IsCancellationRequested)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line90"></a><code>90</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line91"></a><code>91</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;In&nbsp;early-ACK&nbsp;mode,&nbsp;receiving&nbsp;while&nbsp;the&nbsp;background&nbsp;queue&nbsp;is&nbsp;saturated&nbsp;would&nbsp;burn&nbsp;the</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line92"></a><code>92</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;queue&#39;s&nbsp;redrive&nbsp;policy&nbsp;(SQS&nbsp;counts&nbsp;every&nbsp;receive),&nbsp;so&nbsp;wait&nbsp;for&nbsp;free&nbsp;capacity&nbsp;and&nbsp;never</code></td></tr>
@@ -232,7 +232,7 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line104"></a><code>104</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line105"></a><code>105</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;await&nbsp;DispatchBatchAsync(dispatcher,&nbsp;deliveries,&nbsp;queue,&nbsp;stoppingToken).ConfigureAwait(false);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line106"></a><code>106</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
-<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line107"></a><code>107</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line107"></a><code>107</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line108"></a><code>108</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line109"></a><code>109</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;async&nbsp;Task&nbsp;DispatchBatchAsync(</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line110"></a><code>110</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SqsMessageDispatcher&nbsp;dispatcher,</code></td></tr>
@@ -429,13 +429,13 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/07/2026 - 15:48:15<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/07/2026 - 16:53:01<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
 <a href="#file0_line11" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.SQS.SqsAsyncResponseOptions&gt;, AsyncResponse.Transports.SQS.ISqsClient, Microsoft.Extensions.Logging.ILogger)"><i class="icon-cube"></i>.ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.SQS.SqsAsyncResponseOptions&gt;, AsyncResponse.Transports.SQS.ISqsClient, Microsoft.Extensions.Logging.ILogger)</a><br />
-<a href="#file0_line34" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ExecuteAsync()"><i class="icon-cube"></i>ExecuteAsync()</a><br />
-<a href="#file0_line71" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - RunSubscriberAsync()"><i class="icon-cube"></i>RunSubscriberAsync()</a><br />
+<a href="#file0_line34" class="navigatetohash percentagebar percentagebar90" title="Line coverage: 95.4% - ExecuteAsync()"><i class="icon-cube"></i>ExecuteAsync()</a><br />
+<a href="#file0_line71" class="navigatetohash percentagebar percentagebar90" title="Line coverage: 96.2% - RunSubscriberAsync()"><i class="icon-cube"></i>RunSubscriberAsync()</a><br />
 <a href="#file0_line115" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - DispatchBatchAsync()"><i class="icon-cube"></i>DispatchBatchAsync()</a><br />
 <a href="#file0_line186" class="navigatetohash percentagebar percentagebar60" title="Line coverage: 61.1% - RenewVisibilityLoopAsync()"><i class="icon-cube"></i>RenewVisibilityLoopAsync()</a><br />
 <a href="#file0_line234" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(int)"><i class="icon-cube"></i>.ctor(int)</a><br />
