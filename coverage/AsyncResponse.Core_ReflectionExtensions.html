@@ -36,16 +36,16 @@
 <div class="card">
 <div class="card-header">Line coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar0">100%</div>
+<div class="large cardpercentagebar cardpercentagebar1">99%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="159">159</td>
+<td class="limit-width right" title="158">158</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
-<td class="limit-width right" title="0">0</td>
+<td class="limit-width right" title="1">1</td>
 </tr>
 <tr>
 <th>Coverable lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="159 of 159">100%</td>
+<td class="limit-width right" title="158 of 159">99.3%</td>
 </tr>
 </table>
 </div>
@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar1">98%</div>
+<div class="large cardpercentagebar cardpercentagebar2">97%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="95">95</td>
+<td class="limit-width right" title="94">94</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="95 of 96">98.9%</td>
+<td class="limit-width right" title="94 of 96">97.9%</td>
 </tr>
 </table>
 </div>
@@ -108,7 +108,7 @@
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
 <tr><td title=".cctor()"><a href="#file0_line18" class="navigatetohash">.cctor()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="EnsureAssemblyLoadInvalidation()"><a href="#file0_line45" class="navigatetohash">EnsureAssemblyLoadInvalidation()</a></td><td>100%</td><td>6</td><td>6</td><td>100%</td></tr>
+<tr><td title="EnsureAssemblyLoadInvalidation()"><a href="#file0_line45" class="navigatetohash">EnsureAssemblyLoadInvalidation()</a></td><td>83.33%</td><td>6</td><td>6</td><td>88.89%</td></tr>
 <tr><td title="InvalidateUnresolvableServiceTypes()"><a href="#file0_line69" class="navigatetohash">InvalidateUnresolvableServiceTypes()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="As&lt;T&gt;(object)"><a href="#file0_line85" class="navigatetohash">As&lt;T&gt;(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="ConvertTo(object, System.Type)"><a href="#file0_line92" class="navigatetohash">ConvertTo(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
@@ -190,8 +190,8 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line51"></a><code>51</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;The&nbsp;lock&nbsp;is&nbsp;cold-path&nbsp;only;&nbsp;the&nbsp;steady&nbsp;state&nbsp;is&nbsp;the&nbsp;single&nbsp;volatile&nbsp;read&nbsp;above.</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line52"></a><code>52</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;lock&nbsp;(_assemblyLoadGate)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line53"></a><code>53</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line54"></a><code>54</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(_assemblyLoadHooked)</code></td></tr>
-<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line55"></a><code>55</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return;</code></td></tr>
+<tr class="coverableline" title="Partially covered (3 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line54"></a><code>54</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(_assemblyLoadHooked)</code></td></tr>
+<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line55"></a><code>55</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line56"></a><code>56</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line57"></a><code>57</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AppDomain.CurrentDomain.AssemblyLoad&nbsp;+=&nbsp;static&nbsp;(_,&nbsp;_)&nbsp;=&gt;&nbsp;InvalidateUnresolvableServiceTypes();</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line58"></a><code>58</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Volatile.Write(ref&nbsp;_assemblyLoadHooked,&nbsp;true);</code></td></tr>
@@ -568,12 +568,12 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/07/2026 - 15:23:03<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/07/2026 - 15:48:15<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
-<a href="#file0_line18" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .cctor()"><i class="icon-cube"></i>.cctor()</a><br />
-<a href="#file0_line45" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - EnsureAssemblyLoadInvalidation()"><i class="icon-cube"></i>EnsureAssemblyLoadInvalidation()</a><br />
+<a href="#file0_line18" class="navigatetohash percentagebar percentagebar90" title="Line coverage: 95.2% - .cctor()"><i class="icon-cube"></i>.cctor()</a><br />
+<a href="#file0_line45" class="navigatetohash percentagebar percentagebar80" title="Line coverage: 88.8% - EnsureAssemblyLoadInvalidation()"><i class="icon-cube"></i>EnsureAssemblyLoadInvalidation()</a><br />
 <a href="#file0_line69" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - InvalidateUnresolvableServiceTypes()"><i class="icon-cube"></i>InvalidateUnresolvableServiceTypes()</a><br />
 <a href="#file0_line85" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - As&lt;T&gt;(object)"><i class="icon-cube"></i>As&lt;T&gt;(object)</a><br />
 <a href="#file0_line92" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ConvertTo(object, System.Type)"><i class="icon-cube"></i>ConvertTo(object, System.Type)</a><br />
