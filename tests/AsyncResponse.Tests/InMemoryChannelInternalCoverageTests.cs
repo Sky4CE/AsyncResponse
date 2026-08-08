@@ -224,7 +224,7 @@ public sealed class InMemoryChannelInternalCoverageTests
     /// dispatch same-type payloads, so the serializer is never consulted.
     /// </summary>
     private static readonly Func<object?, string> WireSerializerStub =
-        static response => AsyncResponseJson.Serialize(response, response!.GetType());
+        static response => AsyncResponseJson.Serialize(response!, response!.GetType());
 
     private static object? Invoke(object target, string name, params object?[] arguments)
         => FindMethod(target.GetType(), name).Invoke(target, arguments);
