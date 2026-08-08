@@ -133,6 +133,49 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// The heartbeat round's compensation: a registration dropped (or removed) after the round's
+    /// snapshot was taken gets a compensating subscriber delete — the round's upsert may have
+    /// resurrected the row the cleanup had just deleted, which would count a phantom live waiter
+    /// and suppress lost-subscriber recovery until the heartbeat timeout. Live registrations are
+    /// skipped, and a failing store delete stays best-effort (both asserted through the logs; the
+    /// relational harnesses' closed-port stores make the delete itself throw, which also covers
+    /// the catch).
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task Heartbeat_CompensatesRegistrationsDroppedDuringTheRound(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+
+        var live = harness.Subscription("corr-live").Instance;
+        var droppedDuringRound = harness.Subscription("corr-dropped").Instance;
+        harness.AddSubscription("corr-live", live);
+        harness.AddSubscription("corr-dropped", droppedDuringRound);
+
+        // The round snapshotted all three pairs; afterwards one subscription dropped and one was
+        // removed from the map entirely (its cleanup finished).
+        var heartbeaten = new List<(string CorrelationId, Guid RegistrationId)>
+        {
+            ("corr-live", SubscriptionId(live)),
+            ("corr-dropped", SubscriptionId(droppedDuringRound)),
+            ("corr-ghost", Guid.NewGuid())
+        };
+        SetField(droppedDuringRound, "_dropped", true);
+
+        await harness.InvokeAsync("DeleteRegistrationsDroppedDuringHeartbeatAsync", heartbeaten, CancellationToken.None);
+
+        Assert.Contains(harness.Logger.Messages, m => m.Contains("dropped while a heartbeat round was in flight") && m.Contains("corr-dropped"));
+        Assert.Contains(harness.Logger.Messages, m => m.Contains("dropped while a heartbeat round was in flight") && m.Contains("corr-ghost"));
+        Assert.DoesNotContain(harness.Logger.Messages, m => m.Contains("corr-live"));
+    }
+
+    private static Guid SubscriptionId(object subscription)
+        => (Guid)subscription.GetType().GetProperty("Id", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
+            .GetValue(subscription)!;
+
+    /// <summary>
     /// The same-process fast path stops before claiming the executor when every local subscription
     /// for the correlation id has already been dropped.
     /// </summary>
@@ -182,6 +225,41 @@ public sealed class DbChannelSharedCoverageTests
         // In range and acked after the start: a real target, so the claim runs and the store throws.
         await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
             dispatch, harness.Message("null", ackedAtUtc: startedAt.AddSeconds(5)), subscriptions, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// The same-tick photo-finish that timestamps cannot arbitrate: <c>acked_at</c> equal to the
+    /// subscription's start is EITHER history (a predecessor consumed it just before this waiter
+    /// registered) OR a cross-process fan-out delivery to a group including this waiter. The
+    /// monotonic ack sequence separates them exactly — a claim that drew before the waiter's
+    /// registration draw is history (excluded, no store touch), one that drew after is fan-out
+    /// (included: the claim runs and the failing store throws). Under the old timestamp-only
+    /// watermark both cases were excluded, silently costing the fan-out waiter its response.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task DeliveryWatermark_SameTickTie_IsResolvedExactlyByTheAckSequence(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var startedAt = DateTimeOffset.UtcNow;
+        var subscription = harness.Subscription("corr", startedAt, startedSeq: 100).Instance;
+        var subscriptions = harness.SubscriptionArray(subscription);
+        var dispatch = "DispatchMessageToSubscribersAsync";
+
+        // Identical timestamps; the claim drew BEFORE this waiter registered → history, excluded.
+        await harness.InvokeAsync(
+            dispatch, harness.Message("null", ackedAtUtc: startedAt, ackedSeq: 99), subscriptions, CancellationToken.None);
+
+        // Identical timestamps; the claim drew AFTER this waiter registered → fan-out, included.
+        await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
+            dispatch, harness.Message("null", ackedAtUtc: startedAt, ackedSeq: 101), subscriptions, CancellationToken.None));
+
+        // Sequence stamps win over CONTRADICTING timestamps too (an acked_at far in the past with
+        // a post-registration draw is still fan-out): the exact path consults only the sequence.
+        await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
+            dispatch, harness.Message("null", ackedAtUtc: startedAt.AddSeconds(-5), ackedSeq: 101), subscriptions, CancellationToken.None));
     }
 
     /// <summary>
@@ -265,13 +343,13 @@ public sealed class DbChannelSharedCoverageTests
     private sealed class Harness : IAsyncDisposable
     {
         private readonly Type _channelType;
-        private readonly Func<string, string, DateTimeOffset?, DateTimeOffset?, object> _message;
+        private readonly Func<string, string, DateTimeOffset?, DateTimeOffset?, long?, object> _message;
         private readonly NpgsqlDataSource? _dataSource;
 
         private Harness(
             object channel,
             Type channelType,
-            Func<string, string, DateTimeOffset?, DateTimeOffset?, object> message,
+            Func<string, string, DateTimeOffset?, DateTimeOffset?, long?, object> message,
             CollectingLogger logger,
             Mock<IRecoveryStateStore> recoveryState,
             NpgsqlDataSource? dataSource)
@@ -331,8 +409,8 @@ public sealed class DbChannelSharedCoverageTests
                     return new Harness(
                         channel,
                         typeof(SqlServerAsyncResponseChannel),
-                        (json, correlationId, created, acked) => new SqlServerChannelMessage(
-                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked),
+                        (json, correlationId, created, acked, ackedSeq) => new SqlServerChannelMessage(
+                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked, ackedSeq),
                         logger,
                         recoveryState,
                         dataSource: null);
@@ -361,8 +439,8 @@ public sealed class DbChannelSharedCoverageTests
                     return new Harness(
                         channel,
                         typeof(PostgreSqlAsyncResponseChannel),
-                        (json, correlationId, created, acked) => new PostgreSqlChannelMessage(
-                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked),
+                        (json, correlationId, created, acked, ackedSeq) => new PostgreSqlChannelMessage(
+                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked, ackedSeq),
                         logger,
                         recoveryState,
                         dataSource);
@@ -389,6 +467,7 @@ public sealed class DbChannelSharedCoverageTests
                     database
                         .Setup(db => db.GetCollection<MongoChannelSubscriberDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                         .Returns(subscribers.Object);
+                    database.WithCounters();
                     database
                         .Setup(db => db.RunCommandAsync(It.IsAny<Command<BsonDocument>>(), It.IsAny<ReadPreference>(), It.IsAny<CancellationToken>()))
                         .ReturnsAsync(new BsonDocument("localTime", new BsonDateTime(DateTime.UtcNow)));
@@ -433,8 +512,8 @@ public sealed class DbChannelSharedCoverageTests
                     return new Harness(
                         channel,
                         typeof(MongoDbAsyncResponseChannel),
-                        (json, correlationId, created, acked) => new MongoDbChannelMessage(
-                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked),
+                        (json, correlationId, created, acked, ackedSeq) => new MongoDbChannelMessage(
+                            Guid.NewGuid(), correlationId, json, created ?? DateTimeOffset.UtcNow, acked, ackedSeq),
                         logger,
                         recoveryState,
                         dataSource: null);
@@ -442,8 +521,8 @@ public sealed class DbChannelSharedCoverageTests
             }
         }
 
-        public object Message(string json, string correlationId = "corr", DateTimeOffset? createdAtUtc = null, DateTimeOffset? ackedAtUtc = null)
-            => _message(json, correlationId, createdAtUtc, ackedAtUtc);
+        public object Message(string json, string correlationId = "corr", DateTimeOffset? createdAtUtc = null, DateTimeOffset? ackedAtUtc = null, long? ackedSeq = null)
+            => _message(json, correlationId, createdAtUtc, ackedAtUtc, ackedSeq);
 
         /// <summary>The shared base's per-provider subscription map, for asserting local teardown.</summary>
         public System.Collections.IDictionary Subscriptions
@@ -452,7 +531,8 @@ public sealed class DbChannelSharedCoverageTests
         public (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
             string correlationId,
             DateTimeOffset? startedAtUtc = null,
-            bool cleanupStarted = true)
+            bool cleanupStarted = true,
+            long startedSeq = 0)
         {
             var completion = new TaskCompletionSource<OperationResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             var type = _channelType.BaseType!.GetNestedType("DbSubscription`1", BindingFlags.NonPublic)!
@@ -466,6 +546,7 @@ public sealed class DbChannelSharedCoverageTests
                     correlationId,
                     Guid.NewGuid(),
                     startedAtUtc ?? DateTimeOffset.UtcNow,
+                    startedSeq,
                     (Func<OperationResult, ValueTask<bool>>)(_ => new ValueTask<bool>(true)),
                     completion,
                     null

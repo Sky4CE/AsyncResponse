@@ -121,7 +121,7 @@ public sealed class MongoDbStoreQueryTests
     {
         var messageId = Guid.NewGuid();
         var filter = MongoDbChannelStore.BuildDeliveryClaimFilter(messageId).Render(ChannelRenderArgs());
-        var update = MongoDbChannelStore.BuildDeliveryClaimUpdate().Render(ChannelRenderArgs());
+        var update = MongoDbChannelStore.BuildDeliveryClaimUpdate(ackSeq: 42).Render(ChannelRenderArgs());
 
         // The live-delivery claim gates only on recovery_claimed (not acked_at), preserving
         // cross-process fan-out: multiple processes may each win delivery.
@@ -131,6 +131,9 @@ public sealed class MongoDbStoreQueryTests
 
         var set = update.AsBsonArray[0]["$set"].AsBsonDocument;
         Assert.Equal(new BsonArray { "$acked_at", "$$NOW" }, set["acked_at"]["$ifNull"].AsBsonArray);
+        // The first claim's sequence stamp is kept, mirroring acked_at — the exact watermark
+        // position that separates same-tick history from fan-out.
+        Assert.Equal(new BsonArray { "$acked_seq", 42L }, set["acked_seq"]["$ifNull"].AsBsonArray);
     }
 
     [Fact]
@@ -310,6 +313,7 @@ public sealed class MongoDbStoreQueryTests
         database
             .Setup(d => d.GetCollection<MongoChannelSubscriberDocument>(options.SubscriberCollection, It.IsAny<MongoCollectionSettings>()))
             .Returns(Mock.Of<IMongoCollection<MongoChannelSubscriberDocument>>());
+        database.WithCounters();
         return new MongoDbChannelStore(database.Object, Options.Create(options));
     }
 

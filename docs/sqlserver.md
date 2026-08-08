@@ -37,14 +37,18 @@ directly to lost-subscriber recovery. If subscribers do exist, the publisher ins
 and waits for delivery confirmation:
 
 1. Same-process delivery completes an in-memory confirmation immediately.
-2. Cross-process delivery sets `acked_at`, which the publisher polls as a fallback.
+2. Cross-process delivery sets `acked_at` (plus `acked_seq`, drawn from a per-schema `SEQUENCE`),
+   which the publisher polls as a fallback.
 3. If no waiter confirms before `DeliveryConfirmationTimeout`, the publisher atomically sets
    `recovery_claimed = 1` while `acked_at IS NULL` and dispatches the persisted recovery callback.
 
 That last claim is the race guard: a slow live waiter and the recovery callback cannot both own the
 same response. Row expiries (`expires_at`) are always computed on the **database clock**
 (`SYSUTCDATETIME()`), as is the waiter's delivery watermark, so app-side clock skew cannot drop or
-resurrect messages.
+resurrect messages. `acked_seq` and each subscription's registration draw from the same monotonic
+sequence, so "acked before this waiter registered" (history, not redelivered) versus "acked to a
+fan-out group including this waiter" (delivered) is decided exactly, even when both events land on
+the same server-clock tick.
 
 ## Recovery state
 

@@ -155,7 +155,8 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
         });
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider(), async () =>
         {
-            // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables first, then the schema.
+            // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables and sequences
+            // (the channel's monotonic ack sequence) first, then the schema.
             await using var connection = new SqlConnection(fixture.SqlServerConnectionString);
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
@@ -165,6 +166,10 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
                 SELECT @drop += N'DROP TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N';'
                 FROM sys.tables t
                 JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = @schema;
+                SELECT @drop += N'DROP SEQUENCE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(seq.name) + N';'
+                FROM sys.sequences seq
+                JOIN sys.schemas s ON seq.schema_id = s.schema_id
                 WHERE s.name = @schema;
                 IF SCHEMA_ID(@schema) IS NOT NULL
                     SET @drop += N'DROP SCHEMA ' + QUOTENAME(@schema) + N';';

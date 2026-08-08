@@ -75,6 +75,15 @@ internal static class AsyncResponseJson
     {
         try
         {
+            // Collectible-context (plugin) types are deliberately NOT special-cased here: the
+            // runtime's serializer pins a collectible AssemblyLoadContext through process-wide
+            // static caches (member accessors) no matter which JsonSerializerOptions instance is
+            // used — verified empirically against .NET 10 with a fresh options per call — so a
+            // per-call options copy would add cost without restoring unloadability. The library's
+            // own type caches skip collectible types (see UnresolvableTypeNames call sites); the
+            // supported plugin pattern keeps payload/service CONTRACT types in a non-collectible
+            // contracts assembly, under which nothing here ever sees a collectible type. See
+            // AsyncResponseTypeResolution docs.
             return options.GetTypeInfo(type);
         }
         catch (NotSupportedException ex)

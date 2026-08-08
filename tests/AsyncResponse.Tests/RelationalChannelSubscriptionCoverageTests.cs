@@ -145,7 +145,7 @@ public sealed class RelationalChannelSubscriptionCoverageTests
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, 0L, predicate, completion, null],
             culture: null)!;
         // Processing terminal envelopes normally performs database cleanup. Other integration tests
         // cover that real cleanup; this focused test keeps the branch exercise isolated from a server.

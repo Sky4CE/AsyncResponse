@@ -102,8 +102,26 @@ internal static class PayloadRecoveryClassifier
                         "null — the conservative 'do not resume' route — plus a type-resolution-failure diagnostic.")]
     internal static Type? ResolvePayloadType(string payloadTypeFullName)
     {
+        // Must precede any cache consult/populate: a miss cached without the invalidation hook
+        // active could outlive a later assembly load that makes the name resolvable.
+        UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();
+
         if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached))
             return cached;
+
+        // Fail fast on a name that already failed a full scan (shared with the callback service
+        // resolver): without this, every redelivery naming an unresolvable payload type (a
+        // poisoned recovery row, a renamed class) re-walks every loaded assembly. Only a
+        // CURRENT-generation entry counts — a stale stamp means the miss may have raced a
+        // resolver registration or assembly load, so it rescans. The diagnostic still fires per
+        // attempt, so a poisoned name stays visible to operators while costing a dictionary hit.
+        if (UnresolvableTypeNames.IsKnownMiss(payloadTypeFullName))
+        {
+            AsyncResponseDiagnostics.RecordTypeResolutionFailure("payload");
+            return null;
+        }
+
+        var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
 
         var resolved = AppDomain.CurrentDomain
             .GetAssemblies()
@@ -115,10 +133,15 @@ internal static class PayloadRecoveryClassifier
 
         if (resolved is not null)
         {
-            PayloadTypes.TryAdd(payloadTypeFullName, resolved);
+            // Collectible (plugin) payload types stay resolve-per-call: a strong process-wide
+            // cache entry would pin the plugin's AssemblyLoadContext after unload.
+            if (!resolved.Assembly.IsCollectible)
+                PayloadTypes.TryAdd(payloadTypeFullName, resolved);
         }
         else
         {
+            UnresolvableTypeNames.RecordMiss(payloadTypeFullName, generationBeforeScan);
+
             // Surface the silent "couldn't materialize the payload type" path so operators can
             // correlate a recovery that routed to failure with a missing/ALC-loaded type.
             AsyncResponseDiagnostics.RecordTypeResolutionFailure("payload");

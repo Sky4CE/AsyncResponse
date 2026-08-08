@@ -118,8 +118,14 @@ AsyncResponse.InMemoryWorkerTransport.InMemoryWorkerTransport(Microsoft.Extensio
 AsyncResponse.InMemoryWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.InMemoryWorkerTransportOptions
 AsyncResponse.InMemoryWorkerTransportOptions.InMemoryWorkerTransportOptions() -> void
+AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.set -> void
+AsyncResponse.InMemoryWorkerTransportOptions.RetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.InMemoryWorkerTransportOptions.RetryBaseDelay.set -> void
+AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.set -> void
 AsyncResponse.RecoveryStateObservation

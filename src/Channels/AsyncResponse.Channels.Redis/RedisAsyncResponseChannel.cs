@@ -641,8 +641,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
@@ -731,8 +731,8 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);

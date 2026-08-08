@@ -116,12 +116,37 @@ public sealed class InMemoryWorkerTransportOptions
     /// <summary>Number of jobs that may execute concurrently. Default: 1.</summary>
     public int WorkerCount { get; set; } = 1;
 
+    /// <summary>
+    /// Maximum number of delivery attempts before a failing job is dropped, with an error log and
+    /// a <c>dropped</c> outcome on the worker-jobs counter. The process-local queue has no broker
+    /// to redeliver, so retries run in-process with backoff and occupy the worker slot while they
+    /// run — the same head-of-line trade the Kafka transport documents. This is what honors the
+    /// durable-flow redelivery contract on this transport: a transiently failing wake-up (a lease
+    /// held a beat too long, a revision conflict's designed "abandon and let the delivery retry")
+    /// gets its retry instead of silently stranding the flow. <c>0</c> means unlimited retries —
+    /// the job retries until it succeeds or the process exits, which also means a permanently
+    /// failing job holds its worker slot (and the shutdown drain) indefinitely. Default: <c>5</c>.
+    /// </summary>
+    public int MaxDeliveryAttempts { get; set; } = 5;
+
+    /// <summary>Initial delay between in-process retry attempts (doubles per attempt). Default: <c>100ms</c>.</summary>
+    public TimeSpan RetryBaseDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>Maximum delay between in-process retry attempts. Default: <c>5s</c>.</summary>
+    public TimeSpan RetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
+
     internal void Validate()
     {
         if (QueueCapacity <= 0)
             throw new InvalidOperationException($"{nameof(QueueCapacity)} must be positive.");
         if (WorkerCount <= 0)
             throw new InvalidOperationException($"{nameof(WorkerCount)} must be positive.");
+        if (MaxDeliveryAttempts < 0)
+            throw new InvalidOperationException($"{nameof(MaxDeliveryAttempts)} must be zero (unlimited) or positive.");
+        if (RetryBaseDelay <= TimeSpan.Zero)
+            throw new InvalidOperationException($"{nameof(RetryBaseDelay)} must be positive.");
+        if (RetryMaxDelay < RetryBaseDelay)
+            throw new InvalidOperationException($"{nameof(RetryMaxDelay)} must be at least {nameof(RetryBaseDelay)}.");
     }
 }
 
@@ -170,10 +195,13 @@ internal sealed class InMemoryWorkerHost(
 
             try
             {
-                await RunAsync(queued).ConfigureAwait(false);
+                await ExecuteWithRedeliveryAsync(queued).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
+                // Backstop only — the redelivery loop already contains job failures. Nothing may
+                // break this loop: it is the transport's delivery guarantee for everything still
+                // queued behind the current job.
                 _logger.LogError(ex, "In-memory worker job {Target}.{Method} failed.", queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
             }
             finally
@@ -181,6 +209,57 @@ internal sealed class InMemoryWorkerHost(
                 _transport.OnJobFinished();
             }
         }
+    }
+
+    /// <summary>
+    /// The transport's stand-in for broker redelivery: a failing job is retried in place with
+    /// exponential backoff up to <see cref="InMemoryWorkerTransportOptions.MaxDeliveryAttempts"/>
+    /// (0 = unlimited) — durable-flow wake-ups ride this queue and rely on redelivery for crash
+    /// and contention recovery, so dropping a job on its first failure (the old behavior) could
+    /// strand a flow that a broker-backed transport would have recovered. Retries deliberately
+    /// run during the shutdown drain too: accepted jobs were promised in-process execution, and
+    /// the retry budget is bounded when attempts are.
+    /// </summary>
+    private async Task ExecuteWithRedeliveryAsync(InMemoryWorkerTransport.QueuedJob queued)
+    {
+        var options = _transport.Options;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await RunAsync(queued).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (options.MaxDeliveryAttempts > 0 && attempt >= options.MaxDeliveryAttempts)
+                {
+                    // No broker, no dead-letter queue: dropping is the terminal outcome, so it is
+                    // loud — an error log plus a distinct `dropped` outcome on the worker-jobs
+                    // counter (broker transports dead-letter here instead).
+                    _logger.LogError(ex,
+                        "In-memory worker job {Target}.{Method} failed after {Attempts} attempts; dropping it. A durable flow waiting on this job must be recovered or resumed explicitly.",
+                        queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt);
+                    AsyncResponseDiagnostics.RecordWorkerOutcome("dropped");
+                    return;
+                }
+
+                var delay = RetryDelay(options, attempt);
+                _logger.LogWarning(ex,
+                    "In-memory worker job {Target}.{Method} failed on attempt {Attempt}; retrying in {Delay}.",
+                    queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt, delay);
+                await Task.Delay(delay).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static TimeSpan RetryDelay(InMemoryWorkerTransportOptions options, int attempt)
+    {
+        // Exponential backoff from the base delay, saturating at the max. The shift is capped so
+        // pathological attempt counts (unlimited retries) cannot overflow.
+        var exponent = Math.Min(attempt - 1, 20);
+        var scaled = options.RetryBaseDelay * (1L << exponent);
+        return scaled < options.RetryMaxDelay ? scaled : options.RetryMaxDelay;
     }
 
     private Task RunAsync(InMemoryWorkerTransport.QueuedJob queued)

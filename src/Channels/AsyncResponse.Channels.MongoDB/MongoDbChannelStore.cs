@@ -11,7 +11,8 @@ internal readonly record struct MongoDbChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>Document adapter for the MongoDB channel collections and change-stream wake.</summary>
 internal sealed class MongoDbChannelStore : IDisposable
@@ -19,6 +20,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     private readonly IMongoCollection<MongoRecoveryStateDocument> _recovery;
     private readonly IMongoCollection<MongoChannelMessageDocument> _messages;
     private readonly IMongoCollection<MongoChannelSubscriberDocument> _subscribers;
+    private readonly IMongoCollection<BsonDocument> _counters;
     private readonly IMongoDatabase _database;
     private readonly MongoDbAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -36,6 +38,10 @@ internal sealed class MongoDbChannelStore : IDisposable
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
         _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection);
+        // The monotonic ack sequence: delivery claims and subscription registrations draw from
+        // this ONE counter, giving acked_seq and a subscription's start position a total order no
+        // pair of same-tick timestamps has. Created on first upsert; no index needed (_id only).
+        _counters = database.GetCollection<BsonDocument>($"{_options.MessageCollection}_counters");
         _ownedClient = ownedClient;
     }
 
@@ -292,7 +298,8 @@ internal sealed class MongoDbChannelStore : IDisposable
                 document.CorrelationId,
                 document.EnvelopeJson,
                 new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero),
-                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null));
+                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null,
+                document.AckedSeq));
         return messages;
     }
 
@@ -307,9 +314,14 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async Task<bool> TryClaimForDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        // The sequence value is drawn BEFORE the claim lands, so its position reflects when this
+        // delivery happened relative to subscription registrations (which draw from the same
+        // counter). An unused draw on an already-acked row leaves a harmless gap; $ifNull keeps
+        // the FIRST claim's stamp, mirroring acked_at.
+        var ackSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
         var claimed = await _messages.FindOneAndUpdateAsync(
             BuildDeliveryClaimFilter(messageId),
-            BuildDeliveryClaimUpdate(),
+            BuildDeliveryClaimUpdate(ackSeq),
             new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
             cancellationToken).ConfigureAwait(false);
         return claimed is not null;
@@ -320,13 +332,25 @@ internal sealed class MongoDbChannelStore : IDisposable
            & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
            & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
 
-    internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate()
+    internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate(long ackSeq)
         => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
         {
-            new BsonDocument("$set", new BsonDocument(
-                "acked_at",
-                new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" })))
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["acked_at"] = new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" }),
+                ["acked_seq"] = new BsonDocument("$ifNull", new BsonArray { "$acked_seq", ackSeq })
+            })
         });
+
+    private async Task<long> DrawAckSequenceAsync(CancellationToken cancellationToken)
+    {
+        var counter = await _counters.FindOneAndUpdateAsync<BsonDocument>(
+            new BsonDocument("_id", "ack_seq"),
+            new BsonDocument("$inc", new BsonDocument("seq", 1L)),
+            new FindOneAndUpdateOptions<BsonDocument, BsonDocument> { IsUpsert = true, ReturnDocument = ReturnDocument.After },
+            cancellationToken).ConfigureAwait(false);
+        return counter["seq"].ToInt64();
+    }
 
     /// <summary>
     /// Atomically claims a message for the lost-subscriber path: sets <c>recovery_claimed</c> only
@@ -359,6 +383,18 @@ internal sealed class MongoDbChannelStore : IDisposable
         return reply.TryGetValue("localTime", out var localTime) && localTime is BsonDateTime serverTime
             ? new DateTimeOffset(serverTime.ToUniversalTime(), TimeSpan.Zero)
             : DateTimeOffset.UtcNow;
+    }
+
+    /// <summary>
+    /// A subscription's registration watermark: the server's UTC clock (for the created-at bound)
+    /// and a fresh position in the monotonic ack sequence (for the exact acked-history bound —
+    /// see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        var serverTimeUtc = await GetServerTimeUtcAsync(cancellationToken).ConfigureAwait(false);
+        var startSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
+        return (serverTimeUtc, startSeq);
     }
 
     public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
@@ -573,6 +609,9 @@ internal sealed class MongoChannelMessageDocument
 
     [BsonElement("acked_at")]
     public DateTime? AckedAtUtc { get; set; }
+
+    [BsonElement("acked_seq")]
+    public long? AckedSeq { get; set; }
 
     [BsonElement("recovery_claimed")]
     public bool RecoveryClaimed { get; set; }

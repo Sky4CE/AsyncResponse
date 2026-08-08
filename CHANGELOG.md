@@ -153,6 +153,45 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   — a zombie server-side subscription that made every probe/publish count a live waiter and
   suppressed recovery for that correlation id until process exit; the creator now unsubscribes
   post-assignment when cleanup already ran.
+- **The database channels' same-tick delivery-vs-history tie is now decided exactly.** A message
+  acked in the same server-clock tick a waiter registered in was indistinguishable between
+  "history a reused correlation id must not replay" and "a cross-process fan-out delivery this
+  waiter is part of"; the watermark resolved it in the safe at-most-once direction, costing the
+  fan-out waiter its response (a stall to its step timeout). Delivery claims now stamp
+  `acked_seq` from a store-side monotonic sequence (PostgreSQL/SQL Server: a `SEQUENCE`;
+  MongoDB: a counter document) and every waiter registration draws its position from the same
+  sequence, so the comparison is a strict integer order with no tie. Additive schema — the
+  column/sequence are auto-created when schema creation is enabled, and rows acked by an older
+  build fall back to the previous timestamp rule.
+- **The in-memory worker transport now honors the redelivery contract.** A failing job was
+  dropped on its first failure — silently voiding durable-flow crash/contention recovery (the
+  revision conflict's designed "abandon and let the delivery retry") on the dev transport. Jobs
+  now retry in place with exponential backoff up to
+  `InMemoryWorkerTransportOptions.MaxDeliveryAttempts` (default 5, `0` = unlimited;
+  `RetryBaseDelay`/`RetryMaxDelay` pace it), then drop loudly: an error log plus a `dropped`
+  outcome on `asyncresponse.worker.jobs` (broker transports dead-letter at this point instead).
+- **A DB subscriber heartbeat can no longer resurrect a just-deleted subscriber row.** A cleanup
+  landing between the heartbeat's snapshot and its upsert had its row re-created for up to one
+  heartbeat-timeout window, during which every publisher counted a phantom live waiter and
+  lost-subscriber recovery was suppressed for that correlation id. The heartbeat round now
+  re-checks its snapshot afterwards and issues a compensating delete for any registration
+  dropped mid-round (PostgreSQL, SQL Server, MongoDB).
+- **Shared-correlation dispatches whose registrations legitimately take different recovery routes
+  now report `route=mixed`** on the lost-subscriber metric and publish span instead of
+  `unclassified`, which was indistinguishable from a poisoned payload; each registration's own
+  dispatch span carries its true route as before.
+- **Unresolvable payload type names no longer re-scan every loaded assembly per redelivery.** The
+  recovery classifier now shares the callback resolver's bounded, generation-stamped negative
+  cache — invalidated automatically when an assembly loads or a resolver registers, so a
+  late-loading plugin is picked up immediately while a poisoned/renamed type name costs a
+  dictionary hit (its diagnostic still fires per attempt).
+- **The library's type caches no longer pin collectible (plugin) AssemblyLoadContexts.** Resolved
+  types, conversion/invocation plans, and `OnRecovery` override detection all skip strong caching
+  for types from collectible assemblies, so unloading a plugin context actually reclaims it —
+  verified by an unload test exercising every cache. Note the runtime boundary that remains:
+  `System.Text.Json` pins any collectible type it serializes via runtime-internal caches, so for
+  unloadable plugins keep payload/service contract types in a non-collectible contracts assembly
+  (documented in `docs/security.md`).
 - **A registration step failing after a response already settled the wait no longer discards the
   response (InMemory, Redis, NATS).** When a delivery completed the waiter while the
   recovery-state save was still in flight and the save (or, on NATS, the post-save server flush

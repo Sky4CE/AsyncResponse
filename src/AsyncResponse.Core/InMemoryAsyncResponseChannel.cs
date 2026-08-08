@@ -192,8 +192,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action, result.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked, result.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;
@@ -261,8 +261,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action, result.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked, result.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;

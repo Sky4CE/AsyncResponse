@@ -8,7 +8,8 @@ internal readonly record struct SqlServerChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>SQL helper for the SQL Server channel tables.</summary>
 internal sealed class SqlServerChannelSql
@@ -36,12 +37,23 @@ internal sealed class SqlServerChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
+        AckSequenceName = SequenceName(_options.MessageTable);
+        AckSequence = $"{Schema}.{Quote(AckSequenceName)}";
     }
 
     public string Schema { get; }
     public string RecoveryTable { get; }
     public string MessageTable { get; }
     public string SubscriberTable { get; }
+
+    /// <summary>
+    /// Qualified name of the monotonic ack sequence. Delivery claims and subscription
+    /// registrations draw from this ONE sequence, giving <c>acked_seq</c> and a subscription's
+    /// start position a total order no pair of same-tick timestamps has.
+    /// </summary>
+    public string AckSequence { get; }
+
+    private string AckSequenceName { get; }
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
@@ -108,8 +120,13 @@ internal sealed class SqlServerChannelSql
                     created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
                     expires_at datetime2 NOT NULL,
                     acked_at datetime2 NULL,
+                    acked_seq bigint NULL,
                     recovery_claimed bit NOT NULL DEFAULT 0
                 );
+                IF COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NULL
+                    ALTER TABLE {MessageTable} ADD acked_seq bigint NULL;
+                IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}'))
+                    CREATE SEQUENCE {AckSequence} AS bigint START WITH 1;
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{IndexName(_options.MessageTable, "correlation_created")}' AND object_id = OBJECT_ID(N'{MessageTable}'))
                     CREATE INDEX {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                         ON {MessageTable} (correlation_id, created_at);
@@ -303,7 +320,7 @@ internal sealed class SqlServerChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json, created_at, acked_at
+            SELECT id, correlation_id, envelope_json, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -333,7 +350,8 @@ internal sealed class SqlServerChannelSql
                 reader.GetString(1),
                 reader.GetString(2),
                 new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
-                reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)));
+                reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero),
+                reader.IsDBNull(5) ? null : reader.GetInt64(5)));
         return messages;
     }
 
@@ -349,10 +367,15 @@ internal sealed class SqlServerChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // NEXT VALUE FOR is not allowed inside CASE/COALESCE, so the sequence value is drawn into
+        // a variable first — one batch, one round trip; the unused draw on an already-acked row
+        // just leaves a harmless sequence gap.
         command.CommandText =
             $"""
+            DECLARE @seq bigint = NEXT VALUE FOR {AckSequence};
             UPDATE {MessageTable}
-            SET acked_at = COALESCE(acked_at, SYSUTCDATETIME())
+            SET acked_at = COALESCE(acked_at, SYSUTCDATETIME()),
+                acked_seq = COALESCE(acked_seq, @seq)
             OUTPUT inserted.id
             WHERE id = @id AND recovery_claimed = 0 AND expires_at > SYSUTCDATETIME();
             """;
@@ -382,6 +405,22 @@ internal sealed class SqlServerChannelSql
         command.Parameters.AddWithValue("@id", messageId);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return result is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// One round trip for a subscription's registration watermark: the server's UTC clock (for
+    /// the created-at bound) and a fresh position in the monotonic ack sequence (for the exact
+    /// acked-history bound — see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT SYSUTCDATETIME(), NEXT VALUE FOR {AckSequence};";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return (new DateTimeOffset(reader.GetDateTime(0), TimeSpan.Zero), reader.GetInt64(1));
     }
 
     /// <summary>Returns the database server's current UTC time, used as a clock-safe delivery watermark.</summary>
@@ -593,6 +632,12 @@ internal sealed class SqlServerChannelSql
     }
 
     private static string Quote(string identifier) => "[" + identifier + "]";
+
+    private static string SequenceName(string table)
+    {
+        var name = $"{table}_ack_seq";
+        return name.Length <= 128 ? name : name[..128];
+    }
 
     private static string IndexName(string table, string suffix)
     {

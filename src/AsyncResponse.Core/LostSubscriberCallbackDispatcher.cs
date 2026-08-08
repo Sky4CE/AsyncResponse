@@ -28,6 +28,15 @@ internal readonly record struct LostSubscriberDispatchResult(RecoveryAction? Act
     /// re-snapshot and dispatch live.
     /// </summary>
     public bool RetryLive { get; init; }
+
+    /// <summary>
+    /// <c>true</c> when shared-correlation registrations legitimately took DIFFERENT routes in
+    /// this one dispatch (each registration classifies as the payload type IT registered).
+    /// <see cref="Action"/> stays <c>null</c> — no single action describes the aggregate — but
+    /// diagnostics report the route as <c>mixed</c> rather than <c>unclassified</c>; each
+    /// registration's own dispatch activity carries its true route.
+    /// </summary>
+    public bool RouteMixed { get; init; }
 }
 
 /// <summary>
@@ -131,7 +140,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
         firstException?.Throw();
 
-        return new LostSubscriberDispatchResult(routeMixed ? null : action, callbackInvoked);
+        return new LostSubscriberDispatchResult(routeMixed ? null : action, callbackInvoked) { RouteMixed = routeMixed };
     }
 
     /// <summary>

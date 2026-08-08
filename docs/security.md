@@ -153,4 +153,20 @@ AsyncResponseTypeResolution.RegisterResolver(name =>
 Type names that still can't be resolved are surfaced via the
 `asyncresponse.type_resolution.unresolved` metric (tag `kind = service|payload`) — see
 [observability.md](observability.md) — so an unresolved plugin type shows up as an observable signal
-rather than a silent drop.
+rather than a silent drop. Unresolvable names are negatively cached (bounded), and the cache is
+invalidated automatically when a new assembly loads or a resolver registers — a plugin that
+registers late is picked up immediately, while a poisoned/renamed type name stops costing a full
+assembly scan per redelivery.
+
+### Unloadable (collectible) plugin contexts
+
+If your plugins load into a **collectible** `AssemblyLoadContext` and you expect `Unload()` to
+actually reclaim them, keep the types AsyncResponse touches — payload types and callback service
+**interfaces** — in a shared, non-collectible **contracts assembly**, and load only the plugin's
+*implementations* into the collectible context. This is the standard .NET plugin architecture, and
+under it unloading works: AsyncResponse's own resolution caches additionally skip any type from a
+collectible assembly (resolving it per call instead), so the library never pins your context.
+What the library cannot control is `System.Text.Json` itself: serializing or deserializing a type
+that *lives in* a collectible assembly pins that context through runtime-internal caches
+(regardless of `JsonSerializerOptions` instance, verified through .NET 10) — which is exactly why
+payload contracts belong in the non-collectible contracts assembly.

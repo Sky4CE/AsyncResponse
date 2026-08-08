@@ -719,6 +719,7 @@ public sealed class MongoDbChannelCoverageTests
                     It.IsAny<string>(),
                     It.IsAny<MongoCollectionSettings>()))
                 .Returns(Subscribers.Object);
+            Database.WithCounters();
             Database
                 .Setup(d => d.RunCommandAsync(
                     It.IsAny<Command<BsonDocument>>(),
@@ -789,7 +790,7 @@ public sealed class MongoDbChannelCoverageTests
                 nested,
                 BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
                 binder: null,
-                [Channel, correlationId, Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
+                [Channel, correlationId, Guid.NewGuid(), DateTimeOffset.UtcNow, 0L, predicate, completion, null],
                 culture: null)!;
             return (instance, completion);
         }

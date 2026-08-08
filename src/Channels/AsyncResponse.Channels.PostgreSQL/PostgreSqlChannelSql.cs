@@ -9,7 +9,8 @@ internal readonly record struct PostgreSqlChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>SQL helper for the PostgreSQL channel tables and notification channel.</summary>
 internal sealed class PostgreSqlChannelSql
@@ -37,6 +38,7 @@ internal sealed class PostgreSqlChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
+        AckSequence = $"{Schema}.{Quote(SequenceName(_options.MessageTable))}";
         _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
     }
 
@@ -44,6 +46,13 @@ internal sealed class PostgreSqlChannelSql
     public string RecoveryTable { get; }
     public string MessageTable { get; }
     public string SubscriberTable { get; }
+
+    /// <summary>
+    /// Qualified name of the monotonic ack sequence. Delivery claims and subscription
+    /// registrations draw from this ONE sequence, giving <c>acked_seq</c> and a subscription's
+    /// start position a total order no pair of same-tick timestamps has.
+    /// </summary>
+    public string AckSequence { get; }
     public string NotificationChannel => _options.NotificationChannel;
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
@@ -97,9 +106,12 @@ internal sealed class PostgreSqlChannelSql
                     created_at timestamptz NOT NULL DEFAULT now(),
                     expires_at timestamptz NOT NULL,
                     acked_at timestamptz NULL,
+                    acked_seq bigint NULL,
                     recovery_claimed boolean NOT NULL DEFAULT false
                 );
                 ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;
+                ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+                CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint;
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                     ON {MessageTable} (correlation_id, created_at);
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "expires"))}
@@ -293,7 +305,7 @@ internal sealed class PostgreSqlChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json::text, created_at, acked_at
+            SELECT id, correlation_id, envelope_json::text, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -319,7 +331,8 @@ internal sealed class PostgreSqlChannelSql
                 reader.GetString(1),
                 reader.GetString(2),
                 reader.GetFieldValue<DateTimeOffset>(3),
-                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4)));
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                reader.IsDBNull(5) ? null : reader.GetInt64(5)));
         return messages;
     }
 
@@ -338,7 +351,8 @@ internal sealed class PostgreSqlChannelSql
         command.CommandText =
             $"""
             UPDATE {MessageTable}
-            SET acked_at = COALESCE(acked_at, now())
+            SET acked_at = COALESCE(acked_at, now()),
+                acked_seq = COALESCE(acked_seq, nextval('{AckSequence}'))
             WHERE id = @id AND NOT recovery_claimed AND expires_at > now()
             RETURNING id;
             """;
@@ -368,6 +382,22 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.AddWithValue("id", messageId);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return result is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// One round trip for a subscription's registration watermark: the server's UTC clock (for
+    /// the created-at bound) and a fresh position in the monotonic ack sequence (for the exact
+    /// acked-history bound — see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT now(), nextval('{AckSequence}');";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return (reader.GetFieldValue<DateTimeOffset>(0).ToUniversalTime(), reader.GetInt64(1));
     }
 
     /// <summary>Returns the database server's current UTC time, used as a clock-safe delivery watermark.</summary>
@@ -567,6 +597,12 @@ internal sealed class PostgreSqlChannelSql
     private static string IndexName(string table, string suffix)
     {
         var name = $"{table}_{suffix}_idx";
+        return name.Length <= 63 ? name : name[..63];
+    }
+
+    private static string SequenceName(string table)
+    {
+        var name = $"{table}_ack_seq";
         return name.Length <= 63 ? name : name[..63];
     }
 

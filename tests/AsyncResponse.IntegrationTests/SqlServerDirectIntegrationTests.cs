@@ -716,7 +716,8 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
 
     private async Task DropSchemaAsync(string schema)
     {
-        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables first, then the schema.
+        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables and sequences
+        // (the channel's monotonic ack sequence) first, then the schema.
         await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
@@ -726,6 +727,10 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             SELECT @drop += N'DROP TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N';'
             FROM sys.tables t
             JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = @schema;
+            SELECT @drop += N'DROP SEQUENCE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(seq.name) + N';'
+            FROM sys.sequences seq
+            JOIN sys.schemas s ON seq.schema_id = s.schema_id
             WHERE s.name = @schema;
             IF SCHEMA_ID(@schema) IS NOT NULL
                 SET @drop += N'DROP SCHEMA ' + QUOTENAME(@schema) + N';';
@@ -913,7 +918,7 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, 0L, predicate, completion, null],
             culture: null)!;
         SetField(instance, "_cleanupStarted", 1);
         return (instance, completion);
