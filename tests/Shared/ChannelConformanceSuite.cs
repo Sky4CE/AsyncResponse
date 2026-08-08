@@ -423,6 +423,34 @@ public abstract class ChannelConformanceSuite
     }
 
     [Fact]
+    public async Task Contract_LiveFanout_PolymorphicDeclaredBase_PreservesDiscriminatorForEveryWaiter()
+    {
+        // The polymorphic sharpening of the mixed-type fan-out contract: the publisher declares a
+        // [JsonPolymorphic] base, so the wire representation carries the type discriminator. Every
+        // waiter — including one bound to a DIFFERENT compatible polymorphic contract — must
+        // receive its own materialization of that discriminated payload, exactly as broker
+        // envelopes (which serialize the declared base) deliver it.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("poly-fanout");
+
+        await using var ownWaiter = await harness.Subscriber.CreateResponseWaiter<ConformancePolyBase>(
+            correlationId, timeout: WaiterTimeout);
+        await using var mirrorWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceMirrorPolyBase>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse<ConformancePolyBase>(
+            new ConformancePolyResult { Message = "poly-both" }, correlationId);
+
+        var own = await ownWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var ownResult = Assert.IsType<ConformancePolyResult>(own);
+        Assert.Equal("poly-both", ownResult.Message);
+
+        var mirror = await mirrorWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var mirrorResult = Assert.IsType<ConformanceMirrorPolyResult>(mirror);
+        Assert.Equal("poly-both", mirrorResult.Message);
+    }
+
+    [Fact]
     public async Task Contract_StragglersAfterLiveCompletion_AreDroppedAndCorrelationIdStaysReusable()
     {
         // Broker redelivery and slow remotes produce stragglers: a duplicate of the terminal
@@ -959,6 +987,44 @@ public sealed class ConformanceMirrorResult : IAsyncResponsePayload
         ConformanceStatus.Running => RecoveryAction.KeepWaiting,
         _ => RecoveryAction.Fail,
     };
+}
+
+/// <summary>
+/// A polymorphic payload contract published by its declared base: the wire carries the
+/// discriminator, and every waiter must get a faithful materialization of the derived type.
+/// </summary>
+[System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(ConformancePolyResult), "result")]
+public abstract class ConformancePolyBase : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    // Virtual so the derived override genuinely participates in interface dispatch.
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class ConformancePolyResult : ConformancePolyBase
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>
+/// A second, compatible polymorphic contract (same discriminator name and value) — what a sibling
+/// service waiting on the same correlation id would declare.
+/// </summary>
+[System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(ConformanceMirrorPolyResult), "result")]
+public abstract class ConformanceMirrorPolyBase : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    // Virtual so the derived override genuinely participates in interface dispatch.
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class ConformanceMirrorPolyResult : ConformanceMirrorPolyBase
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }
 
 /// <summary>

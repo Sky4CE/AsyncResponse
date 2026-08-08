@@ -25,9 +25,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   Both resume and failure callbacks now receive the instance the classifier materialized (the
   conservative unclassifiable path still attaches the raw payload). Classification is
   **per-registration**: each recovery registration is classified as the payload type IT registered
-  — for typed in-process publishes too (the published instance is reused only on an exact
-  runtime-type match, otherwise the response is re-materialized as the registered type via the
-  same JSON round-trip a broker delivery would take), so shared-correlation registrations with different
+  — for typed in-process publishes too (normalized to their declared-type wire representation, see
+  the serialization-boundary entry below), so shared-correlation registrations with different
   payload types route independently instead of all inheriting the published instance's verdict.
   Pinned by channel-conformance facts on all six channel derivations plus ingress-level regression
   tests.
@@ -49,18 +48,24 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   The delete is now best-effort bookkeeping: a fault is logged, the registration stays until its
   TTL or the next delivery (at-least-once, watchdog-visible), and the callback's outcome stands.
   Same rule on the exception-dispatch route.
-- **Recovery classification cannot diverge across the serialization boundary.** A typed publish
-  whose runtime type merely DERIVED from the registered payload type reused the instance — its
-  `OnRecovery()` override could return `Resume` while the broker route, materializing the
-  registered base from JSON, returned `Fail` for the same logical response. The instance is now
-  reused only on an exact runtime-type match; any other match re-materializes as the registered
-  type, so the in-process and broker routes always agree.
+- **Recovery classification cannot diverge across the serialization boundary.** Typed lost
+  dispatches are now normalized to their **wire representation** — the payload serialized as the
+  publisher's DECLARED `T`, exactly as `AsyncResponseEnvelope<T>` writes it — before
+  classification, and the classifier consumes only wire JSON. Neither instance reuse (which let
+  `[JsonIgnore]`d in-process state and derived `OnRecovery()` overrides decide routing) nor
+  runtime-type serialization (which dropped the `[JsonPolymorphic]` discriminators only the
+  declared-type contract emits) can make an in-process publish route differently from the same
+  response delivered by a broker. Unserializable payloads (cycles, unregistered AOT metadata)
+  stay conservatively unclassifiable and take the failure route with the instance attached.
 - **In-memory live fan-out matches broker channels for mixed payload types.** Two waiters with
   different declared payload types sharing one correlation id: broker channels give each waiter
   its own JSON materialization of the envelope, but the in-memory channel cast the publisher's
   CLR instance (`Convert.ChangeType`), faulting the second waiter with an `InvalidCastException`.
-  Foreign CLR payloads now take the same JSON round-trip; pinned by a new conformance fact on all
-  six channel derivations.
+  Foreign CLR payloads are now re-materialized from the publisher's **declared-type** wire JSON —
+  the exact envelope representation, polymorphic discriminators included (runtime-type
+  serialization dropped them, faulting waiters bound to a compatible `[JsonPolymorphic]`
+  contract). Pinned by concrete and polymorphic mixed-fan-out conformance facts on all six
+  channel derivations. The same-type fast path still hands the live instance through, unchanged.
 
 ### Added
 

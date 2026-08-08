@@ -84,8 +84,12 @@ internal sealed class LostSubscriberCallbackDispatcher(
         if (hasLiveSubscriber is not null && await hasLiveSubscriber().ConfigureAwait(false))
             return new LostSubscriberDispatchResult(null, false) { RetryLive = true };
 
+        // Classification and callbacks must see the payload exactly as a broker delivery would
+        // have carried it, whichever process publishes.
+        var wirePayload = WirePayload(response);
+
         if (recoveryStates.Count == 0)
-            return await DispatchLostResponse(null, response, channel).ConfigureAwait(false);
+            return await DispatchLostResponse(null, wirePayload, channel).ConfigureAwait(false);
 
         var callbackInvoked = false;
         RecoveryAction? action = null;
@@ -97,7 +101,7 @@ internal sealed class LostSubscriberCallbackDispatcher(
         {
             try
             {
-                var result = await DispatchLostResponse(recoveryState, response, channel).ConfigureAwait(false);
+                var result = await DispatchLostResponse(recoveryState, wirePayload, channel).ConfigureAwait(false);
                 if (!routeSet)
                 {
                     action = result.Action;
@@ -331,11 +335,15 @@ internal sealed class LostSubscriberCallbackDispatcher(
         string? payloadJson = null;
         try
         {
-            // Runtime-type serialization: the payload arrives boxed (materialized instance or raw
-            // JsonElement), and the diagnostic JSON must reflect what it actually is.
-            payloadJson = response is null
-                ? AsyncResponseJson.Serialize(response)
-                : AsyncResponseJson.Serialize(response, response.GetType());
+            // The payload arrives as its wire representation (declared-type-normalized JSON or
+            // raw ingress JSON); reuse it verbatim for diagnostics rather than re-serializing.
+            payloadJson = response switch
+            {
+                string s => s,
+                JsonElement je => je.GetRawText(),
+                null => AsyncResponseJson.Serialize(response),
+                _ => AsyncResponseJson.Serialize(response, response.GetType())
+            };
         }
         catch (Exception)
         {
@@ -427,6 +435,34 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 "Recovery callback for correlationId {CorrelationId} succeeded but deleting its registration {RegistrationId} failed; the registration remains until its TTL or the next delivery.",
                 correlationId,
                 registrationId);
+        }
+    }
+
+    /// <summary>
+    /// Normalizes a typed payload to its WIRE representation — serialized as the publisher's
+    /// DECLARED <typeparamref name="T"/>, exactly as <c>AsyncResponseEnvelope&lt;T&gt;</c> writes
+    /// it. Reusing the live instance leaked state that never crosses the wire
+    /// (<c>[JsonIgnore]</c>) into recovery routing, and serializing the RUNTIME type dropped the
+    /// polymorphic discriminators only the declared-type contract emits — either way the verdict
+    /// depended on which side of a serialization boundary the publisher sat. Raw ingress payloads
+    /// (<see cref="JsonElement"/> / JSON string) already are wire representations.
+    /// </summary>
+    private static object? WirePayload<T>(T response)
+    {
+        if (response is null or JsonElement or string)
+            return response;
+
+        try
+        {
+            return AsyncResponseJson.Serialize(response);
+        }
+        catch
+        {
+            // No wire representation exists (unserializable payload — cycles, unregistered AOT
+            // metadata). Hand the instance through: the wire-only classifier treats it as
+            // unclassifiable, so it takes the conservative failure route with the instance
+            // attached — a payload that could never have crossed the wire never resumes a flow.
+            return response;
         }
     }
 

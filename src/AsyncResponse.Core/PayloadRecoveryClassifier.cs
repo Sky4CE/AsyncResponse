@@ -14,10 +14,9 @@ namespace AsyncResponse;
 /// "do not resume", so a payload that cannot be understood never takes the happy path.
 /// </param>
 /// <param name="MaterializedPayload">
-/// The payload as an <see cref="IAsyncResponsePayload"/> instance of the REGISTERED type — the
-/// original instance only on an exact runtime-type match, otherwise the response materialized as
-/// the registered type (raw-JSON ingress, a derived instance, or a cross-type sibling
-/// registration), so the verdict never depends on a serialization boundary.
+/// The payload as an <see cref="IAsyncResponsePayload"/> instance of the REGISTERED type,
+/// materialized from the payload's wire representation — never the publisher's live instance, so
+/// the verdict (and what callbacks see) can never depend on a serialization boundary.
 /// <c>null</c> exactly when <paramref name="Action"/> is <c>null</c>. Callbacks must receive THIS
 /// instance, never the raw JSON: an <c>object</c>-/interface-/base-typed callback parameter
 /// otherwise gets a <see cref="JsonElement"/> and every type guard in the consuming flow silently
@@ -26,13 +25,14 @@ namespace AsyncResponse;
 internal readonly record struct RecoveryClassification(RecoveryAction? Action, object? MaterializedPayload);
 
 /// <summary>
-/// Resolves the lost-subscriber recovery route for a response payload by asking it
+/// Resolves the lost-subscriber recovery route for a response payload by materializing its wire
+/// representation as the registered payload type and asking
 /// <see cref="IAsyncResponsePayload.OnRecovery"/>.
 /// <para>
-/// Payloads arriving through a broker ingress are untyped (a raw <see cref="JsonElement"/> / JSON
-/// string), so the payload type the original waiter registered for (persisted in the recovery
-/// state) is used to materialize the payload before asking it — and the materialized instance is
-/// returned so the chosen callback receives it instead of the raw JSON.
+/// The input is always a wire representation — raw broker JSON, or a typed publish normalized to
+/// its declared-type serialization by the dispatcher — so in-process and broker deliveries of the
+/// same response classify identically. The materialized instance is returned so the chosen
+/// callback receives it instead of the raw JSON.
 /// </para>
 /// </summary>
 internal static class PayloadRecoveryClassifier
@@ -55,62 +55,34 @@ internal static class PayloadRecoveryClassifier
     {
         try
         {
-            if (payload is null)
+            if (payload is null || string.IsNullOrWhiteSpace(payloadTypeFullName))
             {
                 return new RecoveryClassification(null, null);
             }
 
-            if (payload is IAsyncResponsePayload typedPayload)
-            {
-                // A typed publish with no registered type name: the instance is self-describing.
-                if (string.IsNullOrWhiteSpace(payloadTypeFullName))
-                {
-                    return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
-                }
-
-                // The REGISTRATION's payload type governs, never the publisher's runtime type:
-                // multiple registrations may share one correlation id with different payload types
-                // (shared-correlation recovery), and each must be classified as the type IT
-                // registered — letting the published instance answer for a sibling registration
-                // spuriously resumed (and consumed) registrations that classified the same
-                // response as a checkpoint or a failure.
-                var registeredType = ResolvePayloadType(payloadTypeFullName!);
-                if (registeredType is null || !typeof(IAsyncResponsePayload).IsAssignableFrom(registeredType))
-                {
-                    return new RecoveryClassification(null, null);
-                }
-
-                // Reuse the instance only for an EXACT runtime-type match. A derived instance
-                // must be re-materialized as the registered type like any other mismatch: asking
-                // the derived override directly let the same logical response resume on the typed
-                // in-process route while the broker route (which materializes the registered base
-                // from JSON) failed it — the verdict must not depend on whether the response
-                // crossed a serialization boundary.
-                if (typedPayload.GetType() == registeredType)
-                {
-                    return new RecoveryClassification(typedPayload.OnRecovery(), typedPayload);
-                }
-
-                // Any other registration: interpret the response as the registered type via the
-                // same JSON round-trip a broker delivery of this payload would take.
-                var json = AsyncResponseJson.Serialize((object)typedPayload, typedPayload.GetType());
-                return json.ConvertTo(registeredType) is IAsyncResponsePayload rematerialized
-                    ? new RecoveryClassification(rematerialized.OnRecovery(), rematerialized)
-                    : new RecoveryClassification(null, null);
-            }
-
-            if (string.IsNullOrWhiteSpace(payloadTypeFullName))
+            // Wire-only: classification never consults a live CLR instance. A non-JSON payload
+            // here means no wire representation exists for it (the dispatcher's serialization
+            // failed) — conservatively unclassifiable rather than letting in-process state that
+            // never crosses the wire decide the route.
+            if (payload is not (JsonElement or string))
             {
                 return new RecoveryClassification(null, null);
             }
 
-            var payloadType = ResolvePayloadType(payloadTypeFullName!);
-            if (payloadType is null || !typeof(IAsyncResponsePayload).IsAssignableFrom(payloadType))
+            // The REGISTRATION's payload type governs, never the publisher's runtime type:
+            // multiple registrations may share one correlation id with different payload types
+            // (shared-correlation recovery), and each must be classified as the type IT
+            // registered. The payload arrives as its WIRE representation (the dispatcher
+            // normalizes typed publishes to their declared-type serialization), so materializing
+            // it here yields exactly what a broker delivery would have produced — polymorphic
+            // discriminators included, in-process-only ([JsonIgnore]) state excluded.
+            var registeredType = ResolvePayloadType(payloadTypeFullName!);
+            if (registeredType is null || !typeof(IAsyncResponsePayload).IsAssignableFrom(registeredType))
             {
                 return new RecoveryClassification(null, null);
             }
 
-            return payload.ConvertTo(payloadType) is IAsyncResponsePayload materialized
+            return payload.ConvertTo(registeredType) is IAsyncResponsePayload materialized
                 ? new RecoveryClassification(materialized.OnRecovery(), materialized)
                 : new RecoveryClassification(null, null);
         }
