@@ -289,6 +289,17 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         var triggerCompleted = reattach;
         try
         {
+            if (reattach && await TryShortCircuitRecoveredCheckpointAsync(name, checkpoint).ConfigureAwait(false))
+            {
+                // Lost-subscriber recovery checkpointed this step between our state load and the
+                // waiter registration. Its wake-up delivery will find OUR lease alive and ack as
+                // a duplicate, so nothing would ever wake the parked wait — take the checkpointed
+                // result now instead of waiting out the full step timeout for a response that was
+                // already consumed. (Recovery always checkpoints BEFORE enqueueing its wake-up,
+                // so a completed persisted checkpoint here is authoritative.)
+                return DeserializeResult<TResponse>(checkpoint.ResultJson);
+            }
+
             if (!reattach)
             {
                 // Persist the breadcrumb AFTER the registration exists and BEFORE the send:
@@ -296,6 +307,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // either side of the send re-attaches (or times out and restarts the idempotent
                 // step) — never a lost run, never a double-send.
                 checkpoint.PendingCorrelationId = correlationId;
+                checkpoint.PendingPayloadTypeFullName = typeof(TResponse).FullName;
                 checkpoint.Faulted = false;
                 checkpoint.Message = null;
                 await SaveAsync(cancellationToken).ConfigureAwait(false);
@@ -313,6 +325,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
+            checkpoint.PendingPayloadTypeFullName = null;
             // Deliberately NOT the caller's token: once the response is claimed from the channel
             // it exists nowhere else, so the completion checkpoint must not be interruptible — a
             // cancellation here used to leave `pending` set with the response already consumed,
@@ -392,6 +405,43 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         finally
         {
             await waiter.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Re-reads the persisted step checkpoint after the re-attach waiter registration exists and,
+    /// when recovery already completed the step, syncs the in-memory ledger so the caller can
+    /// short-circuit. Best-effort: a store read failure logs and falls through to the normal wait
+    /// (the behavior before this check existed) rather than faulting the step.
+    /// </summary>
+    private async Task<bool> TryShortCircuitRecoveredCheckpointAsync(string name, FlowStepState checkpoint)
+    {
+        try
+        {
+            var persisted = await _store.LoadAsync(FlowId).ConfigureAwait(false);
+            if (persisted?.Steps is null
+                || !persisted.Steps.TryGetValue(name, out var persistedStep)
+                || !persistedStep.Completed)
+            {
+                return false;
+            }
+
+            checkpoint.Completed = true;
+            checkpoint.ResultJson = persistedStep.ResultJson;
+            checkpoint.PendingCorrelationId = null;
+            checkpoint.PendingPayloadTypeFullName = null;
+            checkpoint.Faulted = false;
+            checkpoint.Message = persistedStep.Message;
+            checkpoint.CompletedAtUtc = persistedStep.CompletedAtUtc;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Flow {FlowId} step '{Step}' could not re-read its checkpoint before re-attaching; continuing with the normal wait.",
+                FlowId, name);
+            return false;
         }
     }
 

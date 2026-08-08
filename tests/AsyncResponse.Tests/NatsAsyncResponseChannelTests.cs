@@ -69,6 +69,92 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryDuringRecoverySave_CompensatesTheOrphanedRegistration()
+    {
+        // The registration-save race: the consume loop is live before the recovery state is
+        // saved. A terminal response landing in that window runs cleanup, whose delete no-ops
+        // (nothing saved yet); the save then commits an orphaned callback-armed registration that
+        // would resurrect recovery for a completed wait on any later publish. The creator must
+        // compensate with a second delete after the save — and must SKIP the post-save flush,
+        // whose lifetime token the settled wait's cleanup disposes.
+        //
+        // Determinism: the consume loop processes the pushed message on its own schedule, so the
+        // save completes only once cleanup's delete has been OBSERVED — cleanup sets
+        // cleanupStarted before that delete, so the post-save check deterministically sees it.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-race");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "fast" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+
+        // One delete from cleanup (pre-save no-op) plus the post-save compensation; no server
+        // flush for a wait that already ended.
+        _store.Verify(
+            s => s.TryDeleteAsync("corr-save-race", It.IsAny<Guid>(), It.IsAny<CancellationToken>()),
+            Times.AtLeast(2));
+        Assert.Equal(0, _client.FlushCount);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_ReturnsTheCompletedWaiter()
+    {
+        // A terminal delivery settles the wait while the recovery-state save is in flight, and
+        // the save then FAILS. Rethrowing (the plain subscribe-failure contract) would discard a
+        // response the waiter already holds — the exact loss the library exists to prevent — and
+        // the same interleaving with a healthy store returns the completed waiter. The save is
+        // released by failing only once cleanup's delete has been observed, so the failure is
+        // deterministically post-settlement.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-fail");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "settled" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("settled", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WithoutExecutionContext_UsesRecoveryExpiryTimeoutFallback()
     {
         Task<IAsyncResponseWaiter<OperationResult>> waiterTask;

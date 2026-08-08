@@ -11,62 +11,6 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ## [Unreleased]
 
-### Fixed
-
-- **Lost-subscriber recovery callbacks now receive the materialized payload, never raw broker
-  JSON.** A response arriving through a broker ingress after the waiter died was classified by
-  materializing it as the registered payload type — and the materialized instance was then
-  discarded: the callback invocation bound the raw `JsonElement` to the callback's *declared*
-  parameter type. An `object`-typed parameter (the natural shape for one callback shared across
-  payload types) received a `JsonElement`, so every `payload is …` guard in the consuming flow
-  silently failed; an interface-typed parameter could not be invoked at all; a base-class parameter
-  silently sliced off derived state. This reproduced a production flow deadlock: duplicate resumed
-  workers, an unpersisted terminal success, and a re-attached wait on a consumed correlation id.
-  Both resume and failure callbacks now receive the instance the classifier materialized (the
-  conservative unclassifiable path still attaches the raw payload). Classification is
-  **per-registration**: each recovery registration is classified as the payload type IT registered
-  — for typed in-process publishes too (normalized to their declared-type wire representation, see
-  the serialization-boundary entry below), so shared-correlation registrations with different
-  payload types route independently instead of all inheriting the published instance's verdict.
-  Pinned by channel-conformance facts on all six channel derivations plus ingress-level regression
-  tests.
-- **Lost-subscriber dispatch after a raced live retry re-checks liveness before consuming
-  recovery state.** On NATS, Redis, and the in-memory channel, when the first lost dispatch found a
-  live subscriber (the miss had raced a fresh registration) and the re-delivery ALSO missed, the
-  second dispatch ran without the liveness re-check — a delivery/probe contradiction (subscription
-  interest not yet visible server-side, a stale heartbeat, subscriber churn) then consumed a live
-  waiter's recovery registration. Every lost dispatch now carries the liveness probe; the retry is
-  bounded, and a persistent contradiction leaves all recovery state intact (warning +
-  `asyncresponse.recovery.liveness_contradiction` trace tag) instead of consuming it. The database
-  channels are unchanged by design: their post-claim dispatch runs only after atomically winning
-  the message for recovery, which already excludes live delivery.
-- **A post-callback cleanup fault is never reinterpreted as a failed response.** The registration
-  delete that follows a successfully invoked recovery callback ran inside the dispatch's
-  exception scope: a store fault on that delete rethrew, the ingress retried the whole delivery
-  (re-invoking the resume callback each attempt) and then published the CLEANUP exception through
-  `SetException` — invoking the failure callback for a flow whose resume had already succeeded.
-  The delete is now best-effort bookkeeping: a fault is logged, the registration stays until its
-  TTL or the next delivery (at-least-once, watchdog-visible), and the callback's outcome stands.
-  Same rule on the exception-dispatch route.
-- **Recovery classification cannot diverge across the serialization boundary.** Typed lost
-  dispatches are now normalized to their **wire representation** — the payload serialized as the
-  publisher's DECLARED `T`, exactly as `AsyncResponseEnvelope<T>` writes it — before
-  classification, and the classifier consumes only wire JSON. Neither instance reuse (which let
-  `[JsonIgnore]`d in-process state and derived `OnRecovery()` overrides decide routing) nor
-  runtime-type serialization (which dropped the `[JsonPolymorphic]` discriminators only the
-  declared-type contract emits) can make an in-process publish route differently from the same
-  response delivered by a broker. Unserializable payloads (cycles, unregistered AOT metadata)
-  stay conservatively unclassifiable and take the failure route with the instance attached.
-- **In-memory live fan-out matches broker channels for mixed payload types.** Two waiters with
-  different declared payload types sharing one correlation id: broker channels give each waiter
-  its own JSON materialization of the envelope, but the in-memory channel cast the publisher's
-  CLR instance (`Convert.ChangeType`), faulting the second waiter with an `InvalidCastException`.
-  Foreign CLR payloads are now re-materialized from the publisher's **declared-type** wire JSON —
-  the exact envelope representation, polymorphic discriminators included (runtime-type
-  serialization dropped them, faulting waiters bound to a compatible `[JsonPolymorphic]`
-  contract). Pinned by concrete and polymorphic mixed-fan-out conformance facts on all six
-  channel derivations. The same-type fast path still hands the live instance through, unchanged.
-
 ### Added
 
 - `RecoveryAction` and `IAsyncResponsePayload.OnRecovery()` — the tri-state lost-subscriber
@@ -106,9 +50,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   waiter disposal drains an in-flight delivery — and `AsyncResponseIndeterminateDeliveryException`,
   the explicit contract for a delivery abandoned mid-flight whose outcome is unknowable.
 - `FlowRunStatus.Suspended` — operator parking for durable flow runs. A suspended run ignores
-  wake-ups, recoveries, resumes, and failure signals (a parent awaiting a suspended child keeps
-  waiting), so a dead-lettered `Running` run can be taken under manual control without a late
-  response resurrecting it. Set the status back to `Running` and call `ResumeAsync` to replay.
+  wake-ups, resumes, and failure signals (a parent awaiting a suspended child keeps waiting), so
+  a dead-lettered `Running` run can be taken under manual control without a late response
+  resurrecting it; a recovered terminal response is checkpointed WITHOUT waking the run (see
+  Fixed). Set the status back to `Running` and call `ResumeAsync` to replay.
 - `AsyncResponseCallbackAllowList.AllowDurableFlowExecutor` (default `true`): the allowlist
   authorizer now covers `IDurableFlowExecutor` explicitly instead of the reflection layer exempting
   it from authorization. Custom `IAsyncResponseCallbackAuthorizer` implementations must allow
@@ -196,6 +141,107 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - NuGet packages now ship a dedicated package README instead of the repository README.
 
 ### Fixed
+
+- **A terminal response racing the waiter's registration can no longer orphan a callback-armed
+  recovery registration (Redis, NATS).** Both channels go live before the recovery state is
+  saved; a response completing the waiter in that window ran cleanup whose delete preceded the
+  save — the save then committed a registration nothing would ever delete, and any later publish
+  on that correlation id resurrected the resume/failure callback for a completed wait. Both
+  channels now compensate after the save when cleanup already started (the in-memory channel's
+  existing post-save check, ported). On Redis, a message pumped INSIDE SubscribeAsync could
+  additionally complete cleanup before the subscription handle existed, skipping the unsubscribe
+  — a zombie server-side subscription that made every probe/publish count a live waiter and
+  suppressed recovery for that correlation id until process exit; the creator now unsubscribes
+  post-assignment when cleanup already ran.
+- **A registration step failing after a response already settled the wait no longer discards the
+  response (InMemory, Redis, NATS).** When a delivery completed the waiter while the
+  recovery-state save was still in flight and the save (or, on NATS, the post-save server flush
+  reading its token from the lifetime source the settled wait's cleanup had disposed) then
+  failed, `CreateResponseWaiter` rethrew — throwing away a response the waiter already held, the
+  exact loss the library exists to prevent, while the same interleaving with a healthy store
+  returns the completed waiter. All three creators now return the completed waiter on a
+  post-settlement failure (an unsettled registration failure still throws, unchanged); NATS skips
+  the flush outright once cleanup started, and the in-memory channel's post-save compensation
+  delete is now best-effort like the broker channels' instead of failing the create.
+- **A resumable response with only a failure callback registered now engages it.** A registration
+  armed with just `OnLostSubscriberFailure` ("tell me if my flow dies") dropped resumable terminal
+  responses with a warning on every redelivery until the registration's TTL; the flow cannot
+  proceed without a resume callback, so the failure route now fires with the materialized payload
+  — mirroring the unclassifiable route's conservatism. Registrations with neither callback keep
+  the warn-and-retain behavior.
+- **Recovered step checkpoints serialize as the step's DECLARED response type.** Lost-subscriber
+  recovery checkpointed the materialized payload by its runtime type; for `[JsonPolymorphic]`
+  contracts the runtime type is the derived payload, whose serialization omits the discriminator —
+  breaking every replay against an abstract declared base or silently truncating against a
+  concrete one. The awaited step now records its declared response type next to the re-attach
+  breadcrumb (`FlowStepState.PendingPayloadTypeFullName`, additive), and recovery serializes the
+  checkpoint as that type, falling back to the runtime type for ledgers written before the field
+  existed.
+- **A re-attaching execution takes a recovery checkpoint that landed between its state load and
+  its waiter registration.** Recovery's wake-up delivery finds the re-attached execution's own
+  lease alive and acks as a duplicate, so nothing would ever wake the parked wait — it burned the
+  full step timeout (and could strand outright once the transport's redelivery window lapsed).
+  After registering its waiter, a re-attach now re-reads the persisted checkpoint and
+  short-circuits with the recovered result; recovery always checkpoints before enqueueing its
+  wake-up, so the re-read is authoritative.
+- **A Suspended run checkpoints a recovered terminal response without being woken.** Suspension
+  still means operator control — no wake-up fires — but the recovered payload (which exists
+  nowhere else once the callback returns) used to be discarded with the registration consumed,
+  so an un-suspended run re-attached to a correlation id nothing could answer. `ResumeAsync` now
+  continues from the recovered checkpoint.
+- **Lost-subscriber recovery callbacks now receive the materialized payload, never raw broker
+  JSON.** A response arriving through a broker ingress after the waiter died was classified by
+  materializing it as the registered payload type — and the materialized instance was then
+  discarded: the callback invocation bound the raw `JsonElement` to the callback's *declared*
+  parameter type. An `object`-typed parameter (the natural shape for one callback shared across
+  payload types) received a `JsonElement`, so every `payload is …` guard in the consuming flow
+  silently failed; an interface-typed parameter could not be invoked at all; a base-class parameter
+  silently sliced off derived state. This reproduced a production flow deadlock: duplicate resumed
+  workers, an unpersisted terminal success, and a re-attached wait on a consumed correlation id.
+  Both resume and failure callbacks now receive the instance the classifier materialized (the
+  conservative unclassifiable path still attaches the raw payload). Classification is
+  **per-registration**: each recovery registration is classified as the payload type IT registered
+  — for typed in-process publishes too (normalized to their declared-type wire representation, see
+  the serialization-boundary entry below), so shared-correlation registrations with different
+  payload types route independently instead of all inheriting the published instance's verdict.
+  Pinned by channel-conformance facts on all six channel derivations plus ingress-level regression
+  tests.
+- **Lost-subscriber dispatch after a raced live retry re-checks liveness before consuming
+  recovery state.** On NATS, Redis, and the in-memory channel, when the first lost dispatch found a
+  live subscriber (the miss had raced a fresh registration) and the re-delivery ALSO missed, the
+  second dispatch ran without the liveness re-check — a delivery/probe contradiction (subscription
+  interest not yet visible server-side, a stale heartbeat, subscriber churn) then consumed a live
+  waiter's recovery registration. Every lost dispatch now carries the liveness probe; the retry is
+  bounded, and a persistent contradiction leaves all recovery state intact (warning +
+  `asyncresponse.recovery.liveness_contradiction` trace tag) instead of consuming it. The database
+  channels are unchanged by design: their post-claim dispatch runs only after atomically winning
+  the message for recovery, which already excludes live delivery.
+- **A post-callback cleanup fault is never reinterpreted as a failed response.** The registration
+  delete that follows a successfully invoked recovery callback ran inside the dispatch's
+  exception scope: a store fault on that delete rethrew, the ingress retried the whole delivery
+  (re-invoking the resume callback each attempt) and then published the CLEANUP exception through
+  `SetException` — invoking the failure callback for a flow whose resume had already succeeded.
+  The delete is now best-effort bookkeeping: a fault is logged, the registration stays until its
+  TTL or the next delivery (at-least-once, watchdog-visible), and the callback's outcome stands.
+  Same rule on the exception-dispatch route.
+- **Recovery classification cannot diverge across the serialization boundary.** Typed lost
+  dispatches are now normalized to their **wire representation** — the payload serialized as the
+  publisher's DECLARED `T`, exactly as `AsyncResponseEnvelope<T>` writes it — before
+  classification, and the classifier consumes only wire JSON. Neither instance reuse (which let
+  `[JsonIgnore]`d in-process state and derived `OnRecovery()` overrides decide routing) nor
+  runtime-type serialization (which dropped the `[JsonPolymorphic]` discriminators only the
+  declared-type contract emits) can make an in-process publish route differently from the same
+  response delivered by a broker. Unserializable payloads (cycles, unregistered AOT metadata)
+  stay conservatively unclassifiable and take the failure route with the instance attached.
+- **In-memory live fan-out matches broker channels for mixed payload types.** Two waiters with
+  different declared payload types sharing one correlation id: broker channels give each waiter
+  its own JSON materialization of the envelope, but the in-memory channel cast the publisher's
+  CLR instance (`Convert.ChangeType`), faulting the second waiter with an `InvalidCastException`.
+  Foreign CLR payloads are now re-materialized from the publisher's **declared-type** wire JSON —
+  the exact envelope representation, polymorphic discriminators included (runtime-type
+  serialization dropped them, faulting waiters bound to a compatible `[JsonPolymorphic]`
+  contract). Pinned by concrete and polymorphic mixed-fan-out conformance facts on all six
+  channel derivations. The same-type fast path still hands the live instance through, unchanged.
 
 - Disposing a waiter before any terminal signal now cancels its public `ResponseTask` on the
   Redis, NATS, PostgreSQL, SQL Server, and MongoDB channels, matching the in-memory reference —

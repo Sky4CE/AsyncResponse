@@ -306,7 +306,13 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 checkpointed = false;
                 lastStatus = state.Status;
                 running = state.Status == FlowRunStatus.Running;
-                if (!running || state.Steps is null)
+
+                // Suspended runs still CHECKPOINT the recovered terminal payload — the response
+                // exists nowhere else once this callback returns — but are never woken (see
+                // below): suspension means an operator took manual control, and ResumeAsync
+                // continues from the checkpoint instead of re-running the remote step.
+                var checkpointable = running || state.Status == FlowRunStatus.Suspended;
+                if (!checkpointable || state.Steps is null)
                     return false;
 
                 var pending = state.Steps.FirstOrDefault(pair =>
@@ -315,8 +321,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     return false;
 
                 pending.Value.Completed = true;
-                pending.Value.ResultJson = AsyncResponseJson.Serialize(payload, payload.GetType());
+                pending.Value.ResultJson = SerializeRecoveredResult(payload, pending.Value.PendingPayloadTypeFullName);
                 pending.Value.PendingCorrelationId = null;
+                pending.Value.PendingPayloadTypeFullName = null;
                 pending.Value.Faulted = false;
                 pending.Value.Message = "Terminal response recovered after subscriber loss.";
                 pending.Value.CompletedAtUtc = DateTime.UtcNow;
@@ -348,8 +355,36 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return;
         }
 
+        if (!running)
+        {
+            _logger.LogInformation(
+                "Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId} while Suspended; not waking the run — ResumeAsync continues from the checkpoint.",
+                flowId, correlationId);
+            return;
+        }
+
         _logger.LogDebug("Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId}; resuming.", flowId, correlationId);
         await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Serializes a recovered terminal payload for the step checkpoint AS THE STEP'S DECLARED
+    /// response type (recorded at await time): replay deserializes the checkpoint as that declared
+    /// type, and the recovered payload's runtime type may be a <c>[JsonPolymorphic]</c> derived
+    /// whose runtime-type serialization omits the discriminator — breaking every replay against an
+    /// abstract declared base, or silently truncating against a concrete one. Falls back to the
+    /// runtime type when the recorded name is absent (ledgers written before it existed) or no
+    /// longer resolves to a compatible type.
+    /// </summary>
+    private static string SerializeRecoveredResult(object payload, string? declaredTypeFullName)
+    {
+        var declaredType = declaredTypeFullName is null
+            ? null
+            : PayloadRecoveryClassifier.ResolvePayloadType(declaredTypeFullName);
+
+        return declaredType is not null && declaredType.IsInstanceOfType(payload)
+            ? AsyncResponseJson.Serialize(payload, declaredType)
+            : AsyncResponseJson.Serialize(payload, payload.GetType());
     }
 
     /// <inheritdoc />

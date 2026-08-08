@@ -91,6 +91,8 @@ AsyncResponse.FlowStepState.Message.get -> string?
 AsyncResponse.FlowStepState.Message.set -> void
 AsyncResponse.FlowStepState.PendingCorrelationId.get -> string?
 AsyncResponse.FlowStepState.PendingCorrelationId.set -> void
+AsyncResponse.FlowStepState.PendingPayloadTypeFullName.get -> string?
+AsyncResponse.FlowStepState.PendingPayloadTypeFullName.set -> void
 AsyncResponse.FlowStepState.ResultJson.get -> string?
 AsyncResponse.FlowStepState.ResultJson.set -> void
 AsyncResponse.IActiveSubscriberProbe

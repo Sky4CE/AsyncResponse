@@ -499,12 +499,51 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A terminal delivery on the already-running consume loop started cleanup while
+                // this registration was still being written: cleanup's delete ran before the save
+                // committed, so the save just orphaned a callback-armed registration that would
+                // resurrect recovery for a wait that already reached a terminal state. Compensate
+                // with a second delete (mirrors the in-memory channel's post-save check).
+                // Best-effort: TTL and the watchdog back a failed delete.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
 
             // Round-trip to the server so the subscription is guaranteed registered before the caller's
-            // trigger publishes the remote request — closing the subscribe/trigger race.
-            await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+            // trigger publishes the remote request — closing the subscribe/trigger race. Skipped
+            // once cleanup started: the wait already settled terminally, so there is no trigger
+            // race left to close — and cleanup's teardown disposes the lifetime source this flush
+            // reads its token from, so attempting it would throw for nothing.
+            if (Volatile.Read(ref cleanupStarted) == 0)
+                await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
 
             _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+        }
+        catch (Exception ex) when (tcs.Task.IsCompleted)
+        {
+            // The wait already settled: a delivery on the consume loop completed the waiter while
+            // this registration step was still in flight (cleanup marks cleanupStarted just after
+            // setting the task, so the task is the race-free signal), and the step then failed
+            // against the torn-down registration state (a failed save, a flush aborted by the
+            // disposed lifetime source). The response in hand outranks the builder's
+            // "throw so the trigger never fires" contract — rethrowing would discard a delivered
+            // response, the exact loss this library exists to prevent, and the success path for
+            // this same interleaving already returns the completed waiter. Cleanup runs on the
+            // delivery path, so nothing is leaked; a save that still committed is compensated
+            // above or expires via TTL, with the recovery watchdog behind it. The task is never
+            // merely canceled here: pre-return, cancellation happens only in cleanup for a still-
+            // pending task, and every cleanup entrant in this window sets a result or fault first.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {

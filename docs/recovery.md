@@ -165,7 +165,9 @@ A resume may re-trigger a flow whose step is still running remotely; resume shou
 (subscribe to the same correlation id) rather than re-execute side effects. Persist enough state to
 tell the difference. And **register both callbacks** for any flow that must survive redeploys — a
 failed payload with no failure callback is logged and dropped (never resumed), but dropped is still
-a stuck flow.
+a stuck flow. The inverse also routes conservatively: a resumable payload arriving for a
+registration with only a failure callback takes the failure route (the flow cannot proceed without
+a resume callback) instead of being discarded.
 
 Recovery callbacks are **at-least-once**. Two publishers racing on the same orphaned correlation id
 can each load the registration before either deletes it, and a crash between "callback invoked" and

@@ -249,6 +249,19 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // action == Resume implies recoveryState is non-null (the verdict is null otherwise).
             if (recoveryState!.ResumeCallback == null)
             {
+                // A resumable response with no resume callback registered: the flow cannot
+                // proceed, which is exactly what the failure route reports — engage the armed
+                // failure callback rather than repeatedly discarding the terminal signal until
+                // the registration's TTL. Mirrors the unclassifiable route's conservatism; a
+                // registration with NEITHER callback keeps the old warn-and-retain behavior.
+                if (recoveryState.FailureCallback != null)
+                {
+                    _logger.LogWarning("No subscribers for channel {Channel}; payload is resumable but no resume callback is registered — routing to the failure callback.", channel);
+                    var fallbackInvoked = await DispatchToFailureCallback(recoveryState, callbackPayload, channel, activity).ConfigureAwait(false);
+                    activity?.SetTag("asyncresponse.recovery.callback_invoked", fallbackInvoked);
+                    return new LostSubscriberDispatchResult(action, fallbackInvoked);
+                }
+
                 _logger.LogWarning("No subscribers for channel {Channel}; no resume callback available.", channel);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", false);
                 return new LostSubscriberDispatchResult(action, false);

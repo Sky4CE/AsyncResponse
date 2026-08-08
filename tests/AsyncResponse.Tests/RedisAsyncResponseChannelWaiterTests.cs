@@ -77,6 +77,116 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryDuringRecoverySave_CompensatesTheOrphanedRegistration()
+    {
+        // The registration-save race: the message pump is live before the recovery state is
+        // saved. A terminal response landing in that window runs cleanup, whose delete no-ops
+        // (nothing saved yet); the save then commits an orphaned callback-armed registration that
+        // would resurrect recovery for a completed wait on any later publish. The creator must
+        // compensate with a second delete after the save when cleanup already started.
+        //
+        // Determinism: awaiting the handler only awaits executor ADMISSION — processing (and the
+        // cleanup it triggers) runs on the executor afterwards. If the save were released on a
+        // free-running clock, cleanup could land after the save instead, where its own delete
+        // removes the committed row (one delete, no orphan — correct, but a different
+        // interleaving than the one this test pins). So the save completes only once cleanup's
+        // delete has been OBSERVED: cleanup sets cleanupStarted before that delete, so the
+        // post-save check deterministically sees it and must compensate.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-race");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Terminal response arrives while the save is still in flight: waiter completes, cleanup
+        // runs its (no-op) delete — which is what releases the parked save.
+        await _channelSubscriber.Handler!(
+            _channelSubscriber.SubscribedChannel,
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"fast"},"ExceptionMessage":null,"ExceptionStackTrace":null}""");
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+
+        // One delete from cleanup (pre-save no-op) plus the post-save compensation.
+        _store.Verify(
+            s => s.TryDeleteAsync("corr-save-race", It.IsAny<Guid>(), It.IsAny<CancellationToken>()),
+            Times.AtLeast(2));
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_ReturnsTheCompletedWaiter()
+    {
+        // A terminal delivery settles the wait while the recovery-state save is in flight, and
+        // the save then FAILS. Rethrowing (the plain subscribe-failure contract) would discard a
+        // response the waiter already holds — the exact loss the library exists to prevent — and
+        // the same interleaving with a healthy store returns the completed waiter. The save is
+        // released by failing only once cleanup's delete has been observed, so the failure is
+        // deterministically post-settlement.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-fail");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await _channelSubscriber.Handler!(
+            _channelSubscriber.SubscribedChannel,
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"settled"},"ExceptionMessage":null,"ExceptionStackTrace":null}""");
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("settled", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryInsideSubscribe_StillUnsubscribes()
+    {
+        // Deliveries can start inside SubscribeAsync, before the creator's `subscription` local is
+        // assigned. If the message completes the waiter and cleanup runs to completion first, the
+        // cleanup's unsubscribe sees a null subscription and the latched cleanup never re-runs —
+        // a zombie server-side subscription that makes every future publish/probe report a live
+        // waiter, permanently suppressing lost-subscriber recovery for the correlation id. The
+        // creator must unsubscribe after the assignment when cleanup already started.
+        _channelSubscriber.InvokeOnSubscribe =
+            """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"inline"},"ExceptionMessage":null,"ExceptionStackTrace":null}""";
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-inline");
+
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+
+        // Cleanup runs on the executor after handler ADMISSION, so it races the creator: either
+        // cleanup's unsubscribe sees the assigned subscription, or it saw null and the creator's
+        // post-assignment compensation unsubscribes — and in the overlap BOTH may (unsubscribe is
+        // idempotent). The zombie being pinned away is "no unsubscribe ever", so the invariant is
+        // eventually-at-least-one, not exactly-one-by-now.
+        await Eventually(() => _channelSubscriber.UnsubscribeCount >= 1);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_CompletesFromSubscribedRedisMessage()
     {
         var channel = CreateChannel();

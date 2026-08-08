@@ -213,6 +213,30 @@ public class LostSubscriberRecoveryRegressionTests
         Assert.IsType<AsyncResponseDomainFailureException>(exception);
     }
 
+    [Fact]
+    public async Task Ingress_ResumableResponseWithOnlyFailureCallback_EngagesTheFailureCallback()
+    {
+        // "Tell me if my flow dies" registrations arm only the failure callback. A resumable
+        // terminal response used to be discarded with a warning on every redelivery until the
+        // registration's TTL; the flow cannot proceed without a resume callback, so the failure
+        // route must fire instead.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: null,
+            failure: IncidentFailureCallback());
+
+        await harness.Ingress.HandleResponseMessageAsync(
+            """{"Status":2,"Message":"pipeline succeeded"}""", CorrelationId);
+
+        Assert.Empty(harness.Spy.Resumed);
+        var (payload, exception) = Assert.Single(harness.Spy.Failed);
+        var typed = Assert.IsType<IncidentStepResult>(payload);
+        Assert.Equal(IncidentStepStatus.Succeeded, typed.Status);
+        Assert.IsType<AsyncResponseDomainFailureException>(exception);
+        Assert.Empty(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
     // ----- cleanup failures must never be reinterpreted as a failed response -----
 
     [Fact]
@@ -394,7 +418,7 @@ public class LostSubscriberRecoveryRegressionTests
 
         public Task ArmRegistrationAsync(
             string? payloadTypeFullName,
-            ReflectionCallDto resume,
+            ReflectionCallDto? resume,
             ReflectionCallDto? failure = null,
             Guid? registrationId = null)
             => RecoveryStateStore.SaveAsync(

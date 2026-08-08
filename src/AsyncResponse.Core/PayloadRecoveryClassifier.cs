@@ -100,7 +100,7 @@ internal static class PayloadRecoveryClassifier
         Justification = "The persisted payload type name comes from a recoverable-waiter registration whose payload type " +
                         "parameter is statically referenced by the registering app; an unresolvable name is answered with " +
                         "null — the conservative 'do not resume' route — plus a type-resolution-failure diagnostic.")]
-    private static Type? ResolvePayloadType(string payloadTypeFullName)
+    internal static Type? ResolvePayloadType(string payloadTypeFullName)
     {
         if (PayloadTypes.TryGetValue(payloadTypeFullName, out var cached))
             return cached;

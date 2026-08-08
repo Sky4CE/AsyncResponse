@@ -91,12 +91,44 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 _options.RecoveryStateExpiry).ConfigureAwait(false);
 
             if (subscription.CleanupStarted)
-                await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
+            {
+                // A response settled the wait while the registration was still being written:
+                // cleanup's delete ran before the save committed, so compensate with a second
+                // delete. Best-effort, mirroring the broker channels — the waiter already holds
+                // its response, so a failed delete must not fail the create; TTL and the recovery
+                // watchdog back it.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
             else
+            {
                 subscription.ArmTimeout();
+            }
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        }
+        catch (Exception ex) when (subscription.ResponseTask.IsCompleted)
+        {
+            // The wait already settled: a dispatched response completed the waiter while the
+            // registration step was still in flight, and the step — the recovery-state save —
+            // then failed. The response in hand outranks the builder's "throw so the trigger
+            // never fires" contract: rethrowing would discard a delivered response, the exact
+            // loss this library exists to prevent, and the success path for this same
+            // interleaving already returns the completed waiter. Cleanup runs on the dispatch
+            // path, so nothing is leaked; a save that still committed is compensated above or
+            // expires via TTL. The task is never merely canceled here: pre-return, cancellation
+            // happens only in cleanup for a still-pending task, and dispatch settles the task
+            // before starting cleanup.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {

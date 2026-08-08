@@ -455,6 +455,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             _executors.OnSubscriptionRegistered(channel.ToString()!);
             executorRegistered = true;
             subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A message pumped inside SubscribeAsync completed the waiter and ran cleanup to
+                // the end before this assignment existed — its unsubscribe saw a null
+                // subscription and the latched cleanup never re-runs. Compensate here, or the
+                // server-side subscription outlives the waiter: NUMSUB and publish keep counting
+                // a live waiter, and lost-subscriber recovery is suppressed for this correlation
+                // id until process exit. Best-effort: the waiter already holds its response, so a
+                // teardown fault must not fail the create.
+                try
+                {
+                    await UnsubscribeQuietlyAsync(subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", channel.ToString()!);
+                }
+            }
+
             var recoveryState = new RecoveryState
             {
                 RegistrationId = registrationId,
@@ -466,7 +485,42 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A terminal delivery started cleanup while this registration was still being
+                // written: cleanup's delete ran before the save committed, so the save just
+                // orphaned a callback-armed registration that would resurrect recovery for a wait
+                // that already reached a terminal state. Compensate with a second delete
+                // (mirrors the in-memory channel's post-save check). Best-effort: TTL and the
+                // watchdog back a failed delete.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
+
             _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
+        }
+        catch (Exception ex) when (tcs.Task.IsCompleted)
+        {
+            // The wait already settled: a delivery completed the waiter while this registration
+            // step was still in flight (cleanup marks cleanupStarted just after setting the task,
+            // so the task is the race-free signal), and the step — the recovery-state save — then
+            // failed. The response in hand outranks the builder's "throw so the trigger never
+            // fires" contract: rethrowing would discard a delivered response, the exact loss this
+            // library exists to prevent, and the success path for this same interleaving already
+            // returns the completed waiter. Cleanup runs on the delivery path, so nothing is
+            // leaked; a save that still committed is compensated above or expires via TTL, with
+            // the recovery watchdog behind it. The task is never merely canceled here: pre-return,
+            // cancellation happens only in cleanup for a still-pending task, and every cleanup
+            // entrant in this window sets a result or fault first.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {
