@@ -527,7 +527,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
         }
-        catch (Exception ex) when (tcs.Task.IsCompleted)
+        catch (Exception ex) when (tcs.Task.IsCompletedSuccessfully || tcs.Task.IsFaulted)
         {
             // The wait already settled: a delivery on the consume loop completed the waiter while
             // this registration step was still in flight (cleanup marks cleanupStarted just after
@@ -538,9 +538,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // response, the exact loss this library exists to prevent, and the success path for
             // this same interleaving already returns the completed waiter. Cleanup runs on the
             // delivery path, so nothing is leaked; a save that still committed is compensated
-            // above or expires via TTL, with the recovery watchdog behind it. The task is never
-            // merely canceled here: pre-return, cancellation happens only in cleanup for a still-
-            // pending task, and every cleanup entrant in this window sets a result or fault first.
+            // above or expires via TTL, with the recovery watchdog behind it. The filter demands
+            // an actual settlement (result or fault): a canceled task means NO response was
+            // delivered — e.g. a future channel-wide teardown canceling in-flight registrations —
+            // and takes the rethrow path below.
             _logger.LogWarning(ex,
                 "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
                 correlationId);

@@ -114,7 +114,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
         }
-        catch (Exception ex) when (subscription.ResponseTask.IsCompleted)
+        catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
         {
             // The wait already settled: a dispatched response completed the waiter while the
             // registration step was still in flight, and the step — the recovery-state save —
@@ -123,9 +123,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // loss this library exists to prevent, and the success path for this same
             // interleaving already returns the completed waiter. Cleanup runs on the dispatch
             // path, so nothing is leaked; a save that still committed is compensated above or
-            // expires via TTL. The task is never merely canceled here: pre-return, cancellation
-            // happens only in cleanup for a still-pending task, and dispatch settles the task
-            // before starting cleanup.
+            // expires via TTL. The filter demands an actual settlement (result or fault): a
+            // canceled task means NO response was delivered — e.g. a future channel-wide teardown
+            // canceling in-flight registrations — and takes the rethrow path below.
             _logger.LogWarning(ex,
                 "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
                 correlationId);

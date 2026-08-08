@@ -255,11 +255,15 @@ internal sealed class InMemoryWorkerHost(
 
     private static TimeSpan RetryDelay(InMemoryWorkerTransportOptions options, int attempt)
     {
-        // Exponential backoff from the base delay, saturating at the max. The shift is capped so
-        // pathological attempt counts (unlimited retries) cannot overflow.
+        // Exponential backoff from the base delay, saturating at the max. Computed in ticks with
+        // a pre-shift comparison so neither pathological attempt counts (unlimited retries) nor a
+        // pathological base delay can overflow before the saturation check.
         var exponent = Math.Min(attempt - 1, 20);
-        var scaled = options.RetryBaseDelay * (1L << exponent);
-        return scaled < options.RetryMaxDelay ? scaled : options.RetryMaxDelay;
+        var baseTicks = options.RetryBaseDelay.Ticks;
+        var maxTicks = options.RetryMaxDelay.Ticks;
+        return baseTicks > maxTicks >> exponent
+            ? options.RetryMaxDelay
+            : TimeSpan.FromTicks(baseTicks << exponent);
     }
 
     private Task RunAsync(InMemoryWorkerTransport.QueuedJob queued)
