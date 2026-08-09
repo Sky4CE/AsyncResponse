@@ -35,9 +35,10 @@ for delivery confirmation:
 
 That last claim is the race guard: a slow live waiter and the recovery callback cannot both own the
 same response. `acked_seq` and each subscription's registration draw from the same monotonic
-sequence, so "acked before this waiter registered" (history, not redelivered) versus "acked to a
-fan-out group including this waiter" (delivered) is decided exactly, even when both events land on
-the same server-clock tick.
+sequence, arbitrating "acked before this waiter registered" (history, not redelivered) versus
+"acked to a fan-out group including this waiter" (delivered) even when both events land on the
+same server-clock tick — with one conservative residual: a claim whose sequence draw stalled
+across ticks resolves as history, never as a replayed response.
 
 ## Recovery state
 

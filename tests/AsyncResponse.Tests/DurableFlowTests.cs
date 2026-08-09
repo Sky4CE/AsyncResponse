@@ -540,6 +540,9 @@ public class DurableFlowTests
         var step = persisted!.Steps!["external-step"];
         Assert.True(step.Completed);
         Assert.Null(step.PendingCorrelationId);
+        // Cleared centrally on every settlement path (the FlowState contract): this
+        // response-winning settlement used to leave the declared-type breadcrumb stale.
+        Assert.Null(step.PendingPayloadTypeFullName);
     }
 
     [Fact]

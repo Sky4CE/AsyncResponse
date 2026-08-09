@@ -131,9 +131,16 @@ public sealed class MongoDbStoreQueryTests
 
         var set = update.AsBsonArray[0]["$set"].AsBsonDocument;
         Assert.Equal(new BsonArray { "$acked_at", "$$NOW" }, set["acked_at"]["$ifNull"].AsBsonArray);
-        // The first claim's sequence stamp is kept, mirroring acked_at — the exact watermark
-        // position that separates same-tick history from fan-out.
-        Assert.Equal(new BsonArray { "$acked_seq", 42L }, set["acked_seq"]["$ifNull"].AsBsonArray);
+        // The sequence stamps ONLY on the null→set acked_at transition of this same update: a
+        // legacy-acked row (pre-sequence build) must stay permanently unsequenced, or a later
+        // fan-out re-claim pairs the OLD acked_at with a FRESH sequence and a tick-tied waiter
+        // replays its predecessor's response.
+        var condition = set["acked_seq"]["$cond"].AsBsonArray;
+        Assert.Equal(
+            new BsonDocument("$eq", new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$acked_at", BsonNull.Value }), BsonNull.Value }),
+            condition[0].AsBsonDocument);
+        Assert.Equal(42L, condition[1].AsInt64);
+        Assert.Equal("$acked_seq", condition[2].AsString);
     }
 
     [Fact]

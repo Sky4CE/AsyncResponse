@@ -140,61 +140,6 @@ public class DurableFlowRecoveryHardeningTests
         Assert.Equal(FlowRunStatus.Succeeded, final!.Status);
     }
 
-    [Fact]
-    public async Task ExecuteAsync_CancellationRacesAnInFlightDelivery_SettledCheckpointClearsBothBreadcrumbs()
-    {
-        // The response-winning cancellation settlement: the caller's token fires while a delivery
-        // is IN FLIGHT (parked inside the step's Until predicate), the cancellation handler
-        // disposes the waiter, and the disposal drain settles the delivery as received — the
-        // checkpoint wins over the cancellation and persists. That settlement must clear BOTH
-        // breadcrumbs: PendingPayloadTypeFullName was left behind on exactly this path, violating
-        // the FlowState contract ("cleared together with the pending correlation id") and handing
-        // the next recovery pass a stale declared type for a completed step.
-        CancellationSettlementProbeFlow.Reset();
-        var store = new InMemoryFlowStateStore();
-        var state = new FlowState
-        {
-            FlowId = "cancel-settle",
-            Status = FlowRunStatus.Running,
-            FlowTypeName = typeof(CancellationSettlementProbeFlow).FullName,
-            InputTypeName = typeof(HardeningFlowInput).FullName,
-            InputJson = """{"Id":1}"""
-        };
-        await SeedAsync(store, state);
-        await using var harness = Harness.Create(
-            store,
-            services =>
-            {
-                services.AddSingleton<CancellationSettlementProbeFlow>();
-                services.AddAsyncResponse().WithInMemoryChannel();
-            },
-            (provider, _) => provider.GetRequiredService<IAsyncResponseSubscriber>());
-        var publisher = harness.Provider.GetRequiredService<IAsyncResponsePublisher>();
-
-        var execution = harness.Executor.ExecuteAsync("cancel-settle");
-        var correlationId = await CancellationSettlementProbeFlow.Triggered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-
-        // The delivery parks inside the Until predicate; the token then fires while it is in
-        // flight; releasing the predicate lets the disposal drain settle it as received.
-        var delivery = Task.Run(() => publisher.SetResponse(
-            new OperationResult { Status = OperationStatus.Completed, Message = "kept" }, correlationId));
-        await CancellationSettlementProbeFlow.PredicateEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        CancellationSettlementProbeFlow.Cancellation.Cancel();
-        CancellationSettlementProbeFlow.ReleasePredicate.TrySetResult();
-
-        await execution.WaitAsync(TimeSpan.FromSeconds(10));
-        await delivery.WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.Equal("kept", CancellationSettlementProbeFlow.Result);
-        var final = await store.LoadAsync("cancel-settle");
-        Assert.Equal(FlowRunStatus.Succeeded, final!.Status);
-        var step = final.Steps!["remote"];
-        Assert.True(step.Completed);
-        Assert.Contains("kept", step.ResultJson, StringComparison.Ordinal);
-        Assert.Null(step.PendingCorrelationId);
-        Assert.Null(step.PendingPayloadTypeFullName);
-    }
-
     // ---------------------------------------------------------------------------------------
     // Harness
     // ---------------------------------------------------------------------------------------
@@ -233,7 +178,6 @@ public class DurableFlowRecoveryHardeningTests
 
         public DurableFlowExecutor Executor { get; }
         public Mock<IAsyncResponseBuilder> Builder { get; }
-        public ServiceProvider Provider => _provider;
 
         public static Harness Create(
             IFlowStateStore store,
@@ -309,52 +253,6 @@ public class DurableFlowRecoveryHardeningTests
 }
 
 public sealed record HardeningFlowInput(int Id);
-
-/// <summary>
-/// Drives the response-winning cancellation settlement deterministically: its Until predicate
-/// parks the in-flight delivery until the test has fired the caller's token, so the cancellation
-/// handler's disposal drain is what settles the delivery.
-/// </summary>
-public sealed class CancellationSettlementProbeFlow : IDurableFlow<HardeningFlowInput>
-{
-    public static CancellationTokenSource Cancellation { get; private set; } = new();
-    public static TaskCompletionSource<string> Triggered { get; private set; } = NewTcs<string>();
-    public static TaskCompletionSource PredicateEntered { get; private set; } = NewTcs();
-    public static TaskCompletionSource ReleasePredicate { get; private set; } = NewTcs();
-    public static string? Result { get; private set; }
-
-    public static void Reset()
-    {
-        Cancellation = new CancellationTokenSource();
-        Triggered = NewTcs<string>();
-        PredicateEntered = NewTcs();
-        ReleasePredicate = NewTcs();
-        Result = null;
-    }
-
-    public async Task ExecuteAsync(IDurableFlowContext flow, HardeningFlowInput input)
-    {
-        var response = await flow.AwaitStepAsync<OperationResult>(
-            "remote",
-            correlationId =>
-            {
-                Triggered.TrySetResult(correlationId);
-                return Task.CompletedTask;
-            },
-            until: async payload =>
-            {
-                PredicateEntered.TrySetResult();
-                await ReleasePredicate.Task;
-                return payload.Status == OperationStatus.Completed;
-            },
-            timeout: TimeSpan.FromSeconds(60),
-            cancellationToken: Cancellation.Token);
-        Result = response.Message;
-    }
-
-    private static TaskCompletionSource NewTcs() => new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private static TaskCompletionSource<T> NewTcs<T>() => new(TaskCreationOptions.RunContinuationsAsynchronously);
-}
 
 public sealed class ReattachProbeFlow : IDurableFlow<HardeningFlowInput>
 {

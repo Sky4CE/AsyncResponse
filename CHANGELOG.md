@@ -173,14 +173,21 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   earlier and so can never replay history. The one conservative residual (a draw stalled from an
   earlier tick into the exact registration tick) resolves as the old rule always did. Additive
   schema — the column/sequence are auto-created when schema creation is enabled, and rows acked
-  by an older build fall back to the previous timestamp rule.
+  by an older build fall back to the previous timestamp rule **permanently**: the sequence is
+  stamped only when the same claim transitions `acked_at` from null, never back-filled onto a
+  legacy-acked row (a fresh stamp against an old `acked_at` would let a tick-tied waiter replay
+  its predecessor's response during a rolling upgrade).
 - **A NATS consume-loop failure during waiter registration now throws instead of returning a
   faulted waiter.** The loop's death faults the response task with a TRANSPORT error — nothing
   was delivered and nothing ever will be — but registration treated any settled task as a
   delivered response, returned the waiter, and the builder then fired the remote trigger with no
   live subscription and no recovery state left to route its response. Registration now
   distinguishes loop deaths from delivered failures and throws, so the operation never starts;
-  a delivered failure envelope still settles the wait as before.
+  a delivered failure envelope still settles the wait as before. The distinction is carried BY
+  the settlement itself (an internal marker on the fault, unwrapped before the public
+  `ResponseTask`), not a side-band flag: only a loop fault that actually WINS the settlement
+  aborts registration, so a loop dying just after a terminal payload landed can never discard
+  the delivered response.
 - **In-memory same-type fan-out is now wire-true.** The exact-type fast path handed the
   publisher's live payload instance to every same-type waiter — one shared mutable reference
   across the fan-out, with `[JsonIgnore]` in-process state visible that no broker-backed channel
@@ -206,7 +213,9 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   heartbeat-timeout window, during which every publisher counted a phantom live waiter and
   lost-subscriber recovery was suppressed for that correlation id. The heartbeat round now
   re-checks its snapshot afterwards and issues a compensating delete for any registration
-  dropped mid-round (PostgreSQL, SQL Server, MongoDB).
+  dropped mid-round — including after a FAILED round: SQL Server commits per-batch and MongoDB
+  bulk-writes unordered, so a round that throws may still have landed the resurrecting upsert
+  (PostgreSQL, SQL Server, MongoDB).
 - **Shared-correlation dispatches whose registrations legitimately take different recovery routes
   now report `route=mixed`** on the lost-subscriber metric and publish span instead of
   `unclassified`, which was indistinguishable from a poisoned payload; each registration's own
@@ -311,7 +320,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   the exact envelope representation, polymorphic discriminators included (runtime-type
   serialization dropped them, faulting waiters bound to a compatible `[JsonPolymorphic]`
   contract). Pinned by concrete and polymorphic mixed-fan-out conformance facts on all six
-  channel derivations. The same-type fast path still hands the live instance through, unchanged.
+  channel derivations. (Same-type deliveries initially kept the live-instance fast path; a later
+  entry above makes same-type fan-out wire-true as well.)
 
 - Disposing a waiter before any terminal signal now cancels its public `ResponseTask` on the
   Redis, NATS, PostgreSQL, SQL Server, and MongoDB channels, matching the in-memory reference —

@@ -420,13 +420,18 @@ internal sealed class SqlServerChannelSql
         await using var command = connection.CreateCommand();
         // NEXT VALUE FOR is not allowed inside CASE/COALESCE, so the sequence value is drawn into
         // a variable first — one batch, one round trip; the unused draw on an already-acked row
-        // just leaves a harmless sequence gap.
+        // just leaves a harmless sequence gap. The sequence is stamped ONLY when this same update
+        // transitions acked_at from null (SET expressions read the pre-update row): a row acked by
+        // a pre-sequence build must stay permanently unsequenced — back-filling it on a later
+        // fan-out re-claim would pair an OLD acked_at with a FRESH sequence value, and a waiter
+        // that registered in the original ack's tick would then read the tie as post-registration
+        // fan-out, replaying a response its predecessor consumed.
         command.CommandText =
             $"""
             DECLARE @seq bigint = NEXT VALUE FOR {AckSequence};
             UPDATE {MessageTable}
             SET acked_at = COALESCE(acked_at, SYSUTCDATETIME()),
-                acked_seq = COALESCE(acked_seq, @seq)
+                acked_seq = CASE WHEN acked_at IS NULL THEN @seq ELSE acked_seq END
             OUTPUT inserted.id
             WHERE id = @id AND recovery_claimed = 0 AND expires_at > SYSUTCDATETIME();
             """;

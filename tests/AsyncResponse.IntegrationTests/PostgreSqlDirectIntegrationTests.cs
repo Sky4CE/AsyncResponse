@@ -63,6 +63,41 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
 
             var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
             Assert.True(startSeq > 0);
+
+            // Rolling-upgrade rule: a row acked by a PRE-sequence build (acked_at set, acked_seq
+            // null — simulated here) must stay permanently unsequenced through later fan-out
+            // re-claims. Back-filling would pair the old acked_at with a fresh sequence and let a
+            // tick-tied waiter replay its predecessor's response.
+            var legacyId = Guid.NewGuid();
+            await managed.InsertMessageAsync(legacyId, "legacy-ack", SuccessEnvelope("old"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var legacyAck = connection.CreateCommand())
+            {
+                legacyAck.CommandText = $"UPDATE {creator.MessageTable} SET acked_at = now() WHERE id = @id;";
+                legacyAck.Parameters.AddWithValue("id", legacyId);
+                await legacyAck.ExecuteNonQueryAsync();
+            }
+
+            Assert.True(await managed.TryClaimForDeliveryAsync(legacyId, CancellationToken.None));
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var check = connection.CreateCommand())
+            {
+                check.CommandText = $"SELECT acked_seq IS NULL FROM {creator.MessageTable} WHERE id = @id;";
+                check.Parameters.AddWithValue("id", legacyId);
+                Assert.True((bool)(await check.ExecuteScalarAsync())!);
+            }
+
+            // A fresh (unacked) row still gets its stamp on the first claim.
+            var freshId = Guid.NewGuid();
+            await managed.InsertMessageAsync(freshId, "fresh-ack", SuccessEnvelope("new"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.True(await managed.TryClaimForDeliveryAsync(freshId, CancellationToken.None));
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var check = connection.CreateCommand())
+            {
+                check.CommandText = $"SELECT acked_seq IS NOT NULL FROM {creator.MessageTable} WHERE id = @id;";
+                check.Parameters.AddWithValue("id", freshId);
+                Assert.True((bool)(await check.ExecuteScalarAsync())!);
+            }
         });
     }
 

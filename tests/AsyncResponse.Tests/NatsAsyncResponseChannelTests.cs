@@ -190,6 +190,46 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_LoopFaultLosingToATerminalPayload_StillReturnsTheDeliveredResponse()
+    {
+        // The other direction of the loop-death guard: a terminal payload settles the wait, and
+        // the consume loop THEN faults (its next read observes the failed stream). The loop's
+        // settlement attempt loses — so it must leave no mark: aborting the registration here
+        // would discard a response the waiter already holds. A side-band flag raced exactly this
+        // way; the settlement-source marker cannot (only a fault that WINS the settlement marks
+        // the task). Deterministic: the terminal message and the stream failure are enqueued
+        // before the loop processes either, and the parked save releases only once the terminal's
+        // cleanup delete is observed.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-loop-lost-race");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        _client.FailSubscription(new IOException("stream down after delivery"));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("delivered", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WithoutExecutionContext_UsesRecoveryExpiryTimeoutFallback()
     {
         Task<IAsyncResponseWaiter<OperationResult>> waiterTask;

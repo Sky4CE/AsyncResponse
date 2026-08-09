@@ -402,11 +402,17 @@ internal sealed class PostgreSqlChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // The sequence is stamped ONLY when this same update transitions acked_at from null (SET
+        // expressions read the pre-update row): a row acked by a pre-sequence build must stay
+        // permanently unsequenced. Back-filling it on a later fan-out re-claim would pair an OLD
+        // acked_at with a FRESH sequence value, and a waiter that registered in the original ack's
+        // tick would then read the tie as post-registration fan-out — replaying a response its
+        // predecessor consumed.
         command.CommandText =
             $"""
             UPDATE {MessageTable}
             SET acked_at = COALESCE(acked_at, now()),
-                acked_seq = COALESCE(acked_seq, nextval('{AckSequence}'))
+                acked_seq = CASE WHEN acked_at IS NULL THEN nextval('{AckSequence}') ELSE acked_seq END
             WHERE id = @id AND NOT recovery_claimed AND expires_at > now()
             RETURNING id;
             """;

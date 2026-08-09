@@ -335,10 +335,21 @@ internal sealed class MongoDbChannelStore : IDisposable
     internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate(long ackSeq)
         => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
         {
+            // Both fields are computed from the PRE-update document (one $set stage), and the
+            // sequence is stamped ONLY when this same update transitions acked_at from null: a
+            // row acked by a pre-sequence build must stay permanently unsequenced — back-filling
+            // it on a later fan-out re-claim would pair an OLD acked_at with a FRESH sequence
+            // value, and a waiter that registered in the original ack's tick would then read the
+            // tie as post-registration fan-out, replaying a response its predecessor consumed.
             new BsonDocument("$set", new BsonDocument
             {
                 ["acked_at"] = new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" }),
-                ["acked_seq"] = new BsonDocument("$ifNull", new BsonArray { "$acked_seq", ackSeq })
+                ["acked_seq"] = new BsonDocument("$cond", new BsonArray
+                {
+                    new BsonDocument("$eq", new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$acked_at", BsonNull.Value }), BsonNull.Value }),
+                    ackSeq,
+                    "$acked_seq"
+                })
             })
         });
 

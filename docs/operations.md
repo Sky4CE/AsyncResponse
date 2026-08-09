@@ -49,8 +49,8 @@ end-to-end profiles).
 11. **Share correlation ids deliberately.** Live delivery and lost-subscriber recovery both fan out
     across multiple waiters on one correlation id; a normally completing waiter removes only its own
     recovery registration. On the database channels, a registration tying another process's
-    delivery claim within one server-clock tick is arbitrated exactly by the monotonic ack
-    sequence; only a claim whose sequence draw stalled across ticks resolves conservatively
+    delivery claim within one server-clock tick is arbitrated by the monotonic ack sequence;
+    a claim whose sequence draw stalled across ticks resolves conservatively
     (the waiter times out and the idempotent step restarts — never a replayed response). See
     [recovery.md](recovery.md#shared-correlation-recovery).
 12. **Measure hot paths in isolation before comparing profiles.** The sample's remote simulator

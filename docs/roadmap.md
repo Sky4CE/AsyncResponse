@@ -238,7 +238,8 @@ the durable asset either way.
 
 Shipped: delivery claims stamp `acked_seq` from a store-side monotonic sequence (PG/SQL Server
 sequence, MongoDB counter collection) and registrations draw their position from the same
-sequence, so the same-tick registration/claim tie is arbitrated exactly. Timestamps remain the
+sequence, arbitrating the same-tick registration/claim tie (a claim whose sequence draw stalled
+across ticks resolves conservatively as history — never a replayed response). Timestamps remain the
 primary comparison (a sequence value is drawn before its claim becomes visible, so it must not
 outrank truthful unequal timestamps); the sequence breaks only the tie, where it provably cannot
 replay history. Legacy rows without the stamp keep the old at-most-once tie resolution.

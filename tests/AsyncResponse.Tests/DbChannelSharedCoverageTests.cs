@@ -171,6 +171,35 @@ public sealed class DbChannelSharedCoverageTests
         Assert.DoesNotContain(harness.Logger.Messages, m => m.Contains("corr-live"));
     }
 
+    /// <summary>
+    /// The compensation must run even when the heartbeat round FAILS: SQL Server commits
+    /// per-batch, MongoDB bulk-writes unordered, and any provider can fail after some upserts
+    /// landed — so a registration dropped mid-round may already be resurrected when the round
+    /// throws. Deterministic on the Mongo harness (the bulk-write mock "lands" the upsert, drops
+    /// the registration, then fails the round); the loop's failure-path ordering is shared
+    /// source, and the compensation logic itself is pinned per-assembly by the ×3 test above.
+    /// </summary>
+    [Fact]
+    public async Task Heartbeat_CompensatesEvenWhenTheRoundFails()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var subscription = harness.Subscription("corr-mid-round").Instance;
+        harness.AddSubscription("corr-mid-round", subscription);
+
+        harness.MongoSubscribers!
+            .Setup(c => c.BulkWriteAsync(
+                It.IsAny<IEnumerable<WriteModel<MongoChannelSubscriberDocument>>>(),
+                It.IsAny<BulkWriteOptions>(),
+                It.IsAny<CancellationToken>()))
+            .Callback(() => SetField(subscription, "_dropped", true))
+            .ThrowsAsync(new MongoException("partial bulk failure"));
+
+        harness.Invoke("EnsureListenerStarted");
+
+        await harness.Logger.WaitForAsync("subscriber heartbeat failed");
+        await harness.Logger.WaitForAsync("dropped while a heartbeat round was in flight");
+    }
+
     private static Guid SubscriptionId(object subscription)
         => (Guid)subscription.GetType().GetProperty("Id", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!
             .GetValue(subscription)!;
@@ -378,6 +407,9 @@ public sealed class DbChannelSharedCoverageTests
         public CollectingLogger Logger { get; }
         public Mock<IRecoveryStateStore> RecoveryState { get; }
 
+        /// <summary>Mongo harness only: the subscribers-collection mock, for heartbeat fault injection.</summary>
+        public Mock<IMongoCollection<MongoChannelSubscriberDocument>>? MongoSubscribers { get; private set; }
+
         public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval)
         {
             var logger = new CollectingLogger();
@@ -521,7 +553,7 @@ public sealed class DbChannelSharedCoverageTests
                         options,
                         new AsyncResponseContextPropagation([]),
                         logger.For<MongoDbAsyncResponseChannel>());
-                    return new Harness(
+                    var harness = new Harness(
                         channel,
                         typeof(MongoDbAsyncResponseChannel),
                         (json, correlationId, created, acked, ackedSeq) => new MongoDbChannelMessage(
@@ -529,6 +561,8 @@ public sealed class DbChannelSharedCoverageTests
                         logger,
                         recoveryState,
                         dataSource: null);
+                    harness.MongoSubscribers = subscribers;
+                    return harness;
                 }
             }
         }

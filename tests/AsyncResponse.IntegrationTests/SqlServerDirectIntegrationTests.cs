@@ -60,6 +60,44 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
 
             var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
             Assert.True(startSeq > 0);
+
+            // Rolling-upgrade rule: a row acked by a PRE-sequence build (acked_at set, acked_seq
+            // null — simulated here) must stay permanently unsequenced through later fan-out
+            // re-claims. Back-filling would pair the old acked_at with a fresh sequence and let a
+            // tick-tied waiter replay its predecessor's response.
+            var legacyId = Guid.NewGuid();
+            await managed.InsertMessageAsync(legacyId, "legacy-ack", SuccessEnvelope("old"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var legacyAck = connection.CreateCommand();
+                legacyAck.CommandText = $"UPDATE {creator.MessageTable} SET acked_at = SYSUTCDATETIME() WHERE id = @id;";
+                legacyAck.Parameters.AddWithValue("@id", legacyId);
+                await legacyAck.ExecuteNonQueryAsync();
+            }
+
+            Assert.True(await managed.TryClaimForDeliveryAsync(legacyId, CancellationToken.None));
+            var freshId = Guid.NewGuid();
+            await managed.InsertMessageAsync(freshId, "fresh-ack", SuccessEnvelope("new"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.True(await managed.TryClaimForDeliveryAsync(freshId, CancellationToken.None));
+
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var check = connection.CreateCommand();
+                check.CommandText =
+                    $"""
+                    SELECT
+                      CASE WHEN (SELECT acked_seq FROM {creator.MessageTable} WHERE id = @legacy) IS NULL THEN 1 ELSE 0 END,
+                      CASE WHEN (SELECT acked_seq FROM {creator.MessageTable} WHERE id = @fresh) IS NOT NULL THEN 1 ELSE 0 END;
+                    """;
+                check.Parameters.AddWithValue("@legacy", legacyId);
+                check.Parameters.AddWithValue("@fresh", freshId);
+                await using var reader = await check.ExecuteReaderAsync();
+                await reader.ReadAsync();
+                Assert.Equal(1, reader.GetInt32(0));
+                Assert.Equal(1, reader.GetInt32(1));
+            }
         });
     }
 

@@ -609,11 +609,28 @@ internal abstract class DbAsyncResponseChannelBase :
                 var registrations = SnapshotActiveRegistrations();
                 if (registrations.Count > 0)
                 {
-                    await _store.HeartbeatSubscribersAsync(
-                        _instanceId,
-                        registrations,
-                        _options.SubscriberHeartbeatTimeout,
-                        cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await _store.HeartbeatSubscribersAsync(
+                            _instanceId,
+                            registrations,
+                            _options.SubscriberHeartbeatTimeout,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The round still compensates below: SQL Server commits per-batch,
+                        // MongoDB bulk-writes unordered, and any provider can fail after some
+                        // upserts landed — a registration dropped mid-round may already be
+                        // resurrected even though the round as a whole threw. Skipping the
+                        // re-check on failure left exactly those rows phantom until TTL.
+                        _logger.LogWarning(ex, "{Provider} subscriber heartbeat failed; retrying for all local waiters.", _providerName);
+                    }
+
                     await DeleteRegistrationsDroppedDuringHeartbeatAsync(registrations, cancellationToken).ConfigureAwait(false);
                 }
             }

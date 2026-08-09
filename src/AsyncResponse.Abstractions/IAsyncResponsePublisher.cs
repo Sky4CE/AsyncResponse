@@ -3,9 +3,11 @@ namespace AsyncResponse;
 /// <summary>
 /// Broadcasts asynchronous responses (payloads or failures) on the response channel identified
 /// by a correlation id. Active waiters receive them (on the database channels a registration
-/// tying another process's delivery claim within one server-clock tick is arbitrated exactly by
-/// the store's monotonic ack sequence — see the shared-correlation section of
-/// <c>docs/recovery.md</c> for the one narrow conservative residual); when nobody is listening,
+/// tying another process's delivery claim within one server-clock tick is arbitrated by the
+/// store's monotonic ack sequence; a claim whose sequence draw stalled across ticks resolves
+/// conservatively as history — never a replayed response, at worst the pre-sequence at-most-once
+/// verdict. See the shared-correlation section of <c>docs/recovery.md</c>); when nobody is
+/// listening,
 /// the lost-subscriber fallback routes them through the
 /// <see cref="RecoveryState"/> callbacks stored in the configured
 /// <see cref="IRecoveryStateStore"/>.
@@ -17,10 +19,11 @@ public interface IAsyncResponsePublisher
     /// Active subscribers awaiting this channel receive the payload — including payloads
     /// that describe a failed business state, which the waiter's <c>Until</c> predicate and flow
     /// code interpret. On the database channels a subscriber whose registration lands in the
-    /// same server-clock tick as another process's delivery claim is included or excluded exactly
-    /// by the store's monotonic ack sequence (see the shared-correlation section of
-    /// <c>docs/recovery.md</c> for the one narrow conservative residual). With no subscribers,
-    /// the payload's
+    /// same server-clock tick as another process's delivery claim is included or excluded by the
+    /// store's monotonic ack sequence; a claim whose sequence draw stalled across ticks resolves
+    /// conservatively as history — the waiter misses that delivery and recovers through its
+    /// timeout, never by replaying a consumed response (see the shared-correlation section of
+    /// <c>docs/recovery.md</c>). With no subscribers, the payload's
     /// <see cref="IAsyncResponsePayload.OnRecovery"/> decides between the persisted resume
     /// and failure callbacks — or retains the registration for a non-terminal checkpoint
     /// (<see cref="RecoveryAction.KeepWaiting"/>).
