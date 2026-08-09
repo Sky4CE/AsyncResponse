@@ -924,9 +924,11 @@ internal abstract class DbAsyncResponseChannelBase :
     /// The same-tick equality is symmetric — it can also be a genuine cross-process fan-out
     /// delivery (this waiter registered and another process's claim stamped <c>acked_at</c>
     /// inside one clock tick) — and no timestamp can separate the two cases. The store's
-    /// monotonic ack sequence breaks EXACTLY that tie: every delivery claim stamps
-    /// <c>acked_seq</c> drawn from the same monotonic source the subscription drew
-    /// <c>StartedSeq</c> from at registration.
+    /// monotonic ack sequence arbitrates that tie (and only that tie): every delivery claim
+    /// stamps <c>acked_seq</c> drawn from the same monotonic source the subscription drew
+    /// <c>StartedSeq</c> from at registration. The arbitration is conservative-exact — exact
+    /// whenever the claim's draw was not stalled across ticks; the stalled-draw residual below
+    /// resolves as history.
     /// </para>
     /// <para>
     /// The sequence deliberately does NOT outrank truthful (unequal) timestamps. A claim's

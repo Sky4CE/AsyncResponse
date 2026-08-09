@@ -126,12 +126,12 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
                 $"{nameof(MessageCollection)}, and {nameof(SubscriberCollection)} must be distinct collections.");
         }
 
-        Positive(MessageRetention, nameof(MessageRetention));
-        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
-        Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
-        Positive(ListenerPollInterval, nameof(ListenerPollInterval));
-        Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
-        Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
+        EnsurePersistedTtl(MessageRetention, nameof(MongoDbAsyncResponseChannelOptions), nameof(MessageRetention));
+        EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
+        EnsureTimerBacked(ListenerPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(ListenerPollInterval));
+        EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
+        EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
@@ -147,16 +147,11 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
         if (PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(PublishMaxAttempts)} must be positive.");
 
-        Positive(PublishRetryBaseDelay, nameof(PublishRetryBaseDelay));
-        Positive(PublishRetryMaxDelay, nameof(PublishRetryMaxDelay));
+        EnsureTimerBacked(PublishRetryBaseDelay, nameof(MongoDbAsyncResponseChannelOptions), nameof(PublishRetryBaseDelay));
+        EnsureTimerBacked(PublishRetryMaxDelay, nameof(MongoDbAsyncResponseChannelOptions), nameof(PublishRetryMaxDelay));
         if (PublishRetryBaseDelay > PublishRetryMaxDelay)
             throw new InvalidOperationException(
                 $"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(PublishRetryBaseDelay)} cannot exceed {nameof(PublishRetryMaxDelay)}.");
     }
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} must be positive.");
-    }
 }

@@ -502,6 +502,33 @@ public sealed class MongoDbOptionsTests
         Assert.NotNull(state);
     }
 
+    [Fact]
+    public void ChannelOptions_RejectIntervalsBeyondTheirCeilings()
+    {
+        // "Passes validation, throws mid-operation" is the failure mode these bounds close: a
+        // TimeSpan.MaxValue deadline overflowed AFTER the publisher's insert (reporting failure
+        // for a possibly delivered response), and an over-timer-ceiling poll/heartbeat interval
+        // threw inside its background loop's own retry delay, killing dispatch.
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.SubscriberHeartbeatTimeout = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatTimeout));
+        AssertChannelInvalid(
+            options => options.ListenerPollInterval = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.ListenerPollInterval));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.PublishRetryMaxDelay = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.PublishRetryMaxDelay));
+    }
+
     private static void AssertChannelInvalid(
         Action<MongoDbAsyncResponseChannelOptions> configure,
         string expectedMessageFragment)

@@ -689,10 +689,16 @@ internal sealed class SqlServerChannelSql
 
     private static string Quote(string identifier) => "[" + identifier + "]";
 
+        // Suffix space is RESERVED before capping: truncating "{table}_ack_seq" as a whole let a
+        // maximum-length table name produce exactly the table's own name — the sequence then
+        // collided with the table (they share a namespace), creation was skipped or failed, and
+        // the first sequence draw failed at runtime instead of registration.
     private static string SequenceName(string table)
     {
-        var name = $"{table}_ack_seq";
-        return name.Length <= 128 ? name : name[..128];
+        const string suffix = "_ack_seq";
+        const int identifierCap = 128;
+        var stem = table.Length <= identifierCap - suffix.Length ? table : table[..(identifierCap - suffix.Length)];
+        return stem + suffix;
     }
 
     private static string IndexName(string table, string suffix)

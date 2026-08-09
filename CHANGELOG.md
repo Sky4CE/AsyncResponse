@@ -159,7 +159,8 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   — a zombie server-side subscription that made every probe/publish count a live waiter and
   suppressed recovery for that correlation id until process exit; the creator now unsubscribes
   post-assignment when cleanup already ran.
-- **The database channels' same-tick delivery-vs-history tie is now arbitrated exactly.** A
+- **The database channels' same-tick delivery-vs-history tie is now arbitrated by a monotonic
+  ack sequence — exact except for a narrow conservative residual.** A
   message acked in the same server-clock tick a waiter registered in was indistinguishable
   between "history a reused correlation id must not replay" and "a cross-process fan-out
   delivery this waiter is part of"; the watermark resolved it in the safe at-most-once
@@ -177,6 +178,24 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   stamped only when the same claim transitions `acked_at` from null, never back-filled onto a
   legacy-acked row (a fresh stamp against an old `acked_at` would let a tick-tied waiter replay
   its predecessor's response during a rolling upgrade).
+- **Maximum-length message-table names no longer collide with their generated ack-sequence
+  name.** `{table}_ack_seq` was truncated as a whole, so a 63-character PostgreSQL (or
+  128-character SQL Server) table name produced the table's own name: PostgreSQL silently skipped
+  sequence creation (tables and sequences share a namespace) and failed at the first `nextval`,
+  SQL Server failed at `CREATE SEQUENCE`. Suffix space is now reserved before capping, and the
+  PostgreSQL managed-schema validation checks `relkind = 'S'` so a table can never satisfy the
+  sequence check. Pinned end-to-end with maximum-length table names on real PostgreSQL and
+  SQL Server.
+- **Interval and TTL options are bounded by what the runtime can represent.** Timer-armed knobs
+  (poll/heartbeat intervals, retry delays, step timeouts, lease durations) are validated against
+  the ~49.7-day .NET timer ceiling, and persisted-TTL/deadline knobs (retentions, expiries,
+  confirmation timeouts, `DurableFlowOptions.StateExpiry`) against a 10-year stamp-arithmetic
+  bound — closing the "passes validation, throws mid-operation" family: a `TimeSpan.MaxValue`
+  confirmation timeout overflowed AFTER the publisher's insert (reporting failure for a possibly
+  delivered response), and an over-ceiling poll interval killed its background loop. The
+  in-memory flow store additionally saturates caller-supplied TTL stamps like every external
+  store, and a durable-flow execution lease acquired in the store is released if local lease
+  construction fails.
 - **A NATS consume-loop failure during waiter registration now throws instead of returning a
   faulted waiter.** The loop's death faults the response task with a TRANSPORT error — nothing
   was delivered and nothing ever will be — but registration treated any settled task as a

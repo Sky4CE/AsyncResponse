@@ -38,7 +38,8 @@ internal sealed class PostgreSqlChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
-        AckSequence = $"{Schema}.{Quote(SequenceName(_options.MessageTable))}";
+        AckSequenceName = SequenceName(_options.MessageTable);
+        AckSequence = $"{Schema}.{Quote(AckSequenceName)}";
         _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
     }
 
@@ -53,6 +54,9 @@ internal sealed class PostgreSqlChannelSql
     /// start position a total order no pair of same-tick timestamps has.
     /// </summary>
     public string AckSequence { get; }
+
+    /// <summary>Unquoted sequence identifier, for catalog queries.</summary>
+    public string AckSequenceName { get; }
     public string NotificationChannel => _options.NotificationChannel;
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
@@ -158,15 +162,20 @@ internal sealed class PostgreSqlChannelSql
 
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
+            // relkind = 'S' precisely: to_regclass matches ANY relation, so a table sharing the
+            // sequence's name (the pre-fix truncation collision) passed validation and failed at
+            // the first nextval instead.
             command.CommandText =
-                $"""
+                """
                 SELECT
                   EXISTS (SELECT 1 FROM information_schema.columns
                           WHERE table_schema = @schema AND table_name = @table AND column_name = 'acked_seq'),
-                  to_regclass('{AckSequence}') IS NOT NULL;
+                  EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = @schema AND c.relname = @sequence AND c.relkind = 'S');
                 """;
             command.Parameters.AddWithValue("schema", _options.SchemaName);
             command.Parameters.AddWithValue("table", _options.MessageTable);
+            command.Parameters.AddWithValue("sequence", AckSequenceName);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             var hasColumn = reader.GetBoolean(0);
@@ -660,10 +669,16 @@ internal sealed class PostgreSqlChannelSql
         return name.Length <= 63 ? name : name[..63];
     }
 
+        // Suffix space is RESERVED before capping: truncating "{table}_ack_seq" as a whole let a
+        // maximum-length table name produce exactly the table's own name — the sequence then
+        // collided with the table (they share a namespace), creation was skipped or failed, and
+        // the first sequence draw failed at runtime instead of registration.
     private static string SequenceName(string table)
     {
-        var name = $"{table}_ack_seq";
-        return name.Length <= 63 ? name : name[..63];
+        const string suffix = "_ack_seq";
+        const int identifierCap = 63;
+        var stem = table.Length <= identifierCap - suffix.Length ? table : table[..(identifierCap - suffix.Length)];
+        return stem + suffix;
     }
 
     /// <summary>NOTIFY payload for a publish: the correlation id, or empty when it is too long to carry.</summary>

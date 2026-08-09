@@ -132,6 +132,31 @@ public sealed class RelationalChannelSubscriptionCoverageTests
         Assert.False(dropped.Completion.Task.IsCompleted);
     }
 
+    [Fact]
+    public void SequenceNames_ReserveSuffixSpaceAtTheIdentifierCaps()
+    {
+        // A maximum-length message-table name used to truncate "{table}_ack_seq" back to the
+        // table's own name: the sequence then collided with the table (they share a namespace) —
+        // PostgreSQL silently skipped creation and failed at the first nextval; SQL Server failed
+        // at CREATE SEQUENCE.
+        var pgOptions = new PostgreSqlAsyncResponseChannelOptions { MessageTable = new string('m', 63) };
+        using var dataSource = NpgsqlDataSource.Create(
+            "Host=localhost;Port=1;Database=unused;Username=unused;Password=unused;Timeout=1;Pooling=false");
+        var pg = new PostgreSqlChannelSql(dataSource, Options.Create(pgOptions));
+        Assert.EndsWith("_ack_seq", pg.AckSequenceName, StringComparison.Ordinal);
+        Assert.True(pg.AckSequenceName.Length <= 63);
+        Assert.NotEqual(pgOptions.MessageTable, pg.AckSequenceName);
+
+        var sqlOptions = new SqlServerAsyncResponseChannelOptions
+        {
+            ConnectionString = "Server=localhost,1;Database=unused;User Id=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+            MessageTable = new string('m', 128)
+        };
+        var sqlServer = new SqlServerChannelSql(Options.Create(sqlOptions));
+        Assert.EndsWith("_ack_seq]", sqlServer.AckSequence, StringComparison.Ordinal);
+        Assert.NotEqual($"{sqlServer.Schema}.[{sqlOptions.MessageTable}]", sqlServer.AckSequence);
+    }
+
     private static (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
         Type channelType,
         string nestedTypeName,

@@ -256,11 +256,14 @@ across all three database channels.
 Each delivery claim additionally stamps `acked_seq` from a store-side monotonic sequence
 (PostgreSQL/SQL Server: a `SEQUENCE` next to the message table; MongoDB: a counter document in
 `{messages}_counters`), and every waiter registration draws its own position from the same
-sequence. That total order is what separates "acked before this waiter registered" (history — a
-reused correlation id must not replay its predecessor's response) from "acked to a fan-out group
-including this waiter" (delivered) *exactly*, even when both events land on the same server-clock
-tick — a tie timestamps cannot arbitrate. Rows acked by a build predating the column fall back to
-the strict server-clock comparison.
+sequence. That order separates "acked before this waiter registered" (history — a reused
+correlation id must not replay its predecessor's response) from "acked to a fan-out group
+including this waiter" (delivered) even when both events land on the same server-clock tick — a
+tie timestamps cannot arbitrate. The arbitration is conservative-exact: exact whenever the
+claim's sequence draw was not stalled across ticks, and on a stalled draw it resolves as history
+(a missed delivery that recovers through the step timeout — never a replayed response; see the
+shared-correlation section below). Rows acked by a build predating the column fall back to the
+strict server-clock comparison.
 
 ## Wire/schema versioning
 

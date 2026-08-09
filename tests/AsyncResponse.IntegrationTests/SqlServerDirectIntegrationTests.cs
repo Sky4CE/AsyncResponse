@@ -17,6 +17,31 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()
+    {
+        // A 128-character table name used to collide with its own generated sequence name
+        // (whole-name truncation): CREATE SEQUENCE failed against the existing table object and
+        // schema creation broke. Suffix space is now reserved before capping.
+        await WithSchemaAsync("max_len_table", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            options.MessageTable = new string('m', 128);
+            var sql = new SqlServerChannelSql(Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.MessageTable = options.MessageTable;
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerChannelSql(Options.Create(managedOptions));
+            var (_, managedSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(managedSeq > startSeq);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

@@ -18,6 +18,32 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()
+    {
+        // A 63-character table name used to collide with its own generated sequence name
+        // (whole-name truncation): CREATE SEQUENCE IF NOT EXISTS silently matched the TABLE,
+        // managed-schema validation was fooled by to_regclass, and the first nextval failed.
+        await WithDataSourceAsync("max_len_table", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            options.MessageTable = new string('m', 63);
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            // The relkind-precise managed-schema validation passes against the real sequence.
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.MessageTable = options.MessageTable;
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlChannelSql(dataSource, Options.Create(managedOptions));
+            var (_, managedSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(managedSeq > startSeq);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

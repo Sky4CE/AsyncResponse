@@ -5,6 +5,12 @@ namespace AsyncResponse;
 /// <summary>Atomic process-local flow-state store for development, tests, and single-process apps.</summary>
 internal sealed class InMemoryFlowStateStore : IFlowStateStore
 {
+    // Saturating expiry stamp: the ttl parameter arrives from callers as well as options, and the
+    // external stores deliberately saturate the same arithmetic — a raw Add threw
+    // ArgumentOutOfRangeException on large ttls where every other store clamped.
+    private static DateTime Expiry(DateTime now, TimeSpan ttl)
+        => ttl >= DateTime.MaxValue - now ? DateTime.MaxValue : now.Add(ttl);
+
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
 
     public Task<bool> TryCreateAsync(
@@ -19,7 +25,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
             throw new ArgumentException("A new flow ledger must start at revision zero.", nameof(state));
 
         var now = DateTime.UtcNow;
-        var created = CreateEntry(state, now.Add(ttl));
+        var created = CreateEntry(state, Expiry(now, ttl));
         while (true)
         {
             if (_entries.TryAdd(flowId, created))
@@ -89,7 +95,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
             var updated = CreateEntry(
                 state,
-                now.Add(ttl),
+                Expiry(now, ttl),
                 current.LeaseId,
                 current.LeaseExpiresAtUtc);
             if (_entries.TryUpdate(flowId, updated, current))

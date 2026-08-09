@@ -129,13 +129,13 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
         SqlServerChannelSql.ValidateIdentifier(MessageTable, nameof(MessageTable));
         SqlServerChannelSql.ValidateIdentifier(SubscriberTable, nameof(SubscriberTable));
 
-        Positive(MessageRetention, nameof(MessageRetention));
-        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
-        Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
-        Positive(ActivePollInterval, nameof(ActivePollInterval));
-        Positive(IdlePollInterval, nameof(IdlePollInterval));
-        Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
-        Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
+        EnsurePersistedTtl(MessageRetention, nameof(SqlServerAsyncResponseChannelOptions), nameof(MessageRetention));
+        EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
+        EnsureTimerBacked(ActivePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(ActivePollInterval));
+        EnsureTimerBacked(IdlePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(IdlePollInterval));
+        EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
+        EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(SqlServerAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 
         if (ActivePollInterval > IdlePollInterval)
             throw new InvalidOperationException(
@@ -159,16 +159,11 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
         if (PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseChannelOptions)}.{nameof(PublishMaxAttempts)} must be positive.");
 
-        Positive(PublishRetryBaseDelay, nameof(PublishRetryBaseDelay));
-        Positive(PublishRetryMaxDelay, nameof(PublishRetryMaxDelay));
+        EnsureTimerBacked(PublishRetryBaseDelay, nameof(SqlServerAsyncResponseChannelOptions), nameof(PublishRetryBaseDelay));
+        EnsureTimerBacked(PublishRetryMaxDelay, nameof(SqlServerAsyncResponseChannelOptions), nameof(PublishRetryMaxDelay));
         if (PublishRetryBaseDelay > PublishRetryMaxDelay)
             throw new InvalidOperationException(
                 $"{nameof(SqlServerAsyncResponseChannelOptions)}.{nameof(PublishRetryBaseDelay)} cannot exceed {nameof(PublishRetryMaxDelay)}.");
     }
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseChannelOptions)}.{name} must be positive.");
-    }
 }

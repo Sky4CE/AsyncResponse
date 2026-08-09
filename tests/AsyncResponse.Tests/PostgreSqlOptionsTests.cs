@@ -515,6 +515,33 @@ public sealed class PostgreSqlOptionsTests
         Assert.Equal(1, attempts);
     }
 
+    [Fact]
+    public void ChannelOptions_RejectIntervalsBeyondTheirCeilings()
+    {
+        // "Passes validation, throws mid-operation" is the failure mode these bounds close: a
+        // TimeSpan.MaxValue deadline overflowed AFTER the publisher's insert (reporting failure
+        // for a possibly delivered response), and an over-timer-ceiling poll/heartbeat interval
+        // threw inside its background loop's own retry delay, killing dispatch.
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.SubscriberHeartbeatTimeout = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatTimeout));
+        AssertChannelInvalid(
+            options => options.ListenerPollInterval = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.PublishRetryMaxDelay = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.PublishRetryMaxDelay));
+    }
+
     private static void AssertChannelInvalid(
         Action<PostgreSqlAsyncResponseChannelOptions> configure,
         string expectedMessageFragment)
