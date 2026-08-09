@@ -2,6 +2,8 @@ using Npgsql;
 using NpgsqlTypes;
 using System.Text;
 
+using AsyncResponse.Internal;
+
 namespace AsyncResponse.Channels.PostgreSQL;
 
 internal readonly record struct PostgreSqlChannelMessage(
@@ -152,29 +154,29 @@ internal sealed class PostgreSqlChannelSql
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
                 // the wrong relation kind mid-batch — surface the namespace collision instead of
                 // the raw "cannot open relation".
-                throw new InvalidOperationException(NamespaceCollisionGuidance("channel", _options.SchemaName), ex);
+                throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("channel", _options.SchemaName), ex);
             }
 
             // Options-level ValidateNamePlan keeps THIS component's names distinct, but the
             // channel can share a schema with the transport and durable-flow stores (and
-            // unrelated objects), whose derived names it cannot see. Verify against the catalog,
+            // unrelated objects), whose derived names it cannot see — and IF NOT EXISTS also
+            // accepts a same-name index with the WRONG definition. Verify against the catalog,
             // in-transaction under the shared DDL lock, that every relation actually IS what the
-            // DDL above intended — CREATE ... IF NOT EXISTS matches ANY relation with the name
-            // and silently skips creation otherwise.
-            await VerifyCreatedRelationsAsync(
+            // DDL above intended, definitions included.
+            await PostgreSqlRelationVerifier.VerifyAsync(
                 connection,
                 transaction,
                 _options.SchemaName,
                 "channel",
                 [
-                    (_options.RecoveryStateTable, 'r', null),
-                    (_options.MessageTable, 'r', null),
-                    (_options.SubscriberTable, 'r', null),
-                    (AckSequenceName, 'S', null),
-                    (IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable),
-                    (IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable),
-                    (IndexName(_options.MessageTable, "expires"), 'i', _options.MessageTable),
-                    (IndexName(_options.SubscriberTable, "expires"), 'i', _options.SubscriberTable),
+                    new(_options.RecoveryStateTable, 'r'),
+                    new(_options.MessageTable, 'r'),
+                    new(_options.SubscriberTable, 'r'),
+                    new(AckSequenceName, 'S'),
+                    new(IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable, ["expires_at"]),
+                    new(IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable, ["correlation_id", "created_at"]),
+                    new(IndexName(_options.MessageTable, "expires"), 'i', _options.MessageTable, ["expires_at"]),
+                    new(IndexName(_options.SubscriberTable, "expires"), 'i', _options.SubscriberTable, ["expires_at"]),
                 ],
                 cancellationToken).ConfigureAwait(false);
 
@@ -187,81 +189,6 @@ internal sealed class PostgreSqlChannelSql
         }
     }
 
-    /// <summary>
-    /// In-transaction catalog check that each expected relation exists with the expected kind
-    /// (and, for indexes, on the expected table). Runs under the schema-keyed advisory DDL lock
-    /// shared by every AsyncResponse PostgreSQL store, so other components' objects are either
-    /// committed and visible or serialized behind this transaction.
-    /// </summary>
-    internal static async Task VerifyCreatedRelationsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string schemaName,
-        string componentName,
-        (string Name, char Kind, string? OwningTable)[] expected,
-        CancellationToken cancellationToken)
-    {
-        await using var verify = connection.CreateCommand();
-        verify.Transaction = transaction;
-        verify.CommandText =
-            """
-            SELECT c.relname, c.relkind::text, COALESCE(t.relname, '')
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN pg_index i ON i.indexrelid = c.oid
-            LEFT JOIN pg_class t ON t.oid = i.indrelid
-            WHERE n.nspname = @schema AND c.relname = ANY(@names);
-            """;
-        verify.Parameters.AddWithValue("schema", schemaName);
-        verify.Parameters.AddWithValue("names", expected.Select(e => e.Name).ToArray());
-
-        var actual = new Dictionary<string, (string Kind, string OwningTable)>(StringComparer.Ordinal);
-        await using (var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
-        {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                actual[reader.GetString(0)] = (reader.GetString(1), reader.GetString(2));
-        }
-
-        foreach (var (name, kind, owningTable) in expected)
-        {
-            if (!actual.TryGetValue(name, out var relation))
-                throw new InvalidOperationException(
-                    $"The PostgreSQL {componentName} store expected '{schemaName}.{name}' to exist after schema creation, but it does not.");
-
-            if (relation.Kind != kind.ToString()
-                || (owningTable is not null && !string.Equals(relation.OwningTable, owningTable, StringComparison.Ordinal)))
-            {
-                var expectedDescription = owningTable is null
-                    ? DescribeRelationKind(kind.ToString())
-                    : $"an index on '{owningTable}'";
-                var actualDescription = relation.OwningTable.Length == 0
-                    ? DescribeRelationKind(relation.Kind)
-                    : $"an index on '{relation.OwningTable}'";
-                throw new InvalidOperationException(
-                    $"The PostgreSQL {componentName} store expected '{schemaName}.{name}' to be {expectedDescription}, " +
-                    $"but the name is occupied by {actualDescription}, so CREATE ... IF NOT EXISTS silently skipped creating it. " +
-                    "Tables, indexes, and sequences share one namespace per schema — across the channel, transport, and " +
-                    "durable-flow stores and any unrelated objects in it. Rename the configured tables so every configured " +
-                    "and derived name stays unique within the schema.");
-            }
-        }
-    }
-
-    internal static string NamespaceCollisionGuidance(string componentName, string schemaName)
-        => $"The PostgreSQL {componentName} store could not create its schema objects in '{schemaName}' because a configured or " +
-           "derived name is occupied by a different kind of relation. Tables, indexes, and sequences share one namespace per " +
-           "schema — across the channel, transport, and durable-flow stores and any unrelated objects in it. Rename the " +
-           "configured tables so every configured and derived name stays unique within the schema.";
-
-    private static string DescribeRelationKind(string kind) => kind switch
-    {
-        "r" => "a table",
-        "i" => "an index",
-        "S" => "a sequence",
-        "v" => "a view",
-        "m" => "a materialized view",
-        _ => $"a relation of kind '{kind}'",
-    };
 
     private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
     {

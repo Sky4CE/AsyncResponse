@@ -109,6 +109,61 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
     }
 
     [Fact]
+    public async Task PreexistingObjectsWithWrongDefinitions_FailVerificationActionably()
+    {
+        // CREATE INDEX IF NOT EXISTS accepts ANY existing index with the name and guarantees
+        // nothing about its shape: a same-name index over the WRONG columns silently starved the
+        // claim query of its compound index. The verifier must compare definitions, not names.
+        await WithDataSourceAsync("wrong_index_def", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var creator = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP INDEX "{schema}"."jobs_claim_idx";
+                    CREATE INDEX "jobs_claim_idx" ON "{schema}"."jobs" (created_at);
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("does not match the expected definition", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("queue, available_at, locked_until, created_at", ex.Message, StringComparison.Ordinal);
+        });
+
+        // Same family for sequences: an existing integer sequence would overflow at 2^31 draws;
+        // CREATE SEQUENCE IF NOT EXISTS accepts it silently.
+        await WithDataSourceAsync("wrong_seq_type", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP SEQUENCE {creator.AckSequence};
+                    CREATE SEQUENCE {creator.AckSequence} AS integer;
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("to be bigint", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

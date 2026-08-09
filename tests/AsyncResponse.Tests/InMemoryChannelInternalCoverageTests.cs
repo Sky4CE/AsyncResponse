@@ -100,7 +100,7 @@ public sealed class InMemoryChannelInternalCoverageTests
         await CleanupAsync(cleaned);
         Invoke(cleaned, "ArmTimeout");
         await InvokeTaskAsync(cleaned, "DispatchExceptionAsync", new InvalidOperationException("late"));
-        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult(), WireSerializerStub);
+        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await InvokeTaskAsync(cleaned, "DispatchRawJsonResponseAsync", new RawJsonResponse("{}"));
         await InvokeTaskAsync(cleaned, "TimeoutCoreAsync");
 
@@ -111,7 +111,7 @@ public sealed class InMemoryChannelInternalCoverageTests
         SetField(terminal, "_terminal", 1);
         await InvokeTaskAsync(terminal, "DispatchExceptionAsync", new InvalidOperationException("duplicate"));
         await InvokeTaskAsync(terminal, "TimeoutCoreAsync");
-        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult(), WireSerializerStub);
+        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await InvokeTaskAsync(terminal, "FaultAsync", new InvalidOperationException("duplicate fault"));
         Assert.False(ResponseTask(terminal).IsCompleted);
         await CleanupAsync(terminal);
@@ -132,7 +132,7 @@ public sealed class InMemoryChannelInternalCoverageTests
                 await release.Task.ConfigureAwait(false);
                 throw new InvalidOperationException("async predicate failed");
             });
-        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult(), WireSerializerStub);
+        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         SetField(asyncFailure, "_terminal", 1);
         release.TrySetResult();
@@ -220,11 +220,11 @@ public sealed class InMemoryChannelInternalCoverageTests
         => throw new InvalidOperationException("synchronous dispatch failure");
 
     /// <summary>
-    /// Declared-type wire serializer stub for the two-parameter typed dispatch: these facts
-    /// dispatch same-type payloads, so the serializer is never consulted.
+    /// Declared-type wire payload for the typed dispatch: the publisher's single UTF-8
+    /// serialization, from which each waiter materializes its own instance.
     /// </summary>
-    private static readonly Func<object?, string> WireSerializerStub =
-        static response => AsyncResponseJson.Serialize(response!, response!.GetType());
+    private static readonly byte[] WireBytesStub =
+        AsyncResponseJson.SerializeToUtf8Bytes(new OperationResult());
 
     private static object? Invoke(object target, string name, params object?[] arguments)
         => FindMethod(target.GetType(), name).Invoke(target, arguments);

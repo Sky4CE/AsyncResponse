@@ -26,26 +26,27 @@ namespace Microsoft.Extensions.DependencyInjection
             // creates and owns a client from the options. Nothing is registered as a bare
             // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are
             // never answered — or broken — by this package.
+            builder.Services.TryAddSingleton<MongoNamespaceRegistry>();
             builder.Services.TryAddSingleton(provider =>
             {
                 var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>();
 
                 var database = provider.GetService<IMongoDatabase>();
                 if (database is not null)
-                    return new MongoDbFlowStateStore(database, options);
+                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
                 var sharedClient = provider.GetService<IMongoClient>();
                 if (sharedClient is not null)
-                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options);
+                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
                 var ownedClient = new MongoClient(options.Value.ConnectionString);
-                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient);
+                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<MongoNamespaceRegistry>());
             });
             return builder.WithDurableFlows<MongoDbFlowStateStore, MongoDbDurableFlowOptions>(configure);
         }
@@ -101,7 +102,29 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     private readonly IMongoClient? _ownedClient;
     private bool _created;
 
-    public MongoDbFlowStateStore(IMongoDatabase database, IOptions<MongoDbDurableFlowOptions> options, IMongoClient? ownedClient = null)
+    /// <summary>
+    /// DI construction path: also claims the collection in the container's cross-component
+    /// ownership ledger — a flow store configured onto the channel's derived counters collection
+    /// would let the flow TTL index silently delete the ack-sequence counter.
+    /// </summary>
+    internal MongoDbFlowStateStore(
+        IMongoDatabase database,
+        IOptions<MongoDbDurableFlowOptions> options,
+        IMongoClient? ownedClient,
+        MongoNamespaceRegistry? namespaceRegistry)
+        : this(database, options, ownedClient)
+    {
+        namespaceRegistry?.Claim(
+            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB durable-flow store",
+            [(_options.CollectionName, nameof(_options.CollectionName))]);
+    }
+
+    public MongoDbFlowStateStore(
+        IMongoDatabase database,
+        IOptions<MongoDbDurableFlowOptions> options,
+        IMongoClient? ownedClient = null)
     {
         _options = options.Value;
         _options.Validate();

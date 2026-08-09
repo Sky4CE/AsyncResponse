@@ -216,15 +216,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            // One serialization per publish, shared by every waiter's materialization (dispatch is
-            // serialized per correlation id, so the memo needs no synchronization). Wire parity is
-            // deliberate for SAME-type waiters too: handing the publisher's live instance through
-            // shared one mutable reference across the fan-out and leaked [JsonIgnore] state no
-            // broker-backed channel can deliver — each waiter gets its own declared-T
-            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive.
-            string? wireJson = null;
-            var serializeDeclared = DeclaredWireSerializer<T>.Instance;
-            await DispatchResponsesAsync(subscribers, response, r => wireJson ??= serializeDeclared(r)).ConfigureAwait(false);
+            // One serialization per publish, shared by every waiter's materialization. Wire parity
+            // is deliberate for SAME-type waiters too: handing the publisher's live instance
+            // through shared one mutable reference across the fan-out and leaked [JsonIgnore]
+            // state no broker-backed channel can deliver — each waiter gets its own declared-T
+            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive. The wire
+            // form is UTF-8 bytes end to end (the earlier string round-trip paid a UTF-16
+            // transcode both ways), serialized eagerly here: every waiter of a typed instance
+            // needs it, and JsonElement/string/null payloads — which materialize through the
+            // conversion path instead — skip it entirely.
+            var wireBytes = response is System.Text.Json.JsonElement or string or null
+                ? null
+                : DeclaredWireSerializer<T>.Instance(response);
+            await DispatchResponsesAsync(subscribers, response, wireBytes).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
@@ -404,15 +408,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             : default;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response, Func<object?, string> serializeDeclared)
+    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response, byte[]? wireBytes)
     {
         if (subscribers.Single is { } single)
-            return single.DispatchResponseAsync(response, serializeDeclared);
+            return single.DispatchResponseAsync(response, wireBytes);
 
         return DispatchManyAsync(
             subscribers.Many,
-            static (subscriber, state) => subscriber.DispatchResponseAsync(state.Response, state.SerializeDeclared),
-            (Response: response, SerializeDeclared: serializeDeclared));
+            static (subscriber, state) => subscriber.DispatchResponseAsync(state.Response, state.WireBytes),
+            (Response: response, WireBytes: wireBytes));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -482,8 +486,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     /// </summary>
     private static class DeclaredWireSerializer<TDeclared>
     {
-        public static readonly Func<object?, string> Instance =
-            static response => AsyncResponseJson.Serialize((TDeclared)response!);
+        public static readonly Func<object?, byte[]> Instance =
+            static response => AsyncResponseJson.SerializeToUtf8Bytes((TDeclared)response!);
     }
 
     private sealed class SubscriptionGroup
@@ -670,11 +674,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         /// <summary>
         /// Dispatches a typed or materializable response to this subscription.
-        /// <paramref name="serializeDeclared"/> renders the response as the publisher's
-        /// DECLARED-type wire JSON — what a broker envelope would carry — for waiters whose
-        /// payload type differs from the published instance.
+        /// <paramref name="wireBytes"/> is the publisher's single DECLARED-type wire
+        /// serialization (UTF-8 JSON) — what a broker envelope would carry — from which each
+        /// waiter materializes its own instance; <c>null</c> when the response is a
+        /// JsonElement/string/null payload that materializes through the conversion path.
         /// </summary>
-        public abstract Task DispatchResponseAsync(object? response, Func<object?, string> serializeDeclared);
+        public abstract Task DispatchResponseAsync(object? response, byte[]? wireBytes);
 
         /// <summary>Dispatches a raw JSON response to this subscription.</summary>
         public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response);
@@ -930,12 +935,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         public Task<T> ResponseTask => _tcs.Task;
 
         /// <inheritdoc />
-        public override Task DispatchResponseAsync(object? response, Func<object?, string> serializeDeclared)
+        public override Task DispatchResponseAsync(object? response, byte[]? wireBytes)
             => DispatchSerialAsync(
-                (Response: response, SerializeDeclared: serializeDeclared),
-                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state.Response, state.SerializeDeclared));
+                (Response: response, WireBytes: wireBytes),
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state.Response, state.WireBytes));
 
-        private Task DispatchResponseUnserializedAsync(object? response, Func<object?, string> serializeDeclared)
+        private Task DispatchResponseUnserializedAsync(object? response, byte[]? wireBytes)
         {
             if (CleanupStarted)
                 return Task.CompletedTask;
@@ -944,10 +949,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // completion predicate and any logging run under it, even when the response is delivered
             // on a foreign thread such as a broker ingress callback.
             if (_capturedContext is null)
-                return DispatchResponseCoreAsync(response, serializeDeclared);
+                return DispatchResponseCoreAsync(response, wireBytes);
 
             Task? dispatch = null;
-            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchResponseCoreAsync(response, serializeDeclared), null);
+            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchResponseCoreAsync(response, wireBytes), null);
             return dispatch!;
         }
 
@@ -970,11 +975,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return dispatch!;
         }
 
-        private Task DispatchResponseCoreAsync(object? response, Func<object?, string> serializeDeclared)
+        private Task DispatchResponseCoreAsync(object? response, byte[]? wireBytes)
         {
             try
             {
-                var payload = MaterializeAs(response, serializeDeclared);
+                var payload = MaterializeAs(response, wireBytes);
 
                 var completion = _completionPredicate(payload);
                 if (!completion.IsCompletedSuccessfully)
@@ -1038,12 +1043,14 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         // carries, polymorphic discriminators included, [JsonIgnore] state excluded. Handing the
         // publisher's live instance through (the old same-type fast path) aliased one mutable
         // object across all same-type waiters and exposed in-process-only state no broker-backed
-        // channel can deliver. The publish serializes once; each waiter deserializes its own
-        // instance. JsonElement/string/null payloads keep the existing conversion path.
-        private static T MaterializeAs(object? response, Func<object?, string> serializeDeclared)
-            => response is System.Text.Json.JsonElement or string or null
+        // channel can deliver. The publish serializes once (UTF-8 bytes); each waiter
+        // deserializes its own instance case-insensitively — the same property matching the
+        // string conversion path used, and the same options every broker ingress applies.
+        // JsonElement/string/null payloads keep the existing conversion path.
+        private static T MaterializeAs(object? response, byte[]? wireBytes)
+            => wireBytes is null
                 ? response.As<T>()
-                : serializeDeclared(response).As<T>();
+                : AsyncResponseJson.DeserializeCaseInsensitive<T>(wireBytes)!;
 
         private Task FaultAsync(Exception exception)
         {

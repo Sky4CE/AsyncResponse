@@ -41,13 +41,19 @@ internal static class MongoTestCounters
     }
 
     /// <summary>
-    /// Gives a database mock a real <see cref="DatabaseNamespace"/>: the stores validate the
-    /// effective "database.collection" namespace byte length at construction, so a loose mock
-    /// with a null namespace NREs before any operation runs.
+    /// Gives a database mock a real <see cref="DatabaseNamespace"/> and a client with cluster
+    /// settings: the stores validate the effective "database.collection" namespace byte length
+    /// at construction, and DI-hosted stores additionally derive a cluster key from
+    /// <c>Client.Settings.Servers</c> for the cross-component ownership ledger — a loose mock
+    /// NREs on either before any operation runs. Tests that need their own client re-setup
+    /// <c>Client</c> afterwards (last setup wins).
     /// </summary>
     public static Mock<IMongoDatabase> WithTestNamespace(this Mock<IMongoDatabase> database, string name = "tests")
     {
         database.SetupGet(d => d.DatabaseNamespace).Returns(new DatabaseNamespace(name));
+        var client = new Mock<IMongoClient>();
+        client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+        database.SetupGet(d => d.Client).Returns(client.Object);
         return database;
     }
 }

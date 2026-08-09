@@ -1,8 +1,11 @@
 using AsyncResponse.Channels.MongoDB;
 using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.Transports.MongoDB;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Moq;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Clusters;
@@ -37,6 +40,64 @@ public sealed class MongoDbOptionsTests
         AssertChannelInvalid(
             options => options.SubscriberCollection = "app.system.subscribers",
             nameof(MongoDbAsyncResponseChannelOptions.SubscriberCollection));
+    }
+
+    [Fact]
+    public void SharedDatabase_CrossComponentCollectionCollision_FailsInEitherStartupOrder()
+    {
+        // The flow store configured onto the channel's DERIVED "{MessageCollection}_counters"
+        // collection: its TTL index would silently delete the ack-sequence counter. Neither
+        // component's own validation can see the other, so the container-scoped ownership ledger
+        // must fail whichever store is constructed second — in both orders.
+        static ServiceProvider Build()
+        {
+            var client = new Mock<IMongoClient>();
+            client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+            var database = new Mock<IMongoDatabase>().WithTestNamespace();
+            database.SetupGet(d => d.Client).Returns(client.Object);
+
+            var services = new ServiceCollection();
+            services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+            services.AddSingleton(database.Object);
+            services.AddAsyncResponse()
+                .WithMongoDbChannel(options => options.MessageCollection = "jobs")
+                .WithInMemoryTransport()
+                .WithMongoDbDurableFlows(options => options.CollectionName = "jobs_counters");
+            return services.BuildServiceProvider();
+        }
+
+        using (var channelFirst = Build())
+        {
+            _ = channelFirst.GetRequiredService<MongoDbChannelStore>();
+            var ex = Assert.Throws<InvalidOperationException>(channelFirst.GetRequiredService<MongoDbFlowStateStore>);
+            Assert.Contains("MongoDB channel", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("MongoDB durable-flow store", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+
+        using (var flowFirst = Build())
+        {
+            _ = flowFirst.GetRequiredService<MongoDbFlowStateStore>();
+            var ex = Assert.Throws<InvalidOperationException>(flowFirst.GetRequiredService<MongoDbChannelStore>);
+            Assert.Contains("MongoDB durable-flow store", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+
+        // Distinct collections coexist: both stores resolve.
+        var okClient = new Mock<IMongoClient>();
+        okClient.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+        var okDatabase = new Mock<IMongoDatabase>().WithTestNamespace();
+        okDatabase.SetupGet(d => d.Client).Returns(okClient.Object);
+        var okServices = new ServiceCollection();
+        okServices.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        okServices.AddSingleton(okDatabase.Object);
+        okServices.AddAsyncResponse()
+            .WithMongoDbChannel(options => options.MessageCollection = "jobs")
+            .WithInMemoryTransport()
+            .WithMongoDbDurableFlows(options => options.CollectionName = "flows");
+        using var ok = okServices.BuildServiceProvider();
+        _ = ok.GetRequiredService<MongoDbChannelStore>();
+        _ = ok.GetRequiredService<MongoDbFlowStateStore>();
     }
 
     [Fact]

@@ -45,6 +45,34 @@ public sealed class DbTransportSharedCoverageTests
     }
 
     /// <summary>
+    /// A handler that completes synchronously never arms the renewal heartbeat: it cannot outlive
+    /// its lease, and eagerly spinning up (then cancelling) the renewal machinery per delivery
+    /// cost ~10× the rest of the dispatch path — the ×10 CI dispatch regression. The grace wait
+    /// also proves nothing keeps beating after the ack (no leaked renewal loop).
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task SynchronousHandler_AcksWithoutArmingTheRenewalHeartbeat(Provider provider)
+    {
+        var calls = new Calls();
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromMilliseconds(20),
+            calls: calls,
+            handler: static () => Task.CompletedTask);
+
+        // Several beat intervals of grace: a wrongly armed (or leaked) heartbeat would renew here.
+        await Task.Delay(100);
+        Assert.Equal(1, calls.Ack);
+        Assert.Equal(0, calls.Renew);
+    }
+
+    /// <summary>
     /// When the handler fails after an early ACK, the message is already gone from the queue, so a
     /// dead-letter that also fails leaves the failure observable only through logs and the callback —
     /// which is exactly what it must say.

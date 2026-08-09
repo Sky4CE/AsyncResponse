@@ -33,4 +33,8 @@
     <PackageReference Include="Npgsql" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\Shared\PostgreSqlRelationVerifier.cs" Link="PostgreSqlRelationVerifier.cs" />
+  </ItemGroup>
+
 </Project>

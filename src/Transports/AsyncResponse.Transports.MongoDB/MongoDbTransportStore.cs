@@ -48,11 +48,19 @@ internal sealed class MongoDbTransportStore : IDisposable
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseTransportOptions> options,
         IMongoClient? ownedClient = null,
-        ILogger<MongoDbTransportStore>? logger = null)
+        ILogger<MongoDbTransportStore>? logger = null,
+        MongoNamespaceRegistry? namespaceRegistry = null)
     {
         _options = options.Value;
         _logger = logger;
         MongoDbTransportOptionsValidator.ValidateCommon(_options);
+
+        // Cross-component collection ownership (DI-hosted stores only): see MongoNamespaceRegistry.
+        namespaceRegistry?.Claim(
+            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB transport",
+            [(_options.MessageCollection, nameof(_options.MessageCollection))]);
 
         // The namespace BYTE limit can only be checked here, where the actual database name is
         // first known; a near-limit configuration otherwise passes every static check and fails

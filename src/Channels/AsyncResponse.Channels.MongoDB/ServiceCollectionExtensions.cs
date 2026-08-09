@@ -31,26 +31,31 @@ public static class MongoDbAsyncResponseChannelServiceCollectionExtensions
         // creates and owns a client from the options. Nothing is registered as a bare
         // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are never
         // answered — or broken — by this package.
+        // One registry per container: DI-hosted Mongo components claim their effective
+        // collections so a cross-component collision (e.g. a durable-flow store on the channel's
+        // derived counters collection) fails startup in either construction order.
+        services.TryAddSingleton<MongoNamespaceRegistry>();
         services.TryAddSingleton(provider =>
         {
             var options = provider.GetRequiredService<IOptions<MongoDbAsyncResponseChannelOptions>>();
+            var registry = provider.GetRequiredService<MongoNamespaceRegistry>();
 
             var database = provider.GetService<IMongoDatabase>();
             if (database is not null)
-                return new MongoDbChannelStore(database, options);
+                return new MongoDbChannelStore(database, options, namespaceRegistry: registry);
 
             if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MongoDbAsyncResponseChannelOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
             var sharedClient = provider.GetService<IMongoClient>();
             if (sharedClient is not null)
-                return new MongoDbChannelStore(sharedClient.GetDatabase(options.Value.DatabaseName), options);
+                return new MongoDbChannelStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, namespaceRegistry: registry);
 
             if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MongoDbAsyncResponseChannelOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
             var ownedClient = new MongoClient(options.Value.ConnectionString);
-            return new MongoDbChannelStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient);
+            return new MongoDbChannelStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, namespaceRegistry: registry);
         });
 
         services.TryAddSingleton<MongoDbRecoveryStateStore>();

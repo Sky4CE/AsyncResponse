@@ -299,25 +299,22 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
                 // the wrong relation kind mid-batch — surface the namespace collision instead of
                 // the raw "cannot open relation".
-                throw new InvalidOperationException(
-                    $"The PostgreSQL durable-flow store could not create its schema objects in '{_options.SchemaName}' because a configured or " +
-                    "derived name is occupied by a different kind of relation. Tables, indexes, and sequences share one namespace per " +
-                    "schema — across the channel, transport, and durable-flow stores and any unrelated objects in it. Rename the " +
-                    "configured table so every configured and derived name stays unique within the schema.", ex);
+                throw new InvalidOperationException(AsyncResponse.Internal.PostgreSqlRelationVerifier.DdlCollisionMessage("durable-flow", _options.SchemaName), ex);
             }
 
             // The flow store can share a schema with the channel and transport stores (and
-            // unrelated objects), whose derived names its own validation cannot see. Verify
+            // unrelated objects), whose derived names its own validation cannot see — and
+            // IF NOT EXISTS also accepts a same-name index with the WRONG definition. Verify
             // against the catalog, in-transaction under the shared DDL lock, that both relations
-            // actually ARE what the DDL above intended — CREATE ... IF NOT EXISTS matches ANY
-            // relation with the name and silently skips creation otherwise.
-            await VerifyCreatedRelationsAsync(
+            // actually ARE what the DDL above intended, definitions included.
+            await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
                 connection,
                 transaction,
                 _options.SchemaName,
+                "durable-flow",
                 [
-                    (_options.TableName, 'r', null),
-                    (DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63), 'i', _options.TableName),
+                    new(_options.TableName, 'r'),
+                    new(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63), 'i', _options.TableName, ["expires_at_utc"]),
                 ],
                 cancellationToken).ConfigureAwait(false);
 
@@ -330,62 +327,6 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         }
     }
 
-    /// <summary>
-    /// In-transaction catalog check that each expected relation exists with the expected kind
-    /// (and, for the index, on the expected table). Runs under the schema-keyed advisory DDL
-    /// lock shared by every AsyncResponse PostgreSQL store. Mirrors the channel/transport
-    /// stores' check (separate packages cannot share the code).
-    /// </summary>
-    private static async Task VerifyCreatedRelationsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string schemaName,
-        (string Name, char Kind, string? OwningTable)[] expected,
-        CancellationToken cancellationToken)
-    {
-        await using var verify = connection.CreateCommand();
-        verify.Transaction = transaction;
-        verify.CommandText =
-            """
-            SELECT c.relname, c.relkind::text, COALESCE(t.relname, '')
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN pg_index i ON i.indexrelid = c.oid
-            LEFT JOIN pg_class t ON t.oid = i.indrelid
-            WHERE n.nspname = @schema AND c.relname = ANY(@names);
-            """;
-        verify.Parameters.AddWithValue("schema", schemaName);
-        verify.Parameters.AddWithValue("names", expected.Select(e => e.Name).ToArray());
-
-        var actual = new Dictionary<string, (string Kind, string OwningTable)>(StringComparer.Ordinal);
-        await using (var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
-        {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                actual[reader.GetString(0)] = (reader.GetString(1), reader.GetString(2));
-        }
-
-        foreach (var (name, kind, owningTable) in expected)
-        {
-            if (!actual.TryGetValue(name, out var relation))
-                throw new InvalidOperationException(
-                    $"The PostgreSQL durable-flow store expected '{schemaName}.{name}' to exist after schema creation, but it does not.");
-
-            if (relation.Kind != kind.ToString()
-                || (owningTable is not null && !string.Equals(relation.OwningTable, owningTable, StringComparison.Ordinal)))
-            {
-                var expectedDescription = owningTable is null ? "a table" : $"an index on '{owningTable}'";
-                var actualDescription = relation.OwningTable.Length == 0
-                    ? relation.Kind switch { "r" => "a table", "i" => "an index", "S" => "a sequence", _ => $"a relation of kind '{relation.Kind}'" }
-                    : $"an index on '{relation.OwningTable}'";
-                throw new InvalidOperationException(
-                    $"The PostgreSQL durable-flow store expected '{schemaName}.{name}' to be {expectedDescription}, " +
-                    $"but the name is occupied by {actualDescription}, so CREATE ... IF NOT EXISTS silently skipped creating it. " +
-                    "Tables, indexes, and sequences share one namespace per schema — across the channel, transport, and " +
-                    "durable-flow stores and any unrelated objects in it. Rename the configured table so every configured " +
-                    "and derived name stays unique within the schema.");
-            }
-        }
-    }
 
     private async Task<bool> UpdateLeaseAsync(
         string flowId,

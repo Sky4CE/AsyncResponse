@@ -31,11 +31,26 @@ internal sealed class MongoDbChannelStore : IDisposable
     public MongoDbChannelStore(
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseChannelOptions> options,
-        IMongoClient? ownedClient = null)
+        IMongoClient? ownedClient = null,
+        MongoNamespaceRegistry? namespaceRegistry = null)
     {
         _options = options.Value;
         _options.Validate();
         _database = database;
+
+        // Cross-component collection ownership (DI-hosted stores only): another AsyncResponse
+        // component configured onto one of these collections — the derived counters collection
+        // included — must fail startup in either construction order.
+        namespaceRegistry?.Claim(
+            ClusterKey(database),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB channel",
+            [
+                (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
+                (_options.MessageCollection, nameof(_options.MessageCollection)),
+                (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
+                (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
+            ]);
 
         // Namespace BYTE limits can only be checked here, where the actual database name is
         // first known — and the derived counters namespace is 9 bytes longer than the configured
@@ -568,6 +583,13 @@ internal sealed class MongoDbChannelStore : IDisposable
                or MongoExecutionTimeoutException
                or TimeoutException
                || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
+
+    /// <summary>
+    /// Stable identity of the cluster a database handle points at, for cross-component
+    /// collection-ownership claims: same servers + same database name = same namespace space.
+    /// </summary>
+    internal static string ClusterKey(IMongoDatabase database)
+        => string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal));
 
     /// <summary>
     /// Name of the derived ack-counter collection. Part of the effective collection-name plan:

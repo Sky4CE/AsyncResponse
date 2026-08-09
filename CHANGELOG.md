@@ -148,6 +148,28 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **The database transports' per-delivery dispatch cost is back to baseline (~10× regression
+  fixed — PostgreSQL, SQL Server, MongoDB).** The claim-lease heartbeat introduced with the
+  July hardening spun up its renewal machinery eagerly for EVERY delivery and tore it down with
+  a thrown-and-caught `TaskCanceledException` per message — ~6.5 µs and 1.3 KB on a dispatch
+  path that otherwise costs ~750 ns. The heartbeat is now armed only when the handler is
+  actually still running (a synchronously completed handler cannot outlive its lease), and its
+  beat observes cancellation without throwing. Slow handlers keep the exact same renewal
+  cadence, fencing, and lease-lost semantics — pinned by the existing renewal-retry facts plus a
+  new fact proving a synchronous handler acks with zero renewal activity. Locally measured
+  237 ns / 96 B per dispatch, versus 3,465 ns / 1,392 B before the fix and 217 ns / 88 B at the
+  pre-regression baseline.
+- **The in-memory channel's wire-parity materialization dropped its string detour.** The
+  per-waiter materialization introduced with the aliasing fix serialized to a UTF-16 string and
+  deserialized back through the reflection conversion path; it now serializes once per publish
+  straight to UTF-8 bytes and deserializes each waiter's instance from those bytes with the
+  same case-insensitive matching — byte-identical semantics (the conformance wire-parity and
+  fan-out facts are the regression guard), fewer allocations, no transcodes. The remaining
+  ~200 ns/delivery over the pre-fix baseline is the price of the correctness contract itself:
+  every waiter gets its own wire-true instance instead of an alias of the publisher's live
+  object. The watchdog/health-check evaluation cost added by the July observability work
+  (order-independent dedupe, richer health data) is retained deliberately — those run per scan
+  interval and per health probe, not per message.
 - **PostgreSQL schema creation now verifies, against the catalog, that every relation it
   ensured actually IS what it intended (channel, transport, and durable-flow stores).**
   Per-component name-plan validation cannot see the OTHER packages sharing a schema: a channel
@@ -156,9 +178,14 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   skip the DDL, leaving a missing index or a "table" that was really someone else's index.
   After its DDL, each store now checks `pg_class`/`pg_index` (in the same transaction, under
   the shared advisory DDL lock) that every expected name resolves to the expected relation kind
-  and, for indexes, the expected owning table — failing with an actionable rename error on
-  whichever component starts second, regardless of startup order. Pinned by an integration test
-  running the collision in both orders on a real server.
+  and, for indexes, the expected owning table **and definition** — key columns in order,
+  non-unique, non-partial, btree, valid and ready — and that the ack sequence is `bigint`
+  (`CREATE ... IF NOT EXISTS` explicitly guarantees nothing about an existing object's shape;
+  a same-name index over the wrong columns silently starved the claim query, and an integer
+  sequence would overflow). Failing is actionable on whichever component starts second,
+  regardless of startup order. The verifier is one source-linked file compiled into all three
+  packages. Pinned by integration tests running the cross-component collision in both orders
+  and the wrong-definition/wrong-sequence-type cases on a real server.
 - **RabbitMQ rejects non-positive `NetworkRecoveryInterval` instead of breaking automatic
   recovery.** The value is copied verbatim into the client's `ConnectionFactory`, whose
   recovery loop uses it directly as a `Task.Delay`: a negative interval faulted — and
@@ -175,6 +202,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   and durable-flow stores now fail construction with the computed byte count; collection-name
   validation additionally rejects the reserved system namespace appearing anywhere in a dotted
   name, and the durable-flow options gain the same character rules as the channel/transport.
+  DI-hosted Mongo components additionally claim their effective collections — derived ones
+  included — in a container-scoped ownership ledger keyed by cluster + database: a durable-flow
+  store configured onto the channel's derived `{MessageCollection}_counters` collection (whose
+  TTL index would silently delete the ack-sequence counter) now fails startup in either
+  construction order, naming both claimants.
 - **Derived index names now reserve suffix space at the identifier caps, and the full
   object-name plan is validated (PostgreSQL, SQL Server — channels and transports).** The
   generated index names truncated as a whole, so a maximum-length table name derived its own
