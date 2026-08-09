@@ -1,4 +1,5 @@
 using AsyncResponse.Channels.MongoDB;
+using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.Transports.MongoDB;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -32,6 +33,47 @@ public sealed class MongoDbOptionsTests
         AssertChannelInvalid(
             options => options.SubscriberCollection = "system.subscribers",
             nameof(MongoDbAsyncResponseChannelOptions.SubscriberCollection));
+        // The reserved system namespace also cannot appear INSIDE a dotted name.
+        AssertChannelInvalid(
+            options => options.SubscriberCollection = "app.system.subscribers",
+            nameof(MongoDbAsyncResponseChannelOptions.SubscriberCollection));
+    }
+
+    [Fact]
+    public void Stores_RejectEffectiveNamespacesOverTheByteLimit_AtConstruction()
+    {
+        // The 255-byte namespace limit spans "database.collection", so only the store — which
+        // knows the actual database name — can enforce it. MongoClient/GetDatabase are lazy, so
+        // no server is needed. db "tests" (5 bytes) + "." + N-byte collection = N + 6 bytes.
+        var database = new MongoClient("mongodb://localhost:27017").GetDatabase("tests");
+
+        // 250-char collection: 256-byte namespace — over the limit outright.
+        var direct = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 250) })));
+        Assert.Contains("255 bytes", direct.Message, StringComparison.Ordinal);
+
+        // 245-char collection: its own namespace fits (251 bytes) but the DERIVED "_counters"
+        // namespace is 260 bytes — the gap static validation could never see.
+        var derived = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 245) })));
+        Assert.Contains("ack-counter", derived.Message, StringComparison.Ordinal);
+
+        var transport = Assert.Throws<InvalidOperationException>(() => new MongoDbTransportStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('m', 250) })));
+        Assert.Contains("255 bytes", transport.Message, StringComparison.Ordinal);
+
+        var flow = Assert.Throws<InvalidOperationException>(() => new MongoDbFlowStateStore(
+            database,
+            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 250) })));
+        Assert.Contains("255 bytes", flow.Message, StringComparison.Ordinal);
+
+        // At the boundary everything constructs: 240 + 6 + 9 ("_counters") = 255 exactly.
+        using var atLimit = new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 240) }));
     }
 
     [Fact]
@@ -136,6 +178,9 @@ public sealed class MongoDbOptionsTests
             nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
         AssertTransportInvalid(
             options => options.MessageCollection = "system.queue",
+            nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
+        AssertTransportInvalid(
+            options => options.MessageCollection = "app.system.queue",
             nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
     }
 

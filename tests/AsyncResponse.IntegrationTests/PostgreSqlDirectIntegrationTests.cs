@@ -66,6 +66,49 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
     }
 
     [Fact]
+    public async Task SharedSchema_CrossComponentNameCollisions_FailActionablyInsteadOfSilentlySkippingDdl()
+    {
+        // Per-component ValidateNamePlan cannot see the OTHER packages sharing a schema: the
+        // channel's recovery table below occupies the transport's derived claim-index name.
+        // Tables, indexes, and sequences share one relation namespace, and CREATE ... IF NOT
+        // EXISTS matches ANY relation — previously the loser silently skipped its DDL (a missing
+        // claim index, or a channel "table" that is actually someone else's index). The post-DDL
+        // catalog verification must fail whichever component starts second, in both orders.
+        await WithDataSourceAsync("cross_collide_a", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await channel.EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
+            Assert.Contains("jobs_claim_idx", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("occupied by a table", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithDataSourceAsync("cross_collide_b", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await transport.EnsureCreatedAsync();
+
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            // In this direction the collision breaks the DDL batch itself (CREATE INDEX ... ON a
+            // relation that is really the transport's index → wrong object type), which the store
+            // wraps with the same namespace-collision guidance.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("share one namespace", ex.Message, StringComparison.Ordinal);
+            Assert.IsType<PostgresException>(ex.InnerException);
+        });
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its

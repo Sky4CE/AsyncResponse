@@ -3,6 +3,7 @@ using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace AsyncResponse.Channels.MongoDB;
 
@@ -35,6 +36,16 @@ internal sealed class MongoDbChannelStore : IDisposable
         _options = options.Value;
         _options.Validate();
         _database = database;
+
+        // Namespace BYTE limits can only be checked here, where the actual database name is
+        // first known — and the derived counters namespace is 9 bytes longer than the configured
+        // message collection, so a near-limit configuration passed every static check and failed
+        // at the first ack-sequence draw.
+        ValidateEffectiveNamespace(database, _options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection));
+        ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
+        ValidateEffectiveNamespace(database, _options.SubscriberCollection, nameof(_options.SubscriberCollection));
+        ValidateEffectiveNamespace(database, CountersCollectionName(_options.MessageCollection), "the derived ack-counter collection");
+
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
         _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection);
@@ -571,9 +582,25 @@ internal sealed class MongoDbChannelStore : IDisposable
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} must be configured.");
-        if (value.Contains('$') || value.Contains('\0') || value.StartsWith("system.", StringComparison.Ordinal))
+        if (value.Contains('$') || value.Contains('\0')
+            || value.StartsWith("system.", StringComparison.Ordinal) || value.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
-                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in the system namespace).");
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+    }
+
+    /// <summary>
+    /// Validates an effective namespace ("database.collection") against MongoDB's 255-byte UTF-8
+    /// limit. Only the store constructor knows the actual database name, so this cannot live in
+    /// options validation.
+    /// </summary>
+    internal static void ValidateEffectiveNamespace(IMongoDatabase database, string collectionName, string description)
+    {
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{collectionName}";
+        var byteLength = Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 255)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({description}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
+                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
     }
 
     /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>

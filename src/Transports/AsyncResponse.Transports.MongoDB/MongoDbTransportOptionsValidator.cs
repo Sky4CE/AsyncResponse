@@ -101,9 +101,10 @@ internal static class MongoDbTransportOptionsValidator
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} must be configured.");
-        if (value.Contains('$') || value.Contains('\0') || value.StartsWith("system.", StringComparison.Ordinal))
+        if (value.Contains('$') || value.Contains('\0')
+            || value.StartsWith("system.", StringComparison.Ordinal) || value.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
-                $"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in the system namespace).");
+                $"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
     }
 
 }

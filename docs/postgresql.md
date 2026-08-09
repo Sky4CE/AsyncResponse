@@ -142,7 +142,11 @@ Recommended Npgsql connection-string settings:
   longer names, so validation rejects them). Derived names — `{MessageTable}_ack_seq` and the
   `*_idx` indexes — reserve their suffix space by truncating the table stem, and validation
   rejects a configuration whose effective name plan collides (for example a table occupying a
-  derived name, or two near-cap tables whose truncated stems derive the same index name).
+  derived name, or two near-cap tables whose truncated stems derive the same index name). When
+  the channel, transport, and durable-flow stores share one schema, each additionally verifies
+  its relations against the catalog after schema creation (kind and, for indexes, owning table)
+  — a name occupied by another component's object fails startup with a rename error instead of
+  `CREATE ... IF NOT EXISTS` silently skipping the DDL.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
   rows to decide whether to wait for live delivery. Registration writes one row, then each interval
   performs one update for the process's current active-registration snapshot. Rows no longer in that

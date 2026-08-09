@@ -107,8 +107,12 @@ public sealed class OptionCeilingSweepTests
             new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = BeyondTimerCeiling }));
         Assert.Contains(nameof(RabbitMqAsyncResponseOptions.NetworkRecoveryInterval), recovery.Message);
 
-        // Non-positive means "use the 5-second fallback" in the subscriber retry loop.
-        RabbitMqOptionsValidator.ValidateConnection(new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.Zero });
+        // The RabbitMQ client uses the interval DIRECTLY in its recovery loop's Task.Delay: a
+        // negative value faults (and terminates) that loop, zero spins it — both are rejected.
+        Assert.Throws<InvalidOperationException>(() => RabbitMqOptionsValidator.ValidateConnection(
+            new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.Zero }));
+        Assert.Throws<InvalidOperationException>(() => RabbitMqOptionsValidator.ValidateConnection(
+            new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.FromSeconds(-1) }));
     }
 
     [Fact]

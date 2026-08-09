@@ -182,6 +182,9 @@ public sealed class DurableFlowStoreSharedTests
         Assert.Throws<InvalidOperationException>(() => new DynamoDbDurableFlowOptions { TableName = " " }.Validate());
         Assert.Throws<InvalidOperationException>(() => new DynamoDbDurableFlowOptions { TimeToLiveAttributeName = " " }.Validate());
         Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = " " }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "bad$flows" }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "system.flows" }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "app.system.flows" }.Validate());
         Assert.Throws<InvalidOperationException>(() => new MySqlDurableFlowOptions().Validate());
         Assert.Throws<InvalidOperationException>(() => new OracleDurableFlowOptions().Validate());
         Assert.Throws<InvalidOperationException>(() => new SqliteDurableFlowOptions { ConnectionString = " " }.Validate());

@@ -724,24 +724,20 @@ public class RabbitMqTransportTests
     }
 
     [Fact]
-    public async Task Subscriber_UsesFallbackRetryDelay_WhenIntervalNonPositive()
+    public void Subscriber_RejectsNonPositiveRecoveryInterval()
     {
-        var logger = new CapturingLogger<RabbitMqWorkerSubscriber>();
-        var factory = new ThrowingConnectionFactory();
-        var subscriber = new RabbitMqWorkerSubscriber(
-            Options.Create(new RabbitMqAsyncResponseOptions
-            {
-                NetworkRecoveryInterval = TimeSpan.Zero
-            }),
-            Mock.Of<IAsyncResponseIngress>(),
-            logger,
-            factory);
-
-        await subscriber.StartAsync(CancellationToken.None);
-        await WaitUntilAsync(() => logger.Snapshot().Any(entry => entry.Level == LogLevel.Warning));
-        await subscriber.StopAsync(CancellationToken.None);
-
-        Assert.True(factory.Attempts >= 1);
+        // The RabbitMQ client uses the interval DIRECTLY in its automatic-recovery loop: a
+        // negative value faults (and terminates) that loop, zero spins it. The old "fall back to
+        // 5 seconds" subscriber behavior is gone — a non-positive interval is a configuration
+        // error rejected before any connection is attempted.
+        Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.Zero },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+        Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.FromSeconds(-1) },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
     }
 
     [Fact]

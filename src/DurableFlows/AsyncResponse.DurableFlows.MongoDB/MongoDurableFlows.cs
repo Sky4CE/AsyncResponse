@@ -82,6 +82,10 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
     {
         if (string.IsNullOrWhiteSpace(CollectionName))
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} must be configured.");
+        if (CollectionName.Contains('$') || CollectionName.Contains('\0')
+            || CollectionName.StartsWith("system.", StringComparison.Ordinal) || CollectionName.Contains(".system.", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -102,6 +106,17 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         _options = options.Value;
         _options.Validate();
         _database = database;
+
+        // The namespace BYTE limit can only be checked here, where the actual database name is
+        // first known; a near-limit configuration otherwise passes every static check and fails
+        // at the first server operation.
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.CollectionName}";
+        var byteLength = System.Text.Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 255)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({nameof(_options.CollectionName)}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
+                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
+
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
         _ownedClient = ownedClient;
     }

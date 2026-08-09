@@ -300,7 +300,7 @@ public sealed class MongoDbStoreQueryTests
     private static MongoDbTransportStore CreateTransportStore(IMongoCollection<MongoTransportMessageDocument> collection)
     {
         var options = new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false };
-        var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
+        var database = new Mock<IMongoDatabase>(MockBehavior.Loose).WithTestNamespace();
         database
             .Setup(d => d.GetCollection<MongoTransportMessageDocument>(options.MessageCollection, It.IsAny<MongoCollectionSettings>()))
             .Returns(collection);

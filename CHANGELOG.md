@@ -148,6 +148,33 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **PostgreSQL schema creation now verifies, against the catalog, that every relation it
+  ensured actually IS what it intended (channel, transport, and durable-flow stores).**
+  Per-component name-plan validation cannot see the OTHER packages sharing a schema: a channel
+  table occupying the transport's derived claim-index name (or vice versa) let
+  `CREATE ... IF NOT EXISTS` — which matches ANY relation in the shared namespace — silently
+  skip the DDL, leaving a missing index or a "table" that was really someone else's index.
+  After its DDL, each store now checks `pg_class`/`pg_index` (in the same transaction, under
+  the shared advisory DDL lock) that every expected name resolves to the expected relation kind
+  and, for indexes, the expected owning table — failing with an actionable rename error on
+  whichever component starts second, regardless of startup order. Pinned by an integration test
+  running the collision in both orders on a real server.
+- **RabbitMQ rejects non-positive `NetworkRecoveryInterval` instead of breaking automatic
+  recovery.** The value is copied verbatim into the client's `ConnectionFactory`, whose
+  recovery loop uses it directly as a `Task.Delay`: a negative interval faulted — and
+  TERMINATED — that loop (the connection never recovered), and zero spun it. The old
+  "fall back to 5 seconds" behavior only ever applied to the subscriber's start-retry delay,
+  not the client's recovery loop, so the interval is now strictly positive (and
+  timer-ceiling-bounded) with the subscriber fallback removed.
+- **MongoDB stores validate effective namespaces — including the derived counters collection —
+  against the injected database name at construction.** MongoDB limits a namespace
+  (`database.collection`) to 255 UTF-8 bytes (235 sharded); only the store knows the actual
+  database name, and the derived `{MessageCollection}_counters` namespace is 9 bytes longer
+  than anything static validation sees, so a near-limit configuration passed every check and
+  failed at the first ack-sequence draw. The channel (all four effective namespaces), transport,
+  and durable-flow stores now fail construction with the computed byte count; collection-name
+  validation additionally rejects the reserved system namespace appearing anywhere in a dotted
+  name, and the durable-flow options gain the same character rules as the channel/transport.
 - **Derived index names now reserve suffix space at the identifier caps, and the full
   object-name plan is validated (PostgreSQL, SQL Server — channels and transports).** The
   generated index names truncated as a whole, so a maximum-length table name derived its own

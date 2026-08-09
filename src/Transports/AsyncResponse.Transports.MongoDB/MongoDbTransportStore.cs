@@ -53,6 +53,17 @@ internal sealed class MongoDbTransportStore : IDisposable
         _options = options.Value;
         _logger = logger;
         MongoDbTransportOptionsValidator.ValidateCommon(_options);
+
+        // The namespace BYTE limit can only be checked here, where the actual database name is
+        // first known; a near-limit configuration otherwise passes every static check and fails
+        // at the first server operation.
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.MessageCollection}";
+        var byteLength = Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 255)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({nameof(_options.MessageCollection)}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
+                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
+
         _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
         _ownedClient = ownedClient;
     }

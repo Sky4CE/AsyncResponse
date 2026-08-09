@@ -329,6 +329,7 @@ public sealed class MongoDbSubscriberServiceTests
                     It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new DeleteResult.Acknowledged(1));
 
+            Database.WithTestNamespace();
             _store = new MongoDbTransportStore(Database.Object, _options);
         }
 

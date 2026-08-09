@@ -37,6 +37,17 @@ internal static class MongoTestCounters
         database
             .Setup(d => d.GetCollection<BsonDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(Collection());
+        return database.WithTestNamespace();
+    }
+
+    /// <summary>
+    /// Gives a database mock a real <see cref="DatabaseNamespace"/>: the stores validate the
+    /// effective "database.collection" namespace byte length at construction, so a loose mock
+    /// with a null namespace NREs before any operation runs.
+    /// </summary>
+    public static Mock<IMongoDatabase> WithTestNamespace(this Mock<IMongoDatabase> database, string name = "tests")
+    {
+        database.SetupGet(d => d.DatabaseNamespace).Returns(new DatabaseNamespace(name));
         return database;
     }
 }

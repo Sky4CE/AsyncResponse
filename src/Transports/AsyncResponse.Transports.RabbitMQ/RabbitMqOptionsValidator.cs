@@ -11,9 +11,10 @@ internal static class RabbitMqOptionsValidator
     /// <summary>
     /// Bounds the knobs copied verbatim into the RabbitMQ <c>ConnectionFactory</c>, which would
     /// otherwise fail at the FIRST connect — long after registration. AMQP 0-9-1 heartbeats are
-    /// 16-bit seconds (zero disables them); the recovery interval arms the client's reconnect
-    /// timer (non-positive values fall back to the 5-second default, so only positive values are
-    /// bounded).
+    /// 16-bit seconds (zero disables them). The recovery interval is used directly by the
+    /// client's automatic-recovery loop as a <c>Task.Delay</c>: a negative value faults (and
+    /// TERMINATES) that loop and zero spins it, so the interval must be strictly positive and
+    /// under the timer ceiling — there is no client-side fallback.
     /// </summary>
     public static void ValidateConnection(RabbitMqAsyncResponseOptions options)
     {
@@ -21,7 +22,6 @@ internal static class RabbitMqOptionsValidator
             throw new InvalidOperationException(
                 $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(options.RequestedHeartbeat)} must be between zero (disabled) and {ushort.MaxValue} seconds — AMQP heartbeats are 16-bit seconds.");
 
-        if (options.NetworkRecoveryInterval > TimeSpan.Zero)
-            AsyncResponseChannelOptions.EnsureTimerBacked(options.NetworkRecoveryInterval, nameof(RabbitMqAsyncResponseOptions), nameof(options.NetworkRecoveryInterval));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.NetworkRecoveryInterval, nameof(RabbitMqAsyncResponseOptions), nameof(options.NetworkRecoveryInterval));
     }
 }
