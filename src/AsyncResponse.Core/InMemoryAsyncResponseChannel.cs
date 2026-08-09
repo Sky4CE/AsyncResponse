@@ -216,7 +216,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 }
             }
 
-            await DispatchResponsesAsync(subscribers, response, DeclaredWireSerializer<T>.Instance).ConfigureAwait(false);
+            // One serialization per publish, shared by every waiter's materialization (dispatch is
+            // serialized per correlation id, so the memo needs no synchronization). Wire parity is
+            // deliberate for SAME-type waiters too: handing the publisher's live instance through
+            // shared one mutable reference across the fan-out and leaked [JsonIgnore] state no
+            // broker-backed channel can deliver — each waiter gets its own declared-T
+            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive.
+            string? wireJson = null;
+            var serializeDeclared = DeclaredWireSerializer<T>.Instance;
+            await DispatchResponsesAsync(subscribers, response, r => wireJson ??= serializeDeclared(r)).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
@@ -966,9 +974,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             try
             {
-                var payload = response is T typed
-                    ? typed
-                    : MaterializeAs(response, serializeDeclared);
+                var payload = MaterializeAs(response, serializeDeclared);
 
                 var completion = _completionPredicate(payload);
                 if (!completion.IsCompletedSuccessfully)
@@ -1027,12 +1033,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             }
         }
 
-        // Wire parity for mixed-type shared-correlation fan-out: a payload published as a
-        // DIFFERENT CLR type than this waiter's T is re-materialized from the publisher's
-        // DECLARED-type wire JSON — the same representation a broker envelope carries, polymorphic
-        // discriminators included (runtime-type serialization dropped them, faulting waiters bound
-        // to a compatible polymorphic contract). JsonElement/string/null payloads keep the
-        // existing conversion path.
+        // Wire parity for EVERY delivery, same-type included: the payload is re-materialized from
+        // the publisher's DECLARED-type wire JSON — the same representation a broker envelope
+        // carries, polymorphic discriminators included, [JsonIgnore] state excluded. Handing the
+        // publisher's live instance through (the old same-type fast path) aliased one mutable
+        // object across all same-type waiters and exposed in-process-only state no broker-backed
+        // channel can deliver. The publish serializes once; each waiter deserializes its own
+        // instance. JsonElement/string/null payloads keep the existing conversion path.
         private static T MaterializeAs(object? response, Func<object?, string> serializeDeclared)
             => response is System.Text.Json.JsonElement or string or null
                 ? response.As<T>()

@@ -109,6 +109,17 @@ public sealed class InMemoryWorkerTransportRedeliveryTests
                 RetryMaxDelay = TimeSpan.FromSeconds(1)
             })));
 
+        // Delays past the BCL timer ceiling would throw inside Task.Delay at the FIRST retry and
+        // silently void the redelivery contract — rejected up front instead.
+        Assert.Throws<InvalidOperationException>(() => new InMemoryWorkerTransport(
+            Options.Create(new InMemoryWorkerTransportOptions { RetryMaxDelay = TimeSpan.MaxValue })));
+        Assert.Throws<InvalidOperationException>(() => new InMemoryWorkerTransport(
+            Options.Create(new InMemoryWorkerTransportOptions
+            {
+                RetryBaseDelay = TimeSpan.FromDays(60),
+                RetryMaxDelay = TimeSpan.FromDays(60)
+            })));
+
         // 0 = unlimited retries is an accepted configuration.
         _ = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions { MaxDeliveryAttempts = 0 }));
     }

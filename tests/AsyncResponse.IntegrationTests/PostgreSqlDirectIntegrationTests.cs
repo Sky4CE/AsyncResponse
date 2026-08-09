@@ -18,6 +18,55 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
+    {
+        // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its
+        // sequence, which registration and delivery claims now require unconditionally. The
+        // channel must fail at first use with an error carrying the exact migration — not a raw
+        // "column does not exist" mid-operation — and work immediately once the documented
+        // migration has been applied.
+        await WithDataSourceAsync("managed_upgrade", async (schema, dataSource) =>
+        {
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await creator.EnsureCreatedAsync();
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var strip = connection.CreateCommand())
+            {
+                strip.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} DROP COLUMN acked_seq;
+                    DROP SEQUENCE {creator.AckSequence};
+                    """;
+                await strip.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlChannelSql(dataSource, Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("acked_seq", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("docs/postgresql.md", ex.Message, StringComparison.Ordinal);
+
+            // The exact migration from docs/postgresql.md, "Upgrading a manually managed schema".
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var migrate = connection.CreateCommand())
+            {
+                migrate.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+                    CREATE SEQUENCE IF NOT EXISTS {creator.AckSequence} AS bigint;
+                    """;
+                await migrate.ExecuteNonQueryAsync();
+            }
+
+            var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+        });
+    }
+
+    [Fact]
     public async Task InsertMessage_LosingAnUncommittedConflict_ResolvesAfterCommitViaFreshRead()
     {
         // Deterministically forces the stale-snapshot NULL path the fresh-statement re-read

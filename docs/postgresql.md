@@ -78,6 +78,21 @@ processes start together.
 Set `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
 distinct even when they share the same schema.
 
+### Upgrading a manually managed schema
+
+1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`
+the channel validates these objects once at startup and fails with an actionable error until the
+migration below is applied (names shown for the default `public.asyncresponse_channel_messages`;
+the sequence is always `{message_table}_ack_seq` in the same schema):
+
+```sql
+ALTER TABLE public.asyncresponse_channel_messages ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+CREATE SEQUENCE IF NOT EXISTS public.asyncresponse_channel_messages_ack_seq AS bigint;
+```
+
+The column is nullable and the migration is safe to run while old-version hosts are still up:
+rows they ack carry no sequence and fall back to the previous watermark rule.
+
 ## Configuration checklist
 
 ```csharp

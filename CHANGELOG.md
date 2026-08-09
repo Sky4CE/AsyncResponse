@@ -39,6 +39,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   pre-release commits — migration is one line: drop `UseAckAfterEnqueue` from the worker
   subscriber (the safe default), or set `AllowEarlyAckWorkerSubscriber = true` on the flow-store
   registration.
+- Startup schema validation for manually managed database schemas: with
+  `AutoCreateSchema = false`, the PostgreSQL and SQL Server channels verify the 1.0 ack-sequence
+  objects once at first use and fail with an error carrying the exact migration SQL, instead of a
+  raw "column does not exist" mid-operation. `docs/postgresql.md` and `docs/sqlserver.md` gain
+  "Upgrading a manually managed schema" recipes (the integration suite executes the SQL Server
+  recipe straight out of the error message).
 - `asyncresponse.ingress.unroutable_responses` counter (plus an Error-level log): inbound
   responses with no correlation id are acknowledged by design — redelivery could never route
   them — and each occurrence is now loud instead of a Warning-level whisper.
@@ -153,23 +159,48 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   — a zombie server-side subscription that made every probe/publish count a live waiter and
   suppressed recovery for that correlation id until process exit; the creator now unsubscribes
   post-assignment when cleanup already ran.
-- **The database channels' same-tick delivery-vs-history tie is now decided exactly.** A message
-  acked in the same server-clock tick a waiter registered in was indistinguishable between
-  "history a reused correlation id must not replay" and "a cross-process fan-out delivery this
-  waiter is part of"; the watermark resolved it in the safe at-most-once direction, costing the
-  fan-out waiter its response (a stall to its step timeout). Delivery claims now stamp
-  `acked_seq` from a store-side monotonic sequence (PostgreSQL/SQL Server: a `SEQUENCE`;
-  MongoDB: a counter document) and every waiter registration draws its position from the same
-  sequence, so the comparison is a strict integer order with no tie. Additive schema — the
-  column/sequence are auto-created when schema creation is enabled, and rows acked by an older
-  build fall back to the previous timestamp rule.
+- **The database channels' same-tick delivery-vs-history tie is now arbitrated exactly.** A
+  message acked in the same server-clock tick a waiter registered in was indistinguishable
+  between "history a reused correlation id must not replay" and "a cross-process fan-out
+  delivery this waiter is part of"; the watermark resolved it in the safe at-most-once
+  direction, costing the fan-out waiter its response (a stall to its step timeout). Delivery
+  claims now stamp `acked_seq` from a store-side monotonic sequence (PostgreSQL/SQL Server: a
+  `SEQUENCE`; MongoDB: a counter document) and every waiter registration draws its position from
+  the same sequence. Timestamps remain the primary comparison — a sequence value is drawn before
+  its claim becomes visible, so it must not outrank truthful unequal timestamps (a claim can
+  draw, stall past a registration, and truthfully land in a later tick) — and the sequence
+  breaks only the tie, where a claim visible before a same-tick registration necessarily drew
+  earlier and so can never replay history. The one conservative residual (a draw stalled from an
+  earlier tick into the exact registration tick) resolves as the old rule always did. Additive
+  schema — the column/sequence are auto-created when schema creation is enabled, and rows acked
+  by an older build fall back to the previous timestamp rule.
+- **A NATS consume-loop failure during waiter registration now throws instead of returning a
+  faulted waiter.** The loop's death faults the response task with a TRANSPORT error — nothing
+  was delivered and nothing ever will be — but registration treated any settled task as a
+  delivered response, returned the waiter, and the builder then fired the remote trigger with no
+  live subscription and no recovery state left to route its response. Registration now
+  distinguishes loop deaths from delivered failures and throws, so the operation never starts;
+  a delivered failure envelope still settles the wait as before.
+- **In-memory same-type fan-out is now wire-true.** The exact-type fast path handed the
+  publisher's live payload instance to every same-type waiter — one shared mutable reference
+  across the fan-out, with `[JsonIgnore]` in-process state visible that no broker-backed channel
+  can deliver, contradicting the conformance materialization contract. The publish now
+  serializes the declared payload once and every waiter (same-type included) materializes its
+  own instance, byte-equivalent to what Redis/NATS/database waiters receive; pinned by a
+  same-type fan-out conformance fact on all six channel derivations.
+- **Completed durable-flow steps no longer retain a stale `PendingPayloadTypeFullName`.** The
+  response-winning cancellation settlement cleared only the correlation-id breadcrumb; the
+  declared-type breadcrumb is now cleared centrally on every settlement path, per the
+  `FlowState` contract.
 - **The in-memory worker transport now honors the redelivery contract.** A failing job was
   dropped on its first failure — silently voiding durable-flow crash/contention recovery (the
   revision conflict's designed "abandon and let the delivery retry") on the dev transport. Jobs
   now retry in place with exponential backoff up to
   `InMemoryWorkerTransportOptions.MaxDeliveryAttempts` (default 5, `0` = unlimited;
-  `RetryBaseDelay`/`RetryMaxDelay` pace it), then drop loudly: an error log plus a `dropped`
-  outcome on `asyncresponse.worker.jobs` (broker transports dead-letter at this point instead).
+  `RetryBaseDelay`/`RetryMaxDelay` pace it, validated against the ~49.7-day .NET timer ceiling so
+  a delay `Task.Delay` rejects can never silently void the retry contract), then drop loudly: an
+  error log plus a `dropped` outcome on `asyncresponse.worker.jobs` (broker transports
+  dead-letter at this point instead).
 - **A DB subscriber heartbeat can no longer resurrect a just-deleted subscriber row.** A cleanup
   landing between the heartbeat's snapshot and its upsert had its row re-created for up to one
   heartbeat-timeout window, during which every publisher counted a phantom live waiter and

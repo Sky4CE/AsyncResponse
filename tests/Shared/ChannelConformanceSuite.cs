@@ -423,6 +423,39 @@ public abstract class ChannelConformanceSuite
     }
 
     [Fact]
+    public async Task Contract_LiveFanout_SameType_EachWaiterGetsItsOwnWireMaterialization()
+    {
+        // Same-type fan-out must be wire-true too: every waiter receives its OWN materialization
+        // of the declared-type wire JSON — never the publisher's live instance. Sharing the
+        // instance aliases one mutable object across the fan-out and leaks [JsonIgnore] state
+        // that no broker-backed channel can deliver; the in-memory channel must not diverge from
+        // what Redis/NATS/database waiters receive byte-for-byte.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("same-type-fanout");
+
+        await using var firstWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceLocalStateResult>(
+            correlationId, timeout: WaiterTimeout);
+        await using var secondWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceLocalStateResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        var published = new ConformanceLocalStateResult { Marker = 7, LocalHint = "in-process-only" };
+        await harness.Publisher.SetResponse(published, correlationId);
+
+        var first = await firstWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var second = await secondWaiter.ResponseTask.WaitAsync(WaitBudget);
+
+        Assert.Equal(7, first.Marker);
+        Assert.Equal(7, second.Marker);
+        // Wire-excluded state never crosses, and no waiter aliases the publisher's (or another
+        // waiter's) instance.
+        Assert.Null(first.LocalHint);
+        Assert.Null(second.LocalHint);
+        Assert.NotSame(published, first);
+        Assert.NotSame(published, second);
+        Assert.NotSame(first, second);
+    }
+
+    [Fact]
     public async Task Contract_LiveFanout_PolymorphicDeclaredBase_PreservesDiscriminatorForEveryWaiter()
     {
         // The polymorphic sharpening of the mixed-type fan-out contract: the publisher declares a
@@ -987,6 +1020,21 @@ public sealed class ConformanceMirrorResult : IAsyncResponsePayload
         ConformanceStatus.Running => RecoveryAction.KeepWaiting,
         _ => RecoveryAction.Fail,
     };
+}
+
+/// <summary>
+/// Same-type fan-out probe: wire-carried state plus in-process-only (<c>[JsonIgnore]</c>) state.
+/// Pins that every waiter gets its own wire materialization — the ignored member must never
+/// cross, and no waiter may alias the publisher's live instance.
+/// </summary>
+public sealed class ConformanceLocalStateResult : IAsyncResponsePayload
+{
+    public int Marker { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? LocalHint { get; set; }
+
+    public RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }
 
 /// <summary>

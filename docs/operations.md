@@ -48,9 +48,10 @@ end-to-end profiles).
     NATS connection, or PostgreSQL `NpgsqlDataSource`; don't create a second pool for AsyncResponse.
 11. **Share correlation ids deliberately.** Live delivery and lost-subscriber recovery both fan out
     across multiple waiters on one correlation id; a normally completing waiter removes only its own
-    recovery registration. On the database channels, a waiter whose registration ties another
-    process's delivery claim within one server-clock tick misses that delivery and times out
-    instead — at-most-once for the tie. See
+    recovery registration. On the database channels, a registration tying another process's
+    delivery claim within one server-clock tick is arbitrated exactly by the monotonic ack
+    sequence; only a claim whose sequence draw stalled across ticks resolves conservatively
+    (the waiter times out and the idempotent step restarts — never a replayed response). See
     [recovery.md](recovery.md#shared-correlation-recovery).
 12. **Measure hot paths in isolation before comparing profiles.** The sample's remote simulator
     deliberately waits before progress and terminal messages, so broad HTTP load-test latency mostly

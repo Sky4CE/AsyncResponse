@@ -588,6 +588,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         step.Completed = true;
         step.ResultJson = resultJson;
         step.PendingCorrelationId = null;
+        // Cleared together with the breadcrumb on EVERY settlement path (the FlowState contract):
+        // a stale declared-type name on a completed step would mislead the next recovery pass.
+        step.PendingPayloadTypeFullName = null;
         // A memoized failed child keeps Faulted = true so operators can spot the failure on the
         // step itself instead of digging through ResultJson.
         step.Faulted = faulted;

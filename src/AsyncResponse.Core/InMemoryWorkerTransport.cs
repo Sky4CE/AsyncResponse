@@ -147,6 +147,13 @@ public sealed class InMemoryWorkerTransportOptions
             throw new InvalidOperationException($"{nameof(RetryBaseDelay)} must be positive.");
         if (RetryMaxDelay < RetryBaseDelay)
             throw new InvalidOperationException($"{nameof(RetryMaxDelay)} must be at least {nameof(RetryBaseDelay)}.");
+        // Bounded by the BCL timer ceiling: a value Task.Delay rejects would fail at the FIRST
+        // retry, get swallowed by the worker loop's backstop, and drop the job without its
+        // configured attempts or the terminal `dropped` outcome — the exact silent loss the
+        // redelivery loop exists to prevent.
+        if (RetryMaxDelay > AsyncResponseChannelOptions.MaxTimerBackedTimeout)
+            throw new InvalidOperationException(
+                $"{nameof(RetryMaxDelay)} must be at most {AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#} days (the .NET timer ceiling).");
     }
 }
 

@@ -17,6 +17,53 @@ namespace AsyncResponse.IntegrationTests;
 public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
+    public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
+    {
+        // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its
+        // sequence, which registration and delivery claims now require unconditionally. The
+        // channel must fail at first use with an error carrying the exact migration — not a raw
+        // "invalid column name" mid-operation — and work immediately once the documented
+        // migration has been applied.
+        await WithSchemaAsync("managed_upgrade", async schema =>
+        {
+            var creator = new SqlServerChannelSql(Options.Create(ChannelOptions(schema)));
+            await creator.EnsureCreatedAsync();
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var strip = connection.CreateCommand();
+                strip.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} DROP COLUMN acked_seq;
+                    DROP SEQUENCE {creator.AckSequence};
+                    """;
+                await strip.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerChannelSql(Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("acked_seq", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("docs/sqlserver.md", ex.Message, StringComparison.Ordinal);
+
+            // The exact migration from docs/sqlserver.md, "Upgrading a manually managed schema".
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var migrate = connection.CreateCommand();
+                migrate.CommandText = ex.Message[(ex.Message.IndexOf("IF COL_LENGTH", StringComparison.Ordinal))..ex.Message.IndexOf(" See docs/", StringComparison.Ordinal)];
+                await migrate.ExecuteNonQueryAsync();
+            }
+
+            var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+        });
+    }
+
+    [Fact]
     public async Task ChannelSql_RoundTripsRecoverySubscribersMessagesAndClaims()
     {
         await WithSchemaAsync("channel_sql", async schema =>

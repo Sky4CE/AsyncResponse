@@ -134,6 +134,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // Local: CleanupOnceAsync — ends the stream (which ends the consume loop), deletes
         // recovery state, and tears down the timeout, exactly once.
         int cleanupStarted = 0;
+        int consumeLoopFaulted = 0;
         int teardownBudgetSpent = 0;
         var subscriptionTornDown = false;
         var cleanupGate = new object();
@@ -465,6 +466,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 _logger.LogError(ex, "Response subscription loop failed for subject {Subject}.", subject);
                 AsyncResponseDiagnostics.SetError(activity, ex);
+                // Flag BEFORE faulting the task: a loop death is a TRANSPORT failure, not a
+                // delivered response, and the registration path below must be able to tell the
+                // two kinds of faulted task apart — a delivered failure settles the wait; a dead
+                // loop means nothing was delivered and nothing ever will be.
+                Interlocked.Exchange(ref consumeLoopFaulted, 1);
                 if (!tcs.TrySetException(ex))
                     _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 await CleanupOnceAsync().ConfigureAwait(false);
@@ -527,7 +533,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
             _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
         }
-        catch (Exception ex) when (tcs.Task.IsCompletedSuccessfully || tcs.Task.IsFaulted)
+        catch (Exception ex) when ((tcs.Task.IsCompletedSuccessfully || tcs.Task.IsFaulted)
+                                   && Volatile.Read(ref consumeLoopFaulted) == 0)
         {
             // The wait already settled: a delivery on the consume loop completed the waiter while
             // this registration step was still in flight (cleanup marks cleanupStarted just after
@@ -558,6 +565,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // left to receive (or recover) its response. Cleanup leaves nothing behind and cancels
             // the response task rather than faulting it, so no unobserved fault lingers.
             throw;
+        }
+
+        if (Volatile.Read(ref consumeLoopFaulted) != 0)
+        {
+            // The consume loop died while this registration was in flight: the response task is
+            // faulted with a TRANSPORT error, not a delivered response; no subscription is live;
+            // and the loop's cleanup already ran (deleting any saved recovery state, backed by the
+            // post-save compensation). Returning the waiter would let the builder fire the trigger
+            // with nothing registered to receive — or recover — its response, so the builder
+            // contract applies: throw, and the remote operation never starts.
+            var loopFailure = tcs.Task.IsFaulted ? tcs.Task.Exception?.GetBaseException() : null;
+            throw new InvalidOperationException(
+                $"The NATS response subscription for correlationId {correlationId} failed before registration completed.",
+                loopFailure);
         }
 
         try

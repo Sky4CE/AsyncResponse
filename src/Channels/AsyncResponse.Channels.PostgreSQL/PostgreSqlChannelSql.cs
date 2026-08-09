@@ -57,8 +57,19 @@ internal sealed class PostgreSqlChannelSql
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
+
+        if (!_options.AutoCreateSchema)
+        {
+            // Manually managed schemas get a one-time validation instead of DDL: 1.0.0 added
+            // acked_seq and its sequence, which waiter registration and delivery claims require
+            // unconditionally — without this check an un-migrated schema fails later with a raw
+            // "column does not exist" mid-operation instead of an actionable startup error
+            // carrying the exact migration.
+            await ValidateManagedSchemaAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -129,6 +140,49 @@ internal sealed class PostgreSqlChannelSql
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            _created = true;
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+    }
+
+    private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
+    {
+        await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_created)
+                return;
+
+            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                SELECT
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @table AND column_name = 'acked_seq'),
+                  to_regclass('{AckSequence}') IS NOT NULL;
+                """;
+            command.Parameters.AddWithValue("schema", _options.SchemaName);
+            command.Parameters.AddWithValue("table", _options.MessageTable);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var hasColumn = reader.GetBoolean(0);
+            var hasSequence = reader.GetBoolean(1);
+            if (!hasColumn || !hasSequence)
+            {
+                throw new InvalidOperationException(
+                    $"The PostgreSQL channel schema is managed manually (AutoCreateSchema = false) but is missing " +
+                    $"objects this version requires: " +
+                    $"{(hasColumn ? "" : $"column {MessageTable}.acked_seq")}{(!hasColumn && !hasSequence ? " and " : "")}{(hasSequence ? "" : $"sequence {AckSequence}")}. " +
+                    $"Apply the migration and restart: " +
+                    $"ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL; " +
+                    $"CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint; " +
+                    "See docs/postgresql.md, section 'Upgrading a manually managed schema'.");
+            }
+
             _created = true;
         }
         finally

@@ -100,7 +100,25 @@ instances — and the channel and transport inside one app — never race each o
 The packages do **not** create the database itself: point `ConnectionString` at an existing database
 (the sample app ships a small provisioner that creates it for containers/dev). Set
 `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
-distinct even when they share the same schema. Correlation ids are stored as `nvarchar(400)` key
+distinct even when they share the same schema.
+
+### Upgrading a manually managed schema
+
+1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`
+the channel validates these objects once at startup and fails with an actionable error until the
+migration below is applied (names shown for the default `dbo.asyncresponse_channel_messages`; the
+sequence is always `{message_table}_ack_seq` in the same schema):
+
+```sql
+IF COL_LENGTH(N'dbo.asyncresponse_channel_messages', N'acked_seq') IS NULL
+    ALTER TABLE dbo.asyncresponse_channel_messages ADD acked_seq bigint NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.sequences
+               WHERE name = N'asyncresponse_channel_messages_ack_seq' AND schema_id = SCHEMA_ID(N'dbo'))
+    CREATE SEQUENCE dbo.asyncresponse_channel_messages_ack_seq AS bigint START WITH 1;
+```
+
+The column is nullable and the migration is safe to run while old-version hosts are still up:
+rows they ack carry no sequence and fall back to the previous watermark rule. Correlation ids are stored as `nvarchar(400)` key
 columns — keep ids at or under 400 characters (generated ids are far shorter).
 
 ## Configuration checklist

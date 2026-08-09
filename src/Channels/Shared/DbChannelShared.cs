@@ -176,6 +176,11 @@ internal abstract class DbAsyncResponseChannelBase :
         // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
+        // Refuse BEFORE any store round trip: EnsureCreatedAsync now validates manually managed
+        // schemas over the network, and a disposed channel must fail with ObjectDisposedException,
+        // not with whatever that connection attempt throws. EnsureListenerStarted below re-checks
+        // under the gate, so a dispose racing this early check still cannot start listeners.
+        ThrowIfDisposed();
         await _store.EnsureCreatedAsync().ConfigureAwait(false);
         EnsureListenerStarted();
 
@@ -565,6 +570,15 @@ internal abstract class DbAsyncResponseChannelBase :
             _subscriptions.TryRemove(correlationId, out _);
     }
 
+    private void ThrowIfDisposed()
+    {
+        lock (_listenerGate)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(_channelTypeName);
+        }
+    }
+
     private protected void EnsureListenerStarted()
     {
         lock (_listenerGate)
@@ -893,13 +907,31 @@ internal abstract class DbAsyncResponseChannelBase :
     /// The same-tick equality is symmetric — it can also be a genuine cross-process fan-out
     /// delivery (this waiter registered and another process's claim stamped <c>acked_at</c>
     /// inside one clock tick) — and no timestamp can separate the two cases. The store's
-    /// monotonic ack sequence does, exactly: every delivery claim draws <c>acked_seq</c> from the
-    /// same monotonic source the subscription drew <c>StartedSeq</c> from at registration, so
-    /// "acked before this waiter existed" versus "acked to a group including this waiter" is a
-    /// strict integer comparison with no tie to resolve. The timestamp comparison remains as the
-    /// fallback for rows stamped by a pre-sequence build during a rolling upgrade, where it keeps
-    /// the previous deliberate at-most-once resolution (excluded fan-out recovers through its
-    /// step timeout and the idempotent-restart contract).
+    /// monotonic ack sequence breaks EXACTLY that tie: every delivery claim stamps
+    /// <c>acked_seq</c> drawn from the same monotonic source the subscription drew
+    /// <c>StartedSeq</c> from at registration.
+    /// </para>
+    /// <para>
+    /// The sequence deliberately does NOT outrank truthful (unequal) timestamps. A claim's
+    /// sequence value is drawn BEFORE the claim becomes visible — MongoDB draws from a separate
+    /// counter document, SQL Server in a <c>DECLARE</c> ahead of an <c>UPDATE</c> that may block
+    /// on a row lock, and even PostgreSQL's <c>nextval</c> evaluates before the commit — so a
+    /// claim can draw <c>41</c>, stall, and land AFTER a waiter registered at <c>42</c>. Ranking
+    /// the sequence above timestamps would exclude that delivery as history even though
+    /// <c>acked_at</c> truthfully post-dates the registration tick. With timestamps primary, the
+    /// stalled claim lands in a LATER tick and is delivered by the timestamp rule; the sequence
+    /// is consulted only when the tick is identical.
+    /// </para>
+    /// <para>
+    /// Inside the tie the sequence can never replay history: a claim visible before a same-tick
+    /// registration drew its value before that visibility, hence before the registration's own
+    /// draw — <c>acked_seq &lt; StartedSeq</c> — and is excluded. The only residual conservatism
+    /// is a claim whose draw-to-execution stall ends exactly in the registration's tick: it
+    /// resolves as history, which is the same verdict the timestamp-only rule gave every tie —
+    /// never worse, and exact whenever draws are not stalled (the overwhelmingly common case).
+    /// Rows acked by a pre-sequence build carry no <c>acked_seq</c> and keep the old at-most-once
+    /// tie resolution (excluded fan-out recovers through its step timeout and the
+    /// idempotent-restart contract).
     /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)
@@ -907,11 +939,21 @@ internal abstract class DbAsyncResponseChannelBase :
         if (message.CreatedAtUtc < subscription.StartedAtUtc.AddSeconds(-1))
             return false;
 
-        // Exact path: both sides carry positions in the store's monotonic ack sequence.
+        if (message.AckedAtUtc is null)
+            return true;
+
+        // Timestamps are primary: strictly later tick = delivered, strictly earlier = history.
+        if (message.AckedAtUtc > subscription.StartedAtUtc)
+            return true;
+        if (message.AckedAtUtc < subscription.StartedAtUtc)
+            return false;
+
+        // Same-tick tie: the monotonic ack sequence arbitrates when the claim carries one.
         if (message.AckedSeq is { } ackedSeq)
             return ackedSeq > subscription.StartedSeq;
 
-        return message.AckedAtUtc is null || message.AckedAtUtc > subscription.StartedAtUtc;
+        // Legacy tie (row acked by a pre-sequence build): the old conservative resolution.
+        return false;
     }
 
     private async Task TryDispatchLocalSubscribersAsync(DbChannelMessage message, CancellationToken cancellationToken)

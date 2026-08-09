@@ -57,8 +57,19 @@ internal sealed class SqlServerChannelSql
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
+
+        if (!_options.AutoCreateSchema)
+        {
+            // Manually managed schemas get a one-time validation instead of DDL: 1.0.0 added
+            // acked_seq and its sequence, which waiter registration and delivery claims require
+            // unconditionally — without this check an un-migrated schema fails later with a raw
+            // "invalid column name" mid-operation instead of an actionable startup error carrying
+            // the exact migration.
+            await ValidateManagedSchemaAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -148,6 +159,46 @@ internal sealed class SqlServerChannelSql
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            _created = true;
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+    }
+
+    private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
+    {
+        await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_created)
+                return;
+
+            await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                SELECT
+                  CASE WHEN COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NOT NULL THEN 1 ELSE 0 END,
+                  CASE WHEN EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) THEN 1 ELSE 0 END;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var hasColumn = reader.GetInt32(0) == 1;
+            var hasSequence = reader.GetInt32(1) == 1;
+            if (!hasColumn || !hasSequence)
+            {
+                throw new InvalidOperationException(
+                    $"The SQL Server channel schema is managed manually (AutoCreateSchema = false) but is missing " +
+                    $"objects this version requires: " +
+                    $"{(hasColumn ? "" : $"column {MessageTable}.acked_seq")}{(!hasColumn && !hasSequence ? " and " : "")}{(hasSequence ? "" : $"sequence {AckSequence}")}. " +
+                    $"Apply the migration and restart: " +
+                    $"IF COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NULL ALTER TABLE {MessageTable} ADD acked_seq bigint NULL; " +
+                    $"IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) CREATE SEQUENCE {AckSequence} AS bigint START WITH 1; " +
+                    "See docs/sqlserver.md, section 'Upgrading a manually managed schema'.");
+            }
+
             _created = true;
         }
         finally

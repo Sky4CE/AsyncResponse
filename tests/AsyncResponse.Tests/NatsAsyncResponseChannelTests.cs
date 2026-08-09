@@ -155,6 +155,41 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_ConsumeLoopFailureDuringRegistration_ThrowsInsteadOfReturningAFaultedWaiter()
+    {
+        // A consume-loop death faults the response task with a TRANSPORT error — nothing was
+        // delivered and nothing ever will be. Treating that faulted task as a settled wait
+        // returned a waiter, and the builder then fired the remote trigger with no live
+        // subscription and no recovery state left to route its response. Registration must throw
+        // so the operation never starts. Deterministic: the loop's cleanup deletes the recovery
+        // state, and observing that delete is what releases the parked save — so the loop death
+        // is strictly inside the registration window.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-loop-death");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.FailSubscription(new IOException("stream down"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiterTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("failed before registration completed", ex.Message, StringComparison.Ordinal);
+        Assert.IsType<IOException>(ex.InnerException);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WithoutExecutionContext_UsesRecoveryExpiryTimeoutFallback()
     {
         Task<IAsyncResponseWaiter<OperationResult>> waiterTask;

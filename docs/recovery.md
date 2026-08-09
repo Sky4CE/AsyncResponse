@@ -277,14 +277,18 @@ worker with a shape it does not understand.
 ## Shared-correlation recovery
 
 Multiple recoverable waiters may share one correlation id. Live delivery fans out to every active
-waiter, with one deliberate exception on the database channels: a waiter whose registration lands
-in the **same server-clock tick** as another process's delivery claim is indistinguishable from a
-finished predecessor reusing the correlation id, and the tie is resolved toward exclusion — the
-waiter misses that delivery. A durable-flow step then faults at its step timeout and restarts the
-idempotent step fresh; a plain waiter surfaces a `TimeoutException` to its caller (at-most-once
-for the tie; wrong-data redelivery would be the alternative). See the `IsWithinWatermark` documentation in the DB channel
-source for the full trade, and roadmap §5.6 for the sequence-based design that would remove the
-tie entirely. If all waiters are lost, the recovery store keeps one registration per waiter and a
+waiter. On the database channels, a registration and another process's delivery claim can land in
+the **same server-clock tick** — indistinguishable by timestamps from a finished predecessor
+reusing the correlation id. The monotonic ack sequence breaks exactly that tie (see the delivery
+protocol above): claims and registrations draw from one sequence, so tick-tied history and
+fan-out separate by integer order. The one conservative residual: a claim whose sequence draw
+stalled from an earlier tick into that exact tick resolves as history — the waiter misses that
+delivery (a durable-flow step faults at its step timeout and restarts the idempotent step fresh;
+a plain waiter surfaces a `TimeoutException`), which is the same verdict the previous
+timestamp-only rule gave every tie and can never replay a consumed response. Rows acked by a
+pre-1.0 build carry no sequence and keep that older at-most-once tie resolution. See the
+`IsWithinWatermark` documentation in the DB channel source for the full reasoning. If all
+waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
 

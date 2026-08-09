@@ -231,16 +231,17 @@ public sealed class DbChannelSharedCoverageTests
     /// The same-tick photo-finish that timestamps cannot arbitrate: <c>acked_at</c> equal to the
     /// subscription's start is EITHER history (a predecessor consumed it just before this waiter
     /// registered) OR a cross-process fan-out delivery to a group including this waiter. The
-    /// monotonic ack sequence separates them exactly — a claim that drew before the waiter's
-    /// registration draw is history (excluded, no store touch), one that drew after is fan-out
-    /// (included: the claim runs and the failing store throws). Under the old timestamp-only
-    /// watermark both cases were excluded, silently costing the fan-out waiter its response.
+    /// monotonic ack sequence breaks exactly that tie — and ONLY that tie: sequence values are
+    /// drawn before claims become visible, so a claim can draw early, stall past a registration,
+    /// and land in a later tick — where the truthful timestamp must win (ranking the sequence
+    /// above timestamps excluded precisely that delivery as history). Excluded messages never
+    /// touch the store; included ones run the claim and the failing store throws.
     /// </summary>
     [Theory]
     [InlineData(Provider.SqlServer)]
     [InlineData(Provider.PostgreSql)]
     [InlineData(Provider.MongoDb)]
-    public async Task DeliveryWatermark_SameTickTie_IsResolvedExactlyByTheAckSequence(Provider provider)
+    public async Task DeliveryWatermark_SameTickTie_IsResolvedByTheAckSequence_AndTimestampsStayPrimary(Provider provider)
     {
         await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
         var startedAt = DateTimeOffset.UtcNow;
@@ -256,10 +257,21 @@ public sealed class DbChannelSharedCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
             dispatch, harness.Message("null", ackedAtUtc: startedAt, ackedSeq: 101), subscriptions, CancellationToken.None));
 
-        // Sequence stamps win over CONTRADICTING timestamps too (an acked_at far in the past with
-        // a post-registration draw is still fan-out): the exact path consults only the sequence.
+        // Identical timestamps, no sequence stamp (row acked by a pre-sequence build): the legacy
+        // conservative tie resolution — history, excluded.
+        await harness.InvokeAsync(
+            dispatch, harness.Message("null", ackedAtUtc: startedAt), subscriptions, CancellationToken.None);
+
+        // A claim that DREW before this waiter registered (99 < 100) but STALLED and landed in a
+        // strictly later tick is a delivery this waiter is part of — the truthful timestamp wins
+        // over the stale draw order. Ranking the sequence first wrongly excluded exactly this.
         await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
-            dispatch, harness.Message("null", ackedAtUtc: startedAt.AddSeconds(-5), ackedSeq: 101), subscriptions, CancellationToken.None));
+            dispatch, harness.Message("null", ackedAtUtc: startedAt.AddSeconds(5), ackedSeq: 99), subscriptions, CancellationToken.None));
+
+        // And a claim acked in a strictly EARLIER tick is history regardless of its sequence
+        // value — a late-stamped high draw must not resurrect a consumed response.
+        await harness.InvokeAsync(
+            dispatch, harness.Message("null", ackedAtUtc: startedAt.AddSeconds(-5), ackedSeq: 101), subscriptions, CancellationToken.None);
     }
 
     /// <summary>
