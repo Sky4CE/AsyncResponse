@@ -24,14 +24,17 @@ internal static class SqlServerTransportOptionsValidator
                 $"{nameof(options.ResponseQueue)}, and {nameof(options.DeadLetterQueue)} must be distinct; they share one queue table.");
         }
 
-        if (options.DeadLetterRetention is { } deadLetterRetention && deadLetterRetention <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(options.DeadLetterRetention)} must be positive when set.");
+        // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
+        // lease-renewal Task.Delay at half its value); DeadLetterRetention is a database-side
+        // "now - retention" prune cutoff and gets the persistence bound instead.
+        if (options.DeadLetterRetention is { } deadLetterRetention)
+            AsyncResponseChannelOptions.EnsurePersistedTtl(deadLetterRetention, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.DeadLetterRetention));
 
-        Positive(options.LockTimeout, nameof(options.LockTimeout));
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.LockTimeout, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.LockTimeout));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(SqlServerAsyncResponseTransportOptions), nameof(options.SubscriberRetryMaxDelay));
 
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
@@ -68,8 +71,10 @@ internal static class SqlServerTransportOptionsValidator
         if (subscriber.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.MaxDeliveryAttempts)} ({role}) cannot be negative.");
 
-        Positive(subscriber.RedeliveryDelay, $"{nameof(subscriber.RedeliveryDelay)} ({role})");
-        Positive(subscriber.EmptyPollDelay, $"{nameof(subscriber.EmptyPollDelay)} ({role})");
+        // RedeliveryDelay is a database-side "now + delay" visibility stamp (persistence bound);
+        // EmptyPollDelay arms the idle-poll Task.Delay (timer ceiling).
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriber.RedeliveryDelay, nameof(SqlServerSubscriberOptions), $"{nameof(subscriber.RedeliveryDelay)} ({role})");
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.EmptyPollDelay, nameof(SqlServerSubscriberOptions), $"{nameof(subscriber.EmptyPollDelay)} ({role})");
 
         switch (subscriber.AckMode)
         {
@@ -80,7 +85,7 @@ internal static class SqlServerTransportOptionsValidator
                     throw new InvalidOperationException($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
                     throw new InvalidOperationException($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
-                Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.BackgroundDrainTimeout, nameof(SqlServerSubscriberOptions), $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
             default:
                 throw new InvalidOperationException($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.AckMode)} ({role}) has unsupported value '{subscriber.AckMode}'.");
@@ -99,12 +104,11 @@ internal static class SqlServerTransportOptionsValidator
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(SqlServerAsyncResponseTransportOptions)}.{name} '{value}' must be a simple SQL Server identifier (letters, digits, and underscores; not starting with a digit).");
-    }
-
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(SqlServerAsyncResponseTransportOptions)}.{name} must be positive.");
+        // sysname caps identifiers at 128; an over-limit name fails at DDL time with a raw
+        // "identifier too long" error instead of an actionable configuration error.
+        if (value.Length > 128)
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseTransportOptions)}.{name} '{value}' is {value.Length} characters; SQL Server identifiers are limited to 128.");
     }
 
     private static bool IsIdentifier(string value)

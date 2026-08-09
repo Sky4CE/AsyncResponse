@@ -165,7 +165,10 @@ Connection-string notes:
 ## Operational notes
 
 - Use simple SQL Server identifiers for schema/table names: letters, digits, and underscores, not
-  starting with a digit.
+  starting with a digit, at most 128 characters (sysname). Derived names —
+  `{MessageTable}_ack_seq` and the `*_idx` indexes — reserve their suffix space by truncating the
+  table stem, and validation rejects a configuration whose tables collide with the derived
+  sequence name.
 - `ActivePollInterval` bounds cross-process response latency; `IdlePollInterval` bounds idle database
   load. Same-process deliveries (the common case when the waiter and the publisher share the app)
   never wait for either.

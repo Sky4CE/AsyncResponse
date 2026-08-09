@@ -33,6 +33,28 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
             Assert.True(startSeq > 0);
 
+            // Every derived index must actually exist in the catalog. Whole-name truncation used
+            // to make both messages-table index names equal the table's own name, so CREATE INDEX
+            // IF NOT EXISTS matched the table relation and created ZERO indexes — invisible to
+            // any test that only drew from the sequence.
+            var indexNames = new List<string>();
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var indexes = connection.CreateCommand())
+            {
+                indexes.CommandText = "SELECT indexname FROM pg_indexes WHERE schemaname = @schema;";
+                indexes.Parameters.AddWithValue("schema", schema);
+                await using var reader = await indexes.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    indexNames.Add(reader.GetString(0));
+            }
+
+            // Suffix space is reserved by truncating the table STEM, so at the 63-character cap
+            // the two messages-table indexes stay distinct from each other and from the table.
+            Assert.Contains(new string('m', 51) + "_expires_idx", indexNames);
+            Assert.Contains(new string('m', 39) + "_correlation_created_idx", indexNames);
+            Assert.Contains("asyncresponse_recovery_state_expires_idx", indexNames);
+            Assert.Contains("asyncresponse_channel_subscribers_expires_idx", indexNames);
+
             // The relkind-precise managed-schema validation passes against the real sequence.
             var managedOptions = ChannelOptions(schema);
             managedOptions.MessageTable = options.MessageTable;

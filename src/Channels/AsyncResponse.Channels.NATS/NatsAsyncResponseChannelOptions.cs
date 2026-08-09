@@ -78,8 +78,12 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
         if (RecoveryBucketReplicas <= 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(RecoveryBucketReplicas)} must be positive.");
 
-        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
-        Positive(PresenceProbeTimeout, nameof(PresenceProbeTimeout));
+        // Both feed NatsSubOpts.Timeout on the reply subscription (publish confirmation and the
+        // watchdog's presence probe). The NATS client arms a timer from that value — an
+        // over-ceiling timeout throws at subscribe time, mid-operation, and TimeSpan.MaxValue
+        // disables the timeout entirely, hanging the probe — so both are bounded here instead.
+        EnsureTimerBacked(DeliveryConfirmationTimeout, nameof(NatsAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        EnsureTimerBacked(PresenceProbeTimeout, nameof(NatsAsyncResponseChannelOptions), nameof(PresenceProbeTimeout));
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
@@ -105,11 +109,5 @@ public sealed class NatsAsyncResponseChannelOptions : DurableAsyncResponseChanne
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{name} must be configured.");
-    }
-
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(NatsAsyncResponseChannelOptions)}.{name} must be positive.");
     }
 }

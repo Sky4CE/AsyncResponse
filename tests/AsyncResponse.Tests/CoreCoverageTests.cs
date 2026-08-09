@@ -219,6 +219,11 @@ public sealed class CoreCoverageTests
         Assert.True(await store.TryCreateAsync("existing", State("existing"), TimeSpan.FromMinutes(1)));
         Assert.False(await store.TryCreateAsync("existing", State("existing"), TimeSpan.FromMinutes(1)));
 
+        // Callers can pass raw ttls (not just validated options); every external store saturates
+        // the "now + ttl" stamp, and the in-memory one used to overflow instead.
+        Assert.True(await store.TryCreateAsync("huge-ttl", State("huge-ttl"), TimeSpan.MaxValue));
+        Assert.NotNull(await store.LoadAsync("huge-ttl"));
+
         var expiring = State("expiring");
         Assert.True(await store.TryCreateAsync("expiring", expiring, TimeSpan.FromMilliseconds(5)));
         await Task.Delay(20);

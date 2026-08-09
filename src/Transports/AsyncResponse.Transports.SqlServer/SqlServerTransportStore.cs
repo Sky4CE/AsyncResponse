@@ -449,10 +449,16 @@ internal sealed class SqlServerTransportStore
 
     private static string Quote(string identifier) => "[" + identifier + "]";
 
-    private static string IndexName(string table, string suffix)
+    // Suffix space is RESERVED before capping (mirrors the channel store's derived-name rule):
+    // truncating the whole "{table}_{suffix}_idx" let a maximum-length queue table derive one
+    // shared name for both indexes — the second IF NOT EXISTS guard matched the first index and
+    // silently skipped creation.
+    internal static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 128 ? name : name[..128];
+        var tail = $"_{suffix}_idx";
+        const int identifierCap = 128;
+        var stem = table.Length <= identifierCap - tail.Length ? table : table[..(identifierCap - tail.Length)];
+        return stem + tail;
     }
 
     private static readonly TimeSpan DeadLetterPruneThrottle = TimeSpan.FromMinutes(1);

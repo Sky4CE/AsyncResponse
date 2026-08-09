@@ -671,6 +671,11 @@ internal sealed class SqlServerChannelSql
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(SqlServerAsyncResponseChannelOptions)}.{name} '{value}' must be a simple SQL Server identifier (letters, digits, and underscores; not starting with a digit).");
+        // sysname caps identifiers at 128; an over-limit name fails at DDL time with a raw
+        // "identifier too long" error instead of an actionable configuration error.
+        if (value.Length > IdentifierCap)
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseChannelOptions)}.{name} '{value}' is {value.Length} characters; SQL Server identifiers are limited to {IdentifierCap}.");
     }
 
     private static bool IsIdentifier(string value)
@@ -689,22 +694,58 @@ internal sealed class SqlServerChannelSql
 
     private static string Quote(string identifier) => "[" + identifier + "]";
 
-        // Suffix space is RESERVED before capping: truncating "{table}_ack_seq" as a whole let a
-        // maximum-length table name produce exactly the table's own name — the sequence then
-        // collided with the table (they share a namespace), creation was skipped or failed, and
-        // the first sequence draw failed at runtime instead of registration.
+    /// <summary>SQL Server's identifier length cap (sysname); longer names error at DDL time.</summary>
+    internal const int IdentifierCap = 128;
+
+    // Suffix space is RESERVED before capping in BOTH derived-name helpers: truncating the whole
+    // "{table}{suffix}" let a maximum-length table name derive exactly its own name (the sequence
+    // collided with the table in the schema-object namespace and CREATE SEQUENCE failed) or let
+    // the table's two indexes derive one shared name (the second IF NOT EXISTS guard matched the
+    // first index and silently skipped creation).
     private static string SequenceName(string table)
     {
         const string suffix = "_ack_seq";
-        const int identifierCap = 128;
-        var stem = table.Length <= identifierCap - suffix.Length ? table : table[..(identifierCap - suffix.Length)];
+        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
         return stem + suffix;
     }
 
     private static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 128 ? name : name[..128];
+        var tail = $"_{suffix}_idx";
+        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
+        return stem + tail;
+    }
+
+    /// <summary>
+    /// Validates the effective schema-object name plan: the three configured tables plus the
+    /// derived ack sequence must be pairwise distinct (they share SQL Server's schema-scoped
+    /// object namespace, and a table whose name ends exactly where the reserved "_ack_seq" stem
+    /// truncates derives its own name). Index names live in per-table namespaces and carry
+    /// distinct reserved suffixes, so they cannot collide once the tables are distinct.
+    /// Comparison is case-insensitive to match SQL Server's default catalog collations.
+    /// </summary>
+    public static void ValidateNamePlan(SqlServerAsyncResponseChannelOptions options)
+    {
+        (string Role, string Name)[] plan =
+        [
+            ($"{nameof(options.RecoveryStateTable)} table", options.RecoveryStateTable),
+            ($"{nameof(options.MessageTable)} table", options.MessageTable),
+            ($"{nameof(options.SubscriberTable)} table", options.SubscriberTable),
+            ("ack sequence (derived from MessageTable)", SequenceName(options.MessageTable)),
+        ];
+        for (var i = 0; i < plan.Length; i++)
+        {
+            for (var j = i + 1; j < plan.Length; j++)
+            {
+                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"{nameof(SqlServerAsyncResponseChannelOptions)}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
+                        "Tables and the sequence derived from MessageTable share one schema-object namespace and must be distinct " +
+                        "(long names reserve suffix space by truncating the table stem). Shorten or de-overlap the configured table names.");
+                }
+            }
+        }
     }
 
     /// <summary>

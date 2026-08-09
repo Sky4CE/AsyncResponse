@@ -126,6 +126,19 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
                 $"{nameof(MessageCollection)}, and {nameof(SubscriberCollection)} must be distinct collections.");
         }
 
+        // The derived "{MessageCollection}_counters" collection is part of the effective name
+        // plan: a configured collection occupying it would receive the ack-counter document —
+        // in the TTL-indexed recovery collection the reaper would silently delete the counter
+        // and reset the same-tick delivery tie-breaker.
+        var countersCollection = MongoDbChannelStore.CountersCollectionName(MessageCollection);
+        if (StringComparer.Ordinal.Equals(RecoveryStateCollection, countersCollection)
+            || StringComparer.Ordinal.Equals(SubscriberCollection, countersCollection))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}: '{countersCollection}' is reserved for the ack counter " +
+                $"(derived from {nameof(MessageCollection)}); {nameof(RecoveryStateCollection)} and {nameof(SubscriberCollection)} must not use it.");
+        }
+
         EnsurePersistedTtl(MessageRetention, nameof(MongoDbAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));

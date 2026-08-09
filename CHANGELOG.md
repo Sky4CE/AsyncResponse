@@ -148,6 +148,47 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **Derived index names now reserve suffix space at the identifier caps, and the full
+  object-name plan is validated (PostgreSQL, SQL Server — channels and transports).** The
+  generated index names truncated as a whole, so a maximum-length table name derived its own
+  name: on PostgreSQL `CREATE INDEX IF NOT EXISTS` matched the table relation and created ZERO
+  indexes; on SQL Server both indexes shared one name and only the first was created — silent
+  full scans either way. Index names now truncate the table STEM (as the ack-sequence name
+  already did), identifier length is enforced at validation (63/128 — PostgreSQL silently
+  truncates longer names server-side; SQL Server errors at DDL), and the complete effective name
+  plan (tables + derived sequence + derived indexes) is checked for pairwise distinctness, which
+  also catches a table occupying a derived name outright and two long tables whose reserved
+  stems truncate identically. The MongoDB channel likewise reserves the derived
+  `{MessageCollection}_counters` name — a recovery collection occupying it would have let the
+  TTL reaper silently delete the ack counter. The same rule is applied to the durable-flow
+  stores' derived `{TableName}_expires_idx` (PostgreSQL, SQL Server, MySQL, Oracle): stem
+  truncation at each provider's cap, identifier-length validation, and a PostgreSQL
+  relation-namespace collision guard. Boundary integration tests now assert the expected
+  catalog indexes on real servers.
+- **The timer-ceiling/persistence-bound classification now covers every timeout knob in every
+  package** — completing the "passes validation, throws (or hangs) mid-operation" family at both
+  ends. Timer-armed knobs (retry delays, poll/drain/shutdown timeouts, lock and visibility
+  renewal intervals, the watchdog interval and startup delay, the NATS channel's confirmation
+  and probe timeouts that feed `NatsSubOpts.Timeout`) are bounded by the ~49.7-day .NET timer
+  ceiling; values that become persisted or server-side "now + value" stamps (DB `LockTimeout`
+  renewal aside, redelivery-delay stamps, dead-letter retention, NATS `AckWait`/NAK delays,
+  Redis XAUTOCLAIM min-idle) carry the 3650-day persistence bound instead — and deliberately
+  accept beyond-timer-ceiling values. Client-specific domains are tighter still and enforced
+  with their own reasons: the Kafka client passes timeouts as 32-bit milliseconds
+  (`OperationTimeout`, `PollTimeout` ≤ ~24.8 days) and librdkafka caps
+  `auto.commit.interval.ms` at one day; AMQP heartbeats are 16-bit seconds
+  (`RequestedHeartbeat` ≤ 65535 s, zero = disabled). Google Pub/Sub's retry delays and shutdown
+  timeout previously had NO validation at all. Zero remains valid where it means "skip the
+  wait" (`Watchdog.StartupDelay`).
+- **Durable-flow option bounds re-classified to their actual sinks — a valid 60-day lease or
+  progress throttle no longer fails startup.** The previous release's upper bounds over-reached:
+  `ExecutionLeaseDuration` is a persisted lease deadline (the timers are the renew interval and
+  a capped poll) and now carries the persistence bound rather than the timer ceiling, the
+  explicitly timer-armed `ExecutionLeaseRenewInterval` carries the timer ceiling, and
+  `ProgressPersistenceInterval` — only ever compared against elapsed time — is merely
+  non-negative again. The defensive lease-release-on-construction-failure path (unreachable
+  after validation, and mislabeled its own failure) is removed; lease expiry remains the
+  backstop.
 - **A terminal response racing the waiter's registration can no longer orphan a callback-armed
   recovery registration (Redis, NATS).** Both channels go live before the recovery state is
   saved; a response completing the waiter in that window ran cleanup whose delete preceded the

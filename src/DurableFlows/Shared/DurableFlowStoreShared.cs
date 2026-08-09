@@ -155,7 +155,7 @@ internal static class DurableFlowStoreShared
     public static string SchemaLockResource(string schemaName)
         => $"asyncresponse:ddl:{schemaName}";
 
-    public static void ValidateIdentifier(string? value, string optionName, string providerName)
+    public static void ValidateIdentifier(string? value, string optionName, string providerName, int identifierCap = 0)
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{optionName} must be configured.");
@@ -168,6 +168,23 @@ internal static class DurableFlowStoreShared
             if (!(char.IsAsciiLetterOrDigit(c) || c == '_'))
                 throw new InvalidOperationException($"{optionName} '{value}' must be a simple {providerName} identifier (letters, digits, and underscores; not starting with a digit).");
         }
+
+        if (identifierCap > 0 && value.Length > identifierCap)
+            throw new InvalidOperationException(
+                $"{optionName} '{value}' is {value.Length} characters; {providerName} identifiers are limited to {identifierCap}.");
+    }
+
+    /// <summary>
+    /// Derived object name with suffix space RESERVED before the provider's identifier cap:
+    /// truncating the whole "{table}{suffix}" lets a maximum-length table name derive its own
+    /// name — on providers where indexes share the table namespace the DDL is then silently
+    /// skipped, on the rest it fails outright.
+    /// </summary>
+    public static string DerivedName(string tableName, string suffix, int identifierCap)
+    {
+        if (identifierCap <= 0 || tableName.Length + suffix.Length <= identifierCap)
+            return tableName + suffix;
+        return tableName[..(identifierCap - suffix.Length)] + suffix;
     }
 
     private static void ValidateWrite(string flowId, FlowState state, TimeSpan ttl)

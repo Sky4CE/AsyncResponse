@@ -43,6 +43,20 @@ public sealed class MongoDbOptionsTests
     }
 
     [Fact]
+    public void ChannelOptions_RejectCollectionsOccupyingTheDerivedCountersName()
+    {
+        // "{MessageCollection}_counters" is part of the effective name plan: were the TTL-indexed
+        // recovery collection to occupy it, the reaper would silently delete the ack counter and
+        // reset the same-tick delivery tie-breaker.
+        AssertChannelInvalid(
+            options => options.RecoveryStateCollection = $"{options.MessageCollection}_counters",
+            "reserved for the ack counter");
+        AssertChannelInvalid(
+            options => options.SubscriberCollection = $"{options.MessageCollection}_counters",
+            "reserved for the ack counter");
+    }
+
+    [Fact]
     public void ChannelOptions_RejectHeartbeatIntervalAtOrAboveTimeout()
     {
         var options = new MongoDbAsyncResponseChannelOptions

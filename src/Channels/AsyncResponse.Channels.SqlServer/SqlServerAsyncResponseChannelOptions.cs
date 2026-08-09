@@ -128,6 +128,7 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
         SqlServerChannelSql.ValidateIdentifier(RecoveryStateTable, nameof(RecoveryStateTable));
         SqlServerChannelSql.ValidateIdentifier(MessageTable, nameof(MessageTable));
         SqlServerChannelSql.ValidateIdentifier(SubscriberTable, nameof(SubscriberTable));
+        SqlServerChannelSql.ValidateNamePlan(this);
 
         EnsurePersistedTtl(MessageRetention, nameof(SqlServerAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));

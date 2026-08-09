@@ -138,7 +138,11 @@ Recommended Npgsql connection-string settings:
 ## Operational notes
 
 - Use simple PostgreSQL identifiers for schema/table/notification names: letters, digits, and
-  underscores, not starting with a digit.
+  underscores, not starting with a digit, at most 63 characters (PostgreSQL silently truncates
+  longer names, so validation rejects them). Derived names — `{MessageTable}_ack_seq` and the
+  `*_idx` indexes — reserve their suffix space by truncating the table stem, and validation
+  rejects a configuration whose effective name plan collides (for example a table occupying a
+  derived name, or two near-cap tables whose truncated stems derive the same index name).
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
   rows to decide whether to wait for live delivery. Registration writes one row, then each interval
   performs one update for the process's current active-registration snapshot. Rows no longer in that

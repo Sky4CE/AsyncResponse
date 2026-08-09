@@ -79,8 +79,15 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(SchemaName)}", "PostgreSQL");
-        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)}", "PostgreSQL");
+        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(SchemaName)}", "PostgreSQL", identifierCap: 63);
+        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)}", "PostgreSQL", identifierCap: 63);
+
+        // Indexes share PostgreSQL's relation namespace with tables: a table whose name ends
+        // exactly where the reserved "_expires_idx" stem truncates derives its own name, and
+        // CREATE INDEX IF NOT EXISTS would silently match the table and skip the index.
+        if (string.Equals(DurableFlowStoreShared.DerivedName(TableName, "_expires_idx", 63), TableName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -342,7 +349,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
 
     private string Schema => Quote(_options.SchemaName);
     private string Table => $"{Schema}.{Quote(_options.TableName)}";
-    private string IndexName => Quote($"{_options.TableName}_expires_idx");
+    private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63));
     private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 }
 }

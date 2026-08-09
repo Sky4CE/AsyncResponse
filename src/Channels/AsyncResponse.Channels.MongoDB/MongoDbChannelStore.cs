@@ -41,7 +41,7 @@ internal sealed class MongoDbChannelStore : IDisposable
         // The monotonic ack sequence: delivery claims and subscription registrations draw from
         // this ONE counter, giving acked_seq and a subscription's start position a total order no
         // pair of same-tick timestamps has. Created on first upsert; no index needed (_id only).
-        _counters = database.GetCollection<BsonDocument>($"{_options.MessageCollection}_counters");
+        _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection));
         _ownedClient = ownedClient;
     }
 
@@ -557,6 +557,14 @@ internal sealed class MongoDbChannelStore : IDisposable
                or MongoExecutionTimeoutException
                or TimeoutException
                || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
+
+    /// <summary>
+    /// Name of the derived ack-counter collection. Part of the effective collection-name plan:
+    /// options validation must keep the configured collections distinct from this derived name,
+    /// or counter documents land in (for example) the TTL-indexed recovery collection, where the
+    /// reaper would silently delete the ack sequence and reset the same-tick tie-breaker.
+    /// </summary>
+    internal static string CountersCollectionName(string messageCollection) => $"{messageCollection}_counters";
 
     /// <summary>Validates a MongoDB collection name coming from options.</summary>
     public static void ValidateCollectionName(string? value, string name)

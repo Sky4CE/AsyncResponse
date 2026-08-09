@@ -61,8 +61,8 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
         if (string.IsNullOrWhiteSpace(ConnectionString))
             throw new InvalidOperationException($"{nameof(SqlServerDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
 
-        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(SchemaName)}", "SQL Server");
-        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(TableName)}", "SQL Server");
+        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(SchemaName)}", "SQL Server", identifierCap: 128);
+        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(TableName)}", "SQL Server", identifierCap: 128);
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(SqlServerDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -338,7 +338,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         => $"DATEADD(SECOND, CAST({parameterName} / 1000 AS int), DATEADD(MILLISECOND, CAST({parameterName} % 1000 AS int), SYSUTCDATETIME()))";
 
     private string Table => $"{Quote(_options.SchemaName)}.{Quote(_options.TableName)}";
-    private string IndexName => $"{_options.TableName}_expires_idx";
+    private string IndexName => DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 128);
     private static string Quote(string identifier) => "[" + identifier + "]";
 }
 }

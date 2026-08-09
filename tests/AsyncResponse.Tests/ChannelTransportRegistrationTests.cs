@@ -309,8 +309,10 @@ public class ChannelTransportRegistrationTests
 
     [Theory]
     [InlineData(0, 1, 0, nameof(AsyncResponseWatchdogOptions.Interval))]
+    [InlineData(1440, 1, 0, nameof(AsyncResponseWatchdogOptions.Interval))] // 60 d > the timer ceiling: Task.Delay would throw mid-loop
     [InlineData(1, 0, 0, nameof(AsyncResponseWatchdogOptions.StaleAfter))]
     [InlineData(1, 1, -1, nameof(AsyncResponseWatchdogOptions.StartupDelay))]
+    [InlineData(1, 1, 86400, nameof(AsyncResponseWatchdogOptions.StartupDelay))] // 60 d > the timer ceiling
     public async Task StartupValidator_RejectsInvalidWatchdogOptions(
         int intervalHours,
         int staleAfterHours,
@@ -337,6 +339,31 @@ public class ChannelTransportRegistrationTests
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => validator.StartAsync(CancellationToken.None));
         Assert.Contains(expectedOption, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StartupValidator_AcceptsZeroStartupDelayAndUncappedStaleThreshold()
+    {
+        // Zero means "scan immediately" and stays valid; StaleAfter is compare-only (never armed
+        // as a timer), so a beyond-timer-ceiling threshold is a legitimate configuration.
+        var provider = Build(builder => builder
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows());
+        var validator = new AsyncResponseStartupValidator(
+            provider.GetServices<AsyncResponseChannelMarker>(),
+            provider.GetServices<AsyncResponseTransportMarker>(),
+            provider.GetServices<AsyncResponseDurableFlowStoreMarker>(),
+            Options.Create(new AsyncResponseOptions
+            {
+                Watchdog = new AsyncResponseWatchdogOptions
+                {
+                    StartupDelay = TimeSpan.Zero,
+                    StaleAfter = TimeSpan.FromDays(60)
+                }
+            }));
+
+        await validator.StartAsync(CancellationToken.None);
     }
 
     [Fact]

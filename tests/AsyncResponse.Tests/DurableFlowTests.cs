@@ -89,29 +89,51 @@ public class DurableFlowTests
     }
 
     [Theory]
-    [InlineData(nameof(DurableFlowOptions.StateExpiry))]
-    [InlineData(nameof(DurableFlowOptions.DefaultStepTimeout))]
-    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseDuration))]
-    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseRenewInterval))]
-    [InlineData(nameof(DurableFlowOptions.ProgressPersistenceInterval))]
-    public void DurableFlowOptions_InvalidValuesAreRejected(string propertyName)
+    [InlineData(nameof(DurableFlowOptions.StateExpiry), false)]
+    [InlineData(nameof(DurableFlowOptions.StateExpiry), true)]
+    [InlineData(nameof(DurableFlowOptions.DefaultStepTimeout), false)]
+    [InlineData(nameof(DurableFlowOptions.DefaultStepTimeout), true)]
+    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseDuration), false)]
+    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseDuration), true)]
+    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseRenewInterval), false)]
+    [InlineData(nameof(DurableFlowOptions.ExecutionLeaseRenewInterval), true)]
+    [InlineData(nameof(DurableFlowOptions.ProgressPersistenceInterval), false)]
+    public void DurableFlowOptions_InvalidValuesAreRejected(string propertyName, bool beyondCeiling)
     {
+        // beyondCeiling exercises each knob's UPPER bound at its actual sink: the persistence
+        // bound for "now + value" stamps (StateExpiry, ExecutionLeaseDuration), the .NET timer
+        // ceiling for timer-armed knobs (DefaultStepTimeout, ExecutionLeaseRenewInterval).
+        // ProgressPersistenceInterval has no upper bound — it only gates elapsed-time
+        // comparisons — so its only invalid value is negative.
         var options = new DurableFlowOptions();
-        switch (propertyName)
+        switch (propertyName, beyondCeiling)
         {
-            case nameof(DurableFlowOptions.StateExpiry):
+            case (nameof(DurableFlowOptions.StateExpiry), false):
                 options.StateExpiry = TimeSpan.Zero;
                 break;
-            case nameof(DurableFlowOptions.DefaultStepTimeout):
+            case (nameof(DurableFlowOptions.StateExpiry), true):
+                options.StateExpiry = TimeSpan.MaxValue;
+                break;
+            case (nameof(DurableFlowOptions.DefaultStepTimeout), false):
                 options.DefaultStepTimeout = TimeSpan.Zero;
                 break;
-            case nameof(DurableFlowOptions.ExecutionLeaseDuration):
+            case (nameof(DurableFlowOptions.DefaultStepTimeout), true):
+                options.DefaultStepTimeout = TimeSpan.FromDays(60);
+                break;
+            case (nameof(DurableFlowOptions.ExecutionLeaseDuration), false):
                 options.ExecutionLeaseDuration = TimeSpan.Zero;
                 break;
-            case nameof(DurableFlowOptions.ExecutionLeaseRenewInterval):
+            case (nameof(DurableFlowOptions.ExecutionLeaseDuration), true):
+                options.ExecutionLeaseDuration = TimeSpan.FromDays(4000);
+                break;
+            case (nameof(DurableFlowOptions.ExecutionLeaseRenewInterval), false):
                 options.ExecutionLeaseRenewInterval = options.ExecutionLeaseDuration;
                 break;
-            case nameof(DurableFlowOptions.ProgressPersistenceInterval):
+            case (nameof(DurableFlowOptions.ExecutionLeaseRenewInterval), true):
+                options.ExecutionLeaseDuration = TimeSpan.FromDays(120);
+                options.ExecutionLeaseRenewInterval = TimeSpan.FromDays(60);
+                break;
+            case (nameof(DurableFlowOptions.ProgressPersistenceInterval), false):
                 options.ProgressPersistenceInterval = TimeSpan.FromTicks(-1);
                 break;
         }
@@ -119,6 +141,23 @@ public class DurableFlowTests
         var exception = Assert.Throws<InvalidOperationException>(() => FlowStateConcurrency.ValidateOptions(options));
 
         Assert.Contains(propertyName, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void DurableFlowOptions_LongLeaseAndProgressIntervalsAreValid()
+    {
+        // Regression: these were briefly misclassified as timer-backed and a valid 60-day lease
+        // failed startup. The lease duration is a persisted "now + lease" deadline (the timers are
+        // the renew interval and a capped poll), and the progress interval is compare-only.
+        FlowStateConcurrency.ValidateOptions(new DurableFlowOptions
+        {
+            ExecutionLeaseDuration = TimeSpan.FromDays(60),
+            ExecutionLeaseRenewInterval = TimeSpan.FromDays(1),
+            ProgressPersistenceInterval = TimeSpan.FromDays(60),
+        });
+
+        // The defaults remain valid.
+        FlowStateConcurrency.ValidateOptions(new DurableFlowOptions());
     }
 
     [Fact]

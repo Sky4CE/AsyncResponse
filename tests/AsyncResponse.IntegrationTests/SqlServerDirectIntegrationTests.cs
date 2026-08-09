@@ -32,6 +32,35 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
             Assert.True(startSeq > 0);
 
+            // Every derived index must actually exist in the catalog. Whole-name truncation used
+            // to give both messages-table indexes ONE shared name, so the second IF NOT EXISTS
+            // guard matched the first index and silently skipped creation — invisible to any test
+            // that only drew from the sequence.
+            var indexNames = new List<string>();
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var indexes = connection.CreateCommand();
+                indexes.CommandText =
+                    """
+                    SELECT i.name FROM sys.indexes i
+                    JOIN sys.tables t ON t.object_id = i.object_id
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = @schema AND i.name IS NOT NULL;
+                    """;
+                indexes.Parameters.AddWithValue("@schema", schema);
+                await using var reader = await indexes.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    indexNames.Add(reader.GetString(0));
+            }
+
+            // Suffix space is reserved by truncating the table STEM, so at the 128-character cap
+            // the two messages-table indexes stay distinct.
+            Assert.Contains(new string('m', 116) + "_expires_idx", indexNames);
+            Assert.Contains(new string('m', 104) + "_correlation_created_idx", indexNames);
+            Assert.Contains("asyncresponse_recovery_state_expires_idx", indexNames);
+            Assert.Contains("asyncresponse_channel_subscribers_expires_idx", indexNames);
+
             var managedOptions = ChannelOptions(schema);
             managedOptions.MessageTable = options.MessageTable;
             managedOptions.AutoCreateSchema = false;

@@ -645,6 +645,11 @@ internal sealed class PostgreSqlChannelSql
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{name} '{value}' must be a simple PostgreSQL identifier (letters, digits, and underscores; not starting with a digit).");
+        // PostgreSQL TRUNCATES over-limit identifiers silently (a NOTICE, not an error), so an
+        // over-limit configured name would create/address an object under a different name.
+        if (value.Length > IdentifierCap)
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{name} '{value}' is {value.Length} characters; PostgreSQL identifiers are limited to {IdentifierCap} and longer names are silently truncated.");
     }
 
     private static bool IsIdentifier(string value)
@@ -663,22 +668,70 @@ internal sealed class PostgreSqlChannelSql
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 
+    /// <summary>PostgreSQL's identifier length cap (NAMEDATALEN - 1); longer names are silently truncated server-side.</summary>
+    internal const int IdentifierCap = 63;
+
+    // Suffix space is RESERVED before capping in BOTH derived-name helpers: truncating the whole
+    // "{table}{suffix}" let a maximum-length table name produce exactly the table's own name — the
+    // derived object then collided with the table (indexes, sequences, and tables share one
+    // relation namespace), CREATE ... IF NOT EXISTS silently skipped it, and the store ran with a
+    // missing sequence (runtime failure) or missing indexes (silent full scans).
     private static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 63 ? name : name[..63];
+        var tail = $"_{suffix}_idx";
+        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
+        return stem + tail;
     }
 
-        // Suffix space is RESERVED before capping: truncating "{table}_ack_seq" as a whole let a
-        // maximum-length table name produce exactly the table's own name — the sequence then
-        // collided with the table (they share a namespace), creation was skipped or failed, and
-        // the first sequence draw failed at runtime instead of registration.
     private static string SequenceName(string table)
     {
         const string suffix = "_ack_seq";
-        const int identifierCap = 63;
-        var stem = table.Length <= identifierCap - suffix.Length ? table : table[..(identifierCap - suffix.Length)];
+        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
         return stem + suffix;
+    }
+
+    /// <summary>
+    /// Validates the complete effective object-name plan — configured tables plus every derived
+    /// index and sequence name — for pairwise distinctness. Suffix reservation makes one table's
+    /// derived names collision-free, but two long tables whose reserved stems truncate identically
+    /// still derive the same index name, and a configured table can occupy a derived name outright;
+    /// either way <c>CREATE ... IF NOT EXISTS</c> silently skips the object. Comparison is
+    /// case-insensitive: the DDL quotes identifiers (case-sensitive to PostgreSQL), but a plan
+    /// distinct only by letter case is a misconfiguration magnet and is rejected for parity with
+    /// SQL Server's case-insensitive catalogs.
+    /// </summary>
+    public static void ValidateNamePlan(PostgreSqlAsyncResponseChannelOptions options)
+    {
+        (string Role, string Name)[] plan =
+        [
+            ($"{nameof(options.RecoveryStateTable)} table", options.RecoveryStateTable),
+            ($"{nameof(options.MessageTable)} table", options.MessageTable),
+            ($"{nameof(options.SubscriberTable)} table", options.SubscriberTable),
+            ("ack sequence (derived from MessageTable)", SequenceName(options.MessageTable)),
+            ("RecoveryStateTable expiry index", IndexName(options.RecoveryStateTable, "expires")),
+            ("MessageTable correlation index", IndexName(options.MessageTable, "correlation_created")),
+            ("MessageTable expiry index", IndexName(options.MessageTable, "expires")),
+            ("SubscriberTable expiry index", IndexName(options.SubscriberTable, "expires")),
+        ];
+        RequireDistinctNamePlan(plan, nameof(PostgreSqlAsyncResponseChannelOptions));
+    }
+
+    internal static void RequireDistinctNamePlan((string Role, string Name)[] plan, string optionsName)
+    {
+        for (var i = 0; i < plan.Length; i++)
+        {
+            for (var j = i + 1; j < plan.Length; j++)
+            {
+                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"{optionsName}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
+                        "All tables and the index/sequence names derived from them share one namespace and must be distinct " +
+                        "(long names reserve suffix space by truncating the table stem, which can make distinct tables derive " +
+                        "the same name). Shorten or de-overlap the configured table names.");
+                }
+            }
+        }
     }
 
     /// <summary>NOTIFY payload for a publish: the correlation id, or empty when it is too long to carry.</summary>

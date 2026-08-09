@@ -116,6 +116,7 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
         PostgreSqlChannelSql.ValidateIdentifier(MessageTable, nameof(MessageTable));
         PostgreSqlChannelSql.ValidateIdentifier(SubscriberTable, nameof(SubscriberTable));
         PostgreSqlChannelSql.ValidateIdentifier(NotificationChannel, nameof(NotificationChannel));
+        PostgreSqlChannelSql.ValidateNamePlan(this);
 
         EnsurePersistedTtl(MessageRetention, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));

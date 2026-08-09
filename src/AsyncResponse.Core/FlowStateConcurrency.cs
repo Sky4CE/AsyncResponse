@@ -35,30 +35,11 @@ internal static class FlowStateConcurrency
                 cancellationToken).ConfigureAwait(false))
             return null;
 
-        try
-        {
-            return new FlowExecutionLease(store, flowId, leaseId, options, logger);
-        }
-        catch (Exception constructionFailure)
-        {
-            // The persisted lease exists but no local owner does — without this release the flow
-            // is unexecutable until the lease expires. Defensive: with the option bounds above,
-            // no known input makes the constructor throw; if something ever does, the acquired
-            // lease must not leak. Best-effort — lease expiry remains the backstop.
-            try
-            {
-                await store.ReleaseLeaseAsync(flowId, leaseId, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception releaseFailure)
-            {
-                logger.LogWarning(releaseFailure,
-                    "Failed to release the execution lease for flow {FlowId} after lease construction failed; it expires on its own.",
-                    flowId);
-            }
-
-            logger.LogError(constructionFailure, "Execution-lease construction failed for flow {FlowId}; the acquired lease was released.", flowId);
-            throw;
-        }
+        // The constructor is throw-free after the option bounds above: it only assigns fields,
+        // computes a bounded "now + lease" stamp, and starts the renewal loop (whose first
+        // Task.Delay faults the loop task, never the constructor). Were that ever to change,
+        // lease expiry is the backstop for the persisted row.
+        return new FlowExecutionLease(store, flowId, leaseId, options, logger);
     }
 
     public static async Task<bool> MutateAsync(
@@ -96,27 +77,27 @@ internal static class FlowStateConcurrency
 
     internal static void ValidateOptions(DurableFlowOptions options)
     {
-        // Upper bounds close the "passes validation, throws mid-operation" gap: a
-        // TimeSpan.MaxValue StateExpiry overflowed the in-memory store's expiry stamp, an
-        // over-ceiling lease/renewal interval failed inside the renewal loop's timers, and an
-        // unbounded step timeout would be rejected only at waiter arming — after side effects.
+        // Upper bounds close the "passes validation, throws mid-operation" gap — but only on the
+        // knobs that actually reach the failing sink. StateExpiry and ExecutionLeaseDuration become
+        // "now + value" stamps (store TTLs and lease deadlines) and never arm a timer themselves,
+        // so they get the persistence bound; DefaultStepTimeout and ExecutionLeaseRenewInterval arm
+        // BCL timers, so they get the timer ceiling; ProgressPersistenceInterval is only ever
+        // compared against elapsed time (DurableFlowContext.ReportProgressAsync), so any
+        // non-negative value is representable — a 60-day lease or progress throttle is a valid
+        // configuration and must not fail startup.
         AsyncResponseChannelOptions.EnsurePersistedTtl(options.StateExpiry, nameof(DurableFlowOptions), nameof(options.StateExpiry));
         if (options.DefaultStepTimeout is { } defaultStepTimeout)
             AsyncResponseChannelOptions.EnsureTimerBacked(defaultStepTimeout, nameof(DurableFlowOptions), nameof(options.DefaultStepTimeout));
-        AsyncResponseChannelOptions.EnsureTimerBacked(options.ExecutionLeaseDuration, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseDuration));
-        if (options.ExecutionLeaseRenewInterval <= TimeSpan.Zero
-            || options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
+        AsyncResponseChannelOptions.EnsurePersistedTtl(options.ExecutionLeaseDuration, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseDuration));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ExecutionLeaseRenewInterval, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseRenewInterval));
+        if (options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
         {
             throw new InvalidOperationException(
-                $"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseRenewInterval)} must be positive and shorter than " +
+                $"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseRenewInterval)} must be shorter than " +
                 $"{nameof(DurableFlowOptions.ExecutionLeaseDuration)}.");
         }
         if (options.ProgressPersistenceInterval < TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.ProgressPersistenceInterval)} cannot be negative.");
-        if (options.ProgressPersistenceInterval > AsyncResponseChannelOptions.MaxTimerBackedTimeout)
-            throw new InvalidOperationException(
-                $"{nameof(DurableFlowOptions)}.{nameof(options.ProgressPersistenceInterval)} must be at most " +
-                $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#} days (the .NET timer ceiling).");
     }
 }
 

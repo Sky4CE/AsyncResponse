@@ -44,6 +44,26 @@ public sealed class SqlServerOptionsTests
     }
 
     [Fact]
+    public void ChannelOptions_RejectOverLimitIdentifiersAndNamePlanCollisions()
+    {
+        // sysname caps identifiers at 128; exactly 128 is legal and the derived sequence and
+        // index names reserve their own suffix space.
+        AssertChannelInvalid(
+            options => options.MessageTable = new string('m', 129),
+            "limited to 128");
+
+        // A configured table must not occupy the derived ack-sequence name — they share the
+        // schema-object namespace and CREATE SEQUENCE would fail (or silently be skipped).
+        AssertChannelInvalid(
+            options => options.SubscriberTable = $"{options.MessageTable}_ack_seq",
+            "ack sequence");
+
+        var atCap = ChannelOptions();
+        atCap.MessageTable = new string('m', 128);
+        atCap.Validate();
+    }
+
+    [Fact]
     public void ChannelOptions_RejectHeartbeatIntervalAtOrAboveTimeout()
     {
         var options = ChannelOptions();
@@ -136,6 +156,19 @@ public sealed class SqlServerOptionsTests
         AssertTransportInvalid(
             options => options.SchemaName = "1bad",
             nameof(SqlServerAsyncResponseTransportOptions.SchemaName));
+    }
+
+    [Fact]
+    public void TransportOptions_RejectOverLimitIdentifiersAndAcceptTheCap()
+    {
+        AssertTransportInvalid(
+            options => options.MessageTable = new string('q', 129),
+            "limited to 128");
+
+        // Exactly at the cap the derived index names reserve suffix space and stay distinct.
+        var atCap = TransportOptions();
+        atCap.MessageTable = new string('q', 128);
+        SqlServerTransportOptionsValidator.ValidateCommon(atCap);
     }
 
     [Fact]

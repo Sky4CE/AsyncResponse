@@ -22,15 +22,18 @@ internal static class MongoDbTransportOptionsValidator
                 $"{nameof(options.ResponseQueue)}, and {nameof(options.DeadLetterQueue)} must be distinct; they share one queue collection.");
         }
 
-        if (options.DeadLetterRetention is { } deadLetterRetention && deadLetterRetention <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(options.DeadLetterRetention)} must be positive when set.");
+        // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
+        // lease-renewal Task.Delay at half its value); DeadLetterRetention is a server-side
+        // "now - retention" prune cutoff and gets the persistence bound instead.
+        if (options.DeadLetterRetention is { } deadLetterRetention)
+            AsyncResponseChannelOptions.EnsurePersistedTtl(deadLetterRetention, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.DeadLetterRetention));
 
-        Positive(options.LockTimeout, nameof(options.LockTimeout));
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.LockTimeout, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.LockTimeout));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(MongoDbAsyncResponseTransportOptions), nameof(options.ShutdownTimeout));
 
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
@@ -68,8 +71,10 @@ internal static class MongoDbTransportOptionsValidator
         if (subscriber.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.MaxDeliveryAttempts)} ({role}) cannot be negative.");
 
-        Positive(subscriber.RedeliveryDelay, $"{nameof(subscriber.RedeliveryDelay)} ({role})");
-        Positive(subscriber.EmptyPollDelay, $"{nameof(subscriber.EmptyPollDelay)} ({role})");
+        // RedeliveryDelay is a server-side "$$NOW + delay" visibility stamp (persistence bound);
+        // EmptyPollDelay arms the idle-poll Task.Delay (timer ceiling).
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriber.RedeliveryDelay, nameof(MongoDbSubscriberOptions), $"{nameof(subscriber.RedeliveryDelay)} ({role})");
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.EmptyPollDelay, nameof(MongoDbSubscriberOptions), $"{nameof(subscriber.EmptyPollDelay)} ({role})");
 
         switch (subscriber.AckMode)
         {
@@ -80,7 +85,7 @@ internal static class MongoDbTransportOptionsValidator
                     throw new InvalidOperationException($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
                     throw new InvalidOperationException($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
-                Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.BackgroundDrainTimeout, nameof(MongoDbSubscriberOptions), $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
             default:
                 throw new InvalidOperationException($"{nameof(MongoDbSubscriberOptions)}.{nameof(subscriber.AckMode)} ({role}) has unsupported value '{subscriber.AckMode}'.");
@@ -101,9 +106,4 @@ internal static class MongoDbTransportOptionsValidator
                 $"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in the system namespace).");
     }
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} must be positive.");
-    }
 }
