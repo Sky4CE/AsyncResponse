@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="235">235</td>
+<td class="limit-width right" title="236">236</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="250">250</td>
+<td class="limit-width right" title="251">251</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="462">462</td>
+<td class="limit-width right" title="468">468</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="235 of 250">94%</td>
+<td class="limit-width right" title="236 of 251">94%</td>
 </tr>
 </table>
 </div>
@@ -125,8 +125,8 @@
 <tr><td title="AddMilliseconds(string)"><a href="#file0_line440" class="navigatetohash">AddMilliseconds(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="SchemaLockResource(string)"><a href="#file0_line448" class="navigatetohash">SchemaLockResource(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="Quote(string)"><a href="#file0_line450" class="navigatetohash">Quote(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="IndexName(string, string)"><a href="#file0_line454" class="navigatetohash">IndexName(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title=".cctor()"><a href="#file0_line458" class="navigatetohash">.cctor()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="IndexName(string, string)"><a href="#file0_line458" class="navigatetohash">IndexName(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
+<tr><td title=".cctor()"><a href="#file0_line464" class="navigatetohash">.cctor()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -587,21 +587,27 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line449"></a><code>449</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line450"></a><code>450</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;string&nbsp;Quote(string&nbsp;identifier)&nbsp;=&gt;&nbsp;&quot;[&quot;&nbsp;+&nbsp;identifier&nbsp;+&nbsp;&quot;]&quot;;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line451"></a><code>451</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line452"></a><code>452</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;string&nbsp;IndexName(string&nbsp;table,&nbsp;string&nbsp;suffix)</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line453"></a><code>453</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line454"></a><code>454</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;name&nbsp;=&nbsp;$&quot;{table}_{suffix}_idx&quot;;</code></td></tr>
-<tr class="coverableline" title="Covered (1 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line455"></a><code>455</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;name.Length&nbsp;&lt;=&nbsp;128&nbsp;?&nbsp;name&nbsp;:&nbsp;name[..128];</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line456"></a><code>456</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line457"></a><code>457</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line458"></a><code>458</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;readonly&nbsp;TimeSpan&nbsp;DeadLetterPruneThrottle&nbsp;=&nbsp;TimeSpan.FromMinutes(1);</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line459"></a><code>459</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line460"></a><code>460</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;readonly&nbsp;IReadOnlyDictionary&lt;string,&nbsp;string&gt;&nbsp;EmptyHeaders&nbsp;=</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line461"></a><code>461</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;new&nbsp;Dictionary&lt;string,&nbsp;string&gt;(0,&nbsp;StringComparer.OrdinalIgnoreCase);</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line462"></a><code>462</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line452"></a><code>452</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;Suffix&nbsp;space&nbsp;is&nbsp;RESERVED&nbsp;before&nbsp;capping&nbsp;(mirrors&nbsp;the&nbsp;channel&nbsp;store&#39;s&nbsp;derived-name&nbsp;rule):</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line453"></a><code>453</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;truncating&nbsp;the&nbsp;whole&nbsp;&quot;{table}_{suffix}_idx&quot;&nbsp;let&nbsp;a&nbsp;maximum-length&nbsp;queue&nbsp;table&nbsp;derive&nbsp;one</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line454"></a><code>454</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;shared&nbsp;name&nbsp;for&nbsp;both&nbsp;indexes&nbsp;—&nbsp;the&nbsp;second&nbsp;IF&nbsp;NOT&nbsp;EXISTS&nbsp;guard&nbsp;matched&nbsp;the&nbsp;first&nbsp;index&nbsp;and</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line455"></a><code>455</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;silently&nbsp;skipped&nbsp;creation.</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line456"></a><code>456</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;internal&nbsp;static&nbsp;string&nbsp;IndexName(string&nbsp;table,&nbsp;string&nbsp;suffix)</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line457"></a><code>457</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line458"></a><code>458</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;tail&nbsp;=&nbsp;$&quot;_{suffix}_idx&quot;;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line459"></a><code>459</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;const&nbsp;int&nbsp;identifierCap&nbsp;=&nbsp;128;</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line460"></a><code>460</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;stem&nbsp;=&nbsp;table.Length&nbsp;&lt;=&nbsp;identifierCap&nbsp;-&nbsp;tail.Length&nbsp;?&nbsp;table&nbsp;:&nbsp;table[..(identifierCap&nbsp;-&nbsp;tail.Length)];</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line461"></a><code>461</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;stem&nbsp;+&nbsp;tail;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line462"></a><code>462</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line463"></a><code>463</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line464"></a><code>464</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;readonly&nbsp;TimeSpan&nbsp;DeadLetterPruneThrottle&nbsp;=&nbsp;TimeSpan.FromMinutes(1);</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line465"></a><code>465</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line466"></a><code>466</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;readonly&nbsp;IReadOnlyDictionary&lt;string,&nbsp;string&gt;&nbsp;EmptyHeaders&nbsp;=</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line467"></a><code>467</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;new&nbsp;Dictionary&lt;string,&nbsp;string&gt;(0,&nbsp;StringComparer.OrdinalIgnoreCase);</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line468"></a><code>468</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/09/2026 - 13:58:33<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/09/2026 - 15:17:12<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
@@ -623,8 +629,8 @@
 <a href="#file0_line440" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - AddMilliseconds(string)"><i class="icon-cube"></i>AddMilliseconds(string)</a><br />
 <a href="#file0_line448" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - SchemaLockResource(string)"><i class="icon-cube"></i>SchemaLockResource(string)</a><br />
 <a href="#file0_line450" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - Quote(string)"><i class="icon-cube"></i>Quote(string)</a><br />
-<a href="#file0_line454" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IndexName(string, string)"><i class="icon-cube"></i>IndexName(string, string)</a><br />
-<a href="#file0_line458" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .cctor()"><i class="icon-cube"></i>.cctor()</a><br />
+<a href="#file0_line458" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IndexName(string, string)"><i class="icon-cube"></i>IndexName(string, string)</a><br />
+<a href="#file0_line464" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .cctor()"><i class="icon-cube"></i>.cctor()</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>

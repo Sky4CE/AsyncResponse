@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="73">73</td>
+<td class="limit-width right" title="69">69</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,7 +49,7 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="75">75</td>
+<td class="limit-width right" title="71">71</td>
 </tr>
 <tr>
 <th>Total lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="73 of 75">97.3%</td>
+<td class="limit-width right" title="69 of 71">97.1%</td>
 </tr>
 </table>
 </div>
@@ -66,20 +66,20 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar7">93%</div>
+<div class="large cardpercentagebar cardpercentagebar8">92%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="41">41</td>
+<td class="limit-width right" title="37">37</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="44">44</td>
+<td class="limit-width right" title="40">40</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="41 of 44">93.1%</td>
+<td class="limit-width right" title="37 of 40">92.5%</td>
 </tr>
 </table>
 </div>
@@ -110,7 +110,7 @@
 <tr><td title=".ctor(System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseChannelMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseTransportMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseDurableFlowStoreMarker&gt;, Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.AsyncResponseOptions&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.DurableFlowOptions&gt;, Microsoft.Extensions.Logging.ILogger&lt;AsyncResponse.AsyncResponseStartupValidator&gt;)"><a href="#file0_line56" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="StartAsync(System.Threading.CancellationToken)"><a href="#file0_line67" class="navigatetohash">StartAsync(...)</a></td><td>100%</td><td>20</td><td>20</td><td>100%</td></tr>
 <tr><td title="ValidateEarlyAckDeclarations()"><a href="#file0_line133" class="navigatetohash">ValidateEarlyAckDeclarations()</a></td><td>87.5%</td><td>16</td><td>16</td><td>95%</td></tr>
-<tr><td title="ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)"><a href="#file0_line171" class="navigatetohash">ValidateWatchdogOptions(...)</a></td><td>87.5%</td><td>8</td><td>8</td><td>84.62%</td></tr>
+<tr><td title="ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)"><a href="#file0_line175" class="navigatetohash">ValidateWatchdogOptions(...)</a></td><td>75%</td><td>4</td><td>4</td><td>77.78%</td></tr>
 <tr><td title="StopAsync(System.Threading.CancellationToken)"><a href="#file0_line186" class="navigatetohash">StopAsync(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
@@ -286,20 +286,20 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line163"></a><code>163</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line164"></a><code>164</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line165"></a><code>165</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;Fails&nbsp;fast&nbsp;on&nbsp;watchdog&nbsp;misconfiguration:&nbsp;a&nbsp;non-positive&nbsp;interval&nbsp;spins&nbsp;the&nbsp;scan&nbsp;loop,&nbsp;a</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line166"></a><code>166</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;non-positive&nbsp;stale&nbsp;threshold&nbsp;flags&nbsp;every&nbsp;entry,&nbsp;and&nbsp;a&nbsp;negative&nbsp;startup&nbsp;delay&nbsp;throws&nbsp;deep</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line167"></a><code>167</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;inside&nbsp;&lt;see&nbsp;cref=&quot;Task.Delay(TimeSpan)&quot;/&gt;&nbsp;long&nbsp;after&nbsp;registration.</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line168"></a><code>168</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/summary&gt;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line169"></a><code>169</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;void&nbsp;ValidateWatchdogOptions(AsyncResponseWatchdogOptions&nbsp;watchdog)</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line170"></a><code>170</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line171"></a><code>171</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(watchdog.Interval&nbsp;&lt;=&nbsp;TimeSpan.Zero)</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line172"></a><code>172</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line173"></a><code>173</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOp</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line174"></a><code>174</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(watchdog.StaleAfter&nbsp;&lt;=&nbsp;TimeSpan.Zero)</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line175"></a><code>175</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line176"></a><code>176</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOp</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line177"></a><code>177</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(watchdog.StartupDelay&nbsp;&lt;&nbsp;TimeSpan.Zero)</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line178"></a><code>178</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line179"></a><code>179</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOp</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line166"></a><code>166</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;non-positive&nbsp;stale&nbsp;threshold&nbsp;flags&nbsp;every&nbsp;entry,&nbsp;and&nbsp;an&nbsp;out-of-range&nbsp;delay&nbsp;(negative,&nbsp;or</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line167"></a><code>167</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;beyond&nbsp;the&nbsp;timer&nbsp;ceiling)&nbsp;throws&nbsp;deep&nbsp;inside&nbsp;&lt;see&nbsp;cref=&quot;Task.Delay(TimeSpan)&quot;/&gt;&nbsp;long&nbsp;after</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line168"></a><code>168</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;registration.&nbsp;&lt;c&gt;StaleAfter&lt;/c&gt;&nbsp;is&nbsp;only&nbsp;ever&nbsp;compared&nbsp;against&nbsp;entry&nbsp;age,&nbsp;so&nbsp;it&nbsp;needs&nbsp;no</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line169"></a><code>169</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;ceiling;&nbsp;&lt;c&gt;Interval&lt;/c&gt;&nbsp;and&nbsp;&lt;c&gt;StartupDelay&lt;/c&gt;&nbsp;arm&nbsp;timers,&nbsp;and&nbsp;zero&nbsp;is&nbsp;a&nbsp;valid&nbsp;startup</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line170"></a><code>170</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;delay&nbsp;(&quot;scan&nbsp;immediately&quot;).</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line171"></a><code>171</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line172"></a><code>172</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;static&nbsp;void&nbsp;ValidateWatchdogOptions(AsyncResponseWatchdogOptions&nbsp;watchdog)</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line173"></a><code>173</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line174"></a><code>174</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;const&nbsp;string&nbsp;optionsPath&nbsp;=&nbsp;$&quot;{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}&quot;;</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line175"></a><code>175</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseChannelOptions.EnsureTimerBacked(watchdog.Interval,&nbsp;optionsPath,&nbsp;nameof(AsyncResponseWatchdogOption</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line176"></a><code>176</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(watchdog.StaleAfter&nbsp;&lt;=&nbsp;TimeSpan.Zero)</code></td></tr>
+<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line177"></a><code>177</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
+<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line178"></a><code>178</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{optionsPath}.{nameof(AsyncResponseWatchdogOptions.StaleAfter)}&nbsp;must&nbsp;be&nbsp;positive.&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line179"></a><code>179</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(watchdog.StartupDelay,&nbsp;optionsPath,&nbsp;nameof(AsyncResponseW</code></td></tr>
 <tr class="coverableline" title="Partially covered (3 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line180"></a><code>180</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(watchdog.MaxScanEntries&nbsp;&lt;=&nbsp;0)</code></td></tr>
 <tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line181"></a><code>181</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
 <tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line182"></a><code>182</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOp</code></td></tr>
@@ -311,14 +311,14 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/09/2026 - 13:58:33<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/09/2026 - 15:17:12<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
 <a href="#file0_line56" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseChannelMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseTransportMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseDurableFlowStoreMarker&gt;, Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.AsyncResponseOptions&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.DurableFlowOptions&gt;, Microsoft.Extensions.Logging.ILogger&lt;AsyncResponse.AsyncResponseStartupValidator&gt;)"><i class="icon-cube"></i>.ctor(System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseChannelMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseTransportMarker&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.AsyncResponseDurableFlowStoreMarker&gt;, Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.AsyncResponseOptions&gt;, System.Collections.Generic.IEnumerable&lt;AsyncResponse.DurableFlowOptions&gt;, Microsoft.Extensions.Logging.ILogger&lt;AsyncResponse.AsyncResponseStartupValidator&gt;)</a><br />
 <a href="#file0_line67" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - StartAsync(System.Threading.CancellationToken)"><i class="icon-cube"></i>StartAsync(System.Threading.CancellationToken)</a><br />
 <a href="#file0_line133" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ValidateEarlyAckDeclarations()"><i class="icon-cube"></i>ValidateEarlyAckDeclarations()</a><br />
-<a href="#file0_line171" class="navigatetohash percentagebar percentagebar80" title="Line coverage: 84.6% - ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)"><i class="icon-cube"></i>ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)</a><br />
+<a href="#file0_line175" class="navigatetohash percentagebar percentagebar70" title="Line coverage: 77.7% - ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)"><i class="icon-cube"></i>ValidateWatchdogOptions(AsyncResponse.AsyncResponseWatchdogOptions)</a><br />
 <a href="#file0_line186" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - StopAsync(System.Threading.CancellationToken)"><i class="icon-cube"></i>StopAsync(System.Threading.CancellationToken)</a><br />
 <br/></div>
 </div></div>
