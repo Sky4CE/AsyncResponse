@@ -302,4 +302,3 @@ public sealed class BrokersCollection : ICollectionFixture<BrokersBatchFixture>
 {
     public const string Name = "AsyncResponse brokers";
 }
-

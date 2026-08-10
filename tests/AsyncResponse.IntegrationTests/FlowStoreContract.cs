@@ -36,7 +36,8 @@ internal static class FlowStoreContract
     internal static async Task AssertStoreContractAsync(
         IFlowStateStore store,
         TimeSpan? expiryTtl = null,
-        TimeSpan? expiryDelay = null)
+        TimeSpan? expiryDelay = null,
+        Func<string, string, Task>? seedRawStateAsync = null)
     {
         var state = CreateState("flow-itest");
 
@@ -134,7 +135,7 @@ internal static class FlowStoreContract
         await AssertLeaseExpiryContractAsync(store);
         await AssertMissingFlowContractAsync(store);
         await AssertLargeStateContractAsync(store);
-        await AssertSchemaVersionContractAsync(store);
+        await AssertSchemaVersionContractAsync(store, seedRawStateAsync);
     }
 
     /// <summary>
@@ -238,7 +239,7 @@ internal static class FlowStoreContract
     /// schema this build does not understand is how a rolling deploy runs a flow with half its
     /// checkpoints invisible.
     /// </summary>
-    private static async Task AssertSchemaVersionContractAsync(IFlowStateStore store)
+    private static async Task AssertSchemaVersionContractAsync(IFlowStateStore store, Func<string, string, Task>? seedRawStateAsync)
     {
         var flowId = $"flow-schema-{Guid.NewGuid():N}";
         var future = CreateState(flowId);
@@ -247,6 +248,18 @@ internal static class FlowStoreContract
         await Assert.ThrowsAnyAsync<ArgumentException>(
             () => store.TryCreateAsync(flowId, future, TimeSpan.FromMinutes(5)));
         Assert.Null(await store.LoadAsync(flowId));
+
+        // Write rejection alone cannot catch a backend-specific READ regression: state written by
+        // a NEWER build reaches this build through the database, never through this build's write
+        // API. Callers that can write a raw record seed one and the read path must refuse it.
+        if (seedRawStateAsync is not null)
+        {
+            var rawFlowId = $"flow-schema-raw-{Guid.NewGuid():N}";
+            var rawFuture = CreateState(rawFlowId);
+            rawFuture.SchemaVersion = FlowStateSchema.Current + 1;
+            await seedRawStateAsync(rawFlowId, JsonSerializer.Serialize(rawFuture));
+            Assert.Null(await store.LoadAsync(rawFlowId));
+        }
     }
 
     /// <summary>Retries an assertion until it holds or the budget expires, then lets it through.</summary>

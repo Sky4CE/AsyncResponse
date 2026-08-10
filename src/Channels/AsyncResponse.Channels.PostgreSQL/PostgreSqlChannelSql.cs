@@ -175,18 +175,18 @@ internal sealed class PostgreSqlChannelSql
                             new("registration_id", "uuid", Nullable: false),
                             new("state_json", "jsonb", Nullable: false),
                             new("expires_at", "timestamp with time zone", Nullable: false),
-                            new("registered_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                            new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
                         ], PrimaryKey: ["correlation_id", "registration_id"]),
                     new(_options.MessageTable, 'r', Columns:
                         [
                             new("id", "uuid", Nullable: false),
                             new("correlation_id", "text", Nullable: false),
                             new("envelope_json", "jsonb", Nullable: false),
-                            new("created_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                            new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
                             new("expires_at", "timestamp with time zone", Nullable: false),
                             new("acked_at", "timestamp with time zone", Nullable: true),
                             new("acked_seq", "bigint", Nullable: true),
-                            new("recovery_claimed", "boolean", Nullable: false, HasDefault: true),
+                            new("recovery_claimed", "boolean", Nullable: false, DefaultExpression: "false"),
                         ], PrimaryKey: ["id"]),
                     new(_options.SubscriberTable, 'r', Columns:
                         [

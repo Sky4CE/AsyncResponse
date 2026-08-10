@@ -49,6 +49,17 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     public bool AutoCreateIndexes { get; set; } = true;
 
     /// <summary>
+    /// Claims this component's collections (the derived ack-counter collection included) in the
+    /// persisted cross-component ownership ledger (<c>asyncresponse_ownership</c>) at first use,
+    /// so another AsyncResponse component — in this or any other process — misconfigured onto
+    /// the same collection fails startup instead of silently corrupting data. Independent of
+    /// <see cref="AutoCreateIndexes"/>: disabling index DDL must not disable collision
+    /// protection. Disable only for least-privilege deployments that cannot write the ledger
+    /// collection and audit their collection layout externally. Default: <c>true</c>.
+    /// </summary>
+    public bool UseOwnershipLedger { get; set; } = true;
+
+    /// <summary>
     /// Watches the message collection with a change stream so active waiters are woken with
     /// broker-grade latency. Requires a replica set. When disabled — or when the server reports
     /// change streams as unsupported — waiters fall back to <see cref="ListenerPollInterval"/>

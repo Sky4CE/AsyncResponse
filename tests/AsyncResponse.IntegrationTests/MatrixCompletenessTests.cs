@@ -187,40 +187,26 @@ public sealed class MatrixCompletenessTests
 
     /// <summary>
     /// The runtime loads an assembly on first use, so a scan of <see cref="AppDomain.GetAssemblies"/>
-    /// sees only what earlier code happened to touch. Naming one options type per package forces every
-    /// provider assembly in — otherwise the guards would silently measure load order.
+    /// sees only what earlier code happened to touch. Loading every AsyncResponse assembly from the
+    /// build output forces them all in — a hand-maintained anchor list rotted silently instead: a
+    /// newly referenced provider package missing from the list stayed unloaded, invisible to every
+    /// completeness guard, and the guards stayed green.
     /// </summary>
     private static void ForceProviderAssemblyLoad()
     {
-        Type[] anchors =
-        [
-            typeof(Channels.Redis.RedisAsyncResponseOptions),
-            typeof(Channels.NATS.NatsAsyncResponseChannelOptions),
-            typeof(Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions),
-            typeof(Channels.SqlServer.SqlServerAsyncResponseChannelOptions),
-            typeof(Channels.MongoDB.MongoDbAsyncResponseChannelOptions),
-            typeof(Transports.Redis.RedisAsyncResponseTransportOptions),
-            typeof(Transports.NATS.NatsAsyncResponseTransportOptions),
-            typeof(Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions),
-            typeof(Transports.SqlServer.SqlServerAsyncResponseTransportOptions),
-            typeof(Transports.MongoDB.MongoDbAsyncResponseTransportOptions),
-            typeof(Transports.Kafka.KafkaAsyncResponseTransportOptions),
-            typeof(Transports.RabbitMQ.RabbitMqAsyncResponseOptions),
-            typeof(Transports.SQS.SqsAsyncResponseOptions),
-            typeof(Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions),
-            typeof(Transports.GooglePubSub.GooglePubSubAsyncResponseOptions),
-            typeof(DurableFlows.Sqlite.SqliteDurableFlowOptions),
-            typeof(DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions),
-            typeof(DurableFlows.SqlServer.SqlServerDurableFlowOptions),
-            typeof(DurableFlows.MySql.MySqlDurableFlowOptions),
-            typeof(DurableFlows.MongoDB.MongoDbDurableFlowOptions),
-            typeof(DurableFlows.DynamoDB.DynamoDbDurableFlowOptions),
-            typeof(DurableFlows.EFCore.EFCoreDurableFlowOptions),
-            typeof(DurableFlows.Cosmos.CosmosDurableFlowOptions),
-            typeof(DurableFlows.Oracle.OracleDurableFlowOptions)
-        ];
+        var loaded = 0;
+        foreach (var path in Directory.EnumerateFiles(AppContext.BaseDirectory, "AsyncResponse.*.dll"))
+        {
+            var name = Path.GetFileNameWithoutExtension(path);
+            if (name.Contains("Tests", StringComparison.Ordinal) || name.Contains("Sample", StringComparison.Ordinal))
+                continue;
 
-        // Referencing the array is enough: the typeof expressions already forced each load.
-        Assert.Equal(24, anchors.Length);
+            Assembly.Load(new AssemblyName(name));
+            loaded++;
+        }
+
+        // A floor pins the mechanism itself: fewer than the currently shipped assembly count means
+        // the scan broke (wrong directory, renamed outputs), not that providers went away.
+        Assert.True(loaded >= 24, $"expected at least 24 AsyncResponse assemblies in the test output, found {loaded}.");
     }
 }

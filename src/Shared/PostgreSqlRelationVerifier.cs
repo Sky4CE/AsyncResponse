@@ -16,8 +16,15 @@ namespace AsyncResponse.Internal;
 /// </summary>
 internal static class PostgreSqlRelationVerifier
 {
-    /// <summary>One expected table column: name, <c>format_type</c> rendering, nullability, and whether the DDL declares a default.</summary>
-    internal readonly record struct ExpectedColumn(string Name, string Type, bool Nullable, bool HasDefault = false);
+    /// <summary>
+    /// One expected table column: name, <c>format_type</c> rendering, nullability, and — for
+    /// columns whose DDL declares a default the runtime relies on — the exact
+    /// <c>pg_get_expr</c> rendering of that default. A merely EXISTING default is not enough:
+    /// <c>created_at DEFAULT now() + interval '1 year'</c> silently shifts every timestamp the
+    /// watermark and visibility logic compare, and <c>available_at</c> with a future default
+    /// would strand transport jobs.
+    /// </summary>
+    internal readonly record struct ExpectedColumn(string Name, string Type, bool Nullable, string? DefaultExpression = null);
 
     /// <summary>
     /// One expected relation: kind 'r' (table, verified against <paramref name="Columns"/> and
@@ -159,9 +166,13 @@ internal static class PostgreSqlRelationVerifier
     /// <summary>
     /// Column-level table verification: a same-kind table occupying the name — another
     /// component's, or a crafted one that happens to satisfy the index DDL — passes the relation
-    /// check and fails only at the first INSERT/SELECT. Every DDL-declared column must exist with
-    /// the declared type and nullability, and columns the DDL gives defaults must have one
-    /// (inserts rely on them). Extra user-added columns are allowed.
+    /// check and fails only at the first INSERT/SELECT, or worse, silently changes runtime
+    /// behavior. Every DDL-declared column must exist with the declared type and nullability;
+    /// columns the DDL gives runtime-relied defaults must carry EXACTLY that default expression
+    /// (a same-named default computing something else shifts every timestamp the store
+    /// compares); and extra columns are allowed only when they are writable without being named
+    /// (nullable, or defaulted) — an extra NOT NULL column without a default fails every normal
+    /// insert with 23502.
     /// </summary>
     private static async Task VerifyTableColumnsAsync(
         NpgsqlConnection connection,
@@ -179,20 +190,22 @@ internal static class PostgreSqlRelationVerifier
         verify.Transaction = transaction;
         verify.CommandText =
             """
-            SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, a.atthasdef
+            SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
+                   COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '')
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+            LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
             WHERE n.nspname = @schema AND c.relname = ANY(@names);
             """;
         verify.Parameters.AddWithValue("schema", schemaName);
         verify.Parameters.AddWithValue("names", tables.Select(t => t.Name).ToArray());
 
-        var actual = new Dictionary<(string Table, string Column), (string Type, bool NotNull, bool HasDefault)>();
+        var actual = new Dictionary<(string Table, string Column), (string Type, bool NotNull, string Default)>();
         await using (var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                actual[(reader.GetString(0), reader.GetString(1))] = (reader.GetString(2), reader.GetBoolean(3), reader.GetBoolean(4));
+                actual[(reader.GetString(0), reader.GetString(1))] = (reader.GetString(2), reader.GetBoolean(3), reader.GetString(4));
         }
 
         foreach (var table in tables)
@@ -207,14 +220,29 @@ internal static class PostgreSqlRelationVerifier
 
                 if (!string.Equals(found.Type, column.Type, StringComparison.Ordinal)
                     || found.NotNull == column.Nullable
-                    || (column.HasDefault && !found.HasDefault))
+                    || (column.DefaultExpression is not null && !string.Equals(found.Default, column.DefaultExpression, StringComparison.Ordinal)))
                 {
                     throw new InvalidOperationException(
                         $"The PostgreSQL {componentName} store's table '{schemaName}.{table.Name}' exists but column '{column.Name}' " +
                         $"does not match the expected shape: expected {column.Type}{(column.Nullable ? " NULL" : " NOT NULL")}" +
-                        $"{(column.HasDefault ? " with a default" : "")}; found {found.Type}{(found.NotNull ? " NOT NULL" : " NULL")}" +
-                        $"{(found.HasDefault ? " with a default" : " without a default")}. " + CollisionGuidance);
+                        $"{(column.DefaultExpression is null ? "" : $" DEFAULT {column.DefaultExpression}")}; found {found.Type}" +
+                        $"{(found.NotNull ? " NOT NULL" : " NULL")}{(found.Default.Length == 0 ? " without a default" : $" DEFAULT {found.Default}")}. " +
+                        CollisionGuidance);
                 }
+            }
+
+            // Extra columns are fine only when inserts that do not name them can still succeed.
+            var expectedNames = table.Columns!.Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+            foreach (var ((tableName, columnName), found) in actual)
+            {
+                if (!string.Equals(tableName, table.Name, StringComparison.Ordinal) || expectedNames.Contains(columnName))
+                    continue;
+
+                if (found.NotNull && found.Default.Length == 0)
+                    throw new InvalidOperationException(
+                        $"The PostgreSQL {componentName} store's table '{schemaName}.{table.Name}' has an extra column " +
+                        $"'{columnName}' that is NOT NULL without a default: every insert the store issues would fail with " +
+                        "not_null_violation (23502). Make the column nullable, give it a default, or drop it.");
             }
         }
     }

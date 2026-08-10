@@ -68,7 +68,16 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                     TableName = "flow_state"
                 }));
 
-            await AssertStoreContractAsync(store);
+            await AssertStoreContractAsync(store, seedRawStateAsync: async (flowId, stateJson) =>
+            {
+                await using var connection = await dataSource.OpenConnectionAsync();
+                await using var seed = connection.CreateCommand();
+                seed.CommandText =
+                    $"""INSERT INTO "{schema}"."flow_state" (flow_id, state_json, expires_at_utc, updated_at_utc, revision) VALUES (@id, @json::jsonb, now() + interval '5 minutes', now(), 0);""";
+                seed.Parameters.AddWithValue("id", flowId);
+                seed.Parameters.AddWithValue("json", stateJson);
+                await seed.ExecuteNonQueryAsync();
+            });
 
         }
         finally
@@ -94,7 +103,18 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                     TableName = "flow_state"
                 }));
 
-            await AssertStoreContractAsync(store);
+            await AssertStoreContractAsync(store, seedRawStateAsync: async (flowId, stateJson) =>
+            {
+                await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+                await connection.OpenAsync();
+                await using var seed = connection.CreateCommand();
+                seed.CommandText =
+                    $"INSERT INTO [{schema}].[flow_state] (flow_id, state_json, expires_at_utc, updated_at_utc, revision) " +
+                    "VALUES (@id, @json, DATEADD(MINUTE, 5, SYSUTCDATETIME()), SYSUTCDATETIME(), 0);";
+                seed.Parameters.AddWithValue("@id", flowId);
+                seed.Parameters.AddWithValue("@json", stateJson);
+                await seed.ExecuteNonQueryAsync();
+            });
         }
         finally
         {
@@ -259,7 +279,15 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                     CollectionName = "flow_state"
                 }));
 
-            await AssertStoreContractAsync(store);
+            await AssertStoreContractAsync(store, seedRawStateAsync: async (flowId, stateJson) =>
+                await client.GetDatabase(databaseName).GetCollection<BsonDocument>("flow_state").InsertOneAsync(new BsonDocument
+                {
+                    ["_id"] = flowId,
+                    ["state_json"] = stateJson,
+                    ["expires_at_utc"] = DateTime.UtcNow.AddMinutes(5),
+                    ["updated_at_utc"] = DateTime.UtcNow,
+                    ["revision"] = 0L
+                }));
 
             var legacyFlowId = "legacy-mongo-flow";
             await client.GetDatabase(databaseName).GetCollection<BsonDocument>("flow_state").InsertOneAsync(new BsonDocument

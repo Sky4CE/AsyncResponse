@@ -661,10 +661,26 @@ public sealed class MatrixHarness : IAsyncDisposable
                 // pool the emulator config declares (see servicebus-emulator-config.json) and rely on
                 // per-cell correlation ids plus the drain in teardown for isolation.
                 var lease = AzureServiceBusQueuePool.Lease();
-                _always.Add(() =>
+                var serviceBusConnection = backends.Require(backends.AzureServiceBus, "servicebus");
+                _always.Add(async () =>
                 {
-                    AzureServiceBusQueuePool.Release(lease);
-                    return Task.CompletedTask;
+                    // Drain worker/response queues AND their dead-letter sub-queues before the
+                    // pair goes back to the pool: a failed or interrupted fact must not leak its
+                    // messages into the next fact that leases the same pair. EXCEPT when this
+                    // harness was created with teardownNamespaces: false — that flag means "a
+                    // successor host consumes what I published" (the consumer-outage durability
+                    // fact hands the pair from a stopped publisher to a fresh consumer), and
+                    // draining here would eat the very message under test. The successor harness
+                    // tears namespaces down normally and drains the pair on its own disposal.
+                    try
+                    {
+                        if (TeardownNamespaces)
+                            await DrainAzureServiceBusQueuePairAsync(serviceBusConnection, lease);
+                    }
+                    finally
+                    {
+                        AzureServiceBusQueuePool.Release(lease);
+                    }
                 });
                 builder.WithAzureServiceBusTransport(options =>
                 {
@@ -861,7 +877,14 @@ public sealed class MatrixHarness : IAsyncDisposable
         // holds on Pub/Sub too rather than being skipped for want of infrastructure.
         var deadLetterTopic = $"{Names.PubSubBase}-dead";
         if (Tuning.MaxDeliveryAttempts is { } maxAttempts)
+        {
             await CreateTopicAsync(publisher, projectId, deadLetterTopic);
+
+            // A topic without a subscription DROPS messages: without this observer subscription
+            // the dead-letter policy would forward exhausted messages into the void and no test
+            // could ever verify dead-lettering happened.
+            await CreateSubscriptionAsync(subscriber, projectId, $"{deadLetterTopic}-sub", deadLetterTopic, null);
+        }
 
         await CreateSubscriptionAsync(
             subscriber, projectId, $"{Names.PubSubBase}-worker-sub", $"{Names.PubSubBase}-worker",
@@ -911,11 +934,46 @@ public sealed class MatrixHarness : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Empties both queues of a leased Service Bus pair, dead-letter sub-queues included. The
+    /// emulator has no management API to delete or recreate entities, so receive-and-delete until
+    /// silence is the only isolation the pool can guarantee between leases.
+    /// </summary>
+    private static async Task DrainAzureServiceBusQueuePairAsync(string connectionString, AzureServiceBusQueueLease lease)
+    {
+        await using var client = new Azure.Messaging.ServiceBus.ServiceBusClient(connectionString);
+        foreach (var queue in new[] { lease.WorkerQueue, lease.ResponseQueue })
+        {
+            foreach (var subQueue in new[] { Azure.Messaging.ServiceBus.SubQueue.None, Azure.Messaging.ServiceBus.SubQueue.DeadLetter })
+            {
+                await using var receiver = client.CreateReceiver(queue, new Azure.Messaging.ServiceBus.ServiceBusReceiverOptions
+                {
+                    SubQueue = subQueue,
+                    ReceiveMode = Azure.Messaging.ServiceBus.ServiceBusReceiveMode.ReceiveAndDelete
+                });
+                while (true)
+                {
+                    var drained = await receiver.ReceiveMessagesAsync(50, TimeSpan.FromMilliseconds(400));
+                    if (drained.Count == 0)
+                        break;
+                }
+            }
+        }
+    }
+
     // --- Teardown ---------------------------------------------------------------------------------
+
+    private int _disposed;
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
+        // Idempotent: facts that time or interleave disposal explicitly also sit inside
+        // `await using`, and a second pass must not re-run teardown — most acutely the Service
+        // Bus queue-pool release, where a duplicate release pushed a duplicate lease.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
         foreach (var hosted in Enumerable.Reverse(_started))
         {
             try
@@ -1282,8 +1340,14 @@ internal sealed class MatrixModelCacheKeyFactory : IModelCacheKeyFactory
 /// </summary>
 internal static class AzureServiceBusQueuePool
 {
-    /// <summary>Pool size. Must match the number of <c>arm-asb-*</c> pairs the emulator config declares.</summary>
-    internal const int Size = 8;
+    /// <summary>
+    /// Pool size. Integration execution is serial (parallelization is disabled assembly-wide) and
+    /// the free list is LIFO, so exactly one pair is ever in use — leasing from a single pair
+    /// keeps the drain-between-leases guarantee airtight and leaves the other emulator-declared
+    /// pairs untouched. Raise toward the emulator config's pair count only together with
+    /// parallel execution.
+    /// </summary>
+    internal const int Size = 1;
 
     private static readonly SemaphoreSlim Available = new(Size, Size);
     private static readonly Stack<int> Free = new(Enumerable.Range(0, Size));

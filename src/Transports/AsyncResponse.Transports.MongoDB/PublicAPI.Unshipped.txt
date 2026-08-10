@@ -47,6 +47,8 @@ AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.Subscriber
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.SubscriberRetryMaxDelay.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseChangeStreamWake.get -> bool
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseChangeStreamWake.set -> void
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseOwnershipLedger.get -> bool
+AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.UseOwnershipLedger.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerQueue.get -> string!
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerQueue.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.WorkerSubscriber.get -> AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions!
@@ -85,6 +87,6 @@ AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.UseAckAfterEnqueue(int
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.MongoDbWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! options, MongoDB.Driver.IMongoDatabase! database) -> void
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
-const AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.TransportName = "MongoDB" -> string!
 Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions
+const AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.TransportName = "MongoDB" -> string!
 static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions.WithMongoDbTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

@@ -1,4 +1,26 @@
+using Amazon.Runtime;
+using Amazon.SQS;
+using AsyncResponse.Transports.AzureServiceBus;
+using AsyncResponse.Transports.GooglePubSub;
+using AsyncResponse.Transports.Kafka;
+using AsyncResponse.Transports.MongoDB;
+using AsyncResponse.Transports.NATS;
+using AsyncResponse.Transports.PostgreSQL;
+using AsyncResponse.Transports.RabbitMQ;
+using AsyncResponse.Transports.Redis;
+using AsyncResponse.Transports.SqlServer;
+using Azure.Messaging.ServiceBus;
+using Confluent.Kafka;
+using Google.Api.Gax;
+using Google.Cloud.PubSub.V1;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using NATS.Client.Core;
+using NATS.Client.JetStream;
+using Npgsql;
 using System.Collections.Concurrent;
 using Xunit;
 
@@ -204,6 +226,28 @@ public abstract class TransportConformanceSuite
         Assert.True(
             probe.CallCount == settled,
             $"the poison job kept being redelivered past its bound: {settled} → {probe.CallCount}.");
+
+        // Stopping is NOT the whole contract: silently dropping or acking the poison job also
+        // "stops". The exhausted job must be sitting in the transport's dead-letter destination —
+        // the library-created one or the broker's native one, per the capability table.
+        if (Capabilities.LibraryDeadLetter || Capabilities.BrokerDeadLetter)
+        {
+            var deadLettered = 0L;
+            var deadline = DateTime.UtcNow + Generous;
+            while (DateTime.UtcNow < deadline)
+            {
+                deadLettered = await CountDeadLetteredJobsAsync(harness);
+                if (deadLettered >= 1)
+                    break;
+
+                await Task.Delay(PollInterval);
+            }
+
+            Assert.True(
+                deadLettered >= 1,
+                $"{Transport}: the exhausted poison job never appeared in the dead-letter destination — " +
+                "it was dropped or acked instead of dead-lettered.");
+        }
     }
 
     // ----- d. Ack modes -----
@@ -288,7 +332,8 @@ public abstract class TransportConformanceSuite
     [Fact]
     public async Task Contract_ShutdownWhileIdle_CompletesWellInsideTheBudget()
     {
-        await using var harness = await CreateHarnessAsync(
+        // No `await using`: this fact times the disposal itself, so it disposes exactly once.
+        var harness = await CreateHarnessAsync(
             new MatrixTransportTuning { HostShutdownTimeout = TimeSpan.FromSeconds(10) });
 
         // An idle transport must not sit out its whole drain budget on shutdown — that budget is the
@@ -300,6 +345,165 @@ public abstract class TransportConformanceSuite
         Assert.True(
             elapsed < TimeSpan.FromSeconds(10),
             $"an idle {Transport} host took {elapsed.TotalSeconds:F1}s to stop, i.e. its whole budget.");
+    }
+
+    [Fact]
+    public async Task Contract_ShutdownWithAnInFlightJob_DrainsItInsteadOfDroppingIt()
+    {
+        // Idle shutdown latency says nothing about accepted work: a transport that drops an
+        // in-flight (or early-ACKed, where supported — the acutest at-most-once risk) job during
+        // shutdown passes the idle fact. Hold a job mid-handler, start disposal while it is held,
+        // then release it and require that shutdown DRAINED it to completion.
+        await using var harness = await CreateHarnessAsync(new MatrixTransportTuning
+        {
+            HostShutdownTimeout = TimeSpan.FromSeconds(30),
+            EarlyAck = Capabilities.EarlyAck
+        });
+        var probe = harness.Provider.GetRequiredService<TransportProbe>();
+        probe.Gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await EnqueueAsync(harness, harness.Names.NewCorrelationId("drain"), token: 21);
+        await ExpectAsync(probe.GateReached.Task, harness, "the in-flight job to reach its hold");
+
+        var disposal = harness.DisposeAsync().AsTask();
+        await Task.Delay(500);
+        Assert.False(disposal.IsCompleted, "shutdown finished while a delivered job was still executing");
+
+        probe.Gate.TrySetResult();
+        await disposal.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(1, probe.GatedCompletions);
+    }
+
+    /// <summary>
+    /// Counts poison jobs in this transport's dead-letter destination, reading the effective
+    /// entity names from the harness's own resolved options so the count inspects exactly what
+    /// the transport wrote. Library dead-letter destinations are rows/streams/topics the library
+    /// created; broker ones are the native DLQ sub-queue/redrive target/dead-letter topic.
+    /// </summary>
+    private async Task<long> CountDeadLetteredJobsAsync(MatrixHarness harness)
+    {
+        switch (Transport)
+        {
+            case MatrixTransport.PostgreSql:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<PostgreSqlAsyncResponseTransportOptions>>().Value;
+                await using var dataSource = NpgsqlDataSource.Create(Backends.Require(Backends.PostgreSql, "postgresql"));
+                await using var command = dataSource.CreateCommand(
+                    $"SELECT count(*) FROM \"{options.SchemaName}\".\"{options.MessageTable}\" WHERE queue = @queue;");
+                command.Parameters.AddWithValue("queue", options.DeadLetterQueue);
+                return (long)(await command.ExecuteScalarAsync() ?? 0L);
+            }
+
+            case MatrixTransport.SqlServer:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<SqlServerAsyncResponseTransportOptions>>().Value;
+                await using var connection = new SqlConnection(Backends.Require(Backends.SqlServer, "sqlserver"));
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = $"SELECT COUNT(*) FROM [{options.SchemaName}].[{options.MessageTable}] WHERE queue = @queue;";
+                command.Parameters.AddWithValue("@queue", options.DeadLetterQueue);
+                return Convert.ToInt64(await command.ExecuteScalarAsync());
+            }
+
+            case MatrixTransport.MongoDb:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<MongoDbAsyncResponseTransportOptions>>().Value;
+                var database = new MongoClient(Backends.Require(Backends.MongoDb, "mongodb")).GetDatabase(options.DatabaseName);
+                return await database.GetCollection<BsonDocument>(options.MessageCollection)
+                    .CountDocumentsAsync(Builders<BsonDocument>.Filter.Eq("queue", options.DeadLetterQueue));
+            }
+
+            case MatrixTransport.Redis:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<RedisAsyncResponseTransportOptions>>().Value;
+                await using var multiplexer = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(
+                    Backends.Require(Backends.Redis, "redis"));
+                return await multiplexer.GetDatabase().StreamLengthAsync($"{options.KeyPrefix}:transport:deadletter");
+            }
+
+            case MatrixTransport.Nats:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<NatsAsyncResponseTransportOptions>>().Value;
+                var schema = new NatsTransportSubjectSchema(options);
+                await using var connection = new NatsConnection(new NatsOpts { Url = Backends.Require(Backends.Nats, "nats") });
+                var stream = await new NatsJSContext(connection).GetStreamAsync(schema.DeadLetterStream);
+                return (long)stream.Info.State.Messages;
+            }
+
+            case MatrixTransport.Kafka:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<KafkaAsyncResponseTransportOptions>>().Value;
+                var topic = new KafkaTransportTopicSchema(options).WorkerTopic + options.DeadLetterTopicSuffix;
+                using var consumer = new ConsumerBuilder<Ignore, Ignore>(new ConsumerConfig
+                {
+                    BootstrapServers = Backends.Require(Backends.Kafka, "kafka"),
+                    GroupId = $"dlq-count-{Guid.NewGuid():N}",
+                    AutoOffsetReset = AutoOffsetReset.Earliest,
+                    EnablePartitionEof = true
+                }).Build();
+                consumer.Subscribe(topic);
+                var count = 0L;
+                var idleUntil = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+                while (DateTime.UtcNow < idleUntil)
+                {
+                    var result = consumer.Consume(TimeSpan.FromMilliseconds(500));
+                    if (result is null)
+                        continue;
+                    if (result.IsPartitionEOF)
+                        break;
+                    count++;
+                }
+
+                consumer.Close();
+                return count;
+            }
+
+            case MatrixTransport.RabbitMq:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<RabbitMqAsyncResponseOptions>>().Value;
+                var factory = new global::RabbitMQ.Client.ConnectionFactory { Uri = new Uri(Backends.Require(Backends.RabbitMq, "rabbitmq")) };
+                await using var connection = await factory.CreateConnectionAsync();
+                await using var channel = await connection.CreateChannelAsync();
+                var declared = await channel.QueueDeclarePassiveAsync(options.DeadLetterQueue!);
+                return declared.MessageCount;
+            }
+
+            case MatrixTransport.Sqs:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<AsyncResponse.Transports.SQS.SqsAsyncResponseOptions>>().Value;
+                using var client = new AmazonSQSClient(
+                    new BasicAWSCredentials("test", "test"),
+                    new AmazonSQSConfig { ServiceURL = Backends.Require(Backends.LocalStack, "localstack"), AuthenticationRegion = "us-east-1" });
+                var queueUrl = (await client.GetQueueUrlAsync($"{options.WorkerQueue}{options.DeadLetterQueueSuffix}")).QueueUrl;
+                var attributes = await client.GetQueueAttributesAsync(queueUrl, ["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"]);
+                return attributes.ApproximateNumberOfMessages + attributes.ApproximateNumberOfMessagesNotVisible;
+            }
+
+            case MatrixTransport.AzureServiceBus:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<AzureServiceBusAsyncResponseOptions>>().Value;
+                await using var client = new ServiceBusClient(Backends.Require(Backends.AzureServiceBus, "servicebus"));
+                await using var receiver = client.CreateReceiver(
+                    options.WorkerQueue,
+                    new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter, ReceiveMode = ServiceBusReceiveMode.PeekLock });
+                var messages = await receiver.PeekMessagesAsync(50);
+                return messages.Count;
+            }
+
+            case MatrixTransport.GooglePubSub:
+            {
+                var options = harness.Provider.GetRequiredService<IOptions<GooglePubSubAsyncResponseOptions>>().Value;
+                var subscriber = await new SubscriberServiceApiClientBuilder { EmulatorDetection = EmulatorDetection.EmulatorOnly }.BuildAsync();
+                var subscription = SubscriptionName.FromProjectSubscription(
+                    options.ProjectId!, $"{harness.Names.PubSubBase}-dead-sub");
+                var response = await subscriber.PullAsync(subscription, maxMessages: 25);
+                return response.ReceivedMessages.Count;
+            }
+
+            default:
+                return 0;
+        }
     }
 
     // ----- Harness -----
@@ -418,6 +622,29 @@ public sealed class TransportProbe
 
     public int SuccessCount => Volatile.Read(ref _successCount);
 
+    /// <summary>
+    /// When set, every invocation signals <see cref="GateReached"/> and then holds until the gate
+    /// completes — the shutdown-drain contract's way of keeping a delivered job in flight while
+    /// disposal runs. <see cref="GatedCompletions"/> counts holds that ran to completion.
+    /// </summary>
+    public TaskCompletionSource? Gate { get; set; }
+
+    public TaskCompletionSource<bool> GateReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private int _gatedCompletions;
+
+    public int GatedCompletions => Volatile.Read(ref _gatedCompletions);
+
+    internal async Task HoldAtGateAsync()
+    {
+        if (Gate is not { } gate)
+            return;
+
+        GateReached.TrySetResult(true);
+        await gate.Task;
+        Interlocked.Increment(ref _gatedCompletions);
+    }
+
     /// <summary>Makes the next <paramref name="count"/> invocations throw, to drive redelivery.</summary>
     public void FailNextCalls(int count) => Volatile.Write(ref _failuresRemaining, count);
 
@@ -459,6 +686,7 @@ public sealed class TransportWorkerService(TransportProbe probe, IAsyncResponseP
         // Record before responding: the response is what unblocks the waiter, so publishing first
         // would let a fact observe completion before the call was visible to the probe.
         probe.Record(new TransportCall(token, correlationId, TransportTenantContext.Current));
+        await probe.HoldAtGateAsync();
 
         // A missing correlation id is itself a contract failure, recorded above; throwing here would
         // instead surface as a redelivery. Only the respond path needs a non-null id.

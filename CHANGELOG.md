@@ -213,7 +213,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   After its DDL, each store now checks `pg_class`/`pg_index`/`pg_attribute`/`pg_sequence` (in
   the same transaction, under the shared advisory DDL lock) that every expected name resolves
   to the expected relation kind **and shape** — tables verified column by column (name, type,
-  nullability, DDL-declared defaults) with the expected primary key; indexes verified to sit on
+  nullability, and for runtime-relied defaults the exact `pg_get_expr` rendering: a same-named
+  default computing something else — `created_at DEFAULT now() + interval '1 year'` — silently
+  shifts every timestamp the store compares, and a future `available_at` default would strand
+  transport jobs), rejecting extra columns that are NOT NULL without a default (every normal
+  insert would fail with 23502), with the expected primary key; indexes verified to sit on
   the expected table as plain, non-unique, non-partial, valid-and-ready btrees over exactly the
   expected key columns in order; the ack sequence verified as the required cross-process
   monotonic clock (`bigint`, `INCREMENT 1`, `CACHE 1` — a larger cache hands sessions private
@@ -243,7 +247,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   and durable-flow stores now fail construction with the computed byte count; collection-name
   validation additionally rejects the reserved system namespace appearing anywhere in a dotted
   name, and the durable-flow options gain the same character rules as the channel/transport.
-  DI-hosted Mongo components additionally claim their effective collections — derived ones
+  Ownership-ledger claims are independent of `AutoCreateIndexes`: disabling index DDL no
+  longer silently disables cross-component collision protection (the new
+  `UseOwnershipLedger` option — default `true` — is the distinct, explicit opt-out for
+  least-privilege deployments that cannot write the ledger collection). DI-hosted Mongo
+  components additionally claim their effective collections — derived ones
   included — in a container-scoped ownership ledger keyed by cluster + database: a durable-flow
   store configured onto the channel's derived `{MessageCollection}_counters` collection (whose
   TTL index would silently delete the ack-sequence counter) now fails startup in either

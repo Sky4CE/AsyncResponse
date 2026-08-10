@@ -319,7 +319,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                             new("state_json", "jsonb", Nullable: false),
                             new("expires_at_utc", "timestamp with time zone", Nullable: false),
                             new("updated_at_utc", "timestamp with time zone", Nullable: false),
-                            new("revision", "bigint", Nullable: false, HasDefault: true),
+                            new("revision", "bigint", Nullable: false, DefaultExpression: "0"),
                             new("lease_id", "text", Nullable: true),
                             new("lease_expires_at_utc", "timestamp with time zone", Nullable: true),
                         ], PrimaryKey: ["flow_id"]),

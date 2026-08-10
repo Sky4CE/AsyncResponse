@@ -82,7 +82,7 @@ internal sealed class MongoDbTransportStore : IDisposable
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -91,12 +91,22 @@ internal sealed class MongoDbTransportStore : IDisposable
             if (_created)
                 return;
 
-            // Persisted cross-host ownership: see MongoOwnershipLedger.
-            await MongoOwnershipLedger.ClaimAsync(
-                _database,
-                "MongoDB transport",
-                [(_options.MessageCollection, nameof(_options.MessageCollection))],
-                cancellationToken).ConfigureAwait(false);
+            // Persisted cross-host ownership, independent of AutoCreateIndexes: see
+            // MongoOwnershipLedger.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB transport",
+                    [(_options.MessageCollection, nameof(_options.MessageCollection))],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             await _messages.Indexes.CreateOneAsync(
                 new CreateIndexModel<MongoTransportMessageDocument>(

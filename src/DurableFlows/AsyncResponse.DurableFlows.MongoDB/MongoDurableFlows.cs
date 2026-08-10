@@ -72,6 +72,17 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateIndexes { get; set; } = true;
 
     /// <summary>
+    /// Claims the ledger collection in the persisted cross-component ownership ledger
+    /// (<c>asyncresponse_ownership</c>) at first use, so another AsyncResponse component — in
+    /// this or any other process — misconfigured onto the same collection fails startup instead
+    /// of silently corrupting data (a flow store on the channel's derived counters collection
+    /// would let this store's TTL index delete the ack counter). Independent of
+    /// <see cref="AutoCreateIndexes"/>. Disable only for least-privilege deployments that cannot
+    /// write the ledger collection. Default: <c>true</c>.
+    /// </summary>
+    public bool UseOwnershipLedger { get; set; } = true;
+
+    /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
     /// with an actionable error instead of the raw 16 MB BSON-document error the executor would
     /// retry into the dead-letter queue. Default: 15 MB (headroom under MongoDB's 16 MB document
@@ -266,7 +277,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -275,14 +286,23 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             if (_created)
                 return;
 
-            // Persisted cross-host ownership: a flow store configured onto the channel's derived
-            // counters collection would let this TTL index silently delete the ack-sequence
-            // counter — see MongoOwnershipLedger.
-            await MongoOwnershipLedger.ClaimAsync(
-                _database,
-                "MongoDB durable-flow store",
-                [(_options.CollectionName, nameof(_options.CollectionName))],
-                cancellationToken).ConfigureAwait(false);
+            // Persisted cross-host ownership, independent of AutoCreateIndexes: a flow store
+            // configured onto the channel's derived counters collection would let this TTL
+            // index silently delete the ack-sequence counter — see MongoOwnershipLedger.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB durable-flow store",
+                    [(_options.CollectionName, nameof(_options.CollectionName))],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             // A TTL index (expireAfterSeconds = 0 on the expiry timestamp) makes MongoDB itself
             // reap expired ledgers — no application-side pruning needed. Loads still filter on

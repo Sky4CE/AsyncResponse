@@ -74,7 +74,7 @@ internal sealed class MongoDbChannelStore : IDisposable
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -85,17 +85,28 @@ internal sealed class MongoDbChannelStore : IDisposable
 
             // Persisted cross-host ownership: the in-container registry cannot see other hosts
             // or directly constructed stores, so claim the effective collections here — before
-            // any index DDL — and fail startup when another component already owns one.
-            await MongoOwnershipLedger.ClaimAsync(
-                _database,
-                "MongoDB channel",
-                [
-                    (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
-                    (_options.MessageCollection, nameof(_options.MessageCollection)),
-                    (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
-                    (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
-                ],
-                cancellationToken).ConfigureAwait(false);
+            // any index DDL, and INDEPENDENTLY of AutoCreateIndexes (disabling index DDL must
+            // not disable collision protection) — and fail startup when another component
+            // already owns one.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB channel",
+                    [
+                        (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
+                        (_options.MessageCollection, nameof(_options.MessageCollection)),
+                        (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
+                        (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
+                    ],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             // TTL indexes (expireAfterSeconds = 0 on the expiry timestamp) make MongoDB itself reap
             // expired documents — no application-side pruning needed. Reads still filter on the
