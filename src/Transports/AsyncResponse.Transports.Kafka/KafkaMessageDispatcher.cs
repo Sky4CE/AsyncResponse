@@ -118,16 +118,14 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
             ? $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.WorkerSubscriber)}"
             : $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.ResponseSubscriber)}";
 
-        if (subscriberOptions.PollTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.PollTimeout)} must be positive.");
-        if (subscriberOptions.BackpressurePollDelay <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.BackpressurePollDelay)} must be positive.");
+        // PollTimeout goes to Consume(TimeSpan), which librdkafka takes as 32-bit milliseconds;
+        // the backpressure and handler-retry delays arm in-process Task.Delay timers.
+        KafkaTransportOptionsValidator.EnsureIntMilliseconds(subscriberOptions.PollTimeout, optionPath, nameof(KafkaSubscriberOptions.PollTimeout));
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackpressurePollDelay, optionPath, nameof(KafkaSubscriberOptions.BackpressurePollDelay));
         if (subscriberOptions.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.MaxDeliveryAttempts)} cannot be negative.");
-        if (subscriberOptions.HandlerRetryBaseDelay <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.HandlerRetryBaseDelay)} must be positive.");
-        if (subscriberOptions.HandlerRetryMaxDelay <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.HandlerRetryMaxDelay)} must be positive.");
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.HandlerRetryBaseDelay, optionPath, nameof(KafkaSubscriberOptions.HandlerRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.HandlerRetryMaxDelay, optionPath, nameof(KafkaSubscriberOptions.HandlerRetryMaxDelay));
         if (subscriberOptions.HandlerRetryBaseDelay > subscriberOptions.HandlerRetryMaxDelay)
         {
             throw new InvalidOperationException(
@@ -155,8 +153,7 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
                         $"when {nameof(KafkaSubscriberOptions.AckMode)} is {nameof(KafkaAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                    throw new InvalidOperationException($"{optionPath}.{nameof(KafkaSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(KafkaSubscriberOptions.BackgroundDrainTimeout));
 
                 // Kafka subscribers spend only the background drain at shutdown; the poll loop
                 // stops with the host token and the consumer close is not separately bounded.

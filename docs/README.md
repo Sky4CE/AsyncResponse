@@ -19,6 +19,8 @@ recipes; come back here to go deeper.
 |---|---|
 | Orchestrate a multi-step flow that survives crashes and redeploys | [durable-flows.md](durable-flows.md) |
 | Compose flows from child flows, and know every failure mode | [Child flows](durable-flows.md#child-flows) and [What happens when things die](durable-flows.md#what-happens-when-things-die) |
+| Sleep inside a flow for days, schedule delayed jobs, or run flows on cron | [timers-and-scheduling.md](timers-and-scheduling.md) |
+| Test flows and waits deterministically — virtual clock, scripted replies, crash injection, simulated restarts | [testing.md](testing.md) |
 | Route late responses after a redeploy (resume vs. fail) | [recovery.md](recovery.md) |
 | Keep flow ledgers in my own database (or write a custom store) | [durable-flow-state-stores.md](durable-flow-state-stores.md), with one example per provider |
 | Lock down persisted callbacks, stack traces, and type resolution | [security.md](security.md) |

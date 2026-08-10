@@ -122,6 +122,8 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
             ? $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.WorkerSubscriber)}"
             : $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ResponseSubscriber)}";
 
+        RabbitMqOptionsValidator.ValidateConnection(transportOptions);
+
         if (StringComparer.Ordinal.Equals(transportOptions.WorkerQueue, transportOptions.ResponseQueue))
         {
             throw new InvalidOperationException(
@@ -152,11 +154,8 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                         $"when {nameof(RabbitMqSubscriberOptions.AckMode)} is {nameof(RabbitMqAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                    throw new InvalidOperationException($"{optionPath}.{nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
-
-                if (transportOptions.ShutdownTimeout <= TimeSpan.Zero)
-                    throw new InvalidOperationException($"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout)} must be positive.");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(RabbitMqSubscriberOptions.BackgroundDrainTimeout));
+                AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.ShutdownTimeout));
 
                 // RabbitMQ spends the background drain plus the bounded connection close
                 // (ShutdownTimeout) at shutdown; both must fit inside the host budget.

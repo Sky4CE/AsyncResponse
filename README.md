@@ -49,6 +49,10 @@ around them.
 - **Multi-step work can stay plain C#.** Durable flows checkpoint named steps, re-attach
   in-flight waits, and preserve terminal payloads received during a restart—without
   replay-determinism rules or a generated workflow DSL.
+- **Time is a first-class citizen.** Flows sleep durably for minutes or months
+  (`flow.DelayAsync`), worker jobs can be scheduled with native broker delays, and flows start on
+  cron schedules with replica-safe, exactly-once occurrences — then all of it runs instantly in
+  tests on the `AsyncResponse.Testing` virtual clock.
 - **Duplicate work is fenced across replicas.** Built-in flow stores combine atomic idempotent
   start, optimistic revisions, and renewable execution leases, so duplicate worker deliveries do
   not run the same flow concurrently.
@@ -93,6 +97,9 @@ dotnet add package AsyncResponse.Transports.RabbitMQ
 
 # Add exactly one provider-backed flow store when ledgers must survive restarts:
 dotnet add package AsyncResponse.DurableFlows.PostgreSQL
+
+# In test projects: the deterministic engine harness + virtual clock:
+dotnet add package AsyncResponse.Testing
 ```
 
 Packages target .NET 8 and .NET 10. `AsyncResponse.Abstractions` contains contracts only and is the
@@ -200,6 +207,11 @@ public sealed class TenantProvisioningFlow(
         if (migration.Status == MigrationStatus.Failed)
             throw new DurableFlowFailedException(migration.Message!);      // terminal, no retry
 
+        await flow.DelayAsync("settle", TimeSpan.FromDays(1));             // durable timer: suspends —
+                                                                           // no worker, lease, or memory
+                                                                           // held; crashes resume the
+                                                                           // remainder, never restart it
+
         await flow.StepAsync("notify", () => _notifier.SendAsync(input.TenantId));
     }
 }
@@ -215,7 +227,11 @@ builder.Services.AddAsyncResponse()
     .WithSqlServerTransport(options =>
         options.ConnectionString = sqlServerConnectionString)
     .WithSqlServerDurableFlows(options =>
-        options.ConnectionString = sqlServerConnectionString);
+        options.ConnectionString = sqlServerConnectionString)
+    // Optional: start a flow on a schedule — replica-safe, exactly one run per occurrence,
+    // no leader election (deterministic ids dedup through the store's atomic create).
+    .WithScheduledFlow<TenantProvisioningFlow, ProvisioningInput>(
+        "nightly-reprovision", "0 6 * * *", occurrence => new ProvisioningInput(TenantId: 0));
 
 var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(tenantId));
 ```
@@ -228,6 +244,12 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
   compare-and-swap protected, and one renewable lease owns execution. Duplicate deliveries become
   cheap no-ops while a worker is active; an expired lease lets another replica take over. Retrying
   `StartAsync` is idempotent only for the same flow and input; conflicting id reuse fails fast.
+- **Durable timers and cron schedules** — `await flow.DelayAsync("payment-window",
+  TimeSpan.FromDays(3))` sleeps as a checkpoint (crashes resume the remainder), and on
+  delayed-capable transports a sleeping run suspends entirely — no worker, lease, or memory
+  while it sleeps. `WithScheduledFlow<TFlow, TInput>("nightly", "0 6 * * *", …)` starts flows on
+  cron with exactly-once occurrences across replicas and no leader election. See
+  [docs/timers-and-scheduling.md](docs/timers-and-scheduling.md).
 - **Edit flows like code** — insert, reorder, or branch steps with ordinary C#; in-flight runs
   pick up compatible changes on resume. Stable step keys preserve existing checkpoints; changing
   a key intentionally creates a new step.
@@ -237,6 +259,29 @@ var flowId = await _flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(
   `.WithDurableFlows<MyFlowStateStore>()` for an application-owned implementation.
 - **Tested like the rest of the library** — a crash-at-every-checkpoint unit matrix, end-to-end
   integration runs against every durable channel, and a concurrent-flow stress scenario gating CI.
+- **And testable by *your* tests** — the `AsyncResponse.Testing` package runs the complete
+  engine in-process on a virtual clock: script replies to awaited steps, skip a three-day timer
+  in a microsecond, inject a crash at any checkpoint, and simulate a restart with real
+  lost-subscriber recovery — no brokers, no sleeps, no instrumentation in your flow classes. See
+  [docs/testing.md](docs/testing.md).
+
+```csharp
+await using var harness = await FlowTestHarness.StartAsync(o =>
+    o.ConfigureAsyncResponse = b => b.WithDurableFlow<TenantProvisioningFlow, ProvisioningInput>());
+
+harness.CrashAfterStep("create-workspace");            // die between checkpoint and next step
+var run = await harness.StartFlowAsync<TenantProvisioningFlow, ProvisioningInput>(new(7));
+await harness.AdvanceAsync(TimeSpan.FromSeconds(2));   // redelivery backoff elapses virtually
+
+await run.WaitForAwaitingStepAsync("run-migration");   // durably parked; reply as the remote system
+await run.ReplyAsync(new MigrationResult { Status = MigrationStatus.Completed });
+
+await run.WaitForTimerStepAsync("settle");             // the one-day timer parks the run…
+await harness.AdvanceAsync(TimeSpan.FromDays(1));      // …and virtual time skips it
+
+Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+Assert.Equal(1, run.StepExecutions("create-workspace")); // crash cost a delivery, not a side effect
+```
 
 > [!IMPORTANT]
 > Durable flows provide **checkpointed, at-least-once execution**, not distributed exactly-once
@@ -606,17 +651,78 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **1,700+ unit tests, run on each target framework** (~3,400 executions across .NET 8 and .NET 10), including
-  concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
-  duplicate-execution detection.
-- **300+ integration test cases** drive the shipped sample app black-box over HTTP against **real
-  brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
-  Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
-  for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport.
-  The same run verifies the atomic durable-flow store contract against SQL Server, PostgreSQL,
-  MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, and EF Core.
-  A scheduled CI matrix reruns the Redis-backed suite against Valkey; Dragonfly is validated by
-  running the real channel and transport against a live server.
+**6000+ test executions per CI run, none skipped** — 3,700+ unit 
+and 2,400+ integration cases against real servers. The unit suite dogfoods the shipped
+[`AsyncResponse.Testing`](docs/testing.md) harness: durable timers, cron schedules,
+production-sized timeouts, crash-at-every-checkpoint matrices, and restart-recovery scenarios all
+run on its virtual clock — multi-day sleeps and seven-day timeouts elapse in microseconds, so the
+suite runs in seconds, not hours, with no timing flakiness to chase.
+
+A channel, a worker transport, and a durable-flow store are chosen independently, so "each provider
+works" and "the combination works" are different claims. The suite makes both, and is structured
+around that split: **one behavioral contract per axis**, run against every provider on it, plus **the
+full cross product** for how the axes compose.
+
+### The provider cross product
+
+**6 channels × 11 transports × 10 durable-flow stores = 660 combinations**, each running three
+scenarios — a durable flow end to end, a terminal domain failure, and a worker job with its
+correlation id and ambient context restored — for **1,980 cases against real servers**. Each cell
+builds a host exactly the way an application does,
+`AddAsyncResponse().With…Channel().With…Transport().With…DurableFlows()`, and drives a real flow
+through it.
+
+Enumerating the product rather than sampling it is the point: a PostgreSQL channel paired with a Kafka
+transport and an Oracle ledger is a combination nobody writes a test for by hand, and it is precisely
+where two providers stop composing. The cells are sharded across nine CI legs by container footprint,
+because the whole fleet at once is ~9 GiB and the two heavyweight stores cannot share a runner:
+`database-light` 288 cells, `cloud-light` 144, `broker-light` 96, then 36/18/12 for each Oracle and
+Cosmos shard. `MatrixCompletenessTests` reflects over the shipped `With…Channel`, `With…Transport`,
+and `With…DurableFlows` registrations and fails when one has no place in the product — a new provider
+package cannot ship without cross-product coverage.
+
+### Behavioral contracts, one per axis
+
+Depth within an axis runs **per provider** rather than per combination, so adding a scenario costs N
+runs instead of 660:
+
+| Contract | Facts | Providers | Cases |
+| --- | ---: | ---: | ---: |
+| Channel conformance | 27 | 6 channels | 162 |
+| Transport conformance | 10 | 11 transports | 110 |
+| Durable-flow store contract | one composed contract | 10 stores | 10 |
+
+The channel contract pins live delivery, `Until` predicates, timeouts, correlation-id isolation and
+reuse, progress streams, mixed-type and polymorphic fan-out, straggler drops, crash-then-recovery
+routing, and disposal semantics. The transport contract pins exactly-once delivery of a successful
+job, ambient-context restoration, redelivery after a transient failure, poison-message bounds,
+early-ACK execution, large payloads, concurrency, durability across a consumer outage, and
+idle-shutdown latency. The store contract pins the atomic revision/lease protocol, TTL expiry, lease
+expiry and steal after a worker dies, large state, and rejection of a newer schema version.
+
+Transports differ in *where* a guarantee comes from, and the suite records that rather than letting
+the difference become an untested gap. Every transport bounds redelivery — via a subscriber knob on
+six of them, the in-process retry budget on the in-memory queue, the queue's redrive policy on SQS,
+and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound itself: RabbitMQ
+cannot count past two without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does
+not increment `x-death`), and a Pub/Sub dead-letter policy rejects anything under five. Payload
+ceilings differ by two orders of magnitude — SQS and Service Bus standard tier both reject messages
+over 256 KiB — so the payload fact is sized per transport. Where a capability is genuinely absent, the
+contract asserts the absence instead of skipping, so adding it later fails the test.
+
+### Real servers, and the shipped app
+
+Everything above runs against real servers orchestrated by .NET Aspire: Redis, NATS, PostgreSQL,
+SQL Server, MongoDB (single-node replica set), MySQL, Oracle, RabbitMQ, and Kafka containers, plus the
+official Azure Service Bus and Google Pub/Sub emulators, the Cosmos DB emulator, and LocalStack for
+AWS SQS and DynamoDB. A separate app-driven suite exercises the **shipped sample black-box over
+HTTP** — 137 scenarios with a dedicated early-ACK app instance per transport — so the packages are
+proven through a real host boundary as well as through in-process wiring.
+
+### Beyond the providers
+
+- A CI matrix reruns the Redis-backed suite against **Valkey** on every invocation and weekly;
+  Dragonfly is validated by running the real channel and transport against a live server.
 - **The same integration suite runs against a Native AOT SUT**: the sample publishes fully
   trimmed and the Aspire harness boots the native binary wherever the full driver stack is
   AOT-capable today (NATS and PostgreSQL pairs; the rest stay JIT with the exact driver-level
@@ -637,27 +743,45 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 **Reach for AsyncResponse when**
 
 - a flow needs the *answer* to a specific request that arrives asynchronously — job results,
-  payment confirmations, DAG completions, webhook callbacks;
-- you're **orchestrating a multi-step flow across async services** — implement
+  payment confirmations, ML/batch completions, DAG runs, provisioning callbacks, webhook
+  round-trips. If any code anywhere ends with "…and then we wait for the outcome", that wait is
+  what this library makes safe;
+- you're **orchestrating a multi-step process across async services** — implement
   `IDurableFlow<TInput>` and write the steps as plain sequential `await`s
-  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints successful steps,
-  re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks; external
-  side effects remain at-least-once and must be idempotent —
+  (`flow.StepAsync(...)`, `flow.AwaitStepAsync<T>(...)`). The library checkpoints successful
+  steps, re-attaches in-flight waits after a crash or redeploy, and wires the recovery callbacks —
+  no replay-determinism rules, no workflow DSL, no engine cluster to operate —
   [durable flows](docs/durable-flows.md);
-- you're maintaining a hand-rolled `TaskCompletionSource` registry or a polling loop today;
-- waits must survive redeploys, and a late **failure** must never be resumed as a success.
+- the process involves **time**: "give the customer three days to pay" (`flow.DelayAsync`
+  suspends without holding a worker), "retry the export in an hour" (delayed worker jobs with
+  native broker delays), "run reconciliation nightly at 06:00" (replica-safe cron flows with
+  exactly-once occurrences) — no separate scheduler to deploy or keep consistent —
+  [timers & scheduling](docs/timers-and-scheduling.md);
+- a **human is in the loop**: an approval is just an awaited step whose response your UI
+  publishes — the flow sleeps durably until the click, whether it comes in seconds or weeks;
+- users watch the work happen — `Until(...)` streams progress messages through the same wait
+  that delivers the terminal result, no side-channel state machine;
+- you're maintaining a hand-rolled `TaskCompletionSource` registry, a polling loop, or a
+  timeout-and-reconcile job today — that is exactly the plumbing this library deletes;
+- waits must **survive redeploys**, and a late *failure* must never be resumed as a success —
+  domain-aware recovery is the part teams get subtly wrong by hand;
+- you want all of the above **on infrastructure you already run** — it rides your existing
+  broker, queue, or database (or starts fully in-memory with zero infrastructure), swappable per
+  axis through DI without touching application code;
+- and you want it **provable in CI** — `AsyncResponse.Testing` runs real flows, timers, and
+  recovery on a virtual clock, so the hardest async behavior in your system becomes the easiest
+  to test.
 
-**Reach for something else when**
+**When something else fits better**
 
-- you need **engine-owned** flow semantics: automatic compensation graphs, durable timers
-  measured in weeks, human-approval tasks, replayable audit histories of every decision. With
-  idempotent steps and a persisted ledger, AsyncResponse runs crash-resumable multi-step flows
-  end to end — including explicit compensation — as
-  [durable flows](docs/durable-flows.md) shows, and it does so without replay-determinism rules
-  or workflow-version patching. Choose Temporal/Durable Task when you want the *engine* to own
-  the ledger and derive compensation automatically, and accept those constraints in exchange.
-- you need fire-and-forget pub/sub fan-out with nobody waiting — that's your message bus, and
-  AsyncResponse coexists with it happily.
+The honest list is short. Pure fire-and-forget fan-out where genuinely nobody ever awaits an
+outcome is your message bus's job — AsyncResponse coexists with it happily, and the moment any
+consumer *does* need the result, you're back in its sweet spot. And if you specifically want a
+workflow *engine* to own the ledger — auto-derived compensation graphs, replayable audit
+histories — Temporal or Durable Task trade those in for replay rules, version patching, and a
+cluster to run; durable flows with timers, cron, and explicit compensation cover most of that
+ground without the ceremony. In practice: if anything in your system waits for an asynchronous
+answer, you're better off with AsyncResponse than without it.
 
 ## Documentation
 
@@ -676,6 +800,12 @@ the right page. The pages:
   `IDurableFlow<TInput>` with automatically checkpointed steps, crash-resume and re-attach,
   progress streaming, pluggable flow-state storage, explicit compensation, and an honest
   comparison with workflow engines.
+- **[Durable timers & scheduling](docs/timers-and-scheduling.md)** — `flow.DelayAsync` sleeps
+  that suspend without holding a worker, delayed worker jobs with the per-transport
+  native-delivery matrix, and replica-safe cron-scheduled flows (syntax, DST, occurrence ids).
+- **[Testing](docs/testing.md)** — the `AsyncResponse.Testing` package: virtual clock,
+  flow-test harness with scripted replies and crash injection at checkpoints, and simulated
+  restarts with real lost-subscriber recovery.
 - **[Durable-flow state stores](docs/durable-flow-state-stores.md)** — a complete registration for
   every store provider, the atomic contract, schema ownership, client lifetimes, and expiry.
 - **[Observability](docs/observability.md)** — tracing (`ActivitySource`) and metrics
@@ -696,8 +826,8 @@ the right page. The pages:
   `UPDLOCK/READPAST` claims, schema, ACK modes, and operational tuning.
 - **[Sample app](docs/sample.md)** — the runnable Aspire testbed and curl walkthroughs for every
   scenario.
-- **[Roadmap](docs/roadmap.md)** — capabilities are the new headline: durable timers, a testing
-  kit, claim-check payloads, and a flow operations API — then Hangfire, Storage Queues, MQTT and
+- **[Roadmap](docs/roadmap.md)** — durable timers and the testing kit have shipped; next up:
+  claim-check payloads and a flow operations API — then Hangfire, Storage Queues, MQTT and
   more, with priorities and design sketches.
 
 ## License

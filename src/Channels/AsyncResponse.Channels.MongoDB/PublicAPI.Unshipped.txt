@@ -35,7 +35,9 @@ AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHear
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatTimeout.set -> void
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseChangeStreams.get -> bool
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseChangeStreams.set -> void
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseOwnershipLedger.get -> bool
+AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.UseOwnershipLedger.set -> void
 AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.Validate() -> void
-const AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ChannelName = "MongoDB" -> string!
 Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions
+const AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions.ChannelName = "MongoDB" -> string!
 static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions.WithMongoDbChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

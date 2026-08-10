@@ -63,6 +63,23 @@ internal static class AsyncResponseJson
     public static T? Deserialize<T>(string json)
         => JsonSerializer.Deserialize(json, GetTypeInfo<T>(Default));
 
+    /// <summary>
+    /// Serializes with default settings straight to UTF-8 bytes — the wire form without the
+    /// UTF-16 string detour. Used by the in-memory channel's per-waiter wire materialization,
+    /// where the string round-trip doubled the publish-path allocations.
+    /// </summary>
+    internal static byte[] SerializeToUtf8Bytes<T>(T value)
+        => JsonSerializer.SerializeToUtf8Bytes(value, GetTypeInfo<T>(Default));
+
+    /// <summary>
+    /// Case-insensitive UTF-8 deserialization — the byte-level twin of the string/JsonElement
+    /// conversion path in <c>ReflectionExtensions.ConvertTo</c> (which resolves through
+    /// <see cref="CaseInsensitive"/>), so switching a call site between the two never changes
+    /// property matching.
+    /// </summary>
+    internal static T? DeserializeCaseInsensitive<T>(ReadOnlySpan<byte> utf8Json)
+        => JsonSerializer.Deserialize(utf8Json, GetTypeInfo<T>(CaseInsensitive));
+
     /// <summary>Resolves typed metadata for <typeparamref name="T"/> from <paramref name="options"/>.</summary>
     public static JsonTypeInfo<T> GetTypeInfo<T>(JsonSerializerOptions options)
         => (JsonTypeInfo<T>)GetTypeInfo(typeof(T), options);
@@ -75,6 +92,15 @@ internal static class AsyncResponseJson
     {
         try
         {
+            // Collectible-context (plugin) types are deliberately NOT special-cased here: the
+            // runtime's serializer pins a collectible AssemblyLoadContext through process-wide
+            // static caches (member accessors) no matter which JsonSerializerOptions instance is
+            // used — verified empirically against .NET 10 with a fresh options per call — so a
+            // per-call options copy would add cost without restoring unloadability. The library's
+            // own type caches skip collectible types (see UnresolvableTypeNames call sites); the
+            // supported plugin pattern keeps payload/service CONTRACT types in a non-collectible
+            // contracts assembly, under which nothing here ever sees a collectible type. See
+            // AsyncResponseTypeResolution docs.
             return options.GetTypeInfo(type);
         }
         catch (NotSupportedException ex)

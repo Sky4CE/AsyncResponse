@@ -21,6 +21,7 @@ namespace AsyncResponse.IntegrationTests;
 /// </para>
 /// <para>Set <c>ASYNCRESPONSE_SKIP_AOT_GATE=1</c> to skip locally when iterating quickly.</para>
 /// </summary>
+[Trait(Batches.Trait, Batches.None)]
 public sealed class NativeAotPublishGateTests
 {
     private static readonly TimeSpan PublishTimeout = TimeSpan.FromMinutes(12);

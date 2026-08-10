@@ -116,10 +116,13 @@ public sealed class DurableFlowWakeRetryTests
     }
 
     [Fact]
-    public async Task RecoverAsync_SuspendedFlow_IgnoresRecovery_WithoutCheckpointOrReenqueue()
+    public async Task RecoverAsync_SuspendedFlow_CheckpointsWithoutWakingTheRun()
     {
-        // Operator parking: a dead-lettered-but-Running run set to Suspended must not be
-        // resurrected (or mutated) behind the operator's back by a late recovered response.
+        // Operator parking: a Suspended run must never be WOKEN behind the operator's back by a
+        // late recovered response — but the recovered terminal payload exists nowhere else once
+        // the callback returns, so it IS checkpointed. Discarding it (the old behavior) meant an
+        // un-suspended run re-attached to a correlation id nothing could answer and burned the
+        // full step timeout; with the checkpoint, ResumeAsync continues from the recovered result.
         var store = new InMemoryFlowStateStore();
         var state = RunnableState("suspended-flow");
         state.Status = FlowRunStatus.Suspended;
@@ -137,8 +140,8 @@ public sealed class DurableFlowWakeRetryTests
             It.IsAny<CancellationToken>()), Times.Never);
         var reloaded = await store.LoadAsync(state.FlowId!);
         Assert.Equal(FlowRunStatus.Suspended, reloaded!.Status);
-        Assert.False(reloaded.Steps!["step"].Completed);
-        Assert.Equal("cid-parked", reloaded.Steps["step"].PendingCorrelationId);
+        Assert.True(reloaded.Steps!["step"].Completed);
+        Assert.Null(reloaded.Steps["step"].PendingCorrelationId);
     }
 
     [Fact]

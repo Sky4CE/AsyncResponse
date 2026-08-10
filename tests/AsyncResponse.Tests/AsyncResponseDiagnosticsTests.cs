@@ -70,6 +70,40 @@ public class AsyncResponseDiagnosticsTests
     }
 
     [Fact]
+    public async Task LostDispatch_SharedCorrelationRegistrationsOnDifferentRoutes_ReportsMixedNotUnclassified()
+    {
+        // Two registrations share one correlation id and legitimately classify differently
+        // (each as the payload type IT registered). The aggregate previously degraded to
+        // "unclassified" — indistinguishable from a poisoned payload — while each
+        // per-registration dispatch span already carried its true route.
+        using var collector = new ActivityCollector();
+        await using var provider = CreateProvider();
+        var store = provider.GetRequiredService<IRecoveryStateStore>();
+        await store.SaveAsync("corr-mixed", new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-mixed",
+            PayloadTypeFullName = typeof(MixedRouteResumePayload).FullName,
+            RegisteredAtUtc = DateTime.UtcNow
+        }, TimeSpan.FromMinutes(5));
+        await store.SaveAsync("corr-mixed", new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-mixed",
+            PayloadTypeFullName = typeof(MixedRouteHoldPayload).FullName,
+            RegisteredAtUtc = DateTime.UtcNow
+        }, TimeSpan.FromMinutes(5));
+
+        await provider.GetRequiredService<IAsyncResponseIngress>()
+            .HandleResponseMessageAsync("{}", "corr-mixed");
+
+        var publish = collector.Single("asyncresponse.ingress.raw_response", "asyncresponse.correlation_id", "corr-mixed");
+        Assert.Equal("mixed", Tag(publish, "asyncresponse.lost_subscriber_route"));
+        collector.Single("asyncresponse.lost_subscriber.dispatch", "asyncresponse.lost_subscriber_route", "resume");
+        collector.Single("asyncresponse.lost_subscriber.dispatch", "asyncresponse.lost_subscriber_route", "keep_waiting");
+    }
+
+    [Fact]
     public async Task WorkerEnqueuePublishAndExecute_EmitActivities()
     {
         using var collector = new ActivityCollector();
@@ -142,6 +176,9 @@ public class AsyncResponseDiagnosticsTests
         AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, null);
         Assert.Equal("unclassified", Tag(activity, "asyncresponse.lost_subscriber_route"));
 
+        AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, null, mixed: true);
+        Assert.Equal("mixed", Tag(activity, "asyncresponse.lost_subscriber_route"));
+
         AsyncResponseDiagnostics.SetError(activity, "custom.error");
         Assert.Equal("custom.error", Tag(activity, "error.type"));
     }
@@ -174,6 +211,18 @@ public class AsyncResponseDiagnosticsTests
 
     private static object? Tag(Activity activity, string key)
         => activity.TagObjects.FirstOrDefault(tag => tag.Key == key).Value;
+
+    /// <summary>Classifies every recovered delivery as resumable (no callbacks armed: warn-and-retain).</summary>
+    public sealed class MixedRouteResumePayload : IAsyncResponsePayload
+    {
+        public RecoveryAction OnRecovery() => RecoveryAction.Resume;
+    }
+
+    /// <summary>Classifies every recovered delivery as a non-terminal checkpoint.</summary>
+    public sealed class MixedRouteHoldPayload : IAsyncResponsePayload
+    {
+        public RecoveryAction OnRecovery() => RecoveryAction.KeepWaiting;
+    }
 
     private sealed class ActivityCollector : IDisposable
     {

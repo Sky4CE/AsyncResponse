@@ -107,16 +107,18 @@ public static class AsyncResponseDiagnostics
         activity?.SetTag("asyncresponse.worker.method", call.MethodName);
     }
 
-    internal static void SetLostSubscriberRoute(Activity? activity, RecoveryAction? action)
-        => activity?.SetTag("asyncresponse.lost_subscriber_route", LostSubscriberRouteName(action));
+    internal static void SetLostSubscriberRoute(Activity? activity, RecoveryAction? action, bool mixed = false)
+        => activity?.SetTag("asyncresponse.lost_subscriber_route", LostSubscriberRouteName(action, mixed));
 
-    private static string LostSubscriberRouteName(RecoveryAction? action) => action switch
-    {
-        RecoveryAction.Resume => "resume",
-        RecoveryAction.Fail => "failure",
-        RecoveryAction.KeepWaiting => "keep_waiting",
-        _ => "unclassified"
-    };
+    private static string LostSubscriberRouteName(RecoveryAction? action, bool mixed) => mixed
+        ? "mixed"
+        : action switch
+        {
+            RecoveryAction.Resume => "resume",
+            RecoveryAction.Fail => "failure",
+            RecoveryAction.KeepWaiting => "keep_waiting",
+            _ => "unclassified"
+        };
 
     internal static void SetError(Activity? activity, Exception exception)
     {
@@ -131,7 +133,7 @@ public static class AsyncResponseDiagnostics
     }
 
     /// <summary>Records one lost-subscriber dispatch (the recovery path was entered for a publish).</summary>
-    internal static void RecordLostSubscriber(string kind, RecoveryAction? action, bool callbackInvoked)
+    internal static void RecordLostSubscriber(string kind, RecoveryAction? action, bool callbackInvoked, bool mixed = false)
     {
         if (!LostSubscriberDispatches.Enabled)
             return;
@@ -139,7 +141,7 @@ public static class AsyncResponseDiagnostics
         LostSubscriberDispatches.Add(
             1,
             new KeyValuePair<string, object?>("kind", kind),
-            new KeyValuePair<string, object?>("route", LostSubscriberRouteName(action)),
+            new KeyValuePair<string, object?>("route", LostSubscriberRouteName(action, mixed)),
             new KeyValuePair<string, object?>("invoked", callbackInvoked));
     }
 

@@ -13,9 +13,149 @@ using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
 
-[Collection(IntegrationCollection.Name)]
-public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
+    [Fact]
+    public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()
+    {
+        // A 128-character table name used to collide with its own generated sequence name
+        // (whole-name truncation): CREATE SEQUENCE failed against the existing table object and
+        // schema creation broke. Suffix space is now reserved before capping.
+        await WithSchemaAsync("max_len_table", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            options.MessageTable = new string('m', 128);
+            var sql = new SqlServerChannelSql(Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            // Every derived index must actually exist in the catalog. Whole-name truncation used
+            // to give both messages-table indexes ONE shared name, so the second IF NOT EXISTS
+            // guard matched the first index and silently skipped creation — invisible to any test
+            // that only drew from the sequence.
+            var indexNames = new List<string>();
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var indexes = connection.CreateCommand();
+                indexes.CommandText =
+                    """
+                    SELECT i.name FROM sys.indexes i
+                    JOIN sys.tables t ON t.object_id = i.object_id
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = @schema AND i.name IS NOT NULL;
+                    """;
+                indexes.Parameters.AddWithValue("@schema", schema);
+                await using var reader = await indexes.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    indexNames.Add(reader.GetString(0));
+            }
+
+            // Suffix space is reserved by truncating the table STEM, so at the 128-character cap
+            // the two messages-table indexes stay distinct.
+            Assert.Contains(new string('m', 116) + "_expires_idx", indexNames);
+            Assert.Contains(new string('m', 104) + "_correlation_created_idx", indexNames);
+            Assert.Contains("asyncresponse_recovery_state_expires_idx", indexNames);
+            Assert.Contains("asyncresponse_channel_subscribers_expires_idx", indexNames);
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.MessageTable = options.MessageTable;
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerChannelSql(Options.Create(managedOptions));
+            var (_, managedSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(managedSeq > startSeq);
+        });
+    }
+
+    [Fact]
+    public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
+    {
+        // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its
+        // sequence, which registration and delivery claims now require unconditionally. The
+        // channel must fail at first use with an error carrying the exact migration — not a raw
+        // "invalid column name" mid-operation — and work immediately once the documented
+        // migration has been applied.
+        await WithSchemaAsync("managed_upgrade", async schema =>
+        {
+            var creator = new SqlServerChannelSql(Options.Create(ChannelOptions(schema)));
+            await creator.EnsureCreatedAsync();
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var strip = connection.CreateCommand();
+                strip.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} DROP COLUMN acked_seq;
+                    DROP SEQUENCE {creator.AckSequence};
+                    """;
+                await strip.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerChannelSql(Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("acked_seq", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("docs/sqlserver.md", ex.Message, StringComparison.Ordinal);
+
+            // The exact migration from docs/sqlserver.md, "Upgrading a manually managed schema".
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var migrate = connection.CreateCommand();
+                migrate.CommandText = ex.Message[(ex.Message.IndexOf("IF COL_LENGTH", StringComparison.Ordinal))..ex.Message.IndexOf(" See docs/", StringComparison.Ordinal)];
+                await migrate.ExecuteNonQueryAsync();
+            }
+
+            var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            // Rolling-upgrade rule: a row acked by a PRE-sequence build (acked_at set, acked_seq
+            // null — simulated here) must stay permanently unsequenced through later fan-out
+            // re-claims. Back-filling would pair the old acked_at with a fresh sequence and let a
+            // tick-tied waiter replay its predecessor's response.
+            var legacyId = Guid.NewGuid();
+            await managed.InsertMessageAsync(legacyId, "legacy-ack", SuccessEnvelope("old"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var legacyAck = connection.CreateCommand();
+                legacyAck.CommandText = $"UPDATE {creator.MessageTable} SET acked_at = SYSUTCDATETIME() WHERE id = @id;";
+                legacyAck.Parameters.AddWithValue("@id", legacyId);
+                await legacyAck.ExecuteNonQueryAsync();
+            }
+
+            Assert.True(await managed.TryClaimForDeliveryAsync(legacyId, CancellationToken.None));
+            var freshId = Guid.NewGuid();
+            await managed.InsertMessageAsync(freshId, "fresh-ack", SuccessEnvelope("new"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.True(await managed.TryClaimForDeliveryAsync(freshId, CancellationToken.None));
+
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var check = connection.CreateCommand();
+                check.CommandText =
+                    $"""
+                    SELECT
+                      CASE WHEN (SELECT acked_seq FROM {creator.MessageTable} WHERE id = @legacy) IS NULL THEN 1 ELSE 0 END,
+                      CASE WHEN (SELECT acked_seq FROM {creator.MessageTable} WHERE id = @fresh) IS NOT NULL THEN 1 ELSE 0 END;
+                    """;
+                check.Parameters.AddWithValue("@legacy", legacyId);
+                check.Parameters.AddWithValue("@fresh", freshId);
+                await using var reader = await check.ExecuteReaderAsync();
+                await reader.ReadAsync();
+                Assert.Equal(1, reader.GetInt32(0));
+                Assert.Equal(1, reader.GetInt32(1));
+            }
+        });
+    }
+
     [Fact]
     public async Task ChannelSql_RoundTripsRecoverySubscribersMessagesAndClaims()
     {
@@ -716,7 +856,8 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
 
     private async Task DropSchemaAsync(string schema)
     {
-        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables first, then the schema.
+        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables and sequences
+        // (the channel's monotonic ack sequence) first, then the schema.
         await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
@@ -726,6 +867,10 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             SELECT @drop += N'DROP TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N';'
             FROM sys.tables t
             JOIN sys.schemas s ON t.schema_id = s.schema_id
+            WHERE s.name = @schema;
+            SELECT @drop += N'DROP SEQUENCE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(seq.name) + N';'
+            FROM sys.sequences seq
+            JOIN sys.schemas s ON seq.schema_id = s.schema_id
             WHERE s.name = @schema;
             IF SCHEMA_ID(@schema) IS NOT NULL
                 SET @drop += N'DROP SCHEMA ' + QUOTENAME(@schema) + N';';
@@ -913,7 +1058,7 @@ public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) 
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, 0L, predicate, completion, null],
             culture: null)!;
         SetField(instance, "_cleanupStarted", 1);
         return (instance, completion);

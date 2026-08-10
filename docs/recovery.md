@@ -58,8 +58,11 @@ returns `KeepWaiting` — e.g. `public RecoveryAction OnRecovery() => Status == 
 RecoveryAction.Fail : RecoveryAction.Resume;`.
 
 The default (no override) is `Fail`, so a response can never resume the happy path by omission.
-Durable channels require the override when you register recovery callbacks — they fail fast at
-waiter creation if it is missing; the in-memory channel, which can't survive a redeploy, doesn't.
+Every channel requires the override when you register recovery callbacks — waiter creation fails
+fast if it is missing. That includes the in-memory channel: it implements the same recoverable
+contract against its process-local store (recovery there spans waiter loss within one process
+lifetime — and the simulated restarts of [AsyncResponse.Testing](testing.md) — rather than a real
+process exit), so a payload that passes in tests passes unchanged on Redis.
 
 Recovery classification is **independent of your `Until` predicate** (which owns live completion).
 They answer different questions: "what does this result do to the flow?" versus "is the operation
@@ -165,7 +168,9 @@ A resume may re-trigger a flow whose step is still running remotely; resume shou
 (subscribe to the same correlation id) rather than re-execute side effects. Persist enough state to
 tell the difference. And **register both callbacks** for any flow that must survive redeploys — a
 failed payload with no failure callback is logged and dropped (never resumed), but dropped is still
-a stuck flow.
+a stuck flow. The inverse also routes conservatively: a resumable payload arriving for a
+registration with only a failure callback takes the failure route (the flow cannot proceed without
+a resume callback) instead of being discarded.
 
 Recovery callbacks are **at-least-once**. Two publishers racing on the same orphaned correlation id
 can each load the registration before either deletes it, and a crash between "callback invoked" and
@@ -251,6 +256,18 @@ The SQL Server and MongoDB channels implement the same claim protocol — the sa
 columns/fields on the message table/collection, updated atomically — so the guarantee holds
 across all three database channels.
 
+Each delivery claim additionally stamps `acked_seq` from a store-side monotonic sequence
+(PostgreSQL/SQL Server: a `SEQUENCE` next to the message table; MongoDB: a counter document in
+`{messages}_counters`), and every waiter registration draws its own position from the same
+sequence. That order separates "acked before this waiter registered" (history — a reused
+correlation id must not replay its predecessor's response) from "acked to a fan-out group
+including this waiter" (delivered) even when both events land on the same server-clock tick — a
+tie timestamps cannot arbitrate. The arbitration is conservative-exact: exact whenever the
+claim's sequence draw was not stalled across ticks, and on a stalled draw it resolves as history
+(a missed delivery that recovers through the step timeout — never a replayed response; see the
+shared-correlation section below). Rows acked by a build predating the column fall back to the
+strict server-clock comparison.
+
 ## Wire/schema versioning
 
 `RecoveryState`, `WorkerJobEnvelope`, and the response envelope each carry a **`SchemaVersion`**. A
@@ -266,14 +283,18 @@ worker with a shape it does not understand.
 ## Shared-correlation recovery
 
 Multiple recoverable waiters may share one correlation id. Live delivery fans out to every active
-waiter, with one deliberate exception on the database channels: a waiter whose registration lands
-in the **same server-clock tick** as another process's delivery claim is indistinguishable from a
-finished predecessor reusing the correlation id, and the tie is resolved toward exclusion — the
-waiter misses that delivery. A durable-flow step then faults at its step timeout and restarts the
-idempotent step fresh; a plain waiter surfaces a `TimeoutException` to its caller (at-most-once
-for the tie; wrong-data redelivery would be the alternative). See the `IsWithinWatermark` documentation in the DB channel
-source for the full trade, and roadmap §5.6 for the sequence-based design that would remove the
-tie entirely. If all waiters are lost, the recovery store keeps one registration per waiter and a
+waiter. On the database channels, a registration and another process's delivery claim can land in
+the **same server-clock tick** — indistinguishable by timestamps from a finished predecessor
+reusing the correlation id. The monotonic ack sequence breaks exactly that tie (see the delivery
+protocol above): claims and registrations draw from one sequence, so tick-tied history and
+fan-out separate by integer order. The one conservative residual: a claim whose sequence draw
+stalled from an earlier tick into that exact tick resolves as history — the waiter misses that
+delivery (a durable-flow step faults at its step timeout and restarts the idempotent step fresh;
+a plain waiter surfaces a `TimeoutException`), which is the same verdict the previous
+timestamp-only rule gave every tie and can never replay a consumed response. Rows acked by a
+pre-1.0 build carry no sequence and keep that older at-most-once tie resolution. See the
+`IsWithinWatermark` documentation in the DB channel source for the full reasoning. If all
+waiters are lost, the recovery store keeps one registration per waiter and a
 late response/exception dispatches to every stored callback for that correlation id. A waiter that
 completes normally removes only its own registration, so a still-active sibling remains recoverable.
 

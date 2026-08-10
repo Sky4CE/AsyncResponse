@@ -4,10 +4,11 @@ using Xunit;
 namespace AsyncResponse.Tests;
 
 /// <summary>
-/// The recovery-routing entry point of the lost-subscriber fallback: typed payloads answer for
-/// themselves via <c>OnRecovery</c>; untyped (broker-delivered) JSON is materialized as the
-/// registered payload type first — and the materialized instance is returned so callbacks receive
-/// it instead of raw JSON; anything unclassifiable yields a <c>null</c> action so the caller fails
+/// The recovery-routing entry point of the lost-subscriber fallback. Input is always a WIRE
+/// representation — raw broker JSON, or a typed publish normalized by the dispatcher to its
+/// declared-type serialization — which is materialized as the REGISTERED payload type and asked
+/// <c>OnRecovery</c>; the materialized instance is returned so callbacks receive it instead of
+/// raw JSON. Anything unclassifiable yields a <c>null</c> action so the caller fails
 /// conservatively (it never resumes a payload it cannot understand).
 /// </summary>
 public class PayloadRecoveryClassifierTests
@@ -17,90 +18,73 @@ public class PayloadRecoveryClassifierTests
     [InlineData(OperationStatus.Running, RecoveryAction.KeepWaiting)]
     [InlineData(OperationStatus.Failed, RecoveryAction.Fail)]
     [InlineData(OperationStatus.Unknown, RecoveryAction.Fail)]
-    public void TypedPayload_UsesItsOwnOnRecoveryAction(OperationStatus status, RecoveryAction expected)
+    public void WireRepresentation_UsesTheRegisteredTypesOwnAction(OperationStatus status, RecoveryAction expected)
     {
-        var payload = new OperationResult { Status = status };
+        // What the dispatcher hands over for a typed publish: the declared-type wire JSON.
+        var wireJson = AsyncResponseJson.Serialize(new OperationResult { Status = status, Message = "wire" });
 
-        var classification = PayloadRecoveryClassifier.Classify(payload, payloadTypeFullName: null);
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, typeof(OperationResult).FullName);
 
         Assert.Equal(expected, classification.Action);
-        Assert.Same(payload, classification.MaterializedPayload);
-    }
-
-    [Theory]
-    [InlineData(IncidentStepStatus.Succeeded, RecoveryAction.Resume)]
-    [InlineData(IncidentStepStatus.InProgress, RecoveryAction.KeepWaiting)]
-    [InlineData(IncidentStepStatus.Failed, RecoveryAction.Fail)]
-    public void TypedPayload_IncidentShape_UsesItsOwnAction(IncidentStepStatus status, RecoveryAction expected)
-    {
-        var payload = new IncidentStepResult { Status = status };
-
-        var classification = PayloadRecoveryClassifier.Classify(payload, payloadTypeFullName: null);
-
-        Assert.Equal(expected, classification.Action);
-        Assert.Same(payload, classification.MaterializedPayload);
+        var materialized = Assert.IsType<OperationResult>(classification.MaterializedPayload);
+        Assert.Equal(status, materialized.Status);
+        Assert.Equal("wire", materialized.Message);
     }
 
     [Fact]
-    public void TypedPayload_AssignableToRegisteredType_ReusesTheInstance()
+    public void WireRepresentation_OfDeclaredBasePublish_MaterializesTheBaseVerdict()
     {
-        var payload = new OperationResult { Status = OperationStatus.Completed };
+        // A derived instance published under its declared (non-polymorphic) base serializes to the
+        // BASE's wire shape — the derived OnRecovery override cannot leak into routing, which is
+        // exactly how the broker route behaves for the same publish.
+        var wireJson = AsyncResponseJson.Serialize<RoutingBasePayload>(new RoutingDerivedPayload());
 
-        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(OperationResult).FullName);
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, typeof(RoutingBasePayload).FullName);
+
+        Assert.Equal(RecoveryAction.Fail, classification.Action);
+        Assert.IsType<RoutingBasePayload>(classification.MaterializedPayload);
+    }
+
+    [Fact]
+    public void WireRepresentation_WithPolymorphicDiscriminator_MaterializesTheDerivedType()
+    {
+        // A [JsonPolymorphic] base publish carries the discriminator on the wire; classification
+        // must honor it and take the DERIVED type's verdict.
+        var wireJson = AsyncResponseJson.Serialize<PolyStepBase>(new PolyStepCompleted { Message = "poly" });
+
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, typeof(PolyStepBase).FullName);
 
         Assert.Equal(RecoveryAction.Resume, classification.Action);
-        Assert.Same(payload, classification.MaterializedPayload);
+        var materialized = Assert.IsType<PolyStepCompleted>(classification.MaterializedPayload);
+        Assert.Equal("poly", materialized.Message);
     }
 
     [Fact]
-    public void TypedPayload_DerivedInstanceForRegisteredBaseType_RematerializesAsTheBaseType()
-    {
-        // Only an EXACT runtime-type match reuses the instance. A derived instance must be
-        // re-materialized as the registered base — exactly what the broker route would produce —
-        // so the routing verdict cannot depend on whether the response crossed a serialization
-        // boundary.
-        var payload = new DerivedStepResult { Status = IncidentStepStatus.Succeeded, Extra = "dropped" };
-
-        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(BaseStepResult).FullName);
-
-        Assert.Equal(RecoveryAction.Resume, classification.Action);
-        var materialized = Assert.IsType<BaseStepResult>(classification.MaterializedPayload);
-        Assert.NotSame(payload, materialized);
-        Assert.Equal(IncidentStepStatus.Succeeded, materialized.Status);
-    }
-
-    [Fact]
-    public void TypedPayload_DerivedOverridingOnRecovery_CannotDivergeFromTheWireRoute()
-    {
-        // The divergence this pins: base classifies Fail, derived overrides to Resume. The typed
-        // in-process route used to ask the derived instance (Resume) while the broker route
-        // materialized the registered base (Fail) — the same logical response resuming or failing
-        // the flow depending on which process happened to publish it. Both routes must agree on
-        // the registered type's verdict.
-        var typed = PayloadRecoveryClassifier.Classify(
-            new RoutingDerivedPayload(), typeof(RoutingBasePayload).FullName);
-        var wire = PayloadRecoveryClassifier.Classify(
-            JsonSerializer.Deserialize<object?>("""{}"""), typeof(RoutingBasePayload).FullName);
-
-        Assert.Equal(RecoveryAction.Fail, wire.Action);
-        Assert.Equal(wire.Action, typed.Action);
-        Assert.IsType<RoutingBasePayload>(typed.MaterializedPayload);
-    }
-
-    [Fact]
-    public void TypedPayload_MismatchedRegisteredType_MaterializesAsTheRegisteredType()
+    public void WireRepresentation_ForSiblingRegistration_MaterializesTheSiblingsType()
     {
         // Shared-correlation, mixed payload types: registration B registered AlwaysCheckpointProbe
-        // while the publisher published an IncidentStepResult. B's registration must be classified
-        // as B's type — via the same JSON round-trip a broker delivery would take — not by the
-        // publisher's runtime type (which spuriously resumed and consumed B's registration).
-        var payload = new IncidentStepResult { Status = IncidentStepStatus.Succeeded, Message = "done" };
+        // while the publisher published an IncidentStepResult. B's registration is classified as
+        // B's type from the same wire JSON — never by the publisher's runtime type (which
+        // spuriously resumed and consumed B's registration).
+        var wireJson = AsyncResponseJson.Serialize(new IncidentStepResult { Status = IncidentStepStatus.Succeeded, Message = "done" });
 
-        var classification = PayloadRecoveryClassifier.Classify(payload, typeof(AlwaysCheckpointProbe).FullName);
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, typeof(AlwaysCheckpointProbe).FullName);
 
         Assert.Equal(RecoveryAction.KeepWaiting, classification.Action);
         var materialized = Assert.IsType<AlwaysCheckpointProbe>(classification.MaterializedPayload);
         Assert.Equal("done", materialized.Message);
+    }
+
+    [Fact]
+    public void WireRepresentation_WithoutRegisteredTypeName_IsUnclassifiable()
+    {
+        // No registered type, no classification: the wire payload alone cannot say what it is.
+        var wireJson = AsyncResponseJson.Serialize(new OperationResult { Status = OperationStatus.Completed });
+
+        var classification = PayloadRecoveryClassifier.Classify(wireJson, payloadTypeFullName: null);
+
+        Assert.Null(classification.Action);
+        Assert.Null(classification.MaterializedPayload);
     }
 
     [Fact]

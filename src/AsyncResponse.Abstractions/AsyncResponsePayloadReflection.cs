@@ -23,6 +23,12 @@ public static class AsyncResponsePayloadReflection
     {
         ArgumentNullException.ThrowIfNull(payloadType);
 
+        // Collectible (plugin) payload types are detected per call: a strong Type-keyed cache
+        // entry would pin the plugin's AssemblyLoadContext after unload. The detection is a cheap
+        // reflection probe on a startup/registration path, so the cold cost is immaterial.
+        if (payloadType.Assembly.IsCollectible)
+            return DetectOverride(payloadType);
+
         return OverrideCache.GetOrAdd(payloadType, DetectOverride);
     }
 

@@ -15,8 +15,11 @@ namespace AsyncResponse.Transports.SQS;
 /// <c>MessageGroupId</c> so one flow's jobs stay ordered, and every message carries a unique
 /// <c>MessageDeduplicationId</c> so distinct jobs of the same flow are never deduplicated away.
 /// </remarks>
-public sealed class SqsWorkerTransport : IWorkerTransport, IAsyncDisposable
+public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IAsyncDisposable
 {
+    /// <summary>The SQS per-message <c>DelaySeconds</c> ceiling (15 minutes).</summary>
+    internal static readonly TimeSpan SqsMaxDelay = TimeSpan.FromSeconds(900);
+
     private readonly SqsAsyncResponseOptions _options;
     private readonly ISqsClient _client;
     private readonly bool _disposeClient;
@@ -79,7 +82,37 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IAsyncDisposable
     }
 
     /// <summary>Publishes the supplied worker job.</summary>
-    public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+    public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+        => PublishCoreAsync(job, delay: null, cancellationToken);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// SQS caps a single hop at 15 minutes (<c>DelaySeconds</c> ≤ 900); longer waits ride the
+    /// <see cref="WorkerJobEnvelope.NotBeforeUtc"/> re-publish chain, 15 minutes per hop.
+    /// A FIFO worker queue reports <see cref="TimeSpan.Zero"/>: SQS rejects per-message
+    /// <c>DelaySeconds</c> on FIFO queues, and advertising a capability the publish would then
+    /// throw on lets a durable flow persist itself as sleeping before the enqueue fails —
+    /// stranding the run. Zero routes the engine to its in-process fallback instead.
+    /// </remarks>
+    public TimeSpan MaxPublishDelay => _isFifoQueue ? TimeSpan.Zero : SqsMaxDelay;
+
+    /// <inheritdoc/>
+    public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        if (_isFifoQueue && delay > TimeSpan.Zero)
+        {
+            // SQS rejects per-message DelaySeconds on FIFO queues (queue-level delay only), and a
+            // silently dropped delay would break every due-time above. Fail loudly with the way out.
+            throw new InvalidOperationException(
+                $"SQS FIFO queues do not support per-message delays, so delayed worker jobs (and suspended durable-flow timers) cannot use the FIFO worker queue '{_options.WorkerQueue}'. " +
+                "Use a standard worker queue for delayed delivery, or keep timers in process by leaving the transport without delays.");
+        }
+
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, MaxPublishDelay);
+        return PublishCoreAsync(job, delay > TimeSpan.Zero ? delay : null, cancellationToken);
+    }
+
+    private async Task PublishCoreAsync(WorkerJobEnvelope job, TimeSpan? delay, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(job);
 
@@ -108,7 +141,10 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IAsyncDisposable
                     ? (string.IsNullOrWhiteSpace(job.CorrelationId) ? _options.FifoMessageGroupIdFallback : job.CorrelationId)
                     : null,
                 MessageDeduplicationId: _isFifoQueue ? Guid.NewGuid().ToString("N") : null,
-                messageAttributes);
+                messageAttributes,
+                DelaySeconds: delay is { } pending ? (int)Math.Ceiling(pending.TotalSeconds) : null);
+            if (delay is { } delayTag)
+                activity?.SetTag("asyncresponse.worker.delay_seconds", delayTag.TotalSeconds);
 
             var messageId = await SendWithRetryAsync(message, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("messaging.message.id", messageId);

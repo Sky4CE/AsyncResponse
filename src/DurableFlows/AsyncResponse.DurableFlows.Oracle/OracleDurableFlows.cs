@@ -58,7 +58,7 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
         if (string.IsNullOrWhiteSpace(ConnectionString))
             throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
 
-        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)}", "Oracle");
+        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)}", "Oracle", identifierCap: 128);
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -347,6 +347,6 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     }
 
     private string Table => _options.TableName;
-    private string IndexName => $"{_options.TableName}_EXPIRES_IDX";
+    private string IndexName => DurableFlowStoreShared.DerivedName(_options.TableName, "_EXPIRES_IDX", 128);
 }
 }

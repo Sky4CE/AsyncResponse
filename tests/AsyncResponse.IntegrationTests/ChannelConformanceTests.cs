@@ -21,8 +21,9 @@ namespace AsyncResponse.IntegrationTests;
 // the classes are re-runnable and safe alongside the SUT-app-driven suites sharing the containers.
 
 /// <summary>Contract run against real Redis (pub/sub channel + recovery keys).</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class RedisChannelConformanceTests(IntegrationFixture fixture) : ChannelConformanceSuite
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class RedisChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     // Broker round-trips over loopback: well under a second healthy; 5s absorbs CI noise.
     protected override TimeSpan Generous => TimeSpan.FromSeconds(5);
@@ -50,8 +51,9 @@ public sealed class RedisChannelConformanceTests(IntegrationFixture fixture) : C
 }
 
 /// <summary>Contract run against real NATS (core request/reply channel + JetStream KV recovery).</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class NatsChannelConformanceTests(IntegrationFixture fixture) : ChannelConformanceSuite
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class NatsChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(5);
 
@@ -80,8 +82,9 @@ public sealed class NatsChannelConformanceTests(IntegrationFixture fixture) : Ch
 }
 
 /// <summary>Contract run against real PostgreSQL (LISTEN/NOTIFY + tables channel).</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class PostgreSqlChannelConformanceTests(IntegrationFixture fixture) : ChannelConformanceSuite
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class PostgreSqlChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     // Polling database channel under the loaded shared container: 15s budget.
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
@@ -128,8 +131,9 @@ public sealed class PostgreSqlChannelConformanceTests(IntegrationFixture fixture
 }
 
 /// <summary>Contract run against real SQL Server (adaptive-polling channel).</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture) : ChannelConformanceSuite
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class SqlServerChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
 
@@ -155,7 +159,8 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
         });
         return Task.FromResult(new ChannelConformanceHarness(services.BuildServiceProvider(), async () =>
         {
-            // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables first, then the schema.
+            // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables and sequences
+            // (the channel's monotonic ack sequence) first, then the schema.
             await using var connection = new SqlConnection(fixture.SqlServerConnectionString);
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
@@ -165,6 +170,10 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
                 SELECT @drop += N'DROP TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N';'
                 FROM sys.tables t
                 JOIN sys.schemas s ON t.schema_id = s.schema_id
+                WHERE s.name = @schema;
+                SELECT @drop += N'DROP SEQUENCE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(seq.name) + N';'
+                FROM sys.sequences seq
+                JOIN sys.schemas s ON seq.schema_id = s.schema_id
                 WHERE s.name = @schema;
                 IF SCHEMA_ID(@schema) IS NOT NULL
                     SET @drop += N'DROP SCHEMA ' + QUOTENAME(@schema) + N';';
@@ -177,8 +186,9 @@ public sealed class SqlServerChannelConformanceTests(IntegrationFixture fixture)
 }
 
 /// <summary>Contract run against real MongoDB (change-stream channel on the single-node replica set).</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class MongoDbChannelConformanceTests(IntegrationFixture fixture) : ChannelConformanceSuite
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class MongoDbChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
 

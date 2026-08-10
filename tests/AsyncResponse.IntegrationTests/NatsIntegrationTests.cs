@@ -9,8 +9,9 @@ namespace AsyncResponse.IntegrationTests;
 /// the NATS JetStream transport (worker dispatch + response ingress), both over one NATS server with
 /// JetStream enabled. Every scenario is driven over HTTP against the Aspire-orchestrated sample app.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class NatsIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
+public sealed class NatsIntegrationTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsNatsChannelTransportAndEarlyAckMode()

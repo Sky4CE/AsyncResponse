@@ -219,6 +219,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
     private readonly IActiveSubscriberProbe? _subscriberProbe;
     private readonly AsyncResponseWatchdogState _state;
     private readonly AsyncResponseWatchdogOptions _options;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger<AsyncResponseWatchdog> _logger;
 
     /// <summary>Creates the background recovery watchdog.</summary>
@@ -227,12 +228,14 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         IEnumerable<IActiveSubscriberProbe> subscriberProbes,
         AsyncResponseWatchdogState state,
         IOptions<AsyncResponseOptions> options,
-        ILogger<AsyncResponseWatchdog> logger)
+        ILogger<AsyncResponseWatchdog> logger,
+        TimeProvider? timeProvider = null)
     {
         _scanner = scanners.FirstOrDefault();
         _subscriberProbe = subscriberProbes.FirstOrDefault();
         _state = state;
         _options = options.Value.Watchdog;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
 
         AsyncResponseDiagnostics.EnsureWatchdogGauges(state);
@@ -257,14 +260,14 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
         try
         {
-            await Task.Delay(_options.StartupDelay, stoppingToken).ConfigureAwait(false);
+            await Task.Delay(_options.StartupDelay, _timeProvider, stoppingToken).ConfigureAwait(false);
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
                     var report = await ScanOnceAsync(stoppingToken).ConfigureAwait(false);
-                    _state.Publish(new AsyncResponseWatchdogSnapshot(DateTime.UtcNow, _options.Interval, report, Error: null));
+                    _state.Publish(new AsyncResponseWatchdogSnapshot(_timeProvider.GetUtcNow().UtcDateTime, _options.Interval, report, Error: null));
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -273,10 +276,10 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Recovery watchdog scan failed; next attempt in {Interval}.", _options.Interval);
-                    _state.Publish(new AsyncResponseWatchdogSnapshot(DateTime.UtcNow, _options.Interval, Report: null, Error: ex.Message));
+                    _state.Publish(new AsyncResponseWatchdogSnapshot(_timeProvider.GetUtcNow().UtcDateTime, _options.Interval, Report: null, Error: ex.Message));
                 }
 
-                await Task.Delay(_options.Interval, stoppingToken).ConfigureAwait(false);
+                await Task.Delay(_options.Interval, _timeProvider, stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -367,7 +370,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 }
             }
 
-            var report = AsyncResponseWatchdogReport.Evaluate(observations, DateTime.UtcNow, _options.StaleAfter);
+            var report = AsyncResponseWatchdogReport.Evaluate(observations, _timeProvider.GetUtcNow().UtcDateTime, _options.StaleAfter);
 
             if (truncated)
             {

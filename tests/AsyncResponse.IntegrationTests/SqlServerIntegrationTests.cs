@@ -9,8 +9,9 @@ namespace AsyncResponse.IntegrationTests;
 /// The real SQL Server stack end to end: SQL Server adaptive-polling channel + durable recovery
 /// tables, and SQL Server queue-table transport for worker dispatch and response ingress.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class SqlServerIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class SqlServerIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsSqlServerChannelTransportAndEarlyAckMode()

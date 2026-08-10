@@ -44,6 +44,26 @@ public sealed class SqlServerOptionsTests
     }
 
     [Fact]
+    public void ChannelOptions_RejectOverLimitIdentifiersAndNamePlanCollisions()
+    {
+        // sysname caps identifiers at 128; exactly 128 is legal and the derived sequence and
+        // index names reserve their own suffix space.
+        AssertChannelInvalid(
+            options => options.MessageTable = new string('m', 129),
+            "limited to 128");
+
+        // A configured table must not occupy the derived ack-sequence name — they share the
+        // schema-object namespace and CREATE SEQUENCE would fail (or silently be skipped).
+        AssertChannelInvalid(
+            options => options.SubscriberTable = $"{options.MessageTable}_ack_seq",
+            "ack sequence");
+
+        var atCap = ChannelOptions();
+        atCap.MessageTable = new string('m', 128);
+        atCap.Validate();
+    }
+
+    [Fact]
     public void ChannelOptions_RejectHeartbeatIntervalAtOrAboveTimeout()
     {
         var options = ChannelOptions();
@@ -136,6 +156,19 @@ public sealed class SqlServerOptionsTests
         AssertTransportInvalid(
             options => options.SchemaName = "1bad",
             nameof(SqlServerAsyncResponseTransportOptions.SchemaName));
+    }
+
+    [Fact]
+    public void TransportOptions_RejectOverLimitIdentifiersAndAcceptTheCap()
+    {
+        AssertTransportInvalid(
+            options => options.MessageTable = new string('q', 129),
+            "limited to 128");
+
+        // Exactly at the cap the derived index names reserve suffix space and stay distinct.
+        var atCap = TransportOptions();
+        atCap.MessageTable = new string('q', 128);
+        SqlServerTransportOptionsValidator.ValidateCommon(atCap);
     }
 
     [Fact]
@@ -559,6 +592,33 @@ public sealed class SqlServerOptionsTests
             CancellationToken.None));
 
         Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectIntervalsBeyondTheirCeilings()
+    {
+        // "Passes validation, throws mid-operation" is the failure mode these bounds close: a
+        // TimeSpan.MaxValue deadline overflowed AFTER the publisher's insert (reporting failure
+        // for a possibly delivered response), and an over-timer-ceiling poll/heartbeat interval
+        // threw inside its background loop's own retry delay, killing dispatch.
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.MaxValue,
+            nameof(SqlServerAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.MaxValue,
+            nameof(SqlServerAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.SubscriberHeartbeatTimeout = TimeSpan.MaxValue,
+            nameof(SqlServerAsyncResponseChannelOptions.SubscriberHeartbeatTimeout));
+        AssertChannelInvalid(
+            options => options.ActivePollInterval = TimeSpan.FromDays(60),
+            nameof(SqlServerAsyncResponseChannelOptions.ActivePollInterval));
+        AssertChannelInvalid(
+            options => options.IdlePollInterval = TimeSpan.FromDays(60),
+            nameof(SqlServerAsyncResponseChannelOptions.IdlePollInterval));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.FromDays(60),
+            nameof(SqlServerAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
     }
 
     private static void AssertChannelInvalid(

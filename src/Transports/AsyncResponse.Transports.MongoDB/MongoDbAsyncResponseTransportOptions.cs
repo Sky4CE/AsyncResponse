@@ -22,6 +22,15 @@ public sealed class MongoDbAsyncResponseTransportOptions
     public bool AutoCreateIndexes { get; set; } = true;
 
     /// <summary>
+    /// Claims the queue collection in the persisted cross-component ownership ledger
+    /// (<c>asyncresponse_ownership</c>) at first use, so another AsyncResponse component — in
+    /// this or any other process — misconfigured onto the same collection fails startup instead
+    /// of silently corrupting data. Independent of <see cref="AutoCreateIndexes"/>. Disable only
+    /// for least-privilege deployments that cannot write the ledger collection. Default: <c>true</c>.
+    /// </summary>
+    public bool UseOwnershipLedger { get; set; } = true;
+
+    /// <summary>
     /// Wakes idle subscribers with a change stream watching inserts to the queue collection.
     /// Requires a replica set; when disabled — or when the server reports change streams as
     /// unsupported — subscribers fall back to <see cref="MongoDbSubscriberOptions.EmptyPollDelay"/>

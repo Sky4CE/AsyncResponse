@@ -37,14 +37,19 @@ directly to lost-subscriber recovery. If subscribers do exist, the publisher ins
 and waits for delivery confirmation:
 
 1. Same-process delivery completes an in-memory confirmation immediately.
-2. Cross-process delivery sets `acked_at`, which the publisher polls as a fallback.
+2. Cross-process delivery sets `acked_at` (plus `acked_seq`, drawn from a per-schema `SEQUENCE`),
+   which the publisher polls as a fallback.
 3. If no waiter confirms before `DeliveryConfirmationTimeout`, the publisher atomically sets
    `recovery_claimed = 1` while `acked_at IS NULL` and dispatches the persisted recovery callback.
 
 That last claim is the race guard: a slow live waiter and the recovery callback cannot both own the
 same response. Row expiries (`expires_at`) are always computed on the **database clock**
 (`SYSUTCDATETIME()`), as is the waiter's delivery watermark, so app-side clock skew cannot drop or
-resurrect messages.
+resurrect messages. `acked_seq` and each subscription's registration draw from the same monotonic
+sequence, arbitrating "acked before this waiter registered" (history, not redelivered) versus
+"acked to a fan-out group including this waiter" (delivered) even when both events land on the
+same server-clock tick — with one conservative residual: a claim whose sequence draw stalled
+across ticks resolves as history, never as a replayed response.
 
 ## Recovery state
 
@@ -96,7 +101,25 @@ instances — and the channel and transport inside one app — never race each o
 The packages do **not** create the database itself: point `ConnectionString` at an existing database
 (the sample app ships a small provisioner that creates it for containers/dev). Set
 `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
-distinct even when they share the same schema. Correlation ids are stored as `nvarchar(400)` key
+distinct even when they share the same schema.
+
+### Upgrading a manually managed schema
+
+1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`
+the channel validates these objects once at startup and fails with an actionable error until the
+migration below is applied (names shown for the default `dbo.asyncresponse_channel_messages`; the
+sequence is always `{message_table}_ack_seq` in the same schema):
+
+```sql
+IF COL_LENGTH(N'dbo.asyncresponse_channel_messages', N'acked_seq') IS NULL
+    ALTER TABLE dbo.asyncresponse_channel_messages ADD acked_seq bigint NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.sequences
+               WHERE name = N'asyncresponse_channel_messages_ack_seq' AND schema_id = SCHEMA_ID(N'dbo'))
+    CREATE SEQUENCE dbo.asyncresponse_channel_messages_ack_seq AS bigint START WITH 1;
+```
+
+The column is nullable and the migration is safe to run while old-version hosts are still up:
+rows they ack carry no sequence and fall back to the previous watermark rule. Correlation ids are stored as `nvarchar(400)` key
 columns — keep ids at or under 400 characters (generated ids are far shorter).
 
 ## Configuration checklist
@@ -142,7 +165,10 @@ Connection-string notes:
 ## Operational notes
 
 - Use simple SQL Server identifiers for schema/table names: letters, digits, and underscores, not
-  starting with a digit.
+  starting with a digit, at most 128 characters (sysname). Derived names —
+  `{MessageTable}_ack_seq` and the `*_idx` indexes — reserve their suffix space by truncating the
+  table stem, and validation rejects a configuration whose tables collide with the derived
+  sequence name.
 - `ActivePollInterval` bounds cross-process response latency; `IdlePollInterval` bounds idle database
   load. Same-process deliveries (the common case when the waiter and the publisher share the app)
   never wait for either.

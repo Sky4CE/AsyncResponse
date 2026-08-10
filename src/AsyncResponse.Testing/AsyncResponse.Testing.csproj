@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>AsyncResponse.Testing</PackageId>
+    <Description>Deterministic testing kit for AsyncResponse: a virtual clock that time-skips waits, timeouts, leases, durable timers, and cron schedules; an in-memory engine harness with full lost-subscriber recovery fidelity and simulated process restarts; and a durable-flow harness with step-level observation, scripted replies, and deterministic crash injection at checkpoints.</Description>
+    <PackageTags>$(PackageTags);testing;virtual-clock;time-skipping;test-harness;durable-flows</PackageTags>
+
+    <!-- Pure orchestration over Core's AOT-safe surface; no reflection of its own. -->
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AsyncResponse.Tests" Key="$(AsyncResponsePublicKey)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AsyncResponse.Core\AsyncResponse.Core.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -166,6 +166,77 @@ public class LostSubscriberRecoveryRegressionTests
         Assert.Equal(IncidentStepStatus.Succeeded, derived.Status);
     }
 
+    // ----- classification must see the payload exactly as the wire would carry it -----
+
+    [Fact]
+    public async Task TypedPublish_PolymorphicDeclaredBase_RoutesLikeTheBrokerWould()
+    {
+        // A [JsonPolymorphic] base published in-process: the broker envelope serializes the
+        // payload as the DECLARED base, emitting the type discriminator, so broker-side recovery
+        // re-materializes the DERIVED payload and takes its verdict (Resume). Runtime-type
+        // serialization dropped the discriminator, failed to materialize the abstract base, and
+        // sent the same logical response down the failure route.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(PolyStepBase).FullName,
+            resume: IncidentResumeCallback(),
+            failure: IncidentFailureCallback());
+
+        await harness.Publisher.SetResponse<PolyStepBase>(
+            new PolyStepCompleted { Message = "poly done" }, CorrelationId);
+
+        var (payload, _) = Assert.Single(harness.Spy.Resumed);
+        var typed = Assert.IsType<PolyStepCompleted>(payload);
+        Assert.Equal("poly done", typed.Message);
+        Assert.Empty(harness.Spy.Failed);
+    }
+
+    [Fact]
+    public async Task TypedPublish_JsonIgnoredState_CannotInfluenceRecoveryRouting()
+    {
+        // Exact-type instance reuse leaked in-process-only state into the verdict: a [JsonIgnore]d
+        // property said Resume while the wire representation (which never carries it) says Fail.
+        // The same payload must route identically whether or not it crossed a broker.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IgnoredStatePayload).FullName,
+            resume: IncidentResumeCallback(),
+            failure: IncidentFailureCallback());
+
+        await harness.Publisher.SetResponse(
+            new IgnoredStatePayload { Message = "hint set", ResumeHint = true }, CorrelationId);
+
+        Assert.Empty(harness.Spy.Resumed);
+        var (payload, exception) = Assert.Single(harness.Spy.Failed);
+        var typed = Assert.IsType<IgnoredStatePayload>(payload);
+        Assert.False(typed.ResumeHint);
+        Assert.IsType<AsyncResponseDomainFailureException>(exception);
+    }
+
+    [Fact]
+    public async Task Ingress_ResumableResponseWithOnlyFailureCallback_EngagesTheFailureCallback()
+    {
+        // "Tell me if my flow dies" registrations arm only the failure callback. A resumable
+        // terminal response used to be discarded with a warning on every redelivery until the
+        // registration's TTL; the flow cannot proceed without a resume callback, so the failure
+        // route must fire instead.
+        await using var harness = Harness.Create();
+        await harness.ArmRegistrationAsync(
+            typeof(IncidentStepResult).FullName,
+            resume: null,
+            failure: IncidentFailureCallback());
+
+        await harness.Ingress.HandleResponseMessageAsync(
+            """{"Status":2,"Message":"pipeline succeeded"}""", CorrelationId);
+
+        Assert.Empty(harness.Spy.Resumed);
+        var (payload, exception) = Assert.Single(harness.Spy.Failed);
+        var typed = Assert.IsType<IncidentStepResult>(payload);
+        Assert.Equal(IncidentStepStatus.Succeeded, typed.Status);
+        Assert.IsType<AsyncResponseDomainFailureException>(exception);
+        Assert.Empty(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
+    }
+
     // ----- cleanup failures must never be reinterpreted as a failed response -----
 
     [Fact]
@@ -249,7 +320,11 @@ public class LostSubscriberRecoveryRegressionTests
 
         var (payload, _) = Assert.Single(harness.Spy.Resumed);
         var typed = Assert.IsType<IncidentStepResult>(payload);
-        Assert.Same(published, typed);
+        // Wire parity: the callback receives a materialization of the wire representation, never
+        // the publisher's live instance.
+        Assert.NotSame(published, typed);
+        Assert.Equal(IncidentStepStatus.Succeeded, typed.Status);
+        Assert.Equal("done", typed.Message);
         Assert.Empty(harness.Spy.Failed);
         var remaining = Assert.Single(await harness.RecoveryStateStore.GetAllAsync(CorrelationId));
         Assert.Equal(keepWaitingRegistration, remaining.RegistrationId);
@@ -343,7 +418,7 @@ public class LostSubscriberRecoveryRegressionTests
 
         public Task ArmRegistrationAsync(
             string? payloadTypeFullName,
-            ReflectionCallDto resume,
+            ReflectionCallDto? resume,
             ReflectionCallDto? failure = null,
             Guid? registrationId = null)
             => RecoveryStateStore.SaveAsync(
@@ -402,6 +477,37 @@ public class BaseStepResult : IAsyncResponsePayload
 public sealed class DerivedStepResult : BaseStepResult
 {
     public string? Extra { get; set; }
+}
+
+/// <summary>
+/// A polymorphic payload contract: publishers declare the base, the wire carries the
+/// discriminator, and recovery must re-materialize the derived type exactly as a broker would.
+/// </summary>
+[System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(PolyStepCompleted), "completed")]
+public abstract class PolyStepBase : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    // Virtual so the derived override genuinely participates in interface dispatch (a new-slot
+    // method on the derived type would NOT re-implement the interface member).
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class PolyStepCompleted : PolyStepBase
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>In-process state that never crosses the wire must never decide recovery routing.</summary>
+public sealed class IgnoredStatePayload : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool ResumeHint { get; set; }
+
+    public RecoveryAction OnRecovery() => ResumeHint ? RecoveryAction.Resume : RecoveryAction.Fail;
 }
 
 /// <summary>Classifies every response as a checkpoint — its registration must never be consumed.</summary>

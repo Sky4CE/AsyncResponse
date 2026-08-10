@@ -13,8 +13,9 @@ namespace AsyncResponse.IntegrationTests;
 /// (progress + terminal via the simulator) → state observation over HTTP — i.e. the flow state
 /// round-trips through the real recovery store of each channel.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class DurableFlowIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class DurableFlowIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     public static TheoryData<string> DurableChannelVariants => new()
     {

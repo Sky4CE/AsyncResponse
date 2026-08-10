@@ -9,8 +9,9 @@ namespace AsyncResponse.IntegrationTests;
 /// The real PostgreSQL stack end to end: PostgreSQL LISTEN/NOTIFY channel + durable recovery tables,
 /// and PostgreSQL queue-table transport for worker dispatch and response ingress.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class PostgreSqlIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class PostgreSqlIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsPostgreSqlChannelTransportAndEarlyAckMode()

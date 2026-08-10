@@ -163,20 +163,20 @@ internal sealed class AsyncResponseStartupValidator(
 
     /// <summary>
     /// Fails fast on watchdog misconfiguration: a non-positive interval spins the scan loop, a
-    /// non-positive stale threshold flags every entry, and a negative startup delay throws deep
-    /// inside <see cref="Task.Delay(TimeSpan)"/> long after registration.
+    /// non-positive stale threshold flags every entry, and an out-of-range delay (negative, or
+    /// beyond the timer ceiling) throws deep inside <see cref="Task.Delay(TimeSpan)"/> long after
+    /// registration. <c>StaleAfter</c> is only ever compared against entry age, so it needs no
+    /// ceiling; <c>Interval</c> and <c>StartupDelay</c> arm timers, and zero is a valid startup
+    /// delay ("scan immediately").
     /// </summary>
     private static void ValidateWatchdogOptions(AsyncResponseWatchdogOptions watchdog)
     {
-        if (watchdog.Interval <= TimeSpan.Zero)
-            throw new InvalidOperationException(
-                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.Interval)} must be positive.");
+        const string optionsPath = $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}";
+        AsyncResponseChannelOptions.EnsureTimerBacked(watchdog.Interval, optionsPath, nameof(AsyncResponseWatchdogOptions.Interval));
         if (watchdog.StaleAfter <= TimeSpan.Zero)
             throw new InvalidOperationException(
-                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.StaleAfter)} must be positive.");
-        if (watchdog.StartupDelay < TimeSpan.Zero)
-            throw new InvalidOperationException(
-                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.StartupDelay)} cannot be negative.");
+                $"{optionsPath}.{nameof(AsyncResponseWatchdogOptions.StaleAfter)} must be positive.");
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(watchdog.StartupDelay, optionsPath, nameof(AsyncResponseWatchdogOptions.StartupDelay));
         if (watchdog.MaxScanEntries <= 0)
             throw new InvalidOperationException(
                 $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.MaxScanEntries)} must be positive.");

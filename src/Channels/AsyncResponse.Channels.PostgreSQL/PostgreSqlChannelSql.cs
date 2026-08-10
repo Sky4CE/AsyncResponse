@@ -2,6 +2,8 @@ using Npgsql;
 using NpgsqlTypes;
 using System.Text;
 
+using AsyncResponse.Internal;
+
 namespace AsyncResponse.Channels.PostgreSQL;
 
 internal readonly record struct PostgreSqlChannelMessage(
@@ -9,7 +11,8 @@ internal readonly record struct PostgreSqlChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>SQL helper for the PostgreSQL channel tables and notification channel.</summary>
 internal sealed class PostgreSqlChannelSql
@@ -37,6 +40,8 @@ internal sealed class PostgreSqlChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
+        AckSequenceName = SequenceName(_options.MessageTable);
+        AckSequence = $"{Schema}.{Quote(AckSequenceName)}";
         _schemaLockKey = SchemaAdvisoryLockKey(_options.SchemaName);
     }
 
@@ -44,12 +49,33 @@ internal sealed class PostgreSqlChannelSql
     public string RecoveryTable { get; }
     public string MessageTable { get; }
     public string SubscriberTable { get; }
+
+    /// <summary>
+    /// Qualified name of the monotonic ack sequence. Delivery claims and subscription
+    /// registrations draw from this ONE sequence, giving <c>acked_seq</c> and a subscription's
+    /// start position a total order no pair of same-tick timestamps has.
+    /// </summary>
+    public string AckSequence { get; }
+
+    /// <summary>Unquoted sequence identifier, for catalog queries.</summary>
+    public string AckSequenceName { get; }
     public string NotificationChannel => _options.NotificationChannel;
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
+
+        if (!_options.AutoCreateSchema)
+        {
+            // Manually managed schemas get a one-time validation instead of DDL: 1.0.0 added
+            // acked_seq and its sequence, which waiter registration and delivery claims require
+            // unconditionally — without this check an un-migrated schema fails later with a raw
+            // "column does not exist" mid-operation instead of an actionable startup error
+            // carrying the exact migration.
+            await ValidateManagedSchemaAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -97,9 +123,12 @@ internal sealed class PostgreSqlChannelSql
                     created_at timestamptz NOT NULL DEFAULT now(),
                     expires_at timestamptz NOT NULL,
                     acked_at timestamptz NULL,
+                    acked_seq bigint NULL,
                     recovery_claimed boolean NOT NULL DEFAULT false
                 );
                 ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;
+                ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+                CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint;
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                     ON {MessageTable} (correlation_id, created_at);
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "expires"))}
@@ -115,8 +144,115 @@ internal sealed class PostgreSqlChannelSql
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.SubscriberTable, "expires"))}
                     ON {SubscriberTable} (expires_at);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+            {
+                // E.g. CREATE INDEX ... ON a name that is really another component's index:
+                // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+                // the wrong relation kind mid-batch — surface the namespace collision instead of
+                // the raw "cannot open relation".
+                throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("channel", _options.SchemaName), ex);
+            }
+
+            // Options-level ValidateNamePlan keeps THIS component's names distinct, but the
+            // channel can share a schema with the transport and durable-flow stores (and
+            // unrelated objects), whose derived names it cannot see — and IF NOT EXISTS also
+            // accepts a same-name index with the WRONG definition. Verify against the catalog,
+            // in-transaction under the shared DDL lock, that every relation actually IS what the
+            // DDL above intended, definitions included.
+            await PostgreSqlRelationVerifier.VerifyAsync(
+                connection,
+                transaction,
+                _options.SchemaName,
+                "channel",
+                [
+                    new(_options.RecoveryStateTable, 'r', Columns:
+                        [
+                            new("correlation_id", "text", Nullable: false),
+                            new("registration_id", "uuid", Nullable: false),
+                            new("state_json", "jsonb", Nullable: false),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                            new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                        ], PrimaryKey: ["correlation_id", "registration_id"]),
+                    new(_options.MessageTable, 'r', Columns:
+                        [
+                            new("id", "uuid", Nullable: false),
+                            new("correlation_id", "text", Nullable: false),
+                            new("envelope_json", "jsonb", Nullable: false),
+                            new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                            new("acked_at", "timestamp with time zone", Nullable: true),
+                            new("acked_seq", "bigint", Nullable: true),
+                            new("recovery_claimed", "boolean", Nullable: false, DefaultExpression: "false"),
+                        ], PrimaryKey: ["id"]),
+                    new(_options.SubscriberTable, 'r', Columns:
+                        [
+                            new("correlation_id", "text", Nullable: false),
+                            new("registration_id", "uuid", Nullable: false),
+                            new("instance_id", "text", Nullable: false),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                        ], PrimaryKey: ["correlation_id", "registration_id"]),
+                    new(AckSequenceName, 'S'),
+                    new(IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable, ["expires_at"]),
+                    new(IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable, ["correlation_id", "created_at"]),
+                    new(IndexName(_options.MessageTable, "expires"), 'i', _options.MessageTable, ["expires_at"]),
+                    new(IndexName(_options.SubscriberTable, "expires"), 'i', _options.SubscriberTable, ["expires_at"]),
+                ],
+                cancellationToken).ConfigureAwait(false);
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            _created = true;
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+    }
+
+
+    private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
+    {
+        await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_created)
+                return;
+
+            await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            // relkind = 'S' precisely: to_regclass matches ANY relation, so a table sharing the
+            // sequence's name (the pre-fix truncation collision) passed validation and failed at
+            // the first nextval instead.
+            command.CommandText =
+                """
+                SELECT
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = @schema AND table_name = @table AND column_name = 'acked_seq'),
+                  EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = @schema AND c.relname = @sequence AND c.relkind = 'S');
+                """;
+            command.Parameters.AddWithValue("schema", _options.SchemaName);
+            command.Parameters.AddWithValue("table", _options.MessageTable);
+            command.Parameters.AddWithValue("sequence", AckSequenceName);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var hasColumn = reader.GetBoolean(0);
+            var hasSequence = reader.GetBoolean(1);
+            if (!hasColumn || !hasSequence)
+            {
+                throw new InvalidOperationException(
+                    $"The PostgreSQL channel schema is managed manually (AutoCreateSchema = false) but is missing " +
+                    $"objects this version requires: " +
+                    $"{(hasColumn ? "" : $"column {MessageTable}.acked_seq")}{(!hasColumn && !hasSequence ? " and " : "")}{(hasSequence ? "" : $"sequence {AckSequence}")}. " +
+                    $"Apply the migration and restart: " +
+                    $"ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL; " +
+                    $"CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint; " +
+                    "See docs/postgresql.md, section 'Upgrading a manually managed schema'.");
+            }
+
             _created = true;
         }
         finally
@@ -293,7 +429,7 @@ internal sealed class PostgreSqlChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json::text, created_at, acked_at
+            SELECT id, correlation_id, envelope_json::text, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -319,7 +455,8 @@ internal sealed class PostgreSqlChannelSql
                 reader.GetString(1),
                 reader.GetString(2),
                 reader.GetFieldValue<DateTimeOffset>(3),
-                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4)));
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4),
+                reader.IsDBNull(5) ? null : reader.GetInt64(5)));
         return messages;
     }
 
@@ -335,10 +472,17 @@ internal sealed class PostgreSqlChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // The sequence is stamped ONLY when this same update transitions acked_at from null (SET
+        // expressions read the pre-update row): a row acked by a pre-sequence build must stay
+        // permanently unsequenced. Back-filling it on a later fan-out re-claim would pair an OLD
+        // acked_at with a FRESH sequence value, and a waiter that registered in the original ack's
+        // tick would then read the tie as post-registration fan-out — replaying a response its
+        // predecessor consumed.
         command.CommandText =
             $"""
             UPDATE {MessageTable}
-            SET acked_at = COALESCE(acked_at, now())
+            SET acked_at = COALESCE(acked_at, now()),
+                acked_seq = CASE WHEN acked_at IS NULL THEN nextval('{AckSequence}') ELSE acked_seq END
             WHERE id = @id AND NOT recovery_claimed AND expires_at > now()
             RETURNING id;
             """;
@@ -368,6 +512,22 @@ internal sealed class PostgreSqlChannelSql
         command.Parameters.AddWithValue("id", messageId);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return result is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// One round trip for a subscription's registration watermark: the server's UTC clock (for
+    /// the created-at bound) and a fresh position in the monotonic ack sequence (for the exact
+    /// acked-history bound — see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT now(), nextval('{AckSequence}');";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return (reader.GetFieldValue<DateTimeOffset>(0).ToUniversalTime(), reader.GetInt64(1));
     }
 
     /// <summary>Returns the database server's current UTC time, used as a clock-safe delivery watermark.</summary>
@@ -546,6 +706,11 @@ internal sealed class PostgreSqlChannelSql
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{name} '{value}' must be a simple PostgreSQL identifier (letters, digits, and underscores; not starting with a digit).");
+        // PostgreSQL TRUNCATES over-limit identifiers silently (a NOTICE, not an error), so an
+        // over-limit configured name would create/address an object under a different name.
+        if (value.Length > IdentifierCap)
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{name} '{value}' is {value.Length} characters; PostgreSQL identifiers are limited to {IdentifierCap} and longer names are silently truncated.");
     }
 
     private static bool IsIdentifier(string value)
@@ -564,10 +729,70 @@ internal sealed class PostgreSqlChannelSql
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 
+    /// <summary>PostgreSQL's identifier length cap (NAMEDATALEN - 1); longer names are silently truncated server-side.</summary>
+    internal const int IdentifierCap = 63;
+
+    // Suffix space is RESERVED before capping in BOTH derived-name helpers: truncating the whole
+    // "{table}{suffix}" let a maximum-length table name produce exactly the table's own name — the
+    // derived object then collided with the table (indexes, sequences, and tables share one
+    // relation namespace), CREATE ... IF NOT EXISTS silently skipped it, and the store ran with a
+    // missing sequence (runtime failure) or missing indexes (silent full scans).
     private static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 63 ? name : name[..63];
+        var tail = $"_{suffix}_idx";
+        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
+        return stem + tail;
+    }
+
+    private static string SequenceName(string table)
+    {
+        const string suffix = "_ack_seq";
+        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
+        return stem + suffix;
+    }
+
+    /// <summary>
+    /// Validates the complete effective object-name plan — configured tables plus every derived
+    /// index and sequence name — for pairwise distinctness. Suffix reservation makes one table's
+    /// derived names collision-free, but two long tables whose reserved stems truncate identically
+    /// still derive the same index name, and a configured table can occupy a derived name outright;
+    /// either way <c>CREATE ... IF NOT EXISTS</c> silently skips the object. Comparison is
+    /// case-insensitive: the DDL quotes identifiers (case-sensitive to PostgreSQL), but a plan
+    /// distinct only by letter case is a misconfiguration magnet and is rejected for parity with
+    /// SQL Server's case-insensitive catalogs.
+    /// </summary>
+    public static void ValidateNamePlan(PostgreSqlAsyncResponseChannelOptions options)
+    {
+        (string Role, string Name)[] plan =
+        [
+            ($"{nameof(options.RecoveryStateTable)} table", options.RecoveryStateTable),
+            ($"{nameof(options.MessageTable)} table", options.MessageTable),
+            ($"{nameof(options.SubscriberTable)} table", options.SubscriberTable),
+            ("ack sequence (derived from MessageTable)", SequenceName(options.MessageTable)),
+            ("RecoveryStateTable expiry index", IndexName(options.RecoveryStateTable, "expires")),
+            ("MessageTable correlation index", IndexName(options.MessageTable, "correlation_created")),
+            ("MessageTable expiry index", IndexName(options.MessageTable, "expires")),
+            ("SubscriberTable expiry index", IndexName(options.SubscriberTable, "expires")),
+        ];
+        RequireDistinctNamePlan(plan, nameof(PostgreSqlAsyncResponseChannelOptions));
+    }
+
+    internal static void RequireDistinctNamePlan((string Role, string Name)[] plan, string optionsName)
+    {
+        for (var i = 0; i < plan.Length; i++)
+        {
+            for (var j = i + 1; j < plan.Length; j++)
+            {
+                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"{optionsName}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
+                        "All tables and the index/sequence names derived from them share one namespace and must be distinct " +
+                        "(long names reserve suffix space by truncating the table stem, which can make distinct tables derive " +
+                        "the same name). Shorten or de-overlap the configured table names.");
+                }
+            }
+        }
     }
 
     /// <summary>NOTIFY payload for a publish: the correlation id, or empty when it is too long to carry.</summary>

@@ -1,0 +1,91 @@
+#nullable enable
+AsyncResponse.Testing.AsyncResponseTestHarness
+AsyncResponse.Testing.AsyncResponseTestHarness.AdvanceAsync(System.TimeSpan delta) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.AsyncResponseTestHarness.Builder.get -> AsyncResponse.IRecoverableAsyncResponseBuilder!
+AsyncResponse.Testing.AsyncResponseTestHarness.Clock.get -> AsyncResponse.Testing.VirtualTimeProvider!
+AsyncResponse.Testing.AsyncResponseTestHarness.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Testing.AsyncResponseTestHarness.FlowExecutor.get -> AsyncResponse.IDurableFlowExecutor!
+AsyncResponse.Testing.AsyncResponseTestHarness.Flows.get -> AsyncResponse.IDurableFlows!
+AsyncResponse.Testing.AsyncResponseTestHarness.PublishAsync<T>(T response, string! correlationId) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.AsyncResponseTestHarness.PublishExceptionAsync(System.Exception! exception, string! correlationId) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.AsyncResponseTestHarness.Publisher.get -> AsyncResponse.IAsyncResponsePublisher!
+AsyncResponse.Testing.AsyncResponseTestHarness.Services.get -> System.IServiceProvider!
+AsyncResponse.Testing.AsyncResponseTestHarness.SimulateRestartAsync(System.Action? whileDown = null) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.AsyncResponseTestHarness.WaitForWorkerIdleAsync() -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.AsyncResponseTestHarnessOptions() -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.Channel.get -> System.Action<AsyncResponse.InMemoryAsyncResponseOptions!>?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.Channel.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.ConfigureAsyncResponse.get -> System.Action<Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!>?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.ConfigureAsyncResponse.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.ConfigureServices.get -> System.Action<Microsoft.Extensions.DependencyInjection.IServiceCollection!>?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.ConfigureServices.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.DurableFlows.get -> System.Action<AsyncResponse.DurableFlowOptions!>?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.DurableFlows.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.FlowObservers.get -> System.Collections.Generic.IList<AsyncResponse.IDurableFlowExecutionObserver!>!
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.RealTimeGuard.get -> System.TimeSpan
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.RealTimeGuard.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.StartTime.get -> System.DateTimeOffset?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.StartTime.set -> void
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.Transport.get -> System.Action<AsyncResponse.InMemoryWorkerTransportOptions!>?
+AsyncResponse.Testing.AsyncResponseTestHarnessOptions.Transport.set -> void
+AsyncResponse.Testing.FlowProbe
+AsyncResponse.Testing.FlowProbe.EventKind
+AsyncResponse.Testing.FlowProbe.EventKind.Completed = 2 -> AsyncResponse.Testing.FlowProbe.EventKind
+AsyncResponse.Testing.FlowProbe.EventKind.Starting = 0 -> AsyncResponse.Testing.FlowProbe.EventKind
+AsyncResponse.Testing.FlowProbe.EventKind.Waiting = 1 -> AsyncResponse.Testing.FlowProbe.EventKind
+AsyncResponse.Testing.FlowProbe.FlowProbe() -> void
+AsyncResponse.Testing.FlowProbeEvent
+AsyncResponse.Testing.FlowProbeEvent.Deconstruct(out AsyncResponse.Testing.FlowProbe.EventKind Kind, out AsyncResponse.DurableFlowStepEvent Step) -> void
+AsyncResponse.Testing.FlowProbeEvent.Equals(AsyncResponse.Testing.FlowProbeEvent other) -> bool
+AsyncResponse.Testing.FlowProbeEvent.FlowProbeEvent() -> void
+AsyncResponse.Testing.FlowProbeEvent.FlowProbeEvent(AsyncResponse.Testing.FlowProbe.EventKind Kind, AsyncResponse.DurableFlowStepEvent Step) -> void
+AsyncResponse.Testing.FlowProbeEvent.Kind.get -> AsyncResponse.Testing.FlowProbe.EventKind
+AsyncResponse.Testing.FlowProbeEvent.Kind.init -> void
+AsyncResponse.Testing.FlowProbeEvent.Step.get -> AsyncResponse.DurableFlowStepEvent
+AsyncResponse.Testing.FlowProbeEvent.Step.init -> void
+AsyncResponse.Testing.FlowRunHandle
+AsyncResponse.Testing.FlowRunHandle.Events.get -> System.Collections.Generic.IReadOnlyList<AsyncResponse.Testing.FlowProbeEvent>!
+AsyncResponse.Testing.FlowRunHandle.ExecuteDirectAsync() -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowRunHandle.FlowId.get -> string!
+AsyncResponse.Testing.FlowRunHandle.GetStateAsync() -> System.Threading.Tasks.Task<AsyncResponse.FlowState?>!
+AsyncResponse.Testing.FlowRunHandle.ReplyAsync<T>(T response, string? stepName = null) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowRunHandle.ReplyExceptionAsync(System.Exception! exception, string? stepName = null) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowRunHandle.ResumeAsync() -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowRunHandle.StepExecutions(string! stepName) -> int
+AsyncResponse.Testing.FlowRunHandle.WaitForAwaitingStepAsync(string! stepName) -> System.Threading.Tasks.Task<string!>!
+AsyncResponse.Testing.FlowRunHandle.WaitForFinishedAsync() -> System.Threading.Tasks.Task<AsyncResponse.FlowRunStatus>!
+AsyncResponse.Testing.FlowRunHandle.WaitForStepCompletedAsync(string! stepName) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowRunHandle.WaitForTimerStepAsync(string! stepName) -> System.Threading.Tasks.Task<System.DateTime>!
+AsyncResponse.Testing.FlowTestHarness
+AsyncResponse.Testing.FlowTestHarness.AdvanceAsync(System.TimeSpan delta) -> System.Threading.Tasks.Task!
+AsyncResponse.Testing.FlowTestHarness.Attach(string! flowId) -> AsyncResponse.Testing.FlowRunHandle!
+AsyncResponse.Testing.FlowTestHarness.Clock.get -> AsyncResponse.Testing.VirtualTimeProvider!
+AsyncResponse.Testing.FlowTestHarness.CrashAfterStep(string! stepName) -> void
+AsyncResponse.Testing.FlowTestHarness.CrashBeforeStep(string! stepName) -> void
+AsyncResponse.Testing.FlowTestHarness.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Testing.FlowTestHarness.Engine.get -> AsyncResponse.Testing.AsyncResponseTestHarness!
+AsyncResponse.Testing.FlowTestHarness.StartFlowAsync<TFlow, TInput>(TInput input, string? flowId = null) -> System.Threading.Tasks.Task<AsyncResponse.Testing.FlowRunHandle!>!
+AsyncResponse.Testing.SimulatedCrashException
+AsyncResponse.Testing.SimulatedCrashException.BeforeStep.get -> bool
+AsyncResponse.Testing.SimulatedCrashException.SimulatedCrashException(string! stepName, bool beforeStep) -> void
+AsyncResponse.Testing.SimulatedCrashException.StepName.get -> string!
+AsyncResponse.Testing.VirtualTimeProvider
+AsyncResponse.Testing.VirtualTimeProvider.Advance(System.TimeSpan delta) -> void
+AsyncResponse.Testing.VirtualTimeProvider.AdvanceTo(System.DateTimeOffset target) -> void
+AsyncResponse.Testing.VirtualTimeProvider.NextTimerDueAt.get -> System.DateTimeOffset?
+AsyncResponse.Testing.VirtualTimeProvider.VirtualTimeProvider() -> void
+AsyncResponse.Testing.VirtualTimeProvider.VirtualTimeProvider(System.DateTimeOffset startTime) -> void
+override AsyncResponse.Testing.FlowProbeEvent.GetHashCode() -> int
+override AsyncResponse.Testing.VirtualTimeProvider.CreateTimer(System.Threading.TimerCallback! callback, object? state, System.TimeSpan dueTime, System.TimeSpan period) -> System.Threading.ITimer!
+override AsyncResponse.Testing.VirtualTimeProvider.GetTimestamp() -> long
+override AsyncResponse.Testing.VirtualTimeProvider.GetUtcNow() -> System.DateTimeOffset
+override AsyncResponse.Testing.VirtualTimeProvider.LocalTimeZone.get -> System.TimeZoneInfo!
+override AsyncResponse.Testing.VirtualTimeProvider.TimestampFrequency.get -> long
+static AsyncResponse.Testing.AsyncResponseTestHarness.StartAsync(System.Action<AsyncResponse.Testing.AsyncResponseTestHarnessOptions!>? configure = null) -> System.Threading.Tasks.Task<AsyncResponse.Testing.AsyncResponseTestHarness!>!
+static AsyncResponse.Testing.FlowProbeEvent.operator !=(AsyncResponse.Testing.FlowProbeEvent left, AsyncResponse.Testing.FlowProbeEvent right) -> bool
+static AsyncResponse.Testing.FlowProbeEvent.operator ==(AsyncResponse.Testing.FlowProbeEvent left, AsyncResponse.Testing.FlowProbeEvent right) -> bool
+static AsyncResponse.Testing.FlowTestHarness.StartAsync(System.Action<AsyncResponse.Testing.AsyncResponseTestHarnessOptions!>? configure = null) -> System.Threading.Tasks.Task<AsyncResponse.Testing.FlowTestHarness!>!
+static readonly AsyncResponse.Testing.VirtualTimeProvider.DefaultStartTime -> System.DateTimeOffset
+~override AsyncResponse.Testing.FlowProbeEvent.Equals(object obj) -> bool
+~override AsyncResponse.Testing.FlowProbeEvent.ToString() -> string

@@ -32,4 +32,8 @@
     <InternalsVisibleTo Include="AsyncResponse.Benchmarks" Key="$(AsyncResponsePublicKey)" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\Shared\PostgreSqlRelationVerifier.cs" Link="PostgreSqlRelationVerifier.cs" />
+  </ItemGroup>
+
 </Project>

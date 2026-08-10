@@ -7,6 +7,7 @@ using MongoDB.Driver;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using AsyncResponse.Internal;
 
 namespace AsyncResponse.Transports.MongoDB;
 
@@ -43,23 +44,45 @@ internal sealed class MongoDbTransportStore : IDisposable
     private readonly IMongoClient? _ownedClient;
     private bool _created;
     private long _lastDeadLetterPruneTicks;
+    private readonly IMongoDatabase _database;
 
     public MongoDbTransportStore(
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseTransportOptions> options,
         IMongoClient? ownedClient = null,
-        ILogger<MongoDbTransportStore>? logger = null)
+        ILogger<MongoDbTransportStore>? logger = null,
+        MongoNamespaceRegistry? namespaceRegistry = null)
     {
         _options = options.Value;
         _logger = logger;
         MongoDbTransportOptionsValidator.ValidateCommon(_options);
+
+        // Cross-component collection ownership (DI-hosted stores only): see MongoNamespaceRegistry.
+        namespaceRegistry?.Claim(
+            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB transport",
+            [(_options.MessageCollection, nameof(_options.MessageCollection))]);
+
+        // The namespace BYTE limit can only be checked here, where the actual database name is
+        // first known; a near-limit configuration otherwise passes every static check and fails
+        // at the first server operation.
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.MessageCollection}";
+        var byteLength = Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 235)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({nameof(_options.MessageCollection)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
+
+        _database = database;
         _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
         _ownedClient = ownedClient;
     }
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -67,6 +90,23 @@ internal sealed class MongoDbTransportStore : IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership, independent of AutoCreateIndexes: see
+            // MongoOwnershipLedger.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB transport",
+                    [(_options.MessageCollection, nameof(_options.MessageCollection))],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             await _messages.Indexes.CreateOneAsync(
                 new CreateIndexModel<MongoTransportMessageDocument>(
@@ -98,9 +138,10 @@ internal sealed class MongoDbTransportStore : IDisposable
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, cancellationToken).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, cancellationToken, delay).ConfigureAwait(false);
         await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -194,7 +235,8 @@ internal sealed class MongoDbTransportStore : IDisposable
         string payload,
         IReadOnlyDictionary<string, string>? headers,
         string? deadLetterReason,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTime.UtcNow;
@@ -211,7 +253,12 @@ internal sealed class MongoDbTransportStore : IDisposable
             // client clock here would let client-ahead-of-server skew hide a fresh message from the
             // server-clock claim filter until the skew elapsed. Epoch expresses what the SQL stores'
             // "available_at DEFAULT now()" expresses; a NAK re-stamps a real server-relative time.
-            AvailableAtUtc = DateTime.UnixEpoch,
+            // A DELAYED publish is the exception: InsertOne still cannot evaluate $$NOW, so the due
+            // time is client-computed (now + delay) in one atomic insert — skew shifts it by the
+            // skew only, and an early delivery is corrected by the envelope's NotBeforeUtc guard in
+            // the worker-job executor. (The insert-then-$$NOW-update alternative had a crash window
+            // that left a never-claimable document.)
+            AvailableAtUtc = delay is { } pending ? now.Add(pending) : DateTime.UnixEpoch,
             Attempts = 0,
             DeadLetterReason = deadLetterReason
         };

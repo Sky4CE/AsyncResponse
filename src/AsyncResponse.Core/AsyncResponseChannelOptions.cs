@@ -69,6 +69,45 @@ public abstract class AsyncResponseChannelOptions
     }
 
     /// <summary>
+    /// Guards a timer-armed interval knob (<see cref="Task.Delay(TimeSpan)"/>, CTS timers,
+    /// <c>WaitAsync</c>): positive and under the .NET timer ceiling. An over-ceiling interval
+    /// otherwise throws at the FIRST arming inside a background loop, where the loop's own
+    /// retry-delay throws again — killing dispatch instead of surfacing a config error.
+    /// </summary>
+    internal static void EnsureTimerBacked(TimeSpan value, string optionsName, string knob)
+    {
+        if (value <= TimeSpan.Zero || value > MaxTimerBackedTimeout)
+            throw new InvalidOperationException(
+                $"{optionsName}.{knob} must be positive and at most {MaxTimerBackedTimeout.TotalDays:0.#} days (the .NET timer ceiling).");
+    }
+
+    /// <summary>
+    /// <see cref="EnsureTimerBacked"/> for knobs where zero legitimately means "skip the wait"
+    /// (e.g. a startup delay): non-negative and under the .NET timer ceiling.
+    /// </summary>
+    internal static void EnsureTimerBackedAllowZero(TimeSpan value, string optionsName, string knob)
+    {
+        if (value < TimeSpan.Zero || value > MaxTimerBackedTimeout)
+            throw new InvalidOperationException(
+                $"{optionsName}.{knob} must be non-negative and at most {MaxTimerBackedTimeout.TotalDays:0.#} days (the .NET timer ceiling).");
+    }
+
+    /// <summary>
+    /// Guards a persisted-TTL/deadline-stamp knob: positive and small enough that the
+    /// "now + value" stamp every consumer computes can never overflow date arithmetic — a
+    /// <see cref="TimeSpan.MaxValue"/> here otherwise passes registration and throws only at the
+    /// first stamp, after side effects (a publisher's overflow lands AFTER its insert, reporting
+    /// failure for a response that may have been delivered).
+    /// </summary>
+    internal static void EnsurePersistedTtl(TimeSpan value, string optionsName, string knob)
+    {
+        if (value <= TimeSpan.Zero || value > MaxPersistenceTtl)
+            throw new InvalidOperationException(
+                $"{optionsName}.{knob} must be positive and at most {MaxPersistenceTtl.TotalDays:0} days — " +
+                "expiry/deadline stamps are computed as \"now + value\", and larger values overflow.");
+    }
+
+    /// <summary>
     /// Validates the shared channel settings, throwing an actionable
     /// <see cref="InvalidOperationException"/> on misconfiguration. Concrete channels call this from
     /// their own <c>Validate()</c> so every channel fails fast at registration/startup instead of

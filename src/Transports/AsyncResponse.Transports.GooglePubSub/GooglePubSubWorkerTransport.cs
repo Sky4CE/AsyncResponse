@@ -36,6 +36,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         _options = options.Value;
         _ = GooglePubSubOptionsValidator.Required(_options.ProjectId, nameof(_options.ProjectId));
         _ = GooglePubSubOptionsValidator.Required(_options.WorkerTopicId, nameof(_options.WorkerTopicId));
+        GooglePubSubOptionsValidator.ValidateTimeouts(_options);
         _publisherFactory = publisherFactory;
     }
 
