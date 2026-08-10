@@ -69,6 +69,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-results
+          overwrite: true
           path: ${{ github.workspace }}/TestResults
 
       # Coverage alone, for the `coverage` job to merge with the integration suite's. The glob is
@@ -78,6 +79,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-unit
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/*.cobertura.xml
           if-no-files-found: error
 
@@ -90,6 +92,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nuget-packages
+          overwrite: true
           path: |
             ./artifacts/*.nupkg
             ./artifacts/*.snupkg
@@ -242,6 +245,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-test-results-aot
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/IntegrationAot
 
   integration-tests:
@@ -354,6 +358,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-test-results-${{ matrix.batch }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration
 
       # The container-backed suite is most of the coverage: the database and broker paths it drives
@@ -364,6 +369,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-integration-${{ matrix.batch }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration/*.cobertura.xml
           if-no-files-found: error
 
@@ -429,6 +435,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-test-results-${{ matrix.server }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}
 
   coverage:
@@ -481,6 +488,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
+          overwrite: true
           path: coverage-report
 
       # Pull requests (including forks, which have no write token) stop at the artifact and the job
