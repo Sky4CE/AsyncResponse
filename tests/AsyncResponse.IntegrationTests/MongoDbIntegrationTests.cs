@@ -11,6 +11,7 @@ namespace AsyncResponse.IntegrationTests;
 /// response ingress — all against a single-node replica set.
 /// </summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class MongoDbIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

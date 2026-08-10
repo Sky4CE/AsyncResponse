@@ -15,10 +15,15 @@ namespace AsyncResponse.IntegrationTests;
 /// 5.8 GiB, which is what tipped it over whenever anything else ran at the same time.
 /// </summary>
 [Collection(OracleCosmosCollection.Name)]
+[Trait(Batches.Trait, Batches.OracleCosmos)]
 public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixture) : IntegrationTestBase(fixture)
 {
-    /// <summary>Oracle provisions its database on first boot; 30s is not close to enough.</summary>
-    private static readonly TimeSpan OracleReadyBudget = TimeSpan.FromMinutes(3);
+    /// <summary>
+    /// Both servers here take minutes to become usable on a cold container — Oracle provisions its
+    /// database on first boot, and the Cosmos emulator serves 503s until its pgcosmos extension is up.
+    /// The 30s default that the cheaper stores use is nowhere near enough for either.
+    /// </summary>
+    private static readonly TimeSpan StoreReadyBudget = TimeSpan.FromMinutes(3);
 
     [Fact]
     public async Task OraclePackageStore_RoundTrips_Expires_Deletes_WhenConnectionStringIsConfigured()
@@ -135,10 +140,13 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
         {
             await using var connection = new OracleConnection(connectionString);
             await connection.OpenAsync();
-        }, OracleReadyBudget);
+        }, StoreReadyBudget);
 
+    // The emulator answers on its gateway well before it can serve requests — it replies 503
+    // "pgcosmos extension is still starting" for a while after that. On a cold CI runner this ran past
+    // the 30s default and failed the whole test, so it gets the same budget Oracle does.
     private static async Task WaitForCosmosAsync(CosmosClient client)
-        => await EventuallyAsync(async () => _ = await client.ReadAccountAsync());
+        => await EventuallyAsync(async () => _ = await client.ReadAccountAsync(), StoreReadyBudget);
 
     private static CosmosClientOptions GetCosmosClientOptions(string connectionString)
     {

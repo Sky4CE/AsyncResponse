@@ -9,6 +9,7 @@ namespace AsyncResponse.IntegrationTests;
 /// and responses ingested from a Pub/Sub topic into active waiters.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
     public sealed class PubSubTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
     {
         [Fact]

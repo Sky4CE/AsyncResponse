@@ -22,6 +22,7 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>Contract run against real Redis (pub/sub channel + recovery keys).</summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class RedisChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     // Broker round-trips over loopback: well under a second healthy; 5s absorbs CI noise.
@@ -51,6 +52,7 @@ public sealed class RedisChannelConformanceTests(DataBatchFixture fixture) : Cha
 
 /// <summary>Contract run against real NATS (core request/reply channel + JetStream KV recovery).</summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class NatsChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(5);
@@ -81,6 +83,7 @@ public sealed class NatsChannelConformanceTests(DataBatchFixture fixture) : Chan
 
 /// <summary>Contract run against real PostgreSQL (LISTEN/NOTIFY + tables channel).</summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class PostgreSqlChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     // Polling database channel under the loaded shared container: 15s budget.
@@ -129,6 +132,7 @@ public sealed class PostgreSqlChannelConformanceTests(DataBatchFixture fixture) 
 
 /// <summary>Contract run against real SQL Server (adaptive-polling channel).</summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class SqlServerChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);
@@ -183,6 +187,7 @@ public sealed class SqlServerChannelConformanceTests(DataBatchFixture fixture) :
 
 /// <summary>Contract run against real MongoDB (change-stream channel on the single-node replica set).</summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class MongoDbChannelConformanceTests(DataBatchFixture fixture) : ChannelConformanceSuite
 {
     protected override TimeSpan Generous => TimeSpan.FromSeconds(15);

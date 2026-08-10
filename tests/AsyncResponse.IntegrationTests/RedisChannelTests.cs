@@ -7,6 +7,7 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>Active-waiter behavior over a real Redis pub/sub response channel, driven via the SUT.</summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class RedisChannelTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

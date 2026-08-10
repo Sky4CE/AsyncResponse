@@ -7,6 +7,7 @@ namespace AsyncResponse.IntegrationTests;
 
 /// <summary>Watchdog/health surfacing, reply targets, and HTTP-driven end-to-end flows.</summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class WatchdogReplyTargetHttpTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// recoverable waiters.
 /// </summary>
 [Collection(CloudCollection.Name)]
+[Trait(Batches.Trait, Batches.Cloud)]
 public sealed class AzureServiceBusTransportTests(CloudBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

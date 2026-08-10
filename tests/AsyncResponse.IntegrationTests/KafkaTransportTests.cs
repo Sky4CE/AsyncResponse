@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// from a Kafka response topic into active waiters.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class KafkaTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

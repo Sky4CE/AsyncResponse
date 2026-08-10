@@ -15,6 +15,7 @@ using Xunit;
 namespace AsyncResponse.IntegrationTests;
 
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

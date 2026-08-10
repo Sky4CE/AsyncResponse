@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// it silently runs in the wrong batch or in none, and the suite still reports green. These tests
 /// are the tie.
 /// </summary>
+[Trait(Batches.Trait, Batches.None)]
 public sealed class BatchAssignmentTests
 {
     private static readonly Dictionary<string, Type> BatchFixtureByCollection = new(StringComparer.Ordinal)
@@ -54,6 +55,73 @@ public sealed class BatchAssignmentTests
         .SelectMany(constructor => constructor.GetParameters())
         .Select(parameter => parameter.ParameterType)
         .FirstOrDefault(parameterType => typeof(IntegrationFixture).IsAssignableFrom(parameterType));
+
+    /// <summary>
+    /// CI runs one matrix leg per batch, selected with <c>--filter-trait "batch=&lt;name&gt;"</c>. A class
+    /// with no batch trait is in no leg, so CI stops running it and stays green — the most expensive
+    /// kind of silent gap. Every test class must carry the trait, including the ones needing no
+    /// AppHost (they take <c>batch=none</c>).
+    /// </summary>
+    [Fact]
+    public void EveryTestClass_CarriesABatchTrait()
+    {
+        var untagged = TestClasses
+            .Where(type => BatchTrait(type) is null)
+            .Select(type => type.Name)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(
+            untagged.Length == 0,
+            $"Every test class needs [Trait(Batches.Trait, ...)] so CI's per-batch matrix runs it; use "
+            + $"Batches.None for classes that need no AppHost. Untagged: {string.Join(", ", untagged)}");
+    }
+
+    [Fact]
+    public void BatchTrait_AgreesWithTheCollection()
+    {
+        var expectedTraitByCollection = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [DataCollection.Name] = Batches.Data,
+            [OracleCosmosCollection.Name] = Batches.OracleCosmos,
+            [BrokersCollection.Name] = Batches.Brokers,
+            [CloudCollection.Name] = Batches.Cloud,
+        };
+
+        var disagreements = new List<string>();
+        foreach (var type in TestClasses)
+        {
+            var trait = BatchTrait(type);
+            var collection = type.GetCustomAttribute<CollectionAttribute>()?.Name;
+
+            if (collection is not null && expectedTraitByCollection.TryGetValue(collection, out var expected))
+            {
+                if (trait != expected)
+                    disagreements.Add($"{type.Name} is in '{collection}' but is tagged batch={trait} (expected {expected})");
+            }
+            else if (trait != Batches.None)
+            {
+                disagreements.Add($"{type.Name} declares no batch collection but is tagged batch={trait} (expected {Batches.None})");
+            }
+        }
+
+        Assert.True(
+            disagreements.Count == 0,
+            "A class's batch trait selects its CI matrix leg and its collection selects the AppHost that "
+            + "leg boots; disagreeing means running against a fleet without the resources it needs. "
+            + string.Join("; ", disagreements));
+    }
+
+    /// <summary>
+    /// Read through <see cref="CustomAttributeData"/> rather than xUnit's trait API, which has moved
+    /// between versions; the constructor arguments have not.
+    /// </summary>
+    private static string? BatchTrait(Type type) => type.GetCustomAttributesData()
+        .Where(attribute => attribute.AttributeType.Name == nameof(TraitAttribute))
+        .Where(attribute => attribute.ConstructorArguments.Count == 2)
+        .Where(attribute => (string?)attribute.ConstructorArguments[0].Value == Batches.Trait)
+        .Select(attribute => (string?)attribute.ConstructorArguments[1].Value)
+        .FirstOrDefault();
 
     [Fact]
     public void EveryTestClass_TakesTheFixtureItsBatchProvides()

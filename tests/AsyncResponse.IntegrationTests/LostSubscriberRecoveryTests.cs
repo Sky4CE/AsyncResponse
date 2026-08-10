@@ -8,6 +8,7 @@ namespace AsyncResponse.IntegrationTests;
 /// then deliver a late response and assert the persisted recovery callbacks fire correctly.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class LostSubscriberRecoveryTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

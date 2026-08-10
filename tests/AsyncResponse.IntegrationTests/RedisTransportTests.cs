@@ -9,6 +9,7 @@ namespace AsyncResponse.IntegrationTests;
 /// and responses ingested from a Redis response stream into active waiters.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class RedisTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

@@ -12,6 +12,7 @@ namespace AsyncResponse.IntegrationTests;
 /// returning to Healthy once stale recovery state is cleared.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class AdditionalScenarioTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

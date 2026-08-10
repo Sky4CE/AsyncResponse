@@ -184,6 +184,14 @@ if (existingUrl is not null || existingAzureServiceBusUrl is not null || existin
 else
 {
     Console.WriteLine("Booting Redis + Google Pub/Sub emulator + Azure Service Bus emulator + LocalStack (SQS) + RabbitMQ + NATS + PostgreSQL + Kafka + sample SUTs via Aspire (Docker required)...");
+
+    // The AppHost declares resources per batch — the integration suite splits itself into small
+    // batches to bound peak footprint, and requires the batch to be named. The load test is the
+    // opposite case: it drives every transport at once, so it asks for the batch that boots the whole
+    // fleet. This must be set before CreateAsync, which runs the AppHost's entry point in-process and
+    // reads the variable straight out of this environment.
+    Environment.SetEnvironmentVariable("ASYNCRESPONSE_ITEST_BATCH", "loadtest");
+
     var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_IntegrationTests_AppHost>();
     app = await appHost.BuildAsync().WaitAsync(TimeSpan.FromMinutes(5));
     await app.StartAsync().WaitAsync(TimeSpan.FromMinutes(5));

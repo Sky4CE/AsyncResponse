@@ -29,6 +29,7 @@ using static AsyncResponse.IntegrationTests.FlowStoreContract;
 namespace AsyncResponse.IntegrationTests;
 
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

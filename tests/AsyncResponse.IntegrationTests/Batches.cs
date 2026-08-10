@@ -28,6 +28,28 @@ namespace AsyncResponse.IntegrationTests;
 // boot nothing at all.
 
 /// <summary>
+/// Batch names. Each is three things at once — the value the AppHost switches on, the trait CI's
+/// matrix filters a leg by (<c>--filter-trait "batch=data"</c>), and the identity
+/// <c>BatchAssignmentTests</c> checks — so they live in one place and cannot drift apart.
+/// </summary>
+public static class Batches
+{
+    /// <summary>Trait name CI filters on.</summary>
+    public const string Trait = "batch";
+
+    public const string Data = "data";
+    public const string OracleCosmos = "oracle-cosmos";
+    public const string Brokers = "brokers";
+    public const string Cloud = "cloud";
+
+    /// <summary>
+    /// Tests that need no AppHost at all. They still carry the trait, so every test in the assembly
+    /// belongs to exactly one matrix leg and CI cannot silently stop running a class.
+    /// </summary>
+    public const string None = "none";
+}
+
+/// <summary>
 /// Shared by the batches with no sample apps. Those apps normally do work on the suite's behalf —
 /// waiting out a server's startup and provisioning SQL Server's database — so a batch without them
 /// has to do it itself, or every test races an unready server.
@@ -94,7 +116,7 @@ public abstract class DriverOnlyBatchFixture : IntegrationFixture
 /// </summary>
 public sealed class DataBatchFixture : DriverOnlyBatchFixture
 {
-    protected override string Batch => "data";
+    protected override string Batch => Batches.Data;
 
     protected override async ValueTask WireAsync()
     {
@@ -141,7 +163,7 @@ public sealed class DataBatchFixture : DriverOnlyBatchFixture
 /// </summary>
 public sealed class OracleCosmosBatchFixture : IntegrationFixture
 {
-    protected override string Batch => "oracle-cosmos";
+    protected override string Batch => Batches.OracleCosmos;
 
     protected override ValueTask WireAsync()
     {
@@ -155,7 +177,7 @@ public sealed class OracleCosmosBatchFixture : IntegrationFixture
 /// <summary>Message-broker transports, driven through sample apps.</summary>
 public sealed class BrokersBatchFixture : IntegrationFixture
 {
-    protected override string Batch => "brokers";
+    protected override string Batch => Batches.Brokers;
 
     protected override async ValueTask WireAsync()
     {
@@ -205,7 +227,7 @@ public sealed class BrokersBatchFixture : IntegrationFixture
 /// </summary>
 public sealed class CloudBatchFixture : IntegrationFixture
 {
-    protected override string Batch => "cloud";
+    protected override string Batch => Batches.Cloud;
 
     protected override async ValueTask WireAsync()
     {

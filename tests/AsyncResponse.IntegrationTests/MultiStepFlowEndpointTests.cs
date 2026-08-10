@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// because this is where subscribe-before-send, SetException, and recovery behavior meet.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class MultiStepFlowEndpointTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

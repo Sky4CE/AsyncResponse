@@ -785,12 +785,33 @@ switch (Env("ASYNCRESPONSE_ITEST_BATCH", "").ToLowerInvariant())
         break;
     }
 
+    // Not a test batch: the whole fleet in one AppHost, for benchmarks/AsyncResponse.LoadTests, which
+    // drives every transport at once and boots this AppHost directly. Batching exists to bound the
+    // *test suite's* peak footprint; the load test wants everything up simultaneously by definition,
+    // so it asks for this. It needs no MySQL, Oracle, or Cosmos — nothing load-tested touches them.
+    case "loadtest":
+    {
+        var redis = AddRedisContainer();
+        AddPubSubApps(redis, AddPubSubContainer(), earlyAck: true);
+        AddRabbitMqApps(redis, AddRabbitMqContainer());
+        AddKafkaApps(redis, AddKafkaContainer());
+        AddNatsApps(AddNatsContainer(), earlyAck: true);
+        AddServiceBusApps(redis, AddServiceBusContainer());
+        AddSqsApps(redis, AddLocalStackContainer(), earlyAck: true);
+        AddRedisTransportApp(redis, "itest-app-redis", earlyAck: false);
+        AddRedisTransportApp(redis, "itest-app-redis-early-ack", earlyAck: true);
+        AddPostgreSqlApps(AddPostgresContainer());
+        AddSqlServerApps(AddSqlServerContainer());
+        AddMongoDbApps(AddMongoDbContainer());
+        break;
+    }
+
     // Unknown or unset: fail loudly. A silent fallback would boot the wrong fleet and the tests would
     // fail far from the cause — which is exactly what a stale build of this file once did.
     case var unknown:
         throw new InvalidOperationException(
-            $"ASYNCRESPONSE_ITEST_BATCH must be one of: data, oracle-cosmos, brokers, cloud. Got '{unknown}'. " +
-            "The integration fixtures set it; if you are running the AppHost directly, set it yourself. " +
+            $"ASYNCRESPONSE_ITEST_BATCH must be set. Got '{unknown}'. Test batches: data, oracle-cosmos, " +
+            "brokers, cloud (the integration fixtures set these). The load test uses: loadtest. " +
             "If this fires from the test suite, the AppHost build is stale relative to the tests.");
 }
 

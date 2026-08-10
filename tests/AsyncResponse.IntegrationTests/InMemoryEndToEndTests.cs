@@ -14,6 +14,7 @@ namespace AsyncResponse.IntegrationTests;
 /// everywhere (including the default CI job). They exercise the same sample app the Aspire/Redis tests
 /// drive, just configured for the zero-dependency path.
 /// </summary>
+[Trait(Batches.Trait, Batches.None)]
 public sealed class InMemoryEndToEndTests : IClassFixture<InMemoryEndToEndTests.InMemoryAppFactory>, IAsyncLifetime
 {
     private readonly InMemoryAppFactory _factory;

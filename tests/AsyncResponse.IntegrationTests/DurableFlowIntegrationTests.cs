@@ -14,6 +14,7 @@ namespace AsyncResponse.IntegrationTests;
 /// round-trips through the real recovery store of each channel.
 /// </summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class DurableFlowIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     public static TheoryData<string> DurableChannelVariants => new()

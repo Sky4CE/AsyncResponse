@@ -20,6 +20,7 @@ namespace AsyncResponse.IntegrationTests;
 /// cross-instance delivery where the publisher and the waiter live in different providers.
 /// </summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture), IDisposable
 {
     private readonly MongoClient _client = new(fixture.MongoDbConnectionString);

@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// option), and responses ingested from an SQS response queue into active or recoverable waiters.
 /// </summary>
 [Collection(CloudCollection.Name)]
+[Trait(Batches.Trait, Batches.Cloud)]
 public sealed class SqsTransportTests(CloudBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

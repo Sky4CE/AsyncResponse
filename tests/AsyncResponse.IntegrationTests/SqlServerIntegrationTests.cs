@@ -10,6 +10,7 @@ namespace AsyncResponse.IntegrationTests;
 /// tables, and SQL Server queue-table transport for worker dispatch and response ingress.
 /// </summary>
 [Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
 public sealed class SqlServerIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

@@ -9,6 +9,7 @@ namespace AsyncResponse.IntegrationTests;
 /// ingested from a RabbitMQ queue into active waiters.
 /// </summary>
 [Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
 public sealed class RabbitMqTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]

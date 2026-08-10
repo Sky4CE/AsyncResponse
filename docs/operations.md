@@ -156,9 +156,25 @@ what it takes: Oracle via `INIT_SGA_SIZE`/`INIT_PGA_SIZE` (2,180 → 518 MiB) an
 `MSSQL_MEMORY_LIMIT_MB`. Override with `ASYNCRESPONSE_ITEST_ORACLE_SGA_MB`,
 `ASYNCRESPONSE_ITEST_ORACLE_PGA_MB`, and `ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB`.
 
-Tests that need no AppHost at all (the in-memory suite, the Native AOT publish gate) belong to no
-batch and boot nothing. `BatchAssignmentTests` fails if a class asks for a fixture without declaring
-its batch, or declares one batch and takes another's fixture.
+Tests that need no AppHost at all (the in-memory suite, the Native AOT publish gate, the batch guards)
+are tagged `batch=none` and boot nothing.
+
+Every test class carries `[Trait(Batches.Trait, Batches.<Name>)]`, so a batch can be run on its own:
+
+```bash
+dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --filter-trait "batch=data"
+```
+
+CI uses exactly that for a matrix — one job per batch, running concurrently instead of end to end, so
+wall-clock is the slowest batch rather than the sum. Each runner also pulls only its own batch's
+images, which is what the disk-reclaim step in that job exists to fight. Legs upload
+`coverage-integration-<batch>`; the coverage job globs `coverage-*` and merges, so the published
+number still covers the whole suite.
+
+`BatchAssignmentTests` holds the whole arrangement together. It fails if a class asks for a fixture
+without declaring its batch, declares one batch and takes another's fixture, carries no batch trait,
+or carries a trait that disagrees with its collection. The trait one matters most: an untagged class
+is in no matrix leg, so CI would quietly stop running it and stay green.
 
 `DurableFlowIntegrationTests` is the one class that spans families — it drives flows across
 PostgreSQL, SQL Server, MongoDB, NATS, and SQS at once. It sits in `databases` because adding NATS and
