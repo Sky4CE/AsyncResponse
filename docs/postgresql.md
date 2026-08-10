@@ -28,12 +28,17 @@ to lost-subscriber recovery. If subscribers do exist, the publisher inserts a me
 for delivery confirmation:
 
 1. Same-process delivery completes an in-memory confirmation immediately.
-2. Cross-process delivery sets `acked_at`, which the publisher polls as a fallback.
+2. Cross-process delivery sets `acked_at` (plus `acked_seq`, drawn from a per-schema sequence),
+   which the publisher polls as a fallback.
 3. If no waiter confirms before `DeliveryConfirmationTimeout`, the publisher atomically sets
    `recovery_claimed = true` while `acked_at IS NULL` and dispatches the persisted recovery callback.
 
 That last claim is the race guard: a slow live waiter and the recovery callback cannot both own the
-same response.
+same response. `acked_seq` and each subscription's registration draw from the same monotonic
+sequence, arbitrating "acked before this waiter registered" (history, not redelivered) versus
+"acked to a fan-out group including this waiter" (delivered) even when both events land on the
+same server-clock tick — with one conservative residual: a claim whose sequence draw stalled
+across ticks resolves as history, never as a replayed response.
 
 ## Recovery state
 
@@ -73,6 +78,21 @@ processes start together.
 
 Set `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
 distinct even when they share the same schema.
+
+### Upgrading a manually managed schema
+
+1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`
+the channel validates these objects once at startup and fails with an actionable error until the
+migration below is applied (names shown for the default `public.asyncresponse_channel_messages`;
+the sequence is always `{message_table}_ack_seq` in the same schema):
+
+```sql
+ALTER TABLE public.asyncresponse_channel_messages ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+CREATE SEQUENCE IF NOT EXISTS public.asyncresponse_channel_messages_ack_seq AS bigint;
+```
+
+The column is nullable and the migration is safe to run while old-version hosts are still up:
+rows they ack carry no sequence and fall back to the previous watermark rule.
 
 ## Configuration checklist
 
@@ -118,7 +138,15 @@ Recommended Npgsql connection-string settings:
 ## Operational notes
 
 - Use simple PostgreSQL identifiers for schema/table/notification names: letters, digits, and
-  underscores, not starting with a digit.
+  underscores, not starting with a digit, at most 63 characters (PostgreSQL silently truncates
+  longer names, so validation rejects them). Derived names — `{MessageTable}_ack_seq` and the
+  `*_idx` indexes — reserve their suffix space by truncating the table stem, and validation
+  rejects a configuration whose effective name plan collides (for example a table occupying a
+  derived name, or two near-cap tables whose truncated stems derive the same index name). When
+  the channel, transport, and durable-flow stores share one schema, each additionally verifies
+  its relations against the catalog after schema creation (kind and, for indexes, owning table)
+  — a name occupied by another component's object fails startup with a rename error instead of
+  `CREATE ... IF NOT EXISTS` silently skipping the DDL.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
   rows to decide whether to wait for live delivery. Registration writes one row, then each interval
   performs one update for the process's current active-registration snapshot. Rows no longer in that

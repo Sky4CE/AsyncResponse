@@ -10,8 +10,9 @@ namespace AsyncResponse.IntegrationTests;
 /// collections, and the findOneAndUpdate queue-collection transport for worker dispatch and
 /// response ingress — all against a single-node replica set.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class MongoDbIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class MongoDbIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsMongoDbChannelTransportAndEarlyAckMode()

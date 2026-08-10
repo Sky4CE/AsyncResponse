@@ -32,6 +32,45 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void ChannelOptions_RejectOverLimitIdentifiersAndAcceptTheCap()
+    {
+        // PostgreSQL silently truncates identifiers past 63 characters, so validation must reject
+        // them; exactly 63 is legal and the derived names reserve their own suffix space.
+        AssertChannelInvalid(
+            options => options.MessageTable = new string('m', 64),
+            "limited to 63");
+        AssertChannelInvalid(
+            options => options.SchemaName = new string('s', 64),
+            "limited to 63");
+
+        new PostgreSqlAsyncResponseChannelOptions { MessageTable = new string('m', 63) }.Validate();
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectEffectiveNamePlanCollisions()
+    {
+        // A configured table can occupy a derived name outright...
+        AssertChannelInvalid(
+            options => options.SubscriberTable = $"{options.MessageTable}_ack_seq",
+            "ack sequence");
+
+        // ...a table whose name ends exactly where the reserved stem truncates derives ITSELF
+        // (63 = 51-char stem + "_expires_idx")...
+        AssertChannelInvalid(
+            options => options.SubscriberTable = new string('s', 51) + "_expires_idx",
+            "expiry index");
+
+        // ...and two max-length tables sharing a 51-char stem derive the SAME expiry-index name.
+        AssertChannelInvalid(
+            options =>
+            {
+                options.MessageTable = new string('m', 63);
+                options.SubscriberTable = string.Concat(new string('m', 51), new string('x', 12));
+            },
+            "both resolve to");
+    }
+
+    [Fact]
     public void ChannelOptions_RejectHeartbeatIntervalAtOrAboveTimeout()
     {
         var options = new PostgreSqlAsyncResponseChannelOptions
@@ -106,6 +145,24 @@ public sealed class PostgreSqlOptionsTests
         AssertTransportInvalid(
             options => options.SchemaName = "1bad",
             nameof(PostgreSqlAsyncResponseTransportOptions.SchemaName));
+    }
+
+    [Fact]
+    public void TransportOptions_RejectOverLimitIdentifiersAndDerivedIndexCollisions()
+    {
+        AssertTransportInvalid(
+            options => options.MessageTable = new string('q', 64),
+            "limited to 63");
+
+        // A queue table whose name ends exactly where the reserved "_claim_idx" stem truncates
+        // derives its own name for the claim index (63 = 53-char stem + "_claim_idx").
+        AssertTransportInvalid(
+            options => options.MessageTable = new string('q', 53) + "_claim_idx",
+            "claim index");
+
+        // Exactly at the cap the derived index names stay distinct and the plan validates.
+        PostgreSqlTransportOptionsValidator.ValidateCommon(
+            new PostgreSqlAsyncResponseTransportOptions { MessageTable = new string('q', 63) });
     }
 
     [Fact]
@@ -513,6 +570,33 @@ public sealed class PostgreSqlOptionsTests
             CancellationToken.None));
 
         Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectIntervalsBeyondTheirCeilings()
+    {
+        // "Passes validation, throws mid-operation" is the failure mode these bounds close: a
+        // TimeSpan.MaxValue deadline overflowed AFTER the publisher's insert (reporting failure
+        // for a possibly delivered response), and an over-timer-ceiling poll/heartbeat interval
+        // threw inside its background loop's own retry delay, killing dispatch.
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.SubscriberHeartbeatTimeout = TimeSpan.MaxValue,
+            nameof(PostgreSqlAsyncResponseChannelOptions.SubscriberHeartbeatTimeout));
+        AssertChannelInvalid(
+            options => options.ListenerPollInterval = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.ListenerPollInterval));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.PublishRetryMaxDelay = TimeSpan.FromDays(60),
+            nameof(PostgreSqlAsyncResponseChannelOptions.PublishRetryMaxDelay));
     }
 
     private static void AssertChannelInvalid(

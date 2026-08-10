@@ -49,6 +49,17 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     public bool AutoCreateIndexes { get; set; } = true;
 
     /// <summary>
+    /// Claims this component's collections (the derived ack-counter collection included) in the
+    /// persisted cross-component ownership ledger (<c>asyncresponse_ownership</c>) at first use,
+    /// so another AsyncResponse component — in this or any other process — misconfigured onto
+    /// the same collection fails startup instead of silently corrupting data. Independent of
+    /// <see cref="AutoCreateIndexes"/>: disabling index DDL must not disable collision
+    /// protection. Disable only for least-privilege deployments that cannot write the ledger
+    /// collection and audit their collection layout externally. Default: <c>true</c>.
+    /// </summary>
+    public bool UseOwnershipLedger { get; set; } = true;
+
+    /// <summary>
     /// Watches the message collection with a change stream so active waiters are woken with
     /// broker-grade latency. Requires a replica set. When disabled — or when the server reports
     /// change streams as unsupported — waiters fall back to <see cref="ListenerPollInterval"/>
@@ -126,12 +137,25 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
                 $"{nameof(MessageCollection)}, and {nameof(SubscriberCollection)} must be distinct collections.");
         }
 
-        Positive(MessageRetention, nameof(MessageRetention));
-        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
-        Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
-        Positive(ListenerPollInterval, nameof(ListenerPollInterval));
-        Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
-        Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
+        // The derived "{MessageCollection}_counters" collection is part of the effective name
+        // plan: a configured collection occupying it would receive the ack-counter document —
+        // in the TTL-indexed recovery collection the reaper would silently delete the counter
+        // and reset the same-tick delivery tie-breaker.
+        var countersCollection = MongoDbChannelStore.CountersCollectionName(MessageCollection);
+        if (StringComparer.Ordinal.Equals(RecoveryStateCollection, countersCollection)
+            || StringComparer.Ordinal.Equals(SubscriberCollection, countersCollection))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}: '{countersCollection}' is reserved for the ack counter " +
+                $"(derived from {nameof(MessageCollection)}); {nameof(RecoveryStateCollection)} and {nameof(SubscriberCollection)} must not use it.");
+        }
+
+        EnsurePersistedTtl(MessageRetention, nameof(MongoDbAsyncResponseChannelOptions), nameof(MessageRetention));
+        EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
+        EnsureTimerBacked(ListenerPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(ListenerPollInterval));
+        EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
+        EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
@@ -147,16 +171,11 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
         if (PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(PublishMaxAttempts)} must be positive.");
 
-        Positive(PublishRetryBaseDelay, nameof(PublishRetryBaseDelay));
-        Positive(PublishRetryMaxDelay, nameof(PublishRetryMaxDelay));
+        EnsureTimerBacked(PublishRetryBaseDelay, nameof(MongoDbAsyncResponseChannelOptions), nameof(PublishRetryBaseDelay));
+        EnsureTimerBacked(PublishRetryMaxDelay, nameof(MongoDbAsyncResponseChannelOptions), nameof(PublishRetryMaxDelay));
         if (PublishRetryBaseDelay > PublishRetryMaxDelay)
             throw new InvalidOperationException(
                 $"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(PublishRetryBaseDelay)} cannot exceed {nameof(PublishRetryMaxDelay)}.");
     }
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} must be positive.");
-    }
 }

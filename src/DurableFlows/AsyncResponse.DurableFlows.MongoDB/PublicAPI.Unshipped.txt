@@ -11,6 +11,8 @@ AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.DatabaseName.set ->
 AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.MaxStateBytes.get -> long?
 AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.MaxStateBytes.set -> void
 AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.MongoDbDurableFlowOptions() -> void
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.UseOwnershipLedger.get -> bool
+AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.UseOwnershipLedger.set -> void
 AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions.Validate() -> void
 AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore
 AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore.Dispose() -> void

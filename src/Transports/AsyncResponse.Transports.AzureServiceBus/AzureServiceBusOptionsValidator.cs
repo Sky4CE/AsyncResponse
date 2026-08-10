@@ -21,12 +21,14 @@ internal static class AzureServiceBusOptionsValidator
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
 
-        Positive(options.ReceiveWaitTime, nameof(options.ReceiveWaitTime));
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
+        // All of these arm timers: ReceiveWaitTime inside the SDK's receive call, the retry
+        // delays via Task.Delay, and ShutdownTimeout as a CancellationTokenSource budget.
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ReceiveWaitTime, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.ReceiveWaitTime));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(AzureServiceBusAsyncResponseOptions), nameof(options.ShutdownTimeout));
 
         if (options.PublishRetryBaseDelay > options.PublishRetryMaxDelay)
             throw new InvalidOperationException($"{nameof(AzureServiceBusAsyncResponseOptions)}.{nameof(options.PublishRetryBaseDelay)} cannot exceed {nameof(options.PublishRetryMaxDelay)}.");
@@ -47,8 +49,8 @@ internal static class AzureServiceBusOptionsValidator
             throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.MaxDeliveryAttempts)} cannot be negative.");
         if (subscriberOptions.PrefetchCount < 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.PrefetchCount)} cannot be negative.");
-        if (subscriberOptions.LockRenewalInterval is { } lockRenewalInterval && lockRenewalInterval <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval)} must be positive when set.");
+        if (subscriberOptions.LockRenewalInterval is { } lockRenewalInterval)
+            AsyncResponseChannelOptions.EnsureTimerBacked(lockRenewalInterval, optionPath, nameof(AzureServiceBusSubscriberOptions.LockRenewalInterval));
 
         switch (subscriberOptions.AckMode)
         {
@@ -70,11 +72,7 @@ internal static class AzureServiceBusOptionsValidator
                         $"when {nameof(AzureServiceBusSubscriberOptions.AckMode)} is {nameof(AzureServiceBusAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                {
-                    throw new InvalidOperationException(
-                        $"{optionPath}.{nameof(AzureServiceBusSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
-                }
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(AzureServiceBusSubscriberOptions.BackgroundDrainTimeout));
 
                 // Service Bus spends the background drain plus receiver close / renewal-task join
                 // (ShutdownTimeout) at shutdown; both must fit inside the host budget.
@@ -97,10 +95,4 @@ internal static class AzureServiceBusOptionsValidator
         => !string.IsNullOrWhiteSpace(value)
             ? value
             : throw new InvalidOperationException($"{nameof(AzureServiceBusAsyncResponseOptions)}.{name} must be configured.");
-
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(AzureServiceBusAsyncResponseOptions)}.{name} must be positive.");
-    }
 }

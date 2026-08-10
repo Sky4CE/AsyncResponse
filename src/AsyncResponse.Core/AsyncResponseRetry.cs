@@ -9,7 +9,8 @@ internal static class AsyncResponseRetry
         int maxAttempts,
         TimeSpan baseDelay,
         TimeSpan maxDelay,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(action);
         ArgumentNullException.ThrowIfNull(isTransient);
@@ -27,7 +28,7 @@ internal static class AsyncResponseRetry
             }
             catch (Exception ex) when (attempt < maxAttempts && isTransient(ex))
             {
-                await Task.Delay(Backoff(attempt, baseDelay, maxDelay), cancellationToken).ConfigureAwait(false);
+                await Task.Delay(Backoff(attempt, baseDelay, maxDelay), timeProvider ?? TimeProvider.System, cancellationToken).ConfigureAwait(false);
             }
         }
     }

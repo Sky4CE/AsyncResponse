@@ -260,6 +260,357 @@ public abstract class ChannelConformanceSuite
         Assert.Empty(harness.Spy.Resumed);
     }
 
+    // ----- f2/g2/h2. Lost-subscriber recovery over the raw ingress (incident 292332 regression) -----
+    //
+    // The production shape of the lost-subscriber path: the waiter's process died (redeploy), the
+    // response arrives through a broker ingress as raw JSON, and the payload type is known only
+    // from the persisted recovery registration. These facts pin the two guarantees whose absence
+    // deadlocked a real flow (Optimatic 292332/292683): the recovery callback must receive the
+    // MATERIALIZED payload (an object-typed callback parameter received a raw JsonElement, so
+    // every `is` guard in the flow silently failed), and a non-terminal checkpoint must not
+    // consume the recovery registration out from under the terminal response that follows it.
+
+    [Fact]
+    public async Task Contract_NoSubscriber_RawJsonResumablePayload_ResumeCallbackReceivesMaterializedPayload()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("lost-raw-typed");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"late raw resume"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the raw-JSON resumable payload routes to the resume callback");
+
+        // The callback parameter is declared `object` (the spy mirrors production flow services
+        // that share one callback across payload types). It must still receive the materialized
+        // payload type recorded in the recovery registration — not the ingress's raw JsonElement.
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal(ConformanceStatus.Completed, resumed.Status);
+        Assert.Equal("late raw resume", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+    }
+
+    [Fact]
+    public async Task Contract_NoSubscriber_NonTerminalCheckpoint_RetainsRegistrationForLaterTerminal()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("keep-waiting");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        // A non-terminal checkpoint (progress report) arrives after the waiter died. It must not
+        // resume, must not fail, and must NOT consume the registration — the flow's real outcome
+        // is still in flight.
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"still running"}""", correlationId);
+
+        await Task.Delay(SettleDelay);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Empty(harness.Spy.Failures);
+        Assert.NotEmpty(await harness.RecoveryStateStore.GetAllAsync(correlationId));
+
+        // The retained registration is live, not a leftover: the terminal response that follows
+        // must route through it with the materialized payload. (Timing-proof: even if the
+        // checkpoint's dispatch were still in flight above, a consumed registration here would
+        // drop the terminal response and this wait would fail.)
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"terminal after checkpoint"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the terminal response routes through the registration the checkpoint left armed");
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal("terminal after checkpoint", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+    }
+
+    [Fact]
+    public async Task Contract_NoSubscriber_CheckpointsThenTerminal_ResumesExactlyOnceWithTerminalPayload()
+    {
+        // The full 292332 message sequence: the waiter died mid-step; the remote side then
+        // publishes two in-progress checkpoints and the terminal success a few seconds later.
+        // Contract: exactly ONE resume, carrying the MATERIALIZED terminal payload — never three
+        // resumed workers, never a checkpoint payload, never a dropped terminal response.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("incident-replay");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"checkpoint-1"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"checkpoint-2"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"pipeline succeeded"}""", correlationId);
+
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count >= 1),
+            "the terminal response resumes the flow");
+
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal(ConformanceStatus.Completed, resumed.Status);
+        Assert.Equal("pipeline succeeded", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+
+        // The terminal dispatch consumed the registration; nothing is left to fire again.
+        await EventuallyAsync(
+            async () => (await harness.RecoveryStateStore.GetAllAsync(correlationId)).Count == 0,
+            "the consumed registration is deleted");
+    }
+
+    // ----- f3/g3/h3. Multi-response streams -----
+    //
+    // The library's core scenario: the remote side reports several progress checkpoints on one
+    // correlation id before its terminal result. These facts pin the stream behaviors around that
+    // shape — a live waiter riding out a whole checkpoint stream, stragglers (duplicate terminals,
+    // late checkpoints) after the wait already ended on either path, and the crash interleaving
+    // where the stream is split across the waiter's death.
+
+    [Fact]
+    public async Task Contract_ProgressStream_MultipleCheckpointsThenTerminal_CompleteLiveWaiter()
+    {
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("stream");
+        var observed = new ConcurrentQueue<string?>();
+
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId,
+            payload =>
+            {
+                observed.Enqueue(payload.Message);
+                return new ValueTask<bool>(payload.Status == ConformanceStatus.Completed);
+            },
+            WaiterTimeout);
+
+        // Every checkpoint is delivered to the SAME waiter and none may end the wait — a
+        // non-terminal delivery must leave the subscription fully armed for the next message.
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Running, "checkpoint-1"), correlationId);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Running, "checkpoint-2"), correlationId);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Running, "checkpoint-3"), correlationId);
+        await EventuallyAsync(
+            () => Task.FromResult(observed.Contains("checkpoint-3")),
+            "the checkpoint stream reaches the Until predicate");
+        Assert.False(waiter.ResponseTask.IsCompleted);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "final"), correlationId);
+        var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
+
+        Assert.Equal("final", result.Message);
+        Assert.Contains("checkpoint-1", observed);
+        Assert.Contains("checkpoint-2", observed);
+        Assert.Contains("checkpoint-3", observed);
+    }
+
+    [Fact]
+    public async Task Contract_LiveFanout_MixedPayloadTypes_EachWaiterReceivesItsDeclaredType()
+    {
+        // Shared-correlation fan-out with DIFFERENT declared payload types: broker channels give
+        // each waiter its own JSON materialization of the envelope, so a waiter never faults just
+        // because the publisher's CLR type differs from its own. The in-memory channel must match
+        // that contract instead of casting the publisher's instance across unrelated DTO types.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("mixed-fanout");
+
+        await using var resultWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await using var mirrorWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceMirrorResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "both"), correlationId);
+
+        var result = await resultWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal(ConformanceStatus.Completed, result.Status);
+        Assert.Equal("both", result.Message);
+
+        var mirror = await mirrorWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal(ConformanceStatus.Completed, mirror.Status);
+        Assert.Equal("both", mirror.Message);
+    }
+
+    [Fact]
+    public async Task Contract_LiveFanout_SameType_EachWaiterGetsItsOwnWireMaterialization()
+    {
+        // Same-type fan-out must be wire-true too: every waiter receives its OWN materialization
+        // of the declared-type wire JSON — never the publisher's live instance. Sharing the
+        // instance aliases one mutable object across the fan-out and leaks [JsonIgnore] state
+        // that no broker-backed channel can deliver; the in-memory channel must not diverge from
+        // what Redis/NATS/database waiters receive byte-for-byte.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("same-type-fanout");
+
+        await using var firstWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceLocalStateResult>(
+            correlationId, timeout: WaiterTimeout);
+        await using var secondWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceLocalStateResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        var published = new ConformanceLocalStateResult { Marker = 7, LocalHint = "in-process-only" };
+        await harness.Publisher.SetResponse(published, correlationId);
+
+        var first = await firstWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var second = await secondWaiter.ResponseTask.WaitAsync(WaitBudget);
+
+        Assert.Equal(7, first.Marker);
+        Assert.Equal(7, second.Marker);
+        // Wire-excluded state never crosses, and no waiter aliases the publisher's (or another
+        // waiter's) instance.
+        Assert.Null(first.LocalHint);
+        Assert.Null(second.LocalHint);
+        Assert.NotSame(published, first);
+        Assert.NotSame(published, second);
+        Assert.NotSame(first, second);
+    }
+
+    [Fact]
+    public async Task Contract_LiveFanout_PolymorphicDeclaredBase_PreservesDiscriminatorForEveryWaiter()
+    {
+        // The polymorphic sharpening of the mixed-type fan-out contract: the publisher declares a
+        // [JsonPolymorphic] base, so the wire representation carries the type discriminator. Every
+        // waiter — including one bound to a DIFFERENT compatible polymorphic contract — must
+        // receive its own materialization of that discriminated payload, exactly as broker
+        // envelopes (which serialize the declared base) deliver it.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("poly-fanout");
+
+        await using var ownWaiter = await harness.Subscriber.CreateResponseWaiter<ConformancePolyBase>(
+            correlationId, timeout: WaiterTimeout);
+        await using var mirrorWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceMirrorPolyBase>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse<ConformancePolyBase>(
+            new ConformancePolyResult { Message = "poly-both" }, correlationId);
+
+        var own = await ownWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var ownResult = Assert.IsType<ConformancePolyResult>(own);
+        Assert.Equal("poly-both", ownResult.Message);
+
+        var mirror = await mirrorWaiter.ResponseTask.WaitAsync(WaitBudget);
+        var mirrorResult = Assert.IsType<ConformanceMirrorPolyResult>(mirror);
+        Assert.Equal("poly-both", mirrorResult.Message);
+    }
+
+    [Fact]
+    public async Task Contract_StragglersAfterLiveCompletion_AreDroppedAndCorrelationIdStaysReusable()
+    {
+        // Broker redelivery and slow remotes produce stragglers: a duplicate of the terminal
+        // response, or a progress checkpoint that was in flight when the wait completed. After a
+        // live completion the waiter's own recovery registration is consumed, so both stragglers
+        // must be dropped benignly — no recovery dispatch, no exception, and the correlation id
+        // remains fully usable for the next operation.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("stragglers");
+
+        await using (var first = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout))
+        {
+            await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "first"), correlationId);
+            Assert.Equal("first", (await first.ResponseTask.WaitAsync(WaitBudget)).Message);
+        }
+
+        await EventuallyAsync(
+            async () => await harness.Probe.CountActiveSubscribersAsync(correlationId) == 0,
+            "the completed waiter's subscription is fully cleaned up");
+        await EventuallyAsync(
+            async () => (await harness.RecoveryStateStore.GetAllAsync(correlationId)).Count == 0,
+            "the completed waiter's recovery registration is consumed");
+
+        // The stragglers: a redelivered terminal and a late checkpoint. Nothing is listening and
+        // no registration exists — both must be dropped without dispatching anything.
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"first"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"late checkpoint"}""", correlationId);
+        await Task.Delay(SettleDelay);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Empty(harness.Spy.Failures);
+
+        // The correlation id is not poisoned: a fresh waiter receives the NEXT response — never a
+        // straggler that predates it.
+        await using var second = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "second"), correlationId);
+        Assert.Equal("second", (await second.ResponseTask.WaitAsync(WaitBudget)).Message);
+    }
+
+    [Fact]
+    public async Task Contract_CrashBetweenProgressAndTerminal_RecoveryResumesWithTerminalPayload()
+    {
+        // The full crash interleaving: the stream starts against a LIVE waiter (a checkpoint is
+        // observed by its Until predicate), the waiting process then dies mid-stream, and the rest
+        // of the stream — another checkpoint, then the terminal success — arrives on the lost
+        // path. The armed recovery registration must ride out the post-crash checkpoint and route
+        // the terminal response, exactly once, with the materialized payload.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("crash-mid-stream");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+        var observed = new ConcurrentQueue<string?>();
+
+        var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId,
+            payload =>
+            {
+                observed.Enqueue(payload.Message);
+                return new ValueTask<bool>(payload.Status == ConformanceStatus.Completed);
+            },
+            WaiterTimeout);
+
+        // Live phase: the checkpoint reaches the waiter, not the recovery spy.
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Running, "progress-live"), correlationId);
+        await EventuallyAsync(
+            () => Task.FromResult(observed.Contains("progress-live")),
+            "the live checkpoint reaches the Until predicate");
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Empty(harness.Spy.Failures);
+
+        // The crash: the waiter's subscription dies mid-wait. (Its own registration goes with it;
+        // the independently armed registration — the flow's recovery arm — survives, exactly like
+        // a real crashed process whose persisted registration outlives it.)
+        var responseTask = waiter.ResponseTask;
+        await waiter.DisposeAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => responseTask.WaitAsync(WaitBudget));
+        await EventuallyAsync(
+            async () => await harness.Probe.CountActiveSubscribersAsync(correlationId) == 0,
+            "the crashed waiter's subscription is fully gone");
+
+        // Post-crash phase, via the raw ingress like a real broker delivery: the checkpoint must
+        // keep the registration armed, and the terminal must resume exactly once, typed.
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"progress-lost"}""", correlationId);
+        await Task.Delay(SettleDelay);
+        Assert.Empty(harness.Spy.Resumed);
+        Assert.Empty(harness.Spy.Failures);
+        Assert.NotEmpty(await harness.RecoveryStateStore.GetAllAsync(correlationId));
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"terminal-lost"}""", correlationId);
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the terminal response routes through the surviving registration");
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal(ConformanceStatus.Completed, resumed.Status);
+        Assert.Equal("terminal-lost", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+    }
+
+    [Fact]
+    public async Task Contract_MessagesAfterConsumedTerminal_AreDroppedWithoutCallbacks()
+    {
+        // Once the terminal response consumed the recovery registration, redelivered terminals and
+        // late checkpoints have nothing to route against — recovery is at-least-once, and once the
+        // registration is gone the contract is a benign drop: never a second resume, never a
+        // failure dispatch.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("post-consume");
+        await ArmRecoveryCallbacksAsync(harness, correlationId);
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"terminal"}""", correlationId);
+        await EventuallyAsync(
+            () => Task.FromResult(harness.Spy.Resumed.Count == 1),
+            "the terminal response resumes the flow");
+        await EventuallyAsync(
+            async () => (await harness.RecoveryStateStore.GetAllAsync(correlationId)).Count == 0,
+            "the consumed registration is deleted");
+
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"terminal"}""", correlationId);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":1,"Message":"late checkpoint"}""", correlationId);
+
+        await Task.Delay(SettleDelay);
+        var resumed = Assert.IsType<ConformanceResult>(Assert.Single(harness.Spy.Resumed));
+        Assert.Equal("terminal", resumed.Message);
+        Assert.Empty(harness.Spy.Failures);
+        Assert.Empty(await harness.RecoveryStateStore.GetAllAsync(correlationId));
+    }
+
     // ----- i. Raw JSON ingress path -----
 
     [Fact]
@@ -637,8 +988,91 @@ public sealed class ConformanceResult : IAsyncResponsePayload
     public ConformanceStatus Status { get; set; }
     public string? Message { get; set; }
 
-    /// <summary>Recovery routing only: resume on in-flight/successful states, fail otherwise.</summary>
-    public bool ShouldResumeOnRecovery() => Status is ConformanceStatus.Completed or ConformanceStatus.Running;
+    /// <summary>
+    /// Recovery routing only: resume on success, keep the registration armed on a non-terminal
+    /// checkpoint (<see cref="ConformanceStatus.Running"/> — the response stream reports progress
+    /// before its terminal message), fail otherwise. Classifying Running as resume would consume
+    /// the registration on a progress message and let the real terminal response arrive with
+    /// nothing to route against — the 292332 flow-deadlock shape.
+    /// </summary>
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        ConformanceStatus.Completed => RecoveryAction.Resume,
+        ConformanceStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
+}
+
+/// <summary>
+/// A second payload type sharing <see cref="ConformanceResult"/>'s wire shape: what a sibling
+/// service waiting on the same correlation id would declare. Lets the suite pin mixed-type
+/// shared-correlation fan-out — every waiter receives its own declared type, however the
+/// publisher spelled the payload.
+/// </summary>
+public sealed class ConformanceMirrorResult : IAsyncResponsePayload
+{
+    public ConformanceStatus Status { get; set; }
+    public string? Message { get; set; }
+
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        ConformanceStatus.Completed => RecoveryAction.Resume,
+        ConformanceStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
+}
+
+/// <summary>
+/// Same-type fan-out probe: wire-carried state plus in-process-only (<c>[JsonIgnore]</c>) state.
+/// Pins that every waiter gets its own wire materialization — the ignored member must never
+/// cross, and no waiter may alias the publisher's live instance.
+/// </summary>
+public sealed class ConformanceLocalStateResult : IAsyncResponsePayload
+{
+    public int Marker { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? LocalHint { get; set; }
+
+    public RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>
+/// A polymorphic payload contract published by its declared base: the wire carries the
+/// discriminator, and every waiter must get a faithful materialization of the derived type.
+/// </summary>
+[System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(ConformancePolyResult), "result")]
+public abstract class ConformancePolyBase : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    // Virtual so the derived override genuinely participates in interface dispatch.
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class ConformancePolyResult : ConformancePolyBase
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
+}
+
+/// <summary>
+/// A second, compatible polymorphic contract (same discriminator name and value) — what a sibling
+/// service waiting on the same correlation id would declare.
+/// </summary>
+[System.Text.Json.Serialization.JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[System.Text.Json.Serialization.JsonDerivedType(typeof(ConformanceMirrorPolyResult), "result")]
+public abstract class ConformanceMirrorPolyBase : IAsyncResponsePayload
+{
+    public string? Message { get; set; }
+
+    // Virtual so the derived override genuinely participates in interface dispatch.
+    public virtual RecoveryAction OnRecovery() => RecoveryAction.Fail;
+}
+
+public sealed class ConformanceMirrorPolyResult : ConformanceMirrorPolyBase
+{
+    public override RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }
 
 /// <summary>

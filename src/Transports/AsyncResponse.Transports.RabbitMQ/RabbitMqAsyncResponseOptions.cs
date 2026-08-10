@@ -37,7 +37,11 @@ public sealed class RabbitMqAsyncResponseOptions
     /// <summary>Enables automatic topology recovery. Default: <c>true</c>.</summary>
     public bool TopologyRecoveryEnabled { get; set; } = true;
 
-    /// <summary>How long the client waits between automatic recovery attempts.</summary>
+    /// <summary>
+    /// How long the client waits between automatic recovery attempts (also the delay between
+    /// subscriber start retries). Must be strictly positive: the RabbitMQ client uses the value
+    /// directly in its recovery loop. Default: 5 seconds.
+    /// </summary>
     public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>Requested AMQP heartbeat interval.</summary>

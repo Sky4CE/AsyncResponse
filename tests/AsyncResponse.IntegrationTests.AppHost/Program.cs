@@ -77,16 +77,17 @@ const string MongoDbDatabase = "asyncresponse_itest";
 const string MongoDbEarlyAckDatabase = "asyncresponse_itest_earlyack";
 const string OracleAppUser = "asyncresponse";
 
+// Oracle and Cosmos back durable-flow store contracts. They run by default everywhere: both images
+// publish linux/arm64 manifests and both boot natively on Apple silicon (verified 2026-08-09 — ~25s
+// to ready, 630 MiB and 310 MiB resident). This used to auto-skip on Apple-silicon macOS on the
+// premise that the Oracle image was amd64-only; that premise was false, and the skip meant the two
+// store contracts never ran locally at all. Set the flag to "true" to leave them out — CI's AOT and
+// load-test jobs do, to avoid pulling two large images they have no use for.
 static bool SkipOracleCosmos()
-{
-    var configured = Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "auto");
-    if (string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase))
-        return true;
-    if (string.Equals(configured, "false", StringComparison.OrdinalIgnoreCase))
-        return false;
-    return OperatingSystem.IsMacOS()
-        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
-}
+    => string.Equals(
+        Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"),
+        "true",
+        StringComparison.OrdinalIgnoreCase);
 
 static string Env(string name, string fallback)
     => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
@@ -150,15 +151,20 @@ IResourceBuilder<IResourceWithEnvironment> AddSutApp(string name, bool aotCapabl
 // share the redis docker-entrypoint.sh + *-server launch contract work through this override — Valkey
 // does. Dragonfly (different container entrypoint) and Garnet (no stream commands) are not drop-ins for
 // this harness and are validated separately (see docs/configuration.md#redis-compatible-servers).
-var redis = builder.AddRedis("redis");
-if (Env("ASYNCRESPONSE_ITEST_REDIS_IMAGE", "") is { Length: > 0 } redisImage)
+IResourceBuilder<RedisResource> AddRedisContainer()
 {
-    if (Env("ASYNCRESPONSE_ITEST_REDIS_REGISTRY", "") is { Length: > 0 } redisRegistry)
-        redis = redis.WithImageRegistry(redisRegistry);
-    redis = redis.WithImage(redisImage, Env("ASYNCRESPONSE_ITEST_REDIS_TAG", "latest"));
+    var redis = builder.AddRedis("redis");
+    if (Env("ASYNCRESPONSE_ITEST_REDIS_IMAGE", "") is { Length: > 0 } redisImage)
+    {
+        if (Env("ASYNCRESPONSE_ITEST_REDIS_REGISTRY", "") is { Length: > 0 } redisRegistry)
+            redis = redis.WithImageRegistry(redisRegistry);
+        redis = redis.WithImage(redisImage, Env("ASYNCRESPONSE_ITEST_REDIS_TAG", "latest"));
+    }
+
+    return redis;
 }
 
-IResourceBuilder<IResourceWithEnvironment> AddRedisTransportApp(string name, bool earlyAck)
+IResourceBuilder<IResourceWithEnvironment> AddRedisTransportApp(IResourceBuilder<RedisResource> redis, string name, bool earlyAck)
 {
     var keyPrefix = earlyAck ? RedisTransportEarlyAckKeyPrefix : RedisTransportKeyPrefix;
     var consumerGroupSuffix = earlyAck ? "-earlyack" : "";
@@ -191,136 +197,178 @@ IResourceBuilder<IResourceWithEnvironment> AddRedisTransportApp(string name, boo
 
 // The compatibility profile intentionally excludes every unrelated broker and database. This keeps a
 // Redis/Valkey signal from failing because SQL Server, Kafka, Oracle, or another heavyweight fixture
-// exhausts a hosted runner or loses a transient port race.
+// exhausts a hosted runner or loses a transient port race. It is a whole-run override rather than a
+// batch: CI filters the run to the Redis classes, so no other batch's fixture ever initializes.
 if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", StringComparison.OrdinalIgnoreCase))
 {
-    AddRedisTransportApp("itest-app-redis", earlyAck: false);
-    AddRedisTransportApp("itest-app-redis-early-ack", earlyAck: true);
+    var compatRedis = AddRedisContainer();
+    AddRedisTransportApp(compatRedis, "itest-app-redis", earlyAck: false);
+    AddRedisTransportApp(compatRedis, "itest-app-redis-early-ack", earlyAck: true);
     builder.Build().Run();
     return;
 }
 
-var rabbitmq = builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
-    .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
-    .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");
+IResourceBuilder<ContainerResource> AddRabbitMqContainer()
+    => builder.AddContainer("rabbitmq", "rabbitmq", "3.13-management")
+        .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
+        .WithEndpoint(targetPort: 15672, scheme: "http", name: "management");
 
-var pubsub = builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli", "446.0.1-emulators")
+IResourceBuilder<ContainerResource> AddPubSubContainer()
+    => builder.AddContainer("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli", "446.0.1-emulators")
     .WithArgs("gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", $"--project={ProjectId}")
     .WithEndpoint(targetPort: 8085, scheme: "tcp", name: "pubsub");
 
 // `-js` enables JetStream, which the NATS channel's Key-Value recovery store and the NATS transport's
 // streams both require.
-var nats = builder.AddContainer("nats", "nats", "latest")
-    .WithArgs("-js")
-    .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
+IResourceBuilder<ContainerResource> AddNatsContainer()
+    => builder.AddContainer("nats", "nats", "latest")
+        .WithArgs("-js")
+        .WithEndpoint(targetPort: 4222, scheme: "tcp", name: "nats");
 
 // Single-broker KRaft Kafka (the Aspire integration uses the confluent-local image). One broker backs
 // both Kafka app variants; they isolate through distinct topics and consumer groups. This container
 // doubles as the roadmap's Redpanda-compatibility reference: everything speaks the Kafka protocol.
-var kafka = builder.AddKafka("kafka");
+IResourceBuilder<KafkaServerResource> AddKafkaContainer() => builder.AddKafka("kafka");
 
 // Two PostgreSQL app instances (default + early-ack) share this one server, each with its own Npgsql
 // pool. The image default max_connections=100 is exhausted under the load-test profile ("FATAL: sorry,
 // too many clients already"). Raise the server ceiling well above the combined pool budget below
 // (2 apps x Maximum Pool Size=120 = 240) so neither the load test nor parallel integration apps starve.
-var postgres = builder.AddContainer("postgres", "postgres", "16-alpine")
-    .WithEnvironment("POSTGRES_DB", "asyncresponse")
-    .WithEnvironment("POSTGRES_PASSWORD", "postgres")
-    .WithArgs("-c", "max_connections=400")
-    .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
+IResourceBuilder<ContainerResource> AddPostgresContainer()
+    => builder.AddContainer("postgres", "postgres", "16-alpine")
+        .WithEnvironment("POSTGRES_DB", "asyncresponse")
+        .WithEnvironment("POSTGRES_PASSWORD", "postgres")
+        .WithArgs("-c", "max_connections=400")
+        .WithEndpoint(targetPort: 5432, scheme: "tcp", name: "postgres");
 
-var mysql = builder.AddContainer("mysql", "mysql", "8.4")
-    .WithEnvironment("MYSQL_DATABASE", "asyncresponse")
-    .WithEnvironment("MYSQL_ROOT_PASSWORD", "mysql")
-    .WithEndpoint(targetPort: 3306, scheme: "tcp", name: "mysql");
+IResourceBuilder<ContainerResource> AddMySqlContainer()
+    => builder.AddContainer("mysql", "mysql", "8.4")
+        .WithEnvironment("MYSQL_DATABASE", "asyncresponse")
+        .WithEnvironment("MYSQL_ROOT_PASSWORD", "mysql")
+        .WithEndpoint(targetPort: 3306, scheme: "tcp", name: "mysql");
 
 // Single-node replica set: change streams — the MongoDB channel's waiter wake and the transport's
 // subscriber wake — require one. The entrypoint wrapper starts mongod with --replSet and initiates
 // the set as soon as the server answers; clients connect with directConnection=true so they never
 // chase the replica-set-advertised container hostname, which is unreachable from the host network.
-var mongodb = builder.AddContainer("mongodb", "mongo", "7")
-    .WithEntrypoint("bash")
-    .WithArgs(
-        "-c",
-        "mongod --replSet rs0 --bind_ip_all & MONGOD_PID=$!; " +
-        "until mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate().ok }' >/dev/null 2>&1; do sleep 0.5; done; " +
-        "wait $MONGOD_PID")
-    .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
+IResourceBuilder<ContainerResource> AddMongoDbContainer()
+    => builder.AddContainer("mongodb", "mongo", "7")
+        .WithEntrypoint("bash")
+        .WithArgs(
+            "-c",
+            "mongod --replSet rs0 --bind_ip_all & MONGOD_PID=$!; " +
+            "until mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate().ok }' >/dev/null 2>&1; do sleep 0.5; done; " +
+            "wait $MONGOD_PID")
+        .WithEndpoint(targetPort: 27017, scheme: "tcp", name: "mongodb");
 
-// Oracle and Cosmos back the durable-flow store contract tests, which run in default CI. They are
-// not part of the broker/load-test SUT, so workflows that don't need them (load tests, the weekly
-// redis-compat matrix) skip their heavyweight containers via this flag. Unset means "auto": skip
-// on Apple-silicon macOS, where the amd64-only Oracle image and the Cosmos emulator cannot run
-// and would fail the WHOLE AppHost boot — turning an IDE "run all tests" (which never sets the
-// flag) into a wall of fixture failures. CI pins "true"/"false" explicitly; the affected
-// store-contract tests Assert.Skip when the containers are absent.
-if (!SkipOracleCosmos())
-{
-    var oracleAppPassword = Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345");
-    var oracle = builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
+// Oracle and Cosmos back durable-flow store contract tests only — no SUT app references them, so
+// they live in the "stores" batch. See SkipOracleCosmos above for the opt-out.
+// INIT_SGA_SIZE/INIT_PGA_SIZE: left to its own devices Oracle sizes its SGA from the host and
+// measured 2,180 MiB here — the single largest container in the suite by a wide margin. The store
+// contract is a handful of small tables, so a 1 GiB SGA is ample and keeps the batch inside a
+// default Docker VM.
+IResourceBuilder<ContainerResource> AddOracleContainer()
+    => builder.AddContainer("oracle", "gvenzl/oracle-free", "23-slim")
         .WithEnvironment("ORACLE_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_ADMIN_PASSWORD", "AsyncResponse12345"))
         .WithEnvironment("APP_USER", OracleAppUser)
-        .WithEnvironment("APP_USER_PASSWORD", oracleAppPassword)
+        .WithEnvironment("APP_USER_PASSWORD", Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345"))
+        .WithEnvironment("INIT_SGA_SIZE", Env("ASYNCRESPONSE_ITEST_ORACLE_SGA_MB", "1024"))
+        .WithEnvironment("INIT_PGA_SIZE", Env("ASYNCRESPONSE_ITEST_ORACLE_PGA_MB", "256"))
         .WithEndpoint(targetPort: 1521, scheme: "tcp", name: "oracle");
 
-    var cosmos = builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
+IResourceBuilder<ContainerResource> AddCosmosContainer()
+    => builder.AddContainer("cosmos", "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator", "vnext-latest")
         .WithEnvironment("PROTOCOL", "https")
         .WithEndpoint(targetPort: 8081, scheme: "https", name: "gateway")
         .WithEndpoint(targetPort: 8080, scheme: "http", name: "health")
         .WithHttpHealthCheck("/ready", endpointName: "health");
-}
 
 // Dedicated SQL Server for the SqlServer channel + transport SUTs (separate from the one backing the
 // Azure Service Bus emulator, so the two suites cannot interfere). Both SqlServer app variants share
 // it; the sample app provisions the database and each variant isolates through its own schema.
 var sqlServerPassword = Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345");
-var sqlserver = builder.AddContainer("sqlserver", "mcr.microsoft.com/mssql/server", "2022-latest")
-    .WithEnvironment("ACCEPT_EULA", "Y")
-    .WithEnvironment("MSSQL_SA_PASSWORD", sqlServerPassword)
-    .WithEndpoint(targetPort: 1433, scheme: "tcp", name: "sqlserver");
 
-var serviceBusSqlPassword = Env("ASYNCRESPONSE_ITEST_SERVICEBUS_SQL_PASSWORD", "P@ssword12345");
-var serviceBusSql = builder.AddContainer("servicebus-sql", "mcr.microsoft.com/mssql/server", "2022-latest")
-    .WithEnvironment("ACCEPT_EULA", "Y")
-    .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword);
-var serviceBusConfigPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "servicebus-emulator-config.json"));
-var serviceBus = builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "latest")
-    .WithBindMount(serviceBusConfigPath, "/ServiceBus_Emulator/ConfigFiles/Config.json", isReadOnly: true)
-    .WithEnvironment("SQL_SERVER", "servicebus-sql")
-    .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
-    .WithEnvironment("ACCEPT_EULA", "Y")
-    .WithEnvironment("EMULATOR_HTTP_PORT", "5300")
-    .WithEnvironment("SQL_WAIT_INTERVAL", "30")
-    .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
-    .WithEndpoint(targetPort: 5300, scheme: "http", name: "management")
-    .WaitFor(serviceBusSql)
-    .WithHttpHealthCheck("/health", endpointName: "management");
+// MSSQL_MEMORY_LIMIT_MB: SQL Server grows its buffer pool to whatever the host allows and measured
+// 1,328 MiB. Two of these run in the suite (this one and the Service Bus emulator's), so capping
+// both keeps a batch from spending most of a Docker VM on database cache it never needs.
+IResourceBuilder<ContainerResource> AddSqlServerContainer()
+    => builder.AddContainer("sqlserver", "mcr.microsoft.com/mssql/server", "2022-latest")
+        .WithEnvironment("ACCEPT_EULA", "Y")
+        .WithEnvironment("MSSQL_SA_PASSWORD", Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345"))
+        .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", Env("ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB", "1024"))
+        .WithEndpoint(targetPort: 1433, scheme: "tcp", name: "sqlserver");
+
+// The Service Bus emulator needs its own SQL Server, so it costs two containers, not one — which is
+// why it dominates whichever batch it lands in.
+IResourceBuilder<ContainerResource> AddServiceBusContainer()
+{
+    var serviceBusSqlPassword = Env("ASYNCRESPONSE_ITEST_SERVICEBUS_SQL_PASSWORD", "P@ssword12345");
+    var serviceBusSql = builder.AddContainer("servicebus-sql", "mcr.microsoft.com/mssql/server", "2022-latest")
+        .WithEnvironment("ACCEPT_EULA", "Y")
+        .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
+        .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", Env("ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB", "1024"));
+    var serviceBusConfigPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "servicebus-emulator-config.json"));
+    return builder.AddContainer("servicebus", "mcr.microsoft.com/azure-messaging/servicebus-emulator", "latest")
+        .WithBindMount(serviceBusConfigPath, "/ServiceBus_Emulator/ConfigFiles/Config.json", isReadOnly: true)
+        .WithEnvironment("SQL_SERVER", "servicebus-sql")
+        .WithEnvironment("MSSQL_SA_PASSWORD", serviceBusSqlPassword)
+        .WithEnvironment("ACCEPT_EULA", "Y")
+        .WithEnvironment("EMULATOR_HTTP_PORT", "5300")
+        .WithEnvironment("SQL_WAIT_INTERVAL", "30")
+        .WithEndpoint(targetPort: 5672, scheme: "tcp", name: "amqp")
+        .WithEndpoint(targetPort: 5300, scheme: "http", name: "management")
+        .WaitFor(serviceBusSql)
+        .WithHttpHealthCheck("/health", endpointName: "management");
+}
 
 // LocalStack emulates AWS SQS for the SQS transport SUTs. Only the SQS service is enabled; the
 // sample app provisions its queues (and redrive-policy dead-letter queues) through the transport's
 // CreateQueues option, so no config file or init script is needed.
-var localstack = builder.AddContainer("localstack", "localstack/localstack", "3")
-    .WithEnvironment("SERVICES", "sqs,dynamodb")
-    .WithEnvironment("EAGER_SERVICE_LOADING", "1")
-    .WithEndpoint(targetPort: 4566, scheme: "http", name: "edge")
-    .WithHttpHealthCheck("/_localstack/health", endpointName: "edge");
+IResourceBuilder<ContainerResource> AddLocalStackContainer()
+    => builder.AddContainer("localstack", "localstack/localstack", "3")
+        .WithEnvironment("SERVICES", "sqs,dynamodb")
+        .WithEnvironment("EAGER_SERVICE_LOADING", "1")
+        .WithEndpoint(targetPort: 4566, scheme: "http", name: "edge")
+        .WithHttpHealthCheck("/_localstack/health", endpointName: "edge");
 
-var pubsubEndpoint = pubsub.GetEndpoint("pubsub");
-var emulatorHost = ReferenceExpression.Create(
-    $"{pubsubEndpoint.Property(EndpointProperty.Host)}:{pubsubEndpoint.Property(EndpointProperty.Port)}");
-var rabbitMqEndpoint = rabbitmq.GetEndpoint("amqp");
-var rabbitMqConnectionString = ReferenceExpression.Create(
-    $"amqp://guest:guest@{rabbitMqEndpoint.Property(EndpointProperty.Host)}:{rabbitMqEndpoint.Property(EndpointProperty.Port)}/");
-var serviceBusEndpoint = serviceBus.GetEndpoint("amqp");
-var serviceBusConnectionString = ReferenceExpression.Create(
-    $"Endpoint=sb://{serviceBusEndpoint.Property(EndpointProperty.Host)}:{serviceBusEndpoint.Property(EndpointProperty.Port)};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;");
-var localstackEndpoint = localstack.GetEndpoint("edge");
-var localstackServiceUrl = ReferenceExpression.Create(
-    $"http://{localstackEndpoint.Property(EndpointProperty.Host)}:{localstackEndpoint.Property(EndpointProperty.Port)}");
-var natsEndpoint = nats.GetEndpoint("nats");
-var natsConnectionString = ReferenceExpression.Create(
-    $"nats://{natsEndpoint.Property(EndpointProperty.Host)}:{natsEndpoint.Property(EndpointProperty.Port)}");
-var postgresEndpoint = postgres.GetEndpoint("postgres");
+// --- Connection strings, derived per container ------------------------------------------------
+// Each takes the container it describes, so a batch can build only the ones it declared.
+
+ReferenceExpression PubSubEmulatorHost(IResourceBuilder<ContainerResource> pubsub)
+{
+    var endpoint = pubsub.GetEndpoint("pubsub");
+    return ReferenceExpression.Create(
+        $"{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)}");
+}
+
+ReferenceExpression RabbitMqConnectionString(IResourceBuilder<ContainerResource> rabbitmq)
+{
+    var endpoint = rabbitmq.GetEndpoint("amqp");
+    return ReferenceExpression.Create(
+        $"amqp://guest:guest@{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)}/");
+}
+
+ReferenceExpression ServiceBusConnectionString(IResourceBuilder<ContainerResource> serviceBus)
+{
+    var endpoint = serviceBus.GetEndpoint("amqp");
+    return ReferenceExpression.Create(
+        $"Endpoint=sb://{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)};SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;");
+}
+
+ReferenceExpression LocalStackServiceUrl(IResourceBuilder<ContainerResource> localstack)
+{
+    var endpoint = localstack.GetEndpoint("edge");
+    return ReferenceExpression.Create(
+        $"http://{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)}");
+}
+
+ReferenceExpression NatsConnectionString(IResourceBuilder<ContainerResource> nats)
+{
+    var endpoint = nats.GetEndpoint("nats");
+    return ReferenceExpression.Create(
+        $"nats://{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)}");
+}
+
 // Cap each app's Npgsql pool so the two PostgreSQL instances sharing the server above cannot, even
 // combined (2 x 120 = 240), exceed its max_connections=400 ceiling — bounding aggregate connection use
 // rather than letting Npgsql's default (100 per app) race the server limit under load.
@@ -330,24 +378,43 @@ var postgresEndpoint = postgres.GetEndpoint("postgres");
 // they roughly halve server-side statements and cut parse/plan CPU — decisive on the load-test runner
 // where one small PostgreSQL server backs every PostgreSQL scenario at once. The channel only LISTENs on
 // dedicated long-lived connections, so skipping reset on the pooled query connections is safe.
-var postgresConnectionString = ReferenceExpression.Create(
-    $"Host={postgresEndpoint.Property(EndpointProperty.Host)};Port={postgresEndpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");
+ReferenceExpression PostgresConnectionString(IResourceBuilder<ContainerResource> postgres)
+{
+    var endpoint = postgres.GetEndpoint("postgres");
+    return ReferenceExpression.Create(
+        $"Host={endpoint.Property(EndpointProperty.Host)};Port={endpoint.Property(EndpointProperty.Port)};Username=postgres;Password=postgres;Database=asyncresponse;Maximum Pool Size=120;No Reset On Close=true;Max Auto Prepare=20");
+}
 
-var mongoDbEndpoint = mongodb.GetEndpoint("mongodb");
-var mongoDbConnectionString = ReferenceExpression.Create(
-    $"mongodb://{mongoDbEndpoint.Property(EndpointProperty.Host)}:{mongoDbEndpoint.Property(EndpointProperty.Port)}/?directConnection=true");
+ReferenceExpression MongoDbConnectionString(IResourceBuilder<ContainerResource> mongodb)
+{
+    var endpoint = mongodb.GetEndpoint("mongodb");
+    return ReferenceExpression.Create(
+        $"mongodb://{endpoint.Property(EndpointProperty.Host)}:{endpoint.Property(EndpointProperty.Port)}/?directConnection=true");
+}
 
 // Cap each app's SqlClient pool (2 apps x 120 = 240) well under SQL Server's default connection
 // ceiling, mirroring the PostgreSQL budget above. TrustServerCertificate accepts the container's
 // self-signed certificate.
-var sqlServerEndpoint = sqlserver.GetEndpoint("sqlserver");
-var sqlServerConnectionString = ReferenceExpression.Create(
-    $"Server={sqlServerEndpoint.Property(EndpointProperty.Host)},{sqlServerEndpoint.Property(EndpointProperty.Port)};User ID=sa;Password={sqlServerPassword};Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=120");
+ReferenceExpression SqlServerConnectionString(IResourceBuilder<ContainerResource> sqlserver)
+{
+    var endpoint = sqlserver.GetEndpoint("sqlserver");
+    return ReferenceExpression.Create(
+        $"Server={endpoint.Property(EndpointProperty.Host)},{endpoint.Property(EndpointProperty.Port)};User ID=sa;Password={Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345")};Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=120");
+}
+
+// --- Sample-app groups --------------------------------------------------------------------------
+// One function per transport family, taking the containers it needs. Batches compose these.
 
 // The integration SUT is the sample app itself (one app, no duplication), booted here with the
 // Redis channel + Google Pub/Sub transport. AddSutApp owns the endpoint and the /alive health
 // check, and switches between project (JIT) and Native AOT binary per ASYNCRESPONSE_ITEST_SUT.
-AddSutApp("itest-app", aotCapable: false, waitFor: [redis, pubsub])
+// earlyAck: only the brokers batch owns PubSubTransportTests, which drives the early-ack variant.
+// Other batches need "itest-app" alone, because it is the fixture's default Client.
+void AddPubSubApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<ContainerResource> pubsub, bool earlyAck)
+{
+    var emulatorHost = PubSubEmulatorHost(pubsub);
+
+    AddSutApp("itest-app", aotCapable: false, waitFor: [redis, pubsub])
     .WithReference(redis)
     .WithEnvironment("PUBSUB_EMULATOR_HOST", emulatorHost)
     .WithEnvironment("PubSub:ProjectId", ProjectId)
@@ -359,7 +426,10 @@ AddSutApp("itest-app", aotCapable: false, waitFor: [redis, pubsub])
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "GooglePubSub");
 
-AddSutApp("itest-app-early-ack", aotCapable: false, waitFor: [redis, pubsub])
+    if (!earlyAck)
+        return;
+
+    AddSutApp("itest-app-early-ack", aotCapable: false, waitFor: [redis, pubsub])
     .WithReference(redis)
     .WithEnvironment("PUBSUB_EMULATOR_HOST", emulatorHost)
     .WithEnvironment("PubSub:ProjectId", ProjectId)
@@ -375,8 +445,13 @@ AddSutApp("itest-app-early-ack", aotCapable: false, waitFor: [redis, pubsub])
     .WithEnvironment("AsyncResponse:KeyPrefix", EarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "GooglePubSub");
+}
 
-AddSutApp("itest-app-rabbitmq", aotCapable: false, waitFor: [redis, rabbitmq])
+void AddRabbitMqApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<ContainerResource> rabbitmq)
+{
+    var rabbitMqConnectionString = RabbitMqConnectionString(rabbitmq);
+
+    AddSutApp("itest-app-rabbitmq", aotCapable: false, waitFor: [redis, rabbitmq])
     .WithReference(redis)
     .WithEnvironment("RabbitMQ:ConnectionString", rabbitMqConnectionString)
     .WithEnvironment("RabbitMQ:WorkerExchange", RabbitMqWorkerExchange)
@@ -406,8 +481,13 @@ AddSutApp("itest-app-rabbitmq-early-ack", aotCapable: false, waitFor: [redis, ra
     .WithEnvironment("AsyncResponse:KeyPrefix", RabbitMqEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "RabbitMQ");
+}
 
-AddSutApp("itest-app-azure-servicebus", aotCapable: false, waitFor: [redis, serviceBus])
+void AddServiceBusApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<ContainerResource> serviceBus)
+{
+    var serviceBusConnectionString = ServiceBusConnectionString(serviceBus);
+
+    AddSutApp("itest-app-azure-servicebus", aotCapable: false, waitFor: [redis, serviceBus])
     .WithReference(redis)
     .WithEnvironment("ConnectionStrings:AzureServiceBus", serviceBusConnectionString)
     .WithEnvironment("AzureServiceBus:WorkerQueue", AzureServiceBusWorkerQueue)
@@ -429,8 +509,15 @@ AddSutApp("itest-app-azure-servicebus-early-ack", aotCapable: false, waitFor: [r
     .WithEnvironment("AsyncResponse:KeyPrefix", AzureServiceBusEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "AzureServiceBus");
+}
 
-AddSutApp("itest-app-sqs", aotCapable: false, waitFor: [redis, localstack])
+// earlyAck: the databases batch needs only the default SQS app (for the durable-flow scenarios); the
+// brokers batch, which owns SqsTransportTests, needs both variants.
+void AddSqsApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<ContainerResource> localstack, bool earlyAck)
+{
+    var localstackServiceUrl = LocalStackServiceUrl(localstack);
+
+    AddSutApp("itest-app-sqs", aotCapable: false, waitFor: [redis, localstack])
     .WithReference(redis)
     .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
     .WithEnvironment("SQS:Region", "us-east-1")
@@ -444,7 +531,10 @@ AddSutApp("itest-app-sqs", aotCapable: false, waitFor: [redis, localstack])
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "SQS");
 
-AddSutApp("itest-app-sqs-early-ack", aotCapable: false, waitFor: [redis, localstack])
+    if (!earlyAck)
+        return;
+
+    AddSutApp("itest-app-sqs-early-ack", aotCapable: false, waitFor: [redis, localstack])
     .WithReference(redis)
     .WithEnvironment("SQS:ServiceUrl", localstackServiceUrl)
     .WithEnvironment("SQS:Region", "us-east-1")
@@ -462,13 +552,16 @@ AddSutApp("itest-app-sqs-early-ack", aotCapable: false, waitFor: [redis, localst
     .WithEnvironment("AsyncResponse:KeyPrefix", SqsEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "SQS");
-
-AddRedisTransportApp("itest-app-redis", earlyAck: false);
-AddRedisTransportApp("itest-app-redis-early-ack", earlyAck: true);
+}
 
 // NATS channel + NATS transport on one connection. A single NATS server backs both the response
 // rendezvous (Core request/reply + JetStream KV recovery) and the worker/response transport (JetStream).
-AddSutApp("itest-app-nats", waitFor: [nats])
+// earlyAck: as with SQS, the databases batch needs only the default variant.
+void AddNatsApps(IResourceBuilder<ContainerResource> nats, bool earlyAck)
+{
+    var natsConnectionString = NatsConnectionString(nats);
+
+    AddSutApp("itest-app-nats", waitFor: [nats])
     .WithEnvironment("Nats:Url", natsConnectionString)
     .WithEnvironment("Nats:SubjectPrefix", NatsSubjectPrefix)
     .WithEnvironment("Nats:RecoveryBucket", "itest-nats-recovery")
@@ -477,7 +570,10 @@ AddSutApp("itest-app-nats", waitFor: [nats])
     .WithEnvironment("AsyncResponse:Channel", "NATS")
     .WithEnvironment("AsyncResponse:Transport", "NATS");
 
-AddSutApp("itest-app-nats-early-ack", waitFor: [nats])
+    if (!earlyAck)
+        return;
+
+    AddSutApp("itest-app-nats-early-ack", waitFor: [nats])
     .WithEnvironment("Nats:Url", natsConnectionString)
     .WithEnvironment("Nats:SubjectPrefix", NatsEarlyAckSubjectPrefix)
     .WithEnvironment("Nats:RecoveryBucket", "itest-nats-earlyack-recovery")
@@ -489,8 +585,11 @@ AddSutApp("itest-app-nats-early-ack", waitFor: [nats])
     .WithEnvironment("Nats:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_NATS_WORKER_DRAIN_SECONDS", "10"))
     .WithEnvironment("AsyncResponse:Channel", "NATS")
     .WithEnvironment("AsyncResponse:Transport", "NATS");
+}
 
-AddSutApp("itest-app-kafka", aotCapable: false, waitFor: [redis, kafka])
+void AddKafkaApps(IResourceBuilder<RedisResource> redis, IResourceBuilder<KafkaServerResource> kafka)
+{
+    AddSutApp("itest-app-kafka", aotCapable: false, waitFor: [redis, kafka])
     .WithReference(redis)
     .WithReference(kafka)
     .WithEnvironment("Kafka:WorkerTopic", KafkaWorkerTopic)
@@ -522,8 +621,13 @@ AddSutApp("itest-app-kafka-early-ack", aotCapable: false, waitFor: [redis, kafka
     .WithEnvironment("AsyncResponse:KeyPrefix", KafkaEarlyAckRedisKeyPrefix)
     .WithEnvironment("AsyncResponse:Channel", "Redis")
     .WithEnvironment("AsyncResponse:Transport", "Kafka");
+}
 
-AddSutApp("itest-app-postgresql", waitFor: [postgres])
+void AddPostgreSqlApps(IResourceBuilder<ContainerResource> postgres)
+{
+    var postgresConnectionString = PostgresConnectionString(postgres);
+
+    AddSutApp("itest-app-postgresql", waitFor: [postgres])
     .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
     .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlWorkerQueue)
     .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlResponseQueue)
@@ -531,7 +635,25 @@ AddSutApp("itest-app-postgresql", waitFor: [postgres])
     .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
     .WithEnvironment("AsyncResponse:Transport", "PostgreSQL");
 
-AddSutApp("itest-app-sqlserver", aotCapable: false, waitFor: [sqlserver])
+    AddSutApp("itest-app-postgresql-early-ack", waitFor: [postgres])
+        .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
+        .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlEarlyAckWorkerQueue)
+        .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlEarlyAckResponseQueue)
+        .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlEarlyAckDeadLetterQueue)
+        .WithEnvironment("PostgreSQL:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_ACK_MODE", "AckAfterEnqueue"))
+        .WithEnvironment("PostgreSQL:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS", "4"))
+        .WithEnvironment("PostgreSQL:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY", "256"))
+        .WithEnvironment("PostgreSQL:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_DRAIN_SECONDS", "10"))
+        .WithEnvironment("PostgreSQL:HostShutdownTimeoutSeconds", "30")
+        .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
+        .WithEnvironment("AsyncResponse:Transport", "PostgreSQL");
+}
+
+void AddSqlServerApps(IResourceBuilder<ContainerResource> sqlserver)
+{
+    var sqlServerConnectionString = SqlServerConnectionString(sqlserver);
+
+    AddSutApp("itest-app-sqlserver", aotCapable: false, waitFor: [sqlserver])
     .WithEnvironment("ConnectionStrings:SqlServer", sqlServerConnectionString)
     .WithEnvironment("SqlServer:SchemaName", SqlServerSchema)
     .WithEnvironment("SqlServer:WorkerQueue", SqlServerWorkerQueue)
@@ -553,24 +675,16 @@ AddSutApp("itest-app-sqlserver-early-ack", aotCapable: false, waitFor: [sqlserve
     .WithEnvironment("SqlServer:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "SqlServer")
     .WithEnvironment("AsyncResponse:Transport", "SqlServer");
-
-AddSutApp("itest-app-postgresql-early-ack", waitFor: [postgres])
-    .WithEnvironment("ConnectionStrings:PostgreSQL", postgresConnectionString)
-    .WithEnvironment("PostgreSQL:WorkerQueue", PostgreSqlEarlyAckWorkerQueue)
-    .WithEnvironment("PostgreSQL:ResponseQueue", PostgreSqlEarlyAckResponseQueue)
-    .WithEnvironment("PostgreSQL:DeadLetterQueue", PostgreSqlEarlyAckDeadLetterQueue)
-    .WithEnvironment("PostgreSQL:Worker:AckMode", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_ACK_MODE", "AckAfterEnqueue"))
-    .WithEnvironment("PostgreSQL:Worker:BackgroundWorkerCount", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_BACKGROUND_WORKERS", "4"))
-    .WithEnvironment("PostgreSQL:Worker:BackgroundQueueCapacity", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_QUEUE_CAPACITY", "256"))
-    .WithEnvironment("PostgreSQL:Worker:BackgroundDrainTimeoutSeconds", Env("ASYNCRESPONSE_ITEST_POSTGRESQL_WORKER_DRAIN_SECONDS", "10"))
-    .WithEnvironment("PostgreSQL:HostShutdownTimeoutSeconds", "30")
-    .WithEnvironment("AsyncResponse:Channel", "PostgreSQL")
-    .WithEnvironment("AsyncResponse:Transport", "PostgreSQL");
+}
 
 // MongoDB channel + transport on one shared client. The default variant also persists durable-flow
 // ledgers through the AsyncResponse.DurableFlows.MongoDB package, so flow checkpoints, resumes, and
 // state reads ride the same replica set as the channel and the worker queue.
-AddSutApp("itest-app-mongodb", aotCapable: false, waitFor: [mongodb])
+void AddMongoDbApps(IResourceBuilder<ContainerResource> mongodb)
+{
+    var mongoDbConnectionString = MongoDbConnectionString(mongodb);
+
+    AddSutApp("itest-app-mongodb", aotCapable: false, waitFor: [mongodb])
     .WithEnvironment("ConnectionStrings:MongoDB", mongoDbConnectionString)
     .WithEnvironment("MongoDB:DatabaseName", MongoDbDatabase)
     .WithEnvironment("MongoDB:WorkerQueue", MongoDbWorkerQueue)
@@ -593,5 +707,200 @@ AddSutApp("itest-app-mongodb-early-ack", aotCapable: false, waitFor: [mongodb])
     .WithEnvironment("MongoDB:HostShutdownTimeoutSeconds", "30")
     .WithEnvironment("AsyncResponse:Channel", "MongoDB")
     .WithEnvironment("AsyncResponse:Transport", "MongoDB");
+}
+
+// --- Batches ------------------------------------------------------------------------------------
+// A batch declares only the resources its test collection touches. The test project boots one AppHost
+// per batch and disposes it before the next batch starts (collections run sequentially), so peak
+// footprint is the largest batch rather than the whole fleet.
+//
+// The split follows the one structural fact that matters: a test either drives a sample app over HTTP
+// or it drives a driver directly. The direct tests need no sample app at all, which is why
+// "conformance", "stores", and "oracle-cosmos" start zero processes. The app-driven half splits by
+// transport family.
+//
+// Batches are balanced on measured MEMORY, not container count — counting containers hid a 2.3x
+// spread (7 small containers can cost more than 8 large-sounding ones). The two SQL Servers, Oracle,
+// and the Cosmos emulator dominate everything else, so the split is really about keeping those apart.
+//
+// Batch names are the contract with the fixtures in Batches.cs — keep them in sync.
+switch (Env("ASYNCRESPONSE_ITEST_BATCH", "").ToLowerInvariant())
+{
+    // Everything that talks to a database: channel conformance, the store contracts, the "direct"
+    // driver tests, and the database channel/transport SUTs. These were three separate batches, which
+    // meant starting SQL Server, PostgreSQL, and MongoDB three times each — SQL Server alone takes the
+    // better part of a minute to accept logins. They share one batch so each starts once; splitting
+    // them bought nothing, because the batch's cost is dominated by SQL Server either way.
+    case "data":
+    {
+        var redis = AddRedisContainer();
+        var postgres = AddPostgresContainer();
+        var sqlserver = AddSqlServerContainer();
+        var mongodb = AddMongoDbContainer();
+        var nats = AddNatsContainer();
+        var localstack = AddLocalStackContainer();
+        AddMySqlContainer(); // store contract only — no sample app uses MySQL
+
+        AddPubSubApps(redis, AddPubSubContainer(), earlyAck: false);
+        AddPostgreSqlApps(postgres);
+        AddSqlServerApps(sqlserver);
+        AddMongoDbApps(mongodb);
+        AddNatsApps(nats, earlyAck: false);
+        AddSqsApps(redis, localstack, earlyAck: false);
+        break;
+    }
+
+    // Oracle and Cosmos alone. Measured 2,180 MiB and 1,031 MiB — together more than half a default
+    // Docker VM, and between them they back exactly two tests. Kept in "stores" they made that batch
+    // 5.8 GiB, which failed as soon as anything else was running. Isolated, they compete with nothing.
+    case "oracle-cosmos":
+        if (!SkipOracleCosmos())
+        {
+            AddOracleContainer();
+            AddCosmosContainer();
+        }
+
+        break;
+
+    // Message brokers proper: all small (Kafka is the largest at ~400 MiB), so they share a batch.
+    case "brokers":
+    {
+        var redis = AddRedisContainer();
+        AddPubSubApps(redis, AddPubSubContainer(), earlyAck: true);
+        AddRabbitMqApps(redis, AddRabbitMqContainer());
+        AddKafkaApps(redis, AddKafkaContainer());
+        AddNatsApps(AddNatsContainer(), earlyAck: true);
+        AddRedisTransportApp(redis, "itest-app-redis", earlyAck: false);
+        AddRedisTransportApp(redis, "itest-app-redis-early-ack", earlyAck: true);
+        break;
+    }
+
+    // The two cloud emulators. Split out of "brokers" because the Service Bus emulator drags in a
+    // second full SQL Server, which made brokers the heaviest app-driven batch on its own.
+    case "cloud":
+    {
+        var redis = AddRedisContainer();
+        AddServiceBusApps(redis, AddServiceBusContainer());
+        AddSqsApps(redis, AddLocalStackContainer(), earlyAck: true);
+        break;
+    }
+
+    // --- Provider cross-product shards --------------------------------------------------------
+    // The combination matrix runs every channel against every transport against every durable-flow
+    // store. Its cells are driver-level (a DI provider per cell inside the test process), so these
+    // batches declare containers and no sample apps at all.
+    //
+    // A shard is picked so its fleet is the union of what its own cells touch, and no more. Every
+    // shard carries the five channel containers because the channel axis is complete within each one;
+    // the transport family adds the brokers, and the store family decides whether Oracle (2,180 MiB)
+    // or Cosmos (1,031 MiB) — which cannot share a runner with each other — has to be up.
+    case "matrix-database-light":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: true);
+        break;
+
+    case "matrix-broker-light":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: true);
+        break;
+
+    case "matrix-cloud-light":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: true);
+        break;
+
+    case "matrix-database-oracle":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-broker-oracle":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-cloud-oracle":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-database-cosmos":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: false, cosmos: true);
+        break;
+
+    case "matrix-broker-cosmos":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: false, cosmos: true);
+        break;
+
+    case "matrix-cloud-cosmos":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: false, cosmos: true);
+        break;
+
+    // Not a test batch: the whole fleet in one AppHost, for benchmarks/AsyncResponse.LoadTests, which
+    // drives every transport at once and boots this AppHost directly. Batching exists to bound the
+    // *test suite's* peak footprint; the load test wants everything up simultaneously by definition,
+    // so it asks for this. It needs no MySQL, Oracle, or Cosmos — nothing load-tested touches them.
+    case "loadtest":
+    {
+        var redis = AddRedisContainer();
+        AddPubSubApps(redis, AddPubSubContainer(), earlyAck: true);
+        AddRabbitMqApps(redis, AddRabbitMqContainer());
+        AddKafkaApps(redis, AddKafkaContainer());
+        AddNatsApps(AddNatsContainer(), earlyAck: true);
+        AddServiceBusApps(redis, AddServiceBusContainer());
+        AddSqsApps(redis, AddLocalStackContainer(), earlyAck: true);
+        AddRedisTransportApp(redis, "itest-app-redis", earlyAck: false);
+        AddRedisTransportApp(redis, "itest-app-redis-early-ack", earlyAck: true);
+        AddPostgreSqlApps(AddPostgresContainer());
+        AddSqlServerApps(AddSqlServerContainer());
+        AddMongoDbApps(AddMongoDbContainer());
+        break;
+    }
+
+    // Unknown or unset: fail loudly. A silent fallback would boot the wrong fleet and the tests would
+    // fail far from the cause — which is exactly what a stale build of this file once did.
+    case var unknown:
+        throw new InvalidOperationException(
+            $"ASYNCRESPONSE_ITEST_BATCH must be set. Got '{unknown}'. Test batches: data, oracle-cosmos, " +
+            "brokers, cloud, and the nine matrix-* shards (the integration fixtures set these). " +
+            "The load test uses: loadtest. " +
+            "If this fires from the test suite, the AppHost build is stale relative to the tests.");
+}
+
+// The fleet one cross-product shard needs. The five channel containers are unconditional: every shard
+// runs the full channel axis, and those same servers also back the database transports and the
+// PostgreSQL/SQL Server/MongoDB stores, so they are never merely the channel's cost.
+void AddMatrixFleet(bool brokers, bool cloud, bool lightStores, bool oracle = false, bool cosmos = false)
+{
+    AddRedisContainer();
+    AddNatsContainer();
+    AddPostgresContainer();
+    AddSqlServerContainer();
+    AddMongoDbContainer();
+
+    if (brokers)
+    {
+        AddKafkaContainer();
+        AddRabbitMqContainer();
+    }
+
+    if (cloud)
+    {
+        AddServiceBusContainer();
+        AddPubSubContainer();
+        // SQS is a cloud transport and DynamoDB is a store; both are LocalStack, so a cloud shard
+        // needs it whether or not it also runs the light stores.
+        AddLocalStackContainer();
+    }
+
+    if (lightStores)
+    {
+        AddMySqlContainer();
+        if (!cloud)
+            AddLocalStackContainer(); // DynamoDB store
+    }
+
+    // Oracle and Cosmos never share a shard: together they are 3.2 GiB on top of a fleet that already
+    // carries SQL Server.
+    if (oracle && !SkipOracleCosmos())
+        AddOracleContainer();
+
+    if (cosmos && !SkipOracleCosmos())
+        AddCosmosContainer();
+}
 
 builder.Build().Run();

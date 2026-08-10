@@ -12,14 +12,22 @@ namespace AsyncResponse;
 /// It provides the async-response programming model without Redis or another broker-backed channel.
 /// Waiters, subscriptions, and recovery state are all in memory and disappear when the process
 /// exits.
+/// <para>
+/// The channel implements the full <see cref="IRecoverableAsyncResponseSubscriber"/> surface:
+/// lost-subscriber recovery callbacks are stored in the (process-local) recovery store and fire
+/// when a response arrives with no live waiter — the same routing the durable channels run.
+/// Recovery therefore works within one process lifetime (and across the simulated restarts of
+/// AsyncResponse.Testing, which preserves the store instance); only a real process exit loses it.
+/// </para>
 /// </summary>
-internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IAsyncResponseSubscriber, IActiveSubscriberProbe
+internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
 {
     private readonly ConcurrentDictionary<string, SubscriptionGroup> _subscriptions = new(StringComparer.Ordinal);
     private readonly IRecoveryStateStore _recoveryStateStore;
     private readonly InMemoryAsyncResponseOptions _options;
     private readonly LostSubscriberCallbackDispatcher _lostSubscriberDispatcher;
     private readonly AsyncResponseContextPropagation _propagation;
+    private readonly TimeProvider _timeProvider;
     private readonly ILogger<InMemoryAsyncResponseChannel> _logger;
 
     /// <summary>Creates a process-local async-response channel.</summary>
@@ -28,24 +36,68 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         IRecoveryStateStore recoveryStateStore,
         IOptions<InMemoryAsyncResponseOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<InMemoryAsyncResponseChannel> logger)
+        ILogger<InMemoryAsyncResponseChannel> logger,
+        TimeProvider? timeProvider = null)
     {
         _recoveryStateStore = recoveryStateStore;
         _options = options.Value;
         _options.ValidateShared(nameof(InMemoryAsyncResponseOptions));
         _propagation = propagation;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
         _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
     }
 
     /// <inheritdoc />
-    public async Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
+    public Task<IAsyncResponseWaiter<T>> CreateResponseWaiter<T>(
         string correlationId,
         Func<T, ValueTask<bool>>? completionPredicate = null,
         TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(
+            correlationId,
+            resumeCallback: null,
+            failureCallback: null,
+            completionPredicate,
+            timeout);
+
+    /// <inheritdoc />
+    public Task<IAsyncResponseWaiter<T>> CreateRecoverableResponseWaiter<T>(
+        string correlationId,
+        ReflectionCallDto? resumeCallback = null,
+        ReflectionCallDto? failureCallback = null,
+        Func<T, ValueTask<bool>>? completionPredicate = null,
+        TimeSpan? timeout = null) where T : IAsyncResponsePayload
+        => CreateResponseWaiterCore(
+            correlationId,
+            resumeCallback,
+            failureCallback,
+            completionPredicate,
+            timeout);
+
+    private async Task<IAsyncResponseWaiter<T>> CreateResponseWaiterCore<T>(
+        string correlationId,
+        ReflectionCallDto? resumeCallback,
+        ReflectionCallDto? failureCallback,
+        Func<T, ValueTask<bool>>? completionPredicate,
+        TimeSpan? timeout) where T : IAsyncResponsePayload
     {
         if (string.IsNullOrWhiteSpace(correlationId))
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+
+        // Same contract as the durable channels: recovery callbacks are only meaningful when the
+        // payload can say whether a late response resumes or fails the flow. Enforcing it here too
+        // keeps the in-memory channel an honest stand-in — a flow that would fail this check on
+        // Redis fails it identically in a test.
+        if ((resumeCallback is not null || failureCallback is not null)
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
+        {
+            throw new InvalidOperationException(
+                $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the in-memory channel " +
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the recovery " +
+                "routing needs this to classify a response that arrives after the waiter was lost.");
+        }
 
         var hasCustomPredicate = completionPredicate is not null;
         completionPredicate ??= static _ => new ValueTask<bool>(true);
@@ -84,19 +136,53 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 {
                     RegistrationId = subscription.Id,
                     CorrelationId = correlationId,
+                    ResumeCallback = resumeCallback,
+                    FailureCallback = failureCallback,
                     PayloadTypeFullName = typeof(T).FullName,
-                    RegisteredAtUtc = DateTime.UtcNow,
+                    RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                     Context = _propagation.Capture()
                 },
                 _options.RecoveryStateExpiry).ConfigureAwait(false);
 
             if (subscription.CleanupStarted)
-                await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
+            {
+                // A response settled the wait while the registration was still being written:
+                // cleanup's delete ran before the save committed, so compensate with a second
+                // delete. Best-effort, mirroring the broker channels — the waiter already holds
+                // its response, so a failed delete must not fail the create; TTL and the recovery
+                // watchdog back it.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
             else
+            {
                 subscription.ArmTimeout();
+            }
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
+        }
+        catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
+        {
+            // The wait already settled: a dispatched response completed the waiter while the
+            // registration step was still in flight, and the step — the recovery-state save —
+            // then failed. The response in hand outranks the builder's "throw so the trigger
+            // never fires" contract: rethrowing would discard a delivered response, the exact
+            // loss this library exists to prevent, and the success path for this same
+            // interleaving already returns the completed waiter. Cleanup runs on the dispatch
+            // path, so nothing is leaked; a save that still committed is compensated above or
+            // expires via TTL. The filter demands an actual settlement (result or fault): a
+            // canceled task means NO response was delivered — e.g. a future channel-wide teardown
+            // canceling in-flight registrations — and takes the rethrow path below.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {
@@ -146,7 +232,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponses(
@@ -160,20 +246,43 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action, result.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked, result.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
-            await DispatchResponsesAsync(subscribers, response).ConfigureAwait(false);
+            // One serialization per publish, shared by every waiter's materialization. Wire parity
+            // is deliberate for SAME-type waiters too: handing the publisher's live instance
+            // through shared one mutable reference across the fan-out and leaked [JsonIgnore]
+            // state no broker-backed channel can deliver — each waiter gets its own declared-T
+            // materialization, byte-equivalent to what Redis/NATS/DB waiters receive. The wire
+            // form is UTF-8 bytes end to end (the earlier string round-trip paid a UTF-16
+            // transcode both ways), serialized eagerly here: every waiter of a typed instance
+            // needs it, and JsonElement/string/null payloads — which materialize through the
+            // conversion path instead — skip it entirely.
+            var wireBytes = response is System.Text.Json.JsonElement or string or null
+                ? null
+                : DeclaredWireSerializer<T>.Instance(response);
+            await DispatchResponsesAsync(subscribers, response, wireBytes).ConfigureAwait(false);
 
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Published response for correlationId {CorrelationId}. PayloadType: {PayloadType}. Subscribers: {SubscriberCount}.", correlationId, typeof(T), subscribers.Count);
@@ -204,7 +313,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostResponses(
@@ -218,17 +327,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 if (!result.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.ShouldResume, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, result.Action, result.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", result.Action, result.CallbackInvoked, result.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
 
                     return;
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
             await DispatchRawJsonResponsesAsync(subscribers, response).ConfigureAwait(false);
@@ -264,7 +384,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             var subscribers = SnapshotSubscribers(correlationId);
             activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
-            if (subscribers.Count == 0)
+            for (var attempt = 0; subscribers.Count == 0; attempt++)
             {
                 var result = await _lostSubscriberDispatcher
                     .DispatchLostExceptions(
@@ -279,15 +399,26 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 if (!result.RetryLive)
                 {
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", result.CallbackInvoked);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, result.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, result.CallbackInvoked);
 
                     return;
                 }
 
                 // A waiter registered between the snapshot and the recovery-state read — deliver
-                // live instead of consuming its registration.
+                // live instead of consuming its registration. An empty re-snapshot (the waiter
+                // vanished again) loops back through the liveness-aware dispatch rather than
+                // silently dropping a response a sibling registration may still be armed for; a
+                // second contradiction leaves all state intact.
                 subscribers = SnapshotSubscribers(correlationId);
                 activity?.SetTag("asyncresponse.subscribers", subscribers.Count);
+                if (subscribers.Count == 0 && attempt >= 1)
+                {
+                    _logger.LogWarning(
+                        "Response for correlationId {CorrelationId} kept racing subscriber churn; recovery registrations are left intact.",
+                        correlationId);
+                    activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                    return;
+                }
             }
 
             await DispatchExceptionsAsync(subscribers, exception).ConfigureAwait(false);
@@ -331,12 +462,15 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             : default;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response)
+    private static Task DispatchResponsesAsync(SubscriptionSnapshot subscribers, object? response, byte[]? wireBytes)
     {
         if (subscribers.Single is { } single)
-            return single.DispatchResponseAsync(response);
+            return single.DispatchResponseAsync(response, wireBytes);
 
-        return DispatchManyAsync(subscribers.Many, static (subscriber, state) => subscriber.DispatchResponseAsync(state), response);
+        return DispatchManyAsync(
+            subscribers.Many,
+            static (subscriber, state) => subscriber.DispatchResponseAsync(state.Response, state.WireBytes),
+            (Response: response, WireBytes: wireBytes));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -397,6 +531,18 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     }
 
     private static string ChannelName(string correlationId) => $"inmemory:response:{correlationId}";
+
+    /// <summary>
+    /// The declared-type wire serializer for typed fan-out, cached per declared type so the
+    /// dispatch chain passes a static delegate — allocation-free on the publish hot path. Mirrors
+    /// <c>AsyncResponseEnvelope&lt;T&gt;</c>: the payload is serialized as the publisher's
+    /// declared type, never the runtime type.
+    /// </summary>
+    private static class DeclaredWireSerializer<TDeclared>
+    {
+        public static readonly Func<object?, byte[]> Instance =
+            static response => AsyncResponseJson.SerializeToUtf8Bytes((TDeclared)response!);
+    }
 
     private sealed class SubscriptionGroup
     {
@@ -521,11 +667,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
     private abstract class SubscriptionBase
     {
         private readonly InMemoryAsyncResponseChannel _owner;
-        private readonly CancellationTokenSource _timeoutCts;
         private readonly Activity? _activity;
         private readonly object _cleanupSync = new();
         private SemaphoreSlim? _dispatchWaiters;
-        private CancellationTokenRegistration _timeoutRegistration;
+        private ITimer? _timeoutTimer;
         private Task? _cleanupTask;
         private int _dispatching;
         private int _dispatchWaiterCount;
@@ -539,7 +684,6 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             CorrelationId = correlationId;
             Timeout = timeout;
             _activity = activity;
-            _timeoutCts = new CancellationTokenSource();
         }
 
         /// <summary>Per-waiter registration id used for subscription and recovery-state cleanup.</summary>
@@ -553,35 +697,37 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             get => Volatile.Read(ref _cleanupStarted) != 0;
         }
 
-        /// <summary>Arms the subscription timeout after registration has succeeded.</summary>
+        /// <summary>
+        /// Arms the subscription timeout after registration has succeeded. The timer comes from the
+        /// engine's <see cref="TimeProvider"/>, so a virtual clock (AsyncResponse.Testing) can fire
+        /// production-sized timeouts instantly.
+        /// </summary>
         public void ArmTimeout()
         {
             if (CleanupStarted)
                 return;
 
-            try
+            var timer = _owner._timeProvider.CreateTimer(static state =>
             {
-                _timeoutRegistration = _timeoutCts.Token.Register(static state =>
-                {
-                    _ = ((SubscriptionBase)state!).TimeoutAsync();
-                }, this);
+                _ = ((SubscriptionBase)state!).TimeoutAsync();
+            }, this, Timeout, System.Threading.Timeout.InfiniteTimeSpan);
+            Volatile.Write(ref _timeoutTimer, timer);
 
-                if (CleanupStarted)
-                {
-                    _timeoutRegistration.Dispose();
-                    return;
-                }
-
-                _timeoutCts.CancelAfter(Timeout);
-            }
-            catch (ObjectDisposedException)
-            {
-                // A response or explicit disposal can clean up between the guard and timer arming.
-            }
+            // A response or explicit disposal can clean up between the guard and timer arming;
+            // cleanup then missed the timer, so the armer disposes it (firing is still harmless —
+            // TimeoutAsync no-ops behind CleanupStarted and the terminal latch).
+            if (CleanupStarted)
+                timer.Dispose();
         }
 
-        /// <summary>Dispatches a typed or materializable response to this subscription.</summary>
-        public abstract Task DispatchResponseAsync(object? response);
+        /// <summary>
+        /// Dispatches a typed or materializable response to this subscription.
+        /// <paramref name="wireBytes"/> is the publisher's single DECLARED-type wire
+        /// serialization (UTF-8 JSON) — what a broker envelope would carry — from which each
+        /// waiter materializes its own instance; <c>null</c> when the response is a
+        /// JsonElement/string/null payload that materializes through the conversion path.
+        /// </summary>
+        public abstract Task DispatchResponseAsync(object? response, byte[]? wireBytes);
 
         /// <summary>Dispatches a raw JSON response to this subscription.</summary>
         public abstract Task DispatchRawJsonResponseAsync(RawJsonResponse response);
@@ -724,7 +870,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 try
                 {
                     await DispatchSerialAsync(0, static (_, _) => Task.CompletedTask)
-                        .WaitAsync(drainTimeout).ConfigureAwait(false);
+                        .WaitAsync(drainTimeout, _owner._timeProvider).ConfigureAwait(false);
                 }
                 catch (TimeoutException)
                 {
@@ -763,8 +909,8 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             finally
             {
                 _owner.RemoveSubscription(CorrelationId, Id);
-                await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
-                _timeoutCts.Dispose();
+                if (Volatile.Read(ref _timeoutTimer) is { } timer)
+                    await timer.DisposeAsync().ConfigureAwait(false);
                 _activity?.Dispose();
             }
         }
@@ -837,12 +983,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         public Task<T> ResponseTask => _tcs.Task;
 
         /// <inheritdoc />
-        public override Task DispatchResponseAsync(object? response)
+        public override Task DispatchResponseAsync(object? response, byte[]? wireBytes)
             => DispatchSerialAsync(
-                response,
-                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state));
+                (Response: response, WireBytes: wireBytes),
+                static (subscription, state) => ((Subscription<T>)subscription).DispatchResponseUnserializedAsync(state.Response, state.WireBytes));
 
-        private Task DispatchResponseUnserializedAsync(object? response)
+        private Task DispatchResponseUnserializedAsync(object? response, byte[]? wireBytes)
         {
             if (CleanupStarted)
                 return Task.CompletedTask;
@@ -851,10 +997,10 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             // completion predicate and any logging run under it, even when the response is delivered
             // on a foreign thread such as a broker ingress callback.
             if (_capturedContext is null)
-                return DispatchResponseCoreAsync(response);
+                return DispatchResponseCoreAsync(response, wireBytes);
 
             Task? dispatch = null;
-            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchResponseCoreAsync(response), null);
+            ExecutionContext.Run(_capturedContext, _ => dispatch = DispatchResponseCoreAsync(response, wireBytes), null);
             return dispatch!;
         }
 
@@ -877,13 +1023,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             return dispatch!;
         }
 
-        private Task DispatchResponseCoreAsync(object? response)
+        private Task DispatchResponseCoreAsync(object? response, byte[]? wireBytes)
         {
             try
             {
-                var payload = response is T typed
-                    ? typed
-                    : response.As<T>();
+                var payload = MaterializeAs(response, wireBytes);
 
                 var completion = _completionPredicate(payload);
                 if (!completion.IsCompletedSuccessfully)
@@ -941,6 +1085,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 return FaultAsync(ex);
             }
         }
+
+        // Wire parity for EVERY delivery, same-type included: the payload is re-materialized from
+        // the publisher's DECLARED-type wire JSON — the same representation a broker envelope
+        // carries, polymorphic discriminators included, [JsonIgnore] state excluded. Handing the
+        // publisher's live instance through (the old same-type fast path) aliased one mutable
+        // object across all same-type waiters and exposed in-process-only state no broker-backed
+        // channel can deliver. The publish serializes once (UTF-8 bytes); each waiter
+        // deserializes its own instance case-insensitively — the same property matching the
+        // string conversion path used, and the same options every broker ingress applies.
+        // JsonElement/string/null payloads keep the existing conversion path.
+        private static T MaterializeAs(object? response, byte[]? wireBytes)
+            => wireBytes is null
+                ? response.As<T>()
+                : AsyncResponseJson.DeserializeCaseInsensitive<T>(wireBytes)!;
 
         private Task FaultAsync(Exception exception)
         {

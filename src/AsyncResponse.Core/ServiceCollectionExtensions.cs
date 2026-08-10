@@ -31,6 +31,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             services.Configure(configure);
         }
 
+        // The engine's single clock. Every Core component that reads time or arms a timer resolves
+        // this TimeProvider, so a test host (AsyncResponse.Testing's VirtualTimeProvider) can make
+        // waits, timeouts, leases, timers, and schedules run on virtual time. Defaults to the
+        // system clock; TryAdd lets a host (or the test harness) pre-register its own.
+        services.TryAddSingleton(TimeProvider.System);
+
         // Channel-agnostic engine.
         services.TryAddSingleton<AsyncResponseContextPropagation>();
         services.TryAddSingleton<WorkerJobExecutor>();
@@ -39,7 +45,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetRequiredService<IAsyncResponseSubscriber>(),
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>()));
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetService<TimeProvider>()));
 
         // Fail fast before background services do any real work if the required channel,
         // transport, and durable-flow store choices were not made explicitly. TryAddEnumerable
@@ -126,6 +133,84 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Starts <typeparamref name="TFlow"/> on a cron schedule. Occurrences carry deterministic run
+    /// ids (<c>sched:{name}:{occurrenceUtc}</c>), so any number of replicas can run the scheduler
+    /// and the flow store's atomic create guarantees exactly one run per occurrence — no leader
+    /// election. Occurrences missed while no replica was up are skipped (at-most-once schedule).
+    /// The flow type is also registered for statically-typed (AOT-safe) execution, exactly like
+    /// <see cref="WithDurableFlow{TFlow, TInput}"/>.
+    /// </summary>
+    /// <param name="builder">The registration builder.</param>
+    /// <param name="name">
+    /// Unique schedule name, embedded in every occurrence's flow id. Keep it short and stable —
+    /// renaming orphans no state but changes the ids future occurrences dedup on.
+    /// </param>
+    /// <param name="cron">
+    /// Five-field cron expression (<c>minute hour day-of-month month day-of-week</c>); see
+    /// <see cref="CronSchedule"/> for the supported syntax and DST semantics. Validated here, so a
+    /// typo fails at registration rather than silently never firing.
+    /// </param>
+    /// <param name="input">
+    /// Builds the flow input for an occurrence (its scheduled UTC instant is passed in). Must be
+    /// deterministic across replicas: every replica computes the same occurrence, and the
+    /// idempotent-start check compares the input value.
+    /// </param>
+    /// <param name="configure">Optional per-schedule options (time zone, enabled).</param>
+    public static AsyncResponseRegistrationBuilder WithScheduledFlow<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
+        this AsyncResponseRegistrationBuilder builder,
+        string name,
+        string cron,
+        Func<DateTimeOffset, TInput> input,
+        Action<ScheduledFlowOptions>? configure = null)
+        where TFlow : class, IDurableFlow<TInput>
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentException.ThrowIfNullOrWhiteSpace(cron);
+        ArgumentNullException.ThrowIfNull(input);
+
+        // Names key the deterministic occurrence ids (sched:{name}:{occurrence}); a duplicate
+        // would make two schedules dedup against each other's runs. Fail at the registration call
+        // site — a BackgroundService fault at startup surfaces far less directly.
+        if (builder.Services.Any(descriptor =>
+                descriptor.ServiceType == typeof(ScheduledFlowRegistration)
+                && descriptor.ImplementationInstance is ScheduledFlowRegistration existing
+                && string.Equals(existing.Name, name, StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"A scheduled flow named '{name}' is already registered. Schedule names key the deterministic occurrence ids " +
+                "(sched:{name}:{occurrence}), so each WithScheduledFlow registration needs a unique name.");
+        }
+
+        var options = new ScheduledFlowOptions();
+        configure?.Invoke(options);
+        ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
+
+        // Parse in the schedule's own time zone AND probe for a real next occurrence: a well-formed
+        // but unsatisfiable expression ("0 0 30 2 *") would otherwise register cleanly and its loop
+        // would die at startup with one warning — the silent 3 a.m. failure this validation exists
+        // to prevent. The runtime null-check in ScheduledFlowService stays as the backstop.
+        var probe = CronSchedule.Parse(cron, options.TimeZone);
+        if (probe.GetNextOccurrence(TimeProvider.System.GetUtcNow()) is null)
+        {
+            throw new ArgumentException(
+                $"The cron expression '{cron}' for scheduled flow '{name}' has no future occurrence (an unsatisfiable date such as Feb 30). It would never fire.",
+                nameof(cron));
+        }
+
+        builder.WithDurableFlow<TFlow, TInput>();
+        builder.Services.AddSingleton(new ScheduledFlowRegistration
+        {
+            Name = name,
+            CronExpression = cron,
+            Options = options,
+            StartOccurrenceAsync = (flows, flowId, occurrence, cancellationToken) =>
+                flows.StartAsync<TFlow, TInput>(input(occurrence), flowId, cancellationToken)
+        });
+        builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<Microsoft.Extensions.Hosting.IHostedService, ScheduledFlowService>());
+        return builder;
+    }
+
+    /// <summary>
     /// Uses an atomic process-local flow-state store. Intended for development, tests, and
     /// single-process apps; choose a DurableFlows provider package for multi-replica execution.
     /// </summary>
@@ -144,21 +229,46 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods, typeof(DurableFlowExecutor))]
     private static void AddDurableFlowEngine(IServiceCollection services)
     {
-        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
-            provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IAsyncResponseBuilder>(),
-            provider.GetRequiredService<IAsyncResponseSubscriber>(),
-            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetRequiredService<DurableFlowOptions>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
-            provider.GetServices<DurableFlowRegistration>()));
+        services.TryAddSingleton<IDurableFlowExecutor>(provider =>
+        {
+            // Observers are resolved ONCE here, from the root provider, and held for the singleton
+            // executor's lifetime. A scoped/transient registration would otherwise surface as an
+            // opaque "Cannot resolve scoped service ... from root provider" thrown per flow job
+            // inside the transport's retry loop (ValidateOnBuild does not catch it). Fail the first
+            // resolution with an error that names the offending registration and the fix instead.
+            var nonSingleton = services.FirstOrDefault(descriptor =>
+                descriptor.ServiceType == typeof(IDurableFlowExecutionObserver)
+                && descriptor.Lifetime != ServiceLifetime.Singleton);
+            if (nonSingleton is not null)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(IDurableFlowExecutionObserver)} '{(nonSingleton.ImplementationType ?? nonSingleton.ImplementationInstance?.GetType())?.Name ?? "(factory registration)"}' " +
+                    $"is registered as {nonSingleton.Lifetime}, but observers are held by the singleton flow executor for its lifetime and must be " +
+                    "singletons (services.AddSingleton<IDurableFlowExecutionObserver, ...>()). An observer that needs scoped services should " +
+                    "create its own scope inside the callback.");
+            }
+
+            return new DurableFlowExecutor(
+                provider.GetRequiredService<IServiceScopeFactory>(),
+                provider.GetRequiredService<IAsyncResponseBuilder>(),
+                provider.GetRequiredService<IAsyncResponseSubscriber>(),
+                provider.GetService<IRecoverableAsyncResponseSubscriber>(),
+                provider.GetRequiredService<AsyncResponseContextPropagation>(),
+                provider.GetRequiredService<DurableFlowOptions>(),
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
+                provider.GetServices<DurableFlowRegistration>(),
+                provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
+                provider.GetService<TimeProvider>(),
+                provider.GetServices<IDurableFlowExecutionObserver>(),
+                provider.GetService<IWorkerTransport>());
+        });
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
             provider.GetRequiredService<AsyncResponseContextPropagation>(),
             provider.GetRequiredService<DurableFlowOptions>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowService>>()));
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowService>>(),
+            provider.GetService<TimeProvider>()));
     }
 
     /// <summary>
@@ -201,7 +311,21 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         services.TryAddSingleton<IAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
         services.TryAddSingleton<IRawAsyncResponsePublisher>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
         services.TryAddSingleton<IAsyncResponseSubscriber>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+        services.TryAddSingleton<IRecoverableAsyncResponseSubscriber>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
         services.TryAddSingleton<IActiveSubscriberProbe>(provider => provider.GetRequiredService<InMemoryAsyncResponseChannel>());
+
+        // Full recovery capability, exactly like the durable channel packages: the recoverable
+        // fluent builder is available, durable flows register their lost-subscriber callbacks, and
+        // the lost-subscriber dispatcher routes late responses through them. The store is
+        // process-local, so this recovery spans waiter loss within one process lifetime (and the
+        // simulated restarts of AsyncResponse.Testing) — not a real process exit.
+        services.Replace(ServiceDescriptor.Singleton<IRecoverableAsyncResponseBuilder>(provider => new RecoverableAsyncResponseBuilder(
+            provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>(),
+            provider.GetService<IWorkerTransport>(),
+            provider.GetService<IAsyncResponseReplyTargetProvider>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetService<TimeProvider>())));
+        services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         services.AddSingleton(new AsyncResponseChannelMarker("InMemory"));
         return builder;

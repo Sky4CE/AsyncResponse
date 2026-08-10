@@ -23,6 +23,7 @@ internal static class FlowStateConcurrency
         string flowId,
         DurableFlowOptions options,
         ILogger logger,
+        TimeProvider? timeProvider = null,
         CancellationToken cancellationToken = default)
     {
         ValidateOptions(options);
@@ -35,13 +36,18 @@ internal static class FlowStateConcurrency
                 cancellationToken).ConfigureAwait(false))
             return null;
 
-        return new FlowExecutionLease(store, flowId, leaseId, options, logger);
+        // The constructor is throw-free after the option bounds above: it only assigns fields,
+        // computes a bounded "now + lease" stamp, and starts the renewal loop (whose first
+        // Task.Delay faults the loop task, never the constructor). Were that ever to change,
+        // lease expiry is the backstop for the persisted row.
+        return new FlowExecutionLease(store, flowId, leaseId, options, logger, timeProvider ?? TimeProvider.System);
     }
 
     public static async Task<bool> MutateAsync(
         IFlowStateStore store,
         string flowId,
         TimeSpan ttl,
+        TimeProvider? timeProvider,
         Func<FlowState, bool> mutate,
         CancellationToken cancellationToken = default)
     {
@@ -56,7 +62,7 @@ internal static class FlowStateConcurrency
 
             var expectedRevision = state.Revision;
             state.Revision = checked(expectedRevision + 1);
-            state.UpdatedAtUtc = DateTime.UtcNow;
+            state.UpdatedAtUtc = (timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime;
             if (await store.TryUpdateAsync(
                     flowId,
                     state,
@@ -73,21 +79,30 @@ internal static class FlowStateConcurrency
 
     internal static void ValidateOptions(DurableFlowOptions options)
     {
-        if (options.StateExpiry <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.StateExpiry)} must be positive.");
-        if (options.DefaultStepTimeout is { } defaultStepTimeout && defaultStepTimeout <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.DefaultStepTimeout)} must be positive when configured.");
-        if (options.ExecutionLeaseDuration <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseDuration)} must be positive.");
-        if (options.ExecutionLeaseRenewInterval <= TimeSpan.Zero
-            || options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
+        // Upper bounds close the "passes validation, throws mid-operation" gap — but only on the
+        // knobs that actually reach the failing sink. StateExpiry and ExecutionLeaseDuration become
+        // "now + value" stamps (store TTLs and lease deadlines) and never arm a timer themselves,
+        // so they get the persistence bound; DefaultStepTimeout and ExecutionLeaseRenewInterval arm
+        // BCL timers, so they get the timer ceiling; ProgressPersistenceInterval is only ever
+        // compared against elapsed time (DurableFlowContext.ReportProgressAsync), so any
+        // non-negative value is representable — a 60-day lease or progress throttle is a valid
+        // configuration and must not fail startup.
+        AsyncResponseChannelOptions.EnsurePersistedTtl(options.StateExpiry, nameof(DurableFlowOptions), nameof(options.StateExpiry));
+        if (options.DefaultStepTimeout is { } defaultStepTimeout)
+            AsyncResponseChannelOptions.EnsureTimerBacked(defaultStepTimeout, nameof(DurableFlowOptions), nameof(options.DefaultStepTimeout));
+        AsyncResponseChannelOptions.EnsurePersistedTtl(options.ExecutionLeaseDuration, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseDuration));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ExecutionLeaseRenewInterval, nameof(DurableFlowOptions), nameof(options.ExecutionLeaseRenewInterval));
+        if (options.ExecutionLeaseRenewInterval >= options.ExecutionLeaseDuration)
         {
             throw new InvalidOperationException(
-                $"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseRenewInterval)} must be positive and shorter than " +
+                $"{nameof(DurableFlowOptions)}.{nameof(options.ExecutionLeaseRenewInterval)} must be shorter than " +
                 $"{nameof(DurableFlowOptions.ExecutionLeaseDuration)}.");
         }
         if (options.ProgressPersistenceInterval < TimeSpan.Zero)
             throw new InvalidOperationException($"{nameof(DurableFlowOptions)}.{nameof(options.ProgressPersistenceInterval)} cannot be negative.");
+        // Timer remainders at or under the threshold arm an in-process Task.Delay, so the knob is
+        // timer-backed; zero legitimately means "always suspend".
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(options.TimerInProcessThreshold, nameof(DurableFlowOptions), nameof(options.TimerInProcessThreshold));
     }
 }
 
@@ -99,6 +114,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     private readonly string _leaseId;
     private readonly DurableFlowOptions _options;
     private readonly ILogger _logger;
+    private readonly TimeProvider _timeProvider;
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _lost = new();
     private readonly Task _renewal;
@@ -110,14 +126,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         string flowId,
         string leaseId,
         DurableFlowOptions options,
-        ILogger logger)
+        ILogger logger,
+        TimeProvider? timeProvider = null)
     {
         _store = store;
         _flowId = flowId;
         _leaseId = leaseId;
         _options = options;
         _logger = logger;
-        _validUntilUtc = DateTime.UtcNow.Add(options.ExecutionLeaseDuration);
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _validUntilUtc = _timeProvider.GetUtcNow().UtcDateTime.Add(options.ExecutionLeaseDuration);
         _renewal = RenewLoopAsync();
     }
 
@@ -138,7 +156,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         ThrowIfLost(cause);
         var expectedRevision = state.Revision;
         state.Revision = checked(expectedRevision + 1);
-        state.UpdatedAtUtc = DateTime.UtcNow;
+        state.UpdatedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
         try
         {
@@ -208,7 +226,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         {
             try
             {
-                await Task.Delay(_options.ExecutionLeaseRenewInterval, _stop.Token).ConfigureAwait(false);
+                await Task.Delay(_options.ExecutionLeaseRenewInterval, _timeProvider, _stop.Token).ConfigureAwait(false);
                 if (!await _store.TryRenewLeaseAsync(
                         _flowId,
                         _leaseId,
@@ -219,7 +237,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     return;
                 }
 
-                _validUntilUtc = DateTime.UtcNow.Add(_options.ExecutionLeaseDuration);
+                _validUntilUtc = _timeProvider.GetUtcNow().UtcDateTime.Add(_options.ExecutionLeaseDuration);
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {
@@ -228,7 +246,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to renew durable flow {FlowId} execution lease; retrying before expiry.", _flowId);
-                if (DateTime.UtcNow >= _validUntilUtc)
+                if (_timeProvider.GetUtcNow().UtcDateTime >= _validUntilUtc)
                 {
                     MarkLost();
                     return;

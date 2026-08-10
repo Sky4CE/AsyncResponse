@@ -76,6 +76,8 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
             ? $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.WorkerSubscriber)}"
             : $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ResponseSubscriber)}";
 
+        GooglePubSubOptionsValidator.ValidateTimeouts(transportOptions);
+
         if (!string.IsNullOrWhiteSpace(transportOptions.WorkerSubscriptionId)
             && !string.IsNullOrWhiteSpace(transportOptions.ResponseSubscriptionId)
             && StringComparer.Ordinal.Equals(transportOptions.WorkerSubscriptionId, transportOptions.ResponseSubscriptionId))
@@ -114,17 +116,7 @@ internal abstract class GooglePubSubMessageDispatcher : IAsyncDisposable
                         $"when {nameof(GooglePubSubSubscriberOptions.AckMode)} is {nameof(GooglePubSubAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                {
-                    throw new InvalidOperationException(
-                        $"{optionPath}.{nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
-                }
-
-                if (transportOptions.ShutdownTimeout <= TimeSpan.Zero)
-                {
-                    throw new InvalidOperationException(
-                        $"{nameof(GooglePubSubAsyncResponseOptions)}.{nameof(GooglePubSubAsyncResponseOptions.ShutdownTimeout)} must be positive.");
-                }
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout));
 
                 // Pub/Sub spends the background drain plus the bounded subscriber-client stop
                 // (ShutdownTimeout) at shutdown; both must fit inside the host budget.

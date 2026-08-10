@@ -24,15 +24,40 @@ internal static class PostgreSqlTransportOptionsValidator
                 $"{nameof(options.ResponseQueue)}, and {nameof(options.DeadLetterQueue)} must be distinct; they share one queue table.");
         }
 
-        if (options.DeadLetterRetention is { } deadLetterRetention && deadLetterRetention <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.DeadLetterRetention)} must be positive when set.");
+        // The queue table's derived index names reserve suffix space, but a table whose name ends
+        // exactly where a reserved stem truncates can still derive its own name, silently skipping
+        // index creation (indexes and tables share PostgreSQL's relation namespace).
+        (string Role, string Name)[] namePlan =
+        [
+            ($"{nameof(options.MessageTable)} table", options.MessageTable),
+            ("claim index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "claim")),
+            ("created index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "created")),
+        ];
+        for (var i = 0; i < namePlan.Length; i++)
+        {
+            for (var j = i + 1; j < namePlan.Length; j++)
+            {
+                if (string.Equals(namePlan[i].Name, namePlan[j].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"{nameof(PostgreSqlAsyncResponseTransportOptions)}: the {namePlan[i].Role} and the {namePlan[j].Role} both resolve to " +
+                        $"'{namePlan[j].Name}'; rename {nameof(options.MessageTable)} so the derived index names stay distinct.");
+                }
+            }
+        }
 
-        Positive(options.LockTimeout, nameof(options.LockTimeout));
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
-        Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
+        // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
+        // lease-renewal Task.Delay at half its value); DeadLetterRetention and RedeliveryDelay are
+        // database-side "now + value" stamps and get the persistence bound instead.
+        if (options.DeadLetterRetention is { } deadLetterRetention)
+            AsyncResponseChannelOptions.EnsurePersistedTtl(deadLetterRetention, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.DeadLetterRetention));
+
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.LockTimeout, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.LockTimeout));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(PostgreSqlAsyncResponseTransportOptions), nameof(options.ShutdownTimeout));
 
         if (options.PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{nameof(options.PublishMaxAttempts)} must be positive.");
@@ -70,8 +95,10 @@ internal static class PostgreSqlTransportOptionsValidator
         if (subscriber.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.MaxDeliveryAttempts)} ({role}) cannot be negative.");
 
-        Positive(subscriber.RedeliveryDelay, $"{nameof(subscriber.RedeliveryDelay)} ({role})");
-        Positive(subscriber.EmptyPollDelay, $"{nameof(subscriber.EmptyPollDelay)} ({role})");
+        // RedeliveryDelay is a database-side "now + delay" visibility stamp (persistence bound);
+        // EmptyPollDelay arms the idle-poll Task.Delay (timer ceiling).
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriber.RedeliveryDelay, nameof(PostgreSqlSubscriberOptions), $"{nameof(subscriber.RedeliveryDelay)} ({role})");
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.EmptyPollDelay, nameof(PostgreSqlSubscriberOptions), $"{nameof(subscriber.EmptyPollDelay)} ({role})");
 
         switch (subscriber.AckMode)
         {
@@ -82,7 +109,7 @@ internal static class PostgreSqlTransportOptionsValidator
                     throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
                     throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
-                Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.BackgroundDrainTimeout, nameof(PostgreSqlSubscriberOptions), $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
             default:
                 throw new InvalidOperationException($"{nameof(PostgreSqlSubscriberOptions)}.{nameof(subscriber.AckMode)} ({role}) has unsupported value '{subscriber.AckMode}'.");
@@ -101,12 +128,11 @@ internal static class PostgreSqlTransportOptionsValidator
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{name} '{value}' must be a simple PostgreSQL identifier (letters, digits, and underscores; not starting with a digit).");
-    }
-
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{name} must be positive.");
+        // PostgreSQL TRUNCATES over-limit identifiers silently (a NOTICE, not an error), so an
+        // over-limit configured name would create/address an object under a different name.
+        if (value.Length > 63)
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseTransportOptions)}.{name} '{value}' is {value.Length} characters; PostgreSQL identifiers are limited to 63 and longer names are silently truncated.");
     }
 
     private static bool IsIdentifier(string value)

@@ -11,17 +11,23 @@ public enum OperationStatus
 }
 
 /// <summary>
-/// The response payload the simulated remote system sends back. <see cref="ShouldResumeOnRecovery"/>
-/// is consulted only on the lost-subscriber recovery path (live completion is owned by the waiter's
-/// <c>Until</c> predicate): resume on the successful/in-flight states, fail on Failed and anything
-/// unrecognized.
+/// The response payload the simulated remote system sends back. <see cref="OnRecovery"/> is
+/// consulted only on the lost-subscriber recovery path (live completion is owned by the waiter's
+/// <c>Until</c> predicate): resume on the terminal success, keep the recovery registration armed on
+/// an in-flight checkpoint (so the terminal response that follows still routes), fail on Failed and
+/// anything unrecognized.
 /// </summary>
 public sealed class OperationResult : IAsyncResponsePayload
 {
     public OperationStatus Status { get; set; }
     public string? Message { get; set; }
 
-    public bool ShouldResumeOnRecovery() => Status is OperationStatus.Completed or OperationStatus.Running;
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        OperationStatus.Completed => RecoveryAction.Resume,
+        OperationStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
 }
 
 /// <summary>One invocation observed by <see cref="SampleFlowService"/> — a worker job, a recovery

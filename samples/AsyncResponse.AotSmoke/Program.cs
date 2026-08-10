@@ -87,7 +87,7 @@ public sealed class WorkCompleted : IAsyncResponsePayload
 {
     public string Outcome { get; set; } = "";
 
-    public bool ShouldResumeOnRecovery() => true;
+    public RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }
 
 /// <summary>

@@ -56,10 +56,20 @@ public sealed class DurableFlowStoreSharedTests
         state.SchemaVersion = FlowStateSchema.Current + 1;
         Assert.Null(Invoke(shared, "Deserialize", JsonSerializer.Serialize(state)));
 
-        Invoke(shared, "ValidateIdentifier", "valid_name2", "Name", "provider");
-        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", null, "Name", "provider");
-        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", "1invalid", "Name", "provider");
-        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", "invalid-name", "Name", "provider");
+        Invoke(shared, "ValidateIdentifier", "valid_name2", "Name", "provider", 0);
+        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", null, "Name", "provider", 0);
+        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", "1invalid", "Name", "provider", 0);
+        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", "invalid-name", "Name", "provider", 0);
+
+        // Identifier caps and derived-name suffix reservation: a cap of 0 disables the length
+        // check, an over-cap name is rejected, and a derived name truncates the table STEM so a
+        // maximum-length table can never derive its own name back.
+        Invoke(shared, "ValidateIdentifier", new string('t', 64), "Name", "provider", 0);
+        AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", new string('t', 64), "Name", "provider", 63);
+        Invoke(shared, "ValidateIdentifier", new string('t', 63), "Name", "provider", 63);
+        Assert.Equal("short_expires_idx", Invoke(shared, "DerivedName", "short", "_expires_idx", 63));
+        var derivedAtCap = Assert.IsType<string>(Invoke(shared, "DerivedName", new string('t', 63), "_expires_idx", 63));
+        Assert.Equal(new string('t', 51) + "_expires_idx", derivedAtCap);
 
         var pruneArgs = new object?[] { 0L, TimeSpan.FromHours(1) };
         Assert.True(Assert.IsType<bool>(Invoke(shared, "ShouldPrune", pruneArgs)));
@@ -172,10 +182,25 @@ public sealed class DurableFlowStoreSharedTests
         Assert.Throws<InvalidOperationException>(() => new DynamoDbDurableFlowOptions { TableName = " " }.Validate());
         Assert.Throws<InvalidOperationException>(() => new DynamoDbDurableFlowOptions { TimeToLiveAttributeName = " " }.Validate());
         Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = " " }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "bad$flows" }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "system.flows" }.Validate());
+        Assert.Throws<InvalidOperationException>(() => new MongoDbDurableFlowOptions { CollectionName = "app.system.flows" }.Validate());
         Assert.Throws<InvalidOperationException>(() => new MySqlDurableFlowOptions().Validate());
         Assert.Throws<InvalidOperationException>(() => new OracleDurableFlowOptions().Validate());
         Assert.Throws<InvalidOperationException>(() => new SqliteDurableFlowOptions { ConnectionString = " " }.Validate());
         Assert.Throws<InvalidOperationException>(() => new SqlServerDurableFlowOptions().Validate());
+
+        // Identifier caps + the PostgreSQL relation-namespace collision: a 64-character name would
+        // be silently truncated server-side, and a 63-character table ending exactly where the
+        // reserved "_expires_idx" stem truncates derives its own name (the index DDL would be
+        // silently skipped).
+        var overCap = Assert.Throws<InvalidOperationException>(
+            () => new PostgreSqlDurableFlowOptions { TableName = new string('t', 64) }.Validate());
+        Assert.Contains("limited to 63", overCap.Message);
+        var selfDerived = Assert.Throws<InvalidOperationException>(
+            () => new PostgreSqlDurableFlowOptions { TableName = new string('t', 51) + "_expires_idx" }.Validate());
+        Assert.Contains("expiry-index", selfDerived.Message);
+        new PostgreSqlDurableFlowOptions { TableName = new string('t', 63) }.Validate();
     }
 
     [Fact]

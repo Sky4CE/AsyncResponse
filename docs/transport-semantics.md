@@ -84,6 +84,23 @@ These hold for every transport in the matrix, verified per package:
 | **SQS** | visibility settle: delete on success; failure lets the visibility timeout lapse (or shortens it to `RedeliveryDelay`) | native `ApproximateReceiveCount` + redrive `maxReceiveCount`; no app counter by design | native redrive DLQ; delegated — or declared by `CreateQueues` (default **off**): `{queue}-dlq` + `MaxReceiveCount` 5 | log + `OnBackgroundFailure`; already deleted, no DLQ write possible | drain only | opt-in `VisibilityRenewalInterval` (default off); suppressed per message once the failure path schedules `RedeliveryDelay` |
 | **SqlServer** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `UPDLOCK/READPAST` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain only | automatic fenced renewal at `LockTimeout`/2 (`lock_id` fence) |
 
+## Delayed delivery (`IDelayedWorkerTransport`)
+
+Delayed worker jobs — `EnqueueWorkerAsync(..., delay)` and the wake-ups behind suspended
+durable-flow timers — are a per-transport capability. Envelopes carry their absolute due time
+(`NotBeforeUtc`); the shared worker-job executor re-publishes any early delivery for the
+remainder, which is how capped transports chunk long delays with no transport-specific code.
+
+| Transport | Native delayed delivery | Per-hop cap | Mechanism / caveats |
+|---|---|---|---|
+| **InMemory** | ✅ | — | `TimeProvider` timer wheel (virtual-clock aware in tests); delayed jobs die with the process, logged at shutdown |
+| **AzureServiceBus** | ✅ | — | scheduled messages (`ScheduledEnqueueTime`); broker-held, survives restarts |
+| **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — a FIFO worker queue advertises no delay capability (`MaxPublishDelay` = zero), so flow timers fall back in process and a delayed enqueue fails fast at publish |
+| **PostgreSQL** | ✅ | — | insert with `available_at = now() + delay` (database clock); pickup latency ≤ `EmptyPollDelay` |
+| **SqlServer** | ✅ | — | insert with `available_at = SYSUTCDATETIME() + delay`; pickup latency ≤ `EmptyPollDelay` |
+| **MongoDB** | ✅ | — | insert stamps a client-computed `available_at` atomically; skew-early deliveries corrected by the `NotBeforeUtc` guard |
+| **Kafka, RabbitMQ, GooglePubSub, Redis, NATS** | — | — | no native mechanism; flow timers wait in process under the lease, bare delayed enqueue throws with guidance |
+
 ## What `OnBackgroundFailure` receives
 
 Each transport reports the failure with its own context type — the broker-native coordinates of

@@ -27,10 +27,58 @@ public interface ICountingWorker
     Task CountAsync(int id);
 }
 
+/// <summary>
+/// Console logger for scenarios where any error is a scenario failure: echoes <c>Error</c> and
+/// above (capped), drops the rest. The stress harness otherwise runs on <see cref="NullLogger{T}"/>,
+/// which hides exactly the diagnostics a broken scenario needs.
+/// </summary>
+internal static class StressErrorLogger
+{
+    internal const int MaxEchoed = 5;
+    private static int _echoed;
+
+    public static void Reset() => Interlocked.Exchange(ref _echoed, 0);
+
+    public static void Echo(string category, LogLevel level, string message, Exception? exception)
+    {
+        var index = Interlocked.Increment(ref _echoed);
+        if (index > MaxEchoed)
+            return;
+
+        Console.WriteLine($"    [{level.ToString().ToLowerInvariant()}] {category}: {message}");
+        if (exception is not null)
+            Console.WriteLine($"      {exception.GetType().Name}: {exception.Message}");
+        if (index == MaxEchoed)
+            Console.WriteLine($"    [warn] further errors suppressed (cap {MaxEchoed}).");
+    }
+}
+
+/// <inheritdoc cref="StressErrorLogger" />
+internal sealed class StressErrorLogger<T> : ILogger<T>
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Error;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Error)
+            StressErrorLogger.Echo(typeof(T).Name, logLevel, formatter(state, exception), exception);
+    }
+}
+
 /// <summary>Awaited-step payload for the durable-flow storm.</summary>
 internal sealed class FlowStormPayload : IAsyncResponsePayload
 {
     public bool Done { get; set; }
+
+    /// <summary>
+    /// Required on every payload a durable flow awaits — flows register lost-subscriber recovery
+    /// callbacks on every channel, and waiter creation fails fast without this override. The
+    /// mapping mirrors the flow's <c>until</c> predicate's other axis: a not-done payload is a
+    /// progress checkpoint that must NOT consume the registration the terminal one still needs.
+    /// </summary>
+    public RecoveryAction OnRecovery() => Done ? RecoveryAction.Resume : RecoveryAction.KeepWaiting;
 }
 
 /// <summary>Input for the durable-flow storm flow (persisted with the flow state).</summary>
@@ -259,8 +307,30 @@ internal static class StressRunner
         }
         finally
         {
-            foreach (var hostedService in hosted)
-                await hostedService.StopAsync(CancellationToken.None);
+            await StopBoundedAsync(hosted);
+        }
+    }
+
+    /// <summary>
+    /// Stops hosted services with a drain budget. The in-memory worker host drains what it
+    /// accepted, retrying failures with backoff — correct in production, but when a scenario is
+    /// broken every job burns its full retry budget on a single worker, and an unbounded stop turns
+    /// a failing scenario into an hours-long hang instead of a report. Past the budget the scenario
+    /// has already recorded its verdict, so the drain is abandoned loudly.
+    /// </summary>
+    private static async Task StopBoundedAsync(IEnumerable<IHostedService> hosted)
+    {
+        using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        foreach (var hostedService in hosted)
+        {
+            try
+            {
+                await hostedService.StopAsync(stopCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine($"    [warn] {hostedService.GetType().Name} did not stop within 30s; abandoning the drain.");
+            }
         }
     }
 
@@ -1566,7 +1636,12 @@ internal static class StressRunner
     private static async Task<int> DurableFlowStorm(int concurrency, int count)
     {
         var services = new ServiceCollection();
-        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        // Not NullLogger here: a flow that fails every attempt (a payload contract violation, a
+        // store rejection) is otherwise completely silent, and the scenario only surfaces it as a
+        // drain timeout minutes later. Errors — including the transport's terminal "dropping it"
+        // log — are echoed, capped, so the cause is on screen the moment it happens.
+        StressErrorLogger.Reset();
+        services.AddSingleton(typeof(ILogger<>), typeof(StressErrorLogger<>));
         services.AddSingleton<FlowStormRig>();
         services.AddScoped<StressFlow>();
         services.AddAsyncResponse(options => options.Watchdog.Enabled = false)
@@ -1647,8 +1722,7 @@ internal static class StressRunner
             {
             }
 
-            foreach (var hostedService in hosted)
-                await hostedService.StopAsync(CancellationToken.None);
+            await StopBoundedAsync(hosted);
         }
     }
 

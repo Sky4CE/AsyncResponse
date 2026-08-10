@@ -13,8 +13,9 @@ namespace AsyncResponse.Tests;
 /// <summary>
 /// No-subscriber behavior of the Redis response channel (the lost-subscriber fallback after a
 /// redeploy/restart), exercised through the real implementation resolved from DI with Redis
-/// mocked. Verifies that the payload's ShouldResumeOnRecovery — not the transport envelope — decides
-/// between the resume callback and the failure callback, and that the broker ingress delivers
+/// mocked. Verifies that the payload's OnRecovery — not the transport envelope — decides between
+/// the resume callback, the failure callback, and the keep-waiting lane, and that the broker
+/// ingress delivers
 /// failed-but-valid payloads through the raw response path instead of converting them at ingress.
 /// </summary>
 public class LostSubscriberRoutingTests
@@ -133,13 +134,18 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task Ingress_CompletedPayload_AsRawJson_InvokesResumeCallback()
+    public async Task Ingress_CompletedPayload_AsRawJson_InvokesResumeCallbackWithMaterializedPayload()
     {
         ArmRecoveryState();
 
         await Ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"done"}""", CorrelationId);
 
-        Assert.Single(_spy.ResumedPayloads);
+        // 292332 regression: asserting only "the callback fired" hid that the object-declared
+        // parameter received a raw JsonElement — the callback must get the payload type recorded
+        // in the recovery state, or every `is`-guard in the consuming flow silently fails.
+        var resumed = Assert.IsType<OperationResult>(Assert.Single(_spy.ResumedPayloads));
+        Assert.Equal(OperationStatus.Completed, resumed.Status);
+        Assert.Equal("done", resumed.Message);
         Assert.Empty(_spy.Failures);
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Once);
     }
@@ -156,14 +162,18 @@ public class LostSubscriberRoutingTests
     }
 
     [Fact]
-    public async Task SetResponse_RunningPayload_InvokesResumeCallback()
+    public async Task SetResponse_RunningPayload_KeepsWaitingWithoutConsumingRegistration()
     {
+        // A Running response is a non-terminal checkpoint: recovery must invoke nothing and leave
+        // the registration armed for the terminal response (consuming it here is the 292332
+        // flow-deadlock shape — the terminal message would find nothing to route against).
         ArmRecoveryState();
 
         await Publisher.SetResponse(new OperationResult { Status = OperationStatus.Running }, CorrelationId);
 
-        Assert.Single(_spy.ResumedPayloads);
+        Assert.Empty(_spy.ResumedPayloads);
         Assert.Empty(_spy.Failures);
+        _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
     }
 
     [Fact]

@@ -13,6 +13,11 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     private sealed record Entry(RecoveryState State, DateTime ExpiresAtUtc);
 
     private readonly ConcurrentDictionary<string, EntryBucket> _entries = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>Creates the store; expiry stamps come from the engine's clock.</summary>
+    public InMemoryRecoveryStateStore(TimeProvider? timeProvider = null)
+        => _timeProvider = timeProvider ?? TimeProvider.System;
 
     /// <inheritdoc />
     public Task SaveAsync(
@@ -34,7 +39,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
         if (state.RegistrationId == Guid.Empty)
             state.RegistrationId = Guid.NewGuid();
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         var entry = new Entry(state, nowUtc.Add(ttl));
         while (true)
         {
@@ -60,7 +65,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
 
         while (_entries.TryGetValue(correlationId, out var bucket))
         {
-            var pruned = bucket.PruneExpired(DateTime.UtcNow);
+            var pruned = bucket.PruneExpired(_timeProvider.GetUtcNow().UtcDateTime);
             if (pruned.IsEmpty)
             {
                 TryRemove(correlationId, bucket);
@@ -86,7 +91,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
 
         while (_entries.TryGetValue(correlationId, out var bucket))
         {
-            var pruned = bucket.PruneExpired(DateTime.UtcNow);
+            var pruned = bucket.PruneExpired(_timeProvider.GetUtcNow().UtcDateTime);
             if (pruned.IsEmpty)
             {
                 TryRemove(correlationId, bucket);
@@ -299,7 +304,7 @@ internal sealed class InMemoryRecoveryStateStore : IRecoveryStateStore, IRecover
     {
         await Task.CompletedTask.ConfigureAwait(false); // process-local store: no async I/O to await
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = _timeProvider.GetUtcNow().UtcDateTime;
         foreach (var (correlationId, bucket) in _entries)
         {
             cancellationToken.ThrowIfCancellationRequested();

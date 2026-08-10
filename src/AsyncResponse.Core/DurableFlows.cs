@@ -12,6 +12,7 @@ internal sealed class DurableFlowService : IDurableFlows
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
     private readonly ILogger<DurableFlowService> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>Creates the durable-flows starter.</summary>
     public DurableFlowService(
@@ -19,7 +20,8 @@ internal sealed class DurableFlowService : IDurableFlows
         IAsyncResponseBuilder builder,
         AsyncResponseContextPropagation propagation,
         DurableFlowOptions options,
-        ILogger<DurableFlowService> logger)
+        ILogger<DurableFlowService> logger,
+        TimeProvider? timeProvider = null)
     {
         _scopeFactory = scopeFactory;
         _builder = builder;
@@ -27,6 +29,7 @@ internal sealed class DurableFlowService : IDurableFlows
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
@@ -46,7 +49,7 @@ internal sealed class DurableFlowService : IDurableFlows
         await using var scope = _scopeFactory.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
 
-        var now = DateTime.UtcNow;
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
         var inputJson = AsyncResponseJson.Serialize(input);
         var state = new FlowState
         {

@@ -11,7 +11,7 @@ namespace AsyncResponse.Transports.AzureServiceBus;
 /// operations are explicitly awaited so the method completes only after Service Bus accepts the
 /// transfer or the Azure SDK reports a failure.
 /// </remarks>
-public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDisposable
+public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedWorkerTransport, IAsyncDisposable
 {
     private readonly AzureServiceBusAsyncResponseOptions _options;
     private readonly IAzureServiceBusClient _client;
@@ -70,7 +70,21 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDis
     }
 
     /// <summary>Publishes the supplied worker job.</summary>
-    public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+    public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+        => PublishCoreAsync(job, delay: null, cancellationToken);
+
+    /// <inheritdoc/>
+    /// <remarks>Service Bus scheduled messages accept any future enqueue time; no per-hop chunking is needed.</remarks>
+    public TimeSpan MaxPublishDelay => AsyncResponseChannelOptions.MaxPersistenceTtl;
+
+    /// <inheritdoc/>
+    public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, MaxPublishDelay);
+        return PublishCoreAsync(job, delay > TimeSpan.Zero ? delay : null, cancellationToken);
+    }
+
+    private async Task PublishCoreAsync(WorkerJobEnvelope job, TimeSpan? delay, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(job);
 
@@ -99,7 +113,10 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IAsyncDis
                 AsyncResponseJson.Serialize(job),
                 messageId,
                 string.IsNullOrWhiteSpace(job.CorrelationId) ? null : job.CorrelationId,
-                properties);
+                properties,
+                delay is { } pending ? DateTimeOffset.UtcNow.Add(pending) : null);
+            if (delay is { } delayTag)
+                activity?.SetTag("asyncresponse.worker.delay_seconds", delayTag.TotalSeconds);
 
             var sender = await GetSenderAsync(cancellationToken).ConfigureAwait(false);
             await SendWithRetryAsync(sender, message, cancellationToken).ConfigureAwait(false);

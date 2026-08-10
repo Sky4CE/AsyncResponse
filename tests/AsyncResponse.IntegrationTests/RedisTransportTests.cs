@@ -8,8 +8,9 @@ namespace AsyncResponse.IntegrationTests;
 /// The real Redis Streams transport: worker jobs published and consumed over Redis consumer groups,
 /// and responses ingested from a Redis response stream into active waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class RedisTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
+public sealed class RedisTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckRedisModes()

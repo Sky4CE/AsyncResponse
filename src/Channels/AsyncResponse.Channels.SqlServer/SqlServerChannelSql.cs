@@ -8,7 +8,8 @@ internal readonly record struct SqlServerChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>SQL helper for the SQL Server channel tables.</summary>
 internal sealed class SqlServerChannelSql
@@ -36,6 +37,8 @@ internal sealed class SqlServerChannelSql
         RecoveryTable = $"{Schema}.{Quote(_options.RecoveryStateTable)}";
         MessageTable = $"{Schema}.{Quote(_options.MessageTable)}";
         SubscriberTable = $"{Schema}.{Quote(_options.SubscriberTable)}";
+        AckSequenceName = SequenceName(_options.MessageTable);
+        AckSequence = $"{Schema}.{Quote(AckSequenceName)}";
     }
 
     public string Schema { get; }
@@ -43,10 +46,30 @@ internal sealed class SqlServerChannelSql
     public string MessageTable { get; }
     public string SubscriberTable { get; }
 
+    /// <summary>
+    /// Qualified name of the monotonic ack sequence. Delivery claims and subscription
+    /// registrations draw from this ONE sequence, giving <c>acked_seq</c> and a subscription's
+    /// start position a total order no pair of same-tick timestamps has.
+    /// </summary>
+    public string AckSequence { get; }
+
+    private string AckSequenceName { get; }
+
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
+
+        if (!_options.AutoCreateSchema)
+        {
+            // Manually managed schemas get a one-time validation instead of DDL: 1.0.0 added
+            // acked_seq and its sequence, which waiter registration and delivery claims require
+            // unconditionally — without this check an un-migrated schema fails later with a raw
+            // "invalid column name" mid-operation instead of an actionable startup error carrying
+            // the exact migration.
+            await ValidateManagedSchemaAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -108,8 +131,13 @@ internal sealed class SqlServerChannelSql
                     created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
                     expires_at datetime2 NOT NULL,
                     acked_at datetime2 NULL,
+                    acked_seq bigint NULL,
                     recovery_claimed bit NOT NULL DEFAULT 0
                 );
+                IF COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NULL
+                    ALTER TABLE {MessageTable} ADD acked_seq bigint NULL;
+                IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}'))
+                    CREATE SEQUENCE {AckSequence} AS bigint START WITH 1;
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{IndexName(_options.MessageTable, "correlation_created")}' AND object_id = OBJECT_ID(N'{MessageTable}'))
                     CREATE INDEX {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                         ON {MessageTable} (correlation_id, created_at);
@@ -131,6 +159,46 @@ internal sealed class SqlServerChannelSql
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            _created = true;
+        }
+        finally
+        {
+            _ensureGate.Release();
+        }
+    }
+
+    private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
+    {
+        await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_created)
+                return;
+
+            await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                $"""
+                SELECT
+                  CASE WHEN COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NOT NULL THEN 1 ELSE 0 END,
+                  CASE WHEN EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) THEN 1 ELSE 0 END;
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            var hasColumn = reader.GetInt32(0) == 1;
+            var hasSequence = reader.GetInt32(1) == 1;
+            if (!hasColumn || !hasSequence)
+            {
+                throw new InvalidOperationException(
+                    $"The SQL Server channel schema is managed manually (AutoCreateSchema = false) but is missing " +
+                    $"objects this version requires: " +
+                    $"{(hasColumn ? "" : $"column {MessageTable}.acked_seq")}{(!hasColumn && !hasSequence ? " and " : "")}{(hasSequence ? "" : $"sequence {AckSequence}")}. " +
+                    $"Apply the migration and restart: " +
+                    $"IF COL_LENGTH(N'{MessageTable}', N'acked_seq') IS NULL ALTER TABLE {MessageTable} ADD acked_seq bigint NULL; " +
+                    $"IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE name = N'{AckSequenceName}' AND schema_id = SCHEMA_ID(N'{_options.SchemaName}')) CREATE SEQUENCE {AckSequence} AS bigint START WITH 1; " +
+                    "See docs/sqlserver.md, section 'Upgrading a manually managed schema'.");
+            }
+
             _created = true;
         }
         finally
@@ -303,7 +371,7 @@ internal sealed class SqlServerChannelSql
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT id, correlation_id, envelope_json, created_at, acked_at
+            SELECT id, correlation_id, envelope_json, created_at, acked_at, acked_seq
             FROM {MessageTable}
             WHERE correlation_id = @correlation_id
               AND created_at >= @since
@@ -333,7 +401,8 @@ internal sealed class SqlServerChannelSql
                 reader.GetString(1),
                 reader.GetString(2),
                 new DateTimeOffset(reader.GetDateTime(3), TimeSpan.Zero),
-                reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero)));
+                reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetDateTime(4), TimeSpan.Zero),
+                reader.IsDBNull(5) ? null : reader.GetInt64(5)));
         return messages;
     }
 
@@ -349,10 +418,20 @@ internal sealed class SqlServerChannelSql
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // NEXT VALUE FOR is not allowed inside CASE/COALESCE, so the sequence value is drawn into
+        // a variable first — one batch, one round trip; the unused draw on an already-acked row
+        // just leaves a harmless sequence gap. The sequence is stamped ONLY when this same update
+        // transitions acked_at from null (SET expressions read the pre-update row): a row acked by
+        // a pre-sequence build must stay permanently unsequenced — back-filling it on a later
+        // fan-out re-claim would pair an OLD acked_at with a FRESH sequence value, and a waiter
+        // that registered in the original ack's tick would then read the tie as post-registration
+        // fan-out, replaying a response its predecessor consumed.
         command.CommandText =
             $"""
+            DECLARE @seq bigint = NEXT VALUE FOR {AckSequence};
             UPDATE {MessageTable}
-            SET acked_at = COALESCE(acked_at, SYSUTCDATETIME())
+            SET acked_at = COALESCE(acked_at, SYSUTCDATETIME()),
+                acked_seq = CASE WHEN acked_at IS NULL THEN @seq ELSE acked_seq END
             OUTPUT inserted.id
             WHERE id = @id AND recovery_claimed = 0 AND expires_at > SYSUTCDATETIME();
             """;
@@ -382,6 +461,22 @@ internal sealed class SqlServerChannelSql
         command.Parameters.AddWithValue("@id", messageId);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return result is not null and not DBNull;
+    }
+
+    /// <summary>
+    /// One round trip for a subscription's registration watermark: the server's UTC clock (for
+    /// the created-at bound) and a fresh position in the monotonic ack sequence (for the exact
+    /// acked-history bound — see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT SYSUTCDATETIME(), NEXT VALUE FOR {AckSequence};";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return (new DateTimeOffset(reader.GetDateTime(0), TimeSpan.Zero), reader.GetInt64(1));
     }
 
     /// <summary>Returns the database server's current UTC time, used as a clock-safe delivery watermark.</summary>
@@ -576,6 +671,11 @@ internal sealed class SqlServerChannelSql
         if (!IsIdentifier(value))
             throw new InvalidOperationException(
                 $"{nameof(SqlServerAsyncResponseChannelOptions)}.{name} '{value}' must be a simple SQL Server identifier (letters, digits, and underscores; not starting with a digit).");
+        // sysname caps identifiers at 128; an over-limit name fails at DDL time with a raw
+        // "identifier too long" error instead of an actionable configuration error.
+        if (value.Length > IdentifierCap)
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseChannelOptions)}.{name} '{value}' is {value.Length} characters; SQL Server identifiers are limited to {IdentifierCap}.");
     }
 
     private static bool IsIdentifier(string value)
@@ -594,10 +694,58 @@ internal sealed class SqlServerChannelSql
 
     private static string Quote(string identifier) => "[" + identifier + "]";
 
+    /// <summary>SQL Server's identifier length cap (sysname); longer names error at DDL time.</summary>
+    internal const int IdentifierCap = 128;
+
+    // Suffix space is RESERVED before capping in BOTH derived-name helpers: truncating the whole
+    // "{table}{suffix}" let a maximum-length table name derive exactly its own name (the sequence
+    // collided with the table in the schema-object namespace and CREATE SEQUENCE failed) or let
+    // the table's two indexes derive one shared name (the second IF NOT EXISTS guard matched the
+    // first index and silently skipped creation).
+    private static string SequenceName(string table)
+    {
+        const string suffix = "_ack_seq";
+        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
+        return stem + suffix;
+    }
+
     private static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 128 ? name : name[..128];
+        var tail = $"_{suffix}_idx";
+        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
+        return stem + tail;
+    }
+
+    /// <summary>
+    /// Validates the effective schema-object name plan: the three configured tables plus the
+    /// derived ack sequence must be pairwise distinct (they share SQL Server's schema-scoped
+    /// object namespace, and a table whose name ends exactly where the reserved "_ack_seq" stem
+    /// truncates derives its own name). Index names live in per-table namespaces and carry
+    /// distinct reserved suffixes, so they cannot collide once the tables are distinct.
+    /// Comparison is case-insensitive to match SQL Server's default catalog collations.
+    /// </summary>
+    public static void ValidateNamePlan(SqlServerAsyncResponseChannelOptions options)
+    {
+        (string Role, string Name)[] plan =
+        [
+            ($"{nameof(options.RecoveryStateTable)} table", options.RecoveryStateTable),
+            ($"{nameof(options.MessageTable)} table", options.MessageTable),
+            ($"{nameof(options.SubscriberTable)} table", options.SubscriberTable),
+            ("ack sequence (derived from MessageTable)", SequenceName(options.MessageTable)),
+        ];
+        for (var i = 0; i < plan.Length; i++)
+        {
+            for (var j = i + 1; j < plan.Length; j++)
+            {
+                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"{nameof(SqlServerAsyncResponseChannelOptions)}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
+                        "Tables and the sequence derived from MessageTable share one schema-object namespace and must be distinct " +
+                        "(long names reserve suffix space by truncating the table stem). Shorten or de-overlap the configured table names.");
+                }
+            }
+        }
     }
 
     /// <summary>

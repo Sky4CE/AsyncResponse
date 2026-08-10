@@ -79,8 +79,10 @@ AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.RedeliveryDelay.se
 AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.SqlServerSubscriberOptions() -> void
 AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions!
 AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport
+AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport.SqlServerWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions!>! options) -> void
-const AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.TransportName = "SqlServer" -> string!
 Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportServiceCollectionExtensions
+const AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions.TransportName = "SqlServer" -> string!
 static Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportServiceCollectionExtensions.WithSqlServerTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

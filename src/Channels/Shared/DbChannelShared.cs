@@ -158,13 +158,14 @@ internal abstract class DbAsyncResponseChannelBase :
             throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
 
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the {_providerName} channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         completionPredicate ??= _ => new ValueTask<bool>(true);
@@ -175,13 +176,22 @@ internal abstract class DbAsyncResponseChannelBase :
         // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
+        // Refuse BEFORE any store round trip: EnsureCreatedAsync now validates manually managed
+        // schemas over the network, and a disposed channel must fail with ObjectDisposedException,
+        // not with whatever that connection attempt throws. EnsureListenerStarted below re-checks
+        // under the gate, so a dispose racing this early check still cannot start listeners.
+        ThrowIfDisposed();
         await _store.EnsureCreatedAsync().ConfigureAwait(false);
         EnsureListenerStarted();
 
         // Watermark from the database server's clock, not the app clock: the dispatch loop filters
         // pending messages with created_at >= started, and mixing an app-side timestamp with the
-        // server-stamped created_at would silently drop live deliveries under clock skew.
-        var startedAtUtc = await _store.GetServerTimeUtcAsync(CancellationToken.None).ConfigureAwait(false);
+        // server-stamped created_at would silently drop live deliveries under clock skew. The
+        // same round trip draws this subscription's position in the store's monotonic ack
+        // sequence — the exact ordering IsWithinWatermark uses to separate "acked before this
+        // waiter existed" (history) from "acked to a group including this waiter" (fan-out),
+        // which no pair of same-tick timestamps can distinguish.
+        var (startedAtUtc, startedSeq) = await _store.GetSubscriptionStartAsync(CancellationToken.None).ConfigureAwait(false);
 
         var storedCorrelationId = correlationId;
         var capturedContext = ExecutionContext.Capture();
@@ -198,6 +208,7 @@ internal abstract class DbAsyncResponseChannelBase :
             correlationId,
             registrationId,
             startedAtUtc,
+            startedSeq,
             completionPredicate,
             tcs,
             activity);
@@ -319,8 +330,8 @@ internal abstract class DbAsyncResponseChannelBase :
                     .ConfigureAwait(false);
                 if (!dispatchResult.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                     return;
                 }
@@ -340,8 +351,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
         }
@@ -384,8 +395,8 @@ internal abstract class DbAsyncResponseChannelBase :
                     .ConfigureAwait(false);
                 if (!dispatchResult.RetryLive)
                 {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
                     return;
                 }
@@ -404,8 +415,8 @@ internal abstract class DbAsyncResponseChannelBase :
                 var dispatchResult = await _lostSubscriberDispatcher
                     .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
         }
@@ -452,7 +463,7 @@ internal abstract class DbAsyncResponseChannelBase :
                 if (!dispatchResult.RetryLive)
                 {
                     activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                    AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
                     return;
                 }
 
@@ -480,7 +491,7 @@ internal abstract class DbAsyncResponseChannelBase :
                     .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, ChannelName(correlationId), cancellationToken)
                     .ConfigureAwait(false);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
         }
         catch (Exception ex)
@@ -559,6 +570,15 @@ internal abstract class DbAsyncResponseChannelBase :
             _subscriptions.TryRemove(correlationId, out _);
     }
 
+    private void ThrowIfDisposed()
+    {
+        lock (_listenerGate)
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(_channelTypeName);
+        }
+    }
+
     private protected void EnsureListenerStarted()
     {
         lock (_listenerGate)
@@ -589,11 +609,29 @@ internal abstract class DbAsyncResponseChannelBase :
                 var registrations = SnapshotActiveRegistrations();
                 if (registrations.Count > 0)
                 {
-                    await _store.HeartbeatSubscribersAsync(
-                        _instanceId,
-                        registrations,
-                        _options.SubscriberHeartbeatTimeout,
-                        cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await _store.HeartbeatSubscribersAsync(
+                            _instanceId,
+                            registrations,
+                            _options.SubscriberHeartbeatTimeout,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        // The round still compensates below: SQL Server commits per-batch,
+                        // MongoDB bulk-writes unordered, and any provider can fail after some
+                        // upserts landed — a registration dropped mid-round may already be
+                        // resurrected even though the round as a whole threw. Skipping the
+                        // re-check on failure left exactly those rows phantom until TTL.
+                        _logger.LogWarning(ex, "{Provider} subscriber heartbeat failed; retrying for all local waiters.", _providerName);
+                    }
+
+                    await DeleteRegistrationsDroppedDuringHeartbeatAsync(registrations, cancellationToken).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -624,6 +662,52 @@ internal abstract class DbAsyncResponseChannelBase :
 
         return registrations;
     }
+
+    /// <summary>
+    /// Closes the heartbeat/cleanup race: a subscription can be dropped (and its subscriber row
+    /// deleted) AFTER the snapshot above was taken but BEFORE the round's upsert landed — the
+    /// upsert then resurrects the deleted row, and until it ages out past the heartbeat timeout
+    /// every publisher counts a live waiter that no longer exists, suppressing lost-subscriber
+    /// recovery for the correlation id. Both cleanup paths set <c>Dropped</c> BEFORE issuing
+    /// their delete, which makes this post-round re-check airtight: either the drop is visible
+    /// here and the compensating delete below lands after the resurrecting upsert, or the drop
+    /// happened after this check — and then the cleanup's own delete is ordered after the upsert
+    /// and removes the row itself. Best-effort like the cleanup delete: a failed compensation
+    /// ages out via the heartbeat timeout.
+    /// </summary>
+    private async Task DeleteRegistrationsDroppedDuringHeartbeatAsync(
+        List<(string CorrelationId, Guid RegistrationId)> heartbeaten,
+        CancellationToken cancellationToken)
+    {
+        foreach (var (correlationId, registrationId) in heartbeaten)
+        {
+            if (IsRegistrationLive(correlationId, registrationId))
+                continue;
+
+            _logger.LogDebug(
+                "Deleting {Provider} subscriber {RegistrationId} for correlationId {CorrelationId}: it was dropped while a heartbeat round was in flight.",
+                _providerName, registrationId, correlationId);
+            try
+            {
+                await _store.DeleteSubscriberAsync(correlationId, registrationId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Failed to delete {Provider} subscriber {SubscriberRecord} for correlationId {CorrelationId} after its heartbeat-round drop; it ages out via the heartbeat timeout.",
+                    _providerName, _subscriberRecordNoun, correlationId);
+            }
+        }
+    }
+
+    private bool IsRegistrationLive(string correlationId, Guid registrationId)
+        => _subscriptions.TryGetValue(correlationId, out var group)
+           && group.TryGetValue(registrationId, out var subscription)
+           && !subscription.Dropped;
 
     private async Task DispatchLoopAsync(CancellationToken cancellationToken)
     {
@@ -837,24 +921,59 @@ internal abstract class DbAsyncResponseChannelBase :
     /// form excludes it deterministically — not probabilistically.
     /// </para>
     /// <para>
-    /// The tie is symmetric, and its resolution is deliberate: the same equality can also be a
-    /// genuine cross-process fan-out delivery (this waiter registered and another process's claim
-    /// stamped <c>acked_at</c> inside one clock tick), and the strict form then excludes the
-    /// waiter from its own response — it recovers through its step timeout and the
-    /// idempotent-restart contract. That at-most-once cost (a rare missed delivery that
-    /// self-heals) is chosen over the wrong-data redelivery a tolerant comparison re-opens. No
-    /// timestamp can separate the two same-tick cases; only an identity carried on the claim (the
-    /// claiming registration id, or a monotonic sequence) could — a possible store-schema
-    /// evolution if the trade ever bites in practice. The recovery asymmetry is worth naming for
-    /// the eventual triager: excluded HISTORY re-subscribes and proceeds immediately, while an
-    /// excluded fan-out waiter stalls for its full timeout first — a durable-flow step's default
-    /// is 7 days, and a plain waiter surfaces a TimeoutException to its caller. "Bites in
-    /// practice" looks like a long stall, not a quick retry.
+    /// The same-tick equality is symmetric — it can also be a genuine cross-process fan-out
+    /// delivery (this waiter registered and another process's claim stamped <c>acked_at</c>
+    /// inside one clock tick) — and no timestamp can separate the two cases. The store's
+    /// monotonic ack sequence arbitrates that tie (and only that tie): every delivery claim
+    /// stamps <c>acked_seq</c> drawn from the same monotonic source the subscription drew
+    /// <c>StartedSeq</c> from at registration. The arbitration is conservative-exact — exact
+    /// whenever the claim's draw was not stalled across ticks; the stalled-draw residual below
+    /// resolves as history.
+    /// </para>
+    /// <para>
+    /// The sequence deliberately does NOT outrank truthful (unequal) timestamps. A claim's
+    /// sequence value is drawn BEFORE the claim becomes visible — MongoDB draws from a separate
+    /// counter document, SQL Server in a <c>DECLARE</c> ahead of an <c>UPDATE</c> that may block
+    /// on a row lock, and even PostgreSQL's <c>nextval</c> evaluates before the commit — so a
+    /// claim can draw <c>41</c>, stall, and land AFTER a waiter registered at <c>42</c>. Ranking
+    /// the sequence above timestamps would exclude that delivery as history even though
+    /// <c>acked_at</c> truthfully post-dates the registration tick. With timestamps primary, the
+    /// stalled claim lands in a LATER tick and is delivered by the timestamp rule; the sequence
+    /// is consulted only when the tick is identical.
+    /// </para>
+    /// <para>
+    /// Inside the tie the sequence can never replay history: a claim visible before a same-tick
+    /// registration drew its value before that visibility, hence before the registration's own
+    /// draw — <c>acked_seq &lt; StartedSeq</c> — and is excluded. The only residual conservatism
+    /// is a claim whose draw-to-execution stall ends exactly in the registration's tick: it
+    /// resolves as history, which is the same verdict the timestamp-only rule gave every tie —
+    /// never worse, and exact whenever draws are not stalled (the overwhelmingly common case).
+    /// Rows acked by a pre-sequence build carry no <c>acked_seq</c> and keep the old at-most-once
+    /// tie resolution (excluded fan-out recovers through its step timeout and the
+    /// idempotent-restart contract).
     /// </para>
     /// </summary>
     private static bool IsWithinWatermark(IDbSubscription subscription, DbChannelMessage message)
-        => message.CreatedAtUtc >= subscription.StartedAtUtc.AddSeconds(-1)
-           && (message.AckedAtUtc is null || message.AckedAtUtc > subscription.StartedAtUtc);
+    {
+        if (message.CreatedAtUtc < subscription.StartedAtUtc.AddSeconds(-1))
+            return false;
+
+        if (message.AckedAtUtc is null)
+            return true;
+
+        // Timestamps are primary: strictly later tick = delivered, strictly earlier = history.
+        if (message.AckedAtUtc > subscription.StartedAtUtc)
+            return true;
+        if (message.AckedAtUtc < subscription.StartedAtUtc)
+            return false;
+
+        // Same-tick tie: the monotonic ack sequence arbitrates when the claim carries one.
+        if (message.AckedSeq is { } ackedSeq)
+            return ackedSeq > subscription.StartedSeq;
+
+        // Legacy tie (row acked by a pre-sequence build): the old conservative resolution.
+        return false;
+    }
 
     private async Task TryDispatchLocalSubscribersAsync(DbChannelMessage message, CancellationToken cancellationToken)
     {
@@ -1083,6 +1202,7 @@ internal abstract class DbAsyncResponseChannelBase :
     {
         Guid Id { get; }
         DateTimeOffset StartedAtUtc { get; }
+        long StartedSeq { get; }
         bool Dropped { get; }
         Func<DbChannelMessage, Task> ProcessUnderContextAsync { get; set; }
         bool HasSeen(Guid messageId);
@@ -1114,6 +1234,7 @@ internal abstract class DbAsyncResponseChannelBase :
             string correlationId,
             Guid registrationId,
             DateTimeOffset startedAtUtc,
+            long startedSeq,
             Func<T, ValueTask<bool>> completionPredicate,
             TaskCompletionSource<T> tcs,
             Activity? activity)
@@ -1122,6 +1243,7 @@ internal abstract class DbAsyncResponseChannelBase :
             _correlationId = correlationId;
             Id = registrationId;
             StartedAtUtc = startedAtUtc;
+            StartedSeq = startedSeq;
             _completionPredicate = completionPredicate;
             _tcs = tcs;
             _activity = activity;
@@ -1130,6 +1252,7 @@ internal abstract class DbAsyncResponseChannelBase :
 
         public Guid Id { get; }
         public DateTimeOffset StartedAtUtc { get; }
+        public long StartedSeq { get; }
         public bool Dropped => _dropped;
         public Func<ValueTask>? TimeoutRegistration { get; set; }
         public CancellationTokenSource? TimeoutCancellation { get; set; }

@@ -83,8 +83,10 @@ AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.get -> Syste
 AsyncResponse.Transports.SQS.SqsSubscriberOptions.VisibilityTimeout.set -> void
 AsyncResponse.Transports.SQS.SqsWorkerTransport
 AsyncResponse.Transports.SQS.SqsWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.SQS.SqsWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.Transports.SQS.SqsWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.SQS.SqsWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.Transports.SQS.SqsWorkerTransport.SqsWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.SQS.SqsAsyncResponseOptions!>! options) -> void
-const AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.TransportName = "AmazonSQS" -> string!
 Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionExtensions
+const AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.TransportName = "AmazonSQS" -> string!
 static Microsoft.Extensions.DependencyInjection.SqsAsyncResponseServiceCollectionExtensions.WithSqsTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.SQS.SqsAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
