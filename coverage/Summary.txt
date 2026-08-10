@@ -1,17 +1,17 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/10/2026 - 10:18:56
+  Generated on: 08/10/2026 - 13:28:01
   Parser: MultiReport (16x Cobertura)
   Assemblies: 26
   Classes: 455
   Files: 204
   Line coverage: 98.7%
-  Covered lines: 25991
-  Uncovered lines: 326
-  Coverable lines: 26317
-  Total lines: 39018
-  Branch coverage: 95.2% (9113 of 9570)
-  Covered branches: 9113
-  Total branches: 9570
+  Covered lines: 26037
+  Uncovered lines: 332
+  Coverable lines: 26369
+  Total lines: 39107
+  Branch coverage: 95% (9150 of 9630)
+  Covered branches: 9150
+  Total branches: 9630
   Method coverage: 99.8% (2859 of 2864)
   Full method coverage: 96.1% (2755 of 2864)
   Covered methods: 2859
@@ -81,7 +81,7 @@ AsyncResponse.Channels.PostgreSQL                                               
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql                                                              100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlRecoveryStateStore                                                      100%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                    94%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  94.4%
   Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions                  100%
 
 AsyncResponse.Channels.Redis                                                                                         98.8%
@@ -279,12 +279,12 @@ AsyncResponse.DurableFlows.Oracle                                               
   AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore                                                             98.8%
   Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions                               100%
 
-AsyncResponse.DurableFlows.PostgreSQL                                                                                85.2%
+AsyncResponse.DurableFlows.PostgreSQL                                                                                84.2%
   AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
   AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions                                                  100%
   AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore                                                     97.2%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  59.6%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  58.6%
   Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions                           100%
 
 AsyncResponse.DurableFlows.Sqlite                                                                                     100%
@@ -412,8 +412,8 @@ AsyncResponse.Transports.NATS                                                   
   AsyncResponse.Transports.NATS.NatsWorkerTransport                                                                   100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions                      100%
 
-AsyncResponse.Transports.PostgreSQL                                                                                    97%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  89.4%
+AsyncResponse.Transports.PostgreSQL                                                                                  97.1%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  90.1%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
   AsyncResponse.Transports.DbMessageDispatcherBase                                                                    100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions                                         100%
