@@ -36,16 +36,16 @@
 <div class="card">
 <div class="card-header">Line coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar1">98%</div>
+<div class="large cardpercentagebar cardpercentagebar0">100%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="90">90</td>
+<td class="limit-width right" title="91">91</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
-<td class="limit-width right" title="1">1</td>
+<td class="limit-width right" title="0">0</td>
 </tr>
 <tr>
 <th>Coverable lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="90 of 91">98.9%</td>
+<td class="limit-width right" title="91 of 91">100%</td>
 </tr>
 </table>
 </div>
@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar2">97%</div>
+<div class="large cardpercentagebar cardpercentagebar0">100%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="41">41</td>
+<td class="limit-width right" title="42">42</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="41 of 42">97.6%</td>
+<td class="limit-width right" title="42 of 42">100%</td>
 </tr>
 </table>
 </div>
@@ -112,7 +112,7 @@
 <tr><td title="CreateQueueAsync()"><a href="#file0_line36" class="navigatetohash">CreateQueueAsync()</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="GetQueueArnAsync()"><a href="#file0_line47" class="navigatetohash">GetQueueArnAsync()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="SetQueueAttributesAsync(string, System.Collections.Generic.IReadOnlyDictionary&lt;string, string&gt;, System.Threading.CancellationToken)"><a href="#file0_line62" class="navigatetohash">SetQueueAttributesAsync(...)</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
-<tr><td title="SendMessageAsync()"><a href="#file0_line73" class="navigatetohash">SendMessageAsync()</a></td><td>83.33%</td><td>6</td><td>6</td><td>94.44%</td></tr>
+<tr><td title="SendMessageAsync()"><a href="#file0_line73" class="navigatetohash">SendMessageAsync()</a></td><td>100%</td><td>6</td><td>6</td><td>100%</td></tr>
 <tr><td title="ReceiveMessagesAsync()"><a href="#file0_line103" class="navigatetohash">ReceiveMessagesAsync()</a></td><td>100%</td><td>8</td><td>8</td><td>100%</td></tr>
 <tr><td title="CreateDelivery(string, Amazon.SQS.Model.Message)"><a href="#file0_line128" class="navigatetohash">CreateDelivery(...)</a></td><td>100%</td><td>18</td><td>18</td><td>100%</td></tr>
 <tr><td title="DisposeAsync()"><a href="#file0_line165" class="navigatetohash">DisposeAsync()</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
@@ -206,8 +206,8 @@
 <tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line79"></a><code>79</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;};</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line80"></a><code>80</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;Native&nbsp;per-message&nbsp;delay&nbsp;(standard&nbsp;queues;&nbsp;0–900s).&nbsp;Longer&nbsp;waits&nbsp;arrive&nbsp;chunked:&nbsp;the</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line81"></a><code>81</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;envelope&#39;s&nbsp;NotBeforeUtc&nbsp;re-publish&nbsp;chain&nbsp;in&nbsp;the&nbsp;worker-job&nbsp;executor&nbsp;takes&nbsp;the&nbsp;next&nbsp;hop.</code></td></tr>
-<tr class="coverableline" title="Partially covered (7 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line82"></a><code>82</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(message.DelaySeconds&nbsp;is&nbsp;{&nbsp;}&nbsp;delaySeconds)</code></td></tr>
-<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line83"></a><code>83</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;request.DelaySeconds&nbsp;=&nbsp;delaySeconds;</code></td></tr>
+<tr class="coverableline" title="Covered (7 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line82"></a><code>82</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(message.DelaySeconds&nbsp;is&nbsp;{&nbsp;}&nbsp;delaySeconds)</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line83"></a><code>83</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;request.DelaySeconds&nbsp;=&nbsp;delaySeconds;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line84"></a><code>84</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (7 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line85"></a><code>85</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;foreach&nbsp;(var&nbsp;attribute&nbsp;in&nbsp;message.MessageAttributes)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line86"></a><code>86</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
@@ -359,7 +359,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 18:23:22<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 21:22:54<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
@@ -368,7 +368,7 @@
 <a href="#file0_line36" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - CreateQueueAsync()"><i class="icon-cube"></i>CreateQueueAsync()</a><br />
 <a href="#file0_line47" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - GetQueueArnAsync()"><i class="icon-cube"></i>GetQueueArnAsync()</a><br />
 <a href="#file0_line62" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - SetQueueAttributesAsync(string, System.Collections.Generic.IReadOnlyDictionary&lt;string, string&gt;, System.Threading.CancellationToken)"><i class="icon-cube"></i>SetQueueAttributesAsync(string, System.Collections.Generic.IReadOnlyDictionary&lt;string, string&gt;, System.Threading.CancellationToken)</a><br />
-<a href="#file0_line73" class="navigatetohash percentagebar percentagebar90" title="Line coverage: 94.4% - SendMessageAsync()"><i class="icon-cube"></i>SendMessageAsync()</a><br />
+<a href="#file0_line73" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - SendMessageAsync()"><i class="icon-cube"></i>SendMessageAsync()</a><br />
 <a href="#file0_line103" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ReceiveMessagesAsync()"><i class="icon-cube"></i>ReceiveMessagesAsync()</a><br />
 <a href="#file0_line128" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - CreateDelivery(string, Amazon.SQS.Model.Message)"><i class="icon-cube"></i>CreateDelivery(string, Amazon.SQS.Model.Message)</a><br />
 <a href="#file0_line165" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - DisposeAsync()"><i class="icon-cube"></i>DisposeAsync()</a><br />

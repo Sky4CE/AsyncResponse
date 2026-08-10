@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar29">71%</div>
+<div class="large cardpercentagebar cardpercentagebar34">65%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="27">27</td>
+<td class="limit-width right" title="25">25</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="27 of 38">71%</td>
+<td class="limit-width right" title="25 of 38">65.7%</td>
 </tr>
 </table>
 </div>
@@ -116,7 +116,7 @@
 <tr><td title="OnJobFinished()"><a href="#file0_line127" class="navigatetohash">OnJobFinished()</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="PublishAsync()"><a href="#file0_line134" class="navigatetohash">PublishAsync()</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
 <tr><td title="get_MaxPublishDelay()"><a href="#file0_line162" class="navigatetohash">get_MaxPublishDelay()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line167" class="navigatetohash">PublishAsync(...)</a></td><td>64.29%</td><td>16</td><td>14</td><td>76.92%</td></tr>
+<tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line167" class="navigatetohash">PublishAsync(...)</a></td><td>50%</td><td>16</td><td>14</td><td>76.92%</td></tr>
 <tr><td title="FireDelayed(AsyncResponse.InMemoryWorkerTransport.DelayedJob)"><a href="#file0_line210" class="navigatetohash">FireDelayed(...)</a></td><td>50%</td><td>2</td><td>2</td><td>87.5%</td></tr>
 <tr><td title="WriteFiredAsync()"><a href="#file0_line228" class="navigatetohash">WriteFiredAsync()</a></td><td>0%</td><td>12</td><td>4</td><td>20%</td></tr>
 <tr><td title=".ctor(AsyncResponse.InMemoryWorkerTransport, AsyncResponse.InMemoryWorkerTransport.QueuedJob)"><a href="#file0_line247" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
@@ -309,8 +309,8 @@
 <tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line176"></a><code>176</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;asyncresponse.worker.publish&quot;,</code></td></tr>
 <tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line177"></a><code>177</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ActivityKind.Producer,</code></td></tr>
 <tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line178"></a><code>178</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;job.CorrelationId);</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line179"></a><code>179</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.transport&quot;,&nbsp;&quot;inmemory&quot;);</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line180"></a><code>180</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.worker.delay_seconds&quot;,&nbsp;delay.TotalSeconds);</code></td></tr>
+<tr class="coverableline" title="Partially covered (2 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line179"></a><code>179</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.transport&quot;,&nbsp;&quot;inmemory&quot;);</code></td></tr>
+<tr class="coverableline" title="Partially covered (2 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line180"></a><code>180</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.worker.delay_seconds&quot;,&nbsp;delay.TotalSeconds);</code></td></tr>
 <tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line181"></a><code>181</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseDiagnostics.SetReplyTarget(activity,&nbsp;job.ReplyTarget);</code></td></tr>
 <tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line182"></a><code>182</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseDiagnostics.SetWorker(activity,&nbsp;job.Call);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line183"></a><code>183</code></td><td></td><td class="lightgray"><code></code></td></tr>
@@ -574,7 +574,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 18:23:22<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 21:22:53<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>

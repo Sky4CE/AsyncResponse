@@ -36,16 +36,16 @@
 <div class="card">
 <div class="card-header">Line coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar3">96%</div>
+<div class="large cardpercentagebar cardpercentagebar0">100%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="87">87</td>
+<td class="limit-width right" title="90">90</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
-<td class="limit-width right" title="3">3</td>
+<td class="limit-width right" title="0">0</td>
 </tr>
 <tr>
 <th>Coverable lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="87 of 90">96.6%</td>
+<td class="limit-width right" title="90 of 90">100%</td>
 </tr>
 </table>
 </div>
@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar28">72%</div>
+<div class="large cardpercentagebar cardpercentagebar17">83%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="26">26</td>
+<td class="limit-width right" title="30">30</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="26 of 36">72.2%</td>
+<td class="limit-width right" title="30 of 36">83.3%</td>
 </tr>
 </table>
 </div>
@@ -112,9 +112,9 @@
 <tr><td title=".ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions&gt;, AsyncResponse.Transports.AzureServiceBus.IAzureServiceBusClient)"><a href="#file0_line38" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="GetSenderAsync()"><a href="#file0_line55" class="navigatetohash">GetSenderAsync()</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.Threading.CancellationToken)"><a href="#file0_line74" class="navigatetohash">PublishAsync(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="get_MaxPublishDelay()"><a href="#file0_line78" class="navigatetohash">get_MaxPublishDelay()</a></td><td>100%</td><td>2</td><td>1</td><td>0%</td></tr>
-<tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line83" class="navigatetohash">PublishAsync(...)</a></td><td>0%</td><td>6</td><td>2</td><td>0%</td></tr>
-<tr><td title="PublishCoreAsync()"><a href="#file0_line89" class="navigatetohash">PublishCoreAsync()</a></td><td>55.56%</td><td>18</td><td>18</td><td>96.67%</td></tr>
+<tr><td title="get_MaxPublishDelay()"><a href="#file0_line78" class="navigatetohash">get_MaxPublishDelay()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line83" class="navigatetohash">PublishAsync(...)</a></td><td>50%</td><td>2</td><td>2</td><td>100%</td></tr>
+<tr><td title="PublishCoreAsync()"><a href="#file0_line89" class="navigatetohash">PublishCoreAsync()</a></td><td>72.22%</td><td>18</td><td>18</td><td>96.67%</td></tr>
 <tr><td title="SendWithRetryAsync()"><a href="#file0_line137" class="navigatetohash">SendWithRetryAsync()</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="IsTransient(System.Exception)"><a href="#file0_line154" class="navigatetohash">IsTransient(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
 <tr><td title="RetryDelay(int)"><a href="#file0_line158" class="navigatetohash">RetryDelay(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
@@ -205,13 +205,13 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line75"></a><code>75</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line76"></a><code>76</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;inheritdoc/&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line77"></a><code>77</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;remarks&gt;Service&nbsp;Bus&nbsp;scheduled&nbsp;messages&nbsp;accept&nbsp;any&nbsp;future&nbsp;enqueue&nbsp;time;&nbsp;no&nbsp;per-hop&nbsp;chunking&nbsp;is&nbsp;needed.&lt;/remarks&gt;</code></td></tr>
-<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line78"></a><code>78</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;TimeSpan&nbsp;MaxPublishDelay&nbsp;=&gt;&nbsp;AsyncResponseChannelOptions.MaxPersistenceTtl;</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line78"></a><code>78</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;TimeSpan&nbsp;MaxPublishDelay&nbsp;=&gt;&nbsp;AsyncResponseChannelOptions.MaxPersistenceTtl;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line79"></a><code>79</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line80"></a><code>80</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;inheritdoc/&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line81"></a><code>81</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;Task&nbsp;PublishAsync(WorkerJobEnvelope&nbsp;job,&nbsp;TimeSpan&nbsp;delay,&nbsp;CancellationToken&nbsp;cancellationToken&nbsp;=&nbsp;default)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line82"></a><code>82</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Not covered (0 visits)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line83"></a><code>83</code></td><td></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ArgumentOutOfRangeException.ThrowIfGreaterThan(delay,&nbsp;MaxPublishDelay);</code></td></tr>
-<tr class="coverableline" title="Not covered (0 visits, 0 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '0', 'LVS': 'red'}}"><td class="red">&nbsp;</td><td class="leftmargin rightmargin right">0</td><td class="rightmargin right"><a id="file0_line84"></a><code>84</code></td><td class="percentagebar percentagebar0"><i class="icon-fork"></i></td><td class="lightred"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;PublishCoreAsync(job,&nbsp;delay&nbsp;&gt;&nbsp;TimeSpan.Zero&nbsp;?&nbsp;delay&nbsp;:&nbsp;null,&nbsp;cancellationToken);</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line83"></a><code>83</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ArgumentOutOfRangeException.ThrowIfGreaterThan(delay,&nbsp;MaxPublishDelay);</code></td></tr>
+<tr class="coverableline" title="Partially covered (1 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line84"></a><code>84</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;PublishCoreAsync(job,&nbsp;delay&nbsp;&gt;&nbsp;TimeSpan.Zero&nbsp;?&nbsp;delay&nbsp;:&nbsp;null,&nbsp;cancellationToken);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line85"></a><code>85</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line86"></a><code>86</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line87"></a><code>87</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;async&nbsp;Task&nbsp;PublishCoreAsync(WorkerJobEnvelope&nbsp;job,&nbsp;TimeSpan?&nbsp;delay,&nbsp;CancellationToken&nbsp;cancellationToken)</code></td></tr>
@@ -239,14 +239,14 @@
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line109"></a><code>109</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;properties&nbsp;=&nbsp;new&nbsp;Dictionary&lt;string,&nbsp;object?&gt;(StringComparer.Ordinal);</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line110"></a><code>110</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(!string.IsNullOrWhiteSpace(job.CorrelationId))</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line111"></a><code>111</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;properties[_options.CorrelationIdProperty]&nbsp;=&nbsp;job.CorrelationId;</code></td></tr>
-<tr class="coverableline" title="Partially covered (6 visits, 3 of 4 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line112"></a><code>112</code></td><td class="percentagebar percentagebar70"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;message&nbsp;=&nbsp;new&nbsp;AzureServiceBusOutboundMessage(</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 4 of 4 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line112"></a><code>112</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;message&nbsp;=&nbsp;new&nbsp;AzureServiceBusOutboundMessage(</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line113"></a><code>113</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseJson.Serialize(job),</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line114"></a><code>114</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;messageId,</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line115"></a><code>115</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;string.IsNullOrWhiteSpace(job.CorrelationId)&nbsp;?&nbsp;null&nbsp;:&nbsp;job.CorrelationId,</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line116"></a><code>116</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;properties,</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line117"></a><code>117</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;delay&nbsp;is&nbsp;{&nbsp;}&nbsp;pending&nbsp;?&nbsp;DateTimeOffset.UtcNow.Add(pending)&nbsp;:&nbsp;null);</code></td></tr>
-<tr class="coverableline" title="Partially covered (6 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line118"></a><code>118</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(delay&nbsp;is&nbsp;{&nbsp;}&nbsp;delayTag)</code></td></tr>
-<tr class="coverableline" title="Partially covered (1 visits, 0 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line119"></a><code>119</code></td><td class="percentagebar percentagebar0"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.worker.delay_seconds&quot;,&nbsp;delayTag.TotalSeconds);</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line118"></a><code>118</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(delay&nbsp;is&nbsp;{&nbsp;}&nbsp;delayTag)</code></td></tr>
+<tr class="coverableline" title="Partially covered (2 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line119"></a><code>119</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.worker.delay_seconds&quot;,&nbsp;delayTag.TotalSeconds);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line120"></a><code>120</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line121"></a><code>121</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;sender&nbsp;=&nbsp;await&nbsp;GetSenderAsync(cancellationToken).ConfigureAwait(false);</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line122"></a><code>122</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;await&nbsp;SendWithRetryAsync(sender,&nbsp;message,&nbsp;cancellationToken).ConfigureAwait(false);</code></td></tr>
@@ -327,7 +327,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 18:23:22<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 21:22:53<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
@@ -336,8 +336,8 @@
 <a href="#file0_line38" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions&gt;, AsyncResponse.Transports.AzureServiceBus.IAzureServiceBusClient)"><i class="icon-cube"></i>.ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions&gt;, AsyncResponse.Transports.AzureServiceBus.IAzureServiceBusClient)</a><br />
 <a href="#file0_line55" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - GetSenderAsync()"><i class="icon-cube"></i>GetSenderAsync()</a><br />
 <a href="#file0_line74" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - PublishAsync(AsyncResponse.WorkerJobEnvelope, System.Threading.CancellationToken)"><i class="icon-cube"></i>PublishAsync(AsyncResponse.WorkerJobEnvelope, System.Threading.CancellationToken)</a><br />
-<a href="#file0_line78" class="navigatetohash percentagebar percentagebar0" title="Line coverage: 0% - get_MaxPublishDelay()"><i class="icon-wrench"></i>get_MaxPublishDelay()</a><br />
-<a href="#file0_line83" class="navigatetohash percentagebar percentagebar0" title="Line coverage: 0% - PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><i class="icon-cube"></i>PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)</a><br />
+<a href="#file0_line78" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_MaxPublishDelay()"><i class="icon-wrench"></i>get_MaxPublishDelay()</a><br />
+<a href="#file0_line83" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><i class="icon-cube"></i>PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)</a><br />
 <a href="#file0_line89" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - PublishCoreAsync()"><i class="icon-cube"></i>PublishCoreAsync()</a><br />
 <a href="#file0_line137" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - SendWithRetryAsync()"><i class="icon-cube"></i>SendWithRetryAsync()</a><br />
 <a href="#file0_line154" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsTransient(System.Exception)"><i class="icon-cube"></i>IsTransient(System.Exception)</a><br />
