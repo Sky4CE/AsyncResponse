@@ -8,15 +8,23 @@ public enum OperationStatus
     Failed = 3
 }
 
-/// <summary>A typical remote-operation payload with explicit lost-subscriber recovery semantics.</summary>
+/// <summary>
+/// A typical remote-operation payload with explicit lost-subscriber recovery semantics: the remote
+/// side streams Running progress before its terminal result, so a Running message on the recovery
+/// path is a checkpoint to wait past, not an outcome. Live completion is decided by the waiter's
+/// Until predicate, not here.
+/// </summary>
 public sealed class OperationResult : IAsyncResponsePayload
 {
     public OperationStatus Status { get; set; }
     public string? Message { get; set; }
 
-    // Recovery routing only — resume on the in-flight/successful states, fail on Failed (and any
-    // unrecognized state). Live completion is decided by the waiter's Until predicate, not here.
-    public bool ShouldResumeOnRecovery() => Status is OperationStatus.Completed or OperationStatus.Running;
+    public RecoveryAction OnRecovery() => Status switch
+    {
+        OperationStatus.Completed => RecoveryAction.Resume,
+        OperationStatus.Running => RecoveryAction.KeepWaiting,
+        _ => RecoveryAction.Fail,
+    };
 }
 
 /// <summary>A payload only ever published on success paths (failures go through SetException).</summary>
@@ -24,5 +32,5 @@ public sealed class SuccessOnlyPayload : IAsyncResponsePayload
 {
     public string? Message { get; set; }
 
-    public bool ShouldResumeOnRecovery() => true;
+    public RecoveryAction OnRecovery() => RecoveryAction.Resume;
 }

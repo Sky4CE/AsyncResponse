@@ -1,7 +1,11 @@
 using AsyncResponse.Channels.MongoDB;
+using AsyncResponse.DurableFlows.MongoDB;
 using AsyncResponse.Transports.MongoDB;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Moq;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using MongoDB.Driver.Core.Clusters;
@@ -32,6 +36,111 @@ public sealed class MongoDbOptionsTests
         AssertChannelInvalid(
             options => options.SubscriberCollection = "system.subscribers",
             nameof(MongoDbAsyncResponseChannelOptions.SubscriberCollection));
+        // The reserved system namespace also cannot appear INSIDE a dotted name.
+        AssertChannelInvalid(
+            options => options.SubscriberCollection = "app.system.subscribers",
+            nameof(MongoDbAsyncResponseChannelOptions.SubscriberCollection));
+    }
+
+    [Fact]
+    public void SharedDatabase_CrossComponentCollectionCollision_FailsInEitherStartupOrder()
+    {
+        // The flow store configured onto the channel's DERIVED "{MessageCollection}_counters"
+        // collection: its TTL index would silently delete the ack-sequence counter. Neither
+        // component's own validation can see the other, so the container-scoped ownership ledger
+        // must fail whichever store is constructed second — in both orders.
+        static ServiceProvider Build()
+        {
+            var client = new Mock<IMongoClient>();
+            client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+            var database = new Mock<IMongoDatabase>().WithTestNamespace();
+            database.SetupGet(d => d.Client).Returns(client.Object);
+
+            var services = new ServiceCollection();
+            services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+            services.AddSingleton(database.Object);
+            services.AddAsyncResponse()
+                .WithMongoDbChannel(options => options.MessageCollection = "jobs")
+                .WithInMemoryTransport()
+                .WithMongoDbDurableFlows(options => options.CollectionName = "jobs_counters");
+            return services.BuildServiceProvider();
+        }
+
+        using (var channelFirst = Build())
+        {
+            _ = channelFirst.GetRequiredService<MongoDbChannelStore>();
+            var ex = Assert.Throws<InvalidOperationException>(channelFirst.GetRequiredService<MongoDbFlowStateStore>);
+            Assert.Contains("MongoDB channel", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("MongoDB durable-flow store", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+
+        using (var flowFirst = Build())
+        {
+            _ = flowFirst.GetRequiredService<MongoDbFlowStateStore>();
+            var ex = Assert.Throws<InvalidOperationException>(flowFirst.GetRequiredService<MongoDbChannelStore>);
+            Assert.Contains("MongoDB durable-flow store", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+
+        // Distinct collections coexist: both stores resolve.
+        var okClient = new Mock<IMongoClient>();
+        okClient.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+        var okDatabase = new Mock<IMongoDatabase>().WithTestNamespace();
+        okDatabase.SetupGet(d => d.Client).Returns(okClient.Object);
+        var okServices = new ServiceCollection();
+        okServices.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        okServices.AddSingleton(okDatabase.Object);
+        okServices.AddAsyncResponse()
+            .WithMongoDbChannel(options => options.MessageCollection = "jobs")
+            .WithInMemoryTransport()
+            .WithMongoDbDurableFlows(options => options.CollectionName = "flows");
+        using var ok = okServices.BuildServiceProvider();
+        _ = ok.GetRequiredService<MongoDbChannelStore>();
+        _ = ok.GetRequiredService<MongoDbFlowStateStore>();
+    }
+
+    [Fact]
+    public void Stores_RejectEffectiveNamespacesOverTheByteLimit_AtConstruction()
+    {
+        // The namespace limit spans "database.collection", so only the store — which knows the
+        // actual database name — can enforce it. The stores enforce the SHARDED limit (235
+        // bytes) conservatively: 255 is only valid while the collection stays unsharded, and a
+        // later shard-enable would strand a 236..255-byte namespace. MongoClient/GetDatabase are
+        // lazy, so no server is needed. db "tests" (5 bytes) + "." + N-byte collection = N + 6.
+        var database = new MongoClient("mongodb://localhost:27017").GetDatabase("tests");
+
+        // 230-char collection: 236-byte namespace — one byte over the sharded limit.
+        var direct = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 230) })));
+        Assert.Contains("235 bytes", direct.Message, StringComparison.Ordinal);
+
+        // 225-char collection: its own namespace fits (231 bytes) but the DERIVED "_counters"
+        // namespace is 240 bytes — the gap static validation could never see.
+        var derived = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 225) })));
+        Assert.Contains("ack-counter", derived.Message, StringComparison.Ordinal);
+
+        var transport = Assert.Throws<InvalidOperationException>(() => new MongoDbTransportStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('m', 230) })));
+        Assert.Contains("235 bytes", transport.Message, StringComparison.Ordinal);
+
+        var flow = Assert.Throws<InvalidOperationException>(() => new MongoDbFlowStateStore(
+            database,
+            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 230) })));
+        Assert.Contains("235 bytes", flow.Message, StringComparison.Ordinal);
+
+        // At the boundary (235 exactly) everything constructs: 220 + 6 + 9 ("_counters") = 235
+        // for the channel's derived counters namespace, and 229 + 6 = 235 for the flow store.
+        using var atLimit = new MongoDbChannelStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 220) }));
+        using var flowAtLimit = new MongoDbFlowStateStore(
+            database,
+            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 229) }));
     }
 
     [Fact]
@@ -40,6 +149,20 @@ public sealed class MongoDbOptionsTests
         AssertChannelInvalid(
             options => options.MessageCollection = options.RecoveryStateCollection,
             nameof(MongoDbAsyncResponseChannelOptions.RecoveryStateCollection));
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectCollectionsOccupyingTheDerivedCountersName()
+    {
+        // "{MessageCollection}_counters" is part of the effective name plan: were the TTL-indexed
+        // recovery collection to occupy it, the reaper would silently delete the ack counter and
+        // reset the same-tick delivery tie-breaker.
+        AssertChannelInvalid(
+            options => options.RecoveryStateCollection = $"{options.MessageCollection}_counters",
+            "reserved for the ack counter");
+        AssertChannelInvalid(
+            options => options.SubscriberCollection = $"{options.MessageCollection}_counters",
+            "reserved for the ack counter");
     }
 
     [Fact]
@@ -122,6 +245,9 @@ public sealed class MongoDbOptionsTests
             nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
         AssertTransportInvalid(
             options => options.MessageCollection = "system.queue",
+            nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
+        AssertTransportInvalid(
+            options => options.MessageCollection = "app.system.queue",
             nameof(MongoDbAsyncResponseTransportOptions.MessageCollection));
     }
 
@@ -500,6 +626,33 @@ public sealed class MongoDbOptionsTests
             }),
             "fallback");
         Assert.NotNull(state);
+    }
+
+    [Fact]
+    public void ChannelOptions_RejectIntervalsBeyondTheirCeilings()
+    {
+        // "Passes validation, throws mid-operation" is the failure mode these bounds close: a
+        // TimeSpan.MaxValue deadline overflowed AFTER the publisher's insert (reporting failure
+        // for a possibly delivered response), and an over-timer-ceiling poll/heartbeat interval
+        // threw inside its background loop's own retry delay, killing dispatch.
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationTimeout = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.DeliveryConfirmationTimeout));
+        AssertChannelInvalid(
+            options => options.MessageRetention = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.MessageRetention));
+        AssertChannelInvalid(
+            options => options.SubscriberHeartbeatTimeout = TimeSpan.MaxValue,
+            nameof(MongoDbAsyncResponseChannelOptions.SubscriberHeartbeatTimeout));
+        AssertChannelInvalid(
+            options => options.ListenerPollInterval = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.ListenerPollInterval));
+        AssertChannelInvalid(
+            options => options.DeliveryConfirmationPollInterval = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.DeliveryConfirmationPollInterval));
+        AssertChannelInvalid(
+            options => options.PublishRetryMaxDelay = TimeSpan.FromDays(60),
+            nameof(MongoDbAsyncResponseChannelOptions.PublishRetryMaxDelay));
     }
 
     private static void AssertChannelInvalid(

@@ -82,7 +82,57 @@ public sealed class NatsChannelCoverageTests
 
         Assert.Equal(2, _client.Requests.Count(request => !request.Probe));
         _store.Verify(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        // The second dispatch consumed the registration only because ITS liveness re-check agreed
+        // the waiter is gone — the probe must have been consulted both times.
+        Assert.Equal(2, probes);
     }
+
+    /// <summary>
+    /// Delivery keeps reporting no responders while the probe keeps reporting a live waiter — a
+    /// contradiction (subscription interest not yet visible server-side, or a stale heartbeat).
+    /// Consuming recovery registrations on that evidence would strip a live waiter of its recovery
+    /// arm, so after the bounded retry the publish leaves all state intact.
+    /// </summary>
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_LeavesRecoveryIntactWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
+    {
+        using var activities = new AsyncResponseActivityCollector();
+        var channel = CreateChannel();
+        _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
+        _client.OutcomeForProbe = _ => NatsDeliveryOutcome.Replied;
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([NewRecoveryState("corr-contradiction")]);
+
+        await PublishAsync(channel, kind, "corr-contradiction");
+
+        // Bounded: one retry, then hands off to the intact registration instead of a third publish.
+        Assert.Equal(2, _client.Requests.Count(request => !request.Probe));
+        Assert.Equal(2, _client.Requests.Count(request => request.Probe));
+        _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    private static RecoveryState NewRecoveryState(string correlationId) => new()
+    {
+        RegistrationId = Guid.NewGuid(),
+        CorrelationId = correlationId,
+        PayloadTypeFullName = typeof(OperationResult).FullName,
+        RegisteredAtUtc = DateTime.UtcNow,
+        ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnResume),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
+        },
+        FailureCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnFailure),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+        }
+    };
 
     /// <summary>
     /// Every publish entry point opens an activity and tags the channel, the delivery outcome and
@@ -136,8 +186,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger);
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>());
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-teardown");
         await waiter.DisposeAsync();
@@ -159,8 +209,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => throw new InvalidOperationException("teardown failed")
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         using var predicateEntered = new SemaphoreSlim(0);
         using var releasePredicate = new SemaphoreSlim(0);
@@ -202,8 +252,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-hang");
         client.Push(TerminalEnvelope("done"));
@@ -240,8 +290,8 @@ public sealed class NatsChannelCoverageTests
         {
             SubscriptionDisposeOverride = () => new ValueTask(hang.Task)
         };
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
-        var channel = CreateChannel(client, logger, drainTimeout: TimeSpan.FromMilliseconds(200));
+        var logger = new CollectingLogger();
+        var channel = CreateChannel(client, logger.For<NatsAsyncResponseChannel>(), drainTimeout: TimeSpan.FromMilliseconds(200));
 
         var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-single-budget");
         await waiter.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
@@ -311,14 +361,14 @@ public sealed class NatsChannelCoverageTests
         client.Setup(instance => instance.FlushAsync(It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var logger = new CollectingLogger<NatsAsyncResponseChannel>();
+        var logger = new CollectingLogger();
         var channel = new NatsAsyncResponseChannel(
             _services.GetRequiredService<IServiceScopeFactory>(),
             client.Object,
             _store.Object,
             Options.Create(new NatsAsyncResponseChannelOptions { DefaultTimeout = TimeSpan.FromSeconds(5) }),
             new AsyncResponseContextPropagation([]),
-            logger);
+            logger.For<NatsAsyncResponseChannel>());
 
         await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-late-failure");
         Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
@@ -392,29 +442,4 @@ public sealed class NatsChannelCoverageTests
 
 
 
-    private sealed class CollectingLogger<T> : ILogger<T>
-    {
-        private readonly List<(string Message, Exception? Exception)> _entries = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _entries.Select(entry => entry.Message).ToArray(); }
-        }
-
-        /// <summary>Message + attached exception — lets a test pin WHICH failure was logged.</summary>
-        public IReadOnlyList<(string Message, Exception? Exception)> Entries
-        {
-            get { lock (_gate) return _entries.ToArray(); }
-        }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
-
-        public bool IsEnabled(LogLevel logLevel) => true;
-
-        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
-        {
-            lock (_gate) _entries.Add((formatter(state, exception), exception));
-        }
-    }
 }

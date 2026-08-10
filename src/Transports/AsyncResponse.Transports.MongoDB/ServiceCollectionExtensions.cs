@@ -33,27 +33,29 @@ public static class MongoDbAsyncResponseTransportServiceCollectionExtensions
         // creates and owns a client from the options. Nothing is registered as a bare
         // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are never
         // answered — or broken — by this package.
+        services.TryAddSingleton<MongoNamespaceRegistry>();
         services.TryAddSingleton(provider =>
         {
             var options = provider.GetRequiredService<IOptions<MongoDbAsyncResponseTransportOptions>>();
             var logger = provider.GetService<ILogger<MongoDbTransportStore>>();
+            var registry = provider.GetRequiredService<MongoNamespaceRegistry>();
 
             var database = provider.GetService<IMongoDatabase>();
             if (database is not null)
-                return new MongoDbTransportStore(database, options, logger: logger);
+                return new MongoDbTransportStore(database, options, logger: logger, namespaceRegistry: registry);
 
             if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(MongoDbAsyncResponseTransportOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
             var sharedClient = provider.GetService<IMongoClient>();
             if (sharedClient is not null)
-                return new MongoDbTransportStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, logger: logger);
+                return new MongoDbTransportStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, logger: logger, namespaceRegistry: registry);
 
             if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseTransportOptions)}.{nameof(MongoDbAsyncResponseTransportOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
             var ownedClient = new MongoClient(options.Value.ConnectionString);
-            return new MongoDbTransportStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, logger);
+            return new MongoDbTransportStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, logger, namespaceRegistry: registry);
         });
 
         services.TryAddSingleton(provider => new MongoDbWorkerTransport(

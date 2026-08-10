@@ -3,6 +3,8 @@ using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
+using System.Text;
+using AsyncResponse.Internal;
 
 namespace AsyncResponse.Channels.MongoDB;
 
@@ -11,7 +13,8 @@ internal readonly record struct MongoDbChannelMessage(
     string CorrelationId,
     string EnvelopeJson,
     DateTimeOffset CreatedAtUtc,
-    DateTimeOffset? AckedAtUtc = null);
+    DateTimeOffset? AckedAtUtc = null,
+    long? AckedSeq = null);
 
 /// <summary>Document adapter for the MongoDB channel collections and change-stream wake.</summary>
 internal sealed class MongoDbChannelStore : IDisposable
@@ -19,6 +22,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     private readonly IMongoCollection<MongoRecoveryStateDocument> _recovery;
     private readonly IMongoCollection<MongoChannelMessageDocument> _messages;
     private readonly IMongoCollection<MongoChannelSubscriberDocument> _subscribers;
+    private readonly IMongoCollection<BsonDocument> _counters;
     private readonly IMongoDatabase _database;
     private readonly MongoDbAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
@@ -28,20 +32,49 @@ internal sealed class MongoDbChannelStore : IDisposable
     public MongoDbChannelStore(
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseChannelOptions> options,
-        IMongoClient? ownedClient = null)
+        IMongoClient? ownedClient = null,
+        MongoNamespaceRegistry? namespaceRegistry = null)
     {
         _options = options.Value;
         _options.Validate();
         _database = database;
+
+        // Cross-component collection ownership (DI-hosted stores only): another AsyncResponse
+        // component configured onto one of these collections — the derived counters collection
+        // included — must fail startup in either construction order.
+        namespaceRegistry?.Claim(
+            ClusterKey(database),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB channel",
+            [
+                (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
+                (_options.MessageCollection, nameof(_options.MessageCollection)),
+                (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
+                (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
+            ]);
+
+        // Namespace BYTE limits can only be checked here, where the actual database name is
+        // first known — and the derived counters namespace is 9 bytes longer than the configured
+        // message collection, so a near-limit configuration passed every static check and failed
+        // at the first ack-sequence draw.
+        ValidateEffectiveNamespace(database, _options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection));
+        ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
+        ValidateEffectiveNamespace(database, _options.SubscriberCollection, nameof(_options.SubscriberCollection));
+        ValidateEffectiveNamespace(database, CountersCollectionName(_options.MessageCollection), "the derived ack-counter collection");
+
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
         _subscribers = database.GetCollection<MongoChannelSubscriberDocument>(_options.SubscriberCollection);
+        // The monotonic ack sequence: delivery claims and subscription registrations draw from
+        // this ONE counter, giving acked_seq and a subscription's start position a total order no
+        // pair of same-tick timestamps has. Created on first upsert; no index needed (_id only).
+        _counters = database.GetCollection<BsonDocument>(CountersCollectionName(_options.MessageCollection));
         _ownedClient = ownedClient;
     }
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -49,6 +82,31 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership: the in-container registry cannot see other hosts
+            // or directly constructed stores, so claim the effective collections here — before
+            // any index DDL, and INDEPENDENTLY of AutoCreateIndexes (disabling index DDL must
+            // not disable collision protection) — and fail startup when another component
+            // already owns one.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB channel",
+                    [
+                        (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
+                        (_options.MessageCollection, nameof(_options.MessageCollection)),
+                        (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
+                        (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
+                    ],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             // TTL indexes (expireAfterSeconds = 0 on the expiry timestamp) make MongoDB itself reap
             // expired documents — no application-side pruning needed. Reads still filter on the
@@ -292,7 +350,8 @@ internal sealed class MongoDbChannelStore : IDisposable
                 document.CorrelationId,
                 document.EnvelopeJson,
                 new DateTimeOffset(document.CreatedAtUtc, TimeSpan.Zero),
-                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null));
+                document.AckedAtUtc is { } acked ? new DateTimeOffset(acked, TimeSpan.Zero) : null,
+                document.AckedSeq));
         return messages;
     }
 
@@ -307,9 +366,14 @@ internal sealed class MongoDbChannelStore : IDisposable
     public async Task<bool> TryClaimForDeliveryAsync(Guid messageId, CancellationToken cancellationToken)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
+        // The sequence value is drawn BEFORE the claim lands, so its position reflects when this
+        // delivery happened relative to subscription registrations (which draw from the same
+        // counter). An unused draw on an already-acked row leaves a harmless gap; $ifNull keeps
+        // the FIRST claim's stamp, mirroring acked_at.
+        var ackSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
         var claimed = await _messages.FindOneAndUpdateAsync(
             BuildDeliveryClaimFilter(messageId),
-            BuildDeliveryClaimUpdate(),
+            BuildDeliveryClaimUpdate(ackSeq),
             new FindOneAndUpdateOptions<MongoChannelMessageDocument> { ReturnDocument = ReturnDocument.After },
             cancellationToken).ConfigureAwait(false);
         return claimed is not null;
@@ -320,13 +384,36 @@ internal sealed class MongoDbChannelStore : IDisposable
            & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
            & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
 
-    internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate()
+    internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate(long ackSeq)
         => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
         {
-            new BsonDocument("$set", new BsonDocument(
-                "acked_at",
-                new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" })))
+            // Both fields are computed from the PRE-update document (one $set stage), and the
+            // sequence is stamped ONLY when this same update transitions acked_at from null: a
+            // row acked by a pre-sequence build must stay permanently unsequenced — back-filling
+            // it on a later fan-out re-claim would pair an OLD acked_at with a FRESH sequence
+            // value, and a waiter that registered in the original ack's tick would then read the
+            // tie as post-registration fan-out, replaying a response its predecessor consumed.
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["acked_at"] = new BsonDocument("$ifNull", new BsonArray { "$acked_at", "$$NOW" }),
+                ["acked_seq"] = new BsonDocument("$cond", new BsonArray
+                {
+                    new BsonDocument("$eq", new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$acked_at", BsonNull.Value }), BsonNull.Value }),
+                    ackSeq,
+                    "$acked_seq"
+                })
+            })
         });
+
+    private async Task<long> DrawAckSequenceAsync(CancellationToken cancellationToken)
+    {
+        var counter = await _counters.FindOneAndUpdateAsync<BsonDocument>(
+            new BsonDocument("_id", "ack_seq"),
+            new BsonDocument("$inc", new BsonDocument("seq", 1L)),
+            new FindOneAndUpdateOptions<BsonDocument, BsonDocument> { IsUpsert = true, ReturnDocument = ReturnDocument.After },
+            cancellationToken).ConfigureAwait(false);
+        return counter["seq"].ToInt64();
+    }
 
     /// <summary>
     /// Atomically claims a message for the lost-subscriber path: sets <c>recovery_claimed</c> only
@@ -359,6 +446,18 @@ internal sealed class MongoDbChannelStore : IDisposable
         return reply.TryGetValue("localTime", out var localTime) && localTime is BsonDateTime serverTime
             ? new DateTimeOffset(serverTime.ToUniversalTime(), TimeSpan.Zero)
             : DateTimeOffset.UtcNow;
+    }
+
+    /// <summary>
+    /// A subscription's registration watermark: the server's UTC clock (for the created-at bound)
+    /// and a fresh position in the monotonic ack sequence (for the exact acked-history bound —
+    /// see the watermark in the shared channel base).
+    /// </summary>
+    public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
+    {
+        var serverTimeUtc = await GetServerTimeUtcAsync(cancellationToken).ConfigureAwait(false);
+        var startSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
+        return (serverTimeUtc, startSeq);
     }
 
     public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
@@ -511,14 +610,49 @@ internal sealed class MongoDbChannelStore : IDisposable
                or TimeoutException
                || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
 
+    /// <summary>
+    /// Stable identity of the cluster a database handle points at, for cross-component
+    /// collection-ownership claims: same servers + same database name = same namespace space.
+    /// </summary>
+    internal static string ClusterKey(IMongoDatabase database)
+        => string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal));
+
+    /// <summary>
+    /// Name of the derived ack-counter collection. Part of the effective collection-name plan:
+    /// options validation must keep the configured collections distinct from this derived name,
+    /// or counter documents land in (for example) the TTL-indexed recovery collection, where the
+    /// reaper would silently delete the ack sequence and reset the same-tick tie-breaker.
+    /// </summary>
+    internal static string CountersCollectionName(string messageCollection) => $"{messageCollection}_counters";
+
     /// <summary>Validates a MongoDB collection name coming from options.</summary>
     public static void ValidateCollectionName(string? value, string name)
     {
         if (string.IsNullOrWhiteSpace(value))
             throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} must be configured.");
-        if (value.Contains('$') || value.Contains('\0') || value.StartsWith("system.", StringComparison.Ordinal))
+        if (value.Contains('$') || value.Contains('\0')
+            || value.StartsWith("system.", StringComparison.Ordinal) || value.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
-                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in the system namespace).");
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+        if (string.Equals(value, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' is reserved for the cross-component ownership ledger.");
+    }
+
+    /// <summary>
+    /// Validates an effective namespace ("database.collection") against MongoDB's 255-byte UTF-8
+    /// limit. Only the store constructor knows the actual database name, so this cannot live in
+    /// options validation.
+    /// </summary>
+    internal static void ValidateEffectiveNamespace(IMongoDatabase database, string collectionName, string description)
+    {
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{collectionName}";
+        var byteLength = Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 235)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({description}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
     }
 
     /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>
@@ -573,6 +707,9 @@ internal sealed class MongoChannelMessageDocument
 
     [BsonElement("acked_at")]
     public DateTime? AckedAtUtc { get; set; }
+
+    [BsonElement("acked_seq")]
+    public long? AckedSeq { get; set; }
 
     [BsonElement("recovery_claimed")]
     public bool RecoveryClaimed { get; set; }

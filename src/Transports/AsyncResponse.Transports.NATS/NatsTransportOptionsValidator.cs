@@ -9,13 +9,6 @@ internal static class NatsTransportOptionsValidator
             : throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be configured.");
 
     /// <summary>Validates the supplied options.</summary>
-    public static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be positive.");
-    }
-
-    /// <summary>Validates the supplied options.</summary>
     public static void PositiveOrNull(long? value, string name)
     {
         if (value is <= 0)
@@ -37,11 +30,14 @@ internal static class NatsTransportOptionsValidator
             throw new InvalidOperationException(
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.SubjectPrefix)} '{options.SubjectPrefix}' must not contain whitespace or the NATS wildcards '*'/'>'.");
 
-        Positive(options.AckWait, nameof(options.AckWait));
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
+        // AckWait is a server-side JetStream consumer deadline carried as nanoseconds on the wire
+        // (persistence bound keeps it representable); the retry delays arm in-process Task.Delay
+        // timers (timer ceiling).
+        AsyncResponseChannelOptions.EnsurePersistedTtl(options.AckWait, nameof(NatsAsyncResponseTransportOptions), nameof(options.AckWait));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(NatsAsyncResponseTransportOptions), nameof(options.SubscriberRetryMaxDelay));
         PositiveOrNull(options.StreamMaxMessages, nameof(options.StreamMaxMessages));
         PositiveOrNull(options.DeadLetterStreamMaxMessages, nameof(options.DeadLetterStreamMaxMessages));
 
@@ -88,7 +84,9 @@ internal static class NatsTransportOptionsValidator
         if (subscriber.MaxDeliveryAttempts < 0)
             throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.MaxDeliveryAttempts)} ({role}) cannot be negative.");
 
-        Positive(subscriber.RedeliveryDelay, $"{nameof(subscriber.RedeliveryDelay)} ({role})");
+        // The NAK redelivery delay rides the wire as nanoseconds and is honored server-side —
+        // persistence bound, not the (smaller) in-process timer ceiling.
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriber.RedeliveryDelay, nameof(NatsSubscriberOptions), $"{nameof(subscriber.RedeliveryDelay)} ({role})");
 
         switch (subscriber.AckMode)
         {
@@ -100,7 +98,7 @@ internal static class NatsTransportOptionsValidator
                     throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundWorkerCount)} ({role}) must be positive for AckAfterEnqueue.");
                 if (subscriber.BackgroundQueueCapacity <= 0)
                     throw new InvalidOperationException($"{nameof(NatsSubscriberOptions)}.{nameof(subscriber.BackgroundQueueCapacity)} ({role}) must be positive for AckAfterEnqueue.");
-                Positive(subscriber.BackgroundDrainTimeout, $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriber.BackgroundDrainTimeout, nameof(NatsSubscriberOptions), $"{nameof(subscriber.BackgroundDrainTimeout)} ({role})");
                 return;
 
             default:

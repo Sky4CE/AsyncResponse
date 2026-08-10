@@ -72,7 +72,9 @@ public class WireContractSerializationTests
             },
             CorrelationId = "corr-1",
             ReplyTarget = new AsyncResponseReplyTarget { Name = "default", Transport = "test", Address = "test://reply" },
-            Context = new Dictionary<string, string> { ["tenant"] = "acme" }
+            Context = new Dictionary<string, string> { ["tenant"] = "acme" },
+            NotBeforeUtc = new DateTime(2026, 5, 1, 8, 0, 0, DateTimeKind.Utc),
+            LastRedelayRemaining = TimeSpan.FromMinutes(90)
         };
 
         var json = JsonSerializer.Serialize(envelope);
@@ -88,6 +90,33 @@ public class WireContractSerializationTests
         Assert.Equal("Process", restored.Call.MethodName);
         Assert.Equal("default", restored.ReplyTarget!.Name);
         Assert.Equal("acme", restored.Context!["tenant"]);
+        // The chunk chain's only durable carriers: the absolute due time and the progress baseline
+        // must survive a serialize/deserialize hop or delayed delivery breaks across a broker.
+        Assert.Equal(envelope.NotBeforeUtc, restored.NotBeforeUtc);
+        Assert.Equal(TimeSpan.FromMinutes(90), restored.LastRedelayRemaining);
+    }
+
+    [Fact]
+    public void WorkerJobEnvelope_PinnedLegacyPayload_WithoutDelayFields_Deserializes()
+    {
+        // Pinned raw v1 envelope JSON written BEFORE delayed delivery existed (no NotBeforeUtc /
+        // LastRedelayRemaining). Additive wire properties: this literal must keep deserializing to
+        // null forever — a producer on an older build must interop with a newer consumer.
+        const string legacyJson =
+            """
+            {
+              "SchemaVersion": 1,
+              "Call": { "ServiceInterfaceFullName": "My.IWorker", "MethodName": "Process", "Params": [] },
+              "CorrelationId": "legacy-corr"
+            }
+            """;
+
+        var restored = JsonSerializer.Deserialize<WorkerJobEnvelope>(legacyJson);
+
+        Assert.NotNull(restored);
+        Assert.Equal("legacy-corr", restored!.CorrelationId);
+        Assert.Null(restored.NotBeforeUtc);
+        Assert.Null(restored.LastRedelayRemaining);
     }
 
     [Fact]
@@ -169,5 +198,8 @@ public class WireContractSerializationTests
         Assert.Null(state.ParentFlowId);
         Assert.Null(state.ParentStepName);
         Assert.Null(state.Steps["remote-op"].ChildFlowId);
+        // WakeAtUtc is the timers feature's additive wire property: absent on ledgers written
+        // before timers existed, and it must stay optional on the read path forever.
+        Assert.Null(state.Steps["remote-op"].WakeAtUtc);
     }
 }

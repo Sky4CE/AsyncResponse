@@ -95,6 +95,21 @@ owns the full story — this page is the map, not the territory.
   `ExecutionLeaseDuration` before another replica may take the run over. See
   [what happens when things die](durable-flows.md#what-happens-when-things-die).
 
+### Every attempt of an awaited step fails with an `OnRecovery` error
+
+- **Symptom:** a flow never gets past its first `AwaitStepAsync`; each delivery throws
+  `InvalidOperationException` naming a payload type and `OnRecovery`, and the run eventually
+  dead-letters (or, on the in-memory transport, is dropped after its retry budget).
+- **Cause:** durable flows register lost-subscriber recovery callbacks on *every* awaited step, and
+  a payload that does not override `IAsyncResponsePayload.OnRecovery()` cannot be classified when
+  it arrives with no live waiter — so waiter creation fails fast rather than guessing. Every
+  channel enforces this, the in-memory one included; code written before that was uniform can hit
+  it the first time it runs in-memory.
+- **Fix:** override `OnRecovery()` on the payload — terminal success → `Resume`, terminal failure
+  → `Fail`, progress/checkpoint payloads → `KeepWaiting` (which is what keeps a progress message
+  from consuming the registration the terminal response still needs). See
+  [recovery.md](recovery.md).
+
 ### Flow state exceeds the store's size limit
 
 - **Symptom:** a checkpoint fails with an error naming the flow, its state size, and the limit.

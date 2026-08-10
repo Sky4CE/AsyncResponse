@@ -116,13 +116,14 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
         PostgreSqlChannelSql.ValidateIdentifier(MessageTable, nameof(MessageTable));
         PostgreSqlChannelSql.ValidateIdentifier(SubscriberTable, nameof(SubscriberTable));
         PostgreSqlChannelSql.ValidateIdentifier(NotificationChannel, nameof(NotificationChannel));
+        PostgreSqlChannelSql.ValidateNamePlan(this);
 
-        Positive(MessageRetention, nameof(MessageRetention));
-        Positive(DeliveryConfirmationTimeout, nameof(DeliveryConfirmationTimeout));
-        Positive(DeliveryConfirmationPollInterval, nameof(DeliveryConfirmationPollInterval));
-        Positive(ListenerPollInterval, nameof(ListenerPollInterval));
-        Positive(SubscriberHeartbeatInterval, nameof(SubscriberHeartbeatInterval));
-        Positive(SubscriberHeartbeatTimeout, nameof(SubscriberHeartbeatTimeout));
+        EnsurePersistedTtl(MessageRetention, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(MessageRetention));
+        EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
+        EnsureTimerBacked(ListenerPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(ListenerPollInterval));
+        EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
+        EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 
         if (MaxRemoteStackTraceLength < 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
@@ -141,16 +142,11 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
         if (PublishMaxAttempts <= 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(PublishMaxAttempts)} must be positive.");
 
-        Positive(PublishRetryBaseDelay, nameof(PublishRetryBaseDelay));
-        Positive(PublishRetryMaxDelay, nameof(PublishRetryMaxDelay));
+        EnsureTimerBacked(PublishRetryBaseDelay, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(PublishRetryBaseDelay));
+        EnsureTimerBacked(PublishRetryMaxDelay, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(PublishRetryMaxDelay));
         if (PublishRetryBaseDelay > PublishRetryMaxDelay)
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(PublishRetryBaseDelay)} cannot exceed {nameof(PublishRetryMaxDelay)}.");
     }
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{name} must be positive.");
-    }
 }

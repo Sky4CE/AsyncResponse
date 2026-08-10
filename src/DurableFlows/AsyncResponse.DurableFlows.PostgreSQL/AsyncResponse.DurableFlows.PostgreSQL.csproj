@@ -31,4 +31,8 @@
     <PackageReference Include="Microsoft.Extensions.Options" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\..\Shared\PostgreSqlRelationVerifier.cs" Link="PostgreSqlRelationVerifier.cs" />
+  </ItemGroup>
+
 </Project>

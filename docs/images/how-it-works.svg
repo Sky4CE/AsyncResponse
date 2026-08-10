@@ -3,7 +3,7 @@
   <desc id="description">
     AsyncResponse subscribes and saves recovery state before it triggers remote work. Progress
     messages keep the caller waiting, a terminal message completes the await, and late responses
-    after a redeploy are routed to either the resume or failure callback.
+    after a redeploy are routed by OnRecovery(): resume, fail, or keep waiting for the terminal response.
   </desc>
 
   <defs>
@@ -330,21 +330,25 @@
     <path d="M699 702H731" fill="none" stroke="#8AB0CC" stroke-width="2.2" marker-end="url(#arrowCyan)" />
 
     <path d="M797 672L855 702L797 732L739 702Z" fill="#0A3150" stroke="#48DCF5" stroke-width="1.5" />
-    <text x="820" y="658" class="flow-note code" text-anchor="end">ShouldResumeOnRecovery()</text>
-    <text x="797" y="707" class="flow-label" text-anchor="middle">resume?</text>
+    <text x="820" y="658" class="flow-note code" text-anchor="end">OnRecovery()</text>
+    <text x="797" y="707" class="flow-label" text-anchor="middle">route?</text>
 
     <path d="M855 702C895 702 915 666 952 666" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" />
     <path d="M944 659L954 666L944 673" fill="none" stroke="#5AF0B3" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-    <text x="895" y="650" class="flow-note" text-anchor="middle" fill="#75F0BB" style="font-size: 13px; font-weight: 650">true</text>
+    <text x="895" y="650" class="flow-note" text-anchor="middle" fill="#75F0BB" style="font-size: 13px; font-weight: 650">Resume</text>
     <rect x="964" y="642" width="396" height="48" rx="14" fill="#0A2D2D" stroke="#45D7A3" stroke-opacity="0.75" />
     <text x="982" y="663" class="flow-label code" fill="#B9FFE1">ResumeCallback(payload)</text>
     <text x="982" y="681" class="flow-note">continue the interrupted work</text>
 
     <path d="M855 702C895 702 915 738 952 738" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" />
     <path d="M944 731L954 738L944 745" fill="none" stroke="#FF789F" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-    <text x="895" y="759" class="flow-note" text-anchor="middle" fill="#FF9CB8" style="font-size: 13px; font-weight: 650">false</text>
+    <text x="895" y="759" class="flow-note" text-anchor="middle" fill="#FF9CB8" style="font-size: 13px; font-weight: 650">Fail</text>
     <rect x="964" y="714" width="396" height="48" rx="14" fill="#321A2A" stroke="#FF789F" stroke-opacity="0.75" />
     <text x="982" y="735" class="flow-label code" fill="#FFC3D4">FailureCallback(exception)</text>
-    <text x="982" y="753" class="flow-note">fail safely when the payload cannot resume</text>
+    <text x="982" y="753" class="flow-note">fail safely — never resume a failure</text>
+
+    <path d="M797 732C795 780 725 788 668 736" fill="none" stroke="#FFD166" stroke-width="2.2" stroke-dasharray="6 6" stroke-linecap="round" marker-end="url(#arrowAmber)" />
+    <text x="790" y="788" class="flow-note" text-anchor="middle" fill="#FFD166" style="font-size: 13px; font-weight: 650">KeepWaiting</text>
+    <text x="790" y="805" class="flow-note" text-anchor="middle">checkpoint — registration stays armed</text>
   </g>
 </svg>

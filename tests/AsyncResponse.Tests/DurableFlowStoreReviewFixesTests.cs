@@ -124,7 +124,7 @@ public sealed class DurableFlowStoreReviewFixesTests
     [Fact]
     public async Task MongoDbStore_RejectsOversizedState_BeforeAnyCollectionCall()
     {
-        using var store = new MongoDbFlowStateStore(Mock.Of<IMongoDatabase>(), Options.Create(new MongoDbDurableFlowOptions
+        using var store = new MongoDbFlowStateStore(new Mock<IMongoDatabase>().WithTestNamespace().Object, Options.Create(new MongoDbDurableFlowOptions
         {
             CollectionName = "flows",
             AutoCreateIndexes = false,
@@ -172,7 +172,7 @@ public sealed class DurableFlowStoreReviewFixesTests
     public async Task MongoDbStore_TreatsSameMillisecondRenewalAsSuccess_AndKeepsModifiedSemanticsForCheckpoints()
     {
         var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
-        var database = new Mock<IMongoDatabase>();
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
         database
             .Setup(item => item.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
             .Returns(collection.Object);

@@ -69,6 +69,167 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_TerminalDeliveryDuringRecoverySave_CompensatesTheOrphanedRegistration()
+    {
+        // The registration-save race: the consume loop is live before the recovery state is
+        // saved. A terminal response landing in that window runs cleanup, whose delete no-ops
+        // (nothing saved yet); the save then commits an orphaned callback-armed registration that
+        // would resurrect recovery for a completed wait on any later publish. The creator must
+        // compensate with a second delete after the save — and must SKIP the post-save flush,
+        // whose lifetime token the settled wait's cleanup disposes.
+        //
+        // Determinism: the consume loop processes the pushed message on its own schedule, so the
+        // save completes only once cleanup's delete has been OBSERVED — cleanup sets
+        // cleanupStarted before that delete, so the post-save check deterministically sees it.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-race");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "fast" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
+
+        // One delete from cleanup (pre-save no-op) plus the post-save compensation; no server
+        // flush for a wait that already ended.
+        _store.Verify(
+            s => s.TryDeleteAsync("corr-save-race", It.IsAny<Guid>(), It.IsAny<CancellationToken>()),
+            Times.AtLeast(2));
+        Assert.Equal(0, _client.FlushCount);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_ReturnsTheCompletedWaiter()
+    {
+        // A terminal delivery settles the wait while the recovery-state save is in flight, and
+        // the save then FAILS. Rethrowing (the plain subscribe-failure contract) would discard a
+        // response the waiter already holds — the exact loss the library exists to prevent — and
+        // the same interleaving with a healthy store returns the completed waiter. The save is
+        // released by failing only once cleanup's delete has been observed, so the failure is
+        // deterministically post-settlement.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+                throw new InvalidOperationException("recovery save failed");
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-save-fail");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "settled" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("settled", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_ConsumeLoopFailureDuringRegistration_ThrowsInsteadOfReturningAFaultedWaiter()
+    {
+        // A consume-loop death faults the response task with a TRANSPORT error — nothing was
+        // delivered and nothing ever will be. Treating that faulted task as a settled wait
+        // returned a waiter, and the builder then fired the remote trigger with no live
+        // subscription and no recovery state left to route its response. Registration must throw
+        // so the operation never starts. Deterministic: the loop's cleanup deletes the recovery
+        // state, and observing that delete is what releases the parked save — so the loop death
+        // is strictly inside the registration window.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-loop-death");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.FailSubscription(new IOException("stream down"));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => waiterTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("failed before registration completed", ex.Message, StringComparison.Ordinal);
+        Assert.IsType<IOException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_LoopFaultLosingToATerminalPayload_StillReturnsTheDeliveredResponse()
+    {
+        // The other direction of the loop-death guard: a terminal payload settles the wait, and
+        // the consume loop THEN faults (its next read observes the failed stream). The loop's
+        // settlement attempt loses — so it must leave no mark: aborting the registration here
+        // would discard a response the waiter already holds. A side-band flag raced exactly this
+        // way; the settlement-source marker cannot (only a fault that WINS the settlement marks
+        // the task). Deterministic: the terminal message and the stream failure are enqueued
+        // before the loop processes either, and the parked save releases only once the terminal's
+        // cleanup delete is observed.
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanupDeleteIssued = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await cleanupDeleteIssued.Task;
+            });
+        _store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .Callback(() => cleanupDeleteIssued.TrySetResult());
+        var channel = CreateChannel();
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>("corr-loop-lost-race");
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        _client.Push(JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        _client.FailSubscription(new IOException("stream down after delivery"));
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("delivered", (await waiter.ResponseTask).Message);
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WithoutExecutionContext_UsesRecoveryExpiryTimeoutFallback()
     {
         Task<IAsyncResponseWaiter<OperationResult>> waiterTask;

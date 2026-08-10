@@ -45,7 +45,8 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         _ = RabbitMqOptionsValidator.Required(options.WorkerExchange, nameof(options.WorkerExchange));
         _ = RabbitMqOptionsValidator.Required(options.WorkerQueue, nameof(options.WorkerQueue));
         _ = RabbitMqOptionsValidator.Required(options.WorkerRoutingKey, nameof(options.WorkerRoutingKey));
-        RabbitMqOptionsValidator.Positive(options.ShutdownTimeout, nameof(options.ShutdownTimeout));
+        RabbitMqOptionsValidator.ValidateConnection(options);
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(RabbitMqAsyncResponseOptions), nameof(options.ShutdownTimeout));
     }
 
     private async Task<IRabbitMqChannel> GetChannelAsync(CancellationToken cancellationToken)

@@ -73,7 +73,8 @@ jobs:
           LOADTEST_DURATION: ${{ github.event.inputs.duration || '30' }}
           LOADTEST_EXTRA_ARGS: ${{ github.event.inputs.extra_args || '' }}
           LOADTEST_APPHOST_ENV: ${{ github.event.inputs.apphost_env || '' }}
-          ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: 'true'
+          # No ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS here: the load test asks the AppHost for its own
+          # "loadtest" batch, which never declares Oracle or Cosmos — nothing load-tested touches them.
         run: |
           python3 - <<'PY' > "$RUNNER_TEMP/loadtest-env"
           import os

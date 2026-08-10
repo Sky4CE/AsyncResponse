@@ -1922,6 +1922,12 @@ app.MapPost("/lost-subscriber-flow", async (
         };
         normalized = status.ToString();
         await publisher.SetResponse(new OperationResult { Status = status, Message = "late" }, correlationId);
+
+        // A Running response is a non-terminal checkpoint: recovery classifies it KeepWaiting —
+        // no callback fires and the registration stays armed — so follow it with the terminal
+        // success to show the retained registration routing the real result.
+        if (status == OperationStatus.Running)
+            await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "late terminal" }, correlationId);
     }
 
     var callbackKind = normalized is nameof(OperationStatus.Completed) or nameof(OperationStatus.Running)

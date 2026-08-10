@@ -96,7 +96,59 @@ public sealed class RedisChannelCoverageTests
             instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
             Times.Exactly(2));
         _store.Verify(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        // The second dispatch consumed the registration only because ITS liveness re-check agreed
+        // the waiter is gone — the probe must have been consulted both times.
+        Assert.Equal(2, probes);
     }
+
+    /// <summary>
+    /// Publishes keep reaching nobody while PUBSUB NUMSUB keeps reporting a live waiter — a
+    /// contradiction (subscription landing on another node, or propagation lag). Consuming
+    /// recovery registrations on that evidence would strip a live waiter of its recovery arm, so
+    /// after the bounded retry the publish leaves all state intact.
+    /// </summary>
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_LeavesRecoveryIntactWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
+    {
+        using var activities = new AsyncResponseActivityCollector();
+        _liveSubscribers = 1;
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([NewRecoveryState("corr-contradiction")]);
+
+        await PublishAsync(CreateChannel(), kind, "corr-contradiction");
+
+        // Bounded: one re-publish, then hands off to the intact registration instead of looping.
+        _subscriber.Verify(
+            instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
+            Times.Exactly(2));
+        _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    private static RecoveryState NewRecoveryState(string correlationId) => new()
+    {
+        RegistrationId = Guid.NewGuid(),
+        CorrelationId = correlationId,
+        PayloadTypeFullName = typeof(OperationResult).FullName,
+        RegisteredAtUtc = DateTime.UtcNow,
+        ResumeCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnResume),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
+        },
+        FailureCallback = new ReflectionCallDto
+        {
+            ServiceInterfaceFullName = typeof(IRecoverySpy).FullName!,
+            MethodName = nameof(IRecoverySpy.OnFailure),
+            Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+        }
+    };
 
     /// <summary>Every publish entry point opens an activity and tags the channel and subscriber count.</summary>
     [Fact]

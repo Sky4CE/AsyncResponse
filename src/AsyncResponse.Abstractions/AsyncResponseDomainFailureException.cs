@@ -3,8 +3,8 @@ namespace AsyncResponse;
 /// <summary>
 /// Raised by the lost-subscriber fallback when a response payload published through
 /// <see cref="IAsyncResponsePublisher.SetResponse{T}"/> reports — via
-/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> returning <c>false</c> — that it
-/// should <em>not</em> resume the flow, and no subscriber was listening on the correlation channel
+/// <see cref="IAsyncResponsePayload.OnRecovery"/> returning <see cref="RecoveryAction.Fail"/> —
+/// that it should <em>not</em> resume the flow, and no subscriber was listening on the correlation channel
 /// (typically after a redeploy/restart).
 /// <para>
     /// Instances of this exception are passed to the failure callback registered through

@@ -18,9 +18,11 @@ public enum FlowRunStatus
     Failed = 2,
 
     /// <summary>
-    /// The run is parked by an operator. Wake-ups, recoveries, resumes, and failure signals are
-    /// all ignored while suspended, so a dead-lettered run cannot be resurrected or terminally
-    /// failed behind the operator's back by a late response. Not terminal: set the status back to
+    /// The run is parked by an operator. Wake-ups, resumes, and failure signals are ignored
+    /// while suspended, so a dead-lettered run cannot be resurrected or terminally failed behind
+    /// the operator's back by a late response. A recovered TERMINAL response is not discarded:
+    /// it is checkpointed into the suspended run's ledger without waking it, so un-parking
+    /// replays from that preserved result. Not terminal: set the status back to
     /// <see cref="Running"/> and call <c>IDurableFlowExecutor.ResumeAsync</c> to replay the run
     /// from its checkpoints. A parent awaiting a suspended child keeps waiting.
     /// </summary>
@@ -113,6 +115,17 @@ public sealed class FlowStepState
     public string? PendingCorrelationId { get; set; }
 
     /// <summary>
+    /// Full name of the awaited step's declared response type, recorded alongside
+    /// <see cref="PendingCorrelationId"/>. Lost-subscriber recovery serializes its checkpoint AS
+    /// this type so the wire shape replay deserializes (polymorphic discriminators included) —
+    /// the recovered payload's runtime type may be a derived type whose runtime-type
+    /// serialization would not round-trip through the declared type. Cleared when the step
+    /// completes. Additive: absent on ledgers written before it existed, in which case recovery
+    /// falls back to the payload's runtime type.
+    /// </summary>
+    public string? PendingPayloadTypeFullName { get; set; }
+
+    /// <summary>
     /// Whether the last attempt of this step faulted (timeout or exception); a faulted awaited
     /// step is restarted fresh instead of re-attached.
     /// </summary>
@@ -123,6 +136,15 @@ public sealed class FlowStepState
 
     /// <summary>Child flow run id when this checkpoint is waiting for a child flow.</summary>
     public string? ChildFlowId { get; set; }
+
+    /// <summary>
+    /// The durable timer's due time when this step is a <c>DelayAsync</c>/<c>DelayUntilAsync</c>
+    /// timer. Persisted when the timer is first reached, so replays wait out the <em>remainder</em>
+    /// instead of restarting the delay, and a wake-up delivered early re-parks until this instant.
+    /// Cleared semantics: stays set after completion as the historical due time. Additive wire
+    /// property: absent on ledgers written before timers existed.
+    /// </summary>
+    public DateTime? WakeAtUtc { get; set; }
 
     /// <summary>UTC timestamp the step completed.</summary>
     public DateTime? CompletedAtUtc { get; set; }

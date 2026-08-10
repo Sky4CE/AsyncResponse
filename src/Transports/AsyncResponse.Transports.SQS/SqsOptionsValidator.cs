@@ -47,10 +47,10 @@ internal static class SqsOptionsValidator
         if (SqsQueueAddress.IsFifo(options.WorkerQueue))
             Required(options.FifoMessageGroupIdFallback, nameof(options.FifoMessageGroupIdFallback));
 
-        Positive(options.PublishRetryBaseDelay, nameof(options.PublishRetryBaseDelay));
-        Positive(options.PublishRetryMaxDelay, nameof(options.PublishRetryMaxDelay));
-        Positive(options.SubscriberRetryBaseDelay, nameof(options.SubscriberRetryBaseDelay));
-        Positive(options.SubscriberRetryMaxDelay, nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryBaseDelay, nameof(SqsAsyncResponseOptions), nameof(options.PublishRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(SqsAsyncResponseOptions), nameof(options.PublishRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(SqsAsyncResponseOptions), nameof(options.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(SqsAsyncResponseOptions), nameof(options.SubscriberRetryMaxDelay));
 
         if (options.PublishRetryBaseDelay > options.PublishRetryMaxDelay)
             throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{nameof(options.PublishRetryBaseDelay)} cannot exceed {nameof(options.PublishRetryMaxDelay)}.");
@@ -83,11 +83,9 @@ internal static class SqsOptionsValidator
 
         if (subscriberOptions.VisibilityRenewalInterval is { } renewalInterval)
         {
-            if (renewalInterval <= TimeSpan.Zero)
-            {
-                throw new InvalidOperationException(
-                    $"{optionPath}.{nameof(SqsSubscriberOptions.VisibilityRenewalInterval)} must be positive when set.");
-            }
+            // The renewal heartbeat arms Task.Delay, so the interval carries the timer ceiling
+            // (in practice the shorter-than-visibility rule below is far tighter).
+            AsyncResponseChannelOptions.EnsureTimerBacked(renewalInterval, optionPath, nameof(SqsSubscriberOptions.VisibilityRenewalInterval));
 
             if (subscriberOptions.VisibilityTimeout is not { } renewedVisibility)
             {
@@ -124,11 +122,7 @@ internal static class SqsOptionsValidator
                         $"when {nameof(SqsSubscriberOptions.AckMode)} is {nameof(SqsAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                {
-                    throw new InvalidOperationException(
-                        $"{optionPath}.{nameof(SqsSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
-                }
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(SqsSubscriberOptions.BackgroundDrainTimeout));
 
                 // SQS subscribers spend only the background drain at shutdown; the receive loop
                 // stops with the host token and the SDK client needs no bounded close.
@@ -151,9 +145,4 @@ internal static class SqsOptionsValidator
             ? value
             : throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{name} must be configured.");
 
-    private static void Positive(TimeSpan value, string name)
-    {
-        if (value <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{name} must be positive.");
-    }
 }

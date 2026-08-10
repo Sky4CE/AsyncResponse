@@ -73,9 +73,8 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
-                var retryDelay = Options.NetworkRecoveryInterval > TimeSpan.Zero
-                    ? Options.NetworkRecoveryInterval
-                    : TimeSpan.FromSeconds(5);
+                // Strictly positive and timer-bounded by validation — usable directly.
+                var retryDelay = Options.NetworkRecoveryInterval;
                 Logger.LogWarning(
                     ex,
                     "RabbitMQ subscriber could not start for queue {Queue} ({Role}); retrying in {RetryDelay}.",

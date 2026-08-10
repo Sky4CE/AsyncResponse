@@ -38,10 +38,10 @@ public class SerializationBenchmarks
             _envelopeJson, AsyncResponseEnvelopeOptions<BenchPayload>.Instance)!.Payload!.Status;
 
     [Benchmark]
-    public bool? Classify_TypedPayload()
-        => PayloadRecoveryClassifier.ShouldResume(Payload, _payloadTypeName);
+    public RecoveryAction? Classify_TypedPayload()
+        => PayloadRecoveryClassifier.Classify(Payload, _payloadTypeName).Action;
 
     [Benchmark]
-    public bool? Classify_RawJson()
-        => PayloadRecoveryClassifier.ShouldResume(_rawJson, _payloadTypeName);
+    public RecoveryAction? Classify_RawJson()
+        => PayloadRecoveryClassifier.Classify(_rawJson, _payloadTypeName).Action;
 }

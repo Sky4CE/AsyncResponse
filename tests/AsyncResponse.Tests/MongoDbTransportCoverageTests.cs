@@ -155,7 +155,7 @@ public sealed class MongoDbTransportCoverageTests
     [Fact]
     public void Registration_UsesSharedClientOrOwnedClient_WhenNoDatabaseIsRegistered()
     {
-        var database = new Mock<IMongoDatabase>();
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
         var client = new Mock<IMongoClient>();
         client.Setup(c => c.GetDatabase("shared_db", It.IsAny<MongoDatabaseSettings>())).Returns(database.Object);
         var sharedServices = Services();
@@ -205,7 +205,7 @@ public sealed class MongoDbTransportCoverageTests
 
     private static Mock<IMongoDatabase> Database(IMongoCollection<MongoTransportMessageDocument> collection)
     {
-        var database = new Mock<IMongoDatabase>(MockBehavior.Loose);
+        var database = new Mock<IMongoDatabase>(MockBehavior.Loose).WithTestNamespace();
         database
             .Setup(d => d.GetCollection<MongoTransportMessageDocument>(
                 It.IsAny<string>(),

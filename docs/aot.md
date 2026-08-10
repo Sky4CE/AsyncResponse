@@ -91,7 +91,7 @@ Two operational caveats under Native AOT:
   are loud, not silent.
 
 One behavioral note: the durable channels' fail-fast check that a recovery-enabled payload
-actually overrides `ShouldResumeOnRecovery` relies on `Type.GetInterfaceMap`, which Native AOT
+actually overrides `OnRecovery` relies on `Type.GetInterfaceMap`, which Native AOT
 cannot compute for interfaces with default implementations. Implicit (public-method)
 implementations are still detected; for the rare explicit-implementation shape the check fails
 *open* under Native AOT — a payload that silently inherits the conservative default is caught at

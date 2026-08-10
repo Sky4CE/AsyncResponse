@@ -329,6 +329,7 @@ public sealed class MongoDbSubscriberServiceTests
                     It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new DeleteResult.Acknowledged(1));
 
+            Database.WithTestNamespace();
             _store = new MongoDbTransportStore(Database.Object, _options);
         }
 
@@ -406,51 +407,4 @@ public sealed class MongoDbSubscriberServiceTests
         }
     }
 
-    /// <summary>Captures rendered log messages so a background loop can be awaited rather than slept on.</summary>
-    internal sealed class CollectingLogger
-    {
-        private readonly List<string> _messages = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _messages.ToArray(); }
-        }
-
-        public Microsoft.Extensions.Logging.ILogger<T> For<T>() => new Typed<T>(this);
-
-        public async Task WaitForAsync(string fragment, int occurrences = 1)
-        {
-            var deadline = DateTime.UtcNow.AddSeconds(30);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (Messages.Count(message => message.Contains(fragment, StringComparison.Ordinal)) >= occurrences)
-                    return;
-                await Task.Delay(15);
-            }
-
-            Assert.Fail($"Timed out waiting for '{fragment}'. Saw: {string.Join(" | ", Messages)}");
-        }
-
-        private void Add(string message)
-        {
-            lock (_gate) _messages.Add(message);
-        }
-
-        private sealed class Typed<T>(CollectingLogger owner) : Microsoft.Extensions.Logging.ILogger<T>
-        {
-            public IDisposable? BeginScope<TState>(TState state) where TState : notnull
-                => NullLogger.Instance.BeginScope(state);
-
-            public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-
-            public void Log<TState>(
-                Microsoft.Extensions.Logging.LogLevel logLevel,
-                Microsoft.Extensions.Logging.EventId eventId,
-                TState state,
-                Exception? exception,
-                Func<TState, Exception?, string> formatter)
-                => owner.Add(formatter(state, exception));
-        }
-    }
 }

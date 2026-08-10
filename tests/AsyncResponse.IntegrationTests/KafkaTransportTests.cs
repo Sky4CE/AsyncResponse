@@ -9,8 +9,9 @@ namespace AsyncResponse.IntegrationTests;
 /// consumed over classic consumer groups with manual offset management, and responses ingested
 /// from a Kafka response topic into active waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class KafkaTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
+public sealed class KafkaTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckKafkaModes()

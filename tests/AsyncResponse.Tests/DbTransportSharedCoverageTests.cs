@@ -45,6 +45,67 @@ public sealed class DbTransportSharedCoverageTests
     }
 
     /// <summary>
+    /// A handler that completes before the first beat produces no renewal activity — the beat is
+    /// cancelled exception-free before it fires — and the grace wait proves nothing keeps beating
+    /// after the ack (no leaked renewal loop). The heartbeat is still ARMED before the handler
+    /// runs; see the blocking-handler fact for why that must never be lazy.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task FastHandler_AcksWithoutRenewalActivity_AndLeaksNoHeartbeat(Provider provider)
+    {
+        var calls = new Calls();
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromMilliseconds(20),
+            calls: calls,
+            handler: static () => Task.CompletedTask);
+
+        // Several beat intervals of grace: a leaked heartbeat would renew here.
+        await Task.Delay(100);
+        Assert.Equal(1, calls.Ack);
+        Assert.Equal(0, calls.Renew);
+    }
+
+    /// <summary>
+    /// The heartbeat must be armed BEFORE any user code runs: a handler can burn its whole lease
+    /// synchronously (CPU work or blocking I/O with no await), and only an already-armed beat —
+    /// firing on a timer thread — can renew under the blocked handler thread. This handler never
+    /// yields until it OBSERVES a renewal, so a lazily-armed heartbeat (armed only after the
+    /// first incomplete await) fails this fact by timeout.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task SynchronouslyBlockingHandler_IsRenewedUnderTheBlockedThread(Provider provider)
+    {
+        var calls = new Calls();
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromMilliseconds(100),
+            calls: calls,
+            handler: () =>
+            {
+                var blockedUntil = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                while (Volatile.Read(ref calls.Renew) < 1 && DateTime.UtcNow < blockedUntil)
+                    Thread.Sleep(10);
+                return Task.CompletedTask;
+            });
+
+        Assert.True(calls.Renew >= 1, "the lease was never renewed while the handler blocked its thread");
+        Assert.Equal(1, calls.Ack);
+    }
+
+    /// <summary>
     /// When the handler fails after an early ACK, the message is already gone from the queue, so a
     /// dead-letter that also fails leaves the failure observable only through logs and the callback —
     /// which is exactly what it must say.
@@ -201,28 +262,4 @@ public sealed class DbTransportSharedCoverageTests
         }
     }
 
-    private sealed class CollectingLogger : Microsoft.Extensions.Logging.ILogger
-    {
-        private readonly List<string> _messages = [];
-        private readonly object _gate = new();
-
-        public IReadOnlyList<string> Messages
-        {
-            get { lock (_gate) return _messages.ToArray(); }
-        }
-
-        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullLogger.Instance.BeginScope(state);
-
-        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
-
-        public void Log<TState>(
-            Microsoft.Extensions.Logging.LogLevel logLevel,
-            Microsoft.Extensions.Logging.EventId eventId,
-            TState state,
-            Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
-            lock (_gate) _messages.Add(formatter(state, exception));
-        }
-    }
 }

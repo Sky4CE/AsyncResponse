@@ -26,7 +26,9 @@ public static class AsyncResponseHealthCheckExtensions
         builder.Services.TryAddSingleton<AsyncResponseWatchdogState>();
         builder.Add(new HealthCheckRegistration(
             name,
-            provider => new AsyncResponseRecoveryHealthCheck(provider.GetRequiredService<AsyncResponseWatchdogState>()),
+            // Pass the engine clock: the watchdog stamps ScanCompletedUtc from it, and the staleness
+            // math is meaningless (negative or permanently tripped) if the two sides read different clocks.
+            provider => new AsyncResponseRecoveryHealthCheck(provider.GetRequiredService<AsyncResponseWatchdogState>(), provider.GetService<TimeProvider>()),
             failureStatus: HealthStatus.Degraded,
             tags));
 

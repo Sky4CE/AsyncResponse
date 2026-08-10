@@ -39,6 +39,28 @@ public sealed class WorkerJobEnvelope
     /// delivered through a broker ingress. <c>null</c> when no context propagators are registered.
     /// </summary>
     public Dictionary<string, string>? Context { get; set; }
+
+    /// <summary>
+    /// UTC instant before which this job must not execute; <c>null</c> for ordinary immediate jobs.
+    /// Stamped by delayed publishes (<see cref="IDelayedWorkerTransport"/>). The worker-job
+    /// executor enforces it: a job delivered early — broker imprecision, or a chunked hop on a
+    /// transport whose per-publish delay is capped — is re-published for the remaining delay
+    /// instead of executed, so the due time holds on every transport. Additive wire property:
+    /// absent on jobs written before it existed.
+    /// </summary>
+    public DateTime? NotBeforeUtc { get; set; }
+
+    /// <summary>
+    /// The remaining delay observed the last time the worker-job executor re-published this job
+    /// for a further hop of the <see cref="NotBeforeUtc"/> chunk chain; <c>null</c> until the
+    /// first re-publish. Consecutive hops must shrink this value: when the due time was stamped
+    /// by a different clock than the one gating delivery (client-computed schedule vs the broker
+    /// clock), a skewed consumer would otherwise re-publish the same remainder forever — and each
+    /// hop is a fresh message id, so delivery counters reset and the loop could never dead-letter.
+    /// On a no-progress hop the executor runs the job (early by the skew) instead of re-publishing.
+    /// Additive wire property: absent on jobs written before it existed.
+    /// </summary>
+    public TimeSpan? LastRedelayRemaining { get; set; }
 }
 
 /// <summary>

@@ -77,6 +77,10 @@ internal sealed class SqsClientAdapter(
             MessageGroupId = message.MessageGroupId,
             MessageDeduplicationId = message.MessageDeduplicationId
         };
+        // Native per-message delay (standard queues; 0–900s). Longer waits arrive chunked: the
+        // envelope's NotBeforeUtc re-publish chain in the worker-job executor takes the next hop.
+        if (message.DelaySeconds is { } delaySeconds)
+            request.DelaySeconds = delaySeconds;
 
         foreach (var attribute in message.MessageAttributes)
         {
@@ -207,7 +211,8 @@ internal sealed record SqsOutboundMessage(
     string? CorrelationId,
     string? MessageGroupId,
     string? MessageDeduplicationId,
-    IReadOnlyDictionary<string, string> MessageAttributes);
+    IReadOnlyDictionary<string, string> MessageAttributes,
+    int? DelaySeconds = null);
 
 internal sealed record SqsReceiveRequest(
     string QueueUrl,

@@ -27,6 +27,8 @@
     <InternalsVisibleTo Include="AsyncResponse.Transports.SqlServer" Key="$(AsyncResponsePublicKey)" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.SQS" Key="$(AsyncResponsePublicKey)" />
     <InternalsVisibleTo Include="AsyncResponse.Transports.Redis" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.DurableFlows.MongoDB" Key="$(AsyncResponsePublicKey)" />
+    <InternalsVisibleTo Include="AsyncResponse.Testing" Key="$(AsyncResponsePublicKey)" />
     <InternalsVisibleTo Include="AsyncResponse.Tests" Key="$(AsyncResponsePublicKey)" />
     <!-- Moq/Castle proxies of internal seams (test doubles for vendor-client adapters); the
          well-known DynamicProxyGenAssembly2 identity is required once assemblies are signed. -->

@@ -36,6 +36,18 @@
     <Compile Include="..\Shared\ChannelConformanceSuite.cs" Link="Shared\ChannelConformanceSuite.cs" />
   </ItemGroup>
 
+  <!-- The provider cross product (channel x transport x durable-flow store). ProviderMatrix.cs
+       enumerates the combinations and partitions them into container-footprint shards; MatrixHarness.cs
+       wires and runs one combination. Shared source rather than test-project source because the
+       unit-test project derives the same suites for the in-memory combination. -->
+  <ItemGroup>
+    <Compile Include="..\Shared\ProviderMatrix.cs" Link="Shared\ProviderMatrix.cs" />
+    <Compile Include="..\Shared\MatrixHarness.cs" Link="Shared\MatrixHarness.cs" />
+    <Compile Include="..\Shared\MatrixScenarios.cs" Link="Shared\MatrixScenarios.cs" />
+    <Compile Include="..\Shared\TransportCapabilities.cs" Link="Shared\TransportCapabilities.cs" />
+    <Compile Include="..\Shared\TransportConformanceSuite.cs" Link="Shared\TransportConformanceSuite.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- The AppHost orchestrates the SUT (Projects.AsyncResponse_IntegrationTests_AppHost). The sample app *is* the
          SUT: it provides the shared DTO types (OperationResult / OperationStatus / FlowCall) and its Program entry
@@ -57,8 +69,14 @@
     <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.SqlServer\AsyncResponse.DurableFlows.SqlServer.csproj" />
     <ProjectReference Include="..\..\src\DurableFlows\AsyncResponse.DurableFlows.Sqlite\AsyncResponse.DurableFlows.Sqlite.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.AzureServiceBus\AsyncResponse.Transports.AzureServiceBus.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.GooglePubSub\AsyncResponse.Transports.GooglePubSub.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.Kafka\AsyncResponse.Transports.Kafka.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.MongoDB\AsyncResponse.Transports.MongoDB.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.NATS\AsyncResponse.Transports.NATS.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.PostgreSQL\AsyncResponse.Transports.PostgreSQL.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.RabbitMQ\AsyncResponse.Transports.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.Redis\AsyncResponse.Transports.Redis.csproj" />
+    <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SQS\AsyncResponse.Transports.SQS.csproj" />
     <ProjectReference Include="..\..\src\Transports\AsyncResponse.Transports.SqlServer\AsyncResponse.Transports.SqlServer.csproj" />
   </ItemGroup>
 

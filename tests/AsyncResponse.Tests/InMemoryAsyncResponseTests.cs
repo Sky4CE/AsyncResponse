@@ -758,6 +758,96 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_SaveFailureAfterTerminalSettledTheWait_ReturnsTheCompletedWaiter()
+    {
+        // A response settles the wait while the recovery-state save is in flight, and the save
+        // then FAILS. Rethrowing (the plain registration-failure contract) would discard a
+        // response the waiter already holds — the exact loss the library exists to prevent — and
+        // the same interleaving with a healthy store returns the completed waiter. Deterministic
+        // because SetResponse dispatches inline: once it returns, the wait has settled and
+        // cleanup has run, so failing the save afterwards is guaranteed post-settlement.
+        var services = new ServiceCollection().BuildServiceProvider();
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSave = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new Mock<IRecoveryStateStore>();
+        store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await releaseSave.Task.ConfigureAwait(false);
+                throw new InvalidOperationException("recovery save failed");
+            });
+        store
+            .Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store.Object,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>(CorrelationId, timeout: TimeSpan.FromSeconds(5));
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "settled" }, CorrelationId);
+        releaseSave.TrySetResult();
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("settled", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_CompensationDeleteFailure_StillReturnsTheCompletedWaiter()
+    {
+        // The post-save compensation delete is best-effort, mirroring the broker channels: the
+        // waiter already holds its response, so a store fault on the second delete must not fail
+        // the create — the orphaned registration is bounded by TTL and the recovery watchdog.
+        var services = new ServiceCollection().BuildServiceProvider();
+        var saveStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSave = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new Mock<IRecoveryStateStore>();
+        store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                saveStarted.TrySetResult();
+                await releaseSave.Task.ConfigureAwait(false);
+            });
+        store
+            .SetupSequence(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ThrowsAsync(new InvalidOperationException("compensation delete failed"));
+        var channel = new InMemoryAsyncResponseChannel(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            store.Object,
+            Options.Create(new InMemoryAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            }),
+            new AsyncResponseContextPropagation([]),
+            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+
+        var waiterTask = channel.CreateResponseWaiter<OperationResult>(CorrelationId, timeout: TimeSpan.FromSeconds(5));
+        await saveStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // Settles the wait and runs cleanup (its delete succeeds); the save then commits, and the
+        // compensation delete — the second store call — throws.
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "kept" }, CorrelationId);
+        releaseSave.TrySetResult();
+
+        await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("kept", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+        store.Verify(s => s.TryDeleteAsync(CorrelationId, It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+    }
+
+    [Fact]
     public async Task Publishers_WhenRecoveryReadFails_Propagate()
     {
         var services = new ServiceCollection().BuildServiceProvider();
@@ -910,7 +1000,7 @@ public class InMemoryAsyncResponseTests
     {
         public SelfReferencingFailurePayload? Self { get; set; }
 
-        public bool ShouldResumeOnRecovery() => false;
+        public RecoveryAction OnRecovery() => RecoveryAction.Fail;
     }
 
     private sealed class RetryLiveRecoveryStore : IRecoveryStateStore
