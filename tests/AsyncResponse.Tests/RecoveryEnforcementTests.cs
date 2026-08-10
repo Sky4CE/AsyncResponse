@@ -70,6 +70,37 @@ public class RecoveryEnforcementTests
     }
 
     [Fact]
+    public async Task DurableFlow_AwaitingAPayloadWithoutOverride_FailsFastWithGuidance()
+    {
+        // A durable flow registers recovery callbacks on EVERY awaited step, so a payload without
+        // the override fails at waiter creation — on the in-memory channel exactly as on Redis.
+        // The regression this pins: when the in-memory channel gained the recoverable contract,
+        // this became a fresh failure for flows that previously ran (a benchmark flow hit it), and
+        // the transport's retry budget turned the fast failure into a long silent grind. The error
+        // must name the payload and the override so the cause is obvious on the first log line.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddScoped<UnannotatedPayloadFlow>();
+        services.AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithInMemoryTransport()
+            .WithInMemoryDurableFlows();
+
+        await using var provider = services.BuildServiceProvider();
+        var flows = provider.GetRequiredService<IDurableFlows>();
+        var executor = provider.GetRequiredService<IDurableFlowExecutor>();
+
+        var flowId = await flows.StartAsync<UnannotatedPayloadFlow, UnannotatedPayloadInput>(new UnannotatedPayloadInput(1));
+
+        // Driven directly: the worker host never starts here, so the failure surfaces once instead
+        // of through the transport's retry budget.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(flowId));
+
+        Assert.Contains(nameof(IAsyncResponsePayload.OnRecovery), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(typeof(DefaultRecoveryPayload).ToString(), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task InMemoryChannel_RecoveryCallbackWithoutOverride_FailsFastLikeDurableChannels()
     {
         var provider = InMemoryProvider();
@@ -125,4 +156,13 @@ public class RecoveryEnforcementTests
 public sealed class DefaultRecoveryPayload : IAsyncResponsePayload
 {
     public string? Message { get; set; }
+}
+
+public sealed record UnannotatedPayloadInput(int Id);
+
+/// <summary>Awaits a payload that never overrides <c>OnRecovery</c> — the guarded combination.</summary>
+public sealed class UnannotatedPayloadFlow : IDurableFlow<UnannotatedPayloadInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, UnannotatedPayloadInput input)
+        => await flow.AwaitStepAsync<DefaultRecoveryPayload>("remote", _ => Task.CompletedTask);
 }

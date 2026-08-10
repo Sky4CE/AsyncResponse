@@ -64,6 +64,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   recoverable builder — what passes in tests passes on Redis. Recovery spans waiter loss within
   one process lifetime (and the Testing harness's simulated restarts); a real process exit still
   loses the process-local store.
+  > **Breaking for in-memory durable flows.** Every payload a flow awaits must now override
+  > `IAsyncResponsePayload.OnRecovery()` on the in-memory channel too — previously only durable
+  > channels enforced it, so a flow that ran in-memory could fail at its first awaited step after
+  > moving to Redis. Waiter creation now fails fast with the payload type and the required
+  > override named. Typical mapping: terminal success → `Resume`, terminal failure → `Fail`,
+  > progress/checkpoint payloads → `KeepWaiting` (see [recovery.md](docs/recovery.md)).
 - `FlowStepState` gains an additive `WakeAtUtc` property (the timer breadcrumb);
   `FlowStateSchema`/`RecoveryStateSchema`/`WorkerJobEnvelopeSchema` stay at version 1.
 - The flow executor's host-lifetime hookup is now actually wired through DI (the lease-poll
