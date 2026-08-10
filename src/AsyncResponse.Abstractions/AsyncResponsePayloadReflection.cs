@@ -7,7 +7,7 @@ namespace AsyncResponse;
 /// <summary>
 /// Reflection helpers over <see cref="IAsyncResponsePayload"/> implementations. Durable channels
 /// use this to fail fast when a recovery-enabled flow's payload has not overridden
-/// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> and would otherwise silently take the
+/// <see cref="IAsyncResponsePayload.OnRecovery"/> and would otherwise silently take the
 /// conservative default (never resume).
 /// </summary>
 public static class AsyncResponsePayloadReflection
@@ -16,12 +16,18 @@ public static class AsyncResponsePayloadReflection
 
     /// <summary>
     /// Returns <c>true</c> when <paramref name="payloadType"/> provides its own implementation of
-    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> rather than inheriting the
-    /// interface's default. The result is cached per type.
+    /// <see cref="IAsyncResponsePayload.OnRecovery"/> rather than inheriting the interface's
+    /// default. The result is cached per type.
     /// </summary>
-    public static bool OverridesShouldResumeOnRecovery(Type payloadType)
+    public static bool OverridesOnRecovery(Type payloadType)
     {
         ArgumentNullException.ThrowIfNull(payloadType);
+
+        // Collectible (plugin) payload types are detected per call: a strong Type-keyed cache
+        // entry would pin the plugin's AssemblyLoadContext after unload. The detection is a cheap
+        // reflection probe on a startup/registration path, so the cold cost is immaterial.
+        if (payloadType.Assembly.IsCollectible)
+            return DetectOverride(payloadType);
 
         return OverrideCache.GetOrAdd(payloadType, DetectOverride);
     }
@@ -36,14 +42,14 @@ public static class AsyncResponsePayloadReflection
             return false;
 
         // Implicit implementations (the overwhelmingly common shape) declare a public
-        // ShouldResumeOnRecovery on the class itself — detectable without the interface map.
-        if (type.GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery), BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes) is not null)
+        // OnRecovery on the class itself — detectable without the interface map.
+        if (type.GetMethod(nameof(IAsyncResponsePayload.OnRecovery), BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes) is not null)
             return true;
 
         try
         {
             var map = type.GetInterfaceMap(typeof(IAsyncResponsePayload));
-            var interfaceMethod = typeof(IAsyncResponsePayload).GetMethod(nameof(IAsyncResponsePayload.ShouldResumeOnRecovery))!;
+            var interfaceMethod = typeof(IAsyncResponsePayload).GetMethod(nameof(IAsyncResponsePayload.OnRecovery))!;
             var index = Array.IndexOf(map.InterfaceMethods, interfaceMethod);
 
             // When the type does not implement the method, the interface map points the target

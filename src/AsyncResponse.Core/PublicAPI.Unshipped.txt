@@ -14,7 +14,7 @@ AsyncResponse.AsyncResponseOptions.AsyncResponseOptions() -> void
 AsyncResponse.AsyncResponseOptions.Watchdog.get -> AsyncResponse.AsyncResponseWatchdogOptions!
 AsyncResponse.AsyncResponseOptions.Watchdog.set -> void
 AsyncResponse.AsyncResponseRecoveryHealthCheck
-AsyncResponse.AsyncResponseRecoveryHealthCheck.AsyncResponseRecoveryHealthCheck(AsyncResponse.AsyncResponseWatchdogState! _state) -> void
+AsyncResponse.AsyncResponseRecoveryHealthCheck.AsyncResponseRecoveryHealthCheck(AsyncResponse.AsyncResponseWatchdogState! _state, System.TimeProvider? _timeProvider = null) -> void
 AsyncResponse.AsyncResponseRecoveryHealthCheck.CheckHealthAsync(Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckContext! context, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult>!
 AsyncResponse.AsyncResponseRecoveryStats
 AsyncResponse.AsyncResponseRecoveryStats.<Clone>$() -> AsyncResponse.AsyncResponseRecoveryStats!
@@ -85,6 +85,10 @@ AsyncResponse.AsyncResponseWatchdogState
 AsyncResponse.AsyncResponseWatchdogState.AsyncResponseWatchdogState() -> void
 AsyncResponse.AsyncResponseWatchdogState.Latest.get -> AsyncResponse.AsyncResponseWatchdogSnapshot?
 AsyncResponse.AsyncResponseWatchdogState.Publish(AsyncResponse.AsyncResponseWatchdogSnapshot! snapshot) -> void
+AsyncResponse.CronSchedule
+AsyncResponse.CronSchedule.Expression.get -> string!
+AsyncResponse.CronSchedule.GetNextOccurrence(System.DateTimeOffset afterUtc) -> System.DateTimeOffset?
+AsyncResponse.CronSchedule.TimeZone.get -> System.TimeZoneInfo!
 AsyncResponse.DurableAsyncResponseChannelOptions
 AsyncResponse.DurableAsyncResponseChannelOptions.DurableAsyncResponseChannelOptions() -> void
 AsyncResponse.DurableAsyncResponseChannelOptions.IncludeRemoteStackTrace.get -> bool
@@ -105,6 +109,8 @@ AsyncResponse.DurableFlowOptions.ProgressPersistenceInterval.get -> System.TimeS
 AsyncResponse.DurableFlowOptions.ProgressPersistenceInterval.set -> void
 AsyncResponse.DurableFlowOptions.StateExpiry.get -> System.TimeSpan
 AsyncResponse.DurableFlowOptions.StateExpiry.set -> void
+AsyncResponse.DurableFlowOptions.TimerInProcessThreshold.get -> System.TimeSpan
+AsyncResponse.DurableFlowOptions.TimerInProcessThreshold.set -> void
 AsyncResponse.IDurableFlowExecutor
 AsyncResponse.IDurableFlowExecutor.ExecuteAsync(string! flowId) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowExecutor.FailAsync(string! flowId, System.Exception! exception) -> System.Threading.Tasks.Task!
@@ -114,12 +120,20 @@ AsyncResponse.InMemoryAsyncResponseOptions
 AsyncResponse.InMemoryAsyncResponseOptions.InMemoryAsyncResponseOptions() -> void
 AsyncResponse.InMemoryWorkerTransport
 AsyncResponse.InMemoryWorkerTransport.InMemoryWorkerTransport() -> void
-AsyncResponse.InMemoryWorkerTransport.InMemoryWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.InMemoryWorkerTransportOptions!>! options) -> void
+AsyncResponse.InMemoryWorkerTransport.InMemoryWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.InMemoryWorkerTransportOptions!>! options, System.TimeProvider? timeProvider = null) -> void
+AsyncResponse.InMemoryWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.InMemoryWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.InMemoryWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.InMemoryWorkerTransportOptions
 AsyncResponse.InMemoryWorkerTransportOptions.InMemoryWorkerTransportOptions() -> void
+AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.get -> int
+AsyncResponse.InMemoryWorkerTransportOptions.MaxDeliveryAttempts.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.QueueCapacity.set -> void
+AsyncResponse.InMemoryWorkerTransportOptions.RetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.InMemoryWorkerTransportOptions.RetryBaseDelay.set -> void
+AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.InMemoryWorkerTransportOptions.RetryMaxDelay.set -> void
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.get -> int
 AsyncResponse.InMemoryWorkerTransportOptions.WorkerCount.set -> void
 AsyncResponse.RecoveryStateObservation
@@ -135,11 +149,19 @@ AsyncResponse.RecoveryStateObservation.PayloadTypeFullName.init -> void
 AsyncResponse.RecoveryStateObservation.RecoveryStateObservation(string? CorrelationId, System.DateTime? RegisteredAtUtc, long ActiveSubscribers, string? PayloadTypeFullName) -> void
 AsyncResponse.RecoveryStateObservation.RegisteredAtUtc.get -> System.DateTime?
 AsyncResponse.RecoveryStateObservation.RegisteredAtUtc.init -> void
+AsyncResponse.ScheduledFlowOptions
+AsyncResponse.ScheduledFlowOptions.Enabled.get -> bool
+AsyncResponse.ScheduledFlowOptions.Enabled.set -> void
+AsyncResponse.ScheduledFlowOptions.ScheduledFlowOptions() -> void
+AsyncResponse.ScheduledFlowOptions.TimeZone.get -> System.TimeZoneInfo!
+AsyncResponse.ScheduledFlowOptions.TimeZone.set -> void
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(System.Func<string!, string!, bool>! predicate) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(System.Type! serviceType) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow(string! serviceInterfaceFullName) -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.Allow<TService>() -> Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList!
+Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowDurableFlowExecutor.get -> bool
+Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowDurableFlowExecutor.set -> void
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AsyncResponseCallbackAllowList() -> void
 Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions
 Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions
@@ -175,6 +197,7 @@ static AsyncResponse.AsyncResponseWatchdogReport.operator !=(AsyncResponse.Async
 static AsyncResponse.AsyncResponseWatchdogReport.operator ==(AsyncResponse.AsyncResponseWatchdogReport? left, AsyncResponse.AsyncResponseWatchdogReport? right) -> bool
 static AsyncResponse.AsyncResponseWatchdogSnapshot.operator !=(AsyncResponse.AsyncResponseWatchdogSnapshot? left, AsyncResponse.AsyncResponseWatchdogSnapshot? right) -> bool
 static AsyncResponse.AsyncResponseWatchdogSnapshot.operator ==(AsyncResponse.AsyncResponseWatchdogSnapshot? left, AsyncResponse.AsyncResponseWatchdogSnapshot? right) -> bool
+static AsyncResponse.CronSchedule.Parse(string! expression, System.TimeZoneInfo? timeZone = null) -> AsyncResponse.CronSchedule!
 static AsyncResponse.RecoveryStateObservation.operator !=(AsyncResponse.RecoveryStateObservation? left, AsyncResponse.RecoveryStateObservation? right) -> bool
 static AsyncResponse.RecoveryStateObservation.operator ==(AsyncResponse.RecoveryStateObservation? left, AsyncResponse.RecoveryStateObservation? right) -> bool
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions.AuthorizeCallbacks(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, AsyncResponse.IAsyncResponseCallbackAuthorizer! authorizer) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
@@ -187,6 +210,5 @@ static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollecti
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithInMemoryChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.InMemoryAsyncResponseOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithInMemoryDurableFlows(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithInMemoryTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.InMemoryWorkerTransportOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+static Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions.WithScheduledFlow<TFlow, TInput>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, string! name, string! cron, System.Func<System.DateTimeOffset, TInput>! input, System.Action<AsyncResponse.ScheduledFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
 static Microsoft.Extensions.DependencyInjection.AsyncResponseHealthCheckExtensions.AddAsyncResponseRecoveryCheck(this Microsoft.Extensions.DependencyInjection.IHealthChecksBuilder! builder, string! name = "async-response-recovery", System.Collections.Generic.IEnumerable<string!>? tags = null) -> Microsoft.Extensions.DependencyInjection.IHealthChecksBuilder!
-Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowDurableFlowExecutor.get -> bool
-Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowDurableFlowExecutor.set -> void

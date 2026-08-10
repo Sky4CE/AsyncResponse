@@ -16,8 +16,8 @@ namespace AsyncResponse.Channels.NATS;
 /// "no responders" signal reports precisely when nobody is listening.</description></item>
 /// <item><description>Persists <see cref="RecoveryState"/> in a JetStream Key-Value bucket so a
 /// response arriving after the waiter died (e.g. a redeploy) is routed through the lost-subscriber
-/// dispatcher, which asks the payload's ShouldResumeOnRecovery and invokes the resume or failure
-/// callback.</description></item>
+/// dispatcher, which asks the payload's OnRecovery and invokes the resume or failure
+/// callback with the materialized payload (or keeps the registration armed for a checkpoint).</description></item>
 /// </list>
 /// </summary>
 internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
@@ -68,6 +68,24 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         TimeSpan? timeout = null) where T : IAsyncResponsePayload
         => CreateResponseWaiterCore(correlationId, resumeCallback, failureCallback, completionPredicate, timeout);
 
+    /// <summary>
+    /// The public <c>ResponseTask</c> surface: internal loop-fault settlements are marked with
+    /// <see cref="NatsConsumeLoopException"/> so registration can abort atomically, but callers
+    /// observe the original exception exactly as before.
+    /// </summary>
+    private static async Task<T> UnwrapConsumeLoopFaults<T>(Task<T> task) where T : IAsyncResponsePayload
+    {
+        try
+        {
+            return await task.ConfigureAwait(false);
+        }
+        catch (NatsConsumeLoopException loopFault)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(loopFault.InnerException!).Throw();
+            throw; // unreachable
+        }
+    }
+
     private async Task<IAsyncResponseWaiter<T>> CreateResponseWaiterCore<T>(
         string correlationId,
         ReflectionCallDto? resumeCallback,
@@ -83,13 +101,14 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // redeploy), so require the override rather than letting the conservative default silently
         // route every recovered response to the failure callback.
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the NATS channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         // default: first envelope completes the wait
@@ -464,7 +483,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             {
                 _logger.LogError(ex, "Response subscription loop failed for subject {Subject}.", subject);
                 AsyncResponseDiagnostics.SetError(activity, ex);
-                if (!tcs.TrySetException(ex))
+                // The settlement itself carries its source: a loop death is a TRANSPORT failure,
+                // not a delivered response, and the registration path must tell the two kinds of
+                // faulted task apart ATOMICALLY — a side-band flag raced the settlement in both
+                // directions (set-then-lose aborted a registration whose response had already
+                // been delivered; set-after-win left a window that returned a dead waiter). Only
+                // a loop fault that actually WINS the settlement marks the task; a fault that
+                // loses to a terminal payload changes nothing. The wrapper never escapes: the
+                // public ResponseTask unwraps it back to the original exception.
+                if (!tcs.TrySetException(new NatsConsumeLoopException(ex)))
                     _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
                 await CleanupOnceAsync().ConfigureAwait(false);
             }
@@ -498,12 +525,53 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A terminal delivery on the already-running consume loop started cleanup while
+                // this registration was still being written: cleanup's delete ran before the save
+                // committed, so the save just orphaned a callback-armed registration that would
+                // resurrect recovery for a wait that already reached a terminal state. Compensate
+                // with a second delete (mirrors the in-memory channel's post-save check).
+                // Best-effort: TTL and the watchdog back a failed delete.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
 
             // Round-trip to the server so the subscription is guaranteed registered before the caller's
-            // trigger publishes the remote request — closing the subscribe/trigger race.
-            await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+            // trigger publishes the remote request — closing the subscribe/trigger race. Skipped
+            // once cleanup started: the wait already settled terminally, so there is no trigger
+            // race left to close — and cleanup's teardown disposes the lifetime source this flush
+            // reads its token from, so attempting it would throw for nothing.
+            if (Volatile.Read(ref cleanupStarted) == 0)
+                await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
 
             _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
+        }
+        catch (Exception ex) when (tcs.Task.IsCompletedSuccessfully
+                                   || (tcs.Task.IsFaulted && tcs.Task.Exception!.InnerException is not NatsConsumeLoopException))
+        {
+            // The wait already settled: a delivery on the consume loop completed the waiter while
+            // this registration step was still in flight (cleanup marks cleanupStarted just after
+            // setting the task, so the task is the race-free signal), and the step then failed
+            // against the torn-down registration state (a failed save, a flush aborted by the
+            // disposed lifetime source). The response in hand outranks the builder's
+            // "throw so the trigger never fires" contract — rethrowing would discard a delivered
+            // response, the exact loss this library exists to prevent, and the success path for
+            // this same interleaving already returns the completed waiter. Cleanup runs on the
+            // delivery path, so nothing is leaked; a save that still committed is compensated
+            // above or expires via TTL, with the recovery watchdog behind it. The filter demands
+            // an actual settlement (result or fault): a canceled task means NO response was
+            // delivered — e.g. a future channel-wide teardown canceling in-flight registrations —
+            // and takes the rethrow path below.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {
@@ -519,6 +587,21 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             throw;
         }
 
+        if (tcs.Task.IsFaulted && tcs.Task.Exception!.InnerException is NatsConsumeLoopException loopFault)
+        {
+            // The consume loop died AND won the settlement while this registration was in
+            // flight: the fault is a TRANSPORT error, not a delivered response; no subscription
+            // is live; and the loop's cleanup already ran (deleting any saved recovery state,
+            // backed by the post-save compensation). Returning the waiter would let the builder
+            // fire the trigger with nothing registered to receive — or recover — its response,
+            // so the builder contract applies: throw, and the remote operation never starts. A
+            // loop fault that LOST the settlement leaves no mark, so a wait a terminal payload
+            // already settled is returned normally.
+            throw new InvalidOperationException(
+                $"The NATS response subscription for correlationId {correlationId} failed before registration completed.",
+                loopFault.InnerException);
+        }
+
         try
         {
             if (Volatile.Read(ref cleanupStarted) == 0)
@@ -529,7 +612,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // A response completed and cleaned up between the check and CancelAfter.
         }
 
-        return new NatsAsyncResponseWaiter<T>(tcs.Task, DrainThenCleanupAsync);
+        return new NatsAsyncResponseWaiter<T>(UnwrapConsumeLoopFaults(tcs.Task), DrainThenCleanupAsync);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -592,12 +675,31 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
@@ -658,12 +760,31 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, subject, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
@@ -734,12 +855,31 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, subject, cancellationToken)
+                        .DispatchLostExceptions(
+                            _recoveryStateStore,
+                            correlationId,
+                            exception,
+                            subject,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
             }
             else if (_logger.IsEnabled(LogLevel.Debug))
             {
@@ -810,3 +950,11 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         return Encoding.UTF8.GetString(buffer.WrittenSpan);
     }
 }
+
+/// <summary>
+/// Internal settlement marker: the consume loop faulted the wait (a transport failure — nothing
+/// was delivered). Never escapes the channel: registration converts a marked settlement into a
+/// thrown registration failure, and the public ResponseTask unwraps it to the original exception.
+/// </summary>
+internal sealed class NatsConsumeLoopException(Exception inner)
+    : Exception("The NATS response subscription loop failed.", inner);

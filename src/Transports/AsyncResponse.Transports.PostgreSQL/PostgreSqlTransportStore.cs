@@ -6,6 +6,8 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
+using AsyncResponse.Internal;
+
 namespace AsyncResponse.Transports.PostgreSQL;
 
 internal enum PostgreSqlSubscriberRole
@@ -109,7 +111,48 @@ internal sealed class PostgreSqlTransportStore
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "created"))}
                     ON {MessageTable} (created_at);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+            {
+                // E.g. CREATE INDEX ... ON a name that is really another component's index:
+                // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+                // the wrong relation kind mid-batch — surface the namespace collision instead of
+                // the raw "cannot open relation".
+                throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
+            }
+
+            // The transport can share a schema with the channel and durable-flow stores (and
+            // unrelated objects), whose derived names its own validation cannot see — and
+            // IF NOT EXISTS also accepts a same-name index with the WRONG definition. Verify
+            // against the catalog, in-transaction under the shared DDL lock, that every relation
+            // actually IS what the DDL above intended, definitions included.
+            await PostgreSqlRelationVerifier.VerifyAsync(
+                connection,
+                transaction,
+                _options.SchemaName,
+                "transport",
+                [
+                    new(_options.MessageTable, 'r', Columns:
+                        [
+                            new("id", "uuid", Nullable: false),
+                            new("queue", "text", Nullable: false),
+                            new("payload_json", "jsonb", Nullable: false),
+                            new("headers_json", "jsonb", Nullable: false, DefaultExpression: "jsonb_build_object()"),
+                            new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                            new("available_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
+                            new("locked_until", "timestamp with time zone", Nullable: true),
+                            new("lock_id", "uuid", Nullable: true),
+                            new("attempts", "integer", Nullable: false, DefaultExpression: "0"),
+                            new("dead_letter_reason", "text", Nullable: true),
+                        ], PrimaryKey: ["id"]),
+                    new(IndexName(_options.MessageTable, "claim"), 'i', _options.MessageTable, ["queue", "available_at", "locked_until", "created_at"]),
+                    new(IndexName(_options.MessageTable, "created"), 'i', _options.MessageTable, ["created_at"]),
+                ],
+                cancellationToken).ConfigureAwait(false);
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
@@ -118,6 +161,7 @@ internal sealed class PostgreSqlTransportStore
             _ensureGate.Release();
         }
     }
+
 
     /// <summary>
     /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
@@ -128,9 +172,10 @@ internal sealed class PostgreSqlTransportStore
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken, delay).ConfigureAwait(false);
         await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -209,17 +254,28 @@ internal sealed class PostgreSqlTransportStore
         IReadOnlyDictionary<string, string>? headers,
         string? deadLetterReason,
         bool notify,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // Native delayed delivery: available_at gates the claim query, and the delay arithmetic
+        // runs on the DATABASE clock (now() + interval), matching the claim-side now() so client
+        // clock skew cannot shift the due time. A due row is picked up by the subscriber's next
+        // poll tick (EmptyPollDelay bounds the extra latency).
         command.CommandText =
-            $"""
-            INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-            VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
-            ON CONFLICT (id) DO NOTHING;
-            """;
+            delay is null
+                ? $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
+                  VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
+                  ON CONFLICT (id) DO NOTHING;
+                  """
+                : $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason, available_at)
+                  VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason, now() + make_interval(secs => @delay_seconds))
+                  ON CONFLICT (id) DO NOTHING;
+                  """;
         if (notify)
             command.CommandText += "SELECT pg_notify(@channel, @payload);";
 
@@ -228,6 +284,8 @@ internal sealed class PostgreSqlTransportStore
         command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
         command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(headers ?? EmptyHeaders);
         command.Parameters.AddWithValue("dead_letter_reason", (object?)deadLetterReason ?? DBNull.Value);
+        if (delay is { } pending)
+            command.Parameters.AddWithValue("delay_seconds", pending.TotalSeconds);
         if (notify)
         {
             command.Parameters.AddWithValue("channel", _options.NotificationChannel);
@@ -426,10 +484,16 @@ internal sealed class PostgreSqlTransportStore
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 
-    private static string IndexName(string table, string suffix)
+    // Suffix space is RESERVED before capping (mirrors the channel store's derived-name rule):
+    // truncating the whole "{table}_{suffix}_idx" let a maximum-length queue table derive its own
+    // name for both indexes — CREATE INDEX IF NOT EXISTS matched the table relation and silently
+    // created neither.
+    internal static string IndexName(string table, string suffix)
     {
-        var name = $"{table}_{suffix}_idx";
-        return name.Length <= 63 ? name : name[..63];
+        var tail = $"_{suffix}_idx";
+        const int identifierCap = 63;
+        var stem = table.Length <= identifierCap - tail.Length ? table : table[..(identifierCap - tail.Length)];
+        return stem + tail;
     }
 
     private static readonly TimeSpan DeadLetterPruneThrottle = TimeSpan.FromMinutes(1);

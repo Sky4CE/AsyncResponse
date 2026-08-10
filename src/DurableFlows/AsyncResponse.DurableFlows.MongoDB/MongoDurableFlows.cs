@@ -1,6 +1,7 @@
 using AsyncResponse;
 using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.MongoDB;
+using AsyncResponse.Internal;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
@@ -26,26 +27,27 @@ namespace Microsoft.Extensions.DependencyInjection
             // creates and owns a client from the options. Nothing is registered as a bare
             // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are
             // never answered — or broken — by this package.
+            builder.Services.TryAddSingleton<MongoNamespaceRegistry>();
             builder.Services.TryAddSingleton(provider =>
             {
                 var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>();
 
                 var database = provider.GetService<IMongoDatabase>();
                 if (database is not null)
-                    return new MongoDbFlowStateStore(database, options);
+                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
                 var sharedClient = provider.GetService<IMongoClient>();
                 if (sharedClient is not null)
-                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options);
+                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
                 var ownedClient = new MongoClient(options.Value.ConnectionString);
-                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient);
+                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<MongoNamespaceRegistry>());
             });
             return builder.WithDurableFlows<MongoDbFlowStateStore, MongoDbDurableFlowOptions>(configure);
         }
@@ -70,6 +72,17 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
     public bool AutoCreateIndexes { get; set; } = true;
 
     /// <summary>
+    /// Claims the ledger collection in the persisted cross-component ownership ledger
+    /// (<c>asyncresponse_ownership</c>) at first use, so another AsyncResponse component — in
+    /// this or any other process — misconfigured onto the same collection fails startup instead
+    /// of silently corrupting data (a flow store on the channel's derived counters collection
+    /// would let this store's TTL index delete the ack counter). Independent of
+    /// <see cref="AutoCreateIndexes"/>. Disable only for least-privilege deployments that cannot
+    /// write the ledger collection. Default: <c>true</c>.
+    /// </summary>
+    public bool UseOwnershipLedger { get; set; } = true;
+
+    /// <summary>
     /// Maximum serialized flow-state size in bytes accepted by writes; oversized ledgers fail fast
     /// with an actionable error instead of the raw 16 MB BSON-document error the executor would
     /// retry into the dead-letter queue. Default: 15 MB (headroom under MongoDB's 16 MB document
@@ -82,6 +95,13 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
     {
         if (string.IsNullOrWhiteSpace(CollectionName))
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} must be configured.");
+        if (CollectionName.Contains('$') || CollectionName.Contains('\0')
+            || CollectionName.StartsWith("system.", StringComparison.Ordinal) || CollectionName.Contains(".system.", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+        if (string.Equals(CollectionName, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' is reserved for the cross-component ownership ledger.");
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -97,11 +117,45 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     private readonly IMongoClient? _ownedClient;
     private bool _created;
 
-    public MongoDbFlowStateStore(IMongoDatabase database, IOptions<MongoDbDurableFlowOptions> options, IMongoClient? ownedClient = null)
+    /// <summary>
+    /// DI construction path: also claims the collection in the container's cross-component
+    /// ownership ledger — a flow store configured onto the channel's derived counters collection
+    /// would let the flow TTL index silently delete the ack-sequence counter.
+    /// </summary>
+    internal MongoDbFlowStateStore(
+        IMongoDatabase database,
+        IOptions<MongoDbDurableFlowOptions> options,
+        IMongoClient? ownedClient,
+        MongoNamespaceRegistry? namespaceRegistry)
+        : this(database, options, ownedClient)
+    {
+        namespaceRegistry?.Claim(
+            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            database.DatabaseNamespace.DatabaseName,
+            "MongoDB durable-flow store",
+            [(_options.CollectionName, nameof(_options.CollectionName))]);
+    }
+
+    public MongoDbFlowStateStore(
+        IMongoDatabase database,
+        IOptions<MongoDbDurableFlowOptions> options,
+        IMongoClient? ownedClient = null)
     {
         _options = options.Value;
         _options.Validate();
         _database = database;
+
+        // The namespace BYTE limit can only be checked here, where the actual database name is
+        // first known; a near-limit configuration otherwise passes every static check and fails
+        // at the first server operation.
+        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.CollectionName}";
+        var byteLength = System.Text.Encoding.UTF8.GetByteCount(ns);
+        if (byteLength > 235)
+            throw new InvalidOperationException(
+                $"The MongoDB namespace '{ns}' ({nameof(_options.CollectionName)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
+
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
         _ownedClient = ownedClient;
     }
@@ -223,7 +277,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateIndexes)
+        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -231,6 +285,24 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership, independent of AutoCreateIndexes: a flow store
+            // configured onto the channel's derived counters collection would let this TTL
+            // index silently delete the ack-sequence counter — see MongoOwnershipLedger.
+            if (_options.UseOwnershipLedger)
+            {
+                await MongoOwnershipLedger.ClaimAsync(
+                    _database,
+                    "MongoDB durable-flow store",
+                    [(_options.CollectionName, nameof(_options.CollectionName))],
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!_options.AutoCreateIndexes)
+            {
+                _created = true;
+                return;
+            }
 
             // A TTL index (expireAfterSeconds = 0 on the expiry timestamp) makes MongoDB itself
             // reap expired ledgers — no application-side pruning needed. Loads still filter on

@@ -79,8 +79,15 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(SchemaName)}", "PostgreSQL");
-        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)}", "PostgreSQL");
+        DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(SchemaName)}", "PostgreSQL", identifierCap: 63);
+        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)}", "PostgreSQL", identifierCap: 63);
+
+        // Indexes share PostgreSQL's relation namespace with tables: a table whose name ends
+        // exactly where the reserved "_expires_idx" stem truncates derives its own name, and
+        // CREATE INDEX IF NOT EXISTS would silently match the table and skip the index.
+        if (string.Equals(DurableFlowStoreShared.DerivedName(TableName, "_expires_idx", 63), TableName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -282,7 +289,44 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                 );
                 CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+            {
+                // E.g. CREATE INDEX ... ON a name that is really another component's index:
+                // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+                // the wrong relation kind mid-batch — surface the namespace collision instead of
+                // the raw "cannot open relation".
+                throw new InvalidOperationException(AsyncResponse.Internal.PostgreSqlRelationVerifier.DdlCollisionMessage("durable-flow", _options.SchemaName), ex);
+            }
+
+            // The flow store can share a schema with the channel and transport stores (and
+            // unrelated objects), whose derived names its own validation cannot see — and
+            // IF NOT EXISTS also accepts a same-name index with the WRONG definition. Verify
+            // against the catalog, in-transaction under the shared DDL lock, that both relations
+            // actually ARE what the DDL above intended, definitions included.
+            await AsyncResponse.Internal.PostgreSqlRelationVerifier.VerifyAsync(
+                connection,
+                transaction,
+                _options.SchemaName,
+                "durable-flow",
+                [
+                    new(_options.TableName, 'r', Columns:
+                        [
+                            new("flow_id", "text", Nullable: false),
+                            new("state_json", "jsonb", Nullable: false),
+                            new("expires_at_utc", "timestamp with time zone", Nullable: false),
+                            new("updated_at_utc", "timestamp with time zone", Nullable: false),
+                            new("revision", "bigint", Nullable: false, DefaultExpression: "0"),
+                            new("lease_id", "text", Nullable: true),
+                            new("lease_expires_at_utc", "timestamp with time zone", Nullable: true),
+                        ], PrimaryKey: ["flow_id"]),
+                    new(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63), 'i', _options.TableName, ["expires_at_utc"]),
+                ],
+                cancellationToken).ConfigureAwait(false);
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
@@ -291,6 +335,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             _ensureGate.Release();
         }
     }
+
 
     private async Task<bool> UpdateLeaseAsync(
         string flowId,
@@ -342,7 +387,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
 
     private string Schema => Quote(_options.SchemaName);
     private string Table => $"{Schema}.{Quote(_options.TableName)}";
-    private string IndexName => Quote($"{_options.TableName}_expires_idx");
+    private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63));
     private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 }
 }

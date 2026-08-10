@@ -103,6 +103,32 @@ public interface IDurableFlowContext
         where TFlow : class, IDurableFlow<TInput>;
 
     /// <summary>
+    /// Durably sleeps this run for <paramref name="delay"/>, measured from the first time this
+    /// step is reached (crashes, redeploys, and redeliveries wait out the <em>remainder</em>, never
+    /// restart the delay; a completed timer is skipped like any checkpointed step).
+    /// <para>
+    /// On a transport with native delayed delivery (<see cref="IDelayedWorkerTransport"/>) the run
+    /// <em>suspends</em>: the worker, execution lease, and memory are released, and a delayed
+    /// wake-up job re-executes the flow at the due time — sleeping for days costs nothing while it
+    /// sleeps. On other transports the run waits in process under its lease, the same footprint as
+    /// an awaited step. Sub-<c>DurableFlowOptions.TimerInProcessThreshold</c> remainders always
+    /// wait in process to spare a broker round-trip.
+    /// </para>
+    /// </summary>
+    /// <param name="name">Stable step name; the due time is checkpointed under it.</param>
+    /// <param name="delay">How long to sleep, anchored at the step's first execution. Non-positive completes immediately.</param>
+    /// <param name="cancellationToken">Stops <em>this execution</em> of the flow, not the timer: the due time stays checkpointed and the next execution resumes the remainder.</param>
+    Task DelayAsync(string name, TimeSpan delay, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Durably sleeps this run until <paramref name="wakeAtUtc"/> (an absolute UTC instant), with
+    /// the same suspension, resume, and checkpoint semantics as
+    /// <see cref="DelayAsync(string, TimeSpan, CancellationToken)"/>. An instant in the past
+    /// completes immediately.
+    /// </summary>
+    Task DelayUntilAsync(string name, DateTimeOffset wakeAtUtc, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Updates the operator-facing progress message on the flow state
     /// (<see cref="FlowState.LastMessage"/>). Rapid reports may be coalesced according to
     /// <c>DurableFlowOptions.ProgressPersistenceInterval</c>; the latest value is included in the

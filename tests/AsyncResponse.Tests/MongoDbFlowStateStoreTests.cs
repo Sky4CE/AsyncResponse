@@ -88,6 +88,7 @@ public sealed class MongoDbFlowStateStoreTests
                     It.IsAny<CancellationToken>()))
                 .Callback((MongoFlowStateDocument document, InsertOneOptions _, CancellationToken _) => Inserted = document)
                 .Returns(Task.CompletedTask);
+            Database.WithTestNamespace();
             Store = new MongoDbFlowStateStore(Database.Object, Options.Create(new MongoDbDurableFlowOptions
             {
                 CollectionName = "flows",

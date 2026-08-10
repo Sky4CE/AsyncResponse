@@ -8,8 +8,9 @@ namespace AsyncResponse.IntegrationTests;
 /// The real Google Pub/Sub transport (emulator): worker jobs published and consumed over Pub/Sub,
 /// and responses ingested from a Pub/Sub topic into active waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-    public sealed class PubSubTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+[Trait(Batches.Trait, Batches.Brokers)]
+    public sealed class PubSubTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
     {
         [Fact]
         public async Task Config_ReportsDefaultAndEarlyAckPubSubModes()

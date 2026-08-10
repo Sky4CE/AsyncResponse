@@ -117,12 +117,12 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
 
         if (subscriberOptions.BatchSize <= 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BatchSize)} must be positive.");
-        if (subscriberOptions.EmptyPollDelay <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.EmptyPollDelay)} must be positive.");
-        if (subscriberOptions.PendingMessageMinIdleTime <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingMessageMinIdleTime)} must be positive.");
-        if (subscriberOptions.PendingClaimInterval <= TimeSpan.Zero)
-            throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingClaimInterval)} must be positive.");
+        // EmptyPollDelay arms the idle Task.Delay (timer ceiling); PendingMessageMinIdleTime is
+        // the server-side XAUTOCLAIM min-idle in milliseconds and PendingClaimInterval a
+        // "now + interval" schedule stamp — both get the persistence bound.
+        AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.EmptyPollDelay, optionPath, nameof(RedisSubscriberOptions.EmptyPollDelay));
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriberOptions.PendingMessageMinIdleTime, optionPath, nameof(RedisSubscriberOptions.PendingMessageMinIdleTime));
+        AsyncResponseChannelOptions.EnsurePersistedTtl(subscriberOptions.PendingClaimInterval, optionPath, nameof(RedisSubscriberOptions.PendingClaimInterval));
         if (subscriberOptions.PendingClaimBatchSize <= 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.PendingClaimBatchSize)} must be positive.");
         if (subscriberOptions.MaxDeliveryAttempts < 0)
@@ -148,8 +148,7 @@ internal abstract class RedisMessageDispatcher : IAsyncDisposable
                         $"when {nameof(RedisSubscriberOptions.AckMode)} is {nameof(RedisAckMode.AckAfterEnqueue)}.");
                 }
 
-                if (subscriberOptions.BackgroundDrainTimeout <= TimeSpan.Zero)
-                    throw new InvalidOperationException($"{optionPath}.{nameof(RedisSubscriberOptions.BackgroundDrainTimeout)} must be positive.");
+                AsyncResponseChannelOptions.EnsureTimerBacked(subscriberOptions.BackgroundDrainTimeout, optionPath, nameof(RedisSubscriberOptions.BackgroundDrainTimeout));
 
                 // Redis subscribers spend only the background drain at shutdown; the read loop
                 // stops with the host token and the multiplexer teardown is not separately bounded.

@@ -49,6 +49,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
     private readonly ILogger<DurableFlowExecutor> _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly IDurableFlowExecutionObserver[] _observers;
+    private readonly IWorkerTransport? _workerTransport;
     private readonly Dictionary<string, DurableFlowRegistration> _registrations;
     private readonly CancellationToken _hostStopping;
 
@@ -62,8 +65,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         DurableFlowOptions options,
         ILogger<DurableFlowExecutor> logger,
         IEnumerable<DurableFlowRegistration>? registrations = null,
-        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
+        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null,
+        TimeProvider? timeProvider = null,
+        IEnumerable<IDurableFlowExecutionObserver>? observers = null,
+        IWorkerTransport? workerTransport = null)
     {
+        _workerTransport = workerTransport;
         _scopeFactory = scopeFactory;
         _builder = builder;
         _subscriber = subscriber;
@@ -72,6 +79,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _observers = observers?.ToArray() ?? [];
         _hostStopping = hostLifetime?.ApplicationStopping ?? CancellationToken.None;
         _registrations = new Dictionary<string, DurableFlowRegistration>(StringComparer.Ordinal);
         foreach (var registration in registrations ?? [])
@@ -170,6 +179,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             throw;
         }
 
+        // The terminal outcome is persisted above; notify OUTSIDE the try/catch so a throwing
+        // observer (throwing is the documented crash-injection contract) cannot re-enter those
+        // catches and rewrite a Succeeded run as Failed — or overwrite a terminal ledger message
+        // with a telemetry error — "the run's outcome is never at stake". A throw from here
+        // propagates for redelivery; the replay sees the terminal status, skips, and acks.
+        await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
 
@@ -192,14 +207,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options,
-            _logger).ConfigureAwait(false);
+            _logger,
+            _timeProvider).ConfigureAwait(false);
         if (lease is not null)
             return lease;
 
         // Poll ceiling: a lease can only stay held past its duration if the holder renewed it, so
         // one full duration + renew interval of failed acquires proves the holder is alive. The 2s
         // poll delay is capped by the renew interval so short test-sized leases still get polled.
-        var deadline = DateTime.UtcNow + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
+        var deadline = _timeProvider.GetUtcNow().UtcDateTime + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
         var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
             ? _options.ExecutionLeaseRenewInterval
             : TimeSpan.FromSeconds(2);
@@ -230,12 +246,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (lease is not null)
                 return lease;
 
-            if (DateTime.UtcNow >= deadline)
+            if (_timeProvider.GetUtcNow().UtcDateTime >= deadline)
                 break;
 
             try
             {
-                await Task.Delay(pollDelay, _hostStopping).ConfigureAwait(false);
+                await Task.Delay(pollDelay, _timeProvider, _hostStopping).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -301,12 +317,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options.StateExpiry,
+            _timeProvider,
             state =>
             {
                 checkpointed = false;
                 lastStatus = state.Status;
                 running = state.Status == FlowRunStatus.Running;
-                if (!running || state.Steps is null)
+
+                // Suspended runs still CHECKPOINT the recovered terminal payload — the response
+                // exists nowhere else once this callback returns — but are never woken (see
+                // below): suspension means an operator took manual control, and ResumeAsync
+                // continues from the checkpoint instead of re-running the remote step.
+                var checkpointable = running || state.Status == FlowRunStatus.Suspended;
+                if (!checkpointable || state.Steps is null)
                     return false;
 
                 var pending = state.Steps.FirstOrDefault(pair =>
@@ -315,11 +338,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                     return false;
 
                 pending.Value.Completed = true;
-                pending.Value.ResultJson = AsyncResponseJson.Serialize(payload, payload.GetType());
+                pending.Value.ResultJson = SerializeRecoveredResult(payload, pending.Value.PendingPayloadTypeFullName);
                 pending.Value.PendingCorrelationId = null;
+                pending.Value.PendingPayloadTypeFullName = null;
                 pending.Value.Faulted = false;
                 pending.Value.Message = "Terminal response recovered after subscriber loss.";
-                pending.Value.CompletedAtUtc = DateTime.UtcNow;
+                pending.Value.CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
                 state.LastMessage = $"Step '{pending.Key}' recovered after subscriber loss.";
                 checkpointed = true;
                 return true;
@@ -348,8 +372,36 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return;
         }
 
+        if (!running)
+        {
+            _logger.LogInformation(
+                "Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId} while Suspended; not waking the run — ResumeAsync continues from the checkpoint.",
+                flowId, correlationId);
+            return;
+        }
+
         _logger.LogDebug("Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId}; resuming.", flowId, correlationId);
         await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Serializes a recovered terminal payload for the step checkpoint AS THE STEP'S DECLARED
+    /// response type (recorded at await time): replay deserializes the checkpoint as that declared
+    /// type, and the recovered payload's runtime type may be a <c>[JsonPolymorphic]</c> derived
+    /// whose runtime-type serialization omits the discriminator — breaking every replay against an
+    /// abstract declared base, or silently truncating against a concrete one. Falls back to the
+    /// runtime type when the recorded name is absent (ledgers written before it existed) or no
+    /// longer resolves to a compatible type.
+    /// </summary>
+    private static string SerializeRecoveredResult(object payload, string? declaredTypeFullName)
+    {
+        var declaredType = declaredTypeFullName is null
+            ? null
+            : PayloadRecoveryClassifier.ResolvePayloadType(declaredTypeFullName);
+
+        return declaredType is not null && declaredType.IsInstanceOfType(payload)
+            ? AsyncResponseJson.Serialize(payload, declaredType)
+            : AsyncResponseJson.Serialize(payload, payload.GetType());
     }
 
     /// <inheritdoc />
@@ -367,6 +419,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options.StateExpiry,
+            _timeProvider,
             state =>
             {
                 updated = state;
@@ -394,6 +447,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         }
 
         await NotifyParentAsync(updated).ConfigureAwait(false);
+        await NotifyRunFinishedAsync(updated).ConfigureAwait(false);
 
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }
@@ -413,7 +467,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             _subscriber,
             _recoverableSubscriber,
             _logger,
-            lease);
+            lease,
+            _timeProvider,
+            _observers,
+            _workerTransport);
 
         // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
         // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
@@ -500,6 +557,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             ?? throw new InvalidOperationException(
                 $"Cannot resolve {kind} type '{fullName}'. For plugin/collectible-assembly scenarios register a resolver " +
                 $"via {nameof(AsyncResponseTypeResolution)}.{nameof(AsyncResponseTypeResolution.RegisterAssembly)}.");
+    }
+
+    /// <summary>
+    /// Observer hook for terminal transitions. Fires AFTER the terminal save: an observer that
+    /// throws here (crash injection) fails a delivery whose run is already terminal, so the
+    /// redelivered execution acks as a no-op — the run's outcome is never at stake.
+    /// </summary>
+    private async Task NotifyRunFinishedAsync(FlowState state)
+    {
+        if (_observers.Length == 0)
+            return;
+
+        var runEvent = new DurableFlowRunEvent(state.FlowId!, state.Status, state.LastMessage);
+        foreach (var observer in _observers)
+            await observer.OnRunFinishedAsync(runEvent).ConfigureAwait(false);
     }
 
     private Task NotifyParentAsync(FlowState state)

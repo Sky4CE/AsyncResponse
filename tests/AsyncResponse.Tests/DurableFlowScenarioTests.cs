@@ -26,7 +26,7 @@ public sealed class DagRunResult : IAsyncResponsePayload
     public DagRunState State { get; set; }
     public string? Message { get; set; }
 
-    public bool ShouldResumeOnRecovery() => State != DagRunState.Failed;
+    public RecoveryAction OnRecovery() => State != DagRunState.Failed ? RecoveryAction.Resume : RecoveryAction.Fail;
 }
 
 public enum DagRunState

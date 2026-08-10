@@ -38,6 +38,9 @@
        the conditioned PackageVersion items in Directory.Packages.props. -->
   <ItemGroup>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <!-- The matrix harness maps its EF Core durable-flow cells onto SQL Server (the provider the
+         integration shards point at); the unit project compiles the same shared source. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" />
   </ItemGroup>
 
   <!-- Channel-contract conformance suite shared with AsyncResponse.IntegrationTests (mirrors the
@@ -45,9 +48,18 @@
        channels it can reach (in-memory here; the container-backed channels over there). -->
   <ItemGroup>
     <Compile Include="..\Shared\ChannelConformanceSuite.cs" Link="Shared\ChannelConformanceSuite.cs" />
+    <!-- The provider cross product. The unit project derives the cells that need no container
+         (in-memory channel/transport, in-memory and SQLite stores), which is also what keeps the
+         matrix plumbing itself under test without Docker. -->
+    <Compile Include="..\Shared\ProviderMatrix.cs" Link="Shared\ProviderMatrix.cs" />
+    <Compile Include="..\Shared\MatrixHarness.cs" Link="Shared\MatrixHarness.cs" />
+    <Compile Include="..\Shared\MatrixScenarios.cs" Link="Shared\MatrixScenarios.cs" />
+    <Compile Include="..\Shared\TransportCapabilities.cs" Link="Shared\TransportCapabilities.cs" />
+    <Compile Include="..\Shared\TransportConformanceSuite.cs" Link="Shared\TransportConformanceSuite.cs" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\AsyncResponse.Testing\AsyncResponse.Testing.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />

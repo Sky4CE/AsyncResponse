@@ -17,58 +17,13 @@ internal static class ReflectionExtensions
 
     private static readonly ConcurrentDictionary<string, Type> ServiceTypes = new(StringComparer.Ordinal);
 
-    // Names that already failed a full assembly scan. Capacity-bounded so hostile inputs cannot
-    // grow it without limit, and invalidated on the only events that can turn a miss into a hit —
-    // a new assembly loading, or a custom resolver registering. At capacity, novel unresolvable
-    // names fall back to scanning; correctness never depends on this cache.
-    //
-    // Entries are stamped with the invalidation GENERATION observed before their failed scan, not
-    // just stored: a plain clear-on-register has a race — an in-flight miss that started against
-    // the old resolver set can insert AFTER the clear, permanently poisoning the name. A stale
-    // stamp (generation advanced mid-scan) makes the entry a non-hit, so the next lookup rescans
-    // with the new resolvers.
-    private static readonly ConcurrentDictionary<string, int> UnresolvableServiceTypes = new(StringComparer.Ordinal);
-    private const int UnresolvableServiceTypeCacheCapacity = 1024;
-    private static int _unresolvableGeneration;
-
-    // The AssemblyLoad invalidation hook is registered on first use (EnsureAssemblyLoadInvalidation
-    // below), NOT from a static constructor and NOT from a module initializer: an explicit static
-    // ctor forfeits beforefieldinit, adding a class-initialization check to every static access —
-    // including the hand-tuned ConvertTo/As<T> hot path this file is benchmarked for — and
-    // [ModuleInitializer] is analyzer-banned in library code (CA2255). First-call registration
-    // costs one volatile read per type resolution, off the conversion hot path entirely.
-    private static readonly object _assemblyLoadGate = new();
-    private static bool _assemblyLoadHooked;
-
-    private static void EnsureAssemblyLoadInvalidation()
-    {
-        if (Volatile.Read(ref _assemblyLoadHooked))
-            return;
-
-        // Attach-then-publish under a gate: publishing the flag before the handler was attached
-        // let a concurrent thread proceed past the fast path, cache a miss, and race an assembly
-        // load into the unhooked window — a false negative that nothing would ever invalidate.
-        // The lock is cold-path only; the steady state is the single volatile read above.
-        lock (_assemblyLoadGate)
-        {
-            if (_assemblyLoadHooked)
-                return;
-
-            AppDomain.CurrentDomain.AssemblyLoad += static (_, _) => InvalidateUnresolvableServiceTypes();
-            Volatile.Write(ref _assemblyLoadHooked, true);
-        }
-    }
-
     /// <summary>
-    /// Invalidates the negative type-resolution cache (a new resolver or assembly may resolve
-    /// cached misses). The generation bump is what guarantees correctness for in-flight scans;
-    /// the clear just reclaims memory.
+    /// Invalidates the shared negative type-resolution cache (a new resolver or assembly may
+    /// resolve cached misses). Kept as a named seam for <see cref="AsyncResponseTypeResolution"/>;
+    /// the machinery lives in <see cref="UnresolvableTypeNames"/>, shared with the payload
+    /// classifier's resolution path.
     /// </summary>
-    internal static void InvalidateUnresolvableServiceTypes()
-    {
-        Interlocked.Increment(ref _unresolvableGeneration);
-        UnresolvableServiceTypes.Clear();
-    }
+    internal static void InvalidateUnresolvableServiceTypes() => UnresolvableTypeNames.Invalidate();
     private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
     private static readonly ConcurrentDictionary<InvocationPlanKey, InvocationPlan> InvocationPlans = new();
     private static readonly MethodInfo ToValueTaskMethod = typeof(ReflectionExtensions)
@@ -130,10 +85,13 @@ internal static class ReflectionExtensions
                        ?? throw new InvalidOperationException(
                             $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
 
-            // 4) Resolve and cache method metadata + compiled invocation delegate.
-            var plan = InvocationPlans.GetOrAdd(
-                new InvocationPlanKey(serviceType, dto.MethodName, dto.Params.Length),
-                static key => CreateInvocationPlan(key));
+            // 4) Resolve and cache method metadata + compiled invocation delegate. Collectible
+            // (plugin) service types are planned per call: a strong Type-keyed cache entry would
+            // pin the plugin's AssemblyLoadContext after unload.
+            var planKey = new InvocationPlanKey(serviceType, dto.MethodName, dto.Params.Length);
+            var plan = serviceType.Assembly.IsCollectible
+                ? CreateInvocationPlan(planKey)
+                : InvocationPlans.GetOrAdd(planKey, static key => CreateInvocationPlan(key));
 
             // 5) Convert only the arguments that need conversion, keeping already-typed arrays hot.
             var invocationArgs = plan.ConvertArguments(dto.Params);
@@ -163,7 +121,7 @@ internal static class ReflectionExtensions
     {
         // Must precede any cache consult/populate: a miss cached without the invalidation hook
         // active could outlive a later assembly load that makes the name resolvable.
-        EnsureAssemblyLoadInvalidation();
+        UnresolvableTypeNames.EnsureAssemblyLoadInvalidation();
 
         if (ServiceTypes.TryGetValue(serviceInterfaceFullName, out var cached))
         {
@@ -174,21 +132,20 @@ internal static class ReflectionExtensions
         // an unresolvable type (a poisoned recovery row, a renamed class) re-walks every loaded
         // assembly on every attempt. Only a CURRENT-generation entry counts — a stale stamp means
         // the miss may have raced a resolver registration or assembly load, so it rescans.
-        if (UnresolvableServiceTypes.TryGetValue(serviceInterfaceFullName, out var missGeneration)
-            && missGeneration == Volatile.Read(ref _unresolvableGeneration))
+        if (UnresolvableTypeNames.IsKnownMiss(serviceInterfaceFullName))
         {
             AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
             return null;
         }
 
-        var generationBeforeScan = Volatile.Read(ref _unresolvableGeneration);
+        var generationBeforeScan = UnresolvableTypeNames.GenerationBeforeScan();
 
         foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
             var resolved = assembly.GetType(serviceInterfaceFullName, throwOnError: false);
             if (resolved is not null)
             {
-                ServiceTypes.TryAdd(serviceInterfaceFullName, resolved);
+                CacheServiceType(serviceInterfaceFullName, resolved);
                 return resolved;
             }
         }
@@ -197,17 +154,26 @@ internal static class ReflectionExtensions
         var custom = AsyncResponseTypeResolution.Resolve(serviceInterfaceFullName);
         if (custom is not null)
         {
-            ServiceTypes.TryAdd(serviceInterfaceFullName, custom);
+            CacheServiceType(serviceInterfaceFullName, custom);
             return custom;
         }
 
-        // Stamped with the generation observed BEFORE the scan: if a resolver registered while
-        // this scan ran, the stamp is already stale and the entry never blocks a re-resolve.
-        if (UnresolvableServiceTypes.Count < UnresolvableServiceTypeCacheCapacity)
-            UnresolvableServiceTypes[serviceInterfaceFullName] = generationBeforeScan;
+        UnresolvableTypeNames.RecordMiss(serviceInterfaceFullName, generationBeforeScan);
 
         AsyncResponseDiagnostics.RecordTypeResolutionFailure("service");
         return null;
+    }
+
+    /// <summary>
+    /// Caches a resolved service type — unless its assembly is collectible: a strong process-wide
+    /// cache entry would pin the plugin's AssemblyLoadContext and keep an unloaded plugin's
+    /// assemblies alive until process exit. Collectible-context types stay resolve-per-call (a
+    /// cold path only plugin hosts hit); the negative cache is name-keyed and unaffected.
+    /// </summary>
+    private static void CacheServiceType(string serviceInterfaceFullName, Type resolved)
+    {
+        if (!resolved.Assembly.IsCollectible)
+            ServiceTypes.TryAdd(serviceInterfaceFullName, resolved);
     }
 
     [UnconditionalSuppressMessage("Trimming", "IL2075",
@@ -308,6 +274,12 @@ internal static class ReflectionExtensions
 
     private static ConversionPlan GetConversionPlan(Type targetType)
     {
+        // Collectible (plugin) target types are planned per call: a strong Type-keyed cache entry
+        // would pin the plugin's AssemblyLoadContext after unload. Cold path — only plugin hosts
+        // resolve conversions for collectible types, and only on recovery/callback traffic.
+        if (targetType.Assembly.IsCollectible)
+            return new ConversionPlan(targetType);
+
         ArgumentNullException.ThrowIfNull(targetType);
         return ConversionPlans.GetOrAdd(targetType, static type => new ConversionPlan(type));
     }

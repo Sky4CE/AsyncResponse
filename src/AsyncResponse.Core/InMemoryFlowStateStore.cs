@@ -5,7 +5,18 @@ namespace AsyncResponse;
 /// <summary>Atomic process-local flow-state store for development, tests, and single-process apps.</summary>
 internal sealed class InMemoryFlowStateStore : IFlowStateStore
 {
+    // Saturating expiry stamp: the ttl parameter arrives from callers as well as options, and the
+    // external stores deliberately saturate the same arithmetic — a raw Add threw
+    // ArgumentOutOfRangeException on large ttls where every other store clamped.
+    private static DateTime Expiry(DateTime now, TimeSpan ttl)
+        => ttl >= DateTime.MaxValue - now ? DateTime.MaxValue : now.Add(ttl);
+
     private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
+
+    /// <summary>Creates the store; expiry and lease stamps come from the engine's clock.</summary>
+    public InMemoryFlowStateStore(TimeProvider? timeProvider = null)
+        => _timeProvider = timeProvider ?? TimeProvider.System;
 
     public Task<bool> TryCreateAsync(
         string flowId,
@@ -18,8 +29,8 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         if (state.Revision != 0)
             throw new ArgumentException("A new flow ledger must start at revision zero.", nameof(state));
 
-        var now = DateTime.UtcNow;
-        var created = CreateEntry(state, now.Add(ttl));
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var created = CreateEntry(state, Expiry(now, ttl));
         while (true)
         {
             if (_entries.TryAdd(flowId, created))
@@ -43,7 +54,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
         while (_entries.TryGetValue(flowId, out var entry))
         {
-            if (entry.ExpiresAtUtc <= DateTime.UtcNow)
+            if (entry.ExpiresAtUtc <= _timeProvider.GetUtcNow().UtcDateTime)
             {
                 _entries.TryRemove(KeyValuePair.Create(flowId, entry));
                 continue;
@@ -79,7 +90,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
         while (_entries.TryGetValue(flowId, out var current))
         {
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             if (current.ExpiresAtUtc <= now || current.Revision != expectedRevision)
                 return Task.FromResult(false);
             if (leaseId is not null
@@ -89,7 +100,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
             var updated = CreateEntry(
                 state,
-                now.Add(ttl),
+                Expiry(now, ttl),
                 current.LeaseId,
                 current.LeaseExpiresAtUtc);
             if (_entries.TryUpdate(flowId, updated, current))
@@ -134,6 +145,23 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Breaks every held execution lease — the test harness's crash semantics for a simulated
+    /// restart. A crashed process goes silent and its leases expire; a simulated restart shares
+    /// the virtual clock with the "crashed" incarnation, whose parked executions would otherwise
+    /// keep renewing against this shared store forever and the new incarnation could never take
+    /// their flows over. Breaking the lease makes the zombie's next renewal fail (its lease loop
+    /// marks itself lost and stops) and lets the new incarnation acquire immediately.
+    /// </summary>
+    internal void ExpireAllLeases()
+    {
+        foreach (var (flowId, entry) in _entries)
+        {
+            if (entry.LeaseId is not null)
+                _entries.TryUpdate(flowId, entry with { LeaseId = null, LeaseExpiresAtUtc = null }, entry);
+        }
+    }
+
     public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
@@ -156,7 +184,7 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
 
         while (_entries.TryGetValue(flowId, out var current))
         {
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             if (current.ExpiresAtUtc <= now)
                 return Task.FromResult(false);
 

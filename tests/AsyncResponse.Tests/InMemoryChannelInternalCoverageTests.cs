@@ -100,7 +100,7 @@ public sealed class InMemoryChannelInternalCoverageTests
         await CleanupAsync(cleaned);
         Invoke(cleaned, "ArmTimeout");
         await InvokeTaskAsync(cleaned, "DispatchExceptionAsync", new InvalidOperationException("late"));
-        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult());
+        await InvokeTaskAsync(cleaned, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await InvokeTaskAsync(cleaned, "DispatchRawJsonResponseAsync", new RawJsonResponse("{}"));
         await InvokeTaskAsync(cleaned, "TimeoutCoreAsync");
 
@@ -111,15 +111,18 @@ public sealed class InMemoryChannelInternalCoverageTests
         SetField(terminal, "_terminal", 1);
         await InvokeTaskAsync(terminal, "DispatchExceptionAsync", new InvalidOperationException("duplicate"));
         await InvokeTaskAsync(terminal, "TimeoutCoreAsync");
-        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult());
+        await InvokeTaskAsync(terminal, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await InvokeTaskAsync(terminal, "FaultAsync", new InvalidOperationException("duplicate fault"));
         Assert.False(ResponseTask(terminal).IsCompleted);
         await CleanupAsync(terminal);
 
-        var disposedTimer = CreateSubscription(channel, "disposed-timer");
-        ((CancellationTokenSource)GetField(disposedTimer, "_timeoutCts")).Dispose();
-        Invoke(disposedTimer, "ArmTimeout");
-        await CleanupAsync(disposedTimer);
+        // Arming schedules a TimeProvider timer; cleanup after arming disposes it (the CTS-disposed
+        // race this block used to cover no longer exists — there is no CTS to dispose out from
+        // under the armer).
+        var armedThenCleaned = CreateSubscription(channel, "armed-then-cleaned");
+        Invoke(armedThenCleaned, "ArmTimeout");
+        Assert.NotNull(GetField(armedThenCleaned, "_timeoutTimer"));
+        await CleanupAsync(armedThenCleaned);
 
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -132,7 +135,7 @@ public sealed class InMemoryChannelInternalCoverageTests
                 await release.Task.ConfigureAwait(false);
                 throw new InvalidOperationException("async predicate failed");
             });
-        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult());
+        var dispatch = InvokeTaskAsync(asyncFailure, "DispatchResponseAsync", new OperationResult(), WireBytesStub);
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         SetField(asyncFailure, "_terminal", 1);
         release.TrySetResult();
@@ -218,6 +221,13 @@ public sealed class InMemoryChannelInternalCoverageTests
 
     private static Task ThrowingDispatch(object _, int __)
         => throw new InvalidOperationException("synchronous dispatch failure");
+
+    /// <summary>
+    /// Declared-type wire payload for the typed dispatch: the publisher's single UTF-8
+    /// serialization, from which each waiter materializes its own instance.
+    /// </summary>
+    private static readonly byte[] WireBytesStub =
+        AsyncResponseJson.SerializeToUtf8Bytes(new OperationResult());
 
     private static object? Invoke(object target, string name, params object?[] arguments)
         => FindMethod(target.GetType(), name).Invoke(target, arguments);

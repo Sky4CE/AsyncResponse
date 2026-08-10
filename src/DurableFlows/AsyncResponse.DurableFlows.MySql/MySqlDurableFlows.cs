@@ -58,7 +58,7 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
         if (string.IsNullOrWhiteSpace(ConnectionString))
             throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
 
-        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL");
+        DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL", identifierCap: 64);
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -319,7 +319,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     }
 
     private string Table => Quote(_options.TableName);
-    private string IndexName => Quote($"{_options.TableName}_expires_idx");
+    private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 64));
     private static string Quote(string identifier) => "`" + identifier.Replace("`", "``", StringComparison.Ordinal) + "`";
 }
 }

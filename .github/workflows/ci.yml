@@ -69,6 +69,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-results
+          overwrite: true
           path: ${{ github.workspace }}/TestResults
 
       # Coverage alone, for the `coverage` job to merge with the integration suite's. The glob is
@@ -78,6 +79,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-unit
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/*.cobertura.xml
           if-no-files-found: error
 
@@ -90,6 +92,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nuget-packages
+          overwrite: true
           path: |
             ./artifacts/*.nupkg
             ./artifacts/*.snupkg
@@ -205,20 +208,31 @@ jobs:
           # those two large images again in the job whose distinct purpose is the Native AOT SUT.
           ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS: "true"
         run: |
-          # The Aspire fixture boots ~11 containers/emulators plus the SUT apps; on 2-core hosted
-          # runners that boot itself intermittently times out or a resource fails to start before
-          # any test executes. Retry once on that exact signature only — genuine test failures
-          # never produce it, so they still fail the job on the first pass.
+          # The suite runs in batches, each booting its own Aspire AppHost; on 2-core hosted runners a
+          # boot intermittently times out or a resource fails to start before any test executes. Retry
+          # once on that exact signature only — genuine test failures never produce it, so they still
+          # fail the job on the first pass. The signature matches the *BatchFixture types in
+          # Batches.cs; keep it in sync if a batch fixture is ever renamed.
           run_integration_tests() {
+            # The cross-product shards are excluded deliberately. Everything in them builds its hosts
+            # in this test process and never touches the sample app, so running them here proves
+            # nothing about the Native AOT SUT while booting nine more fleets — and the Oracle/Cosmos
+            # shards cannot run at all under ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS above. The
+            # dedicated matrix-* legs own that coverage.
+            #
+            # Excluded by trait rather than class name on purpose: the transport contract classes live
+            # in the matrix collections too but are not named Matrix*, and a name-based filter would
+            # leave them behind to boot a shard fleet here.
             dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
               --configuration Release --no-build \
+              --filter-not-trait "batch=matrix-*" \
               --report-trx \
               --results-directory "${{ github.workspace }}/TestResults/IntegrationAot" \
               2>&1 | tee itest-console.log
             return "${PIPESTATUS[0]}"
           }
           if ! run_integration_tests; then
-            if grep -q "IntegrationFixture' threw in InitializeAsync" itest-console.log; then
+            if grep -q "BatchFixture' threw in InitializeAsync" itest-console.log; then
               echo "::warning::Integration fixture failed to boot (known hosted-runner resource flake) — retrying the suite once."
               run_integration_tests
             else
@@ -231,13 +245,51 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-test-results-aot
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/IntegrationAot
 
   integration-tests:
     # The weekly schedule exists only for the redis-compat matrix; skip the per-push jobs on it.
     if: github.event_name != 'schedule'
+    # One leg per batch. The suite already runs in batches in-process (each boots its own AppHost and
+    # tears it down before the next), so a leg is just "run one of them" — selected by the trait every
+    # test class carries, which BatchAssignmentTests keeps honest. Three things this buys over running
+    # all batches on one runner: the legs run concurrently instead of end to end; each runner pulls
+    # only its own batch's images, which is what the disk reclaim below is fighting; and a broker
+    # failure no longer hides a database one.
+    #
+    # The legs partition the suite exactly — every test carries a batch trait, "none" included, so
+    # nothing silently stops running. Keep this list in sync with Batches.cs.
+    #
+    # The nine matrix-* legs are the provider cross product: every channel against every transport
+    # against every durable-flow store, 660 combinations, three scenarios each. They are shards rather
+    # than one leg because the whole fleet at once is roughly 9 GiB of containers — and because Oracle
+    # and Cosmos, the two largest images, cannot share a runner. Each shard boots only the containers
+    # its own cells touch; MatrixCompletenessTests asserts the shards partition the product.
+    strategy:
+      # A failing leg must not cancel the others, or the first failure hides the rest of the signal.
+      fail-fast: false
+      matrix:
+        batch:
+          - data
+          - oracle-cosmos
+          - brokers
+          - cloud
+          - none
+          - matrix-database-light
+          - matrix-broker-light
+          - matrix-cloud-light
+          - matrix-database-oracle
+          - matrix-broker-oracle
+          - matrix-cloud-oracle
+          - matrix-database-cosmos
+          - matrix-broker-cosmos
+          - matrix-cloud-cosmos
+    name: integration-tests (${{ matrix.batch }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The cross-product shards run hundreds of cells each and boot a larger fleet than the original
+    # batches: database-light alone is 288 cells (~7 minutes of cells locally, plus fleet startup).
+    timeout-minutes: ${{ startsWith(matrix.batch, 'matrix-') && 90 || 30 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -250,7 +302,9 @@ jobs:
 
       - name: Reclaim hosted runner disk
         # The real CI failures were ENOSPC while Docker extracted the broker/database fleet, not test
-        # timeouts. Keep the required .NET toolchain and remove unrelated preinstalled SDKs.
+        # timeouts. Keep the required .NET toolchain and remove unrelated preinstalled SDKs. A leg only
+        # pulls its own batch's images now, which is most of why the matrix helps here.
+        if: matrix.batch != 'none'
         run: |
           df -h /
           sudo rm -rf \
@@ -260,6 +314,7 @@ jobs:
           df -h /
 
       - name: Verify Docker
+        if: matrix.batch != 'none'
         run: docker version
 
       - name: Restore
@@ -268,46 +323,53 @@ jobs:
       - name: Build
         run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
 
-      - name: Test (integration)
-        # The integration fixture boots the Aspire AppHost, which starts Redis, the Google Pub/Sub
-        # emulator, Azure Service Bus emulator, LocalStack (SQS), RabbitMQ, NATS, PostgreSQL,
-        # SQL Server, Kafka, MongoDB (single-node replica set), and SUT apps.
+      - name: Test (integration, ${{ matrix.batch }})
+        # This leg boots only its own batch's containers and sample apps; the inventory per batch is
+        # in docs/operations.md. "none" boots nothing at all — it is the in-memory suite, the Native
+        # AOT publish gate, and the batch guards.
         run: |
           # Same targeted boot-flake retry as the AOT integration job: rerun once only when the
-          # failure signature is the Aspire fixture failing to initialize, never for test failures.
+          # failure signature is a batch fixture failing to initialize, never for test failures.
           run_integration_tests() {
             dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
               --configuration Release --no-build \
+              --filter-trait "batch=${{ matrix.batch }}" \
               --report-trx \
               --coverage \
               --coverage-output-format cobertura \
-              --coverage-output integration.cobertura.xml \
+              --coverage-output integration.${{ matrix.batch }}.cobertura.xml \
               --results-directory "${{ github.workspace }}/TestResults/Integration" \
               2>&1 | tee itest-console.log
             return "${PIPESTATUS[0]}"
           }
           if ! run_integration_tests; then
-            if grep -q "IntegrationFixture' threw in InitializeAsync" itest-console.log; then
-              echo "::warning::Integration fixture failed to boot (known hosted-runner resource flake) — retrying the suite once."
+            # Matches both the original *BatchFixture types and the cross-product shards' fixtures
+            # (MatrixDatabaseLightFixture and friends), which carry no "Batch" infix.
+            if grep -q "Fixture' threw in InitializeAsync" itest-console.log; then
+              echo "::warning::Batch '${{ matrix.batch }}' failed to boot (known hosted-runner resource flake) — retrying once."
               run_integration_tests
             else
               exit 1
             fi
           fi
 
-      - name: Upload integration test results
+      - name: Upload integration test results (${{ matrix.batch }})
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: integration-test-results
+          name: integration-test-results-${{ matrix.batch }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration
 
       # The container-backed suite is most of the coverage: the database and broker paths it drives
-      # are unreachable from the unit suite, which alone reads ~16 points lower.
-      - name: Upload integration coverage
+      # are unreachable from the unit suite, which alone reads ~16 points lower. Each leg uploads its
+      # own slice; the coverage job globs coverage-* and merges them, so the published number still
+      # reflects the whole suite.
+      - name: Upload integration coverage (${{ matrix.batch }})
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-integration
+          name: coverage-integration-${{ matrix.batch }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration/*.cobertura.xml
           if-no-files-found: error
 
@@ -373,6 +435,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-test-results-${{ matrix.server }}
+          overwrite: true
           path: ${{ github.workspace }}/TestResults/Integration-${{ matrix.server }}
 
   coverage:
@@ -425,6 +488,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
+          overwrite: true
           path: coverage-report
 
       # Pull requests (including forks, which have no write token) stop at the artifact and the job

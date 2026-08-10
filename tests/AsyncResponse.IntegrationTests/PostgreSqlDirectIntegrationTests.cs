@@ -14,9 +14,328 @@ using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
 
-[Collection(IntegrationCollection.Name)]
-public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+[Trait(Batches.Trait, Batches.Data)]
+public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
+    [Fact]
+    public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()
+    {
+        // A 63-character table name used to collide with its own generated sequence name
+        // (whole-name truncation): CREATE SEQUENCE IF NOT EXISTS silently matched the TABLE,
+        // managed-schema validation was fooled by to_regclass, and the first nextval failed.
+        await WithDataSourceAsync("max_len_table", async (schema, dataSource) =>
+        {
+            var options = ChannelOptions(schema);
+            options.MessageTable = new string('m', 63);
+            var sql = new PostgreSqlChannelSql(dataSource, Options.Create(options));
+            await sql.EnsureCreatedAsync();
+
+            var (_, startSeq) = await sql.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            // Every derived index must actually exist in the catalog. Whole-name truncation used
+            // to make both messages-table index names equal the table's own name, so CREATE INDEX
+            // IF NOT EXISTS matched the table relation and created ZERO indexes — invisible to
+            // any test that only drew from the sequence.
+            var indexNames = new List<string>();
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var indexes = connection.CreateCommand())
+            {
+                indexes.CommandText = "SELECT indexname FROM pg_indexes WHERE schemaname = @schema;";
+                indexes.Parameters.AddWithValue("schema", schema);
+                await using var reader = await indexes.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    indexNames.Add(reader.GetString(0));
+            }
+
+            // Suffix space is reserved by truncating the table STEM, so at the 63-character cap
+            // the two messages-table indexes stay distinct from each other and from the table.
+            Assert.Contains(new string('m', 51) + "_expires_idx", indexNames);
+            Assert.Contains(new string('m', 39) + "_correlation_created_idx", indexNames);
+            Assert.Contains("asyncresponse_recovery_state_expires_idx", indexNames);
+            Assert.Contains("asyncresponse_channel_subscribers_expires_idx", indexNames);
+
+            // The relkind-precise managed-schema validation passes against the real sequence.
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.MessageTable = options.MessageTable;
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlChannelSql(dataSource, Options.Create(managedOptions));
+            var (_, managedSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(managedSeq > startSeq);
+        });
+    }
+
+    [Fact]
+    public async Task SharedSchema_CrossComponentNameCollisions_FailActionablyInsteadOfSilentlySkippingDdl()
+    {
+        // Per-component ValidateNamePlan cannot see the OTHER packages sharing a schema: the
+        // channel's recovery table below occupies the transport's derived claim-index name.
+        // Tables, indexes, and sequences share one relation namespace, and CREATE ... IF NOT
+        // EXISTS matches ANY relation — previously the loser silently skipped its DDL (a missing
+        // claim index, or a channel "table" that is actually someone else's index). The post-DDL
+        // catalog verification must fail whichever component starts second, in both orders.
+        await WithDataSourceAsync("cross_collide_a", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await channel.EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
+            Assert.Contains("jobs_claim_idx", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("occupied by a table", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithDataSourceAsync("cross_collide_b", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await transport.EnsureCreatedAsync();
+
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs_claim_idx";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            // In this direction the collision breaks the DDL batch itself (CREATE INDEX ... ON a
+            // relation that is really the transport's index → wrong object type), which the store
+            // wraps with the same namespace-collision guidance.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("share one namespace", ex.Message, StringComparison.Ordinal);
+            Assert.IsType<PostgresException>(ex.InnerException);
+        });
+    }
+
+    [Fact]
+    public async Task PreexistingObjectsWithWrongDefinitions_FailVerificationActionably()
+    {
+        // CREATE INDEX IF NOT EXISTS accepts ANY existing index with the name and guarantees
+        // nothing about its shape: a same-name index over the WRONG columns silently starved the
+        // claim query of its compound index. The verifier must compare definitions, not names.
+        await WithDataSourceAsync("wrong_index_def", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var creator = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP INDEX "{schema}"."jobs_claim_idx";
+                    CREATE INDEX "jobs_claim_idx" ON "{schema}"."jobs" (created_at);
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("does not match the expected definition", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("queue, available_at, locked_until, created_at", ex.Message, StringComparison.Ordinal);
+        });
+
+        // Same family for sequences: an existing integer sequence would overflow at 2^31 draws;
+        // CREATE SEQUENCE IF NOT EXISTS accepts it silently.
+        await WithDataSourceAsync("wrong_seq_type", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP SEQUENCE {creator.AckSequence};
+                    CREATE SEQUENCE {creator.AckSequence} AS integer;
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("expected bigint", ex.Message, StringComparison.Ordinal);
+        });
+
+        // A bigint sequence is still not necessarily a monotonic cross-process clock: a
+        // descending increment counts down, CYCLE wraps, and CACHE > 1 hands sessions private
+        // blocks. All were accepted before; the property check pins them.
+        await WithDataSourceAsync("wrong_seq_props", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP SEQUENCE {creator.AckSequence};
+                    CREATE SEQUENCE {creator.AckSequence} AS bigint INCREMENT -1 START -1;
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("INCREMENT -1", ex.Message, StringComparison.Ordinal);
+        });
+
+        // A crafted same-kind table that satisfies the index DDL (indexed columns present) but
+        // lacks operational columns previously passed verification and failed at first insert.
+        await WithDataSourceAsync("crafted_table", async (schema, dataSource) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var craft = connection.CreateCommand())
+            {
+                craft.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS "{schema}";
+                    CREATE TABLE "{schema}"."jobs" (
+                        id uuid PRIMARY KEY,
+                        queue text NOT NULL,
+                        available_at timestamptz NOT NULL DEFAULT now(),
+                        locked_until timestamptz NULL,
+                        created_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """;
+                await craft.ExecuteNonQueryAsync();
+            }
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Contains("missing the column 'payload_json'", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task SharedSchema_SameKindTableCollisions_FailActionablyInBothOrders()
+    {
+        // A channel recovery table occupying the transport's table name is the same RELATION
+        // KIND, so the kind check alone accepted it; the dependent index DDL then failed with a
+        // raw "column does not exist". Both directions must produce the actionable collision
+        // error instead.
+        await WithDataSourceAsync("same_kind_a", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await channel.EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = channelOptions.RecoveryStateTable;
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
+            Assert.Contains("occupied by an object of a different kind or shape", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithDataSourceAsync("same_kind_b", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await transport.EnsureCreatedAsync();
+
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("occupied by an object of a different kind or shape", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
+    {
+        // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its
+        // sequence, which registration and delivery claims now require unconditionally. The
+        // channel must fail at first use with an error carrying the exact migration — not a raw
+        // "column does not exist" mid-operation — and work immediately once the documented
+        // migration has been applied.
+        await WithDataSourceAsync("managed_upgrade", async (schema, dataSource) =>
+        {
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            await creator.EnsureCreatedAsync();
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var strip = connection.CreateCommand())
+            {
+                strip.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} DROP COLUMN acked_seq;
+                    DROP SEQUENCE {creator.AckSequence};
+                    """;
+                await strip.ExecuteNonQueryAsync();
+            }
+
+            var managedOptions = ChannelOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlChannelSql(dataSource, Options.Create(managedOptions));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => managed.GetSubscriptionStartAsync(CancellationToken.None));
+            Assert.Contains("acked_seq", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("docs/postgresql.md", ex.Message, StringComparison.Ordinal);
+
+            // The exact migration from docs/postgresql.md, "Upgrading a manually managed schema".
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var migrate = connection.CreateCommand())
+            {
+                migrate.CommandText =
+                    $"""
+                    ALTER TABLE {creator.MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+                    CREATE SEQUENCE IF NOT EXISTS {creator.AckSequence} AS bigint;
+                    """;
+                await migrate.ExecuteNonQueryAsync();
+            }
+
+            var (_, startSeq) = await managed.GetSubscriptionStartAsync(CancellationToken.None);
+            Assert.True(startSeq > 0);
+
+            // Rolling-upgrade rule: a row acked by a PRE-sequence build (acked_at set, acked_seq
+            // null — simulated here) must stay permanently unsequenced through later fan-out
+            // re-claims. Back-filling would pair the old acked_at with a fresh sequence and let a
+            // tick-tied waiter replay its predecessor's response.
+            var legacyId = Guid.NewGuid();
+            await managed.InsertMessageAsync(legacyId, "legacy-ack", SuccessEnvelope("old"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var legacyAck = connection.CreateCommand())
+            {
+                legacyAck.CommandText = $"UPDATE {creator.MessageTable} SET acked_at = now() WHERE id = @id;";
+                legacyAck.Parameters.AddWithValue("id", legacyId);
+                await legacyAck.ExecuteNonQueryAsync();
+            }
+
+            Assert.True(await managed.TryClaimForDeliveryAsync(legacyId, CancellationToken.None));
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var check = connection.CreateCommand())
+            {
+                check.CommandText = $"SELECT acked_seq IS NULL FROM {creator.MessageTable} WHERE id = @id;";
+                check.Parameters.AddWithValue("id", legacyId);
+                Assert.True((bool)(await check.ExecuteScalarAsync())!);
+            }
+
+            // A fresh (unacked) row still gets its stamp on the first claim.
+            var freshId = Guid.NewGuid();
+            await managed.InsertMessageAsync(freshId, "fresh-ack", SuccessEnvelope("new"), TimeSpan.FromSeconds(30), CancellationToken.None);
+            Assert.True(await managed.TryClaimForDeliveryAsync(freshId, CancellationToken.None));
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var check = connection.CreateCommand())
+            {
+                check.CommandText = $"SELECT acked_seq IS NOT NULL FROM {creator.MessageTable} WHERE id = @id;";
+                check.Parameters.AddWithValue("id", freshId);
+                Assert.True((bool)(await check.ExecuteScalarAsync())!);
+            }
+        });
+    }
+
     [Fact]
     public async Task InsertMessage_LosingAnUncommittedConflict_ResolvesAfterCommitViaFreshRead()
     {
@@ -1040,7 +1359,7 @@ public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture)
             type,
             BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
             binder: null,
-            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, predicate, completion, null],
+            [channel, "corr", Guid.NewGuid(), DateTimeOffset.UtcNow, 0L, predicate, completion, null],
             culture: null)!;
         SetField(instance, "_cleanupStarted", 1);
         return (instance, completion);

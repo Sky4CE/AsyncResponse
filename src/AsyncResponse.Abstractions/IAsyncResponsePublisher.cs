@@ -2,9 +2,13 @@ namespace AsyncResponse;
 
 /// <summary>
 /// Broadcasts asynchronous responses (payloads or failures) on the response channel identified
-/// by a correlation id. Active waiters receive them (subject on the database channels to the
-/// same-tick registration/claim tie documented in <c>docs/recovery.md</c>, which is resolved as
-/// at-most-once); when nobody is listening, the lost-subscriber fallback routes them through the
+/// by a correlation id. Active waiters receive them (on the database channels a registration
+/// tying another process's delivery claim within one server-clock tick is arbitrated by the
+/// store's monotonic ack sequence; a claim whose sequence draw stalled across ticks resolves
+/// conservatively as history — never a replayed response, at worst the pre-sequence at-most-once
+/// verdict. See the shared-correlation section of <c>docs/recovery.md</c>); when nobody is
+/// listening,
+/// the lost-subscriber fallback routes them through the
 /// <see cref="RecoveryState"/> callbacks stored in the configured
 /// <see cref="IRecoveryStateStore"/>.
 /// </summary>
@@ -14,12 +18,15 @@ public interface IAsyncResponsePublisher
     /// Publishes a response payload on the channel associated with the specified correlation id.
     /// Active subscribers awaiting this channel receive the payload — including payloads
     /// that describe a failed business state, which the waiter's <c>Until</c> predicate and flow
-    /// code interpret. One deliberate exception on the database channels: a subscriber whose
-    /// registration lands in the same server-clock tick as another process's delivery claim is
-    /// excluded from that delivery and times out instead (at-most-once for the tie — see the
-    /// shared-correlation section of <c>docs/recovery.md</c>). With no subscribers, the payload's
-    /// <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> decides between the persisted
-    /// resume and failure callbacks.
+    /// code interpret. On the database channels a subscriber whose registration lands in the
+    /// same server-clock tick as another process's delivery claim is included or excluded by the
+    /// store's monotonic ack sequence; a claim whose sequence draw stalled across ticks resolves
+    /// conservatively as history — the waiter misses that delivery and recovers through its
+    /// timeout, never by replaying a consumed response (see the shared-correlation section of
+    /// <c>docs/recovery.md</c>). With no subscribers, the payload's
+    /// <see cref="IAsyncResponsePayload.OnRecovery"/> decides between the persisted resume
+    /// and failure callbacks — or retains the registration for a non-terminal checkpoint
+    /// (<see cref="RecoveryAction.KeepWaiting"/>).
     /// </summary>
     /// <typeparam name="T">The payload type.</typeparam>
     /// <param name="response">The payload to publish.</param>
@@ -37,9 +44,9 @@ public interface IAsyncResponsePublisher
     /// <summary>
     /// Publishes a <em>technical</em> failure on the channel associated with the specified
     /// correlation id. Active subscribers' waits fault with <paramref name="exception"/> — the
-    /// database channels' exceptions travel through the same delivery watermark as responses, so
-    /// the same-tick registration/claim tie (see <c>docs/recovery.md</c>) applies here too; with
-    /// no subscribers, the persisted failure callback is invoked.
+    /// database channels' exceptions travel through the same delivery watermark as responses,
+    /// with the same sequence-arbitrated tick tie (see <c>docs/recovery.md</c>); with no
+    /// subscribers, the persisted failure callback is invoked.
     /// <para>
     /// <b>Reserve this for genuinely exceptional, unexpected conditions</b> (a dependency is down, a
     /// message could not be deserialized, an invariant was violated) — not for expected business
@@ -84,7 +91,7 @@ public interface IAsyncResponsePublisher
     /// and have the waiter inspect it. This keeps the fan-out on the cheap value path (no
     /// <see langword="throw"/>, no stack capture, minimal allocation), makes the failure a
     /// first-class part of your contract that survives serialization across brokers and process
-    /// restarts, and lets <see cref="IAsyncResponsePayload.ShouldResumeOnRecovery"/> drive
+    /// restarts, and lets <see cref="IAsyncResponsePayload.OnRecovery"/> drive
     /// recovery routing for it. Keep <c>SetException</c> for the failures you would genuinely want a
     /// stack trace and an <see langword="catch"/> block for.
     /// </para>

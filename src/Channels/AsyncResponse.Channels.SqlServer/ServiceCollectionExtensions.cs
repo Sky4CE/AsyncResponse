@@ -43,7 +43,8 @@ public static class SqlServerAsyncResponseChannelServiceCollectionExtensions
             provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>(),
             provider.GetService<IWorkerTransport>(),
             provider.GetService<IAsyncResponseReplyTargetProvider>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>())));
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetService<TimeProvider>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
         services.AddSingleton(new AsyncResponseChannelMarker(SqlServerAsyncResponseChannelOptions.ChannelName));

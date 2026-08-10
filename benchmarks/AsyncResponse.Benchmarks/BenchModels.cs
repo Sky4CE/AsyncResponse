@@ -14,7 +14,8 @@ public sealed class BenchPayload : IAsyncResponsePayload
     public BenchStatus Status { get; set; }
     public string? Message { get; set; }
 
-    public bool ShouldResumeOnRecovery() => Status is BenchStatus.Completed or BenchStatus.Running;
+    public RecoveryAction OnRecovery()
+        => Status is BenchStatus.Completed or BenchStatus.Running ? RecoveryAction.Resume : RecoveryAction.Fail;
 }
 
 /// <summary>Second payload shape used to exercise conversion/type-dispatch paths.</summary>
@@ -24,7 +25,8 @@ public sealed class BenchPayloadWithMetadata : IAsyncResponsePayload
     public string? Message { get; set; }
     public Dictionary<string, string>? Metadata { get; set; }
 
-    public bool ShouldResumeOnRecovery() => Status is BenchStatus.Completed or BenchStatus.Running;
+    public RecoveryAction OnRecovery()
+        => Status is BenchStatus.Completed or BenchStatus.Running ? RecoveryAction.Resume : RecoveryAction.Fail;
 }
 
 /// <summary>A no-op worker target for the callback/reflection benchmarks.</summary>

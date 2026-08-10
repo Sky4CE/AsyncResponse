@@ -15,6 +15,14 @@ namespace AsyncResponse;
 /// This is process-wide and additive: registered resolvers are consulted only when the default scan
 /// does not find the type. Registering nothing preserves the default behavior exactly.
 /// </para>
+/// <para>
+/// <b>Unloadable (collectible) contexts:</b> the library's resolution caches skip types from
+/// collectible assemblies (resolving them per call), so AsyncResponse never pins a collectible
+/// <c>AssemblyLoadContext</c>. <c>System.Text.Json</c> does, however, pin any collectible type it
+/// serializes through runtime-internal caches — so for unloadable plugins, keep payload types and
+/// callback service interfaces in a shared non-collectible contracts assembly and load only
+/// implementations into the collectible context (see <c>docs/security.md</c>).
+/// </para>
 /// </summary>
 public static class AsyncResponseTypeResolution
 {

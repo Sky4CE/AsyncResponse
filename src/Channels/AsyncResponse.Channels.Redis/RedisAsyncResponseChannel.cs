@@ -16,7 +16,8 @@ namespace AsyncResponse.Channels.Redis;
 /// <item><description>Subscribes waiters to those channels with per-channel serialized handling.</description></item>
 /// <item><description>Persists <see cref="RecoveryState"/> so responses arriving after the waiter
 /// died (e.g. a redeploy) are routed through the lost-subscriber dispatcher, which asks the payload's
-/// ShouldResumeOnRecovery and invokes the resume or failure callback.</description></item>
+/// OnRecovery and invokes the resume or failure callback with the materialized payload
+/// (or keeps the registration armed for a checkpoint).</description></item>
 /// </list>
 /// </summary>
 internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawAsyncResponsePublisher, IRecoverableAsyncResponseSubscriber, IActiveSubscriberProbe
@@ -102,13 +103,14 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // route every recovered response to the failure callback. The in-memory channel, which
         // cannot recover across a process restart, is deliberately not subject to this check.
         if ((resumeCallback is not null || failureCallback is not null)
-            && !AsyncResponsePayloadReflection.OverridesShouldResumeOnRecovery(typeof(T)))
+            && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
         {
             throw new InvalidOperationException(
                 $"Payload type '{typeof(T)}' registers lost-subscriber recovery callbacks on the Redis channel " +
-                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.ShouldResumeOnRecovery)}(). " +
-                "Override it to declare which responses resume the flow (return true) versus fail it (return false); " +
-                "the durable channel needs this to route a response that arrives after the waiter was lost.");
+                $"but does not override {nameof(IAsyncResponsePayload)}.{nameof(IAsyncResponsePayload.OnRecovery)}(). " +
+                "Override it to declare what each response does to the flow — RecoveryAction.Resume, " +
+                "RecoveryAction.Fail, or RecoveryAction.KeepWaiting for non-terminal checkpoints; the durable " +
+                "channel needs this to route a response that arrives after the waiter was lost.");
         }
 
         // default: first envelope completes the wait
@@ -453,6 +455,25 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             _executors.OnSubscriptionRegistered(channel.ToString()!);
             executorRegistered = true;
             subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A message pumped inside SubscribeAsync completed the waiter and ran cleanup to
+                // the end before this assignment existed — its unsubscribe saw a null
+                // subscription and the latched cleanup never re-runs. Compensate here, or the
+                // server-side subscription outlives the waiter: NUMSUB and publish keep counting
+                // a live waiter, and lost-subscriber recovery is suppressed for this correlation
+                // id until process exit. Best-effort: the waiter already holds its response, so a
+                // teardown fault must not fail the create.
+                try
+                {
+                    await UnsubscribeQuietlyAsync(subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", channel.ToString()!);
+                }
+            }
+
             var recoveryState = new RecoveryState
             {
                 RegistrationId = registrationId,
@@ -464,7 +485,43 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
+            if (Volatile.Read(ref cleanupStarted) != 0)
+            {
+                // A terminal delivery started cleanup while this registration was still being
+                // written: cleanup's delete ran before the save committed, so the save just
+                // orphaned a callback-armed registration that would resurrect recovery for a wait
+                // that already reached a terminal state. Compensate with a second delete
+                // (mirrors the in-memory channel's post-save check). Best-effort: TTL and the
+                // watchdog back a failed delete.
+                try
+                {
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
+                }
+            }
+
             _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
+        }
+        catch (Exception ex) when (tcs.Task.IsCompletedSuccessfully || tcs.Task.IsFaulted)
+        {
+            // The wait already settled: a delivery completed the waiter while this registration
+            // step was still in flight (cleanup marks cleanupStarted just after setting the task,
+            // so the task is the race-free signal), and the step — the recovery-state save — then
+            // failed. The response in hand outranks the builder's "throw so the trigger never
+            // fires" contract: rethrowing would discard a delivered response, the exact loss this
+            // library exists to prevent, and the success path for this same interleaving already
+            // returns the completed waiter. Cleanup runs on the delivery path, so nothing is
+            // leaked; a save that still committed is compensated above or expires via TTL, with
+            // the recovery watchdog behind it. The filter demands an actual settlement (result
+            // or fault): a canceled task means NO response was delivered — e.g. a future
+            // channel-wide teardown canceling in-flight registrations — and takes the rethrow
+            // path below.
+            _logger.LogWarning(ex,
+                "Registration step failed after a delivery settled correlationId {CorrelationId}; returning the completed waiter.",
+                correlationId);
         }
         catch (Exception ex)
         {
@@ -562,12 +619,31 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            channel.ToString()!,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
@@ -633,12 +709,31 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostResponses(_recoveryStateStore, correlationId, response, channel.ToString()!, cancellationToken)
+                        .DispatchLostResponses(
+                            _recoveryStateStore,
+                            correlationId,
+                            response,
+                            channel.ToString()!,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.ShouldResume);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.ShouldResume, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
@@ -712,12 +807,31 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         return;
 
                     dispatchResult = await _lostSubscriberDispatcher
-                        .DispatchLostExceptions(_recoveryStateStore, correlationId, exception, channel.ToString()!, cancellationToken)
+                        .DispatchLostExceptions(
+                            _recoveryStateStore,
+                            correlationId,
+                            exception,
+                            channel.ToString()!,
+                            cancellationToken,
+                            hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
                         .ConfigureAwait(false);
+                    if (dispatchResult.RetryLive)
+                    {
+                        // Second contradiction: delivery keeps reporting no responders while the
+                        // probe keeps reporting a live subscriber (interest not yet visible
+                        // server-side, or a stale heartbeat). Consuming registrations on this
+                        // evidence would strip a live waiter of its recovery arm — leave all state
+                        // intact for the next delivery or the waiter's own lifecycle.
+                        _logger.LogWarning(
+                            "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
+                            correlationId);
+                        activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
+                        return;
+                    }
                 }
 
                 activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                AsyncResponseDiagnostics.RecordLostSubscriber("exception", shouldResume: false, dispatchResult.CallbackInvoked);
+                AsyncResponseDiagnostics.RecordLostSubscriber("exception", action: RecoveryAction.Fail, dispatchResult.CallbackInvoked);
 
                 await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
             }
