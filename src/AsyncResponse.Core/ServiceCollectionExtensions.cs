@@ -156,7 +156,7 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     /// idempotent-start check compares the input value.
     /// </param>
     /// <param name="configure">Optional per-schedule options (time zone, enabled).</param>
-    public static AsyncResponseRegistrationBuilder WithScheduledFlow<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] TFlow, TInput>(
+    public static AsyncResponseRegistrationBuilder WithScheduledFlow<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         this AsyncResponseRegistrationBuilder builder,
         string name,
         string cron,
