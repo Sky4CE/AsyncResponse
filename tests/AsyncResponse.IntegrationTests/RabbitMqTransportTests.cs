@@ -8,8 +8,8 @@ namespace AsyncResponse.IntegrationTests;
 /// The real RabbitMQ transport: worker jobs published and consumed over RabbitMQ, and responses
 /// ingested from a RabbitMQ queue into active waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class RabbitMqTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class RabbitMqTransportTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckRabbitMqModes()

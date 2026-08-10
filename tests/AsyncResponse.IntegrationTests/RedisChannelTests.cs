@@ -6,8 +6,8 @@ using Xunit;
 namespace AsyncResponse.IntegrationTests;
 
 /// <summary>Active-waiter behavior over a real Redis pub/sub response channel, driven via the SUT.</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class RedisChannelTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class RedisChannelTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task HappyPath_ConsumesProgress_AndCompletesOnTerminal()

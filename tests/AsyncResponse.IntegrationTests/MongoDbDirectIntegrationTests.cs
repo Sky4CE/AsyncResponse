@@ -19,8 +19,8 @@ namespace AsyncResponse.IntegrationTests;
 /// findOneAndUpdate claims, deterministic dead-letter ids) and the change-stream wake, including
 /// cross-instance delivery where the publisher and the waiter live in different providers.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class MongoDbDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture), IDisposable
+[Collection(DataCollection.Name)]
+public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture), IDisposable
 {
     private readonly MongoClient _client = new(fixture.MongoDbConnectionString);
     private readonly List<string> _databases = [];

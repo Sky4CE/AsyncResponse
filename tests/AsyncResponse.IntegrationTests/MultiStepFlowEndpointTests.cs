@@ -9,8 +9,8 @@ namespace AsyncResponse.IntegrationTests;
 /// transport). These tests intentionally compose the same HTTP affordances the sample exposes,
 /// because this is where subscribe-before-send, SetException, and recovery behavior meet.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class MultiStepFlowEndpointTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class MultiStepFlowEndpointTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task MultiStep_OverRedis_SucceedThenSucceed_CompletesBothStepsInOrder()

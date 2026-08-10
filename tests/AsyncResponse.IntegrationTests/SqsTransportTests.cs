@@ -9,8 +9,8 @@ namespace AsyncResponse.IntegrationTests;
 /// queues (provisioned with redrive-policy dead-letter queues by the transport's CreateQueues
 /// option), and responses ingested from an SQS response queue into active or recoverable waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class SqsTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(CloudCollection.Name)]
+public sealed class SqsTransportTests(CloudBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckSqsModes()

@@ -116,6 +116,67 @@ no separate fixture app to keep in sync). They run at two levels:
 dotnet run --project tests/AsyncResponse.IntegrationTests
 ```
 
+#### Batches
+
+The Aspire-orchestrated tests are split into **batches**. A batch is a named subset of the fleet: the
+AppHost declares only that batch's containers and sample apps, and each batch has its own xUnit
+collection and fixture. Collections run sequentially (`DisableTestParallelization`), so xUnit tears
+one batch's containers down before the next batch's fixture boots. Peak footprint is therefore the
+largest batch, not the whole fleet — and running a single test only boots its own batch.
+
+The split follows the one structural line that exists in the suite: a test either drives a sample app
+over HTTP, or it drives a driver directly. The direct half needs no sample app at all, so those
+batches start zero processes. The app-driven half splits by family.
+
+Batches are balanced on **measured memory, not container count** — counting containers is misleading,
+since a handful of database servers can cost more than twice as much as a larger set of brokers. Four
+containers dominate everything else, so the split is mostly about keeping them apart:
+
+| Batch | Collection | Containers | Apps | Tests | What's in it |
+| --- | --- | --- | --- | --- | --- |
+| `data` | `DataCollection` | 8 | 9 | 224 | Everything database-backed: channel conformance, store contracts, the "direct" driver tests, and the database channel/transport SUTs |
+| `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 2 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
+| `brokers` | `BrokersCollection` | 5 | 10 | 55 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
+| `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
+
+Peak footprint across a full run is ~3.3 GiB, against 5.8 GiB when the store contracts shared a batch.
+That earlier arrangement fit when the suite ran alone and failed wholesale when anything else used the
+machine — a full-solution run in an IDE, for instance.
+
+Batch count is a trade-off in both directions, and more batches is not automatically better: every
+batch is another AppHost boot, and every container it shares with another batch is started twice.
+Conformance, the store contracts, and the database SUTs were three separate batches at one point; all
+three wanted PostgreSQL, SQL Server, and MongoDB, so SQL Server — the slowest container here to accept
+logins — was booted three times for no benefit. They are one batch now, and every heavy container in
+the suite starts exactly once per run. Only Redis, NATS, Pub/Sub, and LocalStack start more than once,
+and those are the cheap ones.
+
+Two containers are explicitly capped, because both size themselves from the host and neither needs
+what it takes: Oracle via `INIT_SGA_SIZE`/`INIT_PGA_SIZE` (2,180 → 518 MiB) and both SQL Servers via
+`MSSQL_MEMORY_LIMIT_MB`. Override with `ASYNCRESPONSE_ITEST_ORACLE_SGA_MB`,
+`ASYNCRESPONSE_ITEST_ORACLE_PGA_MB`, and `ASYNCRESPONSE_ITEST_SQLSERVER_MEMORY_MB`.
+
+Tests that need no AppHost at all (the in-memory suite, the Native AOT publish gate) belong to no
+batch and boot nothing. `BatchAssignmentTests` fails if a class asks for a fixture without declaring
+its batch, or declares one batch and takes another's fixture.
+
+`DurableFlowIntegrationTests` is the one class that spans families — it drives flows across
+PostgreSQL, SQL Server, MongoDB, NATS, and SQS at once. It sits in `databases` because adding NATS and
+LocalStack there costs less than adding three database servers to another batch.
+
+To add a batch: add a `case` to the AppHost's switch on `ASYNCRESPONSE_ITEST_BATCH` composing the
+container and app-group functions it needs, derive a fixture overriding `Batch` and `WireAsync`, add a
+`[CollectionDefinition]`, and register it in `BatchAssignmentTests`. Note that a batch without sample
+apps inherits work they normally do on the suite's behalf — `DriverOnlyBatchFixture` waits for
+PostgreSQL and creates the SQL Server database itself, because no sample app is there to do it.
+
+> **The AppHost must stay in the solution.** `tests/AsyncResponse.IntegrationTests.AppHost` is a
+> solution member, not merely a `ProjectReference`. Left out, an IDE's "build solution and run all
+> tests" rebuilds the test assembly but leaves the AppHost stale — so the suite orchestrates from an
+> old build, asking for batches it no longer defines and resources that no longer exist. The symptom
+> is `Resource '<name>' not found` and container fleets that match no batch in this table, which reads
+> as a test bug rather than a build one. If you ever see that, rebuild the AppHost first.
+
 In Rider, use the Unit Tests window or gutter icons to run/debug individual unit or integration
 tests. Aspire is not a test explorer here; it is only the infrastructure harness that the integration
 fixture starts for you.

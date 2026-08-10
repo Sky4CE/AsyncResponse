@@ -9,8 +9,8 @@ namespace AsyncResponse.IntegrationTests;
 /// from Service Bus queues, and responses ingested from a Service Bus response queue into active or
 /// recoverable waiters.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class AzureServiceBusTransportTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(CloudCollection.Name)]
+public sealed class AzureServiceBusTransportTests(CloudBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Config_ReportsDefaultAndEarlyAckAzureServiceBusModes()

@@ -50,6 +50,12 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj" />
+    <!-- The integration AppHost must be a solution member, not just a ProjectReference. Left out, an
+         IDE "build solution + run all tests" rebuilds the test assembly but leaves this one stale, so
+         the suite silently orchestrates containers from an old build — batches the tests no longer
+         ask for, resources they now expect to exist. That failure looks like a test bug, not a build
+         one, which is exactly what makes it expensive. -->
+    <Project Path="tests/AsyncResponse.IntegrationTests.AppHost/AsyncResponse.IntegrationTests.AppHost.csproj" />
     <Project Path="tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj" />
   </Folder>
   <Folder Name="/Solution Items/">

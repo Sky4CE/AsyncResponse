@@ -5,13 +5,26 @@ using Xunit;
 namespace AsyncResponse.IntegrationTests;
 
 /// <summary>
-/// Boots the Aspire AppHost once for the whole collection — real Redis, a Google Pub/Sub emulator,
-/// Azure Service Bus emulator, Kafka, RabbitMQ, NATS, PostgreSQL, and the system-under-test sample
-/// apps, all orchestrated by the dedicated integration AppHost. Tests drive the SUTs entirely over
-/// HTTP via <see cref="Client"/>.
+/// Boots the Aspire AppHost once per <em>batch</em>. A batch is a named subset of the fleet: the
+/// AppHost declares only that batch's containers and sample apps, and this fixture only resolves
+/// endpoints for what its batch declared. Because collections run sequentially (the assembly-level
+/// <c>DisableTestParallelization</c> in Batches.cs), xUnit disposes one batch's fixture — tearing its
+/// containers down — before the next batch's fixture initializes. Peak footprint is therefore the
+/// largest batch, not the whole fleet.
+/// <para>
+/// Derive a fixture per batch: override <see cref="Batch"/> with a name the AppHost understands and
+/// <see cref="WireAsync"/> to resolve just that batch's resources. Touching a resource the batch did
+/// not declare throws, which is the intended failure — it means the test is in the wrong batch.
+/// </para>
 /// </summary>
-public sealed class IntegrationFixture : IAsyncLifetime
+public abstract class IntegrationFixture : IAsyncLifetime
 {
+    /// <summary>Selects which resources the AppHost declares. Must match a batch it knows.</summary>
+    protected abstract string Batch { get; }
+
+    private const string BatchEnvironmentVariable = "ASYNCRESPONSE_ITEST_BATCH";
+    private string? _previousBatch;
+
     /// <summary>Response topic id the AppHost configures — asserted by the reply-target scenario.</summary>
     public const string ResponseTopicId = "response-topic";
     public const string RabbitMqResponseExchange = "asyncresponse.itest.response";
@@ -26,225 +39,157 @@ public sealed class IntegrationFixture : IAsyncLifetime
     private string? _previousOracleConnectionString;
     private string? _previousCosmosConnectionString;
 
-    public HttpClient Client { get; private set; } = null!;
-    public HttpClient EarlyAckClient { get; private set; } = null!;
-    public HttpClient AzureServiceBusClient { get; private set; } = null!;
-    public HttpClient AzureServiceBusEarlyAckClient { get; private set; } = null!;
-    public HttpClient SqsClient { get; private set; } = null!;
-    public HttpClient SqsEarlyAckClient { get; private set; } = null!;
-    public HttpClient RabbitMqClient { get; private set; } = null!;
-    public HttpClient RabbitMqEarlyAckClient { get; private set; } = null!;
-    public HttpClient KafkaClient { get; private set; } = null!;
-    public HttpClient KafkaEarlyAckClient { get; private set; } = null!;
-    public HttpClient RedisTransportClient { get; private set; } = null!;
-    public HttpClient RedisTransportEarlyAckClient { get; private set; } = null!;
-    public HttpClient NatsClient { get; private set; } = null!;
-    public HttpClient NatsEarlyAckClient { get; private set; } = null!;
+    public HttpClient Client { get; private protected set; } = null!;
+    public HttpClient EarlyAckClient { get; private protected set; } = null!;
+    public HttpClient AzureServiceBusClient { get; private protected set; } = null!;
+    public HttpClient AzureServiceBusEarlyAckClient { get; private protected set; } = null!;
+    public HttpClient SqsClient { get; private protected set; } = null!;
+    public HttpClient SqsEarlyAckClient { get; private protected set; } = null!;
+    public HttpClient RabbitMqClient { get; private protected set; } = null!;
+    public HttpClient RabbitMqEarlyAckClient { get; private protected set; } = null!;
+    public HttpClient KafkaClient { get; private protected set; } = null!;
+    public HttpClient KafkaEarlyAckClient { get; private protected set; } = null!;
+    public HttpClient RedisTransportClient { get; private protected set; } = null!;
+    public HttpClient RedisTransportEarlyAckClient { get; private protected set; } = null!;
+    public HttpClient NatsClient { get; private protected set; } = null!;
+    public HttpClient NatsEarlyAckClient { get; private protected set; } = null!;
     /// <summary>StackExchange.Redis configuration for the fixture's Redis (used by Direct-style tests).</summary>
-    public string RedisConnectionString { get; private set; } = null!;
+    public string RedisConnectionString { get; private protected set; } = null!;
     /// <summary>NATS URL for the fixture's JetStream-enabled NATS server (used by Direct-style tests).</summary>
-    public string NatsConnectionString { get; private set; } = null!;
-    public HttpClient PostgreSqlClient { get; private set; } = null!;
-    public HttpClient PostgreSqlEarlyAckClient { get; private set; } = null!;
-    public string PostgreSqlConnectionString { get; private set; } = null!;
-    public string MySqlConnectionString { get; private set; } = null!;
-    public string MongoDbConnectionString { get; private set; } = null!;
-    public HttpClient SqlServerClient { get; private set; } = null!;
-    public HttpClient SqlServerEarlyAckClient { get; private set; } = null!;
-    public string SqlServerConnectionString { get; private set; } = null!;
-    public HttpClient MongoDbClient { get; private set; } = null!;
-    public HttpClient MongoDbEarlyAckClient { get; private set; } = null!;
-    public string LocalStackServiceUrl { get; private set; } = null!;
+    public string NatsConnectionString { get; private protected set; } = null!;
+    public HttpClient PostgreSqlClient { get; private protected set; } = null!;
+    public HttpClient PostgreSqlEarlyAckClient { get; private protected set; } = null!;
+    public string PostgreSqlConnectionString { get; private protected set; } = null!;
+    public string MySqlConnectionString { get; private protected set; } = null!;
+    public string MongoDbConnectionString { get; private protected set; } = null!;
+    public HttpClient SqlServerClient { get; private protected set; } = null!;
+    public HttpClient SqlServerEarlyAckClient { get; private protected set; } = null!;
+    public string SqlServerConnectionString { get; private protected set; } = null!;
+    public HttpClient MongoDbClient { get; private protected set; } = null!;
+    public HttpClient MongoDbEarlyAckClient { get; private protected set; } = null!;
+    public string LocalStackServiceUrl { get; private protected set; } = null!;
 
     public async ValueTask InitializeAsync()
     {
         _previousOracleConnectionString = Environment.GetEnvironmentVariable(OracleConnectionStringEnvironmentVariable);
         _previousCosmosConnectionString = Environment.GetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable);
 
+        // DistributedApplicationTestingBuilder invokes the AppHost's entry point *in this process*, so
+        // the AppHost reads this variable straight out of our environment. Setting it here is only safe
+        // because batches never run concurrently — see the class remarks.
+        _previousBatch = Environment.GetEnvironmentVariable(BatchEnvironmentVariable);
+        Environment.SetEnvironmentVariable(BatchEnvironmentVariable, Batch);
+
         var appHost = await DistributedApplicationTestingBuilder.CreateAsync<Projects.AsyncResponse_IntegrationTests_AppHost>();
         _app = await appHost.BuildAsync().WaitAsync(StartupTimeout);
         await _app.StartAsync().WaitAsync(StartupTimeout);
 
-        if (string.Equals(Env("ASYNCRESPONSE_ITEST_PROFILE", ""), "redis-compat", StringComparison.OrdinalIgnoreCase))
-        {
-            await _app.ResourceNotifications
-                .WaitForResourceHealthyAsync("itest-app-redis")
-                .WaitAsync(StartupTimeout);
-            await _app.ResourceNotifications
-                .WaitForResourceHealthyAsync("itest-app-redis-early-ack")
-                .WaitAsync(StartupTimeout);
+        await WireAsync();
+    }
 
-            // RedisChannelTests use the fixture's default client; in the focused profile the Redis
-            // channel is paired with the Redis transport instead of booting Pub/Sub just for that role.
-            Client = _app.CreateHttpClient("itest-app-redis");
-            RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
-            RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
+    /// <summary>Resolves the endpoints, clients, and connection strings this batch declared.</summary>
+    protected abstract ValueTask WireAsync();
 
-            await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
-            await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
-            return;
-        }
+    /// <summary>The running AppHost. Only valid from <see cref="WireAsync"/> onward.</summary>
+    private protected DistributedApplication App =>
+        _app ?? throw new InvalidOperationException("The AppHost has not been started yet.");
 
-        // Wait until the SUT reports healthy (its /alive probe) — i.e. it has connected to Redis and the
-        // emulator and provisioned its topics/subscriptions — before driving any scenario.
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-azure-servicebus")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-azure-servicebus-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-sqs")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-sqs-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-rabbitmq")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-rabbitmq-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-kafka")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-kafka-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-redis")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-redis-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-nats")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-nats-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-postgresql")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-postgresql-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-sqlserver")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-sqlserver-early-ack")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-mongodb")
-            .WaitAsync(StartupTimeout);
-        await _app.ResourceNotifications
-            .WaitForResourceHealthyAsync("itest-app-mongodb-early-ack")
-            .WaitAsync(StartupTimeout);
+    /// <summary>
+    /// Waits for each sample app's <c>/alive</c> probe, then hands back a client per app and resets
+    /// its test state. Waiting for an app the batch did not declare hangs until the startup timeout,
+    /// so the names here must match what the AppHost's branch for this batch actually added.
+    /// </summary>
+    private protected async Task<HttpClient[]> WireAppsAsync(params string[] names)
+    {
+        foreach (var name in names)
+            await App.ResourceNotifications.WaitForResourceHealthyAsync(name).WaitAsync(StartupTimeout);
 
-        Client = _app.CreateHttpClient("itest-app");
-        EarlyAckClient = _app.CreateHttpClient("itest-app-early-ack");
-        AzureServiceBusClient = _app.CreateHttpClient("itest-app-azure-servicebus");
-        AzureServiceBusEarlyAckClient = _app.CreateHttpClient("itest-app-azure-servicebus-early-ack");
-        SqsClient = _app.CreateHttpClient("itest-app-sqs");
-        SqsEarlyAckClient = _app.CreateHttpClient("itest-app-sqs-early-ack");
-        RabbitMqClient = _app.CreateHttpClient("itest-app-rabbitmq");
-        RabbitMqEarlyAckClient = _app.CreateHttpClient("itest-app-rabbitmq-early-ack");
-        KafkaClient = _app.CreateHttpClient("itest-app-kafka");
-        KafkaEarlyAckClient = _app.CreateHttpClient("itest-app-kafka-early-ack");
-        RedisTransportClient = _app.CreateHttpClient("itest-app-redis");
-        RedisTransportEarlyAckClient = _app.CreateHttpClient("itest-app-redis-early-ack");
-        NatsClient = _app.CreateHttpClient("itest-app-nats");
-        NatsEarlyAckClient = _app.CreateHttpClient("itest-app-nats-early-ack");
-        PostgreSqlClient = _app.CreateHttpClient("itest-app-postgresql");
-        PostgreSqlEarlyAckClient = _app.CreateHttpClient("itest-app-postgresql-early-ack");
-        SqlServerClient = _app.CreateHttpClient("itest-app-sqlserver");
-        SqlServerEarlyAckClient = _app.CreateHttpClient("itest-app-sqlserver-early-ack");
-        MongoDbClient = _app.CreateHttpClient("itest-app-mongodb");
-        MongoDbEarlyAckClient = _app.CreateHttpClient("itest-app-mongodb-early-ack");
+        var clients = names.Select(name => App.CreateHttpClient(name)).ToArray();
+        foreach (var client in clients)
+            await ResetTestStateAsync(client).WaitAsync(StartupTimeout);
 
+        return clients;
+    }
+
+    private protected async Task WireRedisConnectionStringAsync()
         // AddRedis is a full Aspire resource, so ask it for its connection string (it may carry a
-        // password); the NATS container is a raw AddContainer, so compose its URL from the endpoint.
-        RedisConnectionString = await _app.GetConnectionStringAsync("redis")
+        // password) rather than composing one from the endpoint.
+        => RedisConnectionString = await App.GetConnectionStringAsync("redis")
             ?? throw new InvalidOperationException("The Aspire 'redis' resource reported no connection string.");
-        var natsEndpoint = _app.GetEndpoint("nats", "nats");
-        NatsConnectionString = $"nats://{natsEndpoint.Host}:{natsEndpoint.Port}";
 
-        var postgresEndpoint = _app.GetEndpoint("postgres", "postgres");
+    private protected void WireNatsConnectionString()
+    {
+        var endpoint = App.GetEndpoint("nats", "nats");
+        NatsConnectionString = $"nats://{endpoint.Host}:{endpoint.Port}";
+    }
+
+    // --- Per-resource wiring ------------------------------------------------------------------
+    // Each batch calls only the ones whose containers it declared; calling one for an absent
+    // resource throws from GetEndpoint, which is the signal that a test landed in the wrong batch.
+
+    private protected void WirePostgreSqlConnectionString()
+    {
+        var endpoint = App.GetEndpoint("postgres", "postgres");
         PostgreSqlConnectionString =
-            $"Host={postgresEndpoint.Host};Port={postgresEndpoint.Port};Username=postgres;Password=postgres;Database=asyncresponse;" +
+            $"Host={endpoint.Host};Port={endpoint.Port};Username=postgres;Password=postgres;Database=asyncresponse;" +
             "Maximum Pool Size=40;No Reset On Close=true;Max Auto Prepare=20";
+    }
 
-        var mysqlEndpoint = _app.GetEndpoint("mysql", "mysql");
+    private protected void WireMySqlConnectionString()
+    {
+        var endpoint = App.GetEndpoint("mysql", "mysql");
         MySqlConnectionString =
-            $"Server={mysqlEndpoint.Host};Port={mysqlEndpoint.Port};User ID=root;Password=mysql;Database=asyncresponse;Connection Timeout=30;";
+            $"Server={endpoint.Host};Port={endpoint.Port};User ID=root;Password=mysql;Database=asyncresponse;Connection Timeout=30;";
+    }
 
-        // directConnection: the container is a single-node replica set (change streams need one), and
-        // without it the driver would chase the replica-set-advertised container hostname.
-        var mongoDbEndpoint = _app.GetEndpoint("mongodb", "mongodb");
-        MongoDbConnectionString = $"mongodb://{mongoDbEndpoint.Host}:{mongoDbEndpoint.Port}/?directConnection=true";
+    // directConnection: the container is a single-node replica set (change streams need one), and
+    // without it the driver would chase the replica-set-advertised container hostname.
+    private protected void WireMongoDbConnectionString()
+    {
+        var endpoint = App.GetEndpoint("mongodb", "mongodb");
+        MongoDbConnectionString = $"mongodb://{endpoint.Host}:{endpoint.Port}/?directConnection=true";
+    }
 
-        // The AppHost omits the Oracle and Cosmos containers when ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS
-        // resolves to skip (their endpoints then don't exist), and a user-supplied connection string
-        // always wins over the container-derived one. When neither var ends up set, the opt-in
-        // durable-flow store contract tests Assert.Skip.
-        var skipOracleCosmos = SkipOracleCosmos();
+    private protected void WireSqlServerConnectionString()
+    {
+        var endpoint = App.GetEndpoint("sqlserver", "sqlserver");
+        SqlServerConnectionString =
+            $"Server={endpoint.Host},{endpoint.Port};User ID=sa;Password={Env("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD", "P@ssword12345")};" +
+            "Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=40";
+    }
 
-        if (!skipOracleCosmos && string.IsNullOrEmpty(_previousOracleConnectionString))
+    private protected void WireLocalStackServiceUrl()
+    {
+        var endpoint = App.GetEndpoint("localstack", "edge");
+        LocalStackServiceUrl = $"http://{endpoint.Host}:{endpoint.Port}";
+    }
+
+    /// <summary>
+    /// The AppHost omits the Oracle and Cosmos containers when ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS
+    /// resolves to skip (their endpoints then don't exist), and a user-supplied connection string
+    /// always wins over the container-derived one. When neither var ends up set, the opt-in
+    /// durable-flow store contract tests Assert.Skip.
+    /// </summary>
+    private protected void WireOracleAndCosmosConnectionStrings()
+    {
+        if (SkipOracleCosmos())
+            return;
+
+        if (string.IsNullOrEmpty(_previousOracleConnectionString))
         {
-            var oracleEndpoint = _app.GetEndpoint("oracle", "oracle");
+            var oracleEndpoint = App.GetEndpoint("oracle", "oracle");
             Environment.SetEnvironmentVariable(
                 OracleConnectionStringEnvironmentVariable,
                 $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
         }
 
-        if (!skipOracleCosmos && string.IsNullOrEmpty(_previousCosmosConnectionString))
+        if (string.IsNullOrEmpty(_previousCosmosConnectionString))
         {
-            var cosmosEndpoint = _app.GetEndpoint("cosmos", "gateway");
+            var cosmosEndpoint = App.GetEndpoint("cosmos", "gateway");
             Environment.SetEnvironmentVariable(
                 CosmosConnectionStringEnvironmentVariable,
                 $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
         }
-
-        // The SUT apps have already provisioned the asyncresponse database by the time they report
-        // healthy, so direct tests can connect straight to it.
-        var sqlServerEndpoint = _app.GetEndpoint("sqlserver", "sqlserver");
-        var sqlServerPassword = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_SQLSERVER_PASSWORD") is { Length: > 0 } configured
-            ? configured
-            : "P@ssword12345";
-        SqlServerConnectionString =
-            $"Server={sqlServerEndpoint.Host},{sqlServerEndpoint.Port};User ID=sa;Password={sqlServerPassword};" +
-            "Database=asyncresponse;TrustServerCertificate=True;Max Pool Size=40";
-
-        var localStackEndpoint = _app.GetEndpoint("localstack", "edge");
-        LocalStackServiceUrl = $"http://{localStackEndpoint.Host}:{localStackEndpoint.Port}";
-
-        await ResetTestStateAsync(Client).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(EarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(AzureServiceBusClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(AzureServiceBusEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(SqsClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(SqsEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(RabbitMqClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(RabbitMqEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(KafkaClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(KafkaEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(RedisTransportClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(RedisTransportEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(NatsClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(NatsEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(PostgreSqlClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(PostgreSqlEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(SqlServerClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(SqlServerEarlyAckClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(MongoDbClient).WaitAsync(StartupTimeout);
-        await ResetTestStateAsync(MongoDbEarlyAckClient).WaitAsync(StartupTimeout);
     }
 
     public async ValueTask DisposeAsync()
@@ -278,27 +223,22 @@ public sealed class IntegrationFixture : IAsyncLifetime
         {
             Environment.SetEnvironmentVariable(OracleConnectionStringEnvironmentVariable, _previousOracleConnectionString);
             Environment.SetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable, _previousCosmosConnectionString);
+            Environment.SetEnvironmentVariable(BatchEnvironmentVariable, _previousBatch);
         }
     }
 
     /// <summary>
-    /// Mirrors the AppHost's decision — the two must agree, because the endpoints only exist when
-    /// the AppHost created the containers. Unset means "auto": skip on Apple-silicon macOS, where
-    /// the amd64-only Oracle image and the Cosmos emulator cannot run and would fail the whole
-    /// AppHost boot (an IDE "run all tests" never sets the flag). CI pins "true"/"false" explicitly.
+    /// Mirrors the AppHost's decision — the two must agree, because the endpoints only exist when the
+    /// AppHost created the containers. Oracle and Cosmos run by default everywhere (both images ship
+    /// linux/arm64 and boot natively on Apple silicon); set the flag to "true" to leave them out.
     /// </summary>
     private static bool SkipOracleCosmos()
-    {
-        var configured = Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "auto");
-        if (string.Equals(configured, "true", StringComparison.OrdinalIgnoreCase))
-            return true;
-        if (string.Equals(configured, "false", StringComparison.OrdinalIgnoreCase))
-            return false;
-        return OperatingSystem.IsMacOS()
-            && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
-    }
+        => string.Equals(
+            Env("ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS", "false"),
+            "true",
+            StringComparison.OrdinalIgnoreCase);
 
-    private static string Env(string name, string fallback)
+    private protected static string Env(string name, string fallback)
         => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value ? value : fallback;
 
     private static async Task ResetTestStateAsync(HttpClient client)

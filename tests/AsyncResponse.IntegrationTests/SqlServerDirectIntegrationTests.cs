@@ -13,8 +13,8 @@ using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
 
-[Collection(IntegrationCollection.Name)]
-public sealed class SqlServerDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()

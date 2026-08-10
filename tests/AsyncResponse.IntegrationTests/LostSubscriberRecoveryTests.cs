@@ -7,8 +7,8 @@ namespace AsyncResponse.IntegrationTests;
 /// Real lost-subscriber recovery: arm a waiter on Redis, drop subscriptions (simulated redeploy),
 /// then deliver a late response and assert the persisted recovery callbacks fire correctly.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class LostSubscriberRecoveryTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class LostSubscriberRecoveryTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task CompletedResponse_AfterCrash_InvokesResumeCallback_WithRestoredTrace()

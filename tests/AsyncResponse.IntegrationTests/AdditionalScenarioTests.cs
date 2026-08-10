@@ -11,8 +11,8 @@ namespace AsyncResponse.IntegrationTests;
 /// failed domain payload arriving through the Pub/Sub response ingress, and the watchdog health
 /// returning to Healthy once stale recovery state is cleared.
 /// </summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class AdditionalScenarioTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class AdditionalScenarioTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Attach_OverRedis_CompletesByCorrelationId()

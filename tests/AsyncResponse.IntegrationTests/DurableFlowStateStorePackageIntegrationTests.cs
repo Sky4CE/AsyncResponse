@@ -24,11 +24,12 @@ using Npgsql;
 using Oracle.ManagedDataAccess.Client;
 using System.Text.Json;
 using Xunit;
+using static AsyncResponse.IntegrationTests.FlowStoreContract;
 
 namespace AsyncResponse.IntegrationTests;
 
-[Collection(IntegrationCollection.Name)]
-public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task SqlitePackageStore_RoundTrips_Expires_Deletes()
@@ -323,114 +324,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
         }
     }
 
-    [Fact]
-    public async Task OraclePackageStore_RoundTrips_Expires_Deletes_WhenConnectionStringIsConfigured()
-    {
-        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING");
-        if (string.IsNullOrWhiteSpace(connectionString))
-            Assert.Skip("Set ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING to run the Oracle durable-flow store contract test.");
 
-        await WaitForOracleAsync(connectionString);
-        var table = NewIdentifier("DF_ORACLE", 18).ToUpperInvariant();
-        try
-        {
-            var store = new OracleFlowStateStore(
-                Options.Create(new OracleDurableFlowOptions
-                {
-                    ConnectionString = connectionString,
-                    TableName = table
-                }));
-
-            await AssertStoreContractAsync(store);
-
-            // A second process can provision against an already-created schema. Oracle reports
-            // both CREATE statements as "already exists"; the store must treat that as success.
-            var secondStore = new OracleFlowStateStore(
-                Options.Create(new OracleDurableFlowOptions
-                {
-                    ConnectionString = connectionString,
-                    TableName = table
-                }));
-            Assert.Null(await secondStore.LoadAsync($"missing-{Guid.NewGuid():N}"));
-
-            var mismatchedRevisionFlowId = $"revision-{Guid.NewGuid():N}";
-            Assert.True(await store.TryCreateAsync(
-                mismatchedRevisionFlowId,
-                CreateState(mismatchedRevisionFlowId),
-                TimeSpan.FromMinutes(1)));
-
-            await using var revisionConnection = new OracleConnection(connectionString);
-            await revisionConnection.OpenAsync();
-            await using var revisionCommand = revisionConnection.CreateCommand();
-            revisionCommand.BindByName = true;
-            revisionCommand.CommandText = $"UPDATE {table} SET revision = revision + 1 WHERE flow_id = :flow_id";
-            revisionCommand.Parameters.Add(new OracleParameter("flow_id", mismatchedRevisionFlowId));
-            Assert.Equal(1, await revisionCommand.ExecuteNonQueryAsync());
-            Assert.Null(await store.LoadAsync(mismatchedRevisionFlowId));
-        }
-        finally
-        {
-            await using var connection = new OracleConnection(connectionString);
-            await connection.OpenAsync();
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"DROP TABLE {table} PURGE";
-            try
-            {
-                await command.ExecuteNonQueryAsync();
-            }
-            catch (OracleException ex) when (ex.Number == 942)
-            {
-            }
-        }
-    }
-
-    [Fact]
-    public async Task CosmosPackageStore_RoundTrips_Expires_Deletes_WhenConnectionStringIsConfigured()
-    {
-        var connectionString = Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING");
-        if (string.IsNullOrWhiteSpace(connectionString))
-            Assert.Skip("Set ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING to run the Cosmos DB durable-flow store contract test.");
-
-        var databaseName = NewIdentifier("df_cosmos", 63);
-        using var client = new CosmosClient(connectionString, GetCosmosClientOptions(connectionString));
-        await WaitForCosmosAsync(client);
-        try
-        {
-            var store = new CosmosFlowStateStore(
-                client,
-                Options.Create(new CosmosDurableFlowOptions
-                {
-                    DatabaseName = databaseName,
-                    ContainerName = "flow_state"
-                }));
-
-            await AssertStoreContractAsync(store);
-
-            await client.GetDatabase(databaseName).CreateContainerAsync(
-                new ContainerProperties("flow_state_without_ttl", "/flowId"));
-            var manualStore = new CosmosFlowStateStore(
-                client,
-                Options.Create(new CosmosDurableFlowOptions
-                {
-                    DatabaseName = databaseName,
-                    ContainerName = "flow_state_without_ttl",
-                    AutoCreateContainer = false
-                }));
-            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => manualStore.LoadAsync("flow"));
-            Assert.Contains("TTL", exception.Message, StringComparison.Ordinal);
-        }
-        finally
-        {
-            try
-            {
-                await client.GetDatabase(databaseName).DeleteAsync();
-            }
-            catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-            {
-            }
-        }
-    }
 
     private async Task WaitForMySqlAsync()
         => await EventuallyAsync(async () =>
@@ -447,47 +341,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
             _ = await cursor.AnyAsync();
         });
 
-    private async Task WaitForOracleAsync(string connectionString)
-        => await EventuallyAsync(async () =>
-        {
-            await using var connection = new OracleConnection(connectionString);
-            await connection.OpenAsync();
-        });
 
-    private async Task WaitForCosmosAsync(CosmosClient client)
-        => await EventuallyAsync(async () => _ = await client.ReadAccountAsync());
-
-    private static CosmosClientOptions GetCosmosClientOptions(string connectionString)
-    {
-        var options = new CosmosClientOptions();
-        if (!IsLocalCosmosEndpoint(connectionString))
-            return options;
-
-        options.ConnectionMode = ConnectionMode.Gateway;
-        options.LimitToEndpoint = true;
-        options.HttpClientFactory = () => new HttpClient(new HttpClientHandler
-        {
-            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-        });
-        return options;
-    }
-
-    private static bool IsLocalCosmosEndpoint(string connectionString)
-    {
-        foreach (var segment in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var pair = segment.Split('=', 2, StringSplitOptions.TrimEntries);
-            if (pair.Length == 2 &&
-                pair[0].Equals("AccountEndpoint", StringComparison.OrdinalIgnoreCase) &&
-                Uri.TryCreate(pair[1], UriKind.Absolute, out var endpoint))
-            {
-                return endpoint.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
-                       endpoint.Host is "127.0.0.1" or "::1";
-            }
-        }
-
-        return false;
-    }
 
     private AmazonDynamoDBClient CreateDynamoDbClient()
         => new(
@@ -498,146 +352,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(IntegrationFixt
                 AuthenticationRegion = "us-east-1"
             });
 
-    private static async Task EventuallyAsync(Func<Task> action)
-    {
-        var deadline = DateTime.UtcNow.AddSeconds(30);
-        Exception? last = null;
-        while (DateTime.UtcNow < deadline)
-        {
-            try
-            {
-                await action();
-                return;
-            }
-            catch (Exception ex)
-            {
-                last = ex;
-                await Task.Delay(500);
-            }
-        }
 
-        throw new TimeoutException("The backing store did not become ready within 30 seconds.", last);
-    }
 
-    private static async Task AssertStoreContractAsync(
-        IFlowStateStore store,
-        TimeSpan? expiryTtl = null,
-        TimeSpan? expiryDelay = null)
-    {
-        var state = CreateState("flow-itest");
 
-        Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
-        var loaded = await store.LoadAsync(state.FlowId!);
-        Assert.NotNull(loaded);
-        Assert.Equal(FlowRunStatus.Running, loaded!.Status);
-        Assert.True(loaded.Steps!["step-a"].Completed);
-
-        state.Status = FlowRunStatus.Succeeded;
-        state.LastMessage = "done";
-        state.Revision = 1;
-        Assert.True(await store.TryUpdateAsync(state.FlowId!, state, 0, TimeSpan.FromMinutes(5)));
-        Assert.Equal(FlowRunStatus.Succeeded, (await store.LoadAsync(state.FlowId!))!.Status);
-
-        Assert.True(await store.TryCreateAsync("expired-flow", CreateState("expired-flow"), expiryTtl ?? TimeSpan.FromMilliseconds(1)));
-        await Task.Delay(expiryDelay ?? TimeSpan.FromMilliseconds(30));
-        Assert.Null(await store.LoadAsync("expired-flow"));
-
-        var concurrent = store;
-        var replacement = CreateState("expired-flow");
-        Assert.True(await concurrent.TryCreateAsync("expired-flow", replacement, TimeSpan.FromMinutes(5)));
-        Assert.NotNull(await store.LoadAsync("expired-flow"));
-        Assert.True(await store.TryDeleteAsync("expired-flow"));
-
-        var concurrentFlowId = $"flow-concurrency-{Guid.NewGuid():N}";
-        var createResults = await Task.WhenAll(
-            Enumerable.Range(0, 16)
-                .Select(_ => concurrent.TryCreateAsync(
-                    concurrentFlowId,
-                    CreateState(concurrentFlowId),
-                    TimeSpan.FromMinutes(5))));
-        Assert.Single(createResults, static created => created);
-
-        var concurrentState = await store.LoadAsync(concurrentFlowId);
-        Assert.NotNull(concurrentState);
-        Assert.Equal(0, concurrentState!.Revision);
-
-        Assert.True(await concurrent.TryAcquireLeaseAsync(
-            concurrentFlowId,
-            "owner-a",
-            TimeSpan.FromMinutes(1)));
-        Assert.False(await concurrent.TryAcquireLeaseAsync(
-            concurrentFlowId,
-            "owner-b",
-            TimeSpan.FromMinutes(1)));
-
-        concurrentState.Status = FlowRunStatus.Succeeded;
-        concurrentState.Revision = 1;
-        Assert.False(await concurrent.TryUpdateAsync(
-            concurrentFlowId,
-            concurrentState,
-            expectedRevision: 0,
-            TimeSpan.FromMinutes(5),
-            leaseId: "owner-b"));
-        Assert.True(await concurrent.TryUpdateAsync(
-            concurrentFlowId,
-            concurrentState,
-            expectedRevision: 0,
-            TimeSpan.FromMinutes(5),
-            leaseId: "owner-a"));
-        Assert.False(await concurrent.TryUpdateAsync(
-            concurrentFlowId,
-            concurrentState,
-            expectedRevision: 0,
-            TimeSpan.FromMinutes(5),
-            leaseId: "owner-a"));
-        Assert.Equal(1, (await store.LoadAsync(concurrentFlowId))!.Revision);
-
-        Assert.False(await concurrent.TryRenewLeaseAsync(
-            concurrentFlowId,
-            "owner-b",
-            TimeSpan.FromMinutes(1)));
-        Assert.True(await concurrent.TryRenewLeaseAsync(
-            concurrentFlowId,
-            "owner-a",
-            TimeSpan.FromMinutes(1)));
-        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-b");
-        Assert.False(await concurrent.TryAcquireLeaseAsync(
-            concurrentFlowId,
-            "owner-b",
-            TimeSpan.FromMinutes(1)));
-        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-a");
-        Assert.True(await concurrent.TryAcquireLeaseAsync(
-            concurrentFlowId,
-            "owner-b",
-            TimeSpan.FromMinutes(1)));
-        await concurrent.ReleaseLeaseAsync(concurrentFlowId, "owner-b");
-        Assert.True(await store.TryDeleteAsync(concurrentFlowId));
-
-        Assert.True(await store.TryDeleteAsync(state.FlowId!));
-        Assert.Null(await store.LoadAsync(state.FlowId!));
-        Assert.False(await store.TryDeleteAsync(state.FlowId!));
-    }
-
-    private static FlowState CreateState(string flowId)
-        => new()
-        {
-            FlowId = flowId,
-            FlowTypeName = typeof(DurableFlowStateStorePackageIntegrationTests).FullName,
-            InputTypeName = typeof(int).FullName,
-            InputJson = JsonSerializer.Serialize(7),
-            Status = FlowRunStatus.Running,
-            LastMessage = "started",
-            CreatedAtUtc = DateTime.UtcNow,
-            UpdatedAtUtc = DateTime.UtcNow,
-            Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
-            {
-                ["step-a"] = new() { Completed = true, ResultJson = "123", CompletedAtUtc = DateTime.UtcNow }
-            }
-        };
-
-    private static string NewIdentifier(string prefix, int maxLength)
-    {
-        var identifier = $"{prefix}_{Guid.NewGuid():N}";
-        return identifier.Length <= maxLength ? identifier : identifier[..maxLength];
-    }
 }

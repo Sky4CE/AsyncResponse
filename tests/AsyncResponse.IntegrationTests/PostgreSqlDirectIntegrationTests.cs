@@ -14,8 +14,8 @@ using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
 
-[Collection(IntegrationCollection.Name)]
-public sealed class PostgreSqlDirectIntegrationTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(DataCollection.Name)]
+public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task MaximumLengthMessageTableName_CreatesADistinctSequence_AndDrawsFromIt()

@@ -6,8 +6,8 @@ using Xunit;
 namespace AsyncResponse.IntegrationTests;
 
 /// <summary>Watchdog/health surfacing, reply targets, and HTTP-driven end-to-end flows.</summary>
-[Collection(IntegrationCollection.Name)]
-public sealed class WatchdogReplyTargetHttpTests(IntegrationFixture fixture) : IntegrationTestBase(fixture)
+[Collection(BrokersCollection.Name)]
+public sealed class WatchdogReplyTargetHttpTests(BrokersBatchFixture fixture) : IntegrationTestBase(fixture)
 {
     [Fact]
     public async Task Watchdog_SurfacesStaleRecoveryStateAsDegradedHealth()
