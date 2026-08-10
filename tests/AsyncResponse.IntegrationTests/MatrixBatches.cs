@@ -82,7 +82,164 @@ public abstract class MatrixBatchFixture : DriverOnlyBatchFixture
 
         if (NeedsCosmos)
             WireCosmosConnectionString();
+
+        await WaitForBackendsAsync();
     }
+
+    /// <summary>
+    /// Blocks until every backend this shard wired actually answers. This is the barrier the
+    /// app-driven batches get for free and a matrix shard does not: their sample apps <c>WaitFor</c>
+    /// the containers, and waiting for the apps to report healthy transitively waits for the servers.
+    /// A shard starts no app, so without this the first cells run against containers that have a port
+    /// open and nothing behind it.
+    /// <para>
+    /// That is not hypothetical — it is what CI failed on: the Cosmos emulator answers its gateway
+    /// while still replying <c>503 pgcosmos extension is still starting</c>, MySQL accepts a socket
+    /// before completing its handshake, NATS serves core requests before JetStream's API responds, and
+    /// the Service Bus emulator opens AMQP before its entities exist.
+    /// </para>
+    /// </summary>
+    private async Task WaitForBackendsAsync()
+    {
+        // Oracle and the Cosmos emulator are minutes-scale on a cold container; everything else is
+        // seconds. See DriverOnlyBatchFixture.EventuallyAsync for the default.
+        var heavyStoreBudget = TimeSpan.FromMinutes(6);
+
+        // The five channel backends every shard declares.
+        await EventuallyAsync(async () =>
+        {
+            await using var connection = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(
+                RedisConnectionString);
+            await connection.GetDatabase().PingAsync();
+        });
+
+        await EventuallyAsync(async () =>
+        {
+            await using var connection = new NATS.Client.Core.NatsConnection(
+                new NATS.Client.Core.NatsOpts { Url = NatsConnectionString });
+            await connection.ConnectAsync();
+
+            // JetStream specifically: the NATS transport creates streams through the JetStream API,
+            // which starts answering later than the core protocol does.
+            var jetStream = new NATS.Client.JetStream.NatsJSContext(connection);
+            await foreach (var _ in jetStream.ListStreamNamesAsync())
+                break;
+        });
+
+        await EventuallyAsync(async () =>
+        {
+            var client = new MongoDB.Driver.MongoClient(MongoDbConnectionString);
+            using var cursor = await client.ListDatabaseNamesAsync();
+            _ = await cursor.MoveNextAsync();
+        });
+
+        // PostgreSQL readiness and the SQL Server database are handled by the base fixture above.
+
+        if (NeedsBrokers)
+        {
+            await EventuallyAsync(async () =>
+            {
+                var factory = new RabbitMQ.Client.ConnectionFactory
+                {
+                    Uri = new Uri(RabbitMqConnectionString!)
+                };
+                await using var connection = await factory.CreateConnectionAsync();
+            });
+
+            // Kafka: creating and dropping nothing, just resolving metadata, proves the broker is
+            // past its KRaft startup rather than merely listening.
+            await EventuallyAsync(() =>
+            {
+                using var admin = new Confluent.Kafka.AdminClientBuilder(
+                    new Confluent.Kafka.AdminClientConfig { BootstrapServers = KafkaBootstrapServers }).Build();
+                admin.GetMetadata(TimeSpan.FromSeconds(10));
+                return Task.CompletedTask;
+            });
+        }
+
+        if (NeedsCloud)
+        {
+            await EventuallyAsync(async () =>
+            {
+                await using var client = new Azure.Messaging.ServiceBus.ServiceBusClient(
+                    AzureServiceBusConnectionString);
+                await using var receiver = client.CreateReceiver("arm-asb-worker-00");
+                await receiver.PeekMessageAsync();
+            });
+
+            await EventuallyAsync(async () =>
+            {
+                var publisher = await new Google.Cloud.PubSub.V1.PublisherServiceApiClientBuilder
+                {
+                    EmulatorDetection = Google.Api.Gax.EmulatorDetection.EmulatorOnly
+                }.BuildAsync();
+                await foreach (var _ in publisher.ListTopicsAsync(
+                    new Google.Cloud.PubSub.V1.ListTopicsRequest { Project = $"projects/{PubSubProjectId}" }))
+                {
+                    break;
+                }
+            });
+        }
+
+        if (NeedsCloud || NeedsLightStores)
+            await EventuallyAsync(() => WaitForLocalStackAsync());
+
+        if (NeedsLightStores)
+        {
+            await EventuallyAsync(async () =>
+            {
+                await using var connection = new MySqlConnector.MySqlConnection(MySqlConnectionString);
+                await connection.OpenAsync();
+            });
+        }
+
+        if (NeedsOracle && Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_ORACLE_CONNECTION_STRING") is { Length: > 0 } oracle)
+        {
+            await EventuallyAsync(async () =>
+            {
+                await using var connection = new Oracle.ManagedDataAccess.Client.OracleConnection(oracle);
+                await connection.OpenAsync();
+            }, heavyStoreBudget);
+        }
+
+        if (NeedsCosmos && Environment.GetEnvironmentVariable("ASYNCRESPONSE_ITEST_COSMOS_CONNECTION_STRING") is { Length: > 0 } cosmos)
+        {
+            await EventuallyAsync(async () =>
+            {
+                using var client = new Microsoft.Azure.Cosmos.CosmosClient(cosmos, CosmosReadinessOptions());
+
+                // ReadAccountAsync is not enough on its own: the emulator answers it while the
+                // pgcosmos extension is still starting and every write then fails with a 503. Creating
+                // a database is the first operation a cell actually performs.
+                var probe = $"arm_ready_{Guid.NewGuid():N}";
+                await client.CreateDatabaseIfNotExistsAsync(probe);
+                await client.GetDatabase(probe).DeleteAsync();
+            }, heavyStoreBudget);
+        }
+    }
+
+    /// <summary>LocalStack backs both the SQS transport and the DynamoDB store.</summary>
+    private async Task WaitForLocalStackAsync()
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        var health = await http.GetStringAsync($"{LocalStackServiceUrl}/_localstack/health");
+        if (!health.Contains("\"sqs\": \"available\"", StringComparison.Ordinal) &&
+            !health.Contains("\"sqs\": \"running\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException($"LocalStack SQS is not available yet: {health}");
+        }
+    }
+
+    /// <summary>Gateway mode pinned to the endpoint, accepting the emulator's self-signed certificate.</summary>
+    private static Microsoft.Azure.Cosmos.CosmosClientOptions CosmosReadinessOptions() => new()
+    {
+        ConnectionMode = Microsoft.Azure.Cosmos.ConnectionMode.Gateway,
+        LimitToEndpoint = true,
+        HttpClientFactory = () => new HttpClient(new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+        })
+    };
 }
 
 public sealed class MatrixDatabaseLightFixture : MatrixBatchFixture

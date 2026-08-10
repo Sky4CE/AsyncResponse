@@ -4,17 +4,19 @@ using Xunit;
 namespace AsyncResponse.IntegrationTests;
 
 // The transport behavioral contract (see TransportConformanceSuite) run against every real broker the
-// fixtures boot. Each class builds its hosts in this test process — no sample app — and isolates
-// itself with a per-cell namespace, so these run alongside the app-driven suites on the same fleet.
+// fixtures boot. Each class builds its hosts in this test process and isolates itself with a
+// per-host namespace, so the classes share a fleet without sharing a queue.
 //
-// The classes are spread across the existing batches by which container each transport needs, rather
-// than getting batches of their own: the contract needs one broker per transport, and every one of
-// them is already up in some batch.
+// They ride the cross-product shards rather than the app-driven batches, because those shards are
+// driver-only: they boot exactly these containers and start no sample app. That matters for more than
+// tidiness — the first CI run had every delivery-dependent Redis fact time out in the app-heavy
+// "data" batch, which runs nine sample-app processes alongside eight containers on a four-core
+// runner, while the same facts passed everywhere else.
 
 /// <summary>Contract run against real Redis streams.</summary>
-[Collection(DataCollection.Name)]
-[Trait(Batches.Trait, Batches.Data)]
-public sealed class RedisTransportConformanceTests(DataBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixDatabaseLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixDatabaseLight)]
+public sealed class RedisTransportConformanceTests(MatrixDatabaseLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.Redis;
 
@@ -25,9 +27,9 @@ public sealed class RedisTransportConformanceTests(DataBatchFixture fixture) : T
 }
 
 /// <summary>Contract run against real NATS JetStream.</summary>
-[Collection(DataCollection.Name)]
-[Trait(Batches.Trait, Batches.Data)]
-public sealed class NatsTransportConformanceTests(DataBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixDatabaseLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixDatabaseLight)]
+public sealed class NatsTransportConformanceTests(MatrixDatabaseLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.Nats;
 
@@ -37,9 +39,9 @@ public sealed class NatsTransportConformanceTests(DataBatchFixture fixture) : Tr
 }
 
 /// <summary>Contract run against the real PostgreSQL FOR UPDATE SKIP LOCKED queue.</summary>
-[Collection(DataCollection.Name)]
-[Trait(Batches.Trait, Batches.Data)]
-public sealed class PostgreSqlTransportConformanceTests(DataBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixDatabaseLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixDatabaseLight)]
+public sealed class PostgreSqlTransportConformanceTests(MatrixDatabaseLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.PostgreSql;
 
@@ -50,9 +52,9 @@ public sealed class PostgreSqlTransportConformanceTests(DataBatchFixture fixture
 }
 
 /// <summary>Contract run against the real SQL Server UPDLOCK/READPAST queue.</summary>
-[Collection(DataCollection.Name)]
-[Trait(Batches.Trait, Batches.Data)]
-public sealed class SqlServerTransportConformanceTests(DataBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixDatabaseLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixDatabaseLight)]
+public sealed class SqlServerTransportConformanceTests(MatrixDatabaseLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.SqlServer;
 
@@ -62,9 +64,9 @@ public sealed class SqlServerTransportConformanceTests(DataBatchFixture fixture)
 }
 
 /// <summary>Contract run against the real MongoDB findOneAndUpdate queue.</summary>
-[Collection(DataCollection.Name)]
-[Trait(Batches.Trait, Batches.Data)]
-public sealed class MongoDbTransportConformanceTests(DataBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixDatabaseLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixDatabaseLight)]
+public sealed class MongoDbTransportConformanceTests(MatrixDatabaseLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.MongoDb;
 
@@ -74,9 +76,9 @@ public sealed class MongoDbTransportConformanceTests(DataBatchFixture fixture) :
 }
 
 /// <summary>Contract run against a real single-broker Kafka.</summary>
-[Collection(BrokersCollection.Name)]
-[Trait(Batches.Trait, Batches.Brokers)]
-public sealed class KafkaTransportConformanceTests(BrokersBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixBrokerLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixBrokerLight)]
+public sealed class KafkaTransportConformanceTests(MatrixBrokerLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.Kafka;
 
@@ -87,9 +89,9 @@ public sealed class KafkaTransportConformanceTests(BrokersBatchFixture fixture) 
 }
 
 /// <summary>Contract run against a real RabbitMQ broker.</summary>
-[Collection(BrokersCollection.Name)]
-[Trait(Batches.Trait, Batches.Brokers)]
-public sealed class RabbitMqTransportConformanceTests(BrokersBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixBrokerLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixBrokerLight)]
+public sealed class RabbitMqTransportConformanceTests(MatrixBrokerLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.RabbitMq;
 
@@ -99,9 +101,9 @@ public sealed class RabbitMqTransportConformanceTests(BrokersBatchFixture fixtur
 }
 
 /// <summary>Contract run against the Google Pub/Sub emulator.</summary>
-[Collection(BrokersCollection.Name)]
-[Trait(Batches.Trait, Batches.Brokers)]
-public sealed class GooglePubSubTransportConformanceTests(BrokersBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixCloudLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixCloudLight)]
+public sealed class GooglePubSubTransportConformanceTests(MatrixCloudLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.GooglePubSub;
 
@@ -112,9 +114,9 @@ public sealed class GooglePubSubTransportConformanceTests(BrokersBatchFixture fi
 }
 
 /// <summary>Contract run against LocalStack's SQS.</summary>
-[Collection(CloudCollection.Name)]
-[Trait(Batches.Trait, Batches.Cloud)]
-public sealed class SqsTransportConformanceTests(CloudBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixCloudLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixCloudLight)]
+public sealed class SqsTransportConformanceTests(MatrixCloudLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.Sqs;
 
@@ -125,9 +127,9 @@ public sealed class SqsTransportConformanceTests(CloudBatchFixture fixture) : Tr
 }
 
 /// <summary>Contract run against the Azure Service Bus emulator.</summary>
-[Collection(CloudCollection.Name)]
-[Trait(Batches.Trait, Batches.Cloud)]
-public sealed class AzureServiceBusTransportConformanceTests(CloudBatchFixture fixture) : TransportConformanceSuite
+[Collection(MatrixCloudLightCollection.Name)]
+[Trait(Batches.Trait, Batches.MatrixCloudLight)]
+public sealed class AzureServiceBusTransportConformanceTests(MatrixCloudLightFixture fixture) : TransportConformanceSuite
 {
     protected override MatrixTransport Transport => MatrixTransport.AzureServiceBus;
 

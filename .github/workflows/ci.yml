@@ -211,8 +211,18 @@ jobs:
           # fail the job on the first pass. The signature matches the *BatchFixture types in
           # Batches.cs; keep it in sync if a batch fixture is ever renamed.
           run_integration_tests() {
+            # The cross-product shards are excluded deliberately. Everything in them builds its hosts
+            # in this test process and never touches the sample app, so running them here proves
+            # nothing about the Native AOT SUT while booting nine more fleets — and the Oracle/Cosmos
+            # shards cannot run at all under ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS above. The
+            # dedicated matrix-* legs own that coverage.
+            #
+            # Excluded by trait rather than class name on purpose: the transport contract classes live
+            # in the matrix collections too but are not named Matrix*, and a name-based filter would
+            # leave them behind to boot a shard fleet here.
             dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
               --configuration Release --no-build \
+              --filter-not-trait "batch=matrix-*" \
               --report-trx \
               --results-directory "${{ github.workspace }}/TestResults/IntegrationAot" \
               2>&1 | tee itest-console.log

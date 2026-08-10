@@ -33,6 +33,7 @@ public static class MatrixScenarios
     /// </summary>
     public static async Task DurableFlowCompletesAsync(MatrixCell cell, MatrixBackends backends)
     {
+        SkipWhenStoreIsUnavailable(cell, backends);
         await using var harness = await CreateHarnessAsync(cell, backends);
         var probe = harness.Provider.GetRequiredService<MatrixFlowProbe>();
 
@@ -71,6 +72,7 @@ public static class MatrixScenarios
     /// </summary>
     public static async Task DomainFailureMarksRunFailedAsync(MatrixCell cell, MatrixBackends backends)
     {
+        SkipWhenStoreIsUnavailable(cell, backends);
         await using var harness = await CreateHarnessAsync(cell, backends);
         var probe = harness.Provider.GetRequiredService<MatrixFlowProbe>();
 
@@ -101,6 +103,7 @@ public static class MatrixScenarios
     /// </summary>
     public static async Task WorkerJobRestoresContextAndAnswersWaiterAsync(MatrixCell cell, MatrixBackends backends)
     {
+        SkipWhenStoreIsUnavailable(cell, backends);
         await using var harness = await CreateHarnessAsync(cell, backends);
         var correlationId = harness.Names.NewCorrelationId("worker");
 
@@ -126,6 +129,21 @@ public static class MatrixScenarios
         // The worker echoes the correlation id it observed. Equality proves the transport restored the
         // enqueuing context rather than the job inventing a fresh one.
         Assert.Equal(correlationId, result.Message);
+    }
+
+    /// <summary>
+    /// Skips a cell whose store was deliberately left out of this run. Oracle and Cosmos are the two
+    /// containers CI omits when a job's purpose is something else (see
+    /// ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS), and a cell that cannot reach its store should say so
+    /// rather than fail — a failure there reads as a library defect and is not one.
+    /// </summary>
+    private static void SkipWhenStoreIsUnavailable(MatrixCell cell, MatrixBackends backends)
+    {
+        if (cell.Store == MatrixStore.Oracle && string.IsNullOrWhiteSpace(backends.Oracle))
+            Assert.Skip($"{cell}: Oracle is not part of this run.");
+
+        if (cell.Store == MatrixStore.Cosmos && string.IsNullOrWhiteSpace(backends.Cosmos))
+            Assert.Skip($"{cell}: the Cosmos emulator is not part of this run.");
     }
 
     private static async Task<MatrixHarness> CreateHarnessAsync(MatrixCell cell, MatrixBackends backends)

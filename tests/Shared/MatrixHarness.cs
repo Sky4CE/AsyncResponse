@@ -59,6 +59,16 @@ namespace AsyncResponse.Conformance;
 /// </summary>
 public sealed class MatrixHarness : IAsyncDisposable
 {
+    /// <summary>
+    /// How long to keep trying to get a probe job through before declaring the transport unusable.
+    /// Generous because it covers a cold broker on a loaded runner; it costs nothing when the first
+    /// probe succeeds, which is the normal case.
+    /// </summary>
+    private static readonly TimeSpan ReadinessBudget = TimeSpan.FromSeconds(90);
+
+    /// <summary>How often the readiness probe re-publishes while waiting.</summary>
+    private static readonly TimeSpan ReadinessRepublishInterval = TimeSpan.FromSeconds(2);
+
     private readonly List<IHostedService> _started = [];
 
     /// <summary>Destroys what the cell provisioned (schemas, streams, queues). Skippable — see <see cref="TeardownNamespaces"/>.</summary>
@@ -87,6 +97,13 @@ public sealed class MatrixHarness : IAsyncDisposable
 
     /// <summary>Subscriber knobs applied to whichever transport this cell selected.</summary>
     public MatrixTransportTuning Tuning { get; private init; } = new();
+
+    /// <summary>
+    /// Warnings and errors this host logged. Include it in a timeout message: a transport whose
+    /// subscriber cannot start retries forever behind a caught exception, and this is the only place
+    /// that says so.
+    /// </summary>
+    public MatrixDiagnostics Diagnostics { get; } = new();
 
     /// <summary>
     /// False builds a publish-only host: the transport is wired and its queues provisioned, but no
@@ -159,8 +176,20 @@ public sealed class MatrixHarness : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var services = new ServiceCollection();
-        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
-        services.AddLogging(logging => logging.ClearProviders());
+
+        // Warnings and errors are captured rather than discarded. Every transport subscriber runs its
+        // loop inside a catch-log-retry-with-backoff, so a subscriber that cannot start at all fails
+        // silently and every fact then dies on its own timeout with nothing to explain it — which is
+        // exactly how a CI-only failure became undiagnosable from the logs. Diagnostics surfaces what
+        // was logged when an assertion times out.
+        services.AddSingleton(Diagnostics);
+        services.AddSingleton<ILoggerProvider>(new MatrixLoggerProvider(Diagnostics));
+        services.AddLogging(logging => logging.SetMinimumLevel(LogLevel.Warning));
+
+        // The readiness probe is its own service so its jobs never land in a suite's own counters.
+        services.AddSingleton<MatrixReadinessProbe>();
+        services.AddSingleton<IMatrixReadinessProbe>(provider => provider.GetRequiredService<MatrixReadinessProbe>());
+
         configureServices?.Invoke(services);
 
         AddBackendClients(services, backends);
@@ -202,6 +231,44 @@ public sealed class MatrixHarness : IAsyncDisposable
             await hosted.StartAsync(cancellationToken);
             _started.Add(hosted);
         }
+
+        if (StartSubscribers)
+            await WaitForTransportReadyAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Blocks until a job published now is actually consumed. Every transport subscriber is a
+    /// <see cref="Microsoft.Extensions.Hosting.BackgroundService"/>, so <c>StartAsync</c> returns at
+    /// the first await inside its loop — before the consumer group, JetStream consumer, or queue
+    /// receiver it needs exists. A test that publishes immediately after the harness is built is
+    /// therefore racing the subscriber, and loses that race on a loaded runner.
+    /// <para>
+    /// The probe re-publishes rather than publishing once: for the transports whose subscriber
+    /// establishes its position at startup, a message sent into the gap can legitimately never be
+    /// delivered, so a single unlucky publish would hang the whole harness.
+    /// </para>
+    /// </summary>
+    private async Task WaitForTransportReadyAsync(CancellationToken cancellationToken)
+    {
+        var probe = Provider.GetRequiredService<MatrixReadinessProbe>();
+        var builder = Provider.GetRequiredService<IAsyncResponseBuilder>();
+        var deadline = DateTime.UtcNow + ReadinessBudget;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await builder.EnqueueWorkerAsync<IMatrixReadinessProbe>(
+                service => service.PingAsync(), cancellationToken);
+
+            var completed = await Task.WhenAny(
+                probe.Delivered.Task,
+                Task.Delay(ReadinessRepublishInterval, cancellationToken));
+            if (completed == probe.Delivered.Task)
+                return;
+        }
+
+        throw new InvalidOperationException(
+            $"The {Cell.Transport} transport did not deliver a probe job within {ReadinessBudget}, so the " +
+            $"harness for {Cell} is not usable. Subscriber diagnostics: {Diagnostics.Summary()}.");
     }
 
     // --- Backend client singletons ----------------------------------------------------------------
@@ -1082,6 +1149,92 @@ public sealed record MatrixTransportTuning
 
     /// <summary>Shortens the transport's shutdown budget so a drain assertion does not wait it out.</summary>
     public TimeSpan? HostShutdownTimeout { get; init; }
+}
+
+/// <summary>
+/// Collects the warnings and errors one host logged, so a timed-out assertion can say what the
+/// transport was actually doing instead of only that nothing arrived.
+/// </summary>
+public sealed class MatrixDiagnostics
+{
+    private readonly System.Collections.Concurrent.ConcurrentQueue<string> _entries = new();
+
+    /// <summary>Everything logged at warning or above, oldest first.</summary>
+    public IReadOnlyList<string> Entries => [.. _entries];
+
+    internal void Add(string entry) => _entries.Enqueue(entry);
+
+    /// <summary>
+    /// A short report for an assertion message. Deduplicated because a failing subscriber logs the
+    /// same warning on every backoff iteration and the raw list is then hundreds of identical lines.
+    /// </summary>
+    public string Summary()
+    {
+        var distinct = _entries.Distinct(StringComparer.Ordinal).Take(5).ToArray();
+        return distinct.Length == 0
+            ? "no warnings or errors were logged"
+            : string.Join(" | ", distinct);
+    }
+}
+
+/// <summary>Routes warning-and-above log entries into <see cref="MatrixDiagnostics"/>.</summary>
+internal sealed class MatrixLoggerProvider(MatrixDiagnostics diagnostics) : ILoggerProvider
+{
+    /// <inheritdoc />
+    public ILogger CreateLogger(string categoryName) => new MatrixLogger(categoryName, diagnostics);
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+    }
+
+    private sealed class MatrixLogger(string category, MatrixDiagnostics diagnostics) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (!IsEnabled(logLevel))
+                return;
+
+            var message = formatter(state, exception);
+            diagnostics.Add(exception is null
+                ? $"{logLevel} {category}: {message}"
+                : $"{logLevel} {category}: {message} -> {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+}
+
+/// <summary>
+/// The service the readiness handshake offloads. Deliberately separate from anything a suite
+/// registers, so probe jobs never appear in a suite's own call counts.
+/// </summary>
+public interface IMatrixReadinessProbe
+{
+    /// <summary>Signals that the worker transport is delivering.</summary>
+    Task PingAsync();
+}
+
+/// <inheritdoc />
+public sealed class MatrixReadinessProbe : IMatrixReadinessProbe
+{
+    /// <summary>Completes the first time a probe job is delivered.</summary>
+    internal TaskCompletionSource Delivered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <inheritdoc />
+    public Task PingAsync()
+    {
+        // TrySet: the handshake re-publishes, so several probe jobs can legitimately arrive.
+        Delivered.TrySetResult();
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>Schema name for <see cref="MatrixFlowDbContext"/>, supplied through DI per cell.</summary>

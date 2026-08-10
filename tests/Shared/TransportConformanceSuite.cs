@@ -57,7 +57,7 @@ public abstract class TransportConformanceSuite
 
         await EnqueueAsync(harness, correlationId, token: 11);
 
-        var observed = await probe.FirstCall.Task.WaitAsync(Generous);
+        var observed = await ExpectAsync(probe.FirstCall.Task, harness, "the worker job");
         Assert.Equal(11, observed.Token);
         Assert.Equal(correlationId, observed.CorrelationId);
 
@@ -84,7 +84,7 @@ public abstract class TransportConformanceSuite
             TransportTenantContext.Set(null);
         }
 
-        var observed = await probe.FirstCall.Task.WaitAsync(Generous);
+        var observed = await ExpectAsync(probe.FirstCall.Task, harness, "the worker job");
 
         // The propagator's value has to cross the wire in the envelope's context bag and be restored
         // before the handler runs — the transport carrying only the correlation id is a silent
@@ -102,7 +102,7 @@ public abstract class TransportConformanceSuite
             correlationId, timeout: Generous * 2);
         await EnqueueAsync(harness, correlationId, token: 7, respond: true);
 
-        var result = await waiter.ResponseTask.WaitAsync(Generous * 2);
+        var result = await ExpectAsync(waiter.ResponseTask, harness, "the response from the worker");
         Assert.Equal(MatrixStatus.Completed, result.Status);
     }
 
@@ -118,7 +118,7 @@ public abstract class TransportConformanceSuite
         for (var i = 0; i < count; i++)
             await EnqueueAsync(harness, harness.Names.NewCorrelationId($"c{i}"), token: i);
 
-        await EventuallyAsync(() => probe.CallCount >= count, $"all {count} jobs execute");
+        await EventuallyAsync(() => probe.CallCount >= count, $"all {count} jobs execute", harness);
 
         // No duplicates and no losses: the tokens seen must be exactly 0..count-1.
         await Task.Delay(TimeSpan.FromSeconds(2));
@@ -138,7 +138,7 @@ public abstract class TransportConformanceSuite
         var payload = new string('x', Capabilities.LargePayloadBytes);
         await EnqueueLargeAsync(harness, harness.Names.NewCorrelationId("large"), payload);
 
-        var observed = await probe.FirstLargeCall.Task.WaitAsync(Generous * 2);
+        var observed = await ExpectAsync(probe.FirstLargeCall.Task, harness, "the large-payload job");
         Assert.Equal(payload.Length, observed.Length);
         Assert.Equal(payload, observed);
     }
@@ -157,11 +157,11 @@ public abstract class TransportConformanceSuite
 
         // The second delivery must succeed: an at-least-once transport whose retry never happens
         // silently drops work whenever a handler hits a transient fault.
-        await EventuallyAsync(() => probe.SuccessCount >= 1, "the redelivered job succeeds");
+        await EventuallyAsync(() => probe.SuccessCount >= 1, "the redelivered job succeeds", harness);
 
         // At-least-once permits more than two deliveries, so assert the invariants rather than a
         // count: a redelivery happened, and every delivery carried the job that was enqueued.
-        await EventuallyAsync(() => probe.CallCount >= 2, "the failed delivery is retried");
+        await EventuallyAsync(() => probe.CallCount >= 2, "the failed delivery is retried", harness);
         Assert.All(probe.Calls, call => Assert.Equal(42, call.Token));
     }
 
@@ -195,7 +195,7 @@ public abstract class TransportConformanceSuite
 
         await EnqueueAsync(harness, harness.Names.NewCorrelationId("poison"), token: 99);
 
-        await EventuallyAsync(() => probe.CallCount >= bound, "the job is retried up to the bound");
+        await EventuallyAsync(() => probe.CallCount >= bound, "the job is retried up to the bound", harness);
 
         // The bound is what stops a poison message from looping forever and starving the queue. Let
         // it settle well past the last attempt, then assert it stopped rather than kept going.
@@ -223,7 +223,7 @@ public abstract class TransportConformanceSuite
             await using var noAckMode = await CreateHarnessAsync();
             var probeWithoutAckMode = noAckMode.Provider.GetRequiredService<TransportProbe>();
             await EnqueueAsync(noAckMode, noAckMode.Names.NewCorrelationId("noackmode"), token: 13);
-            Assert.Equal(13, (await probeWithoutAckMode.FirstCall.Task.WaitAsync(Generous)).Token);
+            Assert.Equal(13, (await ExpectAsync(probeWithoutAckMode.FirstCall.Task, noAckMode, "the job")).Token);
             return;
         }
 
@@ -235,7 +235,7 @@ public abstract class TransportConformanceSuite
 
         // Early ACK settles the message before the handler runs; the handler must still run, with the
         // context restored, on the background worker the mode hands off to.
-        var observed = await probe.FirstCall.Task.WaitAsync(Generous);
+        var observed = await ExpectAsync(probe.FirstCall.Task, harness, "the early-ACK job");
         Assert.Equal(13, observed.Token);
         Assert.Equal(correlationId, observed.CorrelationId);
     }
@@ -279,7 +279,7 @@ public abstract class TransportConformanceSuite
         await using var consumer = await CreateHarnessAsync(sharedNames: names);
         var probe = consumer.Provider.GetRequiredService<TransportProbe>();
 
-        var observed = await probe.FirstCall.Task.WaitAsync(Generous * 2);
+        var observed = await ExpectAsync(probe.FirstCall.Task, consumer, "the job published while offline");
         Assert.Equal(77, observed.Token);
     }
 
@@ -361,7 +361,7 @@ public abstract class TransportConformanceSuite
         }
     }
 
-    private async Task EventuallyAsync(Func<bool> condition, string description)
+    private async Task EventuallyAsync(Func<bool> condition, string description, MatrixHarness? harness = null)
     {
         var deadline = DateTime.UtcNow + Generous * 2;
         while (DateTime.UtcNow < deadline)
@@ -372,7 +372,29 @@ public abstract class TransportConformanceSuite
             await Task.Delay(PollInterval);
         }
 
-        Assert.Fail($"Timed out after {Generous * 2} waiting until {description} ({Transport}).");
+        Assert.Fail(
+            $"Timed out after {Generous * 2} waiting until {description} ({Transport}). " +
+            $"Subscriber diagnostics: {harness?.Diagnostics.Summary() ?? "not captured"}.");
+    }
+
+    /// <summary>
+    /// Awaits a delivery, reporting what the transport logged when it never arrives. Every transport
+    /// subscriber catches its own failures and retries with backoff, so "nothing arrived" and "the
+    /// subscriber could not start" look identical without this.
+    /// </summary>
+    private async Task<T> ExpectAsync<T>(Task<T> delivery, MatrixHarness harness, string what)
+    {
+        try
+        {
+            return await delivery.WaitAsync(Generous);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail(
+                $"{Transport}: {what} did not arrive within {Generous}. " +
+                $"Subscriber diagnostics: {harness.Diagnostics.Summary()}.");
+            throw;
+        }
     }
 }
 

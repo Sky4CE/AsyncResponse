@@ -138,7 +138,7 @@ containers dominate everything else, so the split is mostly about keeping them a
 | `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 2 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
 | `brokers` | `BrokersCollection` | 5 | 10 | 55 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
 | `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
-| `matrix-*` | nine collections | 5–10 | 0 | 1,980 | The provider cross product — see [The provider cross product](#the-provider-cross-product) |
+| `matrix-*` | nine collections | 5–10 | 0 | 2,080 | The provider cross product and the transport contract — see [The provider cross product](#the-provider-cross-product) |
 
 Peak footprint across a full run is ~3.3 GiB, against 5.8 GiB when the store contracts shared a batch.
 That earlier arrangement fit when the suite ran alone and failed wholesale when anything else used the
@@ -207,6 +207,22 @@ ASYNCRESPONSE_MATRIX_FILTER=PostgreSql+Kafka+MongoDb dotnet test --project tests
 asserts the shards partition every cell exactly once, and requires each shard to have a test class
 carrying its trait. A new provider package therefore fails the build the day it lands, rather than
 shipping with no cross-product coverage.
+
+Because these shards start **no sample app**, they own two responsibilities the app-driven batches get
+for free. First, backend readiness: an app-driven batch waits for its sample apps to report healthy,
+and those apps `WaitFor` their containers, so the servers are transitively proven up before any test
+runs. A shard has to probe every backend itself — and probe the right thing, because several servers
+accept a connection well before they can serve one (the Cosmos emulator answers its gateway while
+still replying `503 pgcosmos extension is still starting`; NATS serves core requests before its
+JetStream API responds). Second, subscriber readiness: every transport subscriber is a
+`BackgroundService`, so `StartAsync` returns before the consumer group, JetStream consumer, or queue
+receiver it needs exists. The harness publishes a probe job and waits until it is actually consumed
+before handing the host to a test, re-publishing while it waits.
+
+The transport contract runs in these shards too, rather than in the app-driven batches, because it is
+driver-level and needs only its own broker. That is not merely tidiness: on its first CI run every
+delivery-dependent Redis fact timed out in the app-heavy `data` batch — nine sample-app processes and
+eight containers on a four-core runner — while the same facts passed in every other leg.
 
 #### Behavioral contracts
 

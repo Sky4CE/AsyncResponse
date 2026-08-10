@@ -114,9 +114,16 @@ public abstract class DriverOnlyBatchFixture : IntegrationFixture
     }
 
     /// <summary>Retries until the action succeeds or the budget expires, then lets the failure through.</summary>
-    private protected static async Task EventuallyAsync(Func<Task> action)
+    private protected static async Task EventuallyAsync(Func<Task> action) => await EventuallyAsync(action, ProvisionBudget);
+
+    /// <summary>
+    /// Retries with an explicit budget. Oracle provisions its database on first boot and the Cosmos
+    /// emulator serves 503s until its pgcosmos extension is up; on a cold runner both can outlast the
+    /// default, and a readiness probe that gives up early fails the whole shard.
+    /// </summary>
+    private protected static async Task EventuallyAsync(Func<Task> action, TimeSpan budget)
     {
-        var deadline = DateTimeOffset.UtcNow + ProvisionBudget;
+        var deadline = DateTimeOffset.UtcNow + budget;
         while (true)
         {
             try
@@ -219,13 +226,6 @@ public sealed class BrokersBatchFixture : IntegrationFixture
             return;
         }
 
-        // The transport contract builds its own hosts in this process against these same brokers, so
-        // the batch resolves their endpoints alongside the sample apps' Aspire references.
-        await WireBrokerConnectionStringsAsync();
-        WireNatsConnectionString();
-        await WireRedisConnectionStringAsync();
-        WirePubSubEmulator(Batches.PubSubProjectIdValue);
-
         var clients = await WireAppsAsync(
             "itest-app",
             "itest-app-early-ack",
@@ -262,11 +262,6 @@ public sealed class CloudBatchFixture : IntegrationFixture
 
     protected override async ValueTask WireAsync()
     {
-        // Same reason as the brokers batch: the transport contract addresses these emulators directly.
-        WireAzureServiceBusConnectionString();
-        WireLocalStackServiceUrl();
-        await WireRedisConnectionStringAsync();
-
         var clients = await WireAppsAsync(
             "itest-app-azure-servicebus",
             "itest-app-azure-servicebus-early-ack",
