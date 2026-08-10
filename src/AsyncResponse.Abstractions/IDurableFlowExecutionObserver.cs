@@ -45,8 +45,11 @@ public readonly record struct DurableFlowRunEvent(
 
 /// <summary>
 /// Observes durable-flow execution from inside the executor: step activations, waits, checkpoint
-/// completions, and terminal run transitions. Register implementations in DI (any number); the
-/// flow executor invokes every registered observer synchronously on the execution path.
+/// completions, and terminal run transitions. Register implementations in DI (any number, <b>as
+/// singletons</b> — the singleton flow executor resolves them once from the root provider and
+/// holds them for its lifetime; a scoped or transient registration fails resolution with an error
+/// naming this requirement). The flow executor invokes every registered observer synchronously on
+/// the execution path.
 /// <para>
 /// Intended for test instrumentation (AsyncResponse.Testing's harness is built on it) and
 /// lightweight production telemetry. Because observers run <em>on</em> the execution path, an

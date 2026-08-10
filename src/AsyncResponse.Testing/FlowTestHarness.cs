@@ -332,14 +332,31 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
 
         lock (_gate)
         {
+            // Walking backwards, remember the correlation ids of already-answered awaited steps: a
+            // Waiting event whose step has a LATER Completed event is consumed — a reply published
+            // to that dead correlation id is silently dropped by the channel, and the caller's
+            // null-fallback (wait for the run's NEXT awaited step to park) is the correct path.
+            // Progress-aware steps stay un-completed across non-terminal replies, so repeated
+            // replies to the same live correlation id still resolve here.
+            HashSet<string>? answered = null;
             for (var index = list.Count - 1; index >= 0; index--)
             {
                 var candidate = list[index];
+                if (candidate.Kind == EventKind.Completed
+                    && candidate.Step.Kind == DurableFlowStepKind.Awaited
+                    && candidate.Step.CorrelationId is { } answeredCid)
+                {
+                    (answered ??= new HashSet<string>(StringComparer.Ordinal)).Add(answeredCid);
+                    continue;
+                }
+
                 if (candidate.Kind == EventKind.Waiting
                     && candidate.Step.Kind == DurableFlowStepKind.Awaited
-                    && (stepName is null || candidate.Step.StepName == stepName))
+                    && (stepName is null || candidate.Step.StepName == stepName)
+                    && candidate.Step.CorrelationId is { } correlationId
+                    && answered?.Contains(correlationId) != true)
                 {
-                    return candidate.Step.CorrelationId;
+                    return correlationId;
                 }
             }
         }
@@ -399,7 +416,9 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         {
             throw new TimeoutException(
                 $"Timed out after {realTimeGuard} (real time) waiting for {description}. " +
-                "If the flow is sleeping on a timer or a retry backoff, advance the virtual clock first.");
+                "If the flow is sleeping on a timer or a retry backoff, advance the virtual clock first. " +
+                "A run whose last execution failed and exhausted the transport's retry budget also never " +
+                "finishes — it stays Running with its wake-up dropped; check the logs for 'dropping it'.");
         }
     }
 

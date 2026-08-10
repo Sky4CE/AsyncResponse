@@ -77,11 +77,14 @@ internal abstract class AsyncResponseBuilderBase(
                     $"Worker-job delay must be at most {AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0} days.");
             }
 
-            if (transport is not IDelayedWorkerTransport delayedTransport)
+            // MaxPublishDelay <= zero: the type implements the capability but the current
+            // configuration cannot honor it (an SQS FIFO worker queue) — same guidance either way.
+            if (transport is not IDelayedWorkerTransport delayedTransport
+                || delayedTransport.MaxPublishDelay <= TimeSpan.Zero)
             {
                 throw new InvalidOperationException(
                     $"The registered worker transport ({transport.GetType().Name}) does not support native delayed delivery " +
-                    $"({nameof(IDelayedWorkerTransport)}), so EnqueueWorkerAsync with a delay cannot be used. " +
+                    $"({nameof(IDelayedWorkerTransport)}) in its current configuration, so EnqueueWorkerAsync with a delay cannot be used. " +
                     "Register a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB), " +
                     "or — inside a durable flow — use IDurableFlowContext.DelayAsync followed by an immediate enqueue, " +
                     "which works on every transport.");

@@ -75,6 +75,14 @@ public sealed record TransportCapabilities
     public bool EarlyAck { get; init; }
 
     /// <summary>
+    /// The transport implements <see cref="IDelayedWorkerTransport"/> natively — a delayed publish
+    /// becomes deliverable only at its due time (broker scheduling, <c>DelaySeconds</c>, or an
+    /// <c>available_at</c> claim gate), and suspended durable-flow timers ride it. Transports
+    /// without it fall back to in-process timer waits; a fact needing the capability skips there.
+    /// </summary>
+    public bool NativeDelayedDelivery { get; init; }
+
+    /// <summary>
     /// The transport resolves a reply target an external system can publish a response to. The
     /// in-memory transport has no addressable destination.
     /// </summary>
@@ -100,7 +108,8 @@ public sealed record TransportCapabilities
             BoundedRedelivery = true,
             EarlyAck = false,
             ReplyTarget = false,
-            DurableWhileConsumerIsDown = false
+            DurableWhileConsumerIsDown = false,
+            NativeDelayedDelivery = true
         },
 
         MatrixTransport.Redis or MatrixTransport.Nats or MatrixTransport.PostgreSql or
@@ -111,7 +120,10 @@ public sealed record TransportCapabilities
                 LibraryDeadLetter = true,
                 EarlyAck = true,
                 ReplyTarget = true,
-                DurableWhileConsumerIsDown = true
+                DurableWhileConsumerIsDown = true,
+                // The database queues gate claims on an available_at column; the log/stream brokers
+                // (Redis streams, NATS JetStream, Kafka) have no per-message visibility delay.
+                NativeDelayedDelivery = transport is MatrixTransport.PostgreSql or MatrixTransport.SqlServer or MatrixTransport.MongoDb
             },
 
         // RabbitMQ bounds redelivery in the library but dead-letters through a dead-letter exchange
@@ -137,7 +149,9 @@ public sealed record TransportCapabilities
             LargePayloadBytes = 128 * 1024,
             EarlyAck = true,
             ReplyTarget = true,
-            DurableWhileConsumerIsDown = true
+            DurableWhileConsumerIsDown = true,
+            // Broker-scheduled messages (ScheduledEnqueueTime).
+            NativeDelayedDelivery = true
         },
 
         // SQS and Pub/Sub own redelivery entirely — visibility timeout plus redrive policy, and ack
@@ -154,7 +168,10 @@ public sealed record TransportCapabilities
             LargePayloadBytes = 128 * 1024,
             EarlyAck = true,
             ReplyTarget = true,
-            DurableWhileConsumerIsDown = true
+            DurableWhileConsumerIsDown = true,
+            // Per-message DelaySeconds, standard queues only (a FIFO worker queue reports a zero
+            // MaxPublishDelay and the engine treats it as not delayed-capable).
+            NativeDelayedDelivery = true
         },
 
         // Pub/Sub bounds redelivery furthest from the library of all of them: the package exposes

@@ -89,13 +89,16 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
     /// <remarks>
     /// SQS caps a single hop at 15 minutes (<c>DelaySeconds</c> ≤ 900); longer waits ride the
     /// <see cref="WorkerJobEnvelope.NotBeforeUtc"/> re-publish chain, 15 minutes per hop.
+    /// A FIFO worker queue reports <see cref="TimeSpan.Zero"/>: SQS rejects per-message
+    /// <c>DelaySeconds</c> on FIFO queues, and advertising a capability the publish would then
+    /// throw on lets a durable flow persist itself as sleeping before the enqueue fails —
+    /// stranding the run. Zero routes the engine to its in-process fallback instead.
     /// </remarks>
-    public TimeSpan MaxPublishDelay => SqsMaxDelay;
+    public TimeSpan MaxPublishDelay => _isFifoQueue ? TimeSpan.Zero : SqsMaxDelay;
 
     /// <inheritdoc/>
     public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
     {
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, MaxPublishDelay);
         if (_isFifoQueue && delay > TimeSpan.Zero)
         {
             // SQS rejects per-message DelaySeconds on FIFO queues (queue-level delay only), and a
@@ -105,6 +108,7 @@ public sealed class SqsWorkerTransport : IWorkerTransport, IDelayedWorkerTranspo
                 "Use a standard worker queue for delayed delivery, or keep timers in process by leaving the transport without delays.");
         }
 
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, MaxPublishDelay);
         return PublishCoreAsync(job, delay > TimeSpan.Zero ? delay : null, cancellationToken);
     }
 

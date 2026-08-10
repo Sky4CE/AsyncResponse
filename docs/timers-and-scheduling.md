@@ -85,10 +85,10 @@ flow, prefer `flow.DelayAsync(...)` followed by a normal enqueue — that works 
 |---|---|---|---|
 | In-memory | `TimeProvider` timer wheel | none | Delayed jobs share the process lifetime; dropped (loudly) at shutdown. Virtual-clock aware in tests. |
 | Azure Service Bus | scheduled messages (`ScheduledEnqueueTime`) | none | The broker holds the message; survives restarts. |
-| AWS SQS | `DelaySeconds` | 15 min (chunked) | Standard queues only — SQS rejects per-message delays on FIFO queues, and so does the transport (loudly). |
+| AWS SQS | `DelaySeconds` | 15 min (chunked) | Standard queues only — SQS rejects per-message delays on FIFO queues, so a FIFO worker queue advertises **no** delay capability (`MaxPublishDelay` = zero): flow timers fall back to the in-process path, and a bare delayed enqueue fails fast at the publish call site. |
 | PostgreSQL | `available_at` gate on the claim query | none | Due time computed on the **database** clock (`now() + delay`); precision bounded by the subscriber's `EmptyPollDelay`. |
 | SQL Server | `available_at` gate on the claim query | none | Due time on the database clock (`SYSUTCDATETIME`); precision as PostgreSQL. |
-| MongoDB | `available_at` gate on the claim filter | none | Insert stamps a client-computed due time in one atomic write; early delivery from clock skew is corrected by the `NotBeforeUtc` guard. |
+| MongoDB | `available_at` gate on the claim filter | none | Insert stamps a client-computed due time in one atomic write; early delivery from clock skew is corrected by the `NotBeforeUtc` guard, which detects a non-shrinking remainder (persistent skew) and executes rather than re-publishing forever. |
 | Kafka, RabbitMQ, Google Pub/Sub, Redis Streams, NATS | — | — | No native delay; flow timers use the in-process path, bare delayed enqueue throws. |
 
 ## Cron-scheduled flows

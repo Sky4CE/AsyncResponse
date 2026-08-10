@@ -25,6 +25,14 @@ public interface IDelayedWorkerTransport : IWorkerTransport
     /// <summary>
     /// The largest delay this transport can apply to a single publish. Callers must clamp to this;
     /// longer waits ride the <see cref="WorkerJobEnvelope.NotBeforeUtc"/> re-publish chain.
+    /// <para>
+    /// <see cref="TimeSpan.Zero"/> (or negative) means the capability is unavailable in the
+    /// <em>current configuration</em> even though the type implements the interface (e.g. an SQS
+    /// FIFO worker queue). The engine treats such a transport exactly like one that does not
+    /// implement <see cref="IDelayedWorkerTransport"/> at all: flow timers wait in process and
+    /// delayed <c>EnqueueWorkerAsync</c> overloads fail fast at the publish call site — never
+    /// after a flow has already persisted itself as sleeping.
+    /// </para>
     /// </summary>
     TimeSpan MaxPublishDelay { get; }
 

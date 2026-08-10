@@ -145,6 +145,23 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Breaks every held execution lease — the test harness's crash semantics for a simulated
+    /// restart. A crashed process goes silent and its leases expire; a simulated restart shares
+    /// the virtual clock with the "crashed" incarnation, whose parked executions would otherwise
+    /// keep renewing against this shared store forever and the new incarnation could never take
+    /// their flows over. Breaking the lease makes the zombie's next renewal fail (its lease loop
+    /// marks itself lost and stops) and lets the new incarnation acquire immediately.
+    /// </summary>
+    internal void ExpireAllLeases()
+    {
+        foreach (var (flowId, entry) in _entries)
+        {
+            if (entry.LeaseId is not null)
+                _entries.TryUpdate(flowId, entry with { LeaseId = null, LeaseExpiresAtUtc = null }, entry);
+        }
+    }
+
     public Task<bool> TryDeleteAsync(string flowId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(flowId);

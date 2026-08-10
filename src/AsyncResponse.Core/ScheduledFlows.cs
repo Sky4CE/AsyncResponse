@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -85,8 +86,16 @@ internal sealed class ScheduledFlowService(
             .Select(registration => RunScheduleAsync(registration, stoppingToken))
             .ToArray();
 
-        if (loops.Length > 0)
-            await Task.WhenAll(loops).ConfigureAwait(false);
+        // Fail fast: Task.WhenAll would sit on one faulted loop until every other loop ended at
+        // shutdown, degrading "fail the host" into a silently dead schedule while the app reports
+        // healthy. Await completions one at a time so the first fault propagates immediately.
+        var pending = new List<Task>(loops);
+        while (pending.Count > 0)
+        {
+            var finished = await Task.WhenAny(pending).ConfigureAwait(false);
+            pending.Remove(finished);
+            await finished.ConfigureAwait(false);
+        }
     }
 
     private async Task RunScheduleAsync(ScheduledFlowRegistration registration, CancellationToken stoppingToken)
@@ -177,5 +186,8 @@ internal sealed class ScheduledFlowService(
     }
 
     internal static string OccurrenceFlowId(string name, DateTimeOffset occurrence)
-        => $"sched:{name}:{occurrence.UtcDateTime:yyyyMMdd'T'HHmmss'Z'}";
+        // Invariant culture: interpolation formats with CurrentCulture, whose default calendar can
+        // rewrite the digits (Buddhist 25730615, UmAlQura 14520214) — replicas with different
+        // cultures would then mint different ids for the same occurrence and both would run.
+        => string.Create(CultureInfo.InvariantCulture, $"sched:{name}:{occurrence.UtcDateTime:yyyyMMdd'T'HHmmss'Z'}");
 }

@@ -167,7 +167,6 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentException.ThrowIfNullOrWhiteSpace(cron);
         ArgumentNullException.ThrowIfNull(input);
-        _ = CronSchedule.Parse(cron);
 
         // Names key the deterministic occurrence ids (sched:{name}:{occurrence}); a duplicate
         // would make two schedules dedup against each other's runs. Fail at the registration call
@@ -185,6 +184,18 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         var options = new ScheduledFlowOptions();
         configure?.Invoke(options);
         ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
+
+        // Parse in the schedule's own time zone AND probe for a real next occurrence: a well-formed
+        // but unsatisfiable expression ("0 0 30 2 *") would otherwise register cleanly and its loop
+        // would die at startup with one warning — the silent 3 a.m. failure this validation exists
+        // to prevent. The runtime null-check in ScheduledFlowService stays as the backstop.
+        var probe = CronSchedule.Parse(cron, options.TimeZone);
+        if (probe.GetNextOccurrence(TimeProvider.System.GetUtcNow()) is null)
+        {
+            throw new ArgumentException(
+                $"The cron expression '{cron}' for scheduled flow '{name}' has no future occurrence (an unsatisfiable date such as Feb 30). It would never fire.",
+                nameof(cron));
+        }
 
         builder.WithDurableFlow<TFlow, TInput>();
         builder.Services.AddSingleton(new ScheduledFlowRegistration
@@ -218,19 +229,39 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods, typeof(DurableFlowExecutor))]
     private static void AddDurableFlowEngine(IServiceCollection services)
     {
-        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
-            provider.GetRequiredService<IServiceScopeFactory>(),
-            provider.GetRequiredService<IAsyncResponseBuilder>(),
-            provider.GetRequiredService<IAsyncResponseSubscriber>(),
-            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
-            provider.GetRequiredService<AsyncResponseContextPropagation>(),
-            provider.GetRequiredService<DurableFlowOptions>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
-            provider.GetServices<DurableFlowRegistration>(),
-            provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
-            provider.GetService<TimeProvider>(),
-            provider.GetServices<IDurableFlowExecutionObserver>(),
-            provider.GetService<IWorkerTransport>()));
+        services.TryAddSingleton<IDurableFlowExecutor>(provider =>
+        {
+            // Observers are resolved ONCE here, from the root provider, and held for the singleton
+            // executor's lifetime. A scoped/transient registration would otherwise surface as an
+            // opaque "Cannot resolve scoped service ... from root provider" thrown per flow job
+            // inside the transport's retry loop (ValidateOnBuild does not catch it). Fail the first
+            // resolution with an error that names the offending registration and the fix instead.
+            var nonSingleton = services.FirstOrDefault(descriptor =>
+                descriptor.ServiceType == typeof(IDurableFlowExecutionObserver)
+                && descriptor.Lifetime != ServiceLifetime.Singleton);
+            if (nonSingleton is not null)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(IDurableFlowExecutionObserver)} '{(nonSingleton.ImplementationType ?? nonSingleton.ImplementationInstance?.GetType())?.Name ?? "(factory registration)"}' " +
+                    $"is registered as {nonSingleton.Lifetime}, but observers are held by the singleton flow executor for its lifetime and must be " +
+                    "singletons (services.AddSingleton<IDurableFlowExecutionObserver, ...>()). An observer that needs scoped services should " +
+                    "create its own scope inside the callback.");
+            }
+
+            return new DurableFlowExecutor(
+                provider.GetRequiredService<IServiceScopeFactory>(),
+                provider.GetRequiredService<IAsyncResponseBuilder>(),
+                provider.GetRequiredService<IAsyncResponseSubscriber>(),
+                provider.GetService<IRecoverableAsyncResponseSubscriber>(),
+                provider.GetRequiredService<AsyncResponseContextPropagation>(),
+                provider.GetRequiredService<DurableFlowOptions>(),
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
+                provider.GetServices<DurableFlowRegistration>(),
+                provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
+                provider.GetService<TimeProvider>(),
+                provider.GetServices<IDurableFlowExecutionObserver>(),
+                provider.GetService<IWorkerTransport>());
+        });
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),

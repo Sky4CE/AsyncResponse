@@ -95,7 +95,7 @@ remainder, which is how capped transports chunk long delays with no transport-sp
 |---|---|---|---|
 | **InMemory** | ✅ | — | `TimeProvider` timer wheel (virtual-clock aware in tests); delayed jobs die with the process, logged at shutdown |
 | **AzureServiceBus** | ✅ | — | scheduled messages (`ScheduledEnqueueTime`); broker-held, survives restarts |
-| **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — per-message delay on a FIFO queue is rejected loudly |
+| **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — a FIFO worker queue advertises no delay capability (`MaxPublishDelay` = zero), so flow timers fall back in process and a delayed enqueue fails fast at publish |
 | **PostgreSQL** | ✅ | — | insert with `available_at = now() + delay` (database clock); pickup latency ≤ `EmptyPollDelay` |
 | **SqlServer** | ✅ | — | insert with `available_at = SYSUTCDATETIME() + delay`; pickup latency ≤ `EmptyPollDelay` |
 | **MongoDB** | ✅ | — | insert stamps a client-computed `available_at` atomically; skew-early deliveries corrected by the `NotBeforeUtc` guard |

@@ -2,6 +2,7 @@ using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Globalization;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -161,5 +162,39 @@ public class ScheduledFlowTests
         var ex = Assert.Throws<InvalidOperationException>(() =>
             builder.WithScheduledFlow<NightlyReportFlow, ReportInput>("dup", "30 * * * *", occurrence => new ReportInput(occurrence)));
         Assert.Contains("dup", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void UnsatisfiableCronExpression_FailsAtRegistration()
+    {
+        // Well-formed but impossible ("Feb 30"): before the satisfiability probe this registered
+        // cleanly and the schedule's loop died at startup with one warning — the silent 3 a.m.
+        // failure registration-time validation exists to prevent.
+        var services = new ServiceCollection();
+        var builder = services.AddAsyncResponse();
+        var ex = Assert.Throws<ArgumentException>(() => builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+            "impossible",
+            "0 0 30 2 *",
+            occurrence => new ReportInput(occurrence)));
+        Assert.Contains("no future occurrence", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OccurrenceFlowId_IsCultureInvariant()
+    {
+        // The deterministic occurrence id is the cross-replica exactly-once key: a culture whose
+        // default calendar rewrites the digits (Buddhist 2573..., UmAlQura 1452...) would mint a
+        // different id on that replica and the occurrence would run twice.
+        var occurrence = new DateTimeOffset(2030, 6, 15, 12, 30, 0, TimeSpan.Zero);
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("th-TH");
+            Assert.Equal("sched:daily:20300615T123000Z", ScheduledFlowService.OccurrenceFlowId("daily", occurrence));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 }

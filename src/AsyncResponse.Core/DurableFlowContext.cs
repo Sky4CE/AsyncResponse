@@ -169,7 +169,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 $"{AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0} days (ledger TTL stamps are computed as \"now + sleep + StateExpiry\").");
         }
 
-        if (checkpoint.WakeAtUtc is null)
+        var firstPass = checkpoint.WakeAtUtc is null;
+        if (firstPass)
         {
             // Persist the breadcrumb BEFORE any wake-up can exist, with a TTL that covers the whole
             // sleep plus the normal idle margin — a run must never out-sleep its own ledger.
@@ -183,7 +184,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         {
             await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
 
-            if (remaining > _options.TimerInProcessThreshold && _workerTransport is IDelayedWorkerTransport)
+            // MaxPublishDelay <= zero marks a transport whose delayed capability is unavailable in
+            // the current configuration (an SQS FIFO worker queue): suspend-then-throw would strand
+            // the run as "sleeping" with no wake-up, so treat it as not delayed-capable at all.
+            if (remaining > _options.TimerInProcessThreshold
+                && _workerTransport is IDelayedWorkerTransport delayedTransport
+                && delayedTransport.MaxPublishDelay > TimeSpan.Zero)
             {
                 // Suspend instead of waiting here: the delayed wake-up job re-executes the flow at
                 // (or chunked toward) the due time, and this run holds no worker, lease, or memory
@@ -201,6 +207,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and the registered worker " +
                     $"transport has no native delayed delivery ({nameof(IDelayedWorkerTransport)}) to suspend on. " +
                     "Use a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB) for sleeps this long.");
+            }
+
+            if (!firstPass)
+            {
+                // Replayed execution about to resume the sleep in process: the executor's
+                // unconditional per-attempt save reset the ledger TTL to StateExpiry, and every
+                // store recomputes expiry from "now" — a resumed sleep longer than StateExpiry
+                // would out-sleep its own ledger and be silently dropped mid-wait. Re-extend to
+                // cover the remainder (the suspend path re-extends every pass in SuspendForTimerAsync).
+                await SaveForSleepAsync(remaining, cancellationToken).ConfigureAwait(false);
             }
 
             await WaitInProcessAsync(remaining, cancellationToken).ConfigureAwait(false);

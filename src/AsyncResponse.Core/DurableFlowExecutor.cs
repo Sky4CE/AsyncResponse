@@ -144,7 +144,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
 
             _logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", flowId, state.Attempts);
-            await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         }
         catch (DurableFlowSuspendedException ex)
         {
@@ -162,7 +161,6 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);
-            await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         }
         catch (Exception ex) when (lease.LostToken.IsCancellationRequested)
         {
@@ -181,6 +179,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             throw;
         }
 
+        // The terminal outcome is persisted above; notify OUTSIDE the try/catch so a throwing
+        // observer (throwing is the documented crash-injection contract) cannot re-enter those
+        // catches and rewrite a Succeeded run as Failed — or overwrite a terminal ledger message
+        // with a telemetry error — "the run's outcome is never at stake". A throw from here
+        // propagates for redelivery; the replay sees the terminal status, skips, and acks.
+        await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
 

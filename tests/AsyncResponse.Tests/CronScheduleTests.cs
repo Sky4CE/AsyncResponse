@@ -87,6 +87,46 @@ public class CronScheduleTests
     }
 
     [Fact]
+    public void StepInDayOfMonth_RestrictsTheDays()
+    {
+        // The regression this pins: "*/N" in a day field used to be classified as unrestricted, so
+        // its mask was discarded and "every other day" fired every day (twice the intended runs,
+        // each with its own deterministic occurrence id).
+        Assert.Equal(Utc(2030, 1, 3, 0, 0), Next("0 0 */2 * *", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 5, 0, 0), Next("0 0 */2 * *", Utc(2030, 1, 3, 0, 0)));
+        // Same schedule spelled as an explicit range-step, which always worked.
+        Assert.Equal(Utc(2030, 1, 3, 0, 0), Next("0 0 1-31/2 * *", Utc(2030, 1, 1, 0, 0)));
+    }
+
+    [Fact]
+    public void StepInDayOfWeek_RestrictsTheDays()
+    {
+        // "*/2" over 0-7: Sun(0), Tue, Thu, Sat(6) — Jan 1 2030 is a Tuesday, so the same day at
+        // a later hour qualifies, then Thursday Jan 3.
+        Assert.Equal(Utc(2030, 1, 1, 6, 0), Next("0 6 * * */2", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 3, 6, 0), Next("0 6 * * */2", Utc(2030, 1, 1, 6, 0)));
+        // Wednesday Jan 2 must NOT match.
+        Assert.NotEqual(Utc(2030, 1, 2, 6, 0), Next("0 6 * * */2", Utc(2030, 1, 1, 6, 0)));
+    }
+
+    [Fact]
+    public void StepInDayOfMonth_KeepsVixieOrSemantics()
+    {
+        // Odd days OR Fridays. From Jan 1 (odd, but past 00:00) the next is Jan 3 (odd), and from
+        // Jan 3 the next is Jan 4 — a Friday that is an even day.
+        Assert.Equal(Utc(2030, 1, 3, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 4, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 3, 0, 0)));
+    }
+
+    [Fact]
+    public void StepOfOneInDayFields_IsUnrestricted()
+    {
+        // "*/1" is every value — equivalent to "*", so day-of-week stays out of the Vixie OR and
+        // the day-of-month alone decides.
+        Assert.Equal(Utc(2030, 1, 13, 0, 0), Next("0 0 13 * */1", Utc(2030, 1, 1, 0, 0)));
+    }
+
+    [Fact]
     public void LeapDay_ResolvesAcrossYears()
     {
         // Feb 29 exists in 2032 (2030 and 2031 are not leap years).

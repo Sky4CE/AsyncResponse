@@ -27,9 +27,15 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   implementations: in-memory (TimeProvider timer wheel), Azure Service Bus (scheduled
   messages), SQS (`DelaySeconds`; 15-minute hops, standard queues only), PostgreSQL /
   SQL Server / MongoDB (`available_at` on the queue with database-clock arithmetic).
-  `WorkerJobEnvelope` gains an additive `NotBeforeUtc` due-time stamp; the shared worker-job
-  executor re-publishes early deliveries for the remainder, chunking longer-than-cap delays
-  uniformly. Non-capable transports reject delayed enqueue with guidance at the call site.
+  `WorkerJobEnvelope` gains additive `NotBeforeUtc` (due-time stamp) and `LastRedelayRemaining`
+  (re-publish progress baseline) properties; the shared worker-job executor re-publishes early
+  deliveries for the remainder, chunking longer-than-cap delays uniformly, and executes instead
+  of re-publishing when consecutive hops stop shrinking the remainder (persistent clock skew
+  between the stamping and delivery-gating clocks would otherwise loop forever with fresh
+  message ids that never dead-letter). Non-capable transports reject delayed enqueue with
+  guidance at the call site; a transport whose configuration cannot honor the capability
+  advertises `MaxPublishDelay` = zero and counts as non-capable (an SQS FIFO worker queue), so
+  flow timers fall back in process rather than suspending toward a publish that would throw.
 - **Cron-scheduled flows** — `WithScheduledFlow<TFlow, TInput>(name, cron, inputFactory,
   options)` starts a flow per occurrence with a deterministic run id
   (`sched:{name}:{occurrenceUtc}`), deduplicated across replicas by the flow store's atomic

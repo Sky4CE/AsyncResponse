@@ -165,6 +165,65 @@ public abstract class TransportConformanceSuite
         Assert.Equal(payload, observed);
     }
 
+    [Fact]
+    public async Task Contract_DelayedDeliveryCapability_MatchesTheTransportImplementation()
+    {
+        // The capability table is a description of the library, not a wish (see
+        // TransportCapabilities): both directions are asserted so a transport that gains or loses
+        // IDelayedWorkerTransport cannot silently disagree with the facts that skip on it.
+        await using var harness = await CreateHarnessAsync(startSubscribers: false);
+        var delayed = harness.Provider.GetRequiredService<IWorkerTransport>() as IDelayedWorkerTransport;
+
+        if (Capabilities.NativeDelayedDelivery)
+        {
+            Assert.NotNull(delayed);
+            Assert.True(
+                delayed.MaxPublishDelay > TimeSpan.Zero,
+                $"{Transport} advertises native delayed delivery but reports MaxPublishDelay {delayed.MaxPublishDelay}.");
+        }
+        else
+        {
+            Assert.True(
+                delayed is null || delayed.MaxPublishDelay <= TimeSpan.Zero,
+                $"{Transport} implements {nameof(IDelayedWorkerTransport)} but TransportCapabilities says it does not.");
+        }
+    }
+
+    [Fact]
+    public async Task Contract_DelayedJob_IsNotExecutedBeforeItsDueTime()
+    {
+        if (!Capabilities.NativeDelayedDelivery)
+        {
+            Assert.Skip(
+                $"{Transport} has no native delayed delivery ({nameof(IDelayedWorkerTransport)}); " +
+                "durable-flow timers wait in process there instead. See TransportCapabilities.");
+        }
+
+        await using var harness = await CreateHarnessAsync();
+        var probe = harness.Provider.GetRequiredService<TransportProbe>();
+        var delay = TimeSpan.FromSeconds(3);
+
+        var enqueuedAt = DateTime.UtcNow;
+        await EnqueueDelayedAsync(harness, harness.Names.NewCorrelationId("delayed"), token: 21, delay);
+
+        // The whole capability is "not before": the broker (or the store's claim gate) must hold
+        // the job until its due time, and the executor's NotBeforeUtc guard re-publishes an early
+        // delivery instead of running it. Half a second of grace absorbs whole-second broker
+        // rounding (SQS DelaySeconds is ceil'd, so it only ever rounds later) and store clock skew
+        // inside the tolerance the engine itself accepts.
+        var observed = await ExpectAsync(probe.FirstCall.Task, harness, "the delayed worker job");
+        var elapsed = DateTime.UtcNow - enqueuedAt;
+        Assert.Equal(21, observed.Token);
+        Assert.True(
+            elapsed >= delay - TimeSpan.FromMilliseconds(500),
+            $"{Transport}: the delayed job executed after {elapsed}, before its {delay} delay elapsed.");
+
+        // Exactly once, same as the immediate contract: the re-publish chain must not leave a
+        // duplicate behind once the job finally runs.
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        Assert.Equal(1, probe.CallCount);
+    }
+
     // ----- c. Failure handling -----
 
     [Fact]
@@ -544,6 +603,21 @@ public abstract class TransportConformanceSuite
         {
             await harness.Provider.GetRequiredService<IAsyncResponseBuilder>()
                 .EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, respond));
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+        }
+    }
+
+    private static async Task EnqueueDelayedAsync(
+        MatrixHarness harness, string correlationId, int token, TimeSpan delay)
+    {
+        AsyncResponseContext.SetCorrelationId(correlationId);
+        try
+        {
+            await harness.Provider.GetRequiredService<IAsyncResponseBuilder>()
+                .EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, false), delay);
         }
         finally
         {

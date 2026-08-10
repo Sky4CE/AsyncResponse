@@ -297,6 +297,8 @@ AsyncResponse.WorkerJobEnvelope.Context.get -> System.Collections.Generic.Dictio
 AsyncResponse.WorkerJobEnvelope.Context.set -> void
 AsyncResponse.WorkerJobEnvelope.CorrelationId.get -> string?
 AsyncResponse.WorkerJobEnvelope.CorrelationId.set -> void
+AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.get -> System.TimeSpan?
+AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.set -> void
 AsyncResponse.WorkerJobEnvelope.NotBeforeUtc.get -> System.DateTime?
 AsyncResponse.WorkerJobEnvelope.NotBeforeUtc.set -> void
 AsyncResponse.WorkerJobEnvelope.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?

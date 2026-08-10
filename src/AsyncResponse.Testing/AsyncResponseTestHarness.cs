@@ -66,6 +66,7 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     private readonly InMemoryRecoveryStateStore _recoveryStore;
     private readonly InMemoryFlowStateStore _flowStore;
     private readonly IDurableFlowExecutionObserver[] _observers;
+    private readonly QuiesceProbe _quiesce = new();
     private ServiceProvider _provider = null!;
     private IHostedService[] _started = [];
     private bool _disposed;
@@ -182,9 +183,10 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// Simulates a redeploy/restart. Durable state survives: recovery registrations, flow ledgers,
     /// and scheduled (delayed) worker jobs — re-published into the new incarnation with their
     /// remaining virtual delay, as a broker would retain them. Everything process-bound dies: live
-    /// waiters, subscriptions, in-flight executions (their leases expire or are taken over through
-    /// the normal contention machinery). Queued immediate jobs are drained gracefully before the
-    /// old incarnation stops, bounded by the real-time guard.
+    /// waiters, subscriptions, in-flight executions (their execution leases are broken, as a real
+    /// crash's silence would let them expire, so the new incarnation takes their flows over
+    /// immediately). Queued immediate jobs are drained gracefully before the old incarnation
+    /// stops, bounded by the real-time guard.
     /// </summary>
     /// <param name="whileDown">
     /// Runs between the old incarnation stopping and the new one starting — with no engine
@@ -199,6 +201,17 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         var pendingDelayed = Transport.SnapshotDelayedJobs();
         await StopHostedServicesAsync().ConfigureAwait(false);
         await _provider.DisposeAsync().ConfigureAwait(false);
+
+        // Hard-crash semantics for whatever survived the graceful stop: a parked execution's
+        // lease-renew loop runs on the SHARED virtual clock against the SHARED flow store, so it
+        // would keep the lease alive forever and the new incarnation could never take the flow
+        // over — the redelivered wake-up would see "executing on another live worker", ack, and
+        // the flow would never resume. Breaking the leases is what a real crash's silence does
+        // (the lease expires); the zombie's next renewal fails, marks itself lost, and stops. Any
+        // zombie retry after that dies against its own disposed provider before touching the
+        // store. The quiesce probe's parked entries died with the incarnation too.
+        _flowStore.ExpireAllLeases();
+        _quiesce.Reset();
 
         whileDown?.Invoke();
 
@@ -234,6 +247,7 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         services.AddSingleton<TimeProvider>(Clock);
         services.AddSingleton(_recoveryStore);
         services.AddSingleton(_flowStore);
+        services.AddSingleton<IDurableFlowExecutionObserver>(_quiesce);
         foreach (var observer in _observers)
             services.AddSingleton<IDurableFlowExecutionObserver>(observer);
 
@@ -299,29 +313,84 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     }
 
     /// <summary>
-    /// Yields briefly so pool continuations (worker dispatch, chained timer arming) settle. The
-    /// budget is deliberately small — it runs between every timer step of an advance — and grows
-    /// only while the worker transport is visibly busy.
+    /// Give worker jobs that are still RUNNING code a real chance to reach their next stable
+    /// state before the clock moves. Advancing while a job is mid-code would let a later
+    /// <c>DelayAsync</c> or deadline be computed from the already-advanced clock and park beyond
+    /// the advance target — the load-dependent flake this settle exists to prevent. Three
+    /// signals, cheapest first:
+    /// <list type="bullet">
+    /// <item>Every outstanding job is parked on an event-visible engine wait (an awaited reply,
+    /// an in-process flow timer) — the quiesce probe's count covers the outstanding count, and
+    /// settling costs nothing.</item>
+    /// <item>A virtual timer was armed while settling — the busy job just began a virtual-time
+    /// wait (a retry backoff, a lease-acquisition poll, a timer chunk), so advancing the clock is
+    /// exactly how it progresses.</item>
+    /// <item>A bounded real-time grace for what cannot be attributed (a job blocked on a virtual
+    /// timer it armed before this settle began looks identical to one stuck in user code). The
+    /// budget is generous relative to scheduling noise; a fake that sleeps on the SYSTEM clock
+    /// longer than this is the documented harness anti-pattern (use the injected TimeProvider).</item>
+    /// </list>
     /// </summary>
     private async Task SettleAsync()
     {
+        // Let just-released continuations (a fired timer's write, worker dispatch) reach the
+        // transport counters before reading them.
         for (var round = 0; round < 3; round++)
         {
             await Task.Yield();
             await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
         }
 
-        // Busy workers may be about to arm the next timer (a flow re-suspending, a retry backoff
-        // rescheduling). Grant them a short, BOUNDED grace — a job parked on an in-process
-        // virtual-time wait legitimately stays outstanding until the clock advances, so this must
-        // never block on idleness itself.
-        var busyCutoff = TimeProvider.System.GetUtcNow() + TimeSpan.FromMilliseconds(25);
-        while (Transport.OutstandingJobs != 0 && TimeProvider.System.GetUtcNow() < busyCutoff)
+        var budget = TimeProvider.System.GetUtcNow() + TimeSpan.FromMilliseconds(500);
+        while (Transport.OutstandingJobs > _quiesce.ParkedCount
+               && TimeProvider.System.GetUtcNow() < budget)
         {
             var next = Clock.NextTimerDueAt;
             await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
             if (next != Clock.NextTimerDueAt)
-                return; // New timer armed — the advance loop re-evaluates immediately.
+                return; // A virtual wait just began — the advance loop re-evaluates immediately.
+        }
+    }
+
+    /// <summary>
+    /// Tracks flow executions parked on an engine-owned wait: between a step's Waiting event and
+    /// its Completed event the execution holds a worker slot but is idle by design, waiting on
+    /// virtual time or a test-published reply. Only kinds that actually park in process count —
+    /// child-flow steps always suspend (the job ends), and a suspended timer's Waiting is
+    /// reconciled at the wake-up replay's Completed event. Cleared on restart: the old
+    /// incarnation's parked executions die with it.
+    /// </summary>
+    private sealed class QuiesceProbe : IDurableFlowExecutionObserver
+    {
+        private readonly HashSet<(string FlowId, string Step)> _parked = [];
+
+        public int ParkedCount
+        {
+            get { lock (_parked) return _parked.Count; }
+        }
+
+        public void Reset()
+        {
+            lock (_parked) _parked.Clear();
+        }
+
+        public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step)
+        {
+            if (step.Kind is DurableFlowStepKind.Awaited or DurableFlowStepKind.Timer)
+                lock (_parked) _parked.Add((step.FlowId, step.StepName));
+            return default;
+        }
+
+        public ValueTask OnStepCompletedAsync(DurableFlowStepEvent step)
+        {
+            lock (_parked) _parked.Remove((step.FlowId, step.StepName));
+            return default;
+        }
+
+        public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run)
+        {
+            lock (_parked) _parked.RemoveWhere(entry => string.Equals(entry.FlowId, run.FlowId, StringComparison.Ordinal));
+            return default;
         }
     }
 }

@@ -91,7 +91,10 @@ public sealed class CronSchedule
             dayOfMonthRestricted,
             dayOfWeekRestricted);
 
-        static bool IsFull(string field) => field is "*" or "?" || field.StartsWith("*/", StringComparison.Ordinal);
+        // "*/1" is every value and therefore unrestricted; any other "*/N" step keeps only some
+        // values, so it must count as restricted or DayMatches would discard the parsed mask and
+        // Vixie's dom/dow OR-rule would evaporate ("0 0 */2 * *" firing every day).
+        static bool IsFull(string field) => field is "*" or "?" or "*/1";
     }
 
     /// <summary>
