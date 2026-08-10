@@ -1,21 +1,21 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/10/2026 - 21:22:54
+  Generated on: 08/10/2026 - 21:49:23
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 475
   Files: 211
   Line coverage: 98%
-  Covered lines: 27520
-  Uncovered lines: 538
+  Covered lines: 27524
+  Uncovered lines: 534
   Coverable lines: 28058
   Total lines: 41721
-  Branch coverage: 93.9% (9930 of 10564)
-  Covered branches: 9930
+  Branch coverage: 94% (9937 of 10564)
+  Covered branches: 9937
   Total branches: 10564
   Method coverage: 99.1% (3080 of 3105)
-  Full method coverage: 94.6% (2938 of 3105)
+  Full method coverage: 94.6% (2939 of 3105)
   Covered methods: 3080
-  Fully covered methods: 2938
+  Fully covered methods: 2939
   Total methods: 3105
 
 AsyncResponse.Abstractions                                                                                           98.2%
@@ -306,8 +306,8 @@ AsyncResponse.DurableFlows.SqlServer                                            
   AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore                                                       99.4%
   Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollectionExtensions                            100%
 
-AsyncResponse.Testing                                                                                                86.8%
-  AsyncResponse.Testing.AsyncResponseTestHarness                                                                     90.3%
+AsyncResponse.Testing                                                                                                86.7%
+  AsyncResponse.Testing.AsyncResponseTestHarness                                                                     89.6%
   AsyncResponse.Testing.AsyncResponseTestHarness.QuiesceProbe                                                        90.9%
   AsyncResponse.Testing.AsyncResponseTestHarnessOptions                                                               100%
   AsyncResponse.Testing.FlowProbe                                                                                      88%
@@ -366,7 +366,7 @@ AsyncResponse.Transports.GooglePubSub                                           
   AsyncResponse.Transports.GooglePubSub.QueuedGooglePubSubMessageDispatcher                                           100%
   Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions                       100%
 
-AsyncResponse.Transports.Kafka                                                                                       99.7%
+AsyncResponse.Transports.Kafka                                                                                       99.8%
   AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher                                                       100%
   AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions                                                   100%
   AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext                                                        100%
@@ -382,7 +382,7 @@ AsyncResponse.Transports.Kafka                                                  
   AsyncResponse.Transports.Kafka.KafkaReplyTargetProvider                                                             100%
   AsyncResponse.Transports.Kafka.KafkaResponseIngressSubscriber                                                       100%
   AsyncResponse.Transports.Kafka.KafkaSubscriberOptions                                                               100%
-  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                              99.1%
+  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                               100%
   AsyncResponse.Transports.Kafka.KafkaTransportClientDefaults                                                         100%
   AsyncResponse.Transports.Kafka.KafkaTransportHeader                                                                 100%
   AsyncResponse.Transports.Kafka.KafkaTransportOptionsValidator                                                       100%
@@ -499,7 +499,7 @@ AsyncResponse.Transports.Redis                                                  
   AsyncResponse.Transports.Redis.RedisWorkerTransport                                                                 100%
   Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.SqlServer                                                                                   99.4%
+AsyncResponse.Transports.SqlServer                                                                                   99.8%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
   AsyncResponse.Transports.DbMessageDispatcherBase                                                                    100%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
@@ -510,7 +510,7 @@ AsyncResponse.Transports.SqlServer                                              
   AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider                                                     100%
   AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber                                               100%
   AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions                                                       100%
-  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                      93.6%
+  AsyncResponse.Transports.SqlServer.SqlServerSubscriberService                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransientFaults                                                         100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery                                                       100%
   AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator                                               100%
