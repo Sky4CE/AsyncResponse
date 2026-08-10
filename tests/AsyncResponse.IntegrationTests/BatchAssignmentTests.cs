@@ -19,6 +19,15 @@ public sealed class BatchAssignmentTests
         [OracleCosmosCollection.Name] = typeof(OracleCosmosBatchFixture),
         [BrokersCollection.Name] = typeof(BrokersBatchFixture),
         [CloudCollection.Name] = typeof(CloudBatchFixture),
+        [MatrixDatabaseLightCollection.Name] = typeof(MatrixDatabaseLightFixture),
+        [MatrixBrokerLightCollection.Name] = typeof(MatrixBrokerLightFixture),
+        [MatrixCloudLightCollection.Name] = typeof(MatrixCloudLightFixture),
+        [MatrixDatabaseOracleCollection.Name] = typeof(MatrixDatabaseOracleFixture),
+        [MatrixBrokerOracleCollection.Name] = typeof(MatrixBrokerOracleFixture),
+        [MatrixCloudOracleCollection.Name] = typeof(MatrixCloudOracleFixture),
+        [MatrixDatabaseCosmosCollection.Name] = typeof(MatrixDatabaseCosmosFixture),
+        [MatrixBrokerCosmosCollection.Name] = typeof(MatrixBrokerCosmosFixture),
+        [MatrixCloudCosmosCollection.Name] = typeof(MatrixCloudCosmosFixture),
     };
 
     private static IEnumerable<Type> TestClasses => typeof(BatchAssignmentTests).Assembly
@@ -86,6 +95,15 @@ public sealed class BatchAssignmentTests
             [OracleCosmosCollection.Name] = Batches.OracleCosmos,
             [BrokersCollection.Name] = Batches.Brokers,
             [CloudCollection.Name] = Batches.Cloud,
+            [MatrixDatabaseLightCollection.Name] = Batches.MatrixDatabaseLight,
+            [MatrixBrokerLightCollection.Name] = Batches.MatrixBrokerLight,
+            [MatrixCloudLightCollection.Name] = Batches.MatrixCloudLight,
+            [MatrixDatabaseOracleCollection.Name] = Batches.MatrixDatabaseOracle,
+            [MatrixBrokerOracleCollection.Name] = Batches.MatrixBrokerOracle,
+            [MatrixCloudOracleCollection.Name] = Batches.MatrixCloudOracle,
+            [MatrixDatabaseCosmosCollection.Name] = Batches.MatrixDatabaseCosmos,
+            [MatrixBrokerCosmosCollection.Name] = Batches.MatrixBrokerCosmos,
+            [MatrixCloudCosmosCollection.Name] = Batches.MatrixCloudCosmos,
         };
 
         var disagreements = new List<string>();

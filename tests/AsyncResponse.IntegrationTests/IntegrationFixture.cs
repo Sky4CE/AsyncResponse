@@ -1,5 +1,6 @@
 using Aspire.Hosting;
 using Aspire.Hosting.Testing;
+using AsyncResponse.Conformance;
 using Xunit;
 
 namespace AsyncResponse.IntegrationTests;
@@ -68,6 +69,73 @@ public abstract class IntegrationFixture : IAsyncLifetime
     public HttpClient MongoDbClient { get; private protected set; } = null!;
     public HttpClient MongoDbEarlyAckClient { get; private protected set; } = null!;
     public string LocalStackServiceUrl { get; private protected set; } = null!;
+
+    // --- Broker endpoints for driver-level suites --------------------------------------------------
+    // The app-driven tests never needed these (Aspire injected them into the sample apps), but the
+    // transport contract builds its hosts in this process and has to address the brokers itself.
+
+    /// <summary>Kafka bootstrap servers, when the batch declared Kafka.</summary>
+    public string? KafkaBootstrapServers { get; private protected set; }
+
+    /// <summary>RabbitMQ AMQP URI, when the batch declared RabbitMQ.</summary>
+    public string? RabbitMqConnectionString { get; private protected set; }
+
+    /// <summary>Service Bus emulator connection string, when the batch declared it.</summary>
+    public string? AzureServiceBusConnectionString { get; private protected set; }
+
+    /// <summary>The Pub/Sub emulator's project, when the batch declared the emulator.</summary>
+    public string? PubSubProjectId { get; private protected set; }
+
+    /// <summary>
+    /// Everything this batch wired, in the shape the driver-level suites consume. Unwired backends stay
+    /// null, and asking for one names it in the failure — the signal that a test is in the wrong batch.
+    /// </summary>
+    public MatrixBackends Backends => new()
+    {
+        Redis = RedisConnectionString,
+        Nats = NatsConnectionString,
+        PostgreSql = PostgreSqlConnectionString,
+        SqlServer = SqlServerConnectionString,
+        MongoDb = MongoDbConnectionString,
+        MySql = MySqlConnectionString,
+        Kafka = KafkaBootstrapServers,
+        RabbitMq = RabbitMqConnectionString,
+        LocalStack = LocalStackServiceUrl,
+        AzureServiceBus = AzureServiceBusConnectionString,
+        PubSubProjectId = PubSubProjectId,
+        Oracle = Environment.GetEnvironmentVariable(OracleConnectionStringEnvironmentVariable),
+        Cosmos = Environment.GetEnvironmentVariable(CosmosConnectionStringEnvironmentVariable)
+    };
+
+    /// <summary>Resolves Kafka and RabbitMQ for a batch that declared them.</summary>
+    private protected async Task WireBrokerConnectionStringsAsync()
+    {
+        KafkaBootstrapServers = await App.GetConnectionStringAsync("kafka")
+            ?? throw new InvalidOperationException("The Aspire 'kafka' resource reported no connection string.");
+        var amqp = App.GetEndpoint("rabbitmq", "amqp");
+        RabbitMqConnectionString = $"amqp://guest:guest@{amqp.Host}:{amqp.Port}/";
+    }
+
+    /// <summary>Resolves the Service Bus emulator for a batch that declared it.</summary>
+    private protected void WireAzureServiceBusConnectionString()
+    {
+        var endpoint = App.GetEndpoint("servicebus", "amqp");
+        AzureServiceBusConnectionString =
+            $"Endpoint=sb://{endpoint.Host}:{endpoint.Port};SharedAccessKeyName=RootManageSharedAccessKey;" +
+            "SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true;";
+    }
+
+    /// <summary>
+    /// Points this process at the Pub/Sub emulator. The client libraries discover it only through the
+    /// process-wide PUBSUB_EMULATOR_HOST variable — there is no per-client override — so a batch that
+    /// wants driver-level Pub/Sub has to set it.
+    /// </summary>
+    private protected void WirePubSubEmulator(string projectId)
+    {
+        var endpoint = App.GetEndpoint("pubsub", "pubsub");
+        Environment.SetEnvironmentVariable("PUBSUB_EMULATOR_HOST", $"{endpoint.Host}:{endpoint.Port}");
+        PubSubProjectId = projectId;
+    }
 
     public async ValueTask InitializeAsync()
     {
@@ -172,24 +240,36 @@ public abstract class IntegrationFixture : IAsyncLifetime
     /// </summary>
     private protected void WireOracleAndCosmosConnectionStrings()
     {
-        if (SkipOracleCosmos())
+        WireOracleConnectionString();
+        WireCosmosConnectionString();
+    }
+
+    /// <summary>
+    /// Oracle alone. The cross-product shards declare exactly one of the two heavyweight containers —
+    /// together they are 3.2 GiB — so they wire them one at a time; asking Aspire for an endpoint the
+    /// batch never declared throws.
+    /// </summary>
+    private protected void WireOracleConnectionString()
+    {
+        if (SkipOracleCosmos() || !string.IsNullOrEmpty(_previousOracleConnectionString))
             return;
 
-        if (string.IsNullOrEmpty(_previousOracleConnectionString))
-        {
-            var oracleEndpoint = App.GetEndpoint("oracle", "oracle");
-            Environment.SetEnvironmentVariable(
-                OracleConnectionStringEnvironmentVariable,
-                $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
-        }
+        var oracleEndpoint = App.GetEndpoint("oracle", "oracle");
+        Environment.SetEnvironmentVariable(
+            OracleConnectionStringEnvironmentVariable,
+            $"User Id=asyncresponse;Password={Env("ASYNCRESPONSE_ITEST_ORACLE_APP_PASSWORD", "AsyncResponse12345")};Data Source={oracleEndpoint.Host}:{oracleEndpoint.Port}/FREEPDB1;");
+    }
 
-        if (string.IsNullOrEmpty(_previousCosmosConnectionString))
-        {
-            var cosmosEndpoint = App.GetEndpoint("cosmos", "gateway");
-            Environment.SetEnvironmentVariable(
-                CosmosConnectionStringEnvironmentVariable,
-                $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
-        }
+    /// <summary>Cosmos alone. See <see cref="WireOracleConnectionString"/> for why they are separable.</summary>
+    private protected void WireCosmosConnectionString()
+    {
+        if (SkipOracleCosmos() || !string.IsNullOrEmpty(_previousCosmosConnectionString))
+            return;
+
+        var cosmosEndpoint = App.GetEndpoint("cosmos", "gateway");
+        Environment.SetEnvironmentVariable(
+            CosmosConnectionStringEnvironmentVariable,
+            $"AccountEndpoint=https://{cosmosEndpoint.Host}:{cosmosEndpoint.Port}/;AccountKey={CosmosEmulatorAccountKey};");
     }
 
     public async ValueTask DisposeAsync()

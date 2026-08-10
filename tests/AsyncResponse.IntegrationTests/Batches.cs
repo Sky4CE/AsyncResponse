@@ -37,10 +37,34 @@ public static class Batches
     /// <summary>Trait name CI filters on.</summary>
     public const string Trait = "batch";
 
+    /// <summary>The Pub/Sub project the AppHost starts its emulator with. Mirrored from the AppHost.</summary>
+    internal const string PubSubProjectIdValue = "itest-project";
+
     public const string Data = "data";
     public const string OracleCosmos = "oracle-cosmos";
     public const string Brokers = "brokers";
     public const string Cloud = "cloud";
+
+    /// <summary>
+    /// The provider cross-product shards. Every channel runs against every transport against every
+    /// durable-flow store; the cells are partitioned by container footprint so no leg boots more of
+    /// the fleet than its own combinations touch. See <see cref="Conformance.ProviderMatrix"/> for
+    /// the partition and MatrixBatches.cs for the fixtures.
+    /// <para>
+    /// These values must equal <c>"matrix-" + ProviderMatrix.TraitValueOf(shard)</c>. They are spelled
+    /// out because trait values have to be compile-time constants; <c>MatrixShardTests</c> asserts the
+    /// two agree.
+    /// </para>
+    /// </summary>
+    public const string MatrixDatabaseLight = "matrix-database-light";
+    public const string MatrixBrokerLight = "matrix-broker-light";
+    public const string MatrixCloudLight = "matrix-cloud-light";
+    public const string MatrixDatabaseOracle = "matrix-database-oracle";
+    public const string MatrixBrokerOracle = "matrix-broker-oracle";
+    public const string MatrixCloudOracle = "matrix-cloud-oracle";
+    public const string MatrixDatabaseCosmos = "matrix-database-cosmos";
+    public const string MatrixBrokerCosmos = "matrix-broker-cosmos";
+    public const string MatrixCloudCosmos = "matrix-cloud-cosmos";
 
     /// <summary>
     /// Tests that need no AppHost at all. They still carry the trait, so every test in the assembly
@@ -195,6 +219,13 @@ public sealed class BrokersBatchFixture : IntegrationFixture
             return;
         }
 
+        // The transport contract builds its own hosts in this process against these same brokers, so
+        // the batch resolves their endpoints alongside the sample apps' Aspire references.
+        await WireBrokerConnectionStringsAsync();
+        WireNatsConnectionString();
+        await WireRedisConnectionStringAsync();
+        WirePubSubEmulator(Batches.PubSubProjectIdValue);
+
         var clients = await WireAppsAsync(
             "itest-app",
             "itest-app-early-ack",
@@ -231,6 +262,11 @@ public sealed class CloudBatchFixture : IntegrationFixture
 
     protected override async ValueTask WireAsync()
     {
+        // Same reason as the brokers batch: the transport contract addresses these emulators directly.
+        WireAzureServiceBusConnectionString();
+        WireLocalStackServiceUrl();
+        await WireRedisConnectionStringAsync();
+
         var clients = await WireAppsAsync(
             "itest-app-azure-servicebus",
             "itest-app-azure-servicebus-early-ack",

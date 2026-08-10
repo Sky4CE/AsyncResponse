@@ -138,6 +138,7 @@ containers dominate everything else, so the split is mostly about keeping them a
 | `oracle-cosmos` | `OracleCosmosCollection` | 2 | 0 | 2 | Oracle and Cosmos store contracts, isolated — the two largest containers in the suite |
 | `brokers` | `BrokersCollection` | 5 | 10 | 55 | Message brokers proper (Redis, Pub/Sub, RabbitMQ, NATS, Kafka) |
 | `cloud` | `CloudCollection` | 4 | 4 | 18 | Azure Service Bus + SQS emulators. Service Bus brings its own SQL Server |
+| `matrix-*` | nine collections | 5–10 | 0 | 1,980 | The provider cross product — see [The provider cross product](#the-provider-cross-product) |
 
 Peak footprint across a full run is ~3.3 GiB, against 5.8 GiB when the store contracts shared a batch.
 That earlier arrangement fit when the suite ran alone and failed wholesale when anything else used the
@@ -170,6 +171,72 @@ wall-clock is the slowest batch rather than the sum. Each runner also pulls only
 images, which is what the disk-reclaim step in that job exists to fight. Legs upload
 `coverage-integration-<batch>`; the coverage job globs `coverage-*` and merges, so the published
 number still covers the whole suite.
+
+#### The provider cross product
+
+Channels, transports, and durable-flow stores are chosen independently, so "it works" has to mean
+every combination works — not every provider in isolation. The cross product is enumerated in full:
+**6 channels × 11 transports × 10 stores = 660 combinations**, each running three scenarios (a durable
+flow end to end, a terminal domain failure, and a worker job with its context restored).
+
+A cell builds a DI provider inside the test process — `AddAsyncResponse().With…Channel()
+.With…Transport().With…DurableFlows()`, exactly as an application would — against the containers its
+shard booted. No sample app is involved, which is what makes 660 of them affordable.
+
+The cells are partitioned into nine shards on two axes, because the whole fleet at once is roughly
+9 GiB and the two heavyweight stores cannot share a runner:
+
+| Shard axis | Values | What it decides |
+| --- | --- | --- |
+| Transport family | `database` (6 transports), `broker` (Kafka, RabbitMQ), `cloud` (SQS, Service Bus, Pub/Sub) | Which brokers boot |
+| Store family | `light` (8 stores), `oracle`, `cosmos` | Whether Oracle (2,180 MiB) or Cosmos (1,031 MiB) boots |
+
+Every shard carries the five channel containers, because the channel axis is complete within each one.
+The largest shard, `matrix-database-light`, is 288 cells and runs in about 6½ minutes locally once its
+fleet is up.
+
+To reproduce a single combination without waiting out a whole shard, filter by cell name — the same
+string the test id shows:
+
+```bash
+ASYNCRESPONSE_MATRIX_FILTER=PostgreSql+Kafka+MongoDb dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --filter-trait "batch=matrix-broker-light"
+```
+
+`MatrixCompletenessTests` keeps the product honest: it reflects over the shipped `With…Channel`,
+`With…Transport`, and `With…DurableFlows` registrations and fails when one has no matrix axis member,
+asserts the shards partition every cell exactly once, and requires each shard to have a test class
+carrying its trait. A new provider package therefore fails the build the day it lands, rather than
+shipping with no cross-product coverage.
+
+#### Behavioral contracts
+
+Depth within a single axis belongs to that axis's contract suite, which runs **per provider** rather
+than per combination — so adding a scenario costs N runs, not 660:
+
+| Suite | Facts | Derivations |
+| --- | --- | --- |
+| `ChannelConformanceSuite` | 30 | 6 channels |
+| `TransportConformanceSuite` | 10 | 11 transports |
+| `FlowStoreContract` | one composed contract | 10 stores |
+
+`TransportConformanceSuite` covers what the per-broker suites never did: dead-lettering, redelivery
+after a transient failure, poison-message bounds, shutdown drain, large payloads, concurrency, ambient
+context restoration, and durability across a consumer outage.
+
+Transports differ in *where* a guarantee comes from, and `TransportCapabilities` records that rather
+than letting it become a skipped test. Every transport bounds redelivery, but the bound lives in a
+different place: a `MaxDeliveryAttempts` subscriber knob on six of them, the in-process retry budget
+on the in-memory queue, the queue's redrive policy on SQS, and the subscription's `DeadLetterPolicy`
+on Google Pub/Sub — which the package deliberately leaves to infrastructure and warns about at startup
+when it cannot see one. Two transports constrain the bound itself: RabbitMQ cannot count past two
+without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does not increment
+`x-death`), and a Pub/Sub `DeadLetterPolicy` rejects anything under five. Payload ceilings differ by
+two orders of magnitude, so the payload fact is sized per transport — SQS and Service Bus standard
+tier both reject messages over 256 KiB outright.
+
+Where a capability is genuinely absent the contract still asserts it rather than skipping. The
+in-memory transport has no early-ACK mode and no life beyond its host, so those two facts assert the
+absence — a mode appearing later fails the test and forces the capability table to be updated with it.
 
 `BatchAssignmentTests` holds the whole arrangement together. It fails if a class asks for a fixture
 without declaring its batch, declares one batch and takes another's fixture, carries no batch trait,

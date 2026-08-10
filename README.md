@@ -606,17 +606,74 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-- **1,700+ unit tests, run on each target framework** (~3,400 executions across .NET 8 and .NET 10), including
-  concurrency suites with hundreds of parallel waiters, cross-correlation leak detection, and
-  duplicate-execution detection.
-- **310+ integration test cases** drive the shipped sample app black-box over HTTP against **real
-  brokers** — Redis, NATS, PostgreSQL, SQL Server, MongoDB (single-node replica set), RabbitMQ,
-  Kafka containers plus the official Azure Service Bus and Google Pub/Sub emulators and LocalStack
-  for AWS SQS — orchestrated by .NET Aspire, with a dedicated early-ACK app instance per transport.
-  The same run verifies the atomic durable-flow store contract against SQL Server, PostgreSQL,
-  MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, and EF Core.
-  A scheduled CI matrix reruns the Redis-backed suite against Valkey; Dragonfly is validated by
-  running the real channel and transport against a live server.
+**5,972 test executions per CI run, none skipped** — 3,566 unit (1,783 on each of .NET 8 and .NET 10)
+and 2,406 integration cases against real servers.
+
+A channel, a worker transport, and a durable-flow store are chosen independently, so "each provider
+works" and "the combination works" are different claims. The suite makes both, and is structured
+around that split: **one behavioral contract per axis**, run against every provider on it, plus **the
+full cross product** for how the axes compose.
+
+### The provider cross product
+
+**6 channels × 11 transports × 10 durable-flow stores = 660 combinations**, each running three
+scenarios — a durable flow end to end, a terminal domain failure, and a worker job with its
+correlation id and ambient context restored — for **1,980 cases against real servers**. Each cell
+builds a host exactly the way an application does,
+`AddAsyncResponse().With…Channel().With…Transport().With…DurableFlows()`, and drives a real flow
+through it.
+
+Enumerating the product rather than sampling it is the point: a PostgreSQL channel paired with a Kafka
+transport and an Oracle ledger is a combination nobody writes a test for by hand, and it is precisely
+where two providers stop composing. The cells are sharded across nine CI legs by container footprint,
+because the whole fleet at once is ~9 GiB and the two heavyweight stores cannot share a runner:
+`database-light` 288 cells, `cloud-light` 144, `broker-light` 96, then 36/18/12 for each Oracle and
+Cosmos shard. `MatrixCompletenessTests` reflects over the shipped `With…Channel`, `With…Transport`,
+and `With…DurableFlows` registrations and fails when one has no place in the product — a new provider
+package cannot ship without cross-product coverage.
+
+### Behavioral contracts, one per axis
+
+Depth within an axis runs **per provider** rather than per combination, so adding a scenario costs N
+runs instead of 660:
+
+| Contract | Facts | Providers | Cases |
+| --- | ---: | ---: | ---: |
+| Channel conformance | 27 | 6 channels | 162 |
+| Transport conformance | 10 | 11 transports | 110 |
+| Durable-flow store contract | one composed contract | 10 stores | 10 |
+
+The channel contract pins live delivery, `Until` predicates, timeouts, correlation-id isolation and
+reuse, progress streams, mixed-type and polymorphic fan-out, straggler drops, crash-then-recovery
+routing, and disposal semantics. The transport contract pins exactly-once delivery of a successful
+job, ambient-context restoration, redelivery after a transient failure, poison-message bounds,
+early-ACK execution, large payloads, concurrency, durability across a consumer outage, and
+idle-shutdown latency. The store contract pins the atomic revision/lease protocol, TTL expiry, lease
+expiry and steal after a worker dies, large state, and rejection of a newer schema version.
+
+Transports differ in *where* a guarantee comes from, and the suite records that rather than letting
+the difference become an untested gap. Every transport bounds redelivery — via a subscriber knob on
+six of them, the in-process retry budget on the in-memory queue, the queue's redrive policy on SQS,
+and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound itself: RabbitMQ
+cannot count past two without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does
+not increment `x-death`), and a Pub/Sub dead-letter policy rejects anything under five. Payload
+ceilings differ by two orders of magnitude — SQS and Service Bus standard tier both reject messages
+over 256 KiB — so the payload fact is sized per transport. Where a capability is genuinely absent, the
+contract asserts the absence instead of skipping, so adding it later fails the test.
+
+### Real servers, and the shipped app
+
+Everything above runs against real servers orchestrated by .NET Aspire: Redis, NATS, PostgreSQL,
+SQL Server, MongoDB (single-node replica set), MySQL, Oracle, RabbitMQ, and Kafka containers, plus the
+official Azure Service Bus and Google Pub/Sub emulators, the Cosmos DB emulator, and LocalStack for
+AWS SQS and DynamoDB. A separate app-driven suite exercises the **shipped sample black-box over
+HTTP** — 137 scenarios with a dedicated early-ACK app instance per transport — so the packages are
+proven through a real host boundary as well as through in-process wiring.
+
+### Beyond the providers
+
+- A CI matrix reruns the Redis-backed suite against **Valkey** on every invocation and weekly;
+  Dragonfly is validated by running the real channel and transport against a live server.
 - **The same integration suite runs against a Native AOT SUT**: the sample publishes fully
   trimmed and the Aspire harness boots the native binary wherever the full driver stack is
   AOT-capable today (NATS and PostgreSQL pairs; the rest stay JIT with the exact driver-level

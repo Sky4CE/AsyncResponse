@@ -246,14 +246,36 @@ jobs:
     #
     # The legs partition the suite exactly — every test carries a batch trait, "none" included, so
     # nothing silently stops running. Keep this list in sync with Batches.cs.
+    #
+    # The nine matrix-* legs are the provider cross product: every channel against every transport
+    # against every durable-flow store, 660 combinations, three scenarios each. They are shards rather
+    # than one leg because the whole fleet at once is roughly 9 GiB of containers — and because Oracle
+    # and Cosmos, the two largest images, cannot share a runner. Each shard boots only the containers
+    # its own cells touch; MatrixCompletenessTests asserts the shards partition the product.
     strategy:
       # A failing leg must not cancel the others, or the first failure hides the rest of the signal.
       fail-fast: false
       matrix:
-        batch: [data, oracle-cosmos, brokers, cloud, none]
+        batch:
+          - data
+          - oracle-cosmos
+          - brokers
+          - cloud
+          - none
+          - matrix-database-light
+          - matrix-broker-light
+          - matrix-cloud-light
+          - matrix-database-oracle
+          - matrix-broker-oracle
+          - matrix-cloud-oracle
+          - matrix-database-cosmos
+          - matrix-broker-cosmos
+          - matrix-cloud-cosmos
     name: integration-tests (${{ matrix.batch }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The cross-product shards run hundreds of cells each and boot a larger fleet than the original
+    # batches: database-light alone is 288 cells (~7 minutes of cells locally, plus fleet startup).
+    timeout-minutes: ${{ startsWith(matrix.batch, 'matrix-') && 90 || 30 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -307,7 +329,9 @@ jobs:
             return "${PIPESTATUS[0]}"
           }
           if ! run_integration_tests; then
-            if grep -q "BatchFixture' threw in InitializeAsync" itest-console.log; then
+            # Matches both the original *BatchFixture types and the cross-product shards' fixtures
+            # (MatrixDatabaseLightFixture and friends), which carry no "Batch" infix.
+            if grep -q "Fixture' threw in InitializeAsync" itest-console.log; then
               echo "::warning::Batch '${{ matrix.batch }}' failed to boot (known hosted-runner resource flake) — retrying once."
               run_integration_tests
             else

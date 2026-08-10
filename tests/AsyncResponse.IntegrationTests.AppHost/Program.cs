@@ -785,6 +785,51 @@ switch (Env("ASYNCRESPONSE_ITEST_BATCH", "").ToLowerInvariant())
         break;
     }
 
+    // --- Provider cross-product shards --------------------------------------------------------
+    // The combination matrix runs every channel against every transport against every durable-flow
+    // store. Its cells are driver-level (a DI provider per cell inside the test process), so these
+    // batches declare containers and no sample apps at all.
+    //
+    // A shard is picked so its fleet is the union of what its own cells touch, and no more. Every
+    // shard carries the five channel containers because the channel axis is complete within each one;
+    // the transport family adds the brokers, and the store family decides whether Oracle (2,180 MiB)
+    // or Cosmos (1,031 MiB) — which cannot share a runner with each other — has to be up.
+    case "matrix-database-light":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: true);
+        break;
+
+    case "matrix-broker-light":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: true);
+        break;
+
+    case "matrix-cloud-light":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: true);
+        break;
+
+    case "matrix-database-oracle":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-broker-oracle":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-cloud-oracle":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: false, oracle: true);
+        break;
+
+    case "matrix-database-cosmos":
+        AddMatrixFleet(brokers: false, cloud: false, lightStores: false, cosmos: true);
+        break;
+
+    case "matrix-broker-cosmos":
+        AddMatrixFleet(brokers: true, cloud: false, lightStores: false, cosmos: true);
+        break;
+
+    case "matrix-cloud-cosmos":
+        AddMatrixFleet(brokers: false, cloud: true, lightStores: false, cosmos: true);
+        break;
+
     // Not a test batch: the whole fleet in one AppHost, for benchmarks/AsyncResponse.LoadTests, which
     // drives every transport at once and boots this AppHost directly. Batching exists to bound the
     // *test suite's* peak footprint; the load test wants everything up simultaneously by definition,
@@ -811,8 +856,51 @@ switch (Env("ASYNCRESPONSE_ITEST_BATCH", "").ToLowerInvariant())
     case var unknown:
         throw new InvalidOperationException(
             $"ASYNCRESPONSE_ITEST_BATCH must be set. Got '{unknown}'. Test batches: data, oracle-cosmos, " +
-            "brokers, cloud (the integration fixtures set these). The load test uses: loadtest. " +
+            "brokers, cloud, and the nine matrix-* shards (the integration fixtures set these). " +
+            "The load test uses: loadtest. " +
             "If this fires from the test suite, the AppHost build is stale relative to the tests.");
+}
+
+// The fleet one cross-product shard needs. The five channel containers are unconditional: every shard
+// runs the full channel axis, and those same servers also back the database transports and the
+// PostgreSQL/SQL Server/MongoDB stores, so they are never merely the channel's cost.
+void AddMatrixFleet(bool brokers, bool cloud, bool lightStores, bool oracle = false, bool cosmos = false)
+{
+    AddRedisContainer();
+    AddNatsContainer();
+    AddPostgresContainer();
+    AddSqlServerContainer();
+    AddMongoDbContainer();
+
+    if (brokers)
+    {
+        AddKafkaContainer();
+        AddRabbitMqContainer();
+    }
+
+    if (cloud)
+    {
+        AddServiceBusContainer();
+        AddPubSubContainer();
+        // SQS is a cloud transport and DynamoDB is a store; both are LocalStack, so a cloud shard
+        // needs it whether or not it also runs the light stores.
+        AddLocalStackContainer();
+    }
+
+    if (lightStores)
+    {
+        AddMySqlContainer();
+        if (!cloud)
+            AddLocalStackContainer(); // DynamoDB store
+    }
+
+    // Oracle and Cosmos never share a shard: together they are 3.2 GiB on top of a fleet that already
+    // carries SQL Server.
+    if (oracle && !SkipOracleCosmos())
+        AddOracleContainer();
+
+    if (cosmos && !SkipOracleCosmos())
+        AddCosmosContainer();
 }
 
 builder.Build().Run();

@@ -13,6 +13,37 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Added
 
+- **Provider cross-product test coverage.** Channels, transports, and durable-flow stores are
+  selected independently, so the suite now enumerates the whole product rather than testing each
+  provider alone: **6 channels × 11 transports × 10 stores = 660 combinations**, three scenarios
+  each (a durable flow end to end, a terminal domain failure, a worker job with restored context).
+  A cell builds a real DI provider in the test process against real servers; the cells are sharded
+  into nine CI legs by container footprint, because the whole fleet at once is ~9 GiB and Oracle and
+  Cosmos cannot share a runner. `MatrixCompletenessTests` reflects over the shipped `With…Channel` /
+  `With…Transport` / `With…DurableFlows` registrations and fails when a provider has no matrix axis
+  member, so a new package cannot ship without cross-product coverage. Reproduce one combination
+  with `ASYNCRESPONSE_MATRIX_FILTER=PostgreSql+Kafka+MongoDb`. See
+  [operations](docs/operations.md#the-provider-cross-product).
+- **`TransportConformanceSuite`** — the worker-transport behavioral contract, the counterpart to the
+  channel contract that already existed. Ten `Contract_*` facts run against all eleven transports:
+  exactly-once delivery of a successful job, ambient-context restoration, responses published from a
+  worker, concurrency, large payloads, redelivery after a transient failure, poison-message bounds,
+  early-ACK execution, durability across a consumer outage, and idle-shutdown latency. Previously
+  each transport had its own ad-hoc list and none of them covered dead-lettering, redelivery,
+  drain, or payload limits. `TransportCapabilities` records where the guarantees come from rather
+  than letting the difference become an untested gap: every transport bounds redelivery, but through
+  a subscriber knob on six, the in-process retry budget on the in-memory queue, the queue's redrive
+  policy on SQS, and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the bound
+  itself — RabbitMQ cannot count past two without an application-owned TTL-retry cycle, and a Pub/Sub
+  `DeadLetterPolicy` rejects anything under five — and payload ceilings differ by two orders of
+  magnitude, so the payload fact is sized per transport. Where a capability is genuinely absent (the
+  in-memory queue has no early-ACK mode and no life beyond its host) the contract asserts the absence
+  instead of skipping, so adding one later fails the test.
+- **Expanded durable-flow store contract.** Every store now additionally proves lease expiry and
+  steal (the crash-recovery path: a worker that dies never releases its lease), renewal and release
+  by a non-owner, the full unknown-flow-id surface, a ~64 KiB state round trip, and rejection of a
+  state written by a newer schema version.
+
 - `RecoveryAction` and `IAsyncResponsePayload.OnRecovery()` — the tri-state lost-subscriber
   classification that **replaces** the binary `ShouldResumeOnRecovery()`: `Resume`, `Fail`, or
   `KeepWaiting` (default `Fail` — nothing resumes by omission). `KeepWaiting` is the recovery-side
