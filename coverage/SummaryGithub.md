@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/10/2026 - 00:58:26 |
+| Generated on: | 08/10/2026 - 01:32:21 |
 | Parser: | MultiReport (7x Cobertura) |
 | Assemblies: | 26 |
-| Classes: | 452 |
-| Files: | 203 |
-| **Line coverage:** | 98.8% (25659 of 25953) |
-| Covered lines: | 25659 |
-| Uncovered lines: | 294 |
-| Coverable lines: | 25953 |
-| Total lines: | 38733 |
-| **Branch coverage:** | 95.6% (8989 of 9394) |
-| Covered branches: | 8989 |
-| Total branches: | 9394 |
+| Classes: | 455 |
+| Files: | 204 |
+| **Line coverage:** | 98.7% (25981 of 26317) |
+| Covered lines: | 25981 |
+| Uncovered lines: | 336 |
+| Coverable lines: | 26317 |
+| Total lines: | 39018 |
+| **Branch coverage:** | 95.2% (9113 of 9570) |
+| Covered branches: | 9113 |
+| Total branches: | 9570 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -50,7 +50,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.MongoDB**|**99.4%**|**99.6%**|
+|**AsyncResponse.Channels.MongoDB**|**99.4%**|**99.7%**|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase|99.8%|99.6%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
@@ -63,8 +63,9 @@
 |AsyncResponse.Channels.MongoDB.MongoDbAsyncResponseWaiter<T>|100%||
 |AsyncResponse.Channels.MongoDB.MongoDbChannelStore|100%|100%|
 |AsyncResponse.Channels.MongoDB.MongoDbChannelStore<TDocument>|100%|100%|
-|AsyncResponse.Channels.MongoDB.MongoDbRecoveryStateStore|100%|97.2%|
+|AsyncResponse.Channels.MongoDB.MongoDbRecoveryStateStore|100%|100%|
 |AsyncResponse.Channels.MongoDB.MongoRecoveryStateDocument|100%||
+|AsyncResponse.Internal.MongoOwnershipLedger|100%|100%|
 |Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelService<br/>CollectionExtensions|100%|100%|
 
 </details>
@@ -87,11 +88,11 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 99.4%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 99.1%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**99.4%**|**98%**|
+|**AsyncResponse.Channels.PostgreSQL**|**99.1%**|**95.9%**|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase|99.2%|98.8%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
@@ -102,7 +103,7 @@
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>|100%||
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlRecoveryStateStore|100%|97.2%|
-|AsyncResponse.Internal.PostgreSqlRelationVerifier|96.3%|83.3%|
+|AsyncResponse.Internal.PostgreSqlRelationVerifier|94%|72.3%|
 |Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServ<br/>iceCollectionExtensions|100%|100%|
 
 </details>
@@ -193,7 +194,7 @@
 |AsyncResponse.DurableFlowContext<TFlow, TInput>|95.5%|83.8%|
 |AsyncResponse.DurableFlowContext<TResponse>|95.5%|83.8%|
 |AsyncResponse.DurableFlowContext<TResult>|95.5%|83.8%|
-|AsyncResponse.DurableFlowExecutor|98.5%|93.1%|
+|AsyncResponse.DurableFlowExecutor|98.5%|95.4%|
 |AsyncResponse.DurableFlowOptions|100%||
 |AsyncResponse.DurableFlowService|100%|100%|
 |AsyncResponse.DurableFlowService<TFlow, TInput>|100%|100%|
@@ -201,7 +202,7 @@
 |AsyncResponse.FlowExecutionLease|96.7%|85.7%|
 |AsyncResponse.FlowStateConcurrency|100%|100%|
 |AsyncResponse.FlowStateJson|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel|96.4%|89%|
+|AsyncResponse.InMemoryAsyncResponseChannel|96.4%|88.6%|
 |AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer<TDeclared<br/>>|100%||
 |AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer<TDeclared<br/>>|100%||
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
@@ -210,7 +211,7 @@
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>|98.1%|90.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel<T>|96.4%|89%|
+|AsyncResponse.InMemoryAsyncResponseChannel<T>|96.4%|88.6%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%||
 |AsyncResponse.InMemoryAsyncResponseWaiter<T>|100%||
 |AsyncResponse.InMemoryFlowStateStore|100%|96.1%|
@@ -312,12 +313,13 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.MongoDB**|**100%**|**100%**|
+|**AsyncResponse.DurableFlows.MongoDB**|**100%**|**98.4%**|
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|100%|100%|
 |AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException|100%||
 |AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions|100%|100%|
 |AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore|100%|100%|
 |AsyncResponse.DurableFlows.MongoDB.MongoFlowStateDocument|100%||
+|AsyncResponse.Internal.MongoOwnershipLedger|100%|83.3%|
 |Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionE<br/>xtensions|100%|100%|
 
 </details>
@@ -345,16 +347,16 @@
 |Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollection<br/>Extensions|100%||
 
 </details>
-<details><summary>AsyncResponse.DurableFlows.PostgreSQL - 88.8%</summary>
+<details><summary>AsyncResponse.DurableFlows.PostgreSQL - 85.2%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.PostgreSQL**|**88.8%**|**76.4%**|
+|**AsyncResponse.DurableFlows.PostgreSQL**|**85.2%**|**68.6%**|
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|100%|100%|
 |AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException|100%||
 |AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions|100%|100%|
-|AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore|97.1%|83.3%|
-|AsyncResponse.Internal.PostgreSqlRelationVerifier|56%|39.5%|
+|AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore|97.2%|83.3%|
+|AsyncResponse.Internal.PostgreSqlRelationVerifier|59.6%|42.5%|
 |Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollec<br/>tionExtensions|100%|100%|
 
 </details>
@@ -386,14 +388,14 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.AzureServiceBus**|**97.7%**|**93%**|
+|**AsyncResponse.Transports.AzureServiceBus**|**97.7%**|**96.5%**|
 |AsyncResponse.Transports.AzureServiceBus.AwaitingAzureServiceBusMessageDisp<br/>atcher|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOption<br/>s|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureCo<br/>ntext|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientAdapter|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientResolver|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusCorrelationIdExtrac<br/>tor|98.4%|98.2%|
-|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|100%|75%|
+|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOptionsValidator|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOutboundMessage|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReceiverAdapter|100%|100%|
@@ -467,13 +469,14 @@
 |Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportService<br/>CollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.MongoDB - 99.3%</summary>
+<details><summary>AsyncResponse.Transports.MongoDB - 99.2%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.MongoDB**|**99.3%**|**98.3%**|
+|**AsyncResponse.Transports.MongoDB**|**99.2%**|**99.2%**|
+|AsyncResponse.Internal.MongoOwnershipLedger|100%|100%|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
-|AsyncResponse.Transports.DbMessageDispatcherBase|97%|100%|
+|AsyncResponse.Transports.DbMessageDispatcherBase|96.8%|100%|
 |AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext|100%||
 |AsyncResponse.Transports.MongoDB.MongoDbCorrelationIdExtractor|100%||
@@ -488,9 +491,9 @@
 |AsyncResponse.Transports.MongoDB.MongoDbTransportRetry|100%|100%|
 |AsyncResponse.Transports.MongoDB.MongoDbTransportStore|100%|98%|
 |AsyncResponse.Transports.MongoDB.MongoDbWorkerSubscriber|100%||
-|AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport|100%|62.5%|
+|AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport|100%|100%|
 |AsyncResponse.Transports.MongoDB.MongoTransportMessageDocument|100%||
-|Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServi<br/>ceCollectionExtensions|100%|100%|
+|Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServi<br/>ceCollectionExtensions|97.9%|93.7%|
 
 </details>
 <details><summary>AsyncResponse.Transports.NATS - 100%</summary>
@@ -517,12 +520,12 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceC<br/>ollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.PostgreSQL - 97.9%</summary>
+<details><summary>AsyncResponse.Transports.PostgreSQL - 97%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.PostgreSQL**|**97.9%**|**95.2%**|
-|AsyncResponse.Internal.PostgreSqlRelationVerifier|92.6%|75%|
+|**AsyncResponse.Transports.PostgreSQL**|**97%**|**90.5%**|
+|AsyncResponse.Internal.PostgreSqlRelationVerifier|89.4%|69.1%|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.DbMessageDispatcherBase|100%|100%|
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions|100%||
@@ -537,7 +540,7 @@
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery|100%||
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry|100%|100%|
-|AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore|95%|97.6%|
+|AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore|95.2%|97.6%|
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerSubscriber|100%||
 |AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport|100%|100%|
 |Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportSe<br/>rviceCollectionExtensions|100%|100%|
@@ -603,7 +606,7 @@
 |:---|---:|---:|
 |**AsyncResponse.Transports.SqlServer**|**99.2%**|**99.1%**|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
-|AsyncResponse.Transports.DbMessageDispatcherBase|97.6%|100%|
+|AsyncResponse.Transports.DbMessageDispatcherBase|97.5%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor|100%||

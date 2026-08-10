@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/10/2026 - 00:58:27
+  Generated on: 08/10/2026 - 01:32:21
   Parser: MultiReport (7x Cobertura)
   Assemblies: 26
-  Classes: 452
-  Files: 203
-  Line coverage: 98.8%
-  Covered lines: 25659
-  Uncovered lines: 294
-  Coverable lines: 25953
-  Total lines: 38733
-  Branch coverage: 95.6% (8989 of 9394)
-  Covered branches: 8989
-  Total branches: 9394
-  Method coverage: 99.8% (2851 of 2855)
-  Full method coverage: 96.2% (2747 of 2855)
-  Covered methods: 2851
-  Fully covered methods: 2747
-  Total methods: 2855
+  Classes: 455
+  Files: 204
+  Line coverage: 98.7%
+  Covered lines: 25981
+  Uncovered lines: 336
+  Coverable lines: 26317
+  Total lines: 39018
+  Branch coverage: 95.2% (9113 of 9570)
+  Covered branches: 9113
+  Total branches: 9570
+  Method coverage: 99.8% (2859 of 2864)
+  Full method coverage: 96% (2752 of 2864)
+  Covered methods: 2859
+  Fully covered methods: 2752
+  Total methods: 2864
 
 AsyncResponse.Abstractions                                                                                            100%
   AsyncResponse.AsyncResponseContext                                                                                  100%
@@ -53,6 +53,7 @@ AsyncResponse.Channels.MongoDB                                                  
   AsyncResponse.Channels.MongoDB.MongoDbChannelStore<TDocument>                                                       100%
   AsyncResponse.Channels.MongoDB.MongoDbRecoveryStateStore                                                            100%
   AsyncResponse.Channels.MongoDB.MongoRecoveryStateDocument                                                           100%
+  AsyncResponse.Internal.MongoOwnershipLedger                                                                         100%
   Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseChannelServiceCollectionExtensions                     100%
 
 AsyncResponse.Channels.NATS                                                                                          99.5%
@@ -69,7 +70,7 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                                       100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions                        100%
 
-AsyncResponse.Channels.PostgreSQL                                                                                    99.4%
+AsyncResponse.Channels.PostgreSQL                                                                                    99.1%
   AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.2%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
@@ -80,7 +81,7 @@ AsyncResponse.Channels.PostgreSQL                                               
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlChannelSql                                                              100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlRecoveryStateStore                                                      100%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  96.3%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                    94%
   Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions                  100%
 
 AsyncResponse.Channels.Redis                                                                                         98.8%
@@ -261,6 +262,7 @@ AsyncResponse.DurableFlows.MongoDB                                              
   AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions                                                        100%
   AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore                                                            100%
   AsyncResponse.DurableFlows.MongoDB.MongoFlowStateDocument                                                           100%
+  AsyncResponse.Internal.MongoOwnershipLedger                                                                         100%
   Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionExtensions                                100%
 
 AsyncResponse.DurableFlows.MySql                                                                                     99.5%
@@ -277,12 +279,12 @@ AsyncResponse.DurableFlows.Oracle                                               
   AsyncResponse.DurableFlows.Oracle.OracleFlowStateStore                                                             98.8%
   Microsoft.Extensions.DependencyInjection.OracleDurableFlowServiceCollectionExtensions                               100%
 
-AsyncResponse.DurableFlows.PostgreSQL                                                                                88.8%
+AsyncResponse.DurableFlows.PostgreSQL                                                                                85.2%
   AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared                                                          100%
   AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException                                                      100%
   AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlDurableFlowOptions                                                  100%
-  AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore                                                     97.1%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                    56%
+  AsyncResponse.DurableFlows.PostgreSQL.PostgreSqlFlowStateStore                                                     97.2%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  59.6%
   Microsoft.Extensions.DependencyInjection.PostgreSqlDurableFlowServiceCollectionExtensions                           100%
 
 AsyncResponse.DurableFlows.Sqlite                                                                                     100%
@@ -369,9 +371,10 @@ AsyncResponse.Transports.Kafka                                                  
   AsyncResponse.Transports.Kafka.QueuedKafkaMessageDispatcher                                                        99.1%
   Microsoft.Extensions.DependencyInjection.KafkaAsyncResponseTransportServiceCollectionExtensions                     100%
 
-AsyncResponse.Transports.MongoDB                                                                                     99.3%
+AsyncResponse.Transports.MongoDB                                                                                     99.2%
+  AsyncResponse.Internal.MongoOwnershipLedger                                                                         100%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
-  AsyncResponse.Transports.DbMessageDispatcherBase                                                                     97%
+  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   96.8%
   AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions                                               100%
   AsyncResponse.Transports.MongoDB.MongoDbBackgroundFailureContext                                                    100%
   AsyncResponse.Transports.MongoDB.MongoDbCorrelationIdExtractor                                                      100%
@@ -388,7 +391,7 @@ AsyncResponse.Transports.MongoDB                                                
   AsyncResponse.Transports.MongoDB.MongoDbWorkerSubscriber                                                            100%
   AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport                                                             100%
   AsyncResponse.Transports.MongoDB.MongoTransportMessageDocument                                                      100%
-  Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions                   100%
+  Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions                  97.9%
 
 AsyncResponse.Transports.NATS                                                                                         100%
   AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions                                                     100%
@@ -409,8 +412,8 @@ AsyncResponse.Transports.NATS                                                   
   AsyncResponse.Transports.NATS.NatsWorkerTransport                                                                   100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseTransportServiceCollectionExtensions                      100%
 
-AsyncResponse.Transports.PostgreSQL                                                                                  97.9%
-  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  92.6%
+AsyncResponse.Transports.PostgreSQL                                                                                    97%
+  AsyncResponse.Internal.PostgreSqlRelationVerifier                                                                  89.4%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
   AsyncResponse.Transports.DbMessageDispatcherBase                                                                    100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlAsyncResponseTransportOptions                                         100%
@@ -425,7 +428,7 @@ AsyncResponse.Transports.PostgreSQL                                             
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportDelivery                                                     100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportOptionsValidator                                             100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportRetry                                                        100%
-  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore                                                         95%
+  AsyncResponse.Transports.PostgreSQL.PostgreSqlTransportStore                                                       95.2%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerSubscriber                                                      100%
   AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport                                                       100%
   Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions                100%
@@ -476,7 +479,7 @@ AsyncResponse.Transports.Redis                                                  
 
 AsyncResponse.Transports.SqlServer                                                                                   99.2%
   AsyncResponse.Transports.DbCorrelationIdExtractor                                                                   100%
-  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   97.6%
+  AsyncResponse.Transports.DbMessageDispatcherBase                                                                   97.5%
   AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions                                           100%
   AsyncResponse.Transports.SqlServer.SqlServerBackgroundFailureContext                                                100%
   AsyncResponse.Transports.SqlServer.SqlServerCorrelationIdExtractor                                                  100%

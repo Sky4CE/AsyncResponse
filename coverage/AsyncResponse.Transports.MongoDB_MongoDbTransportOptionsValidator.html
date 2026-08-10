@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="62">62</td>
+<td class="limit-width right" title="65">65</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="62">62</td>
+<td class="limit-width right" title="65">65</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="110">110</td>
+<td class="limit-width right" title="113">113</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="62 of 62">100%</td>
+<td class="limit-width right" title="65 of 65">100%</td>
 </tr>
 </table>
 </div>
@@ -71,15 +71,15 @@
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="40">40</td>
+<td class="limit-width right" title="42">42</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="40">40</td>
+<td class="limit-width right" title="42">42</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="40 of 40">100%</td>
+<td class="limit-width right" title="42 of 42">100%</td>
 </tr>
 </table>
 </div>
@@ -111,7 +111,7 @@
 <tr><td title="ValidateSubscriber(AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions, AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions, string)"><a href="#file0_line52" class="navigatetohash">ValidateSubscriber(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
 <tr><td title="ValidateSubscriber(AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions, string)"><a href="#file0_line69" class="navigatetohash">ValidateSubscriber(...)</a></td><td>100%</td><td>12</td><td>12</td><td>100%</td></tr>
 <tr><td title="Required(string, string)"><a href="#file0_line96" class="navigatetohash">Required(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title="ValidateCollectionName(string, string)"><a href="#file0_line102" class="navigatetohash">ValidateCollectionName(...)</a></td><td>100%</td><td>10</td><td>10</td><td>100%</td></tr>
+<tr><td title="ValidateCollectionName(string, string)"><a href="#file0_line102" class="navigatetohash">ValidateCollectionName(...)</a></td><td>100%</td><td>12</td><td>12</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -228,13 +228,16 @@
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line105"></a><code>105</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;||&nbsp;value.StartsWith(&quot;system.&quot;,&nbsp;StringComparison.Ordinal)&nbsp;||&nbsp;value.Contains(&quot;.system.&quot;,&nbsp;StringComparison.Ordi</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line106"></a><code>106</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line107"></a><code>107</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(MongoDbAsyncResponseTransportOptions)}.{name}&nbsp;&#39;{value}&#39;&nbsp;must&nbsp;be&nbsp;a&nbsp;valid&nbsp;MongoDB&nbsp;collection&nbsp;nam</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line108"></a><code>108</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line109"></a><code>109</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line110"></a><code>110</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line108"></a><code>108</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(string.Equals(value,&nbsp;AsyncResponse.Internal.MongoOwnershipLedger.CollectionName,&nbsp;StringComparison.Ordinal))</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line109"></a><code>109</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw&nbsp;new&nbsp;InvalidOperationException(</code></td></tr>
+<tr class="coverableline" title="Covered (1 visits)" data-coverage="{'AllTestMethods': {'VC': '1', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1</td><td class="rightmargin right"><a id="file0_line110"></a><code>110</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;{nameof(MongoDbAsyncResponseTransportOptions)}.{name}&nbsp;&#39;{value}&#39;&nbsp;is&nbsp;reserved&nbsp;for&nbsp;the&nbsp;cross-component&nbsp;ow</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line111"></a><code>111</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line112"></a><code>112</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line113"></a><code>113</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 00:58:26<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 01:32:20<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
