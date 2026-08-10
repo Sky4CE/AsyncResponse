@@ -7,6 +7,7 @@ using MongoDB.Driver;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
+using AsyncResponse.Internal;
 
 namespace AsyncResponse.Transports.MongoDB;
 
@@ -43,6 +44,7 @@ internal sealed class MongoDbTransportStore : IDisposable
     private readonly IMongoClient? _ownedClient;
     private bool _created;
     private long _lastDeadLetterPruneTicks;
+    private readonly IMongoDatabase _database;
 
     public MongoDbTransportStore(
         IMongoDatabase database,
@@ -67,11 +69,13 @@ internal sealed class MongoDbTransportStore : IDisposable
         // at the first server operation.
         var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.MessageCollection}";
         var byteLength = Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 255)
+        if (byteLength > 235)
             throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({nameof(_options.MessageCollection)}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
-                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
+                $"The MongoDB namespace '{ns}' ({nameof(_options.MessageCollection)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
 
+        _database = database;
         _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
         _ownedClient = ownedClient;
     }
@@ -86,6 +90,13 @@ internal sealed class MongoDbTransportStore : IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership: see MongoOwnershipLedger.
+            await MongoOwnershipLedger.ClaimAsync(
+                _database,
+                "MongoDB transport",
+                [(_options.MessageCollection, nameof(_options.MessageCollection))],
+                cancellationToken).ConfigureAwait(false);
 
             await _messages.Indexes.CreateOneAsync(
                 new CreateIndexModel<MongoTransportMessageDocument>(

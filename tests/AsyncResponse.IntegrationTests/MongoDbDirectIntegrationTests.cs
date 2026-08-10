@@ -503,6 +503,45 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
             Assert.Equal(expectedRemoteStack, exception.Data["RemoteStackTrace"]);
     }
 
+    [Fact]
+    public async Task PersistedOwnershipLedger_FailsCrossComponentCollisions_AcrossIndependentStores()
+    {
+        // The in-container registry cannot see other hosts or directly constructed stores; the
+        // persisted ledger must. Two INDEPENDENT store instances on one database stand in for
+        // two processes — a flow store configured onto the channel's derived counters collection
+        // (whose TTL index would silently delete the ack-sequence counter) must fail its first
+        // use, in either startup order.
+        var (database, channelOptions) = NewChannelDatabase("ledger_a");
+        channelOptions.MessageCollection = "jobs";
+        using (var channel = new MongoDbChannelStore(database, Options.Create(channelOptions)))
+        {
+            await channel.EnsureCreatedAsync();
+
+            using var flowStore = new AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore(
+                database,
+                Options.Create(new AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions { CollectionName = "jobs_counters" }));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => flowStore.TryCreateAsync("flow", new FlowState { FlowId = "flow" }, TimeSpan.FromMinutes(1)));
+            Assert.Contains("MongoDB channel", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+
+        // Reverse order on a fresh database: the flow store claims first, the channel fails.
+        var (reversed, reversedChannelOptions) = NewChannelDatabase("ledger_b");
+        reversedChannelOptions.MessageCollection = "jobs";
+        using (var flowFirst = new AsyncResponse.DurableFlows.MongoDB.MongoDbFlowStateStore(
+            reversed,
+            Options.Create(new AsyncResponse.DurableFlows.MongoDB.MongoDbDurableFlowOptions { CollectionName = "jobs_counters" })))
+        {
+            Assert.True(await flowFirst.TryCreateAsync("flow", new FlowState { FlowId = "flow" }, TimeSpan.FromMinutes(1)));
+
+            using var channel = new MongoDbChannelStore(reversed, Options.Create(reversedChannelOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("MongoDB durable-flow store", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
     private (IMongoDatabase Database, MongoDbAsyncResponseChannelOptions Options) NewChannelDatabase(string prefix)
     {
         var database = _client.GetDatabase(NewDatabaseName(prefix));

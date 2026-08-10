@@ -1,6 +1,7 @@
 using AsyncResponse;
 using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.MongoDB;
+using AsyncResponse.Internal;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
@@ -87,6 +88,9 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
             || CollectionName.StartsWith("system.", StringComparison.Ordinal) || CollectionName.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+        if (string.Equals(CollectionName, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' is reserved for the cross-component ownership ledger.");
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -135,10 +139,11 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // at the first server operation.
         var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.CollectionName}";
         var byteLength = System.Text.Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 255)
+        if (byteLength > 235)
             throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({nameof(_options.CollectionName)}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
-                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
+                $"The MongoDB namespace '{ns}' ({nameof(_options.CollectionName)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
 
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
         _ownedClient = ownedClient;
@@ -269,6 +274,15 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership: a flow store configured onto the channel's derived
+            // counters collection would let this TTL index silently delete the ack-sequence
+            // counter — see MongoOwnershipLedger.
+            await MongoOwnershipLedger.ClaimAsync(
+                _database,
+                "MongoDB durable-flow store",
+                [(_options.CollectionName, nameof(_options.CollectionName))],
+                cancellationToken).ConfigureAwait(false);
 
             // A TTL index (expireAfterSeconds = 0 on the expiry timestamp) makes MongoDB itself
             // reap expired ledgers — no application-side pruning needed. Loads still filter on

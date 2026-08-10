@@ -4,6 +4,7 @@ using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
 using System.Text;
+using AsyncResponse.Internal;
 
 namespace AsyncResponse.Channels.MongoDB;
 
@@ -81,6 +82,20 @@ internal sealed class MongoDbChannelStore : IDisposable
         {
             if (_created)
                 return;
+
+            // Persisted cross-host ownership: the in-container registry cannot see other hosts
+            // or directly constructed stores, so claim the effective collections here — before
+            // any index DDL — and fail startup when another component already owns one.
+            await MongoOwnershipLedger.ClaimAsync(
+                _database,
+                "MongoDB channel",
+                [
+                    (_options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection)),
+                    (_options.MessageCollection, nameof(_options.MessageCollection)),
+                    (_options.SubscriberCollection, nameof(_options.SubscriberCollection)),
+                    (CountersCollectionName(_options.MessageCollection), "derived ack-counter collection"),
+                ],
+                cancellationToken).ConfigureAwait(false);
 
             // TTL indexes (expireAfterSeconds = 0 on the expiry timestamp) make MongoDB itself reap
             // expired documents — no application-side pruning needed. Reads still filter on the
@@ -608,6 +623,9 @@ internal sealed class MongoDbChannelStore : IDisposable
             || value.StartsWith("system.", StringComparison.Ordinal) || value.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+        if (string.Equals(value, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' is reserved for the cross-component ownership ledger.");
     }
 
     /// <summary>
@@ -619,10 +637,11 @@ internal sealed class MongoDbChannelStore : IDisposable
     {
         var ns = $"{database.DatabaseNamespace.DatabaseName}.{collectionName}";
         var byteLength = Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 255)
+        if (byteLength > 235)
             throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({description}) is {byteLength} UTF-8 bytes; MongoDB limits namespaces " +
-                "(database + '.' + collection) to 255 bytes, and sharded collections to 235. Shorten the database or collection name.");
+                $"The MongoDB namespace '{ns}' ({description}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
+                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
+                "Shorten the database or collection name.");
     }
 
     /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>

@@ -293,7 +293,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             {
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.WrongObjectType)
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
             {
                 // E.g. CREATE INDEX ... ON a name that is really another component's index:
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
@@ -313,7 +313,16 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                 _options.SchemaName,
                 "durable-flow",
                 [
-                    new(_options.TableName, 'r'),
+                    new(_options.TableName, 'r', Columns:
+                        [
+                            new("flow_id", "text", Nullable: false),
+                            new("state_json", "jsonb", Nullable: false),
+                            new("expires_at_utc", "timestamp with time zone", Nullable: false),
+                            new("updated_at_utc", "timestamp with time zone", Nullable: false),
+                            new("revision", "bigint", Nullable: false, HasDefault: true),
+                            new("lease_id", "text", Nullable: true),
+                            new("lease_expires_at_utc", "timestamp with time zone", Nullable: true),
+                        ], PrimaryKey: ["flow_id"]),
                     new(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63), 'i', _options.TableName, ["expires_at_utc"]),
                 ],
                 cancellationToken).ConfigureAwait(false);

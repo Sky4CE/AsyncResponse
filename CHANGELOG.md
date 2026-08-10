@@ -148,17 +148,20 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
-- **The database transports' per-delivery dispatch cost is back to baseline (~10× regression
-  fixed — PostgreSQL, SQL Server, MongoDB).** The claim-lease heartbeat introduced with the
-  July hardening spun up its renewal machinery eagerly for EVERY delivery and tore it down with
-  a thrown-and-caught `TaskCanceledException` per message — ~6.5 µs and 1.3 KB on a dispatch
-  path that otherwise costs ~750 ns. The heartbeat is now armed only when the handler is
-  actually still running (a synchronously completed handler cannot outlive its lease), and its
-  beat observes cancellation without throwing. Slow handlers keep the exact same renewal
-  cadence, fencing, and lease-lost semantics — pinned by the existing renewal-retry facts plus a
-  new fact proving a synchronous handler acks with zero renewal activity. Locally measured
-  237 ns / 96 B per dispatch, versus 3,465 ns / 1,392 B before the fix and 217 ns / 88 B at the
-  pre-regression baseline.
+- **The database transports' per-delivery dispatch cost dropped ~3.4× (PostgreSQL, SQL Server,
+  MongoDB) — without weakening lease protection.** The claim-lease heartbeat introduced with
+  the July hardening tore down its renewal machinery with a thrown-and-caught
+  `TaskCanceledException` per message — ~6.5 µs and 1.3 KB on a dispatch path that otherwise
+  costs well under a microsecond. The beat now observes cancellation exception-free
+  (`ConfigureAwaitOptions.SuppressThrowing`). The heartbeat is still armed BEFORE any user code
+  runs: a handler can burn its entire lease synchronously (CPU work or blocking I/O before its
+  first await), and only an already-armed beat — firing on a timer thread — renews under a
+  blocked handler thread. (A briefly considered lazily-armed variant was withdrawn as unsound
+  for exactly that case and is pinned against by a fact whose handler blocks its thread until
+  it OBSERVES a renewal.) Renewal cadence, fencing, and lease-lost semantics are unchanged.
+  Locally measured ~1.0 µs / 888 B per dispatch, versus 3,465 ns / 1,392 B before the fix and
+  217 ns / 88 B at the pre-heartbeat baseline — the residual is the price of arming sound lease
+  protection per delivery, negligible beside the database claim round-trip itself.
 - **The in-memory channel's wire-parity materialization dropped its string detour.** The
   per-waiter materialization introduced with the aliasing fix serialized to a UTF-16 string and
   deserialized back through the reflection conversion path; it now serializes once per publish
@@ -176,16 +179,23 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   table occupying the transport's derived claim-index name (or vice versa) let
   `CREATE ... IF NOT EXISTS` — which matches ANY relation in the shared namespace — silently
   skip the DDL, leaving a missing index or a "table" that was really someone else's index.
-  After its DDL, each store now checks `pg_class`/`pg_index` (in the same transaction, under
-  the shared advisory DDL lock) that every expected name resolves to the expected relation kind
-  and, for indexes, the expected owning table **and definition** — key columns in order,
-  non-unique, non-partial, btree, valid and ready — and that the ack sequence is `bigint`
-  (`CREATE ... IF NOT EXISTS` explicitly guarantees nothing about an existing object's shape;
-  a same-name index over the wrong columns silently starved the claim query, and an integer
-  sequence would overflow). Failing is actionable on whichever component starts second,
-  regardless of startup order. The verifier is one source-linked file compiled into all three
-  packages. Pinned by integration tests running the cross-component collision in both orders
-  and the wrong-definition/wrong-sequence-type cases on a real server.
+  After its DDL, each store now checks `pg_class`/`pg_index`/`pg_attribute`/`pg_sequence` (in
+  the same transaction, under the shared advisory DDL lock) that every expected name resolves
+  to the expected relation kind **and shape** — tables verified column by column (name, type,
+  nullability, DDL-declared defaults) with the expected primary key; indexes verified to sit on
+  the expected table as plain, non-unique, non-partial, valid-and-ready btrees over exactly the
+  expected key columns in order; the ack sequence verified as the required cross-process
+  monotonic clock (`bigint`, `INCREMENT 1`, `CACHE 1` — a larger cache hands sessions private
+  blocks and breaks cross-session ordering — `NO CYCLE`, full positive range); everything
+  verified permanent (not UNLOGGED/temporary). `CREATE ... IF NOT EXISTS` explicitly guarantees
+  none of this about an existing object. A same-KIND collision that breaks the dependent index
+  DDL itself (`column ... does not exist`, SQLSTATE 42703) is translated into the same
+  actionable collision error instead of a raw column error. Failing is actionable on whichever
+  component starts second, regardless of startup order. The verifier is one source-linked file
+  compiled into all three packages. Pinned by integration tests running cross-component
+  collisions (different-kind and same-kind, both orders), a crafted table that satisfies the
+  index DDL but lacks operational columns, the wrong-index-definition case, and the
+  integer/descending-sequence cases on a real server.
 - **RabbitMQ rejects non-positive `NetworkRecoveryInterval` instead of breaking automatic
   recovery.** The value is copied verbatim into the client's `ConnectionFactory`, whose
   recovery loop uses it directly as a `Task.Delay`: a negative interval faulted — and
@@ -206,7 +216,15 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   included — in a container-scoped ownership ledger keyed by cluster + database: a durable-flow
   store configured onto the channel's derived `{MessageCollection}_counters` collection (whose
   TTL index would silently delete the ack-sequence counter) now fails startup in either
-  construction order, naming both claimants.
+  construction order, naming both claimants. Because that in-memory ledger ends at the
+  container boundary, every store also claims its collections in a PERSISTED ledger — one
+  atomic upsert per collection into the reserved `asyncresponse_ownership` collection at first
+  use — so two independent hosts (or a directly constructed store) sharing a database fail the
+  same way, in either startup order; restarts re-claim idempotently, deployments that disable
+  auto-creation own their provisioning and skip the ledger, and the error text covers removing
+  a stale claim after a deliberate reconfiguration. The namespace byte limit is now enforced at
+  MongoDB's SHARDED bound (235 bytes, was 255): a 236–255-byte namespace is only valid while
+  the collection stays unsharded, and a later shard-enable would strand it.
 - **Derived index names now reserve suffix space at the identifier caps, and the full
   object-name plan is validated (PostgreSQL, SQL Server — channels and transports).** The
   generated index names truncated as a whole, so a maximum-length table name derived its own

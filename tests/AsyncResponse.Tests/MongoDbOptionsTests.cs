@@ -103,38 +103,44 @@ public sealed class MongoDbOptionsTests
     [Fact]
     public void Stores_RejectEffectiveNamespacesOverTheByteLimit_AtConstruction()
     {
-        // The 255-byte namespace limit spans "database.collection", so only the store — which
-        // knows the actual database name — can enforce it. MongoClient/GetDatabase are lazy, so
-        // no server is needed. db "tests" (5 bytes) + "." + N-byte collection = N + 6 bytes.
+        // The namespace limit spans "database.collection", so only the store — which knows the
+        // actual database name — can enforce it. The stores enforce the SHARDED limit (235
+        // bytes) conservatively: 255 is only valid while the collection stays unsharded, and a
+        // later shard-enable would strand a 236..255-byte namespace. MongoClient/GetDatabase are
+        // lazy, so no server is needed. db "tests" (5 bytes) + "." + N-byte collection = N + 6.
         var database = new MongoClient("mongodb://localhost:27017").GetDatabase("tests");
 
-        // 250-char collection: 256-byte namespace — over the limit outright.
+        // 230-char collection: 236-byte namespace — one byte over the sharded limit.
         var direct = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
             database,
-            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 250) })));
-        Assert.Contains("255 bytes", direct.Message, StringComparison.Ordinal);
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 230) })));
+        Assert.Contains("235 bytes", direct.Message, StringComparison.Ordinal);
 
-        // 245-char collection: its own namespace fits (251 bytes) but the DERIVED "_counters"
-        // namespace is 260 bytes — the gap static validation could never see.
+        // 225-char collection: its own namespace fits (231 bytes) but the DERIVED "_counters"
+        // namespace is 240 bytes — the gap static validation could never see.
         var derived = Assert.Throws<InvalidOperationException>(() => new MongoDbChannelStore(
             database,
-            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 245) })));
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 225) })));
         Assert.Contains("ack-counter", derived.Message, StringComparison.Ordinal);
 
         var transport = Assert.Throws<InvalidOperationException>(() => new MongoDbTransportStore(
             database,
-            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('m', 250) })));
-        Assert.Contains("255 bytes", transport.Message, StringComparison.Ordinal);
+            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('m', 230) })));
+        Assert.Contains("235 bytes", transport.Message, StringComparison.Ordinal);
 
         var flow = Assert.Throws<InvalidOperationException>(() => new MongoDbFlowStateStore(
             database,
-            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 250) })));
-        Assert.Contains("255 bytes", flow.Message, StringComparison.Ordinal);
+            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 230) })));
+        Assert.Contains("235 bytes", flow.Message, StringComparison.Ordinal);
 
-        // At the boundary everything constructs: 240 + 6 + 9 ("_counters") = 255 exactly.
+        // At the boundary (235 exactly) everything constructs: 220 + 6 + 9 ("_counters") = 235
+        // for the channel's derived counters namespace, and 229 + 6 = 235 for the flow store.
         using var atLimit = new MongoDbChannelStore(
             database,
-            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 240) }));
+            Options.Create(new MongoDbAsyncResponseChannelOptions { MessageCollection = new string('m', 220) }));
+        using var flowAtLimit = new MongoDbFlowStateStore(
+            database,
+            Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 229) }));
     }
 
     [Fact]

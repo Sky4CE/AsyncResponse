@@ -160,7 +160,95 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
 
             var second = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
-            Assert.Contains("to be bigint", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("expected bigint", ex.Message, StringComparison.Ordinal);
+        });
+
+        // A bigint sequence is still not necessarily a monotonic cross-process clock: a
+        // descending increment counts down, CYCLE wraps, and CACHE > 1 hands sessions private
+        // blocks. All were accepted before; the property check pins them.
+        await WithDataSourceAsync("wrong_seq_props", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var creator = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await creator.EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    DROP SEQUENCE {creator.AckSequence};
+                    CREATE SEQUENCE {creator.AckSequence} AS bigint INCREMENT -1 START -1;
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var second = new PostgreSqlChannelSql(dataSource, Options.Create(ChannelOptions(schema)));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => second.EnsureCreatedAsync());
+            Assert.Contains("INCREMENT -1", ex.Message, StringComparison.Ordinal);
+        });
+
+        // A crafted same-kind table that satisfies the index DDL (indexed columns present) but
+        // lacks operational columns previously passed verification and failed at first insert.
+        await WithDataSourceAsync("crafted_table", async (schema, dataSource) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var craft = connection.CreateCommand())
+            {
+                craft.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS "{schema}";
+                    CREATE TABLE "{schema}"."jobs" (
+                        id uuid PRIMARY KEY,
+                        queue text NOT NULL,
+                        available_at timestamptz NOT NULL DEFAULT now(),
+                        locked_until timestamptz NULL,
+                        created_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """;
+                await craft.ExecuteNonQueryAsync();
+            }
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Contains("missing the column 'payload_json'", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task SharedSchema_SameKindTableCollisions_FailActionablyInBothOrders()
+    {
+        // A channel recovery table occupying the transport's table name is the same RELATION
+        // KIND, so the kind check alone accepted it; the dependent index DDL then failed with a
+        // raw "column does not exist". Both directions must produce the actionable collision
+        // error instead.
+        await WithDataSourceAsync("same_kind_a", async (schema, dataSource) =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            await channel.EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = channelOptions.RecoveryStateTable;
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
+            Assert.Contains("occupied by an object of a different kind or shape", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithDataSourceAsync("same_kind_b", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            var transport = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await transport.EnsureCreatedAsync();
+
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.RecoveryStateTable = "jobs";
+            var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("occupied by an object of a different kind or shape", ex.Message, StringComparison.Ordinal);
         });
     }
 

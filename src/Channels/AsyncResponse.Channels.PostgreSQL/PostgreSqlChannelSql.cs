@@ -148,7 +148,7 @@ internal sealed class PostgreSqlChannelSql
             {
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.WrongObjectType)
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
             {
                 // E.g. CREATE INDEX ... ON a name that is really another component's index:
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
@@ -169,9 +169,32 @@ internal sealed class PostgreSqlChannelSql
                 _options.SchemaName,
                 "channel",
                 [
-                    new(_options.RecoveryStateTable, 'r'),
-                    new(_options.MessageTable, 'r'),
-                    new(_options.SubscriberTable, 'r'),
+                    new(_options.RecoveryStateTable, 'r', Columns:
+                        [
+                            new("correlation_id", "text", Nullable: false),
+                            new("registration_id", "uuid", Nullable: false),
+                            new("state_json", "jsonb", Nullable: false),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                            new("registered_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                        ], PrimaryKey: ["correlation_id", "registration_id"]),
+                    new(_options.MessageTable, 'r', Columns:
+                        [
+                            new("id", "uuid", Nullable: false),
+                            new("correlation_id", "text", Nullable: false),
+                            new("envelope_json", "jsonb", Nullable: false),
+                            new("created_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                            new("acked_at", "timestamp with time zone", Nullable: true),
+                            new("acked_seq", "bigint", Nullable: true),
+                            new("recovery_claimed", "boolean", Nullable: false, HasDefault: true),
+                        ], PrimaryKey: ["id"]),
+                    new(_options.SubscriberTable, 'r', Columns:
+                        [
+                            new("correlation_id", "text", Nullable: false),
+                            new("registration_id", "uuid", Nullable: false),
+                            new("instance_id", "text", Nullable: false),
+                            new("expires_at", "timestamp with time zone", Nullable: false),
+                        ], PrimaryKey: ["correlation_id", "registration_id"]),
                     new(AckSequenceName, 'S'),
                     new(IndexName(_options.RecoveryStateTable, "expires"), 'i', _options.RecoveryStateTable, ["expires_at"]),
                     new(IndexName(_options.MessageTable, "correlation_created"), 'i', _options.MessageTable, ["correlation_id", "created_at"]),

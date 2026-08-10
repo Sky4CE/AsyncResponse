@@ -34,18 +34,23 @@ internal static class MongoTestCounters
     /// <summary>Registers the counters collection on a database mock, matching any collection name.</summary>
     public static Mock<IMongoDatabase> WithCounters(this Mock<IMongoDatabase> database)
     {
+        // After WithTestNamespace so this counters collection overrides its generic
+        // BsonDocument catch-all (Moq: the last matching setup wins).
+        database.WithTestNamespace();
         database
             .Setup(d => d.GetCollection<BsonDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
             .Returns(Collection());
-        return database.WithTestNamespace();
+        return database;
     }
 
     /// <summary>
-    /// Gives a database mock a real <see cref="DatabaseNamespace"/> and a client with cluster
-    /// settings: the stores validate the effective "database.collection" namespace byte length
-    /// at construction, and DI-hosted stores additionally derive a cluster key from
-    /// <c>Client.Settings.Servers</c> for the cross-component ownership ledger — a loose mock
-    /// NREs on either before any operation runs. Tests that need their own client re-setup
+    /// Gives a database mock a real <see cref="DatabaseNamespace"/>, a client with cluster
+    /// settings, and a generic BsonDocument collection: the stores validate the effective
+    /// namespace byte length at construction, DI-hosted stores derive a cluster key from
+    /// <c>Client.Settings.Servers</c>, and EnsureCreated upserts into the persisted ownership
+    /// ledger — a loose mock NREs on any of these before the behavior under test runs. The
+    /// generic collection answers the ledger upsert with a document carrying no ownership
+    /// fields, which the ledger treats as unowned. Tests that need their own client re-setup
     /// <c>Client</c> afterwards (last setup wins).
     /// </summary>
     public static Mock<IMongoDatabase> WithTestNamespace(this Mock<IMongoDatabase> database, string name = "tests")
@@ -54,6 +59,9 @@ internal static class MongoTestCounters
         var client = new Mock<IMongoClient>();
         client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
         database.SetupGet(d => d.Client).Returns(client.Object);
+        database
+            .Setup(d => d.GetCollection<BsonDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(Collection());
         return database;
     }
 }

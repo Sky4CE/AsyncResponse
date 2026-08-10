@@ -322,6 +322,15 @@ on a standalone server both degrade gracefully to interval polling. The channel 
 envelopes, recovery registrations, and waiter heartbeats in TTL-indexed collections, so MongoDB
 itself reaps expired documents — there is no application-side pruning.
 
+Every MongoDB store (channel, transport, durable flows) also claims its effective collections —
+derived ones such as the channel's `{MessageCollection}_counters` included — in a small reserved
+`asyncresponse_ownership` collection at first use: one tiny document per collection, so two
+components (in the same process or different hosts) misconfigured onto the same collection fail
+startup with an error naming both claimants instead of silently corrupting each other's data.
+Deployments that disable auto-creation own their provisioning and skip the ledger. Effective
+namespaces (`database.collection`, UTF-8 bytes) are validated against MongoDB's sharded limit
+(235 bytes) at store construction.
+
 ### Redis-compatible servers
 
 The Redis channel (`AsyncResponse.Channels.Redis`) and Redis Streams transport

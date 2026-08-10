@@ -105,6 +105,9 @@ internal static class MongoDbTransportOptionsValidator
             || value.StartsWith("system.", StringComparison.Ordinal) || value.Contains(".system.", StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} '{value}' must be a valid MongoDB collection name (no '$' or NUL characters, not in or containing the reserved system namespace).");
+        if (string.Equals(value, AsyncResponse.Internal.MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseTransportOptions)}.{name} '{value}' is reserved for the cross-component ownership ledger.");
     }
 
 }

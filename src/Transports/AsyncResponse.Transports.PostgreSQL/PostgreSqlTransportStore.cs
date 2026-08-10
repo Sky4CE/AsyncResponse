@@ -115,7 +115,7 @@ internal sealed class PostgreSqlTransportStore
             {
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.WrongObjectType)
+            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
             {
                 // E.g. CREATE INDEX ... ON a name that is really another component's index:
                 // IF NOT EXISTS skipped the table create, and the dependent statement then hits
@@ -135,7 +135,19 @@ internal sealed class PostgreSqlTransportStore
                 _options.SchemaName,
                 "transport",
                 [
-                    new(_options.MessageTable, 'r'),
+                    new(_options.MessageTable, 'r', Columns:
+                        [
+                            new("id", "uuid", Nullable: false),
+                            new("queue", "text", Nullable: false),
+                            new("payload_json", "jsonb", Nullable: false),
+                            new("headers_json", "jsonb", Nullable: false, HasDefault: true),
+                            new("created_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                            new("available_at", "timestamp with time zone", Nullable: false, HasDefault: true),
+                            new("locked_until", "timestamp with time zone", Nullable: true),
+                            new("lock_id", "uuid", Nullable: true),
+                            new("attempts", "integer", Nullable: false, HasDefault: true),
+                            new("dead_letter_reason", "text", Nullable: true),
+                        ], PrimaryKey: ["id"]),
                     new(IndexName(_options.MessageTable, "claim"), 'i', _options.MessageTable, ["queue", "available_at", "locked_until", "created_at"]),
                     new(IndexName(_options.MessageTable, "created"), 'i', _options.MessageTable, ["created_at"]),
                 ],

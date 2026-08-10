@@ -101,28 +101,22 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         {
             // While the handler runs, a fenced heartbeat keeps extending the claim's lease at
             // LockTimeout/2 cadence so a slow handler does not let the lock lapse and a competing
-            // subscriber re-claim (and duplicate-process) the queue item. The heartbeat is armed
-            // only when the handler is actually still running: a synchronously completed handler
-            // (fast no-await paths) cannot outlive its lease, and eagerly spinning up the
-            // renewal machinery per delivery cost ~10× the rest of the dispatch path.
-            var handlerTask = ExecuteHandlerAsync(delivery, cancellationToken);
-            if (handlerTask.IsCompleted)
+            // subscriber re-claim (and duplicate-process) the queue item. The heartbeat MUST be
+            // armed before any user code runs: a handler can burn its lease entirely
+            // synchronously (CPU work or blocking I/O before its first await), and only an
+            // already-armed beat — firing on a timer thread — renews under a blocked handler
+            // thread. Teardown is exception-free (SuppressThrowing beat), so the always-armed
+            // loop costs allocations per delivery, not a thrown TaskCanceledException.
+            using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
+            try
             {
-                await handlerTask.ConfigureAwait(false);
+                await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
-            else
+            finally
             {
-                using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
-                try
-                {
-                    await handlerTask.ConfigureAwait(false);
-                }
-                finally
-                {
-                    renewalCancellation.Cancel();
-                    await renewalTask.ConfigureAwait(false);
-                }
+                renewalCancellation.Cancel();
+                await renewalTask.ConfigureAwait(false);
             }
 
             await delivery.AckAsync().ConfigureAwait(false);
@@ -142,11 +136,10 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             {
                 // Exception-free beat: the loop is cancelled once per delivery when the handler
                 // finishes, and a thrown-and-caught TaskCanceledException per message dominated
-                // the dispatch cost. WhenAny observes the cancelled delay without throwing;
-                // cancellation still disarms the underlying timer immediately.
-                var beat = Task.Delay(interval, cancellationToken);
-                await Task.WhenAny(beat).ConfigureAwait(false);
-                if (beat.IsCanceled)
+                // the dispatch cost. SuppressThrowing observes the cancelled delay without
+                // throwing; cancellation still disarms the underlying timer immediately.
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                if (cancellationToken.IsCancellationRequested)
                     return; // The handler finished or the subscriber is stopping.
 
                 bool renewed;
