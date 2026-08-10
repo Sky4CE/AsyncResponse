@@ -1,21 +1,21 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/10/2026 - 01:32:21
-  Parser: MultiReport (7x Cobertura)
+  Generated on: 08/10/2026 - 10:18:56
+  Parser: MultiReport (16x Cobertura)
   Assemblies: 26
   Classes: 455
   Files: 204
   Line coverage: 98.7%
-  Covered lines: 25981
-  Uncovered lines: 336
+  Covered lines: 25991
+  Uncovered lines: 326
   Coverable lines: 26317
   Total lines: 39018
   Branch coverage: 95.2% (9113 of 9570)
   Covered branches: 9113
   Total branches: 9570
   Method coverage: 99.8% (2859 of 2864)
-  Full method coverage: 96% (2752 of 2864)
+  Full method coverage: 96.1% (2755 of 2864)
   Covered methods: 2859
-  Fully covered methods: 2752
+  Fully covered methods: 2755
   Total methods: 2864
 
 AsyncResponse.Abstractions                                                                                            100%
@@ -70,12 +70,12 @@ AsyncResponse.Channels.NATS                                                     
   AsyncResponse.Channels.NATS.NatsSubjectSchema                                                                       100%
   Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCollectionExtensions                        100%
 
-AsyncResponse.Channels.PostgreSQL                                                                                    99.1%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.2%
+AsyncResponse.Channels.PostgreSQL                                                                                    99.2%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase                                                                  99.3%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>                                                 100%
   AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation                                               100%
-  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.2%
+  AsyncResponse.Channels.DbAsyncResponseChannelBase<T>                                                               99.3%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel                                                    100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions                                             100%
   AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>                                                  100%
@@ -433,7 +433,7 @@ AsyncResponse.Transports.PostgreSQL                                             
   AsyncResponse.Transports.PostgreSQL.PostgreSqlWorkerTransport                                                       100%
   Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseTransportServiceCollectionExtensions                100%
 
-AsyncResponse.Transports.RabbitMQ                                                                                    98.8%
+AsyncResponse.Transports.RabbitMQ                                                                                     100%
   AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher                                                 100%
   AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher                                                   100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions                                                      100%
@@ -449,7 +449,7 @@ AsyncResponse.Transports.RabbitMQ                                               
   AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetProvider                                                       100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqResponseIngressSubscriber                                                 100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions                                                         100%
-  AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberService                                                        87.8%
+  AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberService                                                         100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqTopology                                                                  100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerSubscriber                                                          100%
   AsyncResponse.Transports.RabbitMQ.RabbitMqWorkerTransport                                                           100%
