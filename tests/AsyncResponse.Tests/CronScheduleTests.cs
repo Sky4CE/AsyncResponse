@@ -110,12 +110,23 @@ public class CronScheduleTests
     }
 
     [Fact]
-    public void StepInDayOfMonth_KeepsVixieOrSemantics()
+    public void StarStepInDayOfMonth_AndsWithRestrictedDayOfWeek()
     {
-        // Odd days OR Fridays. From Jan 1 (odd, but past 00:00) the next is Jan 3 (odd), and from
-        // Jan 3 the next is Jan 4 — a Friday that is an even day.
-        Assert.Equal(Utc(2030, 1, 3, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 1, 0, 0)));
-        Assert.Equal(Utc(2030, 1, 4, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 3, 0, 0)));
+        // Vixie's star rule: "*/2" starts with '*', so it stays OUT of the dom/dow either-or and
+        // both masks must match (crontab(5): odd days AND Friday). Jan 2030 Fridays fall on the
+        // 4th, 11th, 18th and 25th; the odd ones are the 11th and 25th.
+        Assert.Equal(Utc(2030, 1, 11, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 25, 0, 0), Next("0 0 */2 * FRI", Utc(2030, 1, 11, 0, 0)));
+    }
+
+    [Fact]
+    public void ExplicitRangeStepInDayOfMonth_KeepsVixieOrSemantics()
+    {
+        // "1-31/2" does not start with '*', so both day fields are explicitly restricted and the
+        // classic either-or applies: odd days OR Fridays. From Jan 1 (odd, but past 00:00) the
+        // next is Jan 3 (odd), and from Jan 3 the next is Jan 4 — a Friday that is an even day.
+        Assert.Equal(Utc(2030, 1, 3, 0, 0), Next("0 0 1-31/2 * FRI", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 4, 0, 0), Next("0 0 1-31/2 * FRI", Utc(2030, 1, 3, 0, 0)));
     }
 
     [Fact]

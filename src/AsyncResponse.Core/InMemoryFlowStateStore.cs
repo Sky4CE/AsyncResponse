@@ -155,10 +155,18 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
     /// </summary>
     internal void ExpireAllLeases()
     {
-        foreach (var (flowId, entry) in _entries)
+        foreach (var flowId in _entries.Keys)
         {
-            if (entry.LeaseId is not null)
-                _entries.TryUpdate(flowId, entry with { LeaseId = null, LeaseExpiresAtUtc = null }, entry);
+            // CAS loop: a zombie renewal can swap the entry between the read and the update, and
+            // TryUpdate compares against the snapshot — a silently lost break would recreate the
+            // exact "executing on another live worker" hang this method exists to eliminate.
+            // Retry until no lease is observed; once cleared, the zombie's next renewal fails
+            // (its lease id no longer matches) and its loop stops, so this converges.
+            while (_entries.TryGetValue(flowId, out var entry)
+                   && entry.LeaseId is not null
+                   && !_entries.TryUpdate(flowId, entry with { LeaseId = null, LeaseExpiresAtUtc = null }, entry))
+            {
+            }
         }
     }
 

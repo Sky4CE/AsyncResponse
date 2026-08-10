@@ -9,9 +9,11 @@ namespace AsyncResponse;
 /// Supported syntax per field: <c>*</c>, single values, lists (<c>1,15</c>), ranges (<c>1-5</c>,
 /// wrap-around <c>22-2</c> included), steps (<c>*/15</c>, <c>10-40/5</c>, <c>8/2</c>), and names
 /// (<c>JAN…DEC</c>, <c>SUN…SAT</c>, case-insensitive). <c>?</c> is accepted as <c>*</c> in the two
-/// day fields. Day-of-month and day-of-week combine with classic Vixie-cron OR semantics: when both
-/// are restricted, a date matches if <em>either</em> matches; when only one is restricted, that one
-/// decides. Day-of-week accepts <c>0</c> and <c>7</c> as Sunday.
+/// day fields. Day-of-month and day-of-week combine with classic Vixie-cron semantics: when both
+/// fields are explicitly restricted (neither starts with <c>*</c>), a date matches if <em>either</em>
+/// matches; otherwise both masks must match — a star-step field such as <c>*/2</c> stays out of the
+/// either/or rule (exactly as Vixie's <c>DOM_STAR</c>/<c>DOW_STAR</c> flags keep it) while its step
+/// mask still applies. Day-of-week accepts <c>0</c> and <c>7</c> as Sunday.
 /// </para>
 /// <para>
 /// Occurrences are computed minute-aligned in the schedule's time zone (default UTC) and returned
@@ -77,8 +79,8 @@ public sealed class CronSchedule
         if ((daysOfWeek & (1UL << 7)) != 0)
             daysOfWeek = (daysOfWeek & ~(1UL << 7)) | 1UL;
 
-        var dayOfMonthRestricted = !IsFull(fields[2]);
-        var dayOfWeekRestricted = !IsFull(fields[4]);
+        var dayOfMonthRestricted = !IsStarShaped(fields[2]);
+        var dayOfWeekRestricted = !IsStarShaped(fields[4]);
 
         return new CronSchedule(
             expression,
@@ -91,10 +93,12 @@ public sealed class CronSchedule
             dayOfMonthRestricted,
             dayOfWeekRestricted);
 
-        // "*/1" is every value and therefore unrestricted; any other "*/N" step keeps only some
-        // values, so it must count as restricted or DayMatches would discard the parsed mask and
-        // Vixie's dom/dow OR-rule would evaporate ("0 0 */2 * *" firing every day).
-        static bool IsFull(string field) => field is "*" or "?" or "*/1";
+        // Vixie sets its DOM_STAR/DOW_STAR flags on any day field whose text starts with '*'
+        // ("*", "*/2"): such a field stays OUT of the either/or rule below, but its step mask
+        // still applies — DayMatches ANDs the two masks unless BOTH fields are explicitly
+        // restricted. That keeps "0 0 */2 * *" at every other day (not every day) without turning
+        // "0 0 */2 * FRI" into odd-days-OR-Fridays (crontab(5): odd Fridays only).
+        static bool IsStarShaped(string field) => field is "?" || field.StartsWith('*');
     }
 
     /// <summary>
@@ -197,14 +201,12 @@ public sealed class CronSchedule
         var dayOfMonth = (_daysOfMonth & (1U << date.Day)) != 0;
         var dayOfWeek = (_daysOfWeek & (1 << (int)date.DayOfWeek)) != 0;
 
-        // Vixie-cron OR rule: both restricted → either matches; one restricted → it decides alone.
-        if (_dayOfMonthRestricted && _dayOfWeekRestricted)
-            return dayOfMonth || dayOfWeek;
-        if (_dayOfMonthRestricted)
-            return dayOfMonth;
-        if (_dayOfWeekRestricted)
-            return dayOfWeek;
-        return true;
+        // Vixie-cron dom/dow rule: only when BOTH fields are explicitly restricted does either
+        // match suffice; when either field is star-shaped ("*", "*/N", "?") both masks must match
+        // (a plain "*" mask is full, so the other field decides alone — the classic behavior).
+        return _dayOfMonthRestricted && _dayOfWeekRestricted
+            ? dayOfMonth || dayOfWeek
+            : dayOfMonth && dayOfWeek;
     }
 
     private static readonly string[] MonthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];

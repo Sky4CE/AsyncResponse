@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -48,6 +49,39 @@ internal sealed class AsyncResponseDurableFlowStoreMarker(Type storeType)
 }
 
 /// <summary>
+/// Registered by the durable-flow engine and evaluated by <see cref="AsyncResponseStartupValidator"/>
+/// at host start: every <see cref="IDurableFlowExecutionObserver"/> must be a singleton, because the
+/// singleton flow executor resolves observers once from the root provider and holds them for its
+/// lifetime. Failing here names the offending registration and the fix; without it the first flow
+/// job dies inside the transport's retry loop with an opaque "Cannot resolve scoped service ...
+/// from root provider" (ValidateOnBuild does not descend into the executor's factory registration).
+/// Holds the service collection only until the check runs, then releases it.
+/// </summary>
+internal sealed class DurableFlowObserverLifetimeAudit(IServiceCollection services)
+{
+    private IServiceCollection? _services = services;
+
+    public void Validate()
+    {
+        var services = Interlocked.Exchange(ref _services, null);
+        if (services is null)
+            return;
+
+        var nonSingleton = services.FirstOrDefault(descriptor =>
+            descriptor.ServiceType == typeof(IDurableFlowExecutionObserver)
+            && descriptor.Lifetime != ServiceLifetime.Singleton);
+        if (nonSingleton is not null)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(IDurableFlowExecutionObserver)} '{(nonSingleton.ImplementationType ?? nonSingleton.ImplementationInstance?.GetType())?.Name ?? "(factory registration)"}' " +
+                $"is registered as {nonSingleton.Lifetime}, but observers are held by the singleton flow executor for its lifetime and must be " +
+                "singletons (services.AddSingleton<IDurableFlowExecutionObserver, ...>()). An observer that needs scoped services should " +
+                "create its own scope inside the callback.");
+        }
+    }
+}
+
+/// <summary>
 /// Validates at host startup that <c>AddAsyncResponse()</c> was paired with exactly one response
 /// channel, one worker transport, and one durable-flow state store. These are mandatory core
 /// choices; making each explicit keeps the fluent registration complete and prevents silently
@@ -59,12 +93,14 @@ internal sealed class AsyncResponseStartupValidator(
     IEnumerable<AsyncResponseDurableFlowStoreMarker> _flowStores,
     IOptions<AsyncResponseOptions> _options,
     IEnumerable<DurableFlowOptions>? _flowOptions = null,
-    ILogger<AsyncResponseStartupValidator>? _logger = null) : IHostedService
+    ILogger<AsyncResponseStartupValidator>? _logger = null,
+    DurableFlowObserverLifetimeAudit? _observerAudit = null) : IHostedService
 {
     /// <summary>Starts this service.</summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         ValidateWatchdogOptions(_options.Value.Watchdog);
+        _observerAudit?.Validate();
 
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
 

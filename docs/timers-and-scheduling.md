@@ -124,8 +124,10 @@ usable on its own):
 
 - `*` (and `?` in the day fields), single values, lists `1,15`, ranges `1-5` (wrap-around
   `22-2` supported), steps `*/15`, `10-40/5`, `8/2`, names `JAN…DEC` / `SUN…SAT`.
-- Day-of-month and day-of-week combine with classic Vixie-cron **OR** semantics when both are
-  restricted; `0` and `7` are both Sunday.
+- Day-of-month and day-of-week combine with classic Vixie-cron semantics: **OR** when both are
+  explicitly restricted, **AND** when either is star-shaped (`*`, `*/2`, `?`) — a star-step field
+  stays out of the either/or rule while its step mask still applies, exactly as Vixie's
+  `DOM_STAR`/`DOW_STAR` flags do. `0` and `7` are both Sunday.
 - Expressions are validated at registration — a typo fails the `WithScheduledFlow` call, not
   silently at 3 a.m.
 

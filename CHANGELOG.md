@@ -40,8 +40,10 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   options)` starts a flow per occurrence with a deterministic run id
   (`sched:{name}:{occurrenceUtc}`), deduplicated across replicas by the flow store's atomic
   create — no leader election. Public `CronSchedule` parser (five-field Vixie semantics:
-  lists/ranges/steps/names, dom-or-dow OR rule, optional `TimeZoneInfo` with honest DST
-  behavior), validated at registration (duplicate schedule names too). Occurrences missed while
+  lists/ranges/steps/names, the dom/dow rule with Vixie's star flags — OR only when both day
+  fields are explicitly restricted, AND when either is star-shaped like `*/2` — and optional
+  `TimeZoneInfo` with honest DST behavior), validated at registration (duplicate schedule
+  names too). Occurrences missed while
   no replica ran are skipped by policy.
 - **`AsyncResponse.Testing` package** — deterministic testing kit
   ([docs/testing.md](docs/testing.md)): `VirtualTimeProvider` (stepwise, due-order virtual

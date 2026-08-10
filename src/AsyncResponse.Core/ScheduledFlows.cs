@@ -94,6 +94,25 @@ internal sealed class ScheduledFlowService(
         {
             var finished = await Task.WhenAny(pending).ConfigureAwait(false);
             pending.Remove(finished);
+            if (finished.IsFaulted)
+            {
+                // The first fault propagates and fails the host; the sibling loops keep running
+                // until shutdown cancels them, no longer awaited by anyone. Observe their outcomes
+                // so a second fault in the same outage window is logged with its exception instead
+                // of dying as a finalizer-time unobserved-task event with no schedule context.
+                foreach (var sibling in pending)
+                {
+                    _ = sibling.ContinueWith(
+                        static (task, state) => ((ILogger)state!).LogError(
+                            task.Exception?.GetBaseException(),
+                            "A scheduled-flow loop faulted while the scheduler was already failing."),
+                        _logger,
+                        CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                        TaskScheduler.Default);
+                }
+            }
+
             await finished.ConfigureAwait(false);
         }
     }

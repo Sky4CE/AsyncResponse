@@ -270,6 +270,11 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         _options.ConfigureAsyncResponse?.Invoke(builder);
 
         _provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+
+        // The probe needs the engine clock and this incarnation's timer threshold to tell an
+        // in-process timer park (holds a worker slot) from a suspension (the job ends) — see
+        // QuiesceProbe.OnStepWaitingAsync.
+        _quiesce.Arm(Clock, _provider.GetRequiredService<DurableFlowOptions>().TimerInProcessThreshold);
     }
 
     private async Task StartHostedServicesAsync()
@@ -355,18 +360,29 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// <summary>
     /// Tracks flow executions parked on an engine-owned wait: between a step's Waiting event and
     /// its Completed event the execution holds a worker slot but is idle by design, waiting on
-    /// virtual time or a test-published reply. Only kinds that actually park in process count —
-    /// child-flow steps always suspend (the job ends), and a suspended timer's Waiting is
-    /// reconciled at the wake-up replay's Completed event. Cleared on restart: the old
-    /// incarnation's parked executions die with it.
+    /// virtual time or a test-published reply. Only waits that actually park in process count —
+    /// child-flow steps always suspend (the job ends), and a timer whose remainder exceeds the
+    /// in-process threshold suspends too on this delayed-capable transport, so its Waiting is not
+    /// counted (a stale entry would outlive the worker slot until the wake-up replay and mask a
+    /// genuinely busy job in SettleAsync's guard). Cleared on restart: the old incarnation's
+    /// parked executions die with it.
     /// </summary>
     private sealed class QuiesceProbe : IDurableFlowExecutionObserver
     {
         private readonly HashSet<(string FlowId, string Step)> _parked = [];
+        private TimeProvider _clock = TimeProvider.System;
+        private TimeSpan _timerInProcessThreshold;
 
         public int ParkedCount
         {
             get { lock (_parked) return _parked.Count; }
+        }
+
+        /// <summary>Binds the engine clock and timer threshold of the current incarnation.</summary>
+        public void Arm(TimeProvider clock, TimeSpan timerInProcessThreshold)
+        {
+            _clock = clock;
+            _timerInProcessThreshold = timerInProcessThreshold;
         }
 
         public void Reset()
@@ -376,7 +392,19 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
         public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step)
         {
-            if (step.Kind is DurableFlowStepKind.Awaited or DurableFlowStepKind.Timer)
+            // Awaited steps always park in process holding their worker slot. Timer steps only
+            // park when the remainder is at or below the in-process threshold — a longer wait
+            // suspends (the engine mirrors this decision in DelayCoreAsync against the same
+            // clock), ending the worker job this entry would otherwise be offsetting.
+            var parksInProcess = step.Kind switch
+            {
+                DurableFlowStepKind.Awaited => true,
+                DurableFlowStepKind.Timer => step.WakeAtUtc is { } wakeAtUtc
+                    && wakeAtUtc - _clock.GetUtcNow().UtcDateTime <= _timerInProcessThreshold,
+                _ => false
+            };
+
+            if (parksInProcess)
                 lock (_parked) _parked.Add((step.FlowId, step.StepName));
             return default;
         }

@@ -82,6 +82,12 @@ public interface IDurableFlowExecutionObserver
     /// <summary>The step's completion checkpoint was persisted.</summary>
     ValueTask OnStepCompletedAsync(DurableFlowStepEvent step) => default;
 
-    /// <summary>The run reached a terminal status (<see cref="FlowRunStatus.Succeeded"/> or <see cref="FlowRunStatus.Failed"/>).</summary>
+    /// <summary>
+    /// The run reached a terminal status (<see cref="FlowRunStatus.Succeeded"/> or
+    /// <see cref="FlowRunStatus.Failed"/>). Delivered <b>at least once</b> per terminal run: a
+    /// redelivered duplicate of an already-terminal wake-up re-notifies before acking, because the
+    /// original notification may be exactly what failed the prior delivery — implementations must
+    /// tolerate duplicates.
+    /// </summary>
     ValueTask OnRunFinishedAsync(DurableFlowRunEvent run) => default;
 }

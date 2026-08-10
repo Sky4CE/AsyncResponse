@@ -204,23 +204,23 @@ public abstract class TransportConformanceSuite
         var delay = TimeSpan.FromSeconds(3);
 
         var enqueuedAt = DateTime.UtcNow;
-        await EnqueueDelayedAsync(harness, harness.Names.NewCorrelationId("delayed"), token: 21, delay);
+        await EnqueueAsync(harness, harness.Names.NewCorrelationId("delayed"), token: 21, delay: delay);
 
         // The whole capability is "not before": the broker (or the store's claim gate) must hold
         // the job until its due time, and the executor's NotBeforeUtc guard re-publishes an early
-        // delivery instead of running it. Half a second of grace absorbs whole-second broker
-        // rounding (SQS DelaySeconds is ceil'd, so it only ever rounds later) and store clock skew
-        // inside the tolerance the engine itself accepts.
+        // delivery instead of running it. One second of grace — the engine's own NotBeforeTolerance
+        // — absorbs whole-second broker rounding (SQS DelaySeconds is ceil'd, so it only ever
+        // rounds later) AND the database-clock skew of the store-backed transports, whose due time
+        // is gated by the database clock while elapsed here is measured on the host clock.
         var observed = await ExpectAsync(probe.FirstCall.Task, harness, "the delayed worker job");
         var elapsed = DateTime.UtcNow - enqueuedAt;
         Assert.Equal(21, observed.Token);
         Assert.True(
-            elapsed >= delay - TimeSpan.FromMilliseconds(500),
+            elapsed >= delay - TimeSpan.FromSeconds(1),
             $"{Transport}: the delayed job executed after {elapsed}, before its {delay} delay elapsed.");
 
-        // Exactly once, same as the immediate contract: the re-publish chain must not leave a
-        // duplicate behind once the job finally runs.
-        await Task.Delay(TimeSpan.FromSeconds(2));
+        // Exactly once, asserted the same way as the immediate contract (no settling sleep): the
+        // re-publish chain must not leave a duplicate behind once the job finally runs.
         Assert.Equal(1, probe.CallCount);
     }
 
@@ -596,28 +596,16 @@ public abstract class TransportConformanceSuite
             configureRegistration: builder => builder.WithContextPropagator<TransportTenantPropagator>());
 
     private static async Task EnqueueAsync(
-        MatrixHarness harness, string correlationId, int token, bool respond = false)
+        MatrixHarness harness, string correlationId, int token, bool respond = false, TimeSpan? delay = null)
     {
         AsyncResponseContext.SetCorrelationId(correlationId);
         try
         {
-            await harness.Provider.GetRequiredService<IAsyncResponseBuilder>()
-                .EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, respond));
-        }
-        finally
-        {
-            AsyncResponseContext.ClearCorrelationId();
-        }
-    }
-
-    private static async Task EnqueueDelayedAsync(
-        MatrixHarness harness, string correlationId, int token, TimeSpan delay)
-    {
-        AsyncResponseContext.SetCorrelationId(correlationId);
-        try
-        {
-            await harness.Provider.GetRequiredService<IAsyncResponseBuilder>()
-                .EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, false), delay);
+            var builder = harness.Provider.GetRequiredService<IAsyncResponseBuilder>();
+            if (delay is { } notBefore)
+                await builder.EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, respond), notBefore);
+            else
+                await builder.EnqueueWorkerAsync<ITransportWorkerService>(service => service.HandleAsync(token, respond));
         }
         finally
         {

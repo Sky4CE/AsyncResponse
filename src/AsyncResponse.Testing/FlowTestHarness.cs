@@ -337,8 +337,12 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
             // to that dead correlation id is silently dropped by the channel, and the caller's
             // null-fallback (wait for the run's NEXT awaited step to park) is the correct path.
             // Progress-aware steps stay un-completed across non-terminal replies, so repeated
-            // replies to the same live correlation id still resolve here.
+            // replies to the same live correlation id still resolve here. Only the NEWEST Waiting
+            // of each step is considered live at all: a faulted attempt leaves no Completed event
+            // behind, and returning its abandoned correlation id (an older Waiting of a step the
+            // run has since restarted with a fresh id) would park the caller's reply forever.
             HashSet<string>? answered = null;
+            HashSet<string>? seenWaitingSteps = null;
             for (var index = list.Count - 1; index >= 0; index--)
             {
                 var candidate = list[index];
@@ -352,11 +356,14 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
 
                 if (candidate.Kind == EventKind.Waiting
                     && candidate.Step.Kind == DurableFlowStepKind.Awaited
-                    && (stepName is null || candidate.Step.StepName == stepName)
-                    && candidate.Step.CorrelationId is { } correlationId
-                    && answered?.Contains(correlationId) != true)
+                    && candidate.Step.CorrelationId is { } correlationId)
                 {
-                    return correlationId;
+                    var newestForStep = (seenWaitingSteps ??= new HashSet<string>(StringComparer.Ordinal)).Add(candidate.Step.StepName);
+                    if (!newestForStep || answered?.Contains(correlationId) == true)
+                        continue;
+
+                    if (stepName is null || candidate.Step.StepName == stepName)
+                        return correlationId;
                 }
             }
         }

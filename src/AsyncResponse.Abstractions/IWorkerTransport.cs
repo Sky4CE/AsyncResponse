@@ -61,6 +61,16 @@ public sealed class WorkerJobEnvelope
     /// Additive wire property: absent on jobs written before it existed.
     /// </summary>
     public TimeSpan? LastRedelayRemaining { get; set; }
+
+    /// <summary>
+    /// How many consecutive re-publish hops were observed with a non-shrinking remainder (see
+    /// <see cref="LastRedelayRemaining"/>). A single such hop can be a transient delivery anomaly
+    /// and is re-published once more; on the second consecutive stall the executor concludes the
+    /// stamping and delivery-gating clocks persistently disagree and runs the job early by the
+    /// skew instead of re-publishing forever. Reset to zero whenever a hop makes progress.
+    /// Additive wire property: absent (zero) on jobs written before it existed.
+    /// </summary>
+    public int RedelayStallCount { get; set; }
 }
 
 /// <summary>

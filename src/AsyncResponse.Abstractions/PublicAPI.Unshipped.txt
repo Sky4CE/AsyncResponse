@@ -301,6 +301,8 @@ AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.get -> System.TimeSpan?
 AsyncResponse.WorkerJobEnvelope.LastRedelayRemaining.set -> void
 AsyncResponse.WorkerJobEnvelope.NotBeforeUtc.get -> System.DateTime?
 AsyncResponse.WorkerJobEnvelope.NotBeforeUtc.set -> void
+AsyncResponse.WorkerJobEnvelope.RedelayStallCount.get -> int
+AsyncResponse.WorkerJobEnvelope.RedelayStallCount.set -> void
 AsyncResponse.WorkerJobEnvelope.ReplyTarget.get -> AsyncResponse.AsyncResponseReplyTarget?
 AsyncResponse.WorkerJobEnvelope.ReplyTarget.set -> void
 AsyncResponse.WorkerJobEnvelope.SchemaVersion.get -> int

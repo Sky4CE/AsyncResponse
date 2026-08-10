@@ -32,6 +32,15 @@ internal sealed class WorkerJobExecutor(
     private static readonly TimeSpan RedelayProgressEpsilon = TimeSpan.FromMilliseconds(500);
 
     /// <summary>
+    /// Consecutive no-progress hops required before the stall fallback executes the job early.
+    /// A single early redelivery can be a transient anomaly (an unhonored delay, a redrive
+    /// surfacing the message) — executing on one sample would break the due-time contract by the
+    /// whole remainder. Genuine skew stalls EVERY hop, so requiring a second consecutive stall
+    /// keeps the anti-livelock property while a lone anomaly just re-publishes once more.
+    /// </summary>
+    private const int RedelayStallExecuteThreshold = 2;
+
+    /// <summary>
     /// Executes the job. Exceptions propagate to the caller — transports decide whether to log,
     /// retry, or dead-letter.
     /// </summary>
@@ -81,14 +90,20 @@ internal sealed class WorkerJobExecutor(
                 // the broker's own clock), a consumer running behind that clock is handed the job
                 // back immediately and would re-publish the same remainder forever — each hop a
                 // fresh message id, so no delivery counter ever reaches a DLQ. Executing early by
-                // the skew beats never executing.
-                if (job.LastRedelayRemaining is { } lastRemaining && remaining >= lastRemaining - RedelayProgressEpsilon)
+                // the skew beats never executing — but only after consecutive stalls prove the
+                // skew is persistent, so a single anomalous early delivery cannot fire the job
+                // arbitrarily ahead of its due time.
+                var stalled = job.LastRedelayRemaining is { } lastRemaining && remaining >= lastRemaining - RedelayProgressEpsilon;
+                job.RedelayStallCount = stalled ? job.RedelayStallCount + 1 : 0;
+
+                if (stalled && job.RedelayStallCount >= RedelayStallExecuteThreshold)
                 {
                     _logger.LogWarning(
-                        "Worker job {Target}.{Method} was redelivered {Remaining} before its due time {NotBeforeUtc} with no progress since the previous hop ({LastRemaining}); " +
+                        "Worker job {Target}.{Method} was redelivered {Remaining} before its due time {NotBeforeUtc} with no progress over {StallCount} consecutive hops ({LastRemaining} previously); " +
                         "the publishing and delivery-gating clocks disagree (clock skew). Executing it now instead of re-publishing.",
-                        job.Call.ServiceInterfaceFullName, job.Call.MethodName, remaining, notBeforeUtc, lastRemaining);
-                    AsyncResponseDiagnostics.RecordWorkerOutcome("redelay-stalled");
+                        job.Call.ServiceInterfaceFullName, job.Call.MethodName, remaining, notBeforeUtc, job.RedelayStallCount, job.LastRedelayRemaining);
+                    // No outcome recorded here: the execution below records exactly one outcome
+                    // ("executed"/"failed") for this delivery, like every other path.
                 }
                 else
                 {

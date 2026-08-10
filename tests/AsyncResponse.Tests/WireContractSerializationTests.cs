@@ -74,7 +74,8 @@ public class WireContractSerializationTests
             ReplyTarget = new AsyncResponseReplyTarget { Name = "default", Transport = "test", Address = "test://reply" },
             Context = new Dictionary<string, string> { ["tenant"] = "acme" },
             NotBeforeUtc = new DateTime(2026, 5, 1, 8, 0, 0, DateTimeKind.Utc),
-            LastRedelayRemaining = TimeSpan.FromMinutes(90)
+            LastRedelayRemaining = TimeSpan.FromMinutes(90),
+            RedelayStallCount = 1
         };
 
         var json = JsonSerializer.Serialize(envelope);
@@ -94,6 +95,7 @@ public class WireContractSerializationTests
         // must survive a serialize/deserialize hop or delayed delivery breaks across a broker.
         Assert.Equal(envelope.NotBeforeUtc, restored.NotBeforeUtc);
         Assert.Equal(TimeSpan.FromMinutes(90), restored.LastRedelayRemaining);
+        Assert.Equal(1, restored.RedelayStallCount);
     }
 
     [Fact]
@@ -117,6 +119,7 @@ public class WireContractSerializationTests
         Assert.Equal("legacy-corr", restored!.CorrelationId);
         Assert.Null(restored.NotBeforeUtc);
         Assert.Null(restored.LastRedelayRemaining);
+        Assert.Equal(0, restored.RedelayStallCount);
     }
 
     [Fact]

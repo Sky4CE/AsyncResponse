@@ -112,6 +112,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (state.Status != FlowRunStatus.Running)
         {
             _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping execution.", flowId, state.Status);
+            // Re-notify terminal runs on duplicate deliveries: the ORIGINAL delivery's
+            // run-finished notification (below, outside the try/catch) may itself have thrown and
+            // caused this redelivery — skipping here would lose the terminal event forever.
+            // Observer delivery is at-least-once by contract; implementations tolerate duplicates.
+            if (state.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
+                await NotifyRunFinishedAsync(state).ConfigureAwait(false);
             await NotifyParentAsync(state).ConfigureAwait(false);
             return;
         }
@@ -183,7 +189,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         // observer (throwing is the documented crash-injection contract) cannot re-enter those
         // catches and rewrite a Succeeded run as Failed — or overwrite a terminal ledger message
         // with a telemetry error — "the run's outcome is never at stake". A throw from here
-        // propagates for redelivery; the replay sees the terminal status, skips, and acks.
+        // propagates for redelivery; the replay sees the terminal status, RE-NOTIFIES (so the
+        // event that just failed is not lost), and acks.
         await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         await NotifyParentAsync(state).ConfigureAwait(false);
     }
@@ -234,6 +241,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (state.Status != FlowRunStatus.Running)
             {
                 _logger.LogDebug("Durable flow {FlowId} is already {Status}; skipping duplicate delivery.", flowId, state.Status);
+                // Same at-least-once re-notify as ExecuteAsync's terminal early return: the prior
+                // delivery may have died in the run-finished notification itself.
+                if (state.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
+                    await NotifyRunFinishedAsync(state).ConfigureAwait(false);
                 await NotifyParentAsync(state).ConfigureAwait(false);
                 return null;
             }
@@ -442,6 +453,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (!failedNow)
         {
             _logger.LogDebug("Durable flow {FlowId} is already {Status}; ignoring failure signal.", flowId, updated.Status);
+            // At-least-once re-notify, as in ExecuteAsync: the prior delivery of this failure
+            // signal may have marked the run and then died in its own run-finished notification.
+            if (updated.Status is FlowRunStatus.Succeeded or FlowRunStatus.Failed)
+                await NotifyRunFinishedAsync(updated).ConfigureAwait(false);
             await NotifyParentAsync(updated).ConfigureAwait(false);
             return;
         }
@@ -562,7 +577,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// <summary>
     /// Observer hook for terminal transitions. Fires AFTER the terminal save: an observer that
     /// throws here (crash injection) fails a delivery whose run is already terminal, so the
-    /// redelivered execution acks as a no-op — the run's outcome is never at stake.
+    /// redelivered execution re-notifies and acks — the run's outcome is never at stake, and the
+    /// terminal event is delivered at least once.
     /// </summary>
     private async Task NotifyRunFinishedAsync(FlowState state)
     {

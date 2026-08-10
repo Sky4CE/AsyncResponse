@@ -189,6 +189,10 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         // but unsatisfiable expression ("0 0 30 2 *") would otherwise register cleanly and its loop
         // would die at startup with one warning — the silent 3 a.m. failure this validation exists
         // to prevent. The runtime null-check in ScheduledFlowService stays as the backstop.
+        // Deliberate deviation from the engine's TimeProvider seam: registration runs before any
+        // provider (and thus any injected clock) exists, and the probe scans an 8-year horizon, so
+        // the system clock answers "can this expression ever fire", not "when" — the runtime loop
+        // computes actual occurrences from the injected TimeProvider as usual.
         var probe = CronSchedule.Parse(cron, options.TimeZone);
         if (probe.GetNextOccurrence(TimeProvider.System.GetUtcNow()) is null)
         {
@@ -229,39 +233,27 @@ public static class AsyncResponseCoreServiceCollectionExtensions
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicMethods, typeof(DurableFlowExecutor))]
     private static void AddDurableFlowEngine(IServiceCollection services)
     {
-        services.TryAddSingleton<IDurableFlowExecutor>(provider =>
-        {
-            // Observers are resolved ONCE here, from the root provider, and held for the singleton
-            // executor's lifetime. A scoped/transient registration would otherwise surface as an
-            // opaque "Cannot resolve scoped service ... from root provider" thrown per flow job
-            // inside the transport's retry loop (ValidateOnBuild does not catch it). Fail the first
-            // resolution with an error that names the offending registration and the fix instead.
-            var nonSingleton = services.FirstOrDefault(descriptor =>
-                descriptor.ServiceType == typeof(IDurableFlowExecutionObserver)
-                && descriptor.Lifetime != ServiceLifetime.Singleton);
-            if (nonSingleton is not null)
-            {
-                throw new InvalidOperationException(
-                    $"{nameof(IDurableFlowExecutionObserver)} '{(nonSingleton.ImplementationType ?? nonSingleton.ImplementationInstance?.GetType())?.Name ?? "(factory registration)"}' " +
-                    $"is registered as {nonSingleton.Lifetime}, but observers are held by the singleton flow executor for its lifetime and must be " +
-                    "singletons (services.AddSingleton<IDurableFlowExecutionObserver, ...>()). An observer that needs scoped services should " +
-                    "create its own scope inside the callback.");
-            }
-
-            return new DurableFlowExecutor(
-                provider.GetRequiredService<IServiceScopeFactory>(),
-                provider.GetRequiredService<IAsyncResponseBuilder>(),
-                provider.GetRequiredService<IAsyncResponseSubscriber>(),
-                provider.GetService<IRecoverableAsyncResponseSubscriber>(),
-                provider.GetRequiredService<AsyncResponseContextPropagation>(),
-                provider.GetRequiredService<DurableFlowOptions>(),
-                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
-                provider.GetServices<DurableFlowRegistration>(),
-                provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
-                provider.GetService<TimeProvider>(),
-                provider.GetServices<IDurableFlowExecutionObserver>(),
-                provider.GetService<IWorkerTransport>());
-        });
+        // Observers are resolved ONCE by the executor factory below, from the root provider, and
+        // held for the singleton executor's lifetime. A scoped/transient registration would
+        // surface as an opaque "Cannot resolve scoped service ... from root provider" thrown per
+        // flow job inside the transport's retry loop (ValidateOnBuild does not catch it). The
+        // audit — evaluated by AsyncResponseStartupValidator at host start, then released — fails
+        // with an error naming the offending registration and the fix instead, without the
+        // executor factory rooting the service collection for the app's lifetime.
+        services.TryAddSingleton(new DurableFlowObserverLifetimeAudit(services));
+        services.TryAddSingleton<IDurableFlowExecutor>(provider => new DurableFlowExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>(),
+            provider.GetRequiredService<IAsyncResponseSubscriber>(),
+            provider.GetService<IRecoverableAsyncResponseSubscriber>(),
+            provider.GetRequiredService<AsyncResponseContextPropagation>(),
+            provider.GetRequiredService<DurableFlowOptions>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<DurableFlowExecutor>>(),
+            provider.GetServices<DurableFlowRegistration>(),
+            provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
+            provider.GetService<TimeProvider>(),
+            provider.GetServices<IDurableFlowExecutionObserver>(),
+            provider.GetService<IWorkerTransport>()));
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
