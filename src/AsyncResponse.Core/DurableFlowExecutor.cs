@@ -49,6 +49,9 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private readonly AsyncResponseContextPropagation _propagation;
     private readonly DurableFlowOptions _options;
     private readonly ILogger<DurableFlowExecutor> _logger;
+    private readonly TimeProvider _timeProvider;
+    private readonly IDurableFlowExecutionObserver[] _observers;
+    private readonly IWorkerTransport? _workerTransport;
     private readonly Dictionary<string, DurableFlowRegistration> _registrations;
     private readonly CancellationToken _hostStopping;
 
@@ -62,8 +65,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         DurableFlowOptions options,
         ILogger<DurableFlowExecutor> logger,
         IEnumerable<DurableFlowRegistration>? registrations = null,
-        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null)
+        Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null,
+        TimeProvider? timeProvider = null,
+        IEnumerable<IDurableFlowExecutionObserver>? observers = null,
+        IWorkerTransport? workerTransport = null)
     {
+        _workerTransport = workerTransport;
         _scopeFactory = scopeFactory;
         _builder = builder;
         _subscriber = subscriber;
@@ -72,6 +79,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         _options = options;
         FlowStateConcurrency.ValidateOptions(_options);
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _observers = observers?.ToArray() ?? [];
         _hostStopping = hostLifetime?.ApplicationStopping ?? CancellationToken.None;
         _registrations = new Dictionary<string, DurableFlowRegistration>(StringComparer.Ordinal);
         foreach (var registration in registrations ?? [])
@@ -135,6 +144,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             await lease.SaveAsync(state, _options.StateExpiry).ConfigureAwait(false);
 
             _logger.LogInformation("Durable flow {FlowId} completed successfully (attempt {Attempts}).", flowId, state.Attempts);
+            await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         }
         catch (DurableFlowSuspendedException ex)
         {
@@ -152,6 +162,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
             AsyncResponseDiagnostics.SetError(activity, ex);
             _logger.LogWarning(ex, "Durable flow {FlowId} failed terminally: {Message}", flowId, ex.Message);
+            await NotifyRunFinishedAsync(state).ConfigureAwait(false);
         }
         catch (Exception ex) when (lease.LostToken.IsCancellationRequested)
         {
@@ -192,14 +203,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options,
-            _logger).ConfigureAwait(false);
+            _logger,
+            _timeProvider).ConfigureAwait(false);
         if (lease is not null)
             return lease;
 
         // Poll ceiling: a lease can only stay held past its duration if the holder renewed it, so
         // one full duration + renew interval of failed acquires proves the holder is alive. The 2s
         // poll delay is capped by the renew interval so short test-sized leases still get polled.
-        var deadline = DateTime.UtcNow + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
+        var deadline = _timeProvider.GetUtcNow().UtcDateTime + _options.ExecutionLeaseDuration + _options.ExecutionLeaseRenewInterval;
         var pollDelay = _options.ExecutionLeaseRenewInterval < TimeSpan.FromSeconds(2)
             ? _options.ExecutionLeaseRenewInterval
             : TimeSpan.FromSeconds(2);
@@ -230,12 +242,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             if (lease is not null)
                 return lease;
 
-            if (DateTime.UtcNow >= deadline)
+            if (_timeProvider.GetUtcNow().UtcDateTime >= deadline)
                 break;
 
             try
             {
-                await Task.Delay(pollDelay, _hostStopping).ConfigureAwait(false);
+                await Task.Delay(pollDelay, _timeProvider, _hostStopping).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -301,6 +313,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options.StateExpiry,
+            _timeProvider,
             state =>
             {
                 checkpointed = false;
@@ -326,7 +339,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 pending.Value.PendingPayloadTypeFullName = null;
                 pending.Value.Faulted = false;
                 pending.Value.Message = "Terminal response recovered after subscriber loss.";
-                pending.Value.CompletedAtUtc = DateTime.UtcNow;
+                pending.Value.CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
                 state.LastMessage = $"Step '{pending.Key}' recovered after subscriber loss.";
                 checkpointed = true;
                 return true;
@@ -402,6 +415,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             store,
             flowId,
             _options.StateExpiry,
+            _timeProvider,
             state =>
             {
                 updated = state;
@@ -429,6 +443,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         }
 
         await NotifyParentAsync(updated).ConfigureAwait(false);
+        await NotifyRunFinishedAsync(updated).ConfigureAwait(false);
 
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }
@@ -448,7 +463,10 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             _subscriber,
             _recoverableSubscriber,
             _logger,
-            lease);
+            lease,
+            _timeProvider,
+            _observers,
+            _workerTransport);
 
         // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
         // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
@@ -535,6 +553,21 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             ?? throw new InvalidOperationException(
                 $"Cannot resolve {kind} type '{fullName}'. For plugin/collectible-assembly scenarios register a resolver " +
                 $"via {nameof(AsyncResponseTypeResolution)}.{nameof(AsyncResponseTypeResolution.RegisterAssembly)}.");
+    }
+
+    /// <summary>
+    /// Observer hook for terminal transitions. Fires AFTER the terminal save: an observer that
+    /// throws here (crash injection) fails a delivery whose run is already terminal, so the
+    /// redelivered execution acks as a no-op — the run's outcome is never at stake.
+    /// </summary>
+    private async Task NotifyRunFinishedAsync(FlowState state)
+    {
+        if (_observers.Length == 0)
+            return;
+
+        var runEvent = new DurableFlowRunEvent(state.FlowId!, state.Status, state.LastMessage);
+        foreach (var observer in _observers)
+            await observer.OnRunFinishedAsync(runEvent).ConfigureAwait(false);
     }
 
     private Task NotifyParentAsync(FlowState state)

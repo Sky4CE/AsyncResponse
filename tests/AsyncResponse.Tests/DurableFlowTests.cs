@@ -325,6 +325,7 @@ public class DurableFlowTests
             store,
             flowId,
             TimeSpan.FromMinutes(5),
+            timeProvider: null,
             state =>
             {
                 state.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)
@@ -405,6 +406,7 @@ public class DurableFlowTests
             store,
             flowId,
             TimeSpan.FromMinutes(5),
+            timeProvider: null,
             state =>
             {
                 state.Steps = new Dictionary<string, FlowStepState>(StringComparer.Ordinal)

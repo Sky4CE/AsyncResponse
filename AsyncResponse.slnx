@@ -17,6 +17,7 @@
   <Folder Name="/src/">
     <Project Path="src/AsyncResponse.Abstractions/AsyncResponse.Abstractions.csproj" />
     <Project Path="src/AsyncResponse.Core/AsyncResponse.Core.csproj" />
+    <Project Path="src/AsyncResponse.Testing/AsyncResponse.Testing.csproj" />
   </Folder>
   <Folder Name="/src/Channels/">
     <Project Path="src/Channels/AsyncResponse.Channels.MongoDB/AsyncResponse.Channels.MongoDB.csproj" />

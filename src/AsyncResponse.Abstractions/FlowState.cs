@@ -137,6 +137,15 @@ public sealed class FlowStepState
     /// <summary>Child flow run id when this checkpoint is waiting for a child flow.</summary>
     public string? ChildFlowId { get; set; }
 
+    /// <summary>
+    /// The durable timer's due time when this step is a <c>DelayAsync</c>/<c>DelayUntilAsync</c>
+    /// timer. Persisted when the timer is first reached, so replays wait out the <em>remainder</em>
+    /// instead of restarting the delay, and a wake-up delivered early re-parks until this instant.
+    /// Cleared semantics: stays set after completion as the historical due time. Additive wire
+    /// property: absent on ledgers written before timers existed.
+    /// </summary>
+    public DateTime? WakeAtUtc { get; set; }
+
     /// <summary>UTC timestamp the step completed.</summary>
     public DateTime? CompletedAtUtc { get; set; }
 }

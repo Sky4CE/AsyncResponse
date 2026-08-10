@@ -6,7 +6,7 @@ using System.Text.Json;
 namespace AsyncResponse.Transports.PostgreSQL;
 
 /// <summary>Publishes <see cref="WorkerJobEnvelope"/> messages to the PostgreSQL worker queue.</summary>
-public sealed class PostgreSqlWorkerTransport : IWorkerTransport
+public sealed class PostgreSqlWorkerTransport : IWorkerTransport, IDelayedWorkerTransport
 {
     private readonly PostgreSqlAsyncResponseTransportOptions _options;
     private readonly PostgreSqlTransportStore _store;
@@ -29,7 +29,21 @@ public sealed class PostgreSqlWorkerTransport : IWorkerTransport
     }
 
     /// <inheritdoc />
-    public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+    public Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
+        => PublishCoreAsync(job, delay: null, cancellationToken);
+
+    /// <inheritdoc cref="IDelayedWorkerTransport.MaxPublishDelay"/>
+    /// <remarks>The due time is a database timestamp; no per-hop cap applies.</remarks>
+    public TimeSpan MaxPublishDelay => AsyncResponseChannelOptions.MaxPersistenceTtl;
+
+    /// <inheritdoc cref="IDelayedWorkerTransport.PublishAsync(WorkerJobEnvelope, TimeSpan, CancellationToken)"/>
+    public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, MaxPublishDelay);
+        return PublishCoreAsync(job, delay > TimeSpan.Zero ? delay : null, cancellationToken);
+    }
+
+    private async Task PublishCoreAsync(WorkerJobEnvelope job, TimeSpan? delay, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(job);
 
@@ -56,10 +70,12 @@ public sealed class PostgreSqlWorkerTransport : IWorkerTransport
             // Stable id outside the retry loop so a retried publish is idempotent rather than enqueuing
             // the same worker job twice.
             var messageId = Guid.NewGuid();
+            if (delay is { } delayTag)
+                activity?.SetTag("asyncresponse.worker.delay_seconds", delayTag.TotalSeconds);
             await PostgreSqlTransportRetry.ExecuteAsync(
                 async token =>
                 {
-                    await _store.PublishAsync(messageId, _options.WorkerQueue, payload, headers, token).ConfigureAwait(false);
+                    await _store.PublishAsync(messageId, _options.WorkerQueue, payload, headers, token, delay).ConfigureAwait(false);
                     return true;
                 },
                 _options.PublishMaxAttempts,

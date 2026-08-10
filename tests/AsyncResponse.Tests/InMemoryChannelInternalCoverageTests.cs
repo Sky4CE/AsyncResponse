@@ -116,10 +116,13 @@ public sealed class InMemoryChannelInternalCoverageTests
         Assert.False(ResponseTask(terminal).IsCompleted);
         await CleanupAsync(terminal);
 
-        var disposedTimer = CreateSubscription(channel, "disposed-timer");
-        ((CancellationTokenSource)GetField(disposedTimer, "_timeoutCts")).Dispose();
-        Invoke(disposedTimer, "ArmTimeout");
-        await CleanupAsync(disposedTimer);
+        // Arming schedules a TimeProvider timer; cleanup after arming disposes it (the CTS-disposed
+        // race this block used to cover no longer exists — there is no CTS to dispose out from
+        // under the armer).
+        var armedThenCleaned = CreateSubscription(channel, "armed-then-cleaned");
+        Invoke(armedThenCleaned, "ArmTimeout");
+        Assert.NotNull(GetField(armedThenCleaned, "_timeoutTimer"));
+        await CleanupAsync(armedThenCleaned);
 
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

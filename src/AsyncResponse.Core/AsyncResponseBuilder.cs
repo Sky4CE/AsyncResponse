@@ -7,7 +7,8 @@ namespace AsyncResponse;
 internal abstract class AsyncResponseBuilderBase(
     IWorkerTransport? _workerTransport = null,
     IAsyncResponseReplyTargetProvider? _replyTargetProvider = null,
-    AsyncResponseContextPropagation? _propagation = null)
+    AsyncResponseContextPropagation? _propagation = null,
+    TimeProvider? _timeProvider = null)
 {
     protected IAsyncResponseReplyTargetProvider? ReplyTargetProvider => _replyTargetProvider;
 
@@ -22,11 +23,18 @@ internal abstract class AsyncResponseBuilderBase(
                               "job executes; trimming may have removed them. Use the expression-based EnqueueWorkerAsync<TService> " +
                               "overloads, which root the service's public methods automatically.")]
     public Task EnqueueWorkerAsync(ReflectionCallDto work, CancellationToken cancellationToken = default)
-        => EnqueueWorkerCoreAsync(work, cancellationToken);
+        => EnqueueWorkerCoreAsync(work, TimeSpan.Zero, cancellationToken);
+
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto, TimeSpan, CancellationToken)" />
+    [RequiresUnreferencedCode("The descriptor names its target service and method as strings, resolved by reflection when the " +
+                              "job executes; trimming may have removed them. Use the expression-based EnqueueWorkerAsync<TService> " +
+                              "overloads, which root the service's public methods automatically.")]
+    public Task EnqueueWorkerAsync(ReflectionCallDto work, TimeSpan delay, CancellationToken cancellationToken = default)
+        => EnqueueWorkerCoreAsync(work, delay, cancellationToken);
 
     // Shared by the annotation-free expression overloads (whose TService is rooted via
-    // DynamicallyAccessedMembers) and the RequiresUnreferencedCode DTO overload above.
-    private async Task EnqueueWorkerCoreAsync(ReflectionCallDto work, CancellationToken cancellationToken)
+    // DynamicallyAccessedMembers) and the RequiresUnreferencedCode DTO overloads above.
+    private async Task EnqueueWorkerCoreAsync(ReflectionCallDto work, TimeSpan delay, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(work);
         cancellationToken.ThrowIfCancellationRequested();
@@ -45,15 +53,48 @@ internal abstract class AsyncResponseBuilderBase(
                 ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
                 "or install another full AsyncResponse transport package.");
 
-            await transport.PublishAsync(
-                new WorkerJobEnvelope
-                {
-                    Call = work,
-                    CorrelationId = AsyncResponseContext.CorrelationId,
-                    ReplyTarget = AsyncResponseContext.ReplyTarget,
-                    Context = _propagation?.Capture()
-                },
-                cancellationToken).ConfigureAwait(false);
+            var envelope = new WorkerJobEnvelope
+            {
+                Call = work,
+                CorrelationId = AsyncResponseContext.CorrelationId,
+                ReplyTarget = AsyncResponseContext.ReplyTarget,
+                Context = _propagation?.Capture()
+            };
+
+            if (delay <= TimeSpan.Zero)
+            {
+                await transport.PublishAsync(envelope, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            // Bounded like every persisted-deadline knob: the absolute due-time stamp below is
+            // "now + delay", and an unbounded delay would pass here and overflow at the stamp.
+            if (delay > AsyncResponseChannelOptions.MaxPersistenceTtl)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(delay),
+                    delay,
+                    $"Worker-job delay must be at most {AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0} days.");
+            }
+
+            if (transport is not IDelayedWorkerTransport delayedTransport)
+            {
+                throw new InvalidOperationException(
+                    $"The registered worker transport ({transport.GetType().Name}) does not support native delayed delivery " +
+                    $"({nameof(IDelayedWorkerTransport)}), so EnqueueWorkerAsync with a delay cannot be used. " +
+                    "Register a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB), " +
+                    "or — inside a durable flow — use IDurableFlowContext.DelayAsync followed by an immediate enqueue, " +
+                    "which works on every transport.");
+            }
+
+            activity?.SetTag("asyncresponse.worker.delay_seconds", delay.TotalSeconds);
+
+            // The absolute due time rides the envelope; the per-hop delay is clamped to the
+            // transport's cap. An early delivery (a capped hop, broker imprecision) is re-published
+            // by the worker-job executor for the remainder, so the due time holds end to end.
+            envelope.NotBeforeUtc = (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime.Add(delay);
+            var hop = delay <= delayedTransport.MaxPublishDelay ? delay : delayedTransport.MaxPublishDelay;
+            await delayedTransport.PublishAsync(envelope, hop, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -66,21 +107,42 @@ internal abstract class AsyncResponseBuilderBase(
     public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Action<TService>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), TimeSpan.Zero, cancellationToken);
     }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}}, CancellationToken)" />
     public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), TimeSpan.Zero, cancellationToken);
     }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}}, CancellationToken)" />
     public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), cancellationToken);
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), TimeSpan.Zero, cancellationToken);
+    }
+
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Action{TService}}, TimeSpan, CancellationToken)" />
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Action<TService>> work, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), delay, cancellationToken);
+    }
+
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, Task}}, TimeSpan, CancellationToken)" />
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> work, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), delay, cancellationToken);
+    }
+
+    /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync{TService}(Expression{Func{TService, ValueTask}}, TimeSpan, CancellationToken)" />
+    public Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> work, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return EnqueueWorkerCoreAsync(CallbackExpressionConverter.ToReflectionCall(work), delay, cancellationToken);
     }
 }
 
@@ -89,8 +151,9 @@ internal sealed class AsyncResponseBuilder(
     IAsyncResponseSubscriber _subscriber,
     IWorkerTransport? workerTransport = null,
     IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
-    AsyncResponseContextPropagation? propagation = null)
-    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation),
+    AsyncResponseContextPropagation? propagation = null,
+    TimeProvider? timeProvider = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider),
         IAsyncResponseBuilder
 {
     /// <inheritdoc />
@@ -107,8 +170,9 @@ internal sealed class RecoverableAsyncResponseBuilder(
     IRecoverableAsyncResponseSubscriber _subscriber,
     IWorkerTransport? workerTransport = null,
     IAsyncResponseReplyTargetProvider? replyTargetProvider = null,
-    AsyncResponseContextPropagation? propagation = null)
-    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation),
+    AsyncResponseContextPropagation? propagation = null,
+    TimeProvider? timeProvider = null)
+    : AsyncResponseBuilderBase(workerTransport, replyTargetProvider, propagation, timeProvider),
         IRecoverableAsyncResponseBuilder
 {
     /// <inheritdoc />

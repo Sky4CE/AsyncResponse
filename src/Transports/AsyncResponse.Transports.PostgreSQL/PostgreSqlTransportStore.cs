@@ -172,9 +172,10 @@ internal sealed class PostgreSqlTransportStore
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken, delay).ConfigureAwait(false);
         await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -253,17 +254,28 @@ internal sealed class PostgreSqlTransportStore
         IReadOnlyDictionary<string, string>? headers,
         string? deadLetterReason,
         bool notify,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
+        // Native delayed delivery: available_at gates the claim query, and the delay arithmetic
+        // runs on the DATABASE clock (now() + interval), matching the claim-side now() so client
+        // clock skew cannot shift the due time. A due row is picked up by the subscriber's next
+        // poll tick (EmptyPollDelay bounds the extra latency).
         command.CommandText =
-            $"""
-            INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-            VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
-            ON CONFLICT (id) DO NOTHING;
-            """;
+            delay is null
+                ? $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
+                  VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
+                  ON CONFLICT (id) DO NOTHING;
+                  """
+                : $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason, available_at)
+                  VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason, now() + make_interval(secs => @delay_seconds))
+                  ON CONFLICT (id) DO NOTHING;
+                  """;
         if (notify)
             command.CommandText += "SELECT pg_notify(@channel, @payload);";
 
@@ -272,6 +284,8 @@ internal sealed class PostgreSqlTransportStore
         command.Parameters.Add("payload_json", NpgsqlDbType.Jsonb).Value = payload;
         command.Parameters.Add("headers_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(headers ?? EmptyHeaders);
         command.Parameters.AddWithValue("dead_letter_reason", (object?)deadLetterReason ?? DBNull.Value);
+        if (delay is { } pending)
+            command.Parameters.AddWithValue("delay_seconds", pending.TotalSeconds);
         if (notify)
         {
             command.Parameters.AddWithValue("channel", _options.NotificationChannel);

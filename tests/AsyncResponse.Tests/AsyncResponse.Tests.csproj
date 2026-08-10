@@ -59,6 +59,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\AsyncResponse.Testing\AsyncResponse.Testing.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.MongoDB\AsyncResponse.Channels.MongoDB.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.NATS\AsyncResponse.Channels.NATS.csproj" />
     <ProjectReference Include="..\..\src\Channels\AsyncResponse.Channels.PostgreSQL\AsyncResponse.Channels.PostgreSQL.csproj" />

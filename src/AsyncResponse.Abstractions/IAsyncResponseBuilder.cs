@@ -62,6 +62,27 @@ public interface IAsyncResponseBuilder
 
     /// <summary>Enqueues an asynchronous worker operation returning <see cref="ValueTask"/>.</summary>
     Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> work, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Publishes a work descriptor that becomes deliverable only after <paramref name="delay"/>.
+    /// Requires the registered transport to support native delayed delivery
+    /// (<see cref="IDelayedWorkerTransport"/>) — see that interface for which transports do and how
+    /// longer-than-cap delays are chunked. A non-positive delay publishes immediately. Inside a
+    /// durable flow prefer <c>IDurableFlowContext.DelayAsync</c>, which works on every transport.
+    /// </summary>
+    [RequiresUnreferencedCode("The descriptor names its target service and method as strings, resolved by reflection when the " +
+                              "job executes; trimming may have removed them. Use the expression-based EnqueueWorkerAsync<TService> " +
+                              "overloads, which root the service's public methods automatically.")]
+    Task EnqueueWorkerAsync(ReflectionCallDto work, TimeSpan delay, CancellationToken cancellationToken = default);
+
+    /// <summary>Delayed variant of the synchronous-lambda overload; see <see cref="EnqueueWorkerAsync(ReflectionCallDto, TimeSpan, CancellationToken)"/> for delay semantics.</summary>
+    Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Action<TService>> work, TimeSpan delay, CancellationToken cancellationToken = default);
+
+    /// <summary>Delayed variant of the async-lambda overload; see <see cref="EnqueueWorkerAsync(ReflectionCallDto, TimeSpan, CancellationToken)"/> for delay semantics.</summary>
+    Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, Task>> work, TimeSpan delay, CancellationToken cancellationToken = default);
+
+    /// <summary>Delayed variant of the <see cref="ValueTask"/>-lambda overload; see <see cref="EnqueueWorkerAsync(ReflectionCallDto, TimeSpan, CancellationToken)"/> for delay semantics.</summary>
+    Task EnqueueWorkerAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods)] TService>(Expression<Func<TService, ValueTask>> work, TimeSpan delay, CancellationToken cancellationToken = default);
 }
 
 /// <summary>

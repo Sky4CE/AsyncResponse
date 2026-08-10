@@ -13,6 +13,62 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Added
 
+- **Durable timers inside flows** — `IDurableFlowContext.DelayAsync(name, delay)` and
+  `DelayUntilAsync(name, instant)`: checkpointed sleeps whose due time anchors at first
+  execution, so crashes/redeploys resume the remainder. On transports with native delayed
+  delivery a sleeping run *suspends* (the child-flow mechanism) and is woken by a delayed
+  worker job — no worker, execution lease, or memory held while sleeping; the ledger TTL is
+  extended to cover the sleep. Sub-`TimerInProcessThreshold` (new `DurableFlowOptions` knob,
+  default 10 s) remainders — and all timers on non-delayed transports — wait in process under
+  the lease, the same footprint as an awaited step. See
+  [docs/timers-and-scheduling.md](docs/timers-and-scheduling.md).
+- **Delayed worker jobs** — `EnqueueWorkerAsync(..., TimeSpan delay)` overloads on the fluent
+  builder, backed by the new optional `IDelayedWorkerTransport` capability. Native
+  implementations: in-memory (TimeProvider timer wheel), Azure Service Bus (scheduled
+  messages), SQS (`DelaySeconds`; 15-minute hops, standard queues only), PostgreSQL /
+  SQL Server / MongoDB (`available_at` on the queue with database-clock arithmetic).
+  `WorkerJobEnvelope` gains an additive `NotBeforeUtc` due-time stamp; the shared worker-job
+  executor re-publishes early deliveries for the remainder, chunking longer-than-cap delays
+  uniformly. Non-capable transports reject delayed enqueue with guidance at the call site.
+- **Cron-scheduled flows** — `WithScheduledFlow<TFlow, TInput>(name, cron, inputFactory,
+  options)` starts a flow per occurrence with a deterministic run id
+  (`sched:{name}:{occurrenceUtc}`), deduplicated across replicas by the flow store's atomic
+  create — no leader election. Public `CronSchedule` parser (five-field Vixie semantics:
+  lists/ranges/steps/names, dom-or-dow OR rule, optional `TimeZoneInfo` with honest DST
+  behavior), validated at registration (duplicate schedule names too). Occurrences missed while
+  no replica ran are skipped by policy.
+- **`AsyncResponse.Testing` package** — deterministic testing kit
+  ([docs/testing.md](docs/testing.md)): `VirtualTimeProvider` (stepwise, due-order virtual
+  clock), `AsyncResponseTestHarness` (full in-memory engine + hosted services on virtual time,
+  `AdvanceAsync`, `SimulateRestartAsync` preserving recovery registrations / ledgers / scheduled
+  jobs — with a `whileDown` hook for outage simulation), `FlowTestHarness` (script replies to
+  awaited steps, observe timers/steps, `StepExecutions` exactly-once assertions,
+  `CrashBeforeStep`/`CrashAfterStep` one-shot `SimulatedCrashException` injection) — all with
+  zero instrumentation in the flow classes under test.
+- **`IDurableFlowExecutionObserver`** — public execution-observation seam (step
+  starting/waiting/completed, run finished) invoked on the executor path; the Testing harness is
+  built on it and it doubles as a lightweight production telemetry hook. Observer exceptions
+  fail the current execution attempt like a step failure (that contract is the crash-injection
+  mechanism).
+- **Engine-wide `TimeProvider` seam** — `AddAsyncResponse()` registers `TimeProvider.System`
+  (TryAdd; a host or the test harness can pre-register its own), and every time-driven Core
+  component resolves it: waiter timeouts, execution leases and their renewal, the recovery
+  watchdog, in-memory retry backoff, timers, and schedules.
+
+### Changed
+
+- **The in-memory channel now implements the full recoverable contract**
+  (`IRecoverableAsyncResponseSubscriber` + `IRecoverableAsyncResponseBuilder`, with the same
+  `OnRecovery()`-override guard as the durable channels). Durable flows on the in-memory channel
+  now register their lost-subscriber callbacks, and `IAsyncResponseBuilder` resolves to the
+  recoverable builder — what passes in tests passes on Redis. Recovery spans waiter loss within
+  one process lifetime (and the Testing harness's simulated restarts); a real process exit still
+  loses the process-local store.
+- `FlowStepState` gains an additive `WakeAtUtc` property (the timer breadcrumb);
+  `FlowStateSchema`/`RecoveryStateSchema`/`WorkerJobEnvelopeSchema` stay at version 1.
+- The flow executor's host-lifetime hookup is now actually wired through DI (the lease-poll
+  abandon-on-shutdown path previously never saw `IHostApplicationLifetime`).
+
 - **Provider cross-product test coverage.** Channels, transports, and durable-flow stores are
   selected independently, so the suite now enumerates the whole product rather than testing each
   provider alone: **6 channels × 11 transports × 10 stores = 660 combinations**, three scenarios

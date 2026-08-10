@@ -20,8 +20,8 @@ end-to-end profiles).
    call `.WithReplyTarget()` and pass the `AsyncResponseRequestContext` into the trigger. Transport
    packages own how native destinations become reply targets.
 3. **Decide recovery routing honestly.** Override `OnRecovery()` on **every** payload type you
-   register lost-subscriber recovery callbacks for — durable channels fail fast at waiter creation
-   without it. That includes success-only payloads (`=> RecoveryAction.Resume`) and progress-only
+   register lost-subscriber recovery callbacks for — every channel (the in-memory one included,
+   since it shares the recoverable contract) fails fast at waiter creation without it. That includes success-only payloads (`=> RecoveryAction.Resume`) and progress-only
    checkpoints (`=> RecoveryAction.KeepWaiting`), not just payloads that can carry a domain
    failure: `Fail` for the states that must not resume, `KeepWaiting` for non-terminal checkpoints
    so they don't consume the registration out from under the terminal response. It's independent
@@ -76,6 +76,12 @@ end-to-end profiles).
 dotnet build
 dotnet test            # runs on Microsoft.Testing.Platform (xUnit.net v3)
 ```
+
+The unit suite runs on the shipped [`AsyncResponse.Testing`](testing.md) virtual clock, so
+timer, cron, timeout, lease, and crash-recovery scenarios execute in milliseconds — no real
+sleeps to tune, no timing flakiness to chase. The suites under `tests/AsyncResponse.Tests` that
+start with `FlowTestHarness`, `DurableFlowTimer`, `ScheduledFlow`, and `TestingHarness` double
+as the reference examples for testing applications the same way.
 
 The Docker-backed integration suite can also run against the **Native AOT-published** sample as
 the system under test — the same tests, with every SUT resource switched from the JIT project to

@@ -44,14 +44,14 @@ public sealed record AsyncResponseStaleRecoveryEntry(
 /// publishing (snapshot older than twice the scan interval).</description></item>
 /// </list>
 /// </summary>
-public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState _state) : IHealthCheck
+public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState _state, TimeProvider? _timeProvider = null) : IHealthCheck
 {
     /// <summary>Caps the number of stale entries listed in the health payload.</summary>
     private const int MaxReportedStaleEntries = 10;
 
     /// <summary>Runs the CheckHealthAsync operation.</summary>
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
-        => Task.FromResult(Evaluate(_state.Latest, DateTime.UtcNow));
+        => Task.FromResult(Evaluate(_state.Latest, (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
 
     internal static HealthCheckResult Evaluate(AsyncResponseWatchdogSnapshot? snapshot, DateTime utcNow)
     {

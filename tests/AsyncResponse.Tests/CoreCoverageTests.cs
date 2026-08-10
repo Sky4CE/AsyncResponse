@@ -53,6 +53,7 @@ public sealed class CoreCoverageTests
             missing.Object,
             "missing",
             TimeSpan.FromMinutes(1),
+            timeProvider: null,
             _ => true));
 
         var noOp = new Mock<IFlowStateStore>();
@@ -62,6 +63,7 @@ public sealed class CoreCoverageTests
             noOp.Object,
             "no-op",
             TimeSpan.FromMinutes(1),
+            timeProvider: null,
             _ => false));
         noOp.Verify(s => s.TryUpdateAsync(
             It.IsAny<string>(),
@@ -86,6 +88,7 @@ public sealed class CoreCoverageTests
             success.Object,
             "success",
             TimeSpan.FromMinutes(1),
+            timeProvider: null,
             state =>
             {
                 state.LastMessage = "updated";
@@ -107,6 +110,7 @@ public sealed class CoreCoverageTests
             contention.Object,
             "contended",
             TimeSpan.FromMinutes(1),
+            timeProvider: null,
             _ => true));
     }
 

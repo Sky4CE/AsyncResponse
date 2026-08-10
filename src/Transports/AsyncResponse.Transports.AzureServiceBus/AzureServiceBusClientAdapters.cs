@@ -68,6 +68,12 @@ internal sealed class AzureServiceBusSenderAdapter(ServiceBusSender inner) : IAz
             CorrelationId = message.CorrelationId
         };
 
+        // Native delayed delivery: the broker holds a scheduled message and enqueues it at the
+        // requested instant — the message survives restarts on the broker, unlike any client-side
+        // timer.
+        if (message.ScheduledEnqueueTime is { } scheduledEnqueueTime)
+            serviceBusMessage.ScheduledEnqueueTime = scheduledEnqueueTime;
+
         foreach (var property in message.ApplicationProperties)
             serviceBusMessage.ApplicationProperties[property.Key] = property.Value;
 
@@ -151,7 +157,8 @@ internal sealed record AzureServiceBusOutboundMessage(
     string Body,
     string MessageId,
     string? CorrelationId,
-    IReadOnlyDictionary<string, object?> ApplicationProperties);
+    IReadOnlyDictionary<string, object?> ApplicationProperties,
+    DateTimeOffset? ScheduledEnqueueTime = null);
 
 internal sealed record AzureServiceBusTransportDelivery(
     string Queue,

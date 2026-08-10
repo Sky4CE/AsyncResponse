@@ -154,9 +154,10 @@ internal sealed class SqlServerTransportStore
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, notify: true, cancellationToken, delay).ConfigureAwait(false);
         await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -233,7 +234,8 @@ internal sealed class SqlServerTransportStore
         IReadOnlyDictionary<string, string>? headers,
         string? deadLetterReason,
         bool notify,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -241,17 +243,27 @@ internal sealed class SqlServerTransportStore
         // Insert-if-absent keeps a retried publish idempotent. The UPDLOCK/HOLDLOCK hints make the
         // existence check and the insert atomic; a concurrent same-id insert that still slips through
         // surfaces as a duplicate-key error, which is treated as success below.
+        // Native delayed delivery: available_at gates the claim query, computed on the DATABASE
+        // clock (SYSUTCDATETIME + delay) so client clock skew cannot shift the due time.
         command.CommandText =
-            $"""
-            INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-            SELECT @id, @queue, @payload_json, @headers_json, @dead_letter_reason
-            WHERE NOT EXISTS (SELECT 1 FROM {MessageTable} WITH (UPDLOCK, HOLDLOCK) WHERE id = @id);
-            """;
+            delay is null
+                ? $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
+                  SELECT @id, @queue, @payload_json, @headers_json, @dead_letter_reason
+                  WHERE NOT EXISTS (SELECT 1 FROM {MessageTable} WITH (UPDLOCK, HOLDLOCK) WHERE id = @id);
+                  """
+                : $"""
+                  INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason, available_at)
+                  SELECT @id, @queue, @payload_json, @headers_json, @dead_letter_reason, {AddMilliseconds("@available_delay_ms")}
+                  WHERE NOT EXISTS (SELECT 1 FROM {MessageTable} WITH (UPDLOCK, HOLDLOCK) WHERE id = @id);
+                  """;
         command.Parameters.AddWithValue("@id", id);
         command.Parameters.AddWithValue("@queue", queue);
         command.Parameters.AddWithValue("@payload_json", payload);
         command.Parameters.AddWithValue("@headers_json", AsyncResponseJson.Serialize(headers ?? EmptyHeaders));
         command.Parameters.AddWithValue("@dead_letter_reason", (object?)deadLetterReason ?? DBNull.Value);
+        if (delay is { } pending)
+            command.Parameters.AddWithValue("@available_delay_ms", (long)pending.TotalMilliseconds);
 
         try
         {

@@ -87,6 +87,7 @@ that same options object.
 | `ExecutionLeaseDuration` | 1 minute | How long one store lease owns a flow execution before another replica may take over after owner loss. |
 | `ExecutionLeaseRenewInterval` | 20 seconds | Renewal cadence; must be positive and shorter than `ExecutionLeaseDuration`. |
 | `ProgressPersistenceInterval` | 1 second | Minimum interval between writes caused only by progress reports. Faster updates are coalesced into the next checkpoint/outcome; zero writes every report. |
+| `TimerInProcessThreshold` | 10 seconds | Timer remainders (`flow.DelayAsync`) at or under this wait in process under the execution lease; longer remainders suspend the run behind a delayed wake-up job when the transport supports native delayed delivery. Zero always prefers suspension; on transports without delayed delivery every timer waits in process regardless. See [timers-and-scheduling.md](timers-and-scheduling.md). |
 | `MaxStateBytes` | DynamoDB 350 000 · Cosmos 1 900 000 · MongoDB 15 000 000 · `null` (unlimited) elsewhere | Serialized-ledger size budget checked on every create/checkpoint. An oversized write fails with a diagnosable error (flow id, size, limit) instead of the raw provider error, before the run burns redeliveries — defaults sit under each provider's hard item/document cap. Keep large payloads in your own storage and pass references (see the ledger-size note in [durable-flows.md](durable-flows.md#child-flows)). |
 
 Configure these on the selected store, for example:
@@ -98,7 +99,14 @@ Configure these on the selected store, for example:
     options.ExecutionLeaseDuration = TimeSpan.FromMinutes(1); // common engine option
     options.ConnectionString = connectionString;              // PostgreSQL store option
     options.SchemaName = "public";
-});
+})
+// Cron-scheduled flows are registered on the same builder: five-field cron (validated here),
+// optional time zone, and a deterministic input factory (it must produce the same value on
+// every replica for the same occurrence).
+.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+    "nightly-report", "0 6 * * *",
+    occurrence => new ReportInput(occurrence),
+    schedule => schedule.TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Europe/Berlin"));
 ```
 
 ### Provider-specific options

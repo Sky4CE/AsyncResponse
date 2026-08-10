@@ -237,6 +237,7 @@ public class DurableFlowRecoveryHardeningTests
                 _store,
                 flowId,
                 TimeSpan.FromMinutes(5),
+            timeProvider: null,
                 state =>
                 {
                     var step = state.Steps![StepName];

@@ -13,6 +13,7 @@ atomic creation, optimistic revisions, and a renewable execution lease.
 - [The rules (there are only three)](#the-rules-there-are-only-three)
 - [Injecting your own services](#injecting-your-own-services-signalr-audit-metrics)
 - [Child flows](#child-flows)
+- [Durable timers and scheduling](#durable-timers-and-scheduling)
 - [What happens when things die](#what-happens-when-things-die)
 - [Editing a flow](#editing-a-flow) · [Compensation](#compensation)
 - [Cookbook: patterns from production flows](#cookbook-patterns-from-production-flows)
@@ -55,6 +56,10 @@ public sealed class TenantProvisioningFlow(
                 }
                 return true;
             });
+
+        // A durable timer: the run SUSPENDS for six hours — no worker, lease, or memory held —
+        // and a crash mid-sleep resumes the remainder. See "Durable timers and scheduling" below.
+        await flow.DelayAsync("settle", TimeSpan.FromHours(6));
 
         await flow.StepAsync("notify", () => _notifier.SendProvisionedAsync(input.TenantId));
     }
@@ -221,6 +226,16 @@ transport (including the in-memory transport used in tests) can starve the child
 primitive parks the parent first, so parent → child → grandchild chains are deadlock-free under the
 same worker.
 
+## Durable timers and scheduling
+
+Flows sleep durably — `await flow.DelayAsync("payment-window", TimeSpan.FromDays(3))` — and
+flows start on cron schedules (`WithScheduledFlow<TFlow, TInput>("nightly", "0 6 * * *", …)`)
+with exactly-once occurrences across replicas and no leader election. The due time is a
+checkpoint (crashes resume the remainder, never restart the delay), and on transports with
+native delayed delivery a sleeping run suspends entirely — no worker, no lease, no memory while
+it sleeps. The full design, the per-transport delayed-delivery matrix, cron syntax, and DST
+semantics live in [durable timers, delayed jobs, and cron-scheduled flows](timers-and-scheduling.md).
+
 ## What happens when things die
 
 The flow body always runs from the top; checkpoints make re-running cheap and safe. That single
@@ -312,45 +327,48 @@ app ships exactly this (`/durable-flow`, see [sample.md](sample.md)).
 
 ## Testing your flows
 
-Test the real thing: the in-memory channel + transport give you the full engine in-process, so a
-flow test is *start → answer the triggers → assert the state* — no mocks of library internals.
+Use [`AsyncResponse.Testing`](testing.md): a `FlowTestHarness` that runs the complete engine
+in-process on a virtual clock, observes every step through the executor's observer seam, and
+scripts the remote side — with **zero instrumentation in the flow class under test**:
 
 ```csharp
-var services = new ServiceCollection();
-services.AddSingleton<IWorkspaceService, FakeWorkspaceService>();
-services.AddSingleton<IMigrationService, FakeMigrationService>();
-services.AddSingleton<IImportService, FakeImportService>();
-services.AddSingleton<INotifier, FakeNotifier>(); // ordinary DI: fakes replace production services
-services.AddScoped<TenantProvisioningFlow>();
-services.AddAsyncResponse()
-    .WithInMemoryChannel()
-    .WithInMemoryTransport()
-    .WithInMemoryDurableFlows();
-await using var provider = services.BuildServiceProvider();
+await using var harness = await FlowTestHarness.StartAsync(options =>
+{
+    options.ConfigureServices = services => services.AddSingleton<IMigrationService>(fake);
+    options.ConfigureAsyncResponse = b => b.WithDurableFlow<TenantProvisioningFlow, ProvisioningInput>();
+});
 
-var flows = provider.GetRequiredService<IDurableFlows>();
-var executor = provider.GetRequiredService<IDurableFlowExecutor>();
-var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+var run = await harness.StartFlowAsync<TenantProvisioningFlow, ProvisioningInput>(new(7));
 
-var flowId = await flows.StartAsync<TenantProvisioningFlow, ProvisioningInput>(new(7));
-var run = executor.ExecuteAsync(flowId);                    // drive directly in unit tests
-await publisher.SetResponse(new MigrationResult { … }, capturedCorrelationId);
-await run;
+await run.WaitForAwaitingStepAsync("run-migration");            // durably parked, cid observed
+await run.ReplyAsync(new MigrationResult { Status = MigrationStatus.Completed });
 
-Assert.Equal(FlowRunStatus.Succeeded, (await flows.GetStateAsync(flowId))!.Status);
+await run.WaitForTimerStepAsync("settle");                      // a durable timer parks the run…
+await harness.AdvanceAsync(TimeSpan.FromHours(6));              // …virtual time skips it
+
+Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+Assert.Equal(1, run.StepExecutions("create-workspace"));        // exactly-once, asserted
 ```
 
-Crash-resume is testable deterministically: throw from a step (or seed a
-`PendingCorrelationId` breadcrumb), run the executor again, and assert every step executed
-exactly once. The library's own suites are the reference:
-[`DurableFlowScenarioTests`](../tests/AsyncResponse.Tests/DurableFlowScenarioTests.cs) (a
-production-shaped pipeline with a crash-at-every-checkpoint matrix, subset runs, catch-and-continue,
-and injected notifications), [`DurableChildFlowTests`](../tests/AsyncResponse.Tests/DurableChildFlowTests.cs)
-(single-worker parent → child → grandchild execution plus the old hand-rolled starvation
-regression), integration tests running the same flow against **every durable channel** (Redis,
-NATS, PostgreSQL, SQL Server, MongoDB) over real infrastructure, and a stress-harness storm asserting
-exactly-once step execution across hundreds of concurrent flows. For pure unit tests of flow
-logic, `IDurableFlowContext` is an interface you can fake outright.
+Crash-resume is a first-class assertion: `harness.CrashBeforeStep("swap")` /
+`CrashAfterStep("swap")` inject a one-shot `SimulatedCrashException` at the exact checkpoint
+boundary, the transport redelivers (backoff on the virtual clock), and the run resumes — run a
+`[Theory]` over every step for the crash-at-every-checkpoint matrix. Production-sized timeouts,
+lost-subscriber recovery across `SimulateRestartAsync()`, timers, and cron schedules are all
+deterministic; the guide is [Testing AsyncResponse applications](testing.md).
+
+The library's own suites are the reference:
+[`FlowTestHarnessShowcaseTests`](../tests/AsyncResponse.Tests/FlowTestHarnessShowcaseTests.cs)
+(a production-shaped pipeline — scripted replies, progress-aware steps, a timer, a remote
+failure, and the crash matrix),
+[`DurableFlowTimerTests`](../tests/AsyncResponse.Tests/DurableFlowTimerTests.cs) (timer suspend /
+in-process / remainder semantics),
+[`DurableFlowScenarioTests`](../tests/AsyncResponse.Tests/DurableFlowScenarioTests.cs) (the same
+pipeline hand-wired without the harness — also a guide to what the harness abstracts),
+[`DurableChildFlowTests`](../tests/AsyncResponse.Tests/DurableChildFlowTests.cs), integration
+tests running the same flow against **every durable channel** over real infrastructure, and a
+stress-harness storm asserting exactly-once step execution across hundreds of concurrent flows.
+For pure unit tests of flow logic, `IDurableFlowContext` is an interface you can fake outright.
 
 ## Observing runs
 
@@ -465,11 +483,12 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
   **breadcrumb**, then runs your trigger. That ordering is the whole trick: "breadcrumb exists"
   implies "someone is listening", so a crash on either side of the send re-attaches or safely
   restarts — never a lost run, never a double-send.
-- On durable channels, every awaited step auto-registers the flow executor's payload-recovery and
-  failure methods as lost-subscriber callbacks — the same recovery machinery as
-  [recovery.md](recovery.md), with its at-least-once, idempotency-required contract. (On the
-  in-memory channel these callbacks don't exist; flows still checkpoint and re-attach, with
-  process-lifetime durability.)
+- Every awaited step auto-registers the flow executor's payload-recovery and failure methods as
+  lost-subscriber callbacks — the same recovery machinery as [recovery.md](recovery.md), with its
+  at-least-once, idempotency-required contract. The in-memory channel registers them too (its
+  recovery store is process-local, so they cover waiter loss within one process lifetime and the
+  simulated restarts of [AsyncResponse.Testing](testing.md); durable channels extend the same
+  contract across real restarts).
 - Starting a flow enqueues a worker job carrying only the flow id; resume, redelivery, and
   operator kicks all re-enqueue that same job. `StartAsync` with a caller-supplied `flowId` is
   atomically idempotent for the same flow type and semantically identical input. Conflicting reuse
@@ -490,10 +509,12 @@ The API encodes the *checkpointed-flow pattern*, extracted from years of product
 | Progress from remote steps | First-class (`until` sees every message; `ReportProgressAsync`) | Signals/queries — more ceremony |
 | Hotfixing in-flight runs | Resume into current code; no determinism constraints | Version/patch workflows so old histories still replay |
 | Compensation | Explicit: you write compensating steps; the state tells you what completed | Saga frameworks track and run compensations automatically |
-| Durable timers (weeks), cron, human tasks | Per-step timeouts up to `StateExpiry`; longer cadence belongs to your scheduler | First-class durable timers |
+| Durable timers, cron | First-class: `flow.DelayAsync` sleeps (a suspended run holds no worker or memory) and replica-safe `WithScheduledFlow` cron — see [timers-and-scheduling.md](timers-and-scheduling.md) | First-class durable timers |
+| Human tasks | Model as an awaited step (the approval UI publishes the response); no dedicated task-queue/assignment primitives | First-class human-task activities in some engines |
+| Time-skipping tests | First-class: `AsyncResponse.Testing` virtual clock, scripted replies, crash injection — see [testing.md](testing.md) | Temporal's time-skipping test server; varies by engine |
 | Extra infrastructure | None new — the flow ledger lives in a database/store you already run | An engine cluster/service to operate and upgrade |
 
 Reach for an engine when you need engine-*owned* semantics: automatically derived compensation
-graphs, months-long durable timers, human-approval tasks, or replayable audit histories. For
-request/response orchestration — even at dozens of steps — durable flows are smaller,
-transparent, and hotfix-friendly.
+graphs, human-task assignment and escalation, or replayable audit histories. For
+request/response orchestration — even at dozens of steps, sleeps included — durable flows are
+smaller, transparent, and hotfix-friendly.

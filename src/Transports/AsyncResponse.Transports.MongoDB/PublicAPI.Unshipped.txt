@@ -85,8 +85,10 @@ AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.RedeliveryDelay.get ->
 AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.RedeliveryDelay.set -> void
 AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions.UseAckAfterEnqueue(int backgroundWorkerCount, int backgroundQueueCapacity, System.TimeSpan? backgroundDrainTimeout = null) -> AsyncResponse.Transports.MongoDB.MongoDbSubscriberOptions!
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport
+AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.MongoDbWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! options, MongoDB.Driver.IMongoDatabase! database) -> void
 AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+AsyncResponse.Transports.MongoDB.MongoDbWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions
 const AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions.TransportName = "MongoDB" -> string!
 static Microsoft.Extensions.DependencyInjection.MongoDbAsyncResponseTransportServiceCollectionExtensions.WithMongoDbTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.MongoDB.MongoDbAsyncResponseTransportOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

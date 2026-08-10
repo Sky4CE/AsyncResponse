@@ -44,6 +44,16 @@ public class DurableFlowOptions
     public TimeSpan ProgressPersistenceInterval { get; set; } = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// Timer remainders at or under this threshold wait in process (under the execution lease)
+    /// instead of suspending the run for a delayed wake-up job — a broker round-trip for a
+    /// two-second sleep costs more than it frees. Longer remainders suspend when the registered
+    /// transport supports native delayed delivery (<see cref="IDelayedWorkerTransport"/>); on
+    /// transports without it every timer waits in process regardless of this value. Zero always
+    /// prefers suspension. Default: 10 seconds.
+    /// </summary>
+    public TimeSpan TimerInProcessThreshold { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
     /// Accepts the risk of running the worker subscriber in early ACK (<c>AckAfterEnqueue</c>)
     /// while durable flows are registered, suppressing the startup error. Durable-flow wake-ups
     /// ride the worker queue and rely on broker redelivery for crash recovery; with early ACK, a

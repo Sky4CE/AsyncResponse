@@ -18,9 +18,12 @@ namespace AsyncResponse;
 /// context propagator.
 /// </para>
 /// </summary>
-public sealed class InMemoryWorkerTransport : IWorkerTransport
+public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTransport
 {
     private readonly Channel<QueuedJob> _queue;
+    private readonly TimeProvider _timeProvider;
+    private readonly object _delayedGate = new();
+    private readonly Dictionary<DelayedJob, ITimer> _delayedJobs = [];
     private int _outstanding;
     private volatile bool _draining;
 
@@ -31,10 +34,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     }
 
     /// <summary>Creates a transport with configured capacity and worker concurrency.</summary>
-    public InMemoryWorkerTransport(IOptions<InMemoryWorkerTransportOptions> options)
+    public InMemoryWorkerTransport(IOptions<InMemoryWorkerTransportOptions> options, TimeProvider? timeProvider = null)
     {
         Options = options.Value;
         Options.Validate();
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _queue = Channel.CreateBounded<QueuedJob>(new BoundedChannelOptions(Options.QueueCapacity)
         {
             SingleReader = Options.WorkerCount == 1,
@@ -46,6 +50,30 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
 
     internal ChannelReader<QueuedJob> Reader => _queue.Reader;
     internal InMemoryWorkerTransportOptions Options { get; }
+    internal ILogger? DrainLogger { get; set; }
+
+    /// <summary>Jobs accepted but not yet finished (queued + executing). Test-harness idle probe.</summary>
+    internal int OutstandingJobs => Volatile.Read(ref _outstanding);
+
+    /// <summary>
+    /// The delayed jobs currently waiting on their due-time timers. AsyncResponse.Testing snapshots
+    /// these before a simulated restart and re-publishes them into the next incarnation — modeling
+    /// a broker that retains scheduled messages across a redeploy.
+    /// </summary>
+    internal IReadOnlyList<WorkerJobEnvelope> SnapshotDelayedJobs()
+    {
+        lock (_delayedGate)
+        {
+            if (_delayedJobs.Count == 0)
+                return [];
+
+            var envelopes = new WorkerJobEnvelope[_delayedJobs.Count];
+            var index = 0;
+            foreach (var delayed in _delayedJobs.Keys)
+                envelopes[index++] = delayed.Envelope;
+            return envelopes;
+        }
+    }
 
     /// <summary>
     /// Begins the shutdown drain. Called by <see cref="InMemoryWorkerHost"/> when the host starts
@@ -54,10 +82,33 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
     /// enqueue follow-up work (a durable-flow parent wake-up, a recovery re-enqueue) that must not
     /// hit a closed channel — losing it would strand the dependent flow with no redelivery to
     /// recover it. The last finishing job completes the writer instead, once the transport is idle.
+    /// <para>
+    /// Pending DELAYED jobs are different: their due time may be days away, and holding shutdown
+    /// for them would hang the host. They are dropped with a warning — the in-memory transport is
+    /// process-local by contract, so delayed jobs share the process's lifetime. A durable flow
+    /// sleeping on such a wake-up must be resumed explicitly after restart (or use a broker
+    /// transport, whose delayed messages survive).
+    /// </para>
     /// </summary>
     internal void BeginShutdownDrain()
     {
         _draining = true;
+
+        KeyValuePair<DelayedJob, ITimer>[] pending;
+        lock (_delayedGate)
+        {
+            pending = [.. _delayedJobs];
+            _delayedJobs.Clear();
+        }
+
+        foreach (var (job, timer) in pending)
+        {
+            timer.Dispose();
+            DrainLogger?.LogWarning(
+                "Dropping delayed in-memory worker job {Target}.{Method} due at {NotBeforeUtc} at shutdown; in-memory delayed jobs do not survive the process. A durable flow waiting on this wake-up must be resumed explicitly after restart.",
+                job.Envelope.Call.ServiceInterfaceFullName, job.Envelope.Call.MethodName, job.Envelope.NotBeforeUtc);
+        }
+
         // Interlocked read pairs with the increment in PublishAsync: either this sees the
         // publisher's count (the finishing job completes the writer) or the publisher's write
         // lands before completion. Only a publish initiated after the transport is already idle
@@ -101,6 +152,104 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // IDelayedWorkerTransport
+
+    /// <inheritdoc/>
+    /// <remarks>The in-process timer wheel has no per-hop cap; delays are bounded only by the BCL timer ceiling.</remarks>
+    public TimeSpan MaxPublishDelay => TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
+    /// <inheritdoc/>
+    public Task PublishAsync(WorkerJobEnvelope job, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        if (delay <= TimeSpan.Zero)
+            return PublishAsync(job, cancellationToken);
+        if (delay > MaxPublishDelay)
+            throw new ArgumentOutOfRangeException(nameof(delay), delay, $"Delay must be at most {MaxPublishDelay.TotalDays:0.#} days (the .NET timer ceiling).");
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var activity = AsyncResponseDiagnostics.StartActivity(
+            "asyncresponse.worker.publish",
+            ActivityKind.Producer,
+            job.CorrelationId);
+        activity?.SetTag("asyncresponse.transport", "inmemory");
+        activity?.SetTag("asyncresponse.worker.delay_seconds", delay.TotalSeconds);
+        AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
+        AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+
+        var delayed = new DelayedJob(this, new QueuedJob(job, ExecutionContext.Capture()));
+        lock (_delayedGate)
+        {
+            if (_draining)
+            {
+                // Same contract as the shutdown drain below: delayed in-memory jobs share the
+                // process lifetime, and a publish racing shutdown is dropped loudly, not queued
+                // onto a channel that will complete underneath it.
+                DrainLogger?.LogWarning(
+                    "Rejecting delayed in-memory worker job {Target}.{Method} published during shutdown; in-memory delayed jobs do not survive the process.",
+                    job.Call.ServiceInterfaceFullName, job.Call.MethodName);
+                throw new InvalidOperationException("The in-memory worker transport is shutting down and no longer accepts delayed jobs.");
+            }
+
+            // The timer is created inside the gate so a concurrent drain either sees it in the map
+            // (and disposes it) or the publish observed _draining above. One-shot; Fire removes it.
+            var timer = _timeProvider.CreateTimer(static state => ((DelayedJob)state!).Fire(), delayed, delay, Timeout.InfiniteTimeSpan);
+            _delayedJobs.Add(delayed, timer);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void FireDelayed(DelayedJob delayed)
+    {
+        ITimer? timer;
+        lock (_delayedGate)
+        {
+            if (!_delayedJobs.Remove(delayed, out timer))
+                return; // The shutdown drain already claimed (and dropped) it.
+        }
+
+        timer.Dispose();
+
+        // Count as outstanding BEFORE the write, mirroring the immediate path, so a drain that
+        // starts between the fire and the write still waits for this job.
+        Interlocked.Increment(ref _outstanding);
+        _ = WriteFiredAsync(delayed.Queued);
+    }
+
+    private async Task WriteFiredAsync(QueuedJob queued)
+    {
+        try
+        {
+            await _queue.Writer.WriteAsync(queued).ConfigureAwait(false);
+        }
+        catch (ChannelClosedException)
+        {
+            Interlocked.Decrement(ref _outstanding);
+            DrainLogger?.LogWarning(
+                "Dropping delayed in-memory worker job {Target}.{Method}: its due time fired after the transport completed its shutdown drain.",
+                queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Decrement(ref _outstanding);
+            DrainLogger?.LogError(ex,
+                "Failed to enqueue fired delayed in-memory worker job {Target}.{Method}.",
+                queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
+        }
+    }
+
+    /// <summary>Identity handle for one scheduled delayed job (reference equality keys the timer map).</summary>
+    private sealed class DelayedJob(InMemoryWorkerTransport owner, QueuedJob queued)
+    {
+        public QueuedJob Queued { get; } = queued;
+        public WorkerJobEnvelope Envelope => Queued.Job;
+
+        public void Fire() => owner.FireDelayed(this);
     }
 
     /// <summary>A queued job paired with the ambient execution context captured when it was enqueued.</summary>
@@ -166,11 +315,14 @@ public sealed class InMemoryWorkerTransportOptions
 internal sealed class InMemoryWorkerHost(
     InMemoryWorkerTransport _transport,
     WorkerJobExecutor _executor,
-    ILogger<InMemoryWorkerHost> _logger) : BackgroundService
+    ILogger<InMemoryWorkerHost> _logger,
+    TimeProvider? _timeProvider = null) : BackgroundService
 {
     /// <summary>Runs this background operation until cancellation is requested.</summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _transport.DrainLogger = _logger;
+
         // Shutdown quiesces instead of cancelling the readers: accepted jobs were promised
         // in-process execution, so the workers drain the queue — including follow-up work those
         // jobs enqueue while draining — and the writer completes only once the transport is idle.
@@ -255,7 +407,7 @@ internal sealed class InMemoryWorkerHost(
                 _logger.LogWarning(ex,
                     "In-memory worker job {Target}.{Method} failed on attempt {Attempt}; retrying in {Delay}.",
                     queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName, attempt, delay);
-                await Task.Delay(delay).ConfigureAwait(false);
+                await Task.Delay(delay, _timeProvider ?? TimeProvider.System).ConfigureAwait(false);
             }
         }
     }

@@ -58,8 +58,11 @@ returns `KeepWaiting` — e.g. `public RecoveryAction OnRecovery() => Status == 
 RecoveryAction.Fail : RecoveryAction.Resume;`.
 
 The default (no override) is `Fail`, so a response can never resume the happy path by omission.
-Durable channels require the override when you register recovery callbacks — they fail fast at
-waiter creation if it is missing; the in-memory channel, which can't survive a redeploy, doesn't.
+Every channel requires the override when you register recovery callbacks — waiter creation fails
+fast if it is missing. That includes the in-memory channel: it implements the same recoverable
+contract against its process-local store (recovery there spans waiter loss within one process
+lifetime — and the simulated restarts of [AsyncResponse.Testing](testing.md) — rather than a real
+process exit), so a payload that passes in tests passes unchanged on Redis.
 
 Recovery classification is **independent of your `Until` predicate** (which owns live completion).
 They answer different questions: "what does this result do to the flow?" versus "is the operation

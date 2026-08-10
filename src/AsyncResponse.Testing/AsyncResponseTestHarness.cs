@@ -1,0 +1,327 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace AsyncResponse.Testing;
+
+/// <summary>Options for <see cref="AsyncResponseTestHarness.StartAsync"/>.</summary>
+public sealed class AsyncResponseTestHarnessOptions
+{
+    /// <summary>The virtual clock's start instant. Default: <see cref="VirtualTimeProvider.DefaultStartTime"/>.</summary>
+    public DateTimeOffset? StartTime { get; set; }
+
+    /// <summary>Extra service registrations (fakes for the services your flows and triggers inject).</summary>
+    public Action<IServiceCollection>? ConfigureServices { get; set; }
+
+    /// <summary>
+    /// Continues the <c>AddAsyncResponse()</c> fluent chain: register flows
+    /// (<c>WithDurableFlow</c>), schedules (<c>WithScheduledFlow</c>), context propagators, …
+    /// The in-memory channel, transport, and flow store are already registered.
+    /// </summary>
+    public Action<AsyncResponseRegistrationBuilder>? ConfigureAsyncResponse { get; set; }
+
+    /// <summary>In-memory channel options (timeouts, recovery expiry).</summary>
+    public Action<InMemoryAsyncResponseOptions>? Channel { get; set; }
+
+    /// <summary>In-memory worker transport options (concurrency, retry budget).</summary>
+    public Action<InMemoryWorkerTransportOptions>? Transport { get; set; }
+
+    /// <summary>Durable-flow engine options (lease durations, step timeout, timer threshold).</summary>
+    public Action<DurableFlowOptions>? DurableFlows { get; set; }
+
+    /// <summary>
+    /// Bound on how long harness idle-waits spin in <em>real</em> time before failing the test —
+    /// the safety net that turns a hang into a diagnosable failure. Default: 10 seconds.
+    /// </summary>
+    public TimeSpan RealTimeGuard { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Flow-execution observers installed into every incarnation (the current one and each
+    /// simulated restart). <see cref="FlowTestHarness"/> installs its probe here.
+    /// </summary>
+    public IList<IDurableFlowExecutionObserver> FlowObservers { get; } = [];
+}
+
+/// <summary>
+/// Hosts the complete AsyncResponse engine in process for tests: the in-memory channel (with full
+/// lost-subscriber recovery), the in-memory worker transport (with native delayed delivery), the
+/// in-memory durable-flow store, and every background service — all running on a
+/// <see cref="VirtualTimeProvider"/>. Production-sized timeouts, leases, timers, and cron
+/// schedules elapse only when the test calls <see cref="AdvanceAsync"/>, so nothing in a test ever
+/// sleeps for real.
+/// <para>
+/// <see cref="SimulateRestartAsync"/> models a redeploy: the service provider (and with it every
+/// live waiter and in-flight execution context) is discarded and rebuilt, while the recovery
+/// store, the flow ledgers, and scheduled (delayed) worker jobs survive — the durable state a
+/// broker- and store-backed deployment would retain. Responses published after the restart route
+/// through the real lost-subscriber recovery machinery. Waiter tasks obtained before the restart
+/// never complete (their process is gone — do not await them across a restart).
+/// </para>
+/// <para>For flow-focused tests, <see cref="FlowTestHarness"/> wraps this with step-level tooling.</para>
+/// </summary>
+public sealed class AsyncResponseTestHarness : IAsyncDisposable
+{
+    private readonly AsyncResponseTestHarnessOptions _options;
+    private readonly InMemoryRecoveryStateStore _recoveryStore;
+    private readonly InMemoryFlowStateStore _flowStore;
+    private readonly IDurableFlowExecutionObserver[] _observers;
+    private ServiceProvider _provider = null!;
+    private IHostedService[] _started = [];
+    private bool _disposed;
+
+    private AsyncResponseTestHarness(AsyncResponseTestHarnessOptions options)
+    {
+        _options = options;
+        _observers = [.. options.FlowObservers];
+        Clock = new VirtualTimeProvider(options.StartTime ?? VirtualTimeProvider.DefaultStartTime);
+        _recoveryStore = new InMemoryRecoveryStateStore(Clock);
+        _flowStore = new InMemoryFlowStateStore(Clock);
+    }
+
+    /// <summary>Builds the engine and starts its background services.</summary>
+    public static async Task<AsyncResponseTestHarness> StartAsync(Action<AsyncResponseTestHarnessOptions>? configure = null)
+    {
+        var options = new AsyncResponseTestHarnessOptions();
+        configure?.Invoke(options);
+
+        var harness = new AsyncResponseTestHarness(options);
+        harness.BuildProvider();
+        try
+        {
+            await harness.StartHostedServicesAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            await harness.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
+        return harness;
+    }
+
+    /// <summary>The virtual clock every engine component runs on.</summary>
+    public VirtualTimeProvider Clock { get; }
+
+    /// <summary>The current incarnation's service provider (rebuilt by <see cref="SimulateRestartAsync"/>).</summary>
+    public IServiceProvider Services => _provider;
+
+    /// <summary>The fluent waiter builder (recoverable: the in-memory channel supports lost-subscriber callbacks).</summary>
+    public IRecoverableAsyncResponseBuilder Builder => _provider.GetRequiredService<IRecoverableAsyncResponseBuilder>();
+
+    /// <summary>The response publisher — the test's stand-in for the remote systems that answer requests.</summary>
+    public IAsyncResponsePublisher Publisher => _provider.GetRequiredService<IAsyncResponsePublisher>();
+
+    /// <summary>Durable-flow starter/operations surface.</summary>
+    public IDurableFlows Flows => _provider.GetRequiredService<IDurableFlows>();
+
+    /// <summary>The flow executor, for driving runs directly instead of through the worker queue.</summary>
+    public IDurableFlowExecutor FlowExecutor => _provider.GetRequiredService<IDurableFlowExecutor>();
+
+    private InMemoryWorkerTransport Transport => _provider.GetRequiredService<InMemoryWorkerTransport>();
+
+    /// <summary>Publishes a response payload to a correlation id (what the remote system would do).</summary>
+    public Task PublishAsync<T>(T response, string correlationId) where T : IAsyncResponsePayload
+        => Publisher.SetResponse(response, correlationId);
+
+    /// <summary>Publishes an exception to a correlation id (a remote failure).</summary>
+    public Task PublishExceptionAsync(Exception exception, string correlationId)
+        => Publisher.SetException(exception, correlationId);
+
+    /// <summary>
+    /// Advances virtual time by <paramref name="delta"/>, stepping timer-by-timer and letting the
+    /// worker pipeline settle between steps, so work a fired timer enqueues (a durable-timer
+    /// wake-up that re-arms the next chunk, a retry backoff that re-executes) is honored within
+    /// this same advance.
+    /// </summary>
+    public async Task AdvanceAsync(TimeSpan delta)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(delta, TimeSpan.Zero);
+        var target = Clock.GetUtcNow() + delta;
+
+        while (true)
+        {
+            await SettleAsync().ConfigureAwait(false);
+
+            var next = Clock.NextTimerDueAt;
+            if (next is null || next > target)
+            {
+                Clock.AdvanceTo(target);
+                break;
+            }
+
+            Clock.AdvanceTo(next.Value);
+        }
+
+        await SettleAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Waits (bounded by <see cref="AsyncResponseTestHarnessOptions.RealTimeGuard"/> of real time)
+    /// until the in-memory worker transport has no queued or executing jobs. Do not call while a
+    /// flow is parked on an in-process virtual-time wait — that job stays outstanding until the
+    /// clock advances; await the flow's outcome instead.
+    /// </summary>
+    public async Task WaitForWorkerIdleAsync()
+    {
+        var guard = TimeProvider.System.GetUtcNow() + _options.RealTimeGuard;
+        while (Transport.OutstandingJobs != 0)
+        {
+            if (TimeProvider.System.GetUtcNow() > guard)
+            {
+                throw new TimeoutException(
+                    $"The in-memory worker transport still has {Transport.OutstandingJobs} outstanding job(s) after {_options.RealTimeGuard} of real time. " +
+                    "A job may be parked on virtual time (advance the clock) or genuinely stuck.");
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Simulates a redeploy/restart. Durable state survives: recovery registrations, flow ledgers,
+    /// and scheduled (delayed) worker jobs — re-published into the new incarnation with their
+    /// remaining virtual delay, as a broker would retain them. Everything process-bound dies: live
+    /// waiters, subscriptions, in-flight executions (their leases expire or are taken over through
+    /// the normal contention machinery). Queued immediate jobs are drained gracefully before the
+    /// old incarnation stops, bounded by the real-time guard.
+    /// </summary>
+    /// <param name="whileDown">
+    /// Runs between the old incarnation stopping and the new one starting — with no engine
+    /// running. Advance the clock here to simulate an outage: <c>Clock.Advance(TimeSpan.FromHours(4))</c>
+    /// makes cron schedules skip the occurrences that fell into the downtime, exactly as a real
+    /// outage would.
+    /// </param>
+    public async Task SimulateRestartAsync(Action? whileDown = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var pendingDelayed = Transport.SnapshotDelayedJobs();
+        await StopHostedServicesAsync().ConfigureAwait(false);
+        await _provider.DisposeAsync().ConfigureAwait(false);
+
+        whileDown?.Invoke();
+
+        BuildProvider();
+        await StartHostedServicesAsync().ConfigureAwait(false);
+
+        if (pendingDelayed.Count > 0)
+        {
+            var transport = (IDelayedWorkerTransport)Transport;
+            var now = Clock.GetUtcNow().UtcDateTime;
+            foreach (var job in pendingDelayed)
+            {
+                var remaining = job.NotBeforeUtc is { } notBefore && notBefore > now
+                    ? notBefore - now
+                    : TimeSpan.Zero;
+                if (remaining > TimeSpan.Zero)
+                    await transport.PublishAsync(job, remaining).ConfigureAwait(false);
+                else
+                    await ((IWorkerTransport)transport).PublishAsync(job).ConfigureAwait(false);
+            }
+        }
+    }
+
+    internal TimeSpan RealTimeGuard => _options.RealTimeGuard;
+
+    private void BuildProvider()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+
+        // The engine clock, the shared durable state, and the harness observers go in FIRST so the
+        // TryAdd registrations inside AddAsyncResponse()/With*() adopt them.
+        services.AddSingleton<TimeProvider>(Clock);
+        services.AddSingleton(_recoveryStore);
+        services.AddSingleton(_flowStore);
+        foreach (var observer in _observers)
+            services.AddSingleton<IDurableFlowExecutionObserver>(observer);
+
+        _options.ConfigureServices?.Invoke(services);
+
+        var builder = services.AddAsyncResponse()
+            .WithInMemoryChannel(channel =>
+            {
+                _options.Channel?.Invoke(channel);
+            })
+            .WithInMemoryTransport(transport =>
+            {
+                _options.Transport?.Invoke(transport);
+            })
+            .WithInMemoryDurableFlows(flows =>
+            {
+                _options.DurableFlows?.Invoke(flows);
+            });
+
+        _options.ConfigureAsyncResponse?.Invoke(builder);
+
+        _provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
+    }
+
+    private async Task StartHostedServicesAsync()
+    {
+        var hosted = _provider.GetServices<IHostedService>().ToArray();
+        foreach (var service in hosted)
+            await service.StartAsync(CancellationToken.None).ConfigureAwait(false);
+        _started = hosted;
+    }
+
+    private async Task StopHostedServicesAsync()
+    {
+        // Bounded by the real-time guard: a graceful stop can legitimately hang when a drained job
+        // is parked on virtual time; the restart then proceeds like a hard crash and the lease
+        // machinery reconciles the leftover execution.
+        using var cutoff = new CancellationTokenSource(_options.RealTimeGuard);
+        foreach (var service in Enumerable.Reverse(_started))
+        {
+            try
+            {
+                await service.StopAsync(cutoff.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Hard-crash semantics for whatever did not stop in time.
+            }
+        }
+
+        _started = [];
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        await StopHostedServicesAsync().ConfigureAwait(false);
+        await _provider.DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Yields briefly so pool continuations (worker dispatch, chained timer arming) settle. The
+    /// budget is deliberately small — it runs between every timer step of an advance — and grows
+    /// only while the worker transport is visibly busy.
+    /// </summary>
+    private async Task SettleAsync()
+    {
+        for (var round = 0; round < 3; round++)
+        {
+            await Task.Yield();
+            await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
+        }
+
+        // Busy workers may be about to arm the next timer (a flow re-suspending, a retry backoff
+        // rescheduling). Grant them a short, BOUNDED grace — a job parked on an in-process
+        // virtual-time wait legitimately stays outstanding until the clock advances, so this must
+        // never block on idleness itself.
+        var busyCutoff = TimeProvider.System.GetUtcNow() + TimeSpan.FromMilliseconds(25);
+        while (Transport.OutstandingJobs != 0 && TimeProvider.System.GetUtcNow() < busyCutoff)
+        {
+            var next = Clock.NextTimerDueAt;
+            await Task.Delay(TimeSpan.FromMilliseconds(1)).ConfigureAwait(false);
+            if (next != Clock.NextTimerDueAt)
+                return; // New timer armed — the advance loop re-evaluates immediately.
+        }
+    }
+}

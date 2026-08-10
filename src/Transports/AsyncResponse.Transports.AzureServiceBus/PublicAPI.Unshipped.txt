@@ -1,7 +1,7 @@
 #nullable enable
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
-AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterEnqueue = 1 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode.AckAfterHandlerCompletes = 0 -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAckMode
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AddReplyTarget(string! name, string! queue) -> AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.AzureServiceBusAsyncResponseOptions() -> void
@@ -72,7 +72,9 @@ AsyncResponse.Transports.AzureServiceBus.AzureServiceBusSubscriberOptions.UseAck
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.AzureServiceBusWorkerTransport(Microsoft.Extensions.Options.IOptions<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! options) -> void
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.DisposeAsync() -> System.Threading.Tasks.ValueTask
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.MaxPublishDelay.get -> System.TimeSpan
 AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
-const AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.TransportName = "AzureServiceBus" -> string!
+AsyncResponse.Transports.AzureServiceBus.AzureServiceBusWorkerTransport.PublishAsync(AsyncResponse.WorkerJobEnvelope! job, System.TimeSpan delay, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 Microsoft.Extensions.DependencyInjection.AzureServiceBusAsyncResponseServiceCollectionExtensions
+const AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions.TransportName = "AzureServiceBus" -> string!
 static Microsoft.Extensions.DependencyInjection.AzureServiceBusAsyncResponseServiceCollectionExtensions.WithAzureServiceBusTransport(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOptions!>! configure) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

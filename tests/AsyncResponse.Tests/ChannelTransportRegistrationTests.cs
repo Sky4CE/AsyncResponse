@@ -45,8 +45,12 @@ public class ChannelTransportRegistrationTests
         Assert.Same(store, scanner);
         Assert.IsType<InMemoryRecoveryStateStore>(store);
 
-        Assert.Null(provider.GetService<IRecoverableAsyncResponseBuilder>());
-        Assert.Null(provider.GetService<IRecoverableAsyncResponseSubscriber>());
+        // The in-memory channel exposes the full recoverable surface (same registrations as the
+        // durable channel packages), backed by the process-local recovery store.
+        Assert.Same(publisher, provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>());
+        Assert.Same(
+            provider.GetRequiredService<IRecoverableAsyncResponseBuilder>(),
+            provider.GetRequiredService<IAsyncResponseBuilder>());
         Assert.Equal("InMemory", provider.GetRequiredService<AsyncResponseChannelMarker>().Name);
     }
 

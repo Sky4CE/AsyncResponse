@@ -25,6 +25,9 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private readonly IRecoverableAsyncResponseSubscriber? _recoverableSubscriber;
     private readonly ILogger _logger;
     private readonly FlowExecutionLease _lease;
+    private readonly TimeProvider _timeProvider;
+    private readonly IDurableFlowExecutionObserver[] _observers;
+    private readonly IWorkerTransport? _workerTransport;
     private bool _suspended;
     private bool _progressDirty;
     private DateTime _lastPersistenceUtc;
@@ -39,7 +42,10 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         IAsyncResponseSubscriber subscriber,
         IRecoverableAsyncResponseSubscriber? recoverableSubscriber,
         ILogger logger,
-        FlowExecutionLease lease)
+        FlowExecutionLease lease,
+        TimeProvider? timeProvider = null,
+        IDurableFlowExecutionObserver[]? observers = null,
+        IWorkerTransport? workerTransport = null)
     {
         _state = state;
         _store = store;
@@ -50,6 +56,31 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _recoverableSubscriber = recoverableSubscriber;
         _logger = logger;
         _lease = lease;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _observers = observers ?? [];
+        _workerTransport = workerTransport;
+    }
+
+    private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
+
+    /// <summary>
+    /// Invokes every registered execution observer. Observers run on the execution path by
+    /// contract: an observer exception fails this execution attempt exactly like a step failure
+    /// (AsyncResponse.Testing injects deterministic crashes through precisely this).
+    /// </summary>
+    private async ValueTask NotifyStepAsync(
+        Func<IDurableFlowExecutionObserver, DurableFlowStepEvent, ValueTask> invoke,
+        string stepName,
+        DurableFlowStepKind kind,
+        string? correlationId = null,
+        DateTime? wakeAtUtc = null)
+    {
+        if (_observers.Length == 0)
+            return;
+
+        var stepEvent = new DurableFlowStepEvent(FlowId, stepName, kind, correlationId, wakeAtUtc);
+        foreach (var observer in _observers)
+            await invoke(observer, stepEvent).ConfigureAwait(false);
     }
 
     internal bool IsSuspended => _suspended;
@@ -69,6 +100,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return;
 
         cancellationToken.ThrowIfCancellationRequested();
+        await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
         await CompleteStepAsync(name, checkpoint, resultJson: null, cancellationToken).ConfigureAwait(false);
@@ -86,10 +118,147 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return DeserializeResult<TResult>(checkpoint.ResultJson);
 
         cancellationToken.ThrowIfCancellationRequested();
+        await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Local).ConfigureAwait(false);
         var result = await step().ConfigureAwait(false);
         _lease.ThrowIfLost();
         await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(result), cancellationToken).ConfigureAwait(false);
         return result;
+    }
+
+    /// <inheritdoc />
+    public Task DelayAsync(string name, TimeSpan delay, CancellationToken cancellationToken = default)
+    {
+        ThrowIfSuspended();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        var checkpoint = GetStep(name);
+        if (checkpoint.Completed)
+            return Task.CompletedTask;
+
+        // The due time anchors at the FIRST execution that reaches this step and is checkpointed;
+        // replays (crash, redeploy, chunked wake-up) wait out the remainder, never restart.
+        var wakeAtUtc = checkpoint.WakeAtUtc ?? UtcNow.Add(delay > TimeSpan.Zero ? delay : TimeSpan.Zero);
+        return DelayCoreAsync(name, checkpoint, wakeAtUtc, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public Task DelayUntilAsync(string name, DateTimeOffset wakeAtUtc, CancellationToken cancellationToken = default)
+    {
+        ThrowIfSuspended();
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        var checkpoint = GetStep(name);
+        if (checkpoint.Completed)
+            return Task.CompletedTask;
+
+        // The checkpointed instant wins over the argument on replay, so a code edit that changes
+        // the target while a run is mid-sleep cannot double- or under-sleep that run.
+        return DelayCoreAsync(name, checkpoint, checkpoint.WakeAtUtc ?? wakeAtUtc.UtcDateTime, cancellationToken);
+    }
+
+    private async Task DelayCoreAsync(string name, FlowStepState checkpoint, DateTime wakeAtUtc, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
+
+        var remaining = wakeAtUtc - UtcNow;
+        if (remaining > AsyncResponseChannelOptions.MaxPersistenceTtl)
+        {
+            throw new DurableFlowFailedException(
+                $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0} days; the maximum is " +
+                $"{AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0} days (ledger TTL stamps are computed as \"now + sleep + StateExpiry\").");
+        }
+
+        if (checkpoint.WakeAtUtc is null)
+        {
+            // Persist the breadcrumb BEFORE any wake-up can exist, with a TTL that covers the whole
+            // sleep plus the normal idle margin — a run must never out-sleep its own ledger.
+            checkpoint.WakeAtUtc = wakeAtUtc;
+            checkpoint.Faulted = false;
+            checkpoint.Message = remaining > TimeSpan.Zero ? $"Sleeping until {wakeAtUtc:O}." : null;
+            await SaveForSleepAsync(remaining, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (remaining > TimeSpan.Zero)
+        {
+            await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
+
+            if (remaining > _options.TimerInProcessThreshold && _workerTransport is IDelayedWorkerTransport)
+            {
+                // Suspend instead of waiting here: the delayed wake-up job re-executes the flow at
+                // (or chunked toward) the due time, and this run holds no worker, lease, or memory
+                // while it sleeps. Mirrors the child-flow suspension ordering: persist, enqueue,
+                // throw — a crash between the persist and the enqueue leaves this job unacked, so
+                // broker redelivery re-runs the step and re-enqueues the wake-up.
+                await SuspendForTimerAsync(name, wakeAtUtc, remaining, cancellationToken).ConfigureAwait(false);
+                throw new InvalidOperationException("Unreachable.");
+            }
+
+            if (remaining > AsyncResponseChannelOptions.MaxTimerBackedTimeout)
+            {
+                throw new DurableFlowFailedException(
+                    $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0.#} days, which exceeds the " +
+                    $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and the registered worker " +
+                    $"transport has no native delayed delivery ({nameof(IDelayedWorkerTransport)}) to suspend on. " +
+                    "Use a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB) for sleeps this long.");
+            }
+
+            await WaitInProcessAsync(remaining, cancellationToken).ConfigureAwait(false);
+            _lease.ThrowIfLost();
+        }
+
+        await CompleteStepAsync(name, checkpoint, resultJson: null, CancellationToken.None, kind: DurableFlowStepKind.Timer).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// In-process timer wait under the execution lease — the fallback for transports without
+    /// delayed delivery and for sub-threshold remainders. Cancellation (caller token, host
+    /// shutdown via lease loss) deliberately leaves the checkpoint untouched: the persisted due
+    /// time is the breadcrumb, and the redelivered execution waits out the remainder — the timer
+    /// itself cannot fault.
+    /// </summary>
+    private async Task WaitInProcessAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        using var linked = cancellationToken.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lease.LostToken)
+            : null;
+
+        try
+        {
+            await Task.Delay(remaining, _timeProvider, linked?.Token ?? _lease.LostToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex)
+        {
+            _lease.ThrowIfLost(ex);
+            throw;
+        }
+    }
+
+    private async Task SuspendForTimerAsync(string name, DateTime wakeAtUtc, TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        _suspended = true;
+        _state.LastMessage = $"Flow {FlowId} sleeping until {wakeAtUtc:O} at step '{name}'.";
+        await SaveForSleepAsync(remaining, cancellationToken).ConfigureAwait(false);
+
+        var id = FlowId;
+        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id), remaining).ConfigureAwait(false);
+        throw new DurableFlowSuspendedException(_state.LastMessage);
+    }
+
+    /// <summary>
+    /// Checkpoint save whose TTL covers a sleep: <c>remaining + StateExpiry</c>, saturated at the
+    /// persistence ceiling. The ordinary <see cref="SaveAsync"/> TTL bounds <em>idle</em> time
+    /// between checkpoints; a sleeping run is idle by design for the whole sleep.
+    /// </summary>
+    private Task SaveForSleepAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    {
+        var margin = AsyncResponseChannelOptions.MaxPersistenceTtl - _options.StateExpiry;
+        var ttl = remaining <= TimeSpan.Zero
+            ? _options.StateExpiry
+            : remaining >= margin
+                ? AsyncResponseChannelOptions.MaxPersistenceTtl
+                : remaining + _options.StateExpiry;
+        return SaveAsync(cancellationToken, ttl: ttl);
     }
 
     /// <inheritdoc />
@@ -129,7 +298,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     {
         ThrowIfSuspended();
         _state.LastMessage = message;
-        var now = DateTime.UtcNow;
+        var now = UtcNow;
         if (_options.ProgressPersistenceInterval <= TimeSpan.Zero
             || now - _lastPersistenceUtc >= _options.ProgressPersistenceInterval)
             return SaveAsync(cancellationToken);
@@ -195,6 +364,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             return completedChild;
         }
 
+        await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
+
         var child = await _store.LoadAsync(childFlowId, cancellationToken).ConfigureAwait(false);
         if (child is null)
         {
@@ -247,16 +418,17 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         switch (child.Status)
         {
             case FlowRunStatus.Succeeded:
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
                 return child;
 
             case FlowRunStatus.Failed:
                 checkpoint.Message = child.LastMessage;
-                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, faulted: true).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, FlowStateJson.SerializeSnapshot(child), cancellationToken, faulted: true, kind: DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
                 ThrowIfChildFailed(child, failOnChildFailure);
                 return child;
 
             default:
+                await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
                 await SuspendForChildAsync(childFlowId, cancellationToken).ConfigureAwait(false);
                 throw new InvalidOperationException("Unreachable.");
         }
@@ -284,6 +456,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             ? checkpoint.PendingCorrelationId!
             : AsyncResponseContext.GenerateCorrelationId();
         var stepTimeout = timeout ?? _options.DefaultStepTimeout;
+
+        await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
 
         var waiter = await CreateWaiterAsync(correlationId, until, stepTimeout, name).ConfigureAwait(false);
         var triggerCompleted = reattach;
@@ -322,6 +496,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     FlowId, name, correlationId);
             }
 
+            await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
+
             var response = await WaitForResponseAsync(waiter.ResponseTask, cancellationToken).ConfigureAwait(false);
 
             checkpoint.PendingCorrelationId = null;
@@ -330,7 +506,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // it exists nowhere else, so the completion checkpoint must not be interruptible — a
             // cancellation here used to leave `pending` set with the response already consumed,
             // and the redelivered execution re-attached to a correlation id nothing could answer.
-            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), CancellationToken.None).ConfigureAwait(false);
+            await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(response), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
             return response;
         }
         catch (OperationCanceledException ex) when (triggerCompleted)
@@ -357,7 +533,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // gets its say again at the next step boundary.
                 var received = waiter.ResponseTask.Result;
                 checkpoint.PendingCorrelationId = null;
-                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None).ConfigureAwait(false);
+                await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
                 return received;
             }
 
@@ -480,7 +656,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
     private FlowState CreateChildState<TFlow, TInput>(string flowId, string parentStepName, string inputJson)
     {
-        var now = DateTime.UtcNow;
+        var now = UtcNow;
         return new FlowState
         {
             FlowId = flowId,
@@ -583,7 +759,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return step;
     }
 
-    private async Task CompleteStepAsync(string name, FlowStepState step, string? resultJson, CancellationToken cancellationToken, bool faulted = false)
+    private async Task CompleteStepAsync(
+        string name,
+        FlowStepState step,
+        string? resultJson,
+        CancellationToken cancellationToken,
+        bool faulted = false,
+        DurableFlowStepKind kind = DurableFlowStepKind.Local,
+        string? correlationId = null)
     {
         step.Completed = true;
         step.ResultJson = resultJson;
@@ -594,24 +777,26 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // A memoized failed child keeps Faulted = true so operators can spot the failure on the
         // step itself instead of digging through ResultJson.
         step.Faulted = faulted;
-        step.CompletedAtUtc = DateTime.UtcNow;
+        step.CompletedAtUtc = UtcNow;
         _state.LastMessage = faulted ? $"Step '{name}' completed (child flow failed)." : $"Step '{name}' completed.";
         await SaveAsync(cancellationToken).ConfigureAwait(false);
 
         if (_logger.IsEnabled(LogLevel.Debug))
             _logger.LogDebug("Flow {FlowId} step '{Step}' completed.", FlowId, name);
+
+        await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, kind, correlationId, step.WakeAtUtc).ConfigureAwait(false);
     }
 
     internal Task FlushProgressAsync()
         => _progressDirty ? SaveAsync(CancellationToken.None) : Task.CompletedTask;
 
-    private async Task SaveAsync(CancellationToken cancellationToken, Exception? cause = null)
+    private async Task SaveAsync(CancellationToken cancellationToken, Exception? cause = null, TimeSpan? ttl = null)
     {
-        _state.UpdatedAtUtc = DateTime.UtcNow;
-        await _lease.SaveAsync(_state, _options.StateExpiry, cancellationToken, cause).ConfigureAwait(false);
+        _state.UpdatedAtUtc = UtcNow;
+        await _lease.SaveAsync(_state, ttl ?? _options.StateExpiry, cancellationToken, cause).ConfigureAwait(false);
 
         _progressDirty = false;
-        _lastPersistenceUtc = DateTime.UtcNow;
+        _lastPersistenceUtc = UtcNow;
     }
 
     private async Task<TResponse> WaitForResponseAsync<TResponse>(Task<TResponse> responseTask, CancellationToken cancellationToken)

@@ -39,6 +39,16 @@ public sealed class WorkerJobEnvelope
     /// delivered through a broker ingress. <c>null</c> when no context propagators are registered.
     /// </summary>
     public Dictionary<string, string>? Context { get; set; }
+
+    /// <summary>
+    /// UTC instant before which this job must not execute; <c>null</c> for ordinary immediate jobs.
+    /// Stamped by delayed publishes (<see cref="IDelayedWorkerTransport"/>). The worker-job
+    /// executor enforces it: a job delivered early — broker imprecision, or a chunked hop on a
+    /// transport whose per-publish delay is capped — is re-published for the remaining delay
+    /// instead of executed, so the due time holds on every transport. Additive wire property:
+    /// absent on jobs written before it existed.
+    /// </summary>
+    public DateTime? NotBeforeUtc { get; set; }
 }
 
 /// <summary>

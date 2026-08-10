@@ -32,6 +32,7 @@ facts were re-verified July 2026 (sources at the end).
 | **Channels (6)** | In-memory, Redis (+ Valkey / Dragonfly / Garnet), NATS, PostgreSQL, SQL Server, MongoDB |
 | **Transports (11)** | In-memory, Redis Streams, RabbitMQ, Azure Service Bus, Google Pub/Sub, NATS JetStream, PostgreSQL, Kafka, SQL Server, AWS SQS, MongoDB |
 | **Durable-flow stores (10)** | In-memory, SQL Server, PostgreSQL, MySQL, SQLite, Oracle, MongoDB, Cosmos DB, DynamoDB, EF Core |
+| **Capabilities** | Durable timers + delayed steps (`flow.DelayAsync`), delayed worker jobs (`IDelayedWorkerTransport`, native on 6 transports), cron-scheduled flows, `AsyncResponse.Testing` (virtual clock, flow harness, crash injection, simulated restarts) |
 
 The backend matrix is essentially complete: every mainstream .NET messaging stack can run
 AsyncResponse today without writing an adapter. The two-axes rule from #14/#17 still governs
@@ -44,8 +45,10 @@ What shifted: with the matrix filled, **the frontier has moved from backends to 
 Temporal, the Azure Durable Task Scheduler, Dapr, and now AWS Lambda all ship durable timers;
 none of them ships AsyncResponse's "plain `await`s, no replay rules" model. The competitive gap
 is no longer "does it run on my broker" — it is what a flow can *do* while it runs. That is
-Train A. The remaining one item of the old train 2 — the store-mixing enabler — moves to
-Train B, where it gates the candidates that need it.
+Train A — and its two 🔴 items (durable timers/cron, the testing kit) have now **shipped**
+(see 4.1/4.2 below), closing the loudest gap against every neighbor and adding the
+time-skipping test story only Temporal had. The remaining one item of the old train 2 — the
+store-mixing enabler — moves to Train B, where it gates the candidates that need it.
 
 ---
 
@@ -106,38 +109,46 @@ individual bugs; both have landed:
 
 ## 4. Train A — capabilities (the new headline)
 
-### 4.1 Durable timers + delayed steps → cron-scheduled flows 🔴
+### 4.1 Durable timers + delayed steps → cron-scheduled flows ✅ (shipped)
 
-The loudest competitive gap. Every neighboring system ships durable timers: Temporal always has;
-the Azure Durable Task Scheduler's Consumption SKU went GA in March 2026 and is
-Aspire-integrated; Dapr's Jobs API went stable in 1.18 (June 2026); AWS shipped Lambda durable
-functions in December 2025 — notably with **no .NET runtime support at launch**, which is an
-opportunity, not just a threat. "Sleep for 3 days inside a flow" is the first question every
-workflow-shaped evaluation asks, and today the honest answer is "use your scheduler".
+Shipped: `flow.DelayAsync(name, delay)` / `flow.DelayUntilAsync(name, instant)` as checkpointed
+timer steps, delayed `EnqueueWorkerAsync(..., delay)`, and `WithScheduledFlow<TFlow, TInput>`
+cron-scheduled flows. Full docs: [timers-and-scheduling.md](timers-and-scheduling.md).
 
-Design, two layers so every backend works:
+What shipped differs from the sketch in one healthy way: instead of a store-driven sweep, a
+sleeping flow **suspends through the same mechanism as child flows** and is woken by a *delayed
+worker job* — no new store queries, no sweep loop, no lease held while sleeping. The two layers
+became:
 
-| Layer | Mechanics |
+| Layer | Mechanics as shipped |
 |---|---|
-| **`IDelayedPublish` transport capability (optional)** | Native delayed delivery where the broker has it: Azure Service Bus scheduled messages; SQS `DelaySeconds` (≤ 15 min — chunked re-delays for longer waits); NATS 2.12+ per-message delivery schedules (NATS 2.14 even runs server-side cron); a `visible_at` column/field on the PostgreSQL / SQL Server / MongoDB queue tables |
-| **Store-driven sweep fallback** | Timers persisted in the flow store and woken by a sweep reusing the existing lease machinery — works on every backend, including Kafka, where the log has no per-message delay |
+| **`IDelayedWorkerTransport` capability (optional)** | Native delayed delivery: in-memory (timer wheel), Azure Service Bus (scheduled messages), SQS (`DelaySeconds`, 15-min hops), PostgreSQL / SQL Server / MongoDB (`available_at` on the queue, database-clock arithmetic). Envelopes carry `NotBeforeUtc`; the shared worker-job executor re-publishes early deliveries, so capped transports chunk long delays with zero per-transport code. NATS native schedules stay on watch (client support not landed). |
+| **In-process fallback** | On transports without the capability (Kafka, RabbitMQ, Google Pub/Sub, Redis Streams, NATS) timers wait in process under the execution lease — the same footprint and crash story as an awaited step. Sub-threshold remainders always run in process. |
 
-Delayed steps (`flow.DelayAsync(...)`, delayed `EnqueueWorkerAsync`) land first; cron-scheduled
-flows (start a flow on a schedule) build on the same primitive. The transport capability is
-opt-in per package, so shipping the fallback first unblocks every backend at once.
+Cron: an internal five-field `CronSchedule` (Vixie semantics, names, DST-honest, validated at
+registration) plus a replica-safe scheduler — deterministic occurrence ids
+(`sched:{name}:{occurrence}`) dedup through the flow store's atomic create, so N replicas need no
+leader. Missed-while-down occurrences are skipped by policy.
 
-### 4.2 `AsyncResponse.Testing` package 🔴
+### 4.2 `AsyncResponse.Testing` package ✅ (shipped)
 
-Table stakes the moment timers exist — nobody will wait three real days in a test. Temporal's
-time-skipping test server is the bar to meet:
+Shipped as a NuGet package; guide: [testing.md](testing.md). What landed, against the bar:
 
-- **Virtual clock / time-skipping** for waits, timers, leases, and watchdog schedules.
-- **Flow-test harness** — run a flow against the in-memory stack with scripted responses,
-  assert checkpoints and outcomes without brokers or sleeps.
-- **Deterministic crash-at-checkpoint helpers** — kill the "process" at step N, restart,
-  assert resume — the pattern our own integration tests use, packaged for applications.
-- **CI adoption of the matured Azure Service Bus emulator** (already in the Aspire fixture) as
-  the template for emulator-first test recipes in the docs.
+- **Virtual clock / time-skipping** — the engine now resolves one `TimeProvider` from DI
+  (waits, timeouts, leases, watchdog, retry backoff, timers, cron), and
+  `VirtualTimeProvider` advances it stepwise in due order, so interleavings match real time.
+- **Flow-test harness** — `FlowTestHarness` runs flows on the full in-memory engine with
+  scripted replies (`WaitForAwaitingStepAsync` / `ReplyAsync`), timer/step observation, and
+  ledger assertions, with zero instrumentation in the flow class (a public
+  `IDurableFlowExecutionObserver` seam feeds it).
+- **Deterministic crash-at-checkpoint helpers** — `CrashBeforeStep` / `CrashAfterStep` (one-shot
+  `SimulatedCrashException` at the exact boundary) plus `SimulateRestartAsync()` process-death
+  simulation that preserves exactly the state a broker+store deployment would retain — including
+  the lost-subscriber recovery tri-state, now testable without a broker (the in-memory channel
+  gained the full `IRecoverableAsyncResponseSubscriber` contract for this).
+- **Emulator-first recipes** — still the docs' job (the ASB emulator remains in the Aspire
+  fixture as the template); the harness covers what emulators were previously used for in unit
+  suites.
 
 ### 4.3 Claim-check payload seam — `IPayloadStore` 🟠
 

@@ -138,9 +138,10 @@ internal sealed class MongoDbTransportStore : IDisposable
         string queue,
         string payload,
         IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
-        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, cancellationToken).ConfigureAwait(false);
+        await InsertAsync(id, queue, payload, headers, deadLetterReason: null, cancellationToken, delay).ConfigureAwait(false);
         await PruneDeadLettersIfDueAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -234,7 +235,8 @@ internal sealed class MongoDbTransportStore : IDisposable
         string payload,
         IReadOnlyDictionary<string, string>? headers,
         string? deadLetterReason,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTime.UtcNow;
@@ -251,7 +253,12 @@ internal sealed class MongoDbTransportStore : IDisposable
             // client clock here would let client-ahead-of-server skew hide a fresh message from the
             // server-clock claim filter until the skew elapsed. Epoch expresses what the SQL stores'
             // "available_at DEFAULT now()" expresses; a NAK re-stamps a real server-relative time.
-            AvailableAtUtc = DateTime.UnixEpoch,
+            // A DELAYED publish is the exception: InsertOne still cannot evaluate $$NOW, so the due
+            // time is client-computed (now + delay) in one atomic insert — skew shifts it by the
+            // skew only, and an early delivery is corrected by the envelope's NotBeforeUtc guard in
+            // the worker-job executor. (The insert-then-$$NOW-update alternative had a crash window
+            // that left a never-claimable document.)
+            AvailableAtUtc = delay is { } pending ? now.Add(pending) : DateTime.UnixEpoch,
             Attempts = 0,
             DeadLetterReason = deadLetterReason
         };

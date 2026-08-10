@@ -56,12 +56,30 @@ public class RecoveryEnforcementTests
     }
 
     [Fact]
-    public void InMemoryChannel_DoesNotExposeRecoverableApis()
+    public void InMemoryChannel_ExposesTheFullRecoverableSurface()
     {
+        // The in-memory channel implements the same recoverable contract as the durable channels
+        // (callbacks stored in the process-local recovery store), so tests and dev hosts exercise
+        // the real recovery routing. IAsyncResponseBuilder resolves to the same recoverable
+        // implementation, mirroring the durable channel registrations.
         var provider = InMemoryProvider();
 
-        Assert.Null(provider.GetService<IRecoverableAsyncResponseBuilder>());
-        Assert.Null(provider.GetService<IRecoverableAsyncResponseSubscriber>());
+        Assert.NotNull(provider.GetService<IRecoverableAsyncResponseBuilder>());
+        Assert.NotNull(provider.GetService<IRecoverableAsyncResponseSubscriber>());
+        Assert.Same(provider.GetService<IRecoverableAsyncResponseBuilder>(), provider.GetService<IAsyncResponseBuilder>());
+    }
+
+    [Fact]
+    public async Task InMemoryChannel_RecoveryCallbackWithoutOverride_FailsFastLikeDurableChannels()
+    {
+        var provider = InMemoryProvider();
+        var subscriber = provider.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => subscriber.CreateRecoverableResponseWaiter<DefaultRecoveryPayload>(CorrelationId, resumeCallback: ResumeCallback()));
+
+        Assert.Contains(nameof(IAsyncResponsePayload.OnRecovery), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(typeof(DefaultRecoveryPayload).ToString(), ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
