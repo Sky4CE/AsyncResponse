@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786435188854,
+  "lastUpdate": 1786435212946,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -76336,6 +76336,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1616.2132305025207,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "4d57b3b32a652a53c26e8c74efe18b438c3a3bb2",
+          "message": "review fixes: 15 confirmed findings — NATS publish dedup id + workqueue/discard-new retention, ack-outside-try in DB/RabbitMQ dispatchers (no duplicate execution on ack failure), DbChannelShared subscription add/remove race, Redis contradiction throws instead of silent drop, Mongo server-clock expiry ×3, fail-fast options (Cosmos PK path, DynamoDB TTL collision, Redis distinct streams, GPS correlation attr), SqlServer/PG DI shared-store factory, Mongo/PG listener retry w/ backoff, bounded executor drain, live-string callback args",
+          "timestamp": "2026-08-11T09:42:47+02:00",
+          "tree_id": "d01e1b9e553803297712d716b6211ee3eec41531",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/4d57b3b32a652a53c26e8c74efe18b438c3a3bb2"
+        },
+        "date": 1786435212144,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 96215.34996601674,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 51673.71151600335,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 98210.1012624712,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 250087.5306357225,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 403981.64307413873,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 334059.3556663148,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 340729.43357138964,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 260598.54273294902,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 319697.18282842496,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 288194.4044174438,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 282090.6300776314,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 332796.4217728731,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 380934.96678247093,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 164494.6789261261,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 150957.9793368718,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 47469.27978089699,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 24644.5467729839,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4793.611075159029,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 247304.3822336532,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 91060.41676531544,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1607717.041800643,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1899.5993365079437,
             "unit": "flows/s"
           }
         ]
