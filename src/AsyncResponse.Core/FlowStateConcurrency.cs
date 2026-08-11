@@ -14,9 +14,27 @@ internal static class FlowStateConcurrency
         TimeSpan ttl,
         CancellationToken cancellationToken = default)
     {
+        if (FlowIdTooLong(flowId) is { } tooLong)
+            throw new ArgumentException(tooLong, nameof(flowId));
+
         state.Revision = 0;
         return store.TryCreateAsync(flowId, state, ttl, cancellationToken);
     }
+
+    /// <summary>
+    /// Enforces <see cref="DurableFlowOptions.MaxFlowIdLength"/> on every final id at creation —
+    /// the single door all creates walk through. Without it a long id works on the unbounded
+    /// stores (PostgreSQL, Redis, MongoDB, in-memory) and fails on the 400-character-column ones,
+    /// or works as a root id and starts failing the day a child or scheduled suffix is appended.
+    /// Returns the rejection message, or <c>null</c> when the id fits.
+    /// </summary>
+    internal static string? FlowIdTooLong(string flowId)
+        => flowId.Length <= DurableFlowOptions.MaxFlowIdLength
+            ? null
+            : $"Flow id '{flowId[..40]}…' is {flowId.Length} characters; the portable maximum is " +
+              $"{DurableFlowOptions.MaxFlowIdLength} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id " +
+              "column length in the SQL Server, MySQL, Oracle, and EF Core stores). Budget root ids for growth: child flows " +
+              "append \":{stepName}\" to the parent id, and scheduled flows wrap the schedule name as \"sched:{name}:{timestamp}\".";
 
     public static async Task<FlowExecutionLease?> TryAcquireExecutionLeaseAsync(
         IFlowStateStore store,

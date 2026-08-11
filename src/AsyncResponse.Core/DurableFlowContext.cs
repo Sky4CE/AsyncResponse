@@ -135,9 +135,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (checkpoint.Completed)
             return Task.CompletedTask;
 
+        // Validate the requested span BEFORE the UtcNow.Add below: TimeSpan.MaxValue (or any
+        // absurd span) must surface as the terminal sleep-ceiling failure, not as the DateTime
+        // overflow the addition would throw first.
+        var requested = delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        ThrowIfSleepBeyondLedger(name, requested);
+
         // The due time anchors at the FIRST execution that reaches this step and is checkpointed;
         // replays (crash, redeploy, chunked wake-up) wait out the remainder, never restart.
-        var wakeAtUtc = checkpoint.WakeAtUtc ?? UtcNow.Add(delay > TimeSpan.Zero ? delay : TimeSpan.Zero);
+        var wakeAtUtc = checkpoint.WakeAtUtc ?? UtcNow.Add(requested);
         return DelayCoreAsync(name, checkpoint, wakeAtUtc, cancellationToken);
     }
 
@@ -162,12 +168,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
 
         var remaining = wakeAtUtc - UtcNow;
-        if (remaining > AsyncResponseChannelOptions.MaxPersistenceTtl)
-        {
-            throw new DurableFlowFailedException(
-                $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0} days; the maximum is " +
-                $"{AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0} days (ledger TTL stamps are computed as \"now + sleep + StateExpiry\").");
-        }
+        ThrowIfSleepBeyondLedger(name, remaining);
 
         var firstPass = checkpoint.WakeAtUtc is null;
         if (firstPass)
@@ -262,9 +263,32 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     }
 
     /// <summary>
+    /// The longest sleep a run's ledger can survive: the persistence ceiling minus the configured
+    /// <see cref="DurableFlowOptions.StateExpiry"/>, so the TTL stamped by
+    /// <see cref="SaveForSleepAsync"/> (<c>sleep + StateExpiry</c>) always fits the ceiling with
+    /// the full idle margin intact. Allowing sleeps up to the ceiling itself would stamp a TTL
+    /// that expires exactly at the due instant — any wake latency or store clock skew then finds
+    /// the flow state already gone and strands the run unfinished.
+    /// </summary>
+    private void ThrowIfSleepBeyondLedger(string name, TimeSpan sleep)
+    {
+        var maxSleep = AsyncResponseChannelOptions.MaxPersistenceTtl - _options.StateExpiry;
+        if (sleep <= maxSleep)
+            return;
+
+        throw new DurableFlowFailedException(
+            $"Timer step '{name}' of flow '{FlowId}' sleeps for {sleep.TotalDays:0} days; the maximum is " +
+            $"{maxSleep.TotalDays:0} days — the {AsyncResponseChannelOptions.MaxPersistenceTtl.TotalDays:0}-day persistence ceiling minus " +
+            $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)} ({_options.StateExpiry.TotalDays:0.#} days) — because ledger TTL " +
+            "stamps are computed as \"now + sleep + StateExpiry\" and the ledger must outlive its own wake-up.");
+    }
+
+    /// <summary>
     /// Checkpoint save whose TTL covers a sleep: <c>remaining + StateExpiry</c>, saturated at the
     /// persistence ceiling. The ordinary <see cref="SaveAsync"/> TTL bounds <em>idle</em> time
-    /// between checkpoints; a sleeping run is idle by design for the whole sleep.
+    /// between checkpoints; a sleeping run is idle by design for the whole sleep — and because
+    /// <see cref="ThrowIfSleepBeyondLedger"/> caps every sleep at ceiling − StateExpiry, the sum
+    /// here always carries the full StateExpiry margin past the due instant.
     /// </summary>
     private Task SaveForSleepAsync(TimeSpan remaining, CancellationToken cancellationToken)
     {
@@ -369,6 +393,15 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
 
         var childFlowId = breadcrumb ?? requestedChildFlowId;
+        if (FlowStateConcurrency.FlowIdTooLong(childFlowId) is { } tooLongChildId)
+        {
+            // Deterministic on every replay, so terminal rather than retriable: the composed id
+            // can never shrink, and the 400-character stores would reject the child row anyway
+            // after a full budget of wasted redeliveries.
+            throw new DurableFlowFailedException(
+                $"Step '{name}' of flow '{FlowId}' composed an over-long child flow id. {tooLongChildId}");
+        }
+
         var inputJson = AsyncResponseJson.Serialize(input);
         if (checkpoint.Completed)
         {

@@ -1,6 +1,7 @@
 using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Globalization;
 using Xunit;
@@ -24,6 +25,26 @@ public sealed class NightlyReportFlow(StepRecorder _recorder) : IDurableFlow<Rep
             _recorder.Record($"report:{input.Occurrence:yyyyMMdd'T'HHmm}");
             return Task.CompletedTask;
         });
+    }
+}
+
+public sealed class CapturingLogger<T> : ILogger<T>
+{
+    private readonly List<(LogLevel Level, string Message)> _entries = [];
+
+    public IReadOnlyList<(LogLevel Level, string Message)> Entries
+    {
+        get { lock (_entries) return [.. _entries]; }
+    }
+
+    IDisposable? ILogger.BeginScope<TState>(TState state) => null;
+
+    bool ILogger.IsEnabled(LogLevel logLevel) => true;
+
+    void ILogger.Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        lock (_entries)
+            _entries.Add((logLevel, formatter(state, exception)));
     }
 }
 
@@ -124,6 +145,76 @@ public class ScheduledFlowTests
     }
 
     [Fact]
+    public async Task InputFactoryThrowingInvalidOperation_IsAFailedStart_NotAReportedDuplicate()
+    {
+        var logger = new CapturingLogger<ScheduledFlowService>();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.StartTime = new DateTimeOffset(2030, 1, 1, 0, 30, 0, TimeSpan.Zero);
+            options.ConfigureServices = services => services.AddSingleton<ILogger<ScheduledFlowService>>(logger);
+            options.ConfigureAsyncResponse = builder => builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+                "hourly",
+                "0 * * * *",
+                occurrence => throw new InvalidOperationException("input factory exploded"));
+        });
+
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(31));
+        await harness.Engine.WaitForWorkerIdleAsync();
+
+        // NOTHING was started — the user's input factory threw before any store call. Pre-fix the
+        // broad InvalidOperationException catch classified this as the benign deterministic-id
+        // duplicate and logged "already started with different input … ran exactly once" — a
+        // successful occurrence report for an occurrence that never ran. It is a failed start.
+        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        Assert.Contains("failed to start occurrence", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("already started with different input", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task NonDeterministicInputFactory_AcrossReplicas_StillReportsTheDuplicateWarning()
+    {
+        // The counterpart guard: a REAL deterministic-id conflict (the loser replica's factory
+        // produced different input) must keep the benign duplicate reading — if the dedicated
+        // conflict exception ever stopped flowing, this warning would disappear and the loser
+        // would report a scary error for an occurrence that ran fine.
+        var recorder = new StepRecorder();
+        var logger = new CapturingLogger<ScheduledFlowService>();
+        var sequence = 0;
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.StartTime = new DateTimeOffset(2030, 1, 1, 0, 30, 0, TimeSpan.Zero);
+            options.ConfigureServices = services =>
+            {
+                services.AddSingleton(recorder);
+                services.AddSingleton<ILogger<ScheduledFlowService>>(logger);
+            };
+            options.ConfigureAsyncResponse = builder =>
+            {
+                builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+                    "hourly",
+                    "0 * * * *",
+                    occurrence => new ReportInput(occurrence.AddTicks(Interlocked.Increment(ref sequence))));
+
+                // A second scheduler replica over the same registrations, racing the same store.
+                builder.Services.AddSingleton<IHostedService>(provider => new ScheduledFlowService(
+                    provider.GetRequiredService<IDurableFlows>(),
+                    provider.GetServices<ScheduledFlowRegistration>(),
+                    provider.GetRequiredService<ILogger<ScheduledFlowService>>(),
+                    provider.GetService<TimeProvider>()));
+            };
+        });
+
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(31));
+        var run = harness.Attach("sched:hourly:20300101T010000Z");
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+
+        Assert.Single(recorder.Entries);
+        Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Warning
+            && entry.Message.Contains("not deterministic across replicas", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Level == LogLevel.Error);
+    }
+
+    [Fact]
     public async Task DisabledSchedule_NeverFires()
     {
         var recorder = new StepRecorder();
@@ -177,6 +268,22 @@ public class ScheduledFlowTests
             "0 0 30 2 *",
             occurrence => new ReportInput(occurrence)));
         Assert.Contains("no future occurrence", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ScheduleName_ThatOverflowsThePortableFlowIdLimit_FailsAtRegistration()
+    {
+        // "sched:{name}:{timestamp}" must fit DurableFlowOptions.MaxFlowIdLength. Pre-fix a
+        // 400-character name registered cleanly and every occurrence then failed at start time —
+        // and only on the stores whose flow_id column is 400 characters.
+        var services = new ServiceCollection();
+        var builder = services.AddAsyncResponse();
+        var name = new string('n', DurableFlowOptions.MaxFlowIdLength);
+        var ex = Assert.Throws<ArgumentException>(() => builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+            name,
+            "0 * * * *",
+            occurrence => new ReportInput(occurrence)));
+        Assert.Contains("portable flow-id maximum", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

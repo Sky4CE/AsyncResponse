@@ -249,6 +249,56 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **A maximum-duration durable timer can no longer expire its own ledger.** `DelayAsync` /
+  `DelayUntilAsync` accepted sleeps up to the 3650-day persistence ceiling itself, while the
+  sleeping ledger's TTL (`sleep + StateExpiry`) saturated at that same ceiling — a
+  ceiling-length sleep stamped a TTL that expired exactly at the due instant, so the wake-up
+  found the flow state gone and the run hung unfinished forever. Sleeps are now capped at
+  ceiling − `StateExpiry` (default 14 days → 3636 days), keeping the full idle margin between
+  due time and expiry, and the span is validated **before** the due-time arithmetic —
+  `TimeSpan.MaxValue` previously overflowed `UtcNow.Add` with a retriable
+  `ArgumentOutOfRangeException` that burned the delivery budget; both now fail terminally with
+  the budget in the message.
+- **Scheduled flows no longer report an occurrence as "ran exactly once" when nothing ran.**
+  The scheduler classified ANY `InvalidOperationException` from the start delegate — including
+  one thrown by the user's input factory, before any store call — as the benign
+  deterministic-id duplicate. The idempotent-start conflict now throws the dedicated
+  `DurableFlowIdConflictException` (public, derived from `InvalidOperationException` for
+  compatibility), the scheduler keys the duplicate reading off exactly that type, and every
+  other exception is logged as the failed start it is.
+- **Three cron correctness gaps.** (1) The next-occurrence horizon was 8 years — sparse-but-valid
+  schedules (`0 0 29 2 */7`, Feb 29 on a Sunday: gaps up to 40 years around skipped century leap
+  days) fired once and then permanently stopped, indistinguishable from "Feb 30". The scan now
+  covers 400 years — a full Gregorian cycle (146 097 days, exactly 20 871 weeks), so a miss is a
+  completeness *proof* of unsatisfiability, and misses skip by month/day so the far scan stays
+  cheap. (2) A spring-forward-gapped wall time mapped through the pre-transition offset to a
+  point PAST the jump (02:30 in a 02:00→03:00 gap fired at 03:30, not the documented gap end),
+  and that phantom-late instant also broke next-occurrence ordering — a re-query from inside the
+  half-open window skipped it entirely. Gapped times now fire at the transition instant itself,
+  with all gapped minutes collapsing onto one fire. (3) Step masks were built with `int`
+  arithmetic: a step near `int.MaxValue` overflowed `value += step` and the six-bit shift
+  masking minted phantom low values (`1/2147483647` gained minute 0). The accumulators are now
+  `long`, preserving Vixie's "oversized step → start value only" semantics.
+- **Flow-id length is now a portable contract, enforced centrally.** SQL Server, MySQL, Oracle,
+  and EF Core declare `flow_id` as a 400-character column while the other stores are unbounded,
+  so a long id worked on some providers and failed on others — or worked as a root and started
+  failing the day a child (`:{stepName}`) or scheduled (`sched:{name}:{timestamp}`) suffix was
+  appended. Every final id is validated at creation against the new
+  `DurableFlowOptions.MaxFlowIdLength` (400): over-long root ids are rejected at `StartAsync`,
+  an over-long composed child id fails the parent terminally with the budget in the message
+  (deterministic on every replay — retrying a store rejection would be waste), and
+  `WithScheduledFlow` validates the final occurrence-id length at registration.
+- **Lost-subscriber recovery now raises the step-completed observer event.** `RecoverAsync`
+  checkpoints the recovered terminal payload, and the replayed execution short-circuits the
+  memoized step — so observers (including the Testing probe's step waiters) never saw that
+  completion. The executor now notifies `OnStepCompletedAsync` for the settled step before
+  waking the run. Best-effort by necessity: once the checkpoint settles the pending correlation
+  id is gone, so a redelivered `RecoverAsync` can no longer attribute the completion — unlike
+  run-finished, which re-derives from persisted status.
+- **Timed-out `FlowTestHarness` waiters no longer accumulate.** A waiter that hit its real-time
+  guard stayed registered forever: every future probe event re-evaluated its predicate and its
+  completion source pinned the captured closures. Waits now remove their waiter in a race-safe
+  `finally`.
 - **The database transports' per-delivery dispatch cost dropped ~3.4× (PostgreSQL, SQL Server,
   MongoDB) — without weakening lease protection.** The claim-lease heartbeat introduced with
   the July hardening tore down its renewal machinery with a thrown-and-caught

@@ -8,6 +8,17 @@ namespace AsyncResponse;
 public class DurableFlowOptions
 {
     /// <summary>
+    /// The portable flow-id length contract: the longest final flow id every bundled state store
+    /// accepts (SQL Server, MySQL, Oracle, and EF Core declare <c>flow_id</c> as a 400-character
+    /// column). Every id is validated against this when its state is created — root ids passed to
+    /// <see cref="IDurableFlows.StartAsync{TFlow,TInput}"/>, composed child ids
+    /// (<c>{parentId}:{stepName}</c>), and scheduled occurrence ids
+    /// (<c>sched:{name}:{timestamp}</c>, validated at registration) — so an id cannot work on one
+    /// store and fail on another, or work as a root and fail once a suffix is appended.
+    /// </summary>
+    public const int MaxFlowIdLength = 400;
+
+    /// <summary>
     /// How long persisted flow state lives; the TTL is refreshed on every checkpoint, so it bounds
     /// the *idle* time of a run, not its total duration. Must comfortably exceed the longest gap
     /// between checkpoints (typically the longest awaited step) — the default is deliberately

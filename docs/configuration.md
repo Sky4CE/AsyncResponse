@@ -82,7 +82,8 @@ that same options object.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `StateExpiry` | 14 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. Deliberately double the 7-day default step-timeout chain so a silent step faults before its ledger expires. |
+| `StateExpiry` | 14 days | Idle TTL for persisted flow state; refreshed on every checkpoint, so it bounds the gap *between* checkpoints, not total run duration. Deliberately double the 7-day default step-timeout chain so a silent step faults before its ledger expires. Also bounds the longest single `DelayAsync`/`DelayUntilAsync` sleep: the 3650-day persistence ceiling **minus** this value (default → 3636 days), so a sleeping ledger's TTL always outlives its own wake-up by the full idle margin. |
+| `MaxFlowIdLength` (const) | 400 | The portable flow-id contract — the `flow_id` column length in the SQL Server, MySQL, Oracle, and EF Core stores. Every final id (root, composed child `:{stepName}`, scheduled `sched:{name}:{timestamp}`) is validated against it at creation, so an id cannot work on one store and fail on another. |
 | `DefaultStepTimeout` | `null` (channel default) | Default timeout for `AwaitStepAsync` steps that don't pass one explicitly. |
 | `ExecutionLeaseDuration` | 1 minute | How long one store lease owns a flow execution before another replica may take over after owner loss. |
 | `ExecutionLeaseRenewInterval` | 20 seconds | Renewal cadence; must be positive and shorter than `ExecutionLeaseDuration`. |

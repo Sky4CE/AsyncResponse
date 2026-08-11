@@ -185,14 +185,29 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         configure?.Invoke(options);
         ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
 
+        // Validate the FINAL occurrence-id length now: a name that fits on its own would
+        // otherwise register cleanly and fail on every occurrence at 3 a.m. — and only on the
+        // stores whose flow_id column is 400 characters.
+        var occurrenceIdLength = ScheduledFlowService.OccurrenceFlowId(name, DateTimeOffset.UnixEpoch).Length;
+        if (occurrenceIdLength > DurableFlowOptions.MaxFlowIdLength)
+        {
+            throw new ArgumentException(
+                $"The scheduled flow name '{name}' produces {occurrenceIdLength}-character occurrence ids (sched:{{name}}:{{timestamp}}); " +
+                $"the portable flow-id maximum is {DurableFlowOptions.MaxFlowIdLength} characters " +
+                $"({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id column length in the " +
+                "SQL Server, MySQL, Oracle, and EF Core stores). Use a shorter name.",
+                nameof(name));
+        }
+
         // Parse in the schedule's own time zone AND probe for a real next occurrence: a well-formed
         // but unsatisfiable expression ("0 0 30 2 *") would otherwise register cleanly and its loop
         // would die at startup with one warning — the silent 3 a.m. failure this validation exists
         // to prevent. The runtime null-check in ScheduledFlowService stays as the backstop.
         // Deliberate deviation from the engine's TimeProvider seam: registration runs before any
-        // provider (and thus any injected clock) exists, and the probe scans an 8-year horizon, so
-        // the system clock answers "can this expression ever fire", not "when" — the runtime loop
-        // computes actual occurrences from the injected TimeProvider as usual.
+        // provider (and thus any injected clock) exists, and the probe's 400-year scan (a full
+        // Gregorian cycle — a completeness proof) means the system clock only answers "can this
+        // expression ever fire", not "when" — the runtime loop computes actual occurrences from
+        // the injected TimeProvider as usual.
         var probe = CronSchedule.Parse(cron, options.TimeZone);
         if (probe.GetNextOccurrence(TimeProvider.System.GetUtcNow()) is null)
         {

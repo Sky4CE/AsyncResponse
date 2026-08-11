@@ -103,8 +103,7 @@ public sealed class CronSchedule
 
     /// <summary>
     /// Returns the first occurrence strictly after <paramref name="afterUtc"/>, as a UTC instant,
-    /// or <c>null</c> when no occurrence exists within the search horizon (about eight years —
-    /// enough to prove an expression such as "Feb 30" unsatisfiable).
+    /// or <c>null</c> when the expression can never fire (an impossible date such as "Feb 30").
     /// </summary>
     public DateTimeOffset? GetNextOccurrence(DateTimeOffset afterUtc)
     {
@@ -115,11 +114,15 @@ public sealed class CronSchedule
         var candidate = new DateTime(local.Year, local.Month, local.Day, local.Hour, local.Minute, 0, DateTimeKind.Unspecified)
             .AddMinutes(1);
 
-        // Horizon: 8 years covers every leap-year/day-of-week alignment a satisfiable expression
-        // can need (worst real case, Feb 29 on a fixed weekday, recurs within 40 years — but any
-        // expression matching a *day* recurs within 8; Feb-29-with-weekday beyond that is treated
-        // as unsatisfiable together with the genuinely impossible dates).
-        var horizon = candidate.AddYears(8);
+        // Horizon: 400 Gregorian years — a full calendar cycle (146 097 days, exactly 20 871
+        // weeks), so any (month, day, weekday) combination the calendar ever produces occurs
+        // within the next 400 years of ANY start date. A miss is therefore a completeness proof
+        // of unsatisfiability, not a heuristic: "0 0 29 2 */7" (Feb 29 on a Sunday, gaps of up to
+        // 40 years around skipped century leap days) resolves; "Feb 30" is proven impossible.
+        // The scan stays cheap because misses skip by month/day (an impossible date walks a few
+        // dozen candidates per year, not half a million minutes). The cap keeps the in-loop
+        // day/month jumps (at most ~1 month ahead) inside DateTime.MaxValue for far-future input.
+        var horizon = candidate < HorizonCap ? candidate.AddYears(400) : DateTime.MaxValue.AddDays(-366);
 
         while (candidate < horizon)
         {
@@ -151,12 +154,22 @@ public sealed class CronSchedule
             // A schedule-local match. Map it onto the UTC timeline honoring DST:
             if (TimeZone.IsInvalidTime(candidate))
             {
-                // Spring-forward gap: the wall-clock time never happens. Interpreting the wall time
-                // with the PRE-transition offset yields the exact instant the clock jumps past it —
-                // i.e. the job fires at the gap's end, matching what cron daemons do for jobs the
-                // jump would otherwise skip.
-                var preTransitionOffset = TimeZone.GetUtcOffset(candidate.AddDays(-1));
-                var instant = new DateTimeOffset(candidate, preTransitionOffset).ToUniversalTime();
+                // Spring-forward gap: the wall-clock time never happens, so the job fires at the
+                // gap's END — the exact transition instant, the moment the clock jumps past the
+                // scheduled time (what cron daemons do for jobs the jump skips). That instant is
+                // the gap's FIRST wall minute interpreted with the offset in force just before
+                // the gap. Interpreting the candidate minute itself with the pre-gap offset would
+                // land PAST the transition (02:30 in a 02:00→03:00 jump would fire at 03:30, not
+                // 03:00) — a later instant that also breaks next-occurrence ordering: it would be
+                // reported as the future occurrence and then skipped by a re-query inside the
+                // half-open window. Multiple scheduled minutes inside one gap all collapse onto
+                // the same transition instant, and the strictly-after filter fires it once.
+                var gapStart = candidate;
+                while (TimeZone.IsInvalidTime(gapStart.AddMinutes(-1)))
+                    gapStart = gapStart.AddMinutes(-1);
+
+                var preTransitionOffset = TimeZone.GetUtcOffset(gapStart.AddMinutes(-1));
+                var instant = new DateTimeOffset(gapStart, preTransitionOffset).ToUniversalTime();
                 if (instant > afterUtc)
                     return instant;
 
@@ -211,6 +224,9 @@ public sealed class CronSchedule
 
     private static readonly string[] MonthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
     private static readonly string[] DayNames = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+    // Latest start for which "candidate + 400 years + in-loop jumps" stays inside DateTime.
+    private static readonly DateTime HorizonCap = DateTime.MaxValue.AddDays(-366).AddYears(-400);
 
     private static ulong ParseField(string expression, string field, int min, int max, string[]? names, bool allowQuestionMark)
     {
@@ -292,19 +308,23 @@ public sealed class CronSchedule
 
     private static ulong RangeMask(int min, int max, int low, int high, int step)
     {
+        // The accumulators are long: with an int, a step near int.MaxValue overflows `value += step`
+        // to a negative, and the (six-bit-masked) shift then sets phantom low bits — "1/2147483647"
+        // would silently gain minute 0. In long arithmetic an oversized step simply runs past `high`
+        // after the first value, which is exactly Vixie's semantics for steps beyond the field span.
         ulong mask = 0;
         if (low <= high)
         {
-            for (var value = low; value <= high; value += step)
-                mask |= 1UL << value;
+            for (long value = low; value <= high; value += step)
+                mask |= 1UL << (int)value;
             return mask;
         }
 
         // Wrap-around range (e.g. hours 22-2): low..max then min..high, stepping continuously.
-        var position = low;
+        long position = low;
         while (position <= max)
         {
-            mask |= 1UL << position;
+            mask |= 1UL << (int)position;
             position += step;
         }
 
@@ -312,7 +332,7 @@ public sealed class CronSchedule
         position = min + (position - max - 1);
         while (position <= high)
         {
-            mask |= 1UL << position;
+            mask |= 1UL << (int)position;
             position += step;
         }
 

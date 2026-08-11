@@ -253,11 +253,14 @@ public class DurableFlowTests
         Assert.Equal(flowId, await flows.StartAsync<TestOnboardingFlow, TestFlowInput>(new(7), flowId));
         Assert.Equal(flowId, await flows.StartAsync<TestOnboardingFlow, TestFlowInput>(new(7), flowId));
 
-        var differentInput = await Assert.ThrowsAsync<InvalidOperationException>(
+        // The DEDICATED conflict type (derived from InvalidOperationException for compatibility):
+        // deterministic-id racers key the benign "someone else already started it" reading off it,
+        // so a plain InvalidOperationException here would be a contract break, not a detail.
+        var differentInput = await Assert.ThrowsAsync<DurableFlowIdConflictException>(
             () => flows.StartAsync<TestOnboardingFlow, TestFlowInput>(new(8), flowId));
         Assert.Contains("different flow type or input", differentInput.Message, StringComparison.Ordinal);
 
-        var differentFlow = await Assert.ThrowsAsync<InvalidOperationException>(
+        var differentFlow = await Assert.ThrowsAsync<DurableFlowIdConflictException>(
             () => flows.StartAsync<TestTerminallyFailingFlow, TestFlowInput>(new(7), flowId));
         Assert.Contains("different flow type or input", differentFlow.Message, StringComparison.Ordinal);
     }

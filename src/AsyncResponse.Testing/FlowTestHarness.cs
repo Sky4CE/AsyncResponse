@@ -393,7 +393,19 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
             _waiters.Add(waiter);
         }
 
-        return await AwaitBoundedAsync(waiter.Completion.Task, realTimeGuard, description).ConfigureAwait(false);
+        try
+        {
+            return await AwaitBoundedAsync(waiter.Completion.Task, realTimeGuard, description).ConfigureAwait(false);
+        }
+        finally
+        {
+            // A satisfied waiter was already removed by Record; a timed-out one would otherwise
+            // stay registered forever — its predicate re-evaluated on every future event and its
+            // completion source retained. The gate makes the removal race-safe against a Record
+            // completing it at the same moment (either way it leaves the list exactly once).
+            lock (_gate)
+                _waiters.Remove(waiter);
+        }
     }
 
     internal async Task<DurableFlowRunEvent> WaitForRunAsync(string flowId, TimeSpan realTimeGuard, string description)
@@ -408,7 +420,26 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
             _runWaiters.Add(waiter);
         }
 
-        return await AwaitBoundedAsync(waiter.Completion.Task, realTimeGuard, description).ConfigureAwait(false);
+        try
+        {
+            return await AwaitBoundedAsync(waiter.Completion.Task, realTimeGuard, description).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Same cleanup contract as WaitForAsync: timed-out run waiters must not accumulate.
+            lock (_gate)
+                _runWaiters.Remove(waiter);
+        }
+    }
+
+    /// <summary>Registered-but-unsatisfied waiters — exposed so tests can prove timed-out waits don't leak.</summary>
+    internal int PendingWaiterCount
+    {
+        get
+        {
+            lock (_gate)
+                return _waiters.Count + _runWaiters.Count;
+        }
     }
 
     private static async Task<T> AwaitBoundedAsync<T>(Task<T> task, TimeSpan realTimeGuard, string description)

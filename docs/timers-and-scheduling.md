@@ -62,7 +62,10 @@ On transports **without** native delayed delivery (Kafka, RabbitMQ, Google Pub/S
 Streams, NATS), timers wait in process under the execution lease — the same footprint as an
 awaited step, with the same crash story (broker redelivery of the executing job resumes the
 remainder). The ledger's TTL is automatically extended to cover the sleep on both paths, so a
-run can never out-sleep its own state.
+run can never out-sleep its own state. That contract also bounds a single sleep: at most the
+3650-day persistence ceiling **minus** `DurableFlowOptions.StateExpiry` (default 14 days →
+3636 days), so the extended TTL always outlives the due instant by the full idle margin; a longer
+delay fails the run terminally with the budget in the message instead of stranding it.
 
 ## Delayed worker jobs
 
@@ -133,8 +136,13 @@ usable on its own):
 
 Time zones: occurrences are computed as wall-clock times in the schedule's `TimeZone` (default
 UTC) and fired at the corresponding UTC instant. Across DST transitions: a wall time skipped by
-spring-forward fires at the moment the clock jumps past it; a wall time repeated by fall-back
-fires on the first (earlier-offset) pass only.
+spring-forward fires at the **gap's end** — the transition instant itself (a 02:30 schedule in a
+02:00→03:00 jump fires when the clock reads 03:00); multiple scheduled minutes inside one gap
+collapse onto that single fire. A wall time repeated by fall-back fires on the first
+(earlier-offset) pass only. Sparse-but-valid combinations resolve no matter how far out the next
+occurrence is (`0 0 29 2 */7` — Feb 29 on a Sunday — waits decades between fires): satisfiability
+is proven over a full 400-year Gregorian cycle, so only genuinely impossible dates ("Feb 30")
+are rejected.
 
 ## Semantics worth knowing
 

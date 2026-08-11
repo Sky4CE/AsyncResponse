@@ -134,7 +134,7 @@ internal sealed class DurableFlowService : IDurableFlows
         if (sameFlowType && sameInputType && FlowStateJson.JsonEquivalent(existing.InputJson, requestedInputJson))
             return;
 
-        throw new InvalidOperationException(
+        throw new DurableFlowIdConflictException(
             $"Durable flow id '{flowId}' is already bound to a different flow type or input. " +
             "Idempotent retries must use the same TFlow, TInput, and semantically identical input value.");
     }

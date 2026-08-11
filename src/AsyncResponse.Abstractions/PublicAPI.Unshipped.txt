@@ -37,6 +37,8 @@ AsyncResponse.CallbackParam.Value.set -> void
 AsyncResponse.DurableFlowFailedException
 AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message) -> void
 AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message, System.Exception! innerException) -> void
+AsyncResponse.DurableFlowIdConflictException
+AsyncResponse.DurableFlowIdConflictException.DurableFlowIdConflictException(string! message) -> void
 AsyncResponse.DurableFlowRunEvent
 AsyncResponse.DurableFlowRunEvent.Deconstruct(out string! FlowId, out AsyncResponse.FlowRunStatus Status, out string? Message) -> void
 AsyncResponse.DurableFlowRunEvent.DurableFlowRunEvent() -> void

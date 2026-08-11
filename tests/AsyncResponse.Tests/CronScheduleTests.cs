@@ -151,6 +151,30 @@ public class CronScheduleTests
         Assert.Null(CronSchedule.Parse("0 0 31 4 *").GetNextOccurrence(Utc(2030, 1, 1)));
     }
 
+    [Fact]
+    public void LeapDayOnAFixedWeekday_ResolvesAcrossDecades()
+    {
+        // "Feb 29 that is also a Sunday" — the "*/7" day-of-week is star-shaped, so Vixie AND
+        // semantics apply. Sunday leap days sit up to 28 years apart inside a century (40 across
+        // a skipped century leap day), and the 400-year completeness horizon must resolve them
+        // rather than lump them in with the impossible dates: under the previous 8-year horizon a
+        // schedule registered before 2032 fired once and then permanently stopped.
+        Assert.Equal(Utc(2032, 2, 29, 0, 0), Next("0 0 29 2 */7", Utc(2026, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2060, 2, 29, 0, 0), Next("0 0 29 2 */7", Utc(2032, 3, 1, 0, 0)));
+    }
+
+    [Fact]
+    public void OversizedStep_YieldsOnlyTheStartValue_NoOverflowPhantoms()
+    {
+        // A step beyond the field span contributes its start value only (Vixie semantics). The
+        // pre-fix int accumulator overflowed on `value += step`, and the six-bit shift masking
+        // then minted phantom values: "1/2147483647" gained minute 0, so a schedule meaning
+        // "minute 1 of every hour" also fired on the hour.
+        Assert.Equal(Utc(2030, 1, 1, 1, 1), Next("1/2147483647 * * * *", Utc(2030, 1, 1, 0, 1)));
+        // Same arithmetic in the day-of-week field: Monday only, no phantom Sunday.
+        Assert.Equal(DayOfWeek.Monday, Next("0 0 * * 1/2147483647", Utc(2030, 1, 1, 0, 0)).DayOfWeek);
+    }
+
     [Theory]
     [InlineData("* * * *")]
     [InlineData("* * * * * *")]
@@ -188,13 +212,40 @@ public class CronScheduleTests
     public void SpringForwardGap_FiresAtTheJump()
     {
         var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
-        // US DST 2030 starts Sunday March 10: 02:30 local does not exist that day.
-        // The occurrence fires at the gap's end instant: 02:30 interpreted with the
-        // pre-transition offset (UTC-5) = 07:30 UTC = 03:30 EDT, the moment the clock has jumped past it.
+        // US DST 2030 starts Sunday March 10: 02:30 local does not exist that day. The occurrence
+        // fires at the gap's END — the transition instant itself: 07:00 UTC, the moment the wall
+        // clock jumps from 02:00 EST to 03:00 EDT past the scheduled 02:30. (Interpreting 02:30
+        // with the pre-transition offset — the pre-fix behavior — gives 07:30 UTC = 03:30 EDT, a
+        // point half an hour AFTER the jump, violating both the documented gap-end contract and
+        // next-occurrence ordering; see SpringForwardGap_ReportsTheSameInstantFromAnyEarlierCursor.)
         var occurrence = Next("30 2 * * *", Utc(2030, 3, 10, 0, 0), newYork);
-        Assert.Equal(Utc(2030, 3, 10, 7, 30), occurrence);
+        Assert.Equal(Utc(2030, 3, 10, 7, 0), occurrence);
         // The next day is back to normal: 02:30 EDT = 06:30 UTC.
         Assert.Equal(Utc(2030, 3, 11, 6, 30), Next("30 2 * * *", occurrence, newYork));
+    }
+
+    [Fact]
+    public void SpringForwardGap_ReportsTheSameInstantFromAnyEarlierCursor()
+    {
+        var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+        // Ordering regression: the pre-fix mapping claimed 07:30Z as the gapped occurrence, but a
+        // query from 06:59Z — BEFORE the transition — must return the transition instant, and a
+        // query from inside the pre-fix half-open window (07:00Z–07:30Z) used to skip the
+        // "future" 07:30Z occurrence entirely and jump to the next day. The gap-end instant is
+        // stable from any earlier cursor and consumed exactly once.
+        Assert.Equal(Utc(2030, 3, 10, 7, 0), Next("30 2 * * *", Utc(2030, 3, 10, 6, 59), newYork));
+        Assert.Equal(Utc(2030, 3, 11, 6, 30), Next("30 2 * * *", Utc(2030, 3, 10, 7, 0), newYork));
+    }
+
+    [Fact]
+    public void SpringForwardGap_CollapsesAllGappedMinutesOntoOneFire()
+    {
+        var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+        // Four scheduled minutes (02:00/15/30/45) all fall inside the gap; they collapse onto the
+        // single transition instant, fire once, and resume normally the next day (02:00 EDT).
+        var occurrence = Next("*/15 2 * * *", Utc(2030, 3, 10, 0, 0), newYork);
+        Assert.Equal(Utc(2030, 3, 10, 7, 0), occurrence);
+        Assert.Equal(Utc(2030, 3, 11, 6, 0), Next("*/15 2 * * *", occurrence, newYork));
     }
 
     [Fact]

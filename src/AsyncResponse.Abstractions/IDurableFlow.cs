@@ -50,3 +50,21 @@ public sealed class DurableFlowFailedException : Exception
     {
     }
 }
+
+/// <summary>
+/// Thrown by <c>IDurableFlows.StartAsync</c> when the requested flow id already exists bound to a
+/// different flow type or a semantically different input — the idempotent-start contract accepts
+/// only exact retries. Derives from <see cref="InvalidOperationException"/> for compatibility with
+/// callers that catch that. The distinct type exists so callers running deterministic-id races
+/// (the scheduled-flow service, outbox-style starters) can tell <em>this id is taken with other
+/// data</em> apart from every other <see cref="InvalidOperationException"/> a start can throw —
+/// treating, say, an input-factory failure as a benign duplicate would report an occurrence as
+/// having run when nothing ran.
+/// </summary>
+public sealed class DurableFlowIdConflictException : InvalidOperationException
+{
+    /// <summary>Creates the conflict with an operator-facing message naming the flow id.</summary>
+    public DurableFlowIdConflictException(string message) : base(message)
+    {
+    }
+}

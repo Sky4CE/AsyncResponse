@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -88,6 +89,46 @@ public sealed class NaiveChildFlow(ChildFlowProbe _probe, IAsyncResponsePublishe
 
 public class DurableChildFlowTests
 {
+    [Fact]
+    public async Task RootFlowId_BeyondThePortableMaximum_IsRejectedAtStart()
+    {
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(new ChildFlowProbe());
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        // Pre-fix this id was accepted by the unbounded stores (PostgreSQL, Redis, Mongo,
+        // in-memory) and rejected by the 400-character-column ones (SQL Server, MySQL, Oracle,
+        // EF Core) — the same application worked or failed depending on the provider package.
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(
+            new RecursiveChildInput(0),
+            new string('x', DurableFlowOptions.MaxFlowIdLength + 1)));
+        Assert.Contains("portable maximum is 400", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ChildFlowId_ComposedBeyondThePortableMaximum_FailsTheParentTerminally()
+    {
+        var probe = new ChildFlowProbe();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(probe);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        // The root id fits (395 ≤ 400) but the composed "{parent}:child-1" (403) does not. The
+        // composition is deterministic on every replay, so the parent fails terminally with the
+        // budget in the message instead of burning its redelivery budget on a store rejection.
+        var rootId = new string('p', DurableFlowOptions.MaxFlowIdLength - 5);
+        var run = await harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(new RecursiveChildInput(1), rootId);
+        Assert.Equal(FlowRunStatus.Failed, await run.WaitForFinishedAsync());
+        var state = await run.GetStateAsync();
+        Assert.Contains("over-long child flow id", state!.LastMessage, StringComparison.Ordinal);
+        Assert.Contains("portable maximum is 400", state.LastMessage, StringComparison.Ordinal);
+        Assert.Equal(0, probe.Count("leaf"));
+    }
+
     private static ServiceProvider CreateProvider()
     {
         var services = new ServiceCollection();

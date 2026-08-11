@@ -108,6 +108,51 @@ public sealed class DurableFlowExecutorCoverageTests
             It.IsAny<CancellationToken>()), Times.Exactly(4));
     }
 
+    [Fact]
+    public async Task RecoverAsync_SettlingAPendingStep_NotifiesStepCompleted()
+    {
+        // The recovered response settles the awaited step INSIDE RecoverAsync; the replayed
+        // execution then short-circuits the memoized step, so this notification is the only
+        // completion observers (and the Testing probe's step waiters) ever get for it. Pre-fix
+        // it was never raised: the step went Waiting → (silently) done.
+        var store = new InMemoryFlowStateStore();
+        await CreateAsync(store, State("recover-notify"));
+        await CreateAsync(store, State("recover-suspended", FlowRunStatus.Suspended));
+        var observer = new RecordingObserver();
+        await using var harness = CreateHarness(store, observers: [observer]);
+
+        await harness.Executor.RecoverAsync("recover-notify", new object(), "expected");
+
+        var completed = Assert.Single(observer.Completed);
+        Assert.Equal("recover-notify", completed.FlowId);
+        Assert.Equal("step", completed.StepName);
+        Assert.Equal(DurableFlowStepKind.Awaited, completed.Kind);
+        Assert.Equal("expected", completed.CorrelationId);
+
+        // A Suspended run checkpoints the recovered payload too (it exists nowhere else) — the
+        // completion is observable even though the run is deliberately not woken.
+        await harness.Executor.RecoverAsync("recover-suspended", new object(), "expected");
+        Assert.Equal(2, observer.Completed.Count);
+        Assert.Equal("recover-suspended", observer.Completed[1].FlowId);
+    }
+
+    private sealed class RecordingObserver : IDurableFlowExecutionObserver
+    {
+        public List<DurableFlowStepEvent> Completed { get; } = [];
+
+        public ValueTask OnStepStartingAsync(DurableFlowStepEvent step) => default;
+
+        public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step) => default;
+
+        public ValueTask OnStepCompletedAsync(DurableFlowStepEvent step)
+        {
+            Completed.Add(step);
+            return default;
+        }
+
+        public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run) => default;
+    }
+
     [Theory]
     [InlineData(InvalidFlowDefinition.MissingFlowType, "no flow type name")]
     [InlineData(InvalidFlowDefinition.UnresolvableFlowType, "Cannot resolve flow type")]
@@ -211,7 +256,8 @@ public sealed class DurableFlowExecutorCoverageTests
 
     private static Harness CreateHarness(
         IFlowStateStore store,
-        Action<IServiceCollection>? configure = null)
+        Action<IServiceCollection>? configure = null,
+        IEnumerable<IDurableFlowExecutionObserver>? observers = null)
     {
         var services = new ServiceCollection();
         services.AddSingleton(store);
@@ -229,7 +275,8 @@ public sealed class DurableFlowExecutorCoverageTests
             recoverableSubscriber: null,
             new AsyncResponseContextPropagation([]),
             new DurableFlowOptions(),
-            NullLogger<DurableFlowExecutor>.Instance);
+            NullLogger<DurableFlowExecutor>.Instance,
+            observers: observers);
 
         return new Harness(provider, executor, builder);
     }

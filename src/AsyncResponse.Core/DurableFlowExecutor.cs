@@ -324,6 +324,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         var checkpointed = false;
         var running = false;
         var lastStatus = FlowRunStatus.Running;
+        string? recoveredStep = null;
 
         var found = await FlowStateConcurrency.MutateAsync(
             store,
@@ -333,6 +334,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             state =>
             {
                 checkpointed = false;
+                recoveredStep = null;
                 lastStatus = state.Status;
                 running = state.Status == FlowRunStatus.Running;
 
@@ -358,6 +360,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 pending.Value.CompletedAtUtc = _timeProvider.GetUtcNow().UtcDateTime;
                 state.LastMessage = $"Step '{pending.Key}' recovered after subscriber loss.";
                 checkpointed = true;
+                recoveredStep = pending.Key;
                 return true;
             }).ConfigureAwait(false);
 
@@ -384,6 +387,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return;
         }
 
+        // The completion recorded here is the ONLY chance observers get to see this step finish:
+        // the replayed execution short-circuits the now-memoized step without notifying. Notified
+        // before the wake-up is enqueued so observers (e.g. the Testing probe's step waiters) see
+        // the completion before the resumed run races past it. Best-effort by necessity: once the
+        // checkpoint settles, the pending correlation id is gone, and a redelivered RecoverAsync
+        // can no longer tell which step this response completed — an observer that throws here
+        // loses the event (unlike run-finished, which re-derives from the persisted status).
+        await NotifyStepCompletedAsync(flowId, recoveredStep!, correlationId).ConfigureAwait(false);
+
         if (!running)
         {
             _logger.LogInformation(
@@ -394,6 +406,16 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
 
         _logger.LogDebug("Durable flow {FlowId} checkpointed recovered correlationId {CorrelationId}; resuming.", flowId, correlationId);
         await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(flowId)).ConfigureAwait(false);
+    }
+
+    private async Task NotifyStepCompletedAsync(string flowId, string stepName, string correlationId)
+    {
+        if (_observers.Length == 0)
+            return;
+
+        var stepEvent = new DurableFlowStepEvent(flowId, stepName, DurableFlowStepKind.Awaited, correlationId, WakeAtUtc: null);
+        foreach (var observer in _observers)
+            await observer.OnStepCompletedAsync(stepEvent).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -186,11 +186,14 @@ internal sealed class ScheduledFlowService(
         {
             throw;
         }
-        catch (InvalidOperationException ex)
+        catch (DurableFlowIdConflictException ex)
         {
             // The deterministic id already exists with a DIFFERENT input: another replica won the
             // create with a value this replica's input factory did not reproduce. The occurrence
             // ran (exactly once) — only the factory's determinism is at fault, so say exactly that.
+            // ONLY the dedicated conflict type gets this benign reading: the delegate also runs
+            // the user's input factory, and a plain InvalidOperationException from it (or from the
+            // store) means nothing was started — that is the generic failure logged below.
             _logger.LogWarning(
                 ex,
                 "Scheduled flow '{Schedule}' occurrence {FlowId} was already started with different input — the input factory is not deterministic across replicas. The occurrence still ran exactly once.",

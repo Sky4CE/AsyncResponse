@@ -194,6 +194,14 @@ completed checkpoint is replayed, so changed arguments can never silently adopt 
 The default id, `{parentFlowId}:{stepName}`, is always safe; pass a custom nonblank `flowId` only
 when it is unique per parent step, and keep that id and input stable on every replay.
 
+**Flow-id length is a portable contract.** Every final id — root, composed child, scheduled
+occurrence — must fit `DurableFlowOptions.MaxFlowIdLength` (400 characters, the `flow_id` column
+length in the SQL Server, MySQL, Oracle, and EF Core stores), enforced centrally at creation so
+an id cannot work on one store and fail on another. Budget root ids for growth: each child level
+appends `:{stepName}`, and `WithScheduledFlow` wraps its name as `sched:{name}:{timestamp}`
+(validated at registration). An over-long root id is rejected at `StartAsync`; an over-long
+composed child id fails the parent terminally with the budget in the message.
+
 **No timeout on a child wait — deliberately.** A suspended parent holds no worker, so there is
 nothing to time out cheaply; the child is bounded by its own step timeouts and by the worker
 transport's dead-lettering. If a child gets stuck, that shows up as the child's alarm (its DLQ

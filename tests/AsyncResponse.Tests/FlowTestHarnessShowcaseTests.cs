@@ -231,6 +231,23 @@ public class FlowTestHarnessShowcaseTests
         Assert.Equal(1, client.Calls.Count(c => c == "migrate:21"));
         Assert.True(client.Calls.Count(c => c == "import:21") >= 1);
     }
+
+    [Fact]
+    public async Task TimedOutProbeWaiters_AreRemoved_NotRetained()
+    {
+        // Fully qualified: this test assembly declares its own (unrelated) FlowProbe helper type.
+        var probe = new Testing.FlowProbe();
+
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            probe.WaitForAsync("flow-x", _ => false, TimeSpan.FromMilliseconds(50), "an event that never happens"));
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            probe.WaitForRunAsync("flow-x", TimeSpan.FromMilliseconds(50), "a run that never finishes"));
+
+        // Pre-fix, timed-out waiters stayed registered forever: every future event re-evaluated
+        // their predicates and their completion sources pinned the captured closures — a steady
+        // leak in suites that probe with short guards in retry loops.
+        Assert.Equal(0, probe.PendingWaiterCount);
+    }
 }
 
 internal static class FlowTestHarnessTestExtensions
