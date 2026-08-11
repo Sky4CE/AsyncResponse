@@ -1,5 +1,6 @@
 using AsyncResponse.Transports.NATS;
 using Microsoft.Extensions.Options;
+using NATS.Client.JetStream;
 using System.Text.Json;
 using Xunit;
 
@@ -418,6 +419,69 @@ public class NatsWorkerTransportTests
     }
 
     [Fact]
+    public async Task PublishAsync_RetriesTransientStreamProvisioningFailures()
+    {
+        // Stream provisioning runs on the first publish — precisely when the JetStream API is
+        // likeliest to time out ("No API response received from the server" while the server
+        // settles). It was the one call in this type NOT retried, so that transient condition
+        // failed the caller's publish outright even though the identical condition on the publish
+        // itself was absorbed. Reproduced in CI as random matrix-cell failures at exactly the
+        // 5-second JetStream API timeout.
+        var attempts = 0;
+        _jetStream.EnsureStreamFailureForAttempt = attempt =>
+        {
+            attempts = attempt;
+            return attempt == 1 ? new NatsJSApiNoResponseException() : null;
+        };
+        var transport = CreateTransport(new NatsAsyncResponseTransportOptions
+        {
+            PublishMaxAttempts = 3,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+        });
+
+        await transport.PublishAsync(CreateJob());
+
+        Assert.Equal(2, attempts);
+        Assert.Single(_jetStream.EnsuredStreams);
+        Assert.Single(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task PublishAsync_DoesNotRetryNonTransientStreamProvisioningFailures()
+    {
+        // A misconfigured stream (a name collision, a rejected retention change) is deterministic:
+        // surface it on the first attempt instead of burning the retry budget.
+        _jetStream.EnsureStreamFailureForAttempt = _ => new InvalidOperationException("fatal");
+        var transport = CreateTransport();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(CreateJob()));
+        Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task PublishAsync_AfterATransientProvisioningFailure_DoesNotLatchTheStreamAsEnsured()
+    {
+        // The "once" flag must latch on SUCCESS only: a failed ensure that marked itself done
+        // would leave later publishes writing to a stream that does not exist.
+        _jetStream.EnsureStreamFailureForAttempt = attempt => attempt <= 3 ? new NatsJSApiNoResponseException() : null;
+        var transport = CreateTransport(new NatsAsyncResponseTransportOptions
+        {
+            PublishMaxAttempts = 2,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+        });
+
+        // Attempts 1-2 exhaust the budget and throw; attempts 3-4 are the next publish, whose
+        // second try succeeds — proving the transport re-provisions instead of assuming success.
+        await Assert.ThrowsAsync<NatsJSApiNoResponseException>(() => transport.PublishAsync(CreateJob()));
+        await transport.PublishAsync(CreateJob());
+
+        Assert.Single(_jetStream.EnsuredStreams);
+        Assert.Single(_jetStream.Published);
+    }
+
+    [Fact]
     public async Task PublishAsync_Throws_OnNullJob()
         => await Assert.ThrowsAsync<ArgumentNullException>(() => CreateTransport().PublishAsync(null!));
 }
@@ -450,6 +514,9 @@ public class NatsTransportRetryTests
     public void IsTransient_ClassifiesTimeoutAsTransient_AndCancellationAsNot()
     {
         Assert.True(NatsTransportRetry.IsTransient(new TimeoutException()));
+        // The JetStream API's own "the server did not answer" — the condition that shows up under
+        // load — must classify as transient; it reaches the classifier as a NatsException subtype.
+        Assert.True(NatsTransportRetry.IsTransient(new NatsJSApiNoResponseException()));
         Assert.False(NatsTransportRetry.IsTransient(new OperationCanceledException()));
         Assert.False(NatsTransportRetry.IsTransient(new InvalidOperationException()));
     }

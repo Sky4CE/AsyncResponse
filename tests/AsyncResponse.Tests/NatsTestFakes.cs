@@ -334,12 +334,21 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
     /// <summary>Returns an exception to throw for a given (1-based) EnsureConsumer attempt, or null to succeed.</summary>
     public Func<int, Exception?>? EnsureConsumerFailureForAttempt { get; set; }
 
+    /// <summary>Returns an exception to throw for a given (1-based) EnsureStream attempt, or null to succeed.</summary>
+    public Func<int, Exception?>? EnsureStreamFailureForAttempt { get; set; }
+
     private int _publishAttempts;
     private int _ensureConsumerAttempts;
+    private int _ensureStreamAttempts;
     private readonly Channel<NatsJobDelivery> _deliveries = Channel.CreateUnbounded<NatsJobDelivery>();
 
     public Task EnsureStreamAsync(string stream, string subject, long? maxMessages, CancellationToken cancellationToken)
     {
+        _ensureStreamAttempts++;
+        var failure = EnsureStreamFailureForAttempt?.Invoke(_ensureStreamAttempts);
+        if (failure is not null)
+            throw failure;
+
         EnsuredStreams.Add((stream, subject));
         return Task.CompletedTask;
     }

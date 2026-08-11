@@ -249,6 +249,17 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **The NATS worker transport now retries transient JetStream *provisioning* failures, not just
+  publishes.** Stream creation runs lazily on the first publish — exactly when a JetStream API
+  request is likeliest to time out (`NatsJSApiNoResponseException`, "No API response received
+  from the server"): right after startup, or after any JetStream hiccup, since the once-flag only
+  latches on success. That call was the single path in the transport without the bounded
+  exponential backoff its own contract promises, so a transient condition absorbed one line later
+  on the publish itself failed the caller's enqueue outright. It now retries on the same
+  `PublishMaxAttempts` / `PublishRetryBaseDelay` / `PublishRetryMaxDelay` terms; deterministic
+  provisioning errors (a stream-name collision, a rejected retention change) still surface on the
+  first attempt. Observed as random cross-product matrix-cell failures in CI, each at exactly the
+  five-second JetStream API timeout.
 - **A maximum-duration durable timer can no longer expire its own ledger.** `DelayAsync` /
   `DelayUntilAsync` accepted sleeps up to the 3650-day persistence ceiling itself, while the
   sleeping ledger's TTL (`sleep + StateExpiry`) saturated at that same ceiling — a

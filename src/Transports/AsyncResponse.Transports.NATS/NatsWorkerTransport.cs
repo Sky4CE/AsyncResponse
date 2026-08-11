@@ -98,10 +98,26 @@ public sealed class NatsWorkerTransport : IWorkerTransport
         {
             if (!_streamEnsured)
             {
-                await _jetStream.EnsureStreamAsync(
-                    _schema.WorkerStream,
-                    _schema.WorkerSubject,
-                    _options.StreamMaxMessages,
+                // Retried on the SAME terms as the publish below. Stream provisioning is a
+                // JetStream *API* request, and it runs at the moment that request is likeliest to
+                // time out: the first publish after startup — or after any JetStream hiccup, since
+                // the flag only latches on success — when the server may still be settling. An
+                // unretried "no API response" there failed the caller's publish outright while the
+                // very same transient condition one line later was absorbed, contradicting this
+                // type's own contract that transient NATS failures are retried before throwing.
+                await NatsTransportRetry.ExecuteAsync(
+                    async token =>
+                    {
+                        await _jetStream.EnsureStreamAsync(
+                            _schema.WorkerStream,
+                            _schema.WorkerSubject,
+                            _options.StreamMaxMessages,
+                            token).ConfigureAwait(false);
+                        return true;
+                    },
+                    _options.PublishMaxAttempts,
+                    _options.PublishRetryBaseDelay,
+                    _options.PublishRetryMaxDelay,
                     cancellationToken).ConfigureAwait(false);
                 _streamEnsured = true;
             }

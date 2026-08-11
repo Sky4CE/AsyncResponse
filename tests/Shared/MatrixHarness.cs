@@ -253,11 +253,25 @@ public sealed class MatrixHarness : IAsyncDisposable
         var probe = Provider.GetRequiredService<MatrixReadinessProbe>();
         var builder = Provider.GetRequiredService<IAsyncResponseBuilder>();
         var deadline = DateTime.UtcNow + ReadinessBudget;
+        Exception? lastPublishFailure = null;
 
         while (DateTime.UtcNow < deadline)
         {
-            await builder.EnqueueWorkerAsync<IMatrixReadinessProbe>(
-                service => service.PingAsync(), cancellationToken);
+            try
+            {
+                await builder.EnqueueWorkerAsync<IMatrixReadinessProbe>(
+                    service => service.PingAsync(), cancellationToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A broker that is up but not yet answering its admin API fails the PUBLISH, not
+                // just the delivery — a JetStream request timing out while the server settles on a
+                // loaded runner is the canonical case. That is exactly the not-ready condition
+                // this budget exists to absorb, so keep probing instead of aborting the build on
+                // the first attempt; the exception is kept so a genuine misconfiguration still
+                // surfaces with its cause once the budget runs out.
+                lastPublishFailure = ex;
+            }
 
             var completed = await Task.WhenAny(
                 probe.Delivered.Task,
@@ -268,7 +282,9 @@ public sealed class MatrixHarness : IAsyncDisposable
 
         throw new InvalidOperationException(
             $"The {Cell.Transport} transport did not deliver a probe job within {ReadinessBudget}, so the " +
-            $"harness for {Cell} is not usable. Subscriber diagnostics: {Diagnostics.Summary()}.");
+            $"harness for {Cell} is not usable. Subscriber diagnostics: {Diagnostics.Summary()}." +
+            (lastPublishFailure is null ? string.Empty : " The last probe publish also failed; see the inner exception."),
+            lastPublishFailure);
     }
 
     // --- Backend client singletons ----------------------------------------------------------------
