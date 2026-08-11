@@ -530,7 +530,11 @@ internal abstract class DbAsyncResponseChannelBase :
             foreach (var subscription in group.Values.ToArray())
             {
                 await subscription.DropLocalAsync(cancellationToken).ConfigureAwait(false);
-                group.TryRemove(subscription.Id, out _);
+                // Retire the registry registration too (as RemoveSubscription does): a leftover
+                // refcount would defeat the tombstone set by the RemoveAsync below, letting a
+                // later delivery recreate an executor nothing ever retires.
+                if (group.TryRemove(subscription.Id, out _))
+                    _executors.OnSubscriptionRetired(ChannelName(correlationId));
             }
 
             UnlinkIfEmpty(correlationId, group);

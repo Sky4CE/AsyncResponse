@@ -179,6 +179,29 @@ public sealed class DbChannelSharedCoverageTests
     /// the registration, then fails the round); the loop's failure-path ordering is shared
     /// source, and the compensation logic itself is pinned per-assembly by the ×3 test above.
     /// </summary>
+    /// <summary>
+    /// Regression (review fix): <c>DropLocalSubscriptionsAsync</c> must retire each dropped
+    /// subscription's executor-registry registration, exactly as <c>RemoveSubscription</c> does.
+    /// A leftover refcount defeated the tombstone its own <c>RemoveAsync</c> sets, so a later
+    /// delivery for the correlation id recreated an executor nothing ever retired — one leaked
+    /// drain loop per dropped id. Mongo harness only: its store is fully mocked, so the drop's
+    /// subscriber delete succeeds; the closed-port SQL harnesses fault that call before the
+    /// retire logic runs (the logic itself is shared source, identical in all three assemblies).
+    /// </summary>
+    [Fact]
+    public async Task DropLocalSubscriptions_RetiresExecutorRegistrations()
+    {
+        await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
+        var subscription = harness.Subscription("corr-drop").Instance;
+        harness.AddSubscription("corr-drop", subscription);
+        Assert.Equal(1, harness.ExecutorRegistrations.Count);
+
+        await harness.InvokeAsync("DropLocalSubscriptionsAsync", CancellationToken.None);
+
+        Assert.Equal(0, harness.ExecutorRegistrations.Count);
+        Assert.Equal(0, harness.Subscriptions.Count);
+    }
+
     [Fact]
     public async Task Heartbeat_CompensatesEvenWhenTheRoundFails()
     {
@@ -495,6 +518,10 @@ public sealed class DbChannelSharedCoverageTests
                     var options = Options.Create(new MongoDbAsyncResponseChannelOptions
                     {
                         AutoCreateIndexes = false,
+                        // Keep EnsureCreatedAsync a no-op: the ledger's collection is not mocked,
+                        // and a store call routed through it would fault on the loose mock instead
+                        // of the fault (or success) the test actually arranged.
+                        UseOwnershipLedger = false,
                         UseChangeStreams = false,
                         ListenerPollInterval = pollInterval,
                         SubscriberHeartbeatInterval = heartbeat,
@@ -573,6 +600,18 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>The shared base's per-provider subscription map, for asserting local teardown.</summary>
         public System.Collections.IDictionary Subscriptions
             => (System.Collections.IDictionary)Field("_subscriptions").GetValue(Channel)!;
+
+        /// <summary>The serial-executor registry's per-channel registration refcounts, for asserting retirement.</summary>
+        public System.Collections.IDictionary ExecutorRegistrations
+        {
+            get
+            {
+                var registry = Field("_executors").GetValue(Channel)!;
+                return (System.Collections.IDictionary)registry.GetType()
+                    .GetField("_registrations", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .GetValue(registry)!;
+            }
+        }
 
         public (object Instance, TaskCompletionSource<OperationResult> Completion) Subscription(
             string correlationId,

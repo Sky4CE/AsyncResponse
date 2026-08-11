@@ -17,6 +17,37 @@ public class AsyncResponseWatchdogLoopTests
     private static readonly TimeSpan PublishTimeout = TimeSpan.FromSeconds(30);
 
     [Fact]
+    public void Construction_OverCeilingInterval_FailsFastAtStartup()
+    {
+        // Regression (review fix): Interval arms Task.Delay in the scan loop but was never
+        // validated — an over-ceiling value passed registration and threw mid-run, faulting the
+        // background service (and, with the .NET default StopHost behavior, the whole host).
+        var options = Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions
+        {
+            Watchdog = new AsyncResponseWatchdogOptions { Interval = TimeSpan.FromDays(60) }
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new AsyncResponseWatchdogState(), options, new FakeScanner(), new FakeProbe(0)));
+        Assert.Contains(nameof(AsyncResponseWatchdogOptions.Interval), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Construction_NegativeStartupDelay_FailsFastAtStartup()
+    {
+        // Same regression, StartupDelay flavor: it arms the first Task.Delay of the loop, and a
+        // negative value used to fault the service instead of failing at construction.
+        var options = Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions
+        {
+            Watchdog = new AsyncResponseWatchdogOptions { StartupDelay = TimeSpan.FromSeconds(-1) }
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new AsyncResponseWatchdogState(), options, new FakeScanner(), new FakeProbe(0)));
+        Assert.Contains(nameof(AsyncResponseWatchdogOptions.StartupDelay), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Disabled_DoesNotScanOrPublish()
     {
         var state = new AsyncResponseWatchdogState();

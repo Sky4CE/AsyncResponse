@@ -367,7 +367,6 @@ internal sealed class AwaitingRedisMessageDispatcher(
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
-            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
         {
@@ -385,11 +384,30 @@ internal sealed class AwaitingRedisMessageDispatcher(
                 ex,
                 "handler_failed_max_attempts",
                 CancellationToken.None).ConfigureAwait(false);
+            return RedisDispatchOutcome.Processed;
         }
         catch
         {
             // Leave the entry pending. The subscriber's pending-claim loop reclaims it after
             // PendingMessageMinIdleTime, giving Redis-backed retry without a hot loop.
+            return RedisDispatchOutcome.Processed;
+        }
+
+        // The ACK sits outside the handler's try/catch: a transient XACK failure after a
+        // successful handler must not be misread as a handler failure — dead-lettering or leaving
+        // it for reclaim here would redeliver (or bury) work whose side effects already completed.
+        // Swallow and log instead; the entry stays pending and at-least-once redelivery applies.
+        try
+        {
+            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(
+                ex,
+                "Failed to ACK Redis message {MessageId} on {Stream} after a successful handler; the entry stays pending and may be redelivered.",
+                delivery.MessageId.ToString(),
+                delivery.Stream.ToString());
         }
 
         return RedisDispatchOutcome.Processed;

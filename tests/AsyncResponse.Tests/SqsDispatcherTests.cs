@@ -239,6 +239,34 @@ public sealed class SqsDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_DeleteFailureAfterSuccessfulHandler_DoesNotShortenVisibility()
+    {
+        // Regression (review fix): DeleteAsync used to sit inside the handler try, so a delete
+        // failure after a successful handler took the failure branch — shortening visibility to
+        // hasten a duplicate of already-completed work and burning receives toward the redrive
+        // policy. The delete failure is now swallowed and logged; the visibility timeout owns
+        // redelivery on its own schedule.
+        var calls = new SettlementCalls { DeleteException = new InvalidOperationException("receipt expired") };
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) =>
+            {
+                calls.Handler++;
+                return Task.CompletedTask;
+            },
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions { RedeliveryDelay = TimeSpan.FromSeconds(7) },
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        Assert.Equal(1, calls.Handler);
+        Assert.Equal(1, calls.Delete);
+        Assert.Empty(calls.VisibilityChanges);
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_RedeliveryDelayVisibilityFailure_IsSwallowed()
     {
         var calls = new SettlementCalls { ChangeVisibilityException = new InvalidOperationException("receipt expired") };

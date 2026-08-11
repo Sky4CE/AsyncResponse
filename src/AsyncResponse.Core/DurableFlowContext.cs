@@ -618,6 +618,11 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 return false;
             }
 
+            // Sync the ledger revision too: the recovery write that completed this step advanced
+            // it, and a stale in-memory revision would fail the NEXT checkpoint's compare-and-swap
+            // — aborting every execution that took this short-circuit as a phantom "concurrent
+            // write" and forcing a pointless redelivery.
+            _state.Revision = persisted.Revision;
             checkpoint.Completed = true;
             checkpoint.ResultJson = persistedStep.ResultJson;
             checkpoint.PendingCorrelationId = null;

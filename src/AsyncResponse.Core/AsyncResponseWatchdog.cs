@@ -37,6 +37,17 @@ public sealed class AsyncResponseWatchdogOptions
     /// entries one slot per row. Default: 100 000.
     /// </summary>
     public int MaxScanEntries { get; set; } = 100_000;
+
+    /// <summary>Validates the timer-armed knobs so a bad value fails at startup, not mid-scan.</summary>
+    internal void Validate()
+    {
+        // Interval and StartupDelay arm Task.Delay in the scan loop; an out-of-range value there
+        // would throw outside the per-scan try, fault the background service mid-run, and (with
+        // the default BackgroundServiceExceptionBehavior.StopHost) take the host down instead of
+        // failing fast where the misconfiguration is visible.
+        AsyncResponseChannelOptions.EnsureTimerBacked(Interval, nameof(AsyncResponseWatchdogOptions), nameof(Interval));
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(StartupDelay, nameof(AsyncResponseWatchdogOptions), nameof(StartupDelay));
+    }
 }
 
 /// <summary>
@@ -235,6 +246,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         _subscriberProbe = subscriberProbes.FirstOrDefault();
         _state = state;
         _options = options.Value.Watchdog;
+        _options.Validate();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
 

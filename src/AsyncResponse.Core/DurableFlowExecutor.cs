@@ -253,7 +253,8 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
                 store,
                 flowId,
                 _options,
-                _logger).ConfigureAwait(false);
+                _logger,
+                _timeProvider).ConfigureAwait(false);
             if (lease is not null)
                 return lease;
 

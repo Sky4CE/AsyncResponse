@@ -253,6 +253,40 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_AckFailureAfterSuccessfulHandler_DoesNotDeadLetter()
+    {
+        // Regression (review fix): the XACK used to sit inside the handler try, so an ack failure
+        // after a successful handler was misread as a handler failure — dead-lettering
+        // already-processed work as "handler_failed_max_attempts" at max attempts. The ack
+        // failure is now swallowed and logged; the entry stays pending and the pending-claim
+        // loop owns redelivery.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase
+        {
+            AckException = new InvalidOperationException("xack failed")
+        };
+        var handled = 0;
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) =>
+            {
+                handled++;
+                return Task.CompletedTask;
+            },
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            new RedisSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        var outcome = await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+
+        Assert.Equal(1, handled);
+        Assert.Equal(RedisDispatchOutcome.Processed, outcome);
+        Assert.Empty(database.Adds);
+    }
+
+    [Fact]
     public async Task Awaiting_AlreadyExceededMax_DeadLettersWithoutHandling()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

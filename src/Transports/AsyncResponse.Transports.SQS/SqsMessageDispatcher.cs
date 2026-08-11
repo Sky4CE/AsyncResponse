@@ -208,7 +208,6 @@ internal sealed class AwaitingSqsMessageDispatcher(
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
-            await delivery.DeleteAsync().ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -217,6 +216,24 @@ internal sealed class AwaitingSqsMessageDispatcher(
             // the queue's redrive policy dead-letters it after maxReceiveCount receives.
             if (RedeliveryDelay is { } redeliveryDelay)
                 await TryChangeVisibilityAsync(delivery, redeliveryDelay).ConfigureAwait(false);
+            return;
+        }
+
+        // The delete sits outside the handler's try/catch: a transient DeleteMessage failure after
+        // a successful handler must not be misread as a handler failure — shortening visibility
+        // here would hasten a duplicate of work whose side effects already completed and burn
+        // receives toward the redrive policy. Swallow and log instead; the message reappears when
+        // its visibility timeout expires and at-least-once redelivery applies.
+        try
+        {
+            await delivery.DeleteAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(
+                ex,
+                "Failed to delete SQS message {MessageId} after a successful handler; it may be redelivered after its visibility timeout.",
+                delivery.MessageId);
         }
     }
 }

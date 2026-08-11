@@ -303,13 +303,20 @@ internal sealed class RecordingDelivery
     public int Terms { get; private set; }
     public readonly List<TimeSpan> Naks = new();
 
+    /// <summary>When set, every ACK attempt is recorded and then fails with this exception.</summary>
+    public Exception? AckException { get; set; }
+
     public NatsJobDelivery Create(string payload, long numDelivered, string subject = "asyncresponse.transport.worker", IReadOnlyDictionary<string, string>? headers = null)
         => new(
             subject,
             payload,
             headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             numDelivered,
-            () => { Acks++; return ValueTask.CompletedTask; },
+            () =>
+            {
+                Acks++;
+                return AckException is null ? ValueTask.CompletedTask : ValueTask.FromException(AckException);
+            },
             delay => { Naks.Add(delay); return ValueTask.CompletedTask; },
             () => { Terms++; return ValueTask.CompletedTask; });
 }

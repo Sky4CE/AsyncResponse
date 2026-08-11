@@ -109,6 +109,29 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task AckFailureAfterSuccessfulHandler_DoesNotNakOrDeadLetter()
+    {
+        // Regression (review fix): the ACK used to sit inside the handler try, so an ack failure
+        // after a successful handler took HandleFailureAsync — TERMing already-run work into the
+        // DLQ at max attempts, or NAKing a guaranteed duplicate below it. The failure is now
+        // swallowed and logged; JetStream's ack-wait redelivery owns the retry.
+        var rec = new RecordingDelivery { AckException = new InvalidOperationException("ack failed") };
+        var handled = 0;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => { handled++; return Task.CompletedTask; },
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 5 });
+
+        // numDelivered at max attempts: the old in-try ack routed this to dead-letter + TERM.
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(1, handled);
+        Assert.Equal(1, rec.Acks);
+        Assert.Empty(rec.Naks);
+        Assert.Equal(0, rec.Terms);
+        Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
     public async Task HandlerFailureBelowMaxAttempts_NaksForRedelivery()
     {
         var rec = new RecordingDelivery();

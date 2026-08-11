@@ -228,6 +228,35 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_CompleteFailureAfterSuccessfulHandler_DoesNotDeadLetterOrAbandon()
+    {
+        // Regression (review fix): CompleteAsync used to sit inside the handler try, so a lost
+        // peek-lock after a successful handler was misread as a handler failure — dead-lettering
+        // succeeded work at max attempts, or abandoning it into an immediate duplicate below.
+        // The settlement failure is now swallowed and logged; the lock lapse owns redelivery.
+        var calls = new SettlementCalls { CompleteException = new InvalidOperationException("lock lost") };
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) =>
+            {
+                calls.Handler++;
+                return Task.CompletedTask;
+            },
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        // deliveryCount at max attempts: the old in-try Complete routed this to DeadLetterAsync.
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), CancellationToken.None);
+
+        Assert.Equal(1, calls.Handler);
+        Assert.Equal(1, calls.Complete);
+        Assert.Equal(0, calls.Abandon);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_UnlimitedAttemptsAlwaysAbandons()
     {
         var calls = new SettlementCalls();

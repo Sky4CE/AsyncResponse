@@ -116,23 +116,14 @@ public class DurableFlowRecoveryHardeningTests
                 resultJson: AsyncResponseJson.Serialize(new OperationResult { Status = OperationStatus.Completed, Message = "recovered" })));
 
         // Bounded WELL below the 60s step timeout: without the post-registration re-read the
-        // first execution parks until the step timeout because nothing can wake it. With it, the
-        // execution takes the checkpointed result immediately; its FINAL save then loses the
-        // revision CAS to recovery's bump — the designed "abandon and let the delivery retry"
-        // path — so model the transport retry, which completes from the memoized checkpoint.
-        async Task RunLikeATransportDeliveryAsync()
-        {
-            try
-            {
-                await harness.Executor.ExecuteAsync("reattach-race");
-            }
-            catch (InvalidOperationException)
-            {
-                await harness.Executor.ExecuteAsync("reattach-race");
-            }
-        }
-
-        await RunLikeATransportDeliveryAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        // first execution parks until the step timeout because nothing can wake it.
+        //
+        // ONE delivery must suffice — no retry wrapper. Regression (review fix): the
+        // short-circuit also syncs the ledger REVISION it observed. Recovery's checkpoint bumped
+        // it, and before the sync the execution's next save always lost its compare-and-swap,
+        // failing every short-circuiting delivery with "a concurrent write advanced the ledger"
+        // and forcing a pointless redelivery of a perfectly healthy recovery.
+        await harness.Executor.ExecuteAsync("reattach-race").WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.Equal(0, ReattachProbeFlow.TriggerCount);
         Assert.Equal("recovered", ReattachProbeFlow.Result);

@@ -84,11 +84,28 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         try
         {
             await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
-            await delivery.AckAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The ACK sits outside the handler's try/catch: a transient ack failure after a successful
+        // handler must not be misread as a handler failure — NAK/dead-letter here would redeliver
+        // (or bury) work whose side effects already completed. Swallow and log instead; the ack
+        // window lapses on its own and at-least-once redelivery applies.
+        try
+        {
+            await delivery.AckAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to ACK NATS message on subject {Subject} ({Role}) after a successful handler; it may be redelivered.",
+                delivery.Subject,
+                _role);
         }
     }
 

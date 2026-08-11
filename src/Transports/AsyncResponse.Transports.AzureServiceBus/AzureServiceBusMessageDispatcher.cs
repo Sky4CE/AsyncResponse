@@ -192,7 +192,6 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
-            await delivery.CompleteAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -205,6 +204,24 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
             }
 
             await delivery.AbandonAsync().ConfigureAwait(false);
+            return;
+        }
+
+        // The Complete sits outside the handler's try/catch: a transient settlement failure after
+        // a successful handler must not be misread as a handler failure — dead-lettering or
+        // abandoning here would redeliver (or bury) work whose side effects already completed.
+        // Swallow and log instead; the peek-lock lapses on its own and at-least-once redelivery
+        // applies.
+        try
+        {
+            await delivery.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(
+                ex,
+                "Failed to complete Azure Service Bus message {MessageId} after a successful handler; the lock will lapse and the message may be redelivered.",
+                delivery.MessageId);
         }
     }
 }
