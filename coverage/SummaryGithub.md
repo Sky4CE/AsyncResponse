@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/11/2026 - 08:00:47 |
+| Generated on: | 08/11/2026 - 17:05:17 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 476 |
 | Files: | 211 |
-| **Line coverage:** | 97.9% (27695 of 28269) |
-| Covered lines: | 27695 |
-| Uncovered lines: | 574 |
-| Coverable lines: | 28269 |
-| Total lines: | 42092 |
-| **Branch coverage:** | 93.9% (10026 of 10670) |
-| Covered branches: | 10026 |
-| Total branches: | 10670 |
+| **Line coverage:** | 97.9% (27742 of 28318) |
+| Covered lines: | 27742 |
+| Uncovered lines: | 576 |
+| Coverable lines: | 28318 |
+| Total lines: | 42183 |
+| **Branch coverage:** | 94% (10042 of 10682) |
+| Covered branches: | 10042 |
+| Total branches: | 10682 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -89,16 +89,16 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 99.2%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 99.1%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**99.2%**|**95.7%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.4%|98.8%|
+|**AsyncResponse.Channels.PostgreSQL**|**99.1%**|**95.8%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.2%|98.8%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation|100%||
-|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.4%|98.8%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.2%|98.8%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>|100%||
@@ -151,7 +151,7 @@
 |AsyncResponse.AsyncResponseBuilder|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
-|AsyncResponse.AsyncResponseBuilderBase|94%|85%|
+|AsyncResponse.AsyncResponseBuilderBase|94%|90%|
 |AsyncResponse.AsyncResponseChannelMarker|100%||
 |AsyncResponse.AsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.AsyncResponseContextPropagation|100%|96.6%|
@@ -223,7 +223,7 @@
 |AsyncResponse.InMemoryRecoveryStateStore.Entry|100%||
 |AsyncResponse.InMemoryRecoveryStateStore.EntryBucket|94%|94.1%|
 |AsyncResponse.InMemoryWorkerHost|88.8%|94.4%|
-|AsyncResponse.InMemoryWorkerTransport|83.1%|65.7%|
+|AsyncResponse.InMemoryWorkerTransport|83.1%|71%|
 |AsyncResponse.InMemoryWorkerTransport.DelayedJob|100%||
 |AsyncResponse.InMemoryWorkerTransportOptions|100%|100%|
 |AsyncResponse.JsonSafety|100%|100%|
@@ -632,7 +632,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SqlServer**|**99.4%**|**99.5%**|
+|**AsyncResponse.Transports.SqlServer**|**99.4%**|**100%**|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.DbMessageDispatcherBase|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions|100%||
@@ -648,17 +648,17 @@
 |AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransportRetry|100%|100%|
-|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|99.6%|97.8%|
+|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|99.6%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerSubscriber|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport|100%|100%|
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportSer<br/>viceCollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.SQS - 98.4%</summary>
+<details><summary>AsyncResponse.Transports.SQS - 98.5%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SQS**|**98.4%**|**92.9%**|
+|**AsyncResponse.Transports.SQS**|**98.5%**|**92.9%**|
 |AsyncResponse.Transports.SQS.AwaitingSqsMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.SQS.QueuedSqsMessageDispatcher|99%|100%|
 |AsyncResponse.Transports.SQS.SqsAsyncResponseOptions|100%||
