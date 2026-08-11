@@ -89,6 +89,28 @@ public sealed class DurableFlowStateRecord
     public DateTime? LeaseExpiresAtUtc { get; set; }
 }
 
+/// <summary>
+/// Well-known case-sensitive collations for the <c>flow_id</c> key column, one per mainstream
+/// provider. Pass one to <see cref="EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows"/>
+/// when the database's own collation is case-insensitive — the SQL Server and MySQL defaults are,
+/// and under them two flow ids differing only in case collide on the primary key while the engine
+/// treats them as two different runs.
+/// </summary>
+public static class AsyncResponseFlowIdCollations
+{
+    /// <summary>SQL Server: binary, code-point ordered.</summary>
+    public const string SqlServer = "Latin1_General_100_BIN2";
+
+    /// <summary>MySQL / MariaDB: binary comparison over utf8mb4.</summary>
+    public const string MySql = "utf8mb4_bin";
+
+    /// <summary>PostgreSQL: the C locale, which compares byte-wise.</summary>
+    public const string PostgreSql = "C";
+
+    /// <summary>SQLite: the default, already case-sensitive — named for completeness.</summary>
+    public const string Sqlite = "BINARY";
+}
+
 /// <summary>Maps the durable-flow state table into an application model.</summary>
 public static class EFCoreDurableFlowModelBuilderExtensions
 {
@@ -103,10 +125,20 @@ public static class EFCoreDurableFlowModelBuilderExtensions
     /// <param name="modelBuilder">The application model builder.</param>
     /// <param name="tableName">Table name. Default: <see cref="DefaultTableName"/>.</param>
     /// <param name="schema">Optional schema; <c>null</c> uses the provider default.</param>
+    /// <param name="flowIdCollation">
+    /// Collation for the <c>flow_id</c> key column. Flow ids are compared ORDINALLY by the engine,
+    /// so the column must be case-sensitive — but this package runs no DDL and cannot know which
+    /// provider the application points at, and both the SQL Server and MySQL defaults are
+    /// case-INSENSITIVE, which makes <c>flow-a</c> and <c>FLOW-A</c> one key: the second create
+    /// fails as a duplicate and a load returns the other run's state. Pass the matching
+    /// <see cref="AsyncResponseFlowIdCollations"/> constant (the sibling PostgreSQL, SQL Server,
+    /// and MySQL packages pin this in their own DDL). <c>null</c> keeps the database default.
+    /// </param>
     public static ModelBuilder ConfigureAsyncResponseDurableFlows(
         this ModelBuilder modelBuilder,
         string tableName = DefaultTableName,
-        string? schema = null)
+        string? schema = null,
+        string? flowIdCollation = null)
     {
         ArgumentNullException.ThrowIfNull(modelBuilder);
         ArgumentException.ThrowIfNullOrWhiteSpace(tableName);
@@ -118,6 +150,8 @@ public static class EFCoreDurableFlowModelBuilderExtensions
             // 400 matches the sibling packages' key column and stays inside every mainstream
             // provider's index-key size limit (SQL Server 900 bytes, MySQL 3072 bytes).
             entity.Property(r => r.FlowId).HasColumnName("flow_id").HasMaxLength(400);
+            if (!string.IsNullOrWhiteSpace(flowIdCollation))
+                entity.Property(r => r.FlowId).UseCollation(flowIdCollation);
             entity.Property(r => r.StateJson).HasColumnName("state_json").IsRequired();
             entity.Property(r => r.ExpiresAtUtc).HasColumnName("expires_at_utc");
             entity.Property(r => r.UpdatedAtUtc).HasColumnName("updated_at_utc");

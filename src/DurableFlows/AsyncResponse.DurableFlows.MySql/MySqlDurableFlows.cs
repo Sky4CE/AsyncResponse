@@ -245,7 +245,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             command.CommandText =
                 $"""
                 CREATE TABLE IF NOT EXISTS {Table} (
-                    flow_id varchar(400) NOT NULL PRIMARY KEY,
+                    flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
                     state_json longtext NOT NULL,
                     expires_at_utc datetime(6) NOT NULL,
                     updated_at_utc datetime(6) NOT NULL,

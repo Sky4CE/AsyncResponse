@@ -116,6 +116,61 @@ public class DelayedWorkerTransportTests
     }
 
     [Fact]
+    public async Task SkewProvenTimer_WaitsInProcess_InsteadOfMintingAWakeThatForgetsTheProof()
+    {
+        // Persistent clock skew: the transport keeps handing the wake-up back before its due time.
+        // The executor tolerates one anomaly and executes on the SECOND consecutive stall — but
+        // that proof lives in the ENVELOPE, so a timer step that suspends again mints a fresh
+        // wake-up with the counters back at zero and the whole cycle repeats forever: the run
+        // re-enters its timer step over and over and never finishes. While the skew marker is set,
+        // the step must wait out the remainder in process instead.
+        var recorder = new StepRecorder();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(recorder);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ConfigurableSleepFlow, ReminderInput>();
+        });
+
+        ConfigurableSleepFlow.Delay = TimeSpan.FromMinutes(30);
+        var run = await harness.StartFlowAsync<ConfigurableSleepFlow, ReminderInput>(new ReminderInput("acme"));
+        await run.WaitForTimerStepAsync("nap");
+        await harness.Engine.WaitForWorkerIdleAsync();
+
+        // Re-deliver the parked wake-up early, twice: the first is treated as an anomaly and
+        // re-published, the second proves the stall and releases the job to the flow.
+        var transport = (InMemoryWorkerTransport)harness.Engine.Services.GetRequiredService<IWorkerTransport>();
+        var parked = Assert.Single(transport.SnapshotDelayedJobs());
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            await transport.PublishAsync(new WorkerJobEnvelope
+            {
+                Call = parked.Call,
+                CorrelationId = parked.CorrelationId,
+                NotBeforeUtc = parked.NotBeforeUtc,
+                LastRedelayRemaining = parked.NotBeforeUtc - harness.Clock.GetUtcNow().UtcDateTime,
+                RedelayStallCount = attempt
+            });
+
+            // Only the first hop settles back onto the timer wheel. The second proves the stall,
+            // so the flow takes the job and holds it while it waits out the remainder in process —
+            // "not idle" is the fix working.
+            if (attempt == 0)
+                await harness.Engine.WaitForWorkerIdleAsync();
+        }
+
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(30));
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+        Assert.Equal(1, recorder.Count("after-nap"));
+
+        // The load-bearing assertion. The timer step is entered exactly twice: once to park it,
+        // once when the skew-proven delivery releases it — and that second entry waits out the
+        // remainder in process, so it completes the step itself. Pre-fix that entry re-suspended
+        // and minted a fresh wake-up with the stall counters reset, adding a THIRD entry here and
+        // one more for every skewed lap in production, which is the loop that never converged.
+        Assert.Equal(2, run.StepExecutions("nap"));
+    }
+
+    [Fact]
     public async Task DelayBeyondThePersistenceCeiling_IsRejected()
     {
         await using var harness = await AsyncResponseTestHarness.StartAsync();

@@ -164,6 +164,33 @@ public class CronScheduleTests
     }
 
     [Fact]
+    public void SteppedQuestionMark_KeepsStarSemantics()
+    {
+        // '?' is documented as a synonym for '*' in the day fields, so "?/2" must behave exactly
+        // like "*/2" — including carrying Vixie's DOM_STAR/DOW_STAR flag, which keeps the field OUT
+        // of the either/or rule. Pre-fix only a bare "?" was star-shaped, so "0 0 ?/2 * FRI"
+        // silently flipped to odd-days-OR-Fridays and fired on January 3 instead of January 11.
+        Assert.Equal(
+            Next("0 0 */2 * FRI", Utc(2030, 1, 1, 0, 0)),
+            Next("0 0 ?/2 * FRI", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 11, 0, 0), Next("0 0 ?/2 * FRI", Utc(2030, 1, 1, 0, 0)));
+    }
+
+    [Fact]
+    public void FarFutureQueries_SaturateInsteadOfOverflowingOrReportingFalseNulls()
+    {
+        // The horizon must saturate at DateTime.MaxValue, never be pulled BACK below the candidate:
+        // a capped horizon behind the start ended the scan before its first iteration, so even
+        // "* * * * *" reported "no next occurrence" in year 9999.
+        var late = new DateTimeOffset(9999, 12, 30, 0, 0, 0, TimeSpan.Zero);
+        Assert.Equal(new DateTimeOffset(9999, 12, 30, 0, 1, 0, TimeSpan.Zero), Next("* * * * *", late));
+
+        // And walking off the end of the calendar is "no more occurrences", not an exception.
+        Assert.Null(CronSchedule.Parse("* * * * *").GetNextOccurrence(DateTimeOffset.MaxValue));
+        Assert.Null(CronSchedule.Parse("0 0 1 1 *").GetNextOccurrence(new DateTimeOffset(9999, 6, 1, 0, 0, 0, TimeSpan.Zero)));
+    }
+
+    [Fact]
     public void OversizedStep_YieldsOnlyTheStartValue_NoOverflowPhantoms()
     {
         // A step beyond the field span contributes its start value only (Vixie semantics). The

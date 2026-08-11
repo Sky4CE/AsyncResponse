@@ -66,6 +66,22 @@ public sealed class OverlongSleepFlow : IDurableFlow<SleepInput>
         => flow.DelayAsync("nap", input.Delay);
 }
 
+/// <summary>Its sleep comes from a static, so a test can change the code between executions.</summary>
+public sealed class ConfigurableSleepFlow(StepRecorder _recorder) : IDurableFlow<ReminderInput>
+{
+    public static TimeSpan Delay { get; set; } = TimeSpan.FromDays(3);
+
+    public async Task ExecuteAsync(IDurableFlowContext flow, ReminderInput input)
+    {
+        await flow.DelayAsync("nap", Delay);
+        await flow.StepAsync("after-nap", () =>
+        {
+            _recorder.Record("after-nap");
+            return Task.CompletedTask;
+        });
+    }
+}
+
 public sealed class AbsoluteDeadlineFlow(StepRecorder _recorder) : IDurableFlow<ReminderInput>
 {
     public async Task ExecuteAsync(IDurableFlowContext flow, ReminderInput input)
@@ -178,6 +194,33 @@ public class DurableFlowTimerTests
         // The boundary itself is allowed: a ceiling−StateExpiry sleep parks normally.
         var boundary = await harness.StartFlowAsync<OverlongSleepFlow, SleepInput>(new SleepInput(TimeSpan.FromDays(3636)));
         await boundary.WaitForTimerStepAsync("nap");
+    }
+
+    [Fact]
+    public async Task ParkedTimer_IsNotReValidatedAgainstAChangedDelay()
+    {
+        // The persisted due time wins on every replay — the argument is not even looked at. A code
+        // edit that changes the delay (here to a span the ceiling rejects) must not touch a run
+        // that is already parked, and least of all fail it: the checkpointed instant is the
+        // contract, and re-validating the CURRENT argument turned a valid three-day timer into a
+        // terminal failure the moment the deployment changed.
+        var recorder = new StepRecorder();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(recorder);
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<ConfigurableSleepFlow, ReminderInput>();
+        });
+
+        ConfigurableSleepFlow.Delay = TimeSpan.FromDays(3);
+        var run = await harness.StartFlowAsync<ConfigurableSleepFlow, ReminderInput>(new ReminderInput("acme"));
+        await run.WaitForTimerStepAsync("nap");
+
+        // The "redeploy": the next execution of this flow reads a different delay.
+        ConfigurableSleepFlow.Delay = TimeSpan.MaxValue;
+        await harness.AdvanceAsync(TimeSpan.FromDays(3));
+
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+        Assert.Equal(1, recorder.Count("after-nap"));
     }
 
     [Fact]

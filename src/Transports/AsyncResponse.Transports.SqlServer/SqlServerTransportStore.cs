@@ -1,3 +1,4 @@
+using AsyncResponse.Internal;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -117,7 +118,7 @@ internal sealed class SqlServerTransportStore
                 IF OBJECT_ID(N'{MessageTable}', N'U') IS NULL
                 CREATE TABLE {MessageTable} (
                     id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
-                    queue nvarchar(200) NOT NULL,
+                    queue nvarchar(200) COLLATE Latin1_General_100_BIN2 NOT NULL,
                     payload_json nvarchar(max) NOT NULL,
                     headers_json nvarchar(max) NOT NULL DEFAULT N'{EmptyJsonObject}',
                     created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -135,13 +136,87 @@ internal sealed class SqlServerTransportStore
                     CREATE INDEX {Quote(IndexName(_options.MessageTable, "created"))}
                         ON {MessageTable} (created_at);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqlException ex)
+            {
+                // The batch can break BEFORE the verification below runs: a name held by another
+                // component's table suppresses the guarded CREATE and the index that follows hits
+                // the wrong table, and a name held by a view fails outright with error 2714. Run
+                // the same catalog checks now, on a fresh connection (the objects in question are
+                // somebody else's and already committed), so the operator gets the precise reason.
+                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                throw;
+            }
+
+            // Post-DDL catalog verification inside the DDL transaction (and therefore under the
+            // shared application lock): the existence guard above only asks "is there a user table
+            // with this name", so another component's table silently suppresses creation and a
+            // view or synonym makes the CREATE fail with raw error 2714.
+            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
+        => SqlServerRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "transport",
+            [
+                new(_options.MessageTable, SqlServerObjectKind.Table,
+                [
+                    new("id", "uniqueidentifier", Nullable: false),
+                    new("queue", "nvarchar(200)", Nullable: false, RequiresBinaryCollation: true),
+                    new("payload_json", "nvarchar(max)", Nullable: false),
+                    new("headers_json", "nvarchar(max)", Nullable: false),
+                    new("created_at", "datetime2", Nullable: false),
+                    new("available_at", "datetime2", Nullable: false),
+                    new("locked_until", "datetime2", Nullable: true),
+                    new("lock_id", "uniqueidentifier", Nullable: true),
+                    new("attempts", "int", Nullable: false),
+                    new("dead_letter_reason", "nvarchar(max)", Nullable: true)
+                ])
+            ],
+            cancellationToken);
+
+    /// <summary>
+    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
+    /// error into the actionable one. Returns normally when nothing conclusive is found — the
+    /// caller then rethrows the original exception, the honest outcome for a failure that has
+    /// nothing to do with a name collision.
+    /// </summary>
+    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
+    {
+        SqlConnection diagnosis;
+        try
+        {
+            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            return;
+        }
+
+        await using (diagnosis)
+        {
+            try
+            {
+                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException diagnosed)
+            {
+                throw new InvalidOperationException(diagnosed.Message, failure);
+            }
         }
     }
 

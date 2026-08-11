@@ -135,7 +135,42 @@ internal static class FlowStoreContract
         await AssertLeaseExpiryContractAsync(store);
         await AssertMissingFlowContractAsync(store);
         await AssertLargeStateContractAsync(store);
+        await AssertCaseSensitiveFlowIdContractAsync(store);
         await AssertSchemaVersionContractAsync(store, seedRawStateAsync);
+    }
+
+    /// <summary>
+    /// Flow ids are compared ORDINALLY by the engine, so two ids differing only in case are two
+    /// different flows — and the store has to agree. It is the store that can disagree: SQL Server
+    /// and MySQL columns inherit the database collation, and the common default is
+    /// case-insensitive, which makes the second create collide on the primary key and a load
+    /// return the OTHER run's state. Both stores now pin a binary collation on the column; this
+    /// contract is what proves it, on every store the library ships.
+    /// </summary>
+    private static async Task AssertCaseSensitiveFlowIdContractAsync(IFlowStateStore store)
+    {
+        var suffix = Guid.NewGuid().ToString("N");
+        var lower = $"flow-case-{suffix}";
+        var upper = lower.ToUpperInvariant();
+
+        Assert.True(await store.TryCreateAsync(lower, CreateState(lower), TimeSpan.FromMinutes(5)));
+        Assert.True(
+            await store.TryCreateAsync(upper, CreateState(upper), TimeSpan.FromMinutes(5)),
+            "a flow id differing only in case is a DIFFERENT flow and must be creatable");
+
+        Assert.Equal(lower, (await store.LoadAsync(lower))!.FlowId);
+        Assert.Equal(upper, (await store.LoadAsync(upper))!.FlowId);
+
+        // Leases are keyed by the same id, so a case-folding store would also let one run steal
+        // the other's execution lease.
+        Assert.True(await store.TryAcquireLeaseAsync(lower, "owner-lower", TimeSpan.FromMinutes(1)));
+        Assert.True(await store.TryAcquireLeaseAsync(upper, "owner-upper", TimeSpan.FromMinutes(1)));
+        await store.ReleaseLeaseAsync(lower, "owner-lower");
+        await store.ReleaseLeaseAsync(upper, "owner-upper");
+
+        Assert.True(await store.TryDeleteAsync(lower));
+        Assert.NotNull(await store.LoadAsync(upper));
+        Assert.True(await store.TryDeleteAsync(upper));
     }
 
     /// <summary>

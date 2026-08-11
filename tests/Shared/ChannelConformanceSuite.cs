@@ -200,6 +200,36 @@ public abstract class ChannelConformanceSuite
         Assert.False(waiterB.ResponseTask.IsCompleted);
     }
 
+    [Fact]
+    public async Task Contract_CorrelationIdsDifferingOnlyInCaseAreDistinctWaiters()
+    {
+        // Correlation ids are compared ORDINALLY by contract, so 'x' and 'X' are two conversations.
+        // A store that disagrees delivers one waiter's response to the other: SQL Server columns
+        // inherit the database collation, and the common default is case-INSENSITIVE, so a query
+        // for the upper-case id returns the lower-case row. Both waiters then completed with the
+        // same payload — one of them belonging to somebody else's request.
+        await using var harness = await CreateHarnessAsync();
+        var lower = NewCorrelationId("case-x").ToLowerInvariant();
+        var upper = lower.ToUpperInvariant();
+        Assert.NotEqual(lower, upper, StringComparer.Ordinal);
+
+        await using var lowerWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(lower, timeout: WaiterTimeout);
+        await using var upperWaiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(upper, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "for-lower"), lower);
+
+        var lowerResult = await lowerWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("for-lower", lowerResult.Message);
+
+        await Task.Delay(SettleDelay);
+        Assert.False(upperWaiter.ResponseTask.IsCompleted);
+
+        // …and the reverse direction, so a case-folding store cannot pass by answering only one.
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "for-upper"), upper);
+        var upperResult = await upperWaiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("for-upper", upperResult.Message);
+    }
+
     // ----- f/g/h. Lost-subscriber routing -----
 
     [Fact]

@@ -8,15 +8,32 @@ namespace AsyncResponse;
 public class DurableFlowOptions
 {
     /// <summary>
-    /// The portable flow-id length contract: the longest final flow id every bundled state store
-    /// accepts (SQL Server, MySQL, Oracle, and EF Core declare <c>flow_id</c> as a 400-character
-    /// column). Every id is validated against this when its state is created — root ids passed to
-    /// <see cref="IDurableFlows.StartAsync{TFlow,TInput}"/>, composed child ids
+    /// The portable flow-id length contract in UTF-16 characters: the longest final flow id every
+    /// bundled state store accepts (SQL Server, MySQL, Oracle, and EF Core declare <c>flow_id</c>
+    /// as a 400-character column). Every id is validated when its state is created — root ids
+    /// passed to <see cref="IDurableFlows.StartAsync{TFlow,TInput}"/>, composed child ids
     /// (<c>{parentId}:{stepName}</c>), and scheduled occurrence ids
     /// (<c>sched:{name}:{timestamp}</c>, validated at registration) — so an id cannot work on one
     /// store and fail on another, or work as a root and fail once a suffix is appended.
+    /// <para>
+    /// Length is only one of the three portability rules; see <see cref="MaxFlowIdBytes"/> and the
+    /// character restrictions documented with it.
+    /// </para>
     /// </summary>
     public const int MaxFlowIdLength = 400;
+
+    /// <summary>
+    /// The portable flow-id size contract in UTF-8 <em>bytes</em> — the Cosmos DB id limit, which
+    /// a 400-character id cannot be assumed to satisfy: characters outside the Basic Latin range
+    /// cost two to four bytes each, so 400 CJK characters are 1200 bytes.
+    /// <para>
+    /// Ids must also avoid <c>/</c>, <c>\</c>, <c>?</c> and <c>#</c> (Cosmos rejects them outright)
+    /// and control characters. Ids are compared ORDINALLY everywhere, and the relational stores
+    /// pin a binary collation on the column so the database agrees — two ids differing only in
+    /// case are two different flows.
+    /// </para>
+    /// </summary>
+    public const int MaxFlowIdBytes = 1023;
 
     /// <summary>
     /// How long persisted flow state lives; the TTL is refreshed on every checkpoint, so it bounds

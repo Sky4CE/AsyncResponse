@@ -107,6 +107,31 @@ public class DurableChildFlowTests
         Assert.Contains("portable maximum is 400", ex.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    // 400 characters is inside the character cap, but three-byte characters make it 1200 UTF-8
+    // bytes — past the 1023-byte Cosmos id limit, so the id worked on every store except that one.
+    [InlineData(400, '世', "UTF-8 bytes")]
+    // Cosmos rejects these four characters in an id outright; the other stores accept them, so an
+    // id containing one is portable right up until the day someone switches store.
+    [InlineData(0, '/', "not portable")]
+    [InlineData(0, '\\', "not portable")]
+    [InlineData(0, '?', "not portable")]
+    [InlineData(0, '#', "not portable")]
+    public async Task RootFlowId_ThatIsNotPortable_IsRejectedAtStart(int repeat, char character, string expectedMessage)
+    {
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(new ChildFlowProbe());
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        var flowId = repeat > 0 ? new string(character, repeat) : $"flow{character}a";
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(
+            new RecursiveChildInput(0),
+            flowId));
+        Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task ChildFlowId_ComposedBeyondThePortableMaximum_FailsTheParentTerminally()
     {
@@ -124,7 +149,7 @@ public class DurableChildFlowTests
         var run = await harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(new RecursiveChildInput(1), rootId);
         Assert.Equal(FlowRunStatus.Failed, await run.WaitForFinishedAsync());
         var state = await run.GetStateAsync();
-        Assert.Contains("over-long child flow id", state!.LastMessage, StringComparison.Ordinal);
+        Assert.Contains("non-portable child flow id", state!.LastMessage, StringComparison.Ordinal);
         Assert.Contains("portable maximum is 400", state.LastMessage, StringComparison.Ordinal);
         Assert.Equal(0, probe.Count("leaf"));
     }

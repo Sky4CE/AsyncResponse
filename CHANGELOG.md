@@ -249,6 +249,59 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **A response could be delivered to a waiter whose correlation id differs only in case.** The
+  database channels query one exact correlation id and forwarded every returned row, but "exact"
+  is the database's opinion: SQL Server columns inherit the database collation, and the common
+  default is case-INSENSITIVE, so a query for `FOO` returns the rows of `foo` and both waiters
+  completed with the same payload — one of them holding somebody else's response. Correlation ids
+  are compared ordinally by contract, so the dispatch loop now re-checks the returned id itself
+  (which also protects tables created before this fix, and logs an actionable error instead of
+  delivering), and the SQL Server DDL pins `COLLATE Latin1_General_100_BIN2` on every id column —
+  correlation ids, flow ids, and queue names, in the channel, transport, and durable-flow stores.
+  MySQL's `flow_id` gets `utf8mb4_bin` for the same reason. The channel conformance suite gained a
+  case-variance contract that runs on every channel, and the durable-flow store contract gained one
+  that runs on every store — which is how the same defect was found in the **EF Core** package,
+  whose schema is application-owned: `ConfigureAsyncResponseDurableFlows` now takes an optional
+  `flowIdCollation` (with the new `AsyncResponseFlowIdCollations` constants for SQL Server, MySQL,
+  PostgreSQL, and SQLite), because a provider-agnostic mapping cannot pick the name itself. Set it
+  — on SQL Server or MySQL the database default folds case.
+- **SQL Server stores now verify their objects against the catalog after creating them**, as the
+  PostgreSQL stores have since the previous release. `IF OBJECT_ID(N'…', N'U') IS NULL` answers
+  only "is there a user table with this name", so a name held by another AsyncResponse component's
+  table silently suppressed creation (failing later on a missing column) and a name held by a view
+  or synonym failed with raw error 2714. The new verifier — running inside the DDL transaction, so
+  under the application lock the SQL Server stores already share — checks object kind, every
+  declared column's type and nullability, sequence monotonicity, extra columns that would break
+  inserts, and that identity columns carry a case-sensitive collation, each with remediation in
+  the message. A collision that breaks the DDL batch before verification can run (an index over
+  columns another component's table does not have) is wrapped with the same guidance instead of
+  surfacing as a raw `SqlException`.
+- **A legal SQL Server flow table could derive an illegal constraint name.** The `revision`
+  column's default was named `DF_{table}_revision`, so a table name the store otherwise accepts
+  (117 characters) produced a 129-character identifier and the CREATE failed with error 103 —
+  SQL Server's cap is 128. The default is now unnamed; nothing ever read it by name.
+- **The portable flow-id contract now covers bytes and characters, not just length.** A
+  400-character id is within every `flow_id` column but can be 1200 UTF-8 bytes, which Cosmos DB
+  (1023-byte limit) rejects, and `/`, `\`, `?` and `#` are rejected by Cosmos outright while every
+  other store accepts them. Both are validated centrally at creation alongside the existing
+  character cap, via the new `DurableFlowOptions.MaxFlowIdBytes`.
+- **Durable timers no longer discard the redelay stall proof.** When consecutive hops prove the
+  publishing and delivery-gating clocks disagree, the shared executor releases the job early — but
+  a timer step that then suspends minted a NEW wake-up whose stall counters start at zero, so the
+  run rebuilt the same proof every lap and never finished. The forced-early execution is now
+  marked for the invocation, and a timer step that sees it waits out its remainder in process
+  instead of enqueueing an envelope that forgets what the previous hops established.
+- **A code change could terminally fail an already-parked timer.** `DelayAsync` validated the
+  CURRENT argument before preferring the checkpointed due time, so a deployment that changed the
+  delay to something the ceiling rejects failed runs that were already sleeping on a perfectly
+  valid one. The persisted instant now wins outright and the argument is not examined on a replay
+  — the contract `DelayUntilAsync` always honored.
+- **Three cron corrections.** `?/2` is now star-shaped like `*/2` (the documented `? == *`
+  equivalence had applied only to a bare `?`, so a stepped `?` silently flipped the
+  day-of-month/day-of-week rule to OR); the search horizon saturates at `DateTime.MaxValue`
+  instead of being pulled back below the candidate (which made even `* * * * *` report "no next
+  occurrence" in year 9999); and walking off the end of the representable calendar returns
+  `null` rather than throwing.
 - **The NATS worker transport now retries transient JetStream *provisioning* failures, not just
   publishes.** Stream creation runs lazily on the first publish — exactly when a JetStream API
   request is likeliest to time out (`NatsJSApiNoResponseException`, "No API response received
@@ -256,10 +309,12 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   latches on success. That call was the single path in the transport without the bounded
   exponential backoff its own contract promises, so a transient condition absorbed one line later
   on the publish itself failed the caller's enqueue outright. It now retries on the same
-  `PublishMaxAttempts` / `PublishRetryBaseDelay` / `PublishRetryMaxDelay` terms; deterministic
-  provisioning errors (a stream-name collision, a rejected retention change) still surface on the
-  first attempt. Observed as random cross-product matrix-cell failures in CI, each at exactly the
-  five-second JetStream API timeout.
+  `PublishMaxAttempts` / `PublishRetryBaseDelay` / `PublishRetryMaxDelay` terms. Observed as
+  random cross-product matrix-cell failures in CI, each at exactly the five-second JetStream API
+  timeout. The retry classifier was corrected at the same time: a JetStream API request the server
+  ANSWERED with an error (`NatsJSApiException` — "stream name already in use", a rejected config
+  change) is a decision, not a blip, and inherits `NatsException`, so it was being retried like
+  one; only 5xx API answers, where the server itself reports a temporary condition, retry now.
 - **A maximum-duration durable timer can no longer expire its own ledger.** `DelayAsync` /
   `DelayUntilAsync` accepted sleeps up to the 3650-day persistence ceiling itself, while the
   sleeping ledger's TTL (`sleep + StateExpiry`) saturated at that same ceiling — a

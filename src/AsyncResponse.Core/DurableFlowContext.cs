@@ -135,16 +135,21 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         if (checkpoint.Completed)
             return Task.CompletedTask;
 
-        // Validate the requested span BEFORE the UtcNow.Add below: TimeSpan.MaxValue (or any
-        // absurd span) must surface as the terminal sleep-ceiling failure, not as the DateTime
-        // overflow the addition would throw first.
+        // The due time anchors at the FIRST execution that reaches this step and is checkpointed;
+        // replays (crash, redeploy, chunked wake-up) wait out the remainder, never restart. The
+        // checkpointed instant therefore wins outright — the argument is not even looked at on a
+        // replay, exactly as in DelayUntilAsync: an edit to the delay while a run is mid-sleep
+        // must not change that run, and least of all fail it (validating the new argument here
+        // turned a parked, perfectly valid timer into a terminal failure on resume).
+        if (checkpoint.WakeAtUtc is { } persisted)
+            return DelayCoreAsync(name, checkpoint, persisted, cancellationToken);
+
+        // Fresh arrival: validate the requested span BEFORE the UtcNow.Add below, so
+        // TimeSpan.MaxValue (or any absurd span) surfaces as the terminal sleep-ceiling failure
+        // rather than the DateTime overflow the addition would throw first.
         var requested = delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
         ThrowIfSleepBeyondLedger(name, requested);
-
-        // The due time anchors at the FIRST execution that reaches this step and is checkpointed;
-        // replays (crash, redeploy, chunked wake-up) wait out the remainder, never restart.
-        var wakeAtUtc = checkpoint.WakeAtUtc ?? UtcNow.Add(requested);
-        return DelayCoreAsync(name, checkpoint, wakeAtUtc, cancellationToken);
+        return DelayCoreAsync(name, checkpoint, UtcNow.Add(requested), cancellationToken);
     }
 
     /// <inheritdoc />
@@ -188,7 +193,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // MaxPublishDelay <= zero marks a transport whose delayed capability is unavailable in
             // the current configuration (an SQS FIFO worker queue): suspend-then-throw would strand
             // the run as "sleeping" with no wake-up, so treat it as not delayed-capable at all.
+            //
+            // The skew marker rules out suspension for a different reason: this delivery only
+            // happened because the executor proved (over consecutive hops) that the transport's
+            // delay gate and the stamping clock disagree. Suspending again would enqueue a FRESH
+            // wake-up whose stall counters start at zero, discarding that proof and looping
+            // forever — so the remainder is waited out in process instead, which honors the due
+            // time. That fallback needs no new envelope and is the same one non-delayed transports
+            // always take.
             if (remaining > _options.TimerInProcessThreshold
+                && !WorkerJobSkewScope.IsForcedEarlyExecution
                 && _workerTransport is IDelayedWorkerTransport delayedTransport
                 && delayedTransport.MaxPublishDelay > TimeSpan.Zero)
             {
@@ -205,9 +219,12 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             {
                 throw new DurableFlowFailedException(
                     $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0.#} days, which exceeds the " +
-                    $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and the registered worker " +
-                    $"transport has no native delayed delivery ({nameof(IDelayedWorkerTransport)}) to suspend on. " +
-                    "Use a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB) for sleeps this long.");
+                    $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and " +
+                    (WorkerJobSkewScope.IsForcedEarlyExecution
+                        ? "this wake-up was released early because the transport's delay gate and the publishing clock disagree, so " +
+                          "re-suspending would loop instead of sleeping. Fix the clock skew between the application and the broker/database."
+                        : $"the registered worker transport has no native delayed delivery ({nameof(IDelayedWorkerTransport)}) to suspend on. " +
+                          "Use a delayed-capable transport (in-memory, Azure Service Bus, SQS, PostgreSQL, SQL Server, MongoDB) for sleeps this long."));
             }
 
             if (!firstPass)
@@ -393,13 +410,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
 
         var childFlowId = breadcrumb ?? requestedChildFlowId;
-        if (FlowStateConcurrency.FlowIdTooLong(childFlowId) is { } tooLongChildId)
+        if (FlowStateConcurrency.FlowIdNotPortable(childFlowId) is { } rejection)
         {
             // Deterministic on every replay, so terminal rather than retriable: the composed id
-            // can never shrink, and the 400-character stores would reject the child row anyway
-            // after a full budget of wasted redeliveries.
+            // can never become portable, and the constrained stores would reject the child row
+            // anyway after a full budget of wasted redeliveries.
             throw new DurableFlowFailedException(
-                $"Step '{name}' of flow '{FlowId}' composed an over-long child flow id. {tooLongChildId}");
+                $"Step '{name}' of flow '{FlowId}' composed a non-portable child flow id. {rejection}");
         }
 
         var inputJson = AsyncResponseJson.Serialize(input);

@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DbTransportShared.cs" Link="DbTransportShared.cs" />
+    <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DurableFlowStoreShared.cs" Link="DurableFlowStoreShared.cs" />
+    <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
   </ItemGroup>
 
   <ItemGroup>

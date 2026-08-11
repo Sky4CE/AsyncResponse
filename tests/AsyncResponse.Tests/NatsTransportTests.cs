@@ -1,6 +1,7 @@
 using AsyncResponse.Transports.NATS;
 using Microsoft.Extensions.Options;
 using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
 using System.Text.Json;
 using Xunit;
 
@@ -448,15 +449,46 @@ public class NatsWorkerTransportTests
     }
 
     [Fact]
-    public async Task PublishAsync_DoesNotRetryNonTransientStreamProvisioningFailures()
+    public async Task PublishAsync_DoesNotRetryRejectedStreamProvisioning()
     {
-        // A misconfigured stream (a name collision, a rejected retention change) is deterministic:
-        // surface it on the first attempt instead of burning the retry budget.
-        _jetStream.EnsureStreamFailureForAttempt = _ => new InvalidOperationException("fatal");
+        // The REAL deterministic failure type: JetStream ANSWERED, rejecting the request
+        // (10058 = "stream name already in use" — a genuine name collision). It arrives as
+        // NatsJSApiException, which inherits NatsException, so a bare "any NatsException is
+        // transient" rule would burn the whole retry budget re-asking a question the server has
+        // already answered. Only a 5xx (the server saying it is temporarily unable) retries.
+        var attempts = 0;
+        _jetStream.EnsureStreamFailureForAttempt = attempt =>
+        {
+            attempts = attempt;
+            return new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10058, Description = "stream name already in use" });
+        };
         var transport = CreateTransport();
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(CreateJob()));
+        var ex = await Assert.ThrowsAsync<NatsJSApiException>(() => transport.PublishAsync(CreateJob()));
+        Assert.Equal(10058, ex.Error.ErrCode);
+        Assert.Equal(1, attempts);
         Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task PublishAsync_RetriesServerUnavailableStreamProvisioning()
+    {
+        // The other side of the same coin: a 5xx API answer (503 while a meta-leader election
+        // settles) is the server reporting a temporary condition, so it retries like any blip.
+        _jetStream.EnsureStreamFailureForAttempt = attempt => attempt == 1
+            ? new NatsJSApiException(new ApiError { Code = 503, ErrCode = 10008, Description = "JetStream system temporarily unavailable" })
+            : null;
+        var transport = CreateTransport(new NatsAsyncResponseTransportOptions
+        {
+            PublishMaxAttempts = 3,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+        });
+
+        await transport.PublishAsync(CreateJob());
+
+        Assert.Single(_jetStream.EnsuredStreams);
+        Assert.Single(_jetStream.Published);
     }
 
     [Fact]
@@ -517,6 +549,12 @@ public class NatsTransportRetryTests
         // The JetStream API's own "the server did not answer" — the condition that shows up under
         // load — must classify as transient; it reaches the classifier as a NatsException subtype.
         Assert.True(NatsTransportRetry.IsTransient(new NatsJSApiNoResponseException()));
+        // An ANSWERED API rejection is a decision, not a blip: retrying re-asks a settled
+        // question. Both types inherit NatsException, so they must be told apart by the answer.
+        Assert.False(NatsTransportRetry.IsTransient(
+            new NatsJSApiException(new ApiError { Code = 400, ErrCode = 10058, Description = "stream name already in use" })));
+        Assert.True(NatsTransportRetry.IsTransient(
+            new NatsJSApiException(new ApiError { Code = 503, ErrCode = 10008, Description = "JetStream system temporarily unavailable" })));
         Assert.False(NatsTransportRetry.IsTransient(new OperationCanceledException()));
         Assert.False(NatsTransportRetry.IsTransient(new InvalidOperationException()));
     }

@@ -33,5 +33,10 @@ AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryRenewLeaseAs
 AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>.TryUpdateAsync(string! flowId, AsyncResponse.FlowState! state, long expectedRevision, System.TimeSpan ttl, string? leaseId = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<bool>!
 Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions
 const AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.DefaultTableName = "asyncresponse_flow_state" -> string!
-static AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows(this Microsoft.EntityFrameworkCore.ModelBuilder! modelBuilder, string! tableName = "asyncresponse_flow_state", string? schema = null) -> Microsoft.EntityFrameworkCore.ModelBuilder!
+AsyncResponse.DurableFlows.EFCore.AsyncResponseFlowIdCollations
+const AsyncResponse.DurableFlows.EFCore.AsyncResponseFlowIdCollations.MySql = "utf8mb4_bin" -> string!
+const AsyncResponse.DurableFlows.EFCore.AsyncResponseFlowIdCollations.PostgreSql = "C" -> string!
+const AsyncResponse.DurableFlows.EFCore.AsyncResponseFlowIdCollations.Sqlite = "BINARY" -> string!
+const AsyncResponse.DurableFlows.EFCore.AsyncResponseFlowIdCollations.SqlServer = "Latin1_General_100_BIN2" -> string!
+static AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows(this Microsoft.EntityFrameworkCore.ModelBuilder! modelBuilder, string! tableName = "asyncresponse_flow_state", string? schema = null, string? flowIdCollation = null) -> Microsoft.EntityFrameworkCore.ModelBuilder!
 static Microsoft.Extensions.DependencyInjection.EFCoreDurableFlowServiceCollectionExtensions.WithEFCoreDurableFlows<TContext>(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!

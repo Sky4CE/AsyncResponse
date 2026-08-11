@@ -96,6 +96,7 @@ AsyncResponse.DurableAsyncResponseChannelOptions.IncludeRemoteStackTrace.set -> 
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.get -> int
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.set -> void
 AsyncResponse.DurableFlowOptions
+const AsyncResponse.DurableFlowOptions.MaxFlowIdBytes = 1023 -> int
 const AsyncResponse.DurableFlowOptions.MaxFlowIdLength = 400 -> int
 AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.get -> bool
 AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.set -> void

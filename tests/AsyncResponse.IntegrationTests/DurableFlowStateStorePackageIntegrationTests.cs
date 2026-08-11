@@ -137,6 +137,9 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     {
         var schema = NewIdentifier("df_ef", 32);
         var services = new ServiceCollection();
+        // The mapping is the application's, and so is the collation: this context points at SQL
+        // Server, whose default collation is case-insensitive and would fold two distinct flow ids
+        // onto one primary key. The contract below is what proves the seam actually works.
         services.AddSingleton(new EFCoreFlowSchema(schema));
         services.AddDbContextFactory<EFCoreFlowDbContext>(options => options.UseSqlServer(Fixture.SqlServerConnectionString));
         await using var provider = services.BuildServiceProvider(new ServiceProviderOptions { ValidateScopes = true });
@@ -191,7 +194,9 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
         : DbContext(options)
     {
         protected override void OnModelCreating(ModelBuilder modelBuilder)
-            => modelBuilder.ConfigureAsyncResponseDurableFlows(schema: schema.Name);
+            => modelBuilder.ConfigureAsyncResponseDurableFlows(
+                schema: schema.Name,
+                flowIdCollation: AsyncResponseFlowIdCollations.SqlServer);
     }
 
     [Fact]

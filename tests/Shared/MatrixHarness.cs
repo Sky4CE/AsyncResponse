@@ -265,11 +265,9 @@ public sealed class MatrixHarness : IAsyncDisposable
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // A broker that is up but not yet answering its admin API fails the PUBLISH, not
-                // just the delivery — a JetStream request timing out while the server settles on a
-                // loaded runner is the canonical case. That is exactly the not-ready condition
-                // this budget exists to absorb, so keep probing instead of aborting the build on
-                // the first attempt; the exception is kept so a genuine misconfiguration still
-                // surfaces with its cause once the budget runs out.
+                // just the delivery — which is the not-ready condition this budget exists to
+                // absorb. Keep probing, but keep the exception so a genuine misconfiguration still
+                // surfaces with its cause when the budget runs out.
                 lastPublishFailure = ex;
             }
 

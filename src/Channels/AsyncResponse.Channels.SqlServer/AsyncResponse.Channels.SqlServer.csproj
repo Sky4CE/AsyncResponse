@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DbChannelShared.cs" Link="DbChannelShared.cs" />
+    <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
   </ItemGroup>
 
   <ItemGroup>

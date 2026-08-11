@@ -838,6 +838,23 @@ internal abstract class DbAsyncResponseChannelBase :
                     cancellationToken).ConfigureAwait(false);
                 foreach (var message in messages)
                 {
+                    // The store was asked for ONE exact correlation id, but "exact" is the
+                    // database's opinion: a case-insensitive (or accent-insensitive) column
+                    // collation — the SQL Server default in most deployments — answers a query for
+                    // "FOO" with the rows of "foo". Delivering those would hand one waiter another
+                    // waiter's response, so the id is re-checked ordinally here, where the
+                    // library's own comparison rules apply. This also covers pre-existing tables
+                    // created before the collation was pinned in the DDL.
+                    if (!string.Equals(message.CorrelationId, correlationId, StringComparison.Ordinal))
+                    {
+                        _logger.LogError(
+                            "The {Provider} channel store returned a message for correlationId '{ReturnedCorrelationId}' when asked for '{RequestedCorrelationId}'. " +
+                            "The correlation-id column is not using a case-sensitive/binary collation, so distinct correlation ids collide in the database. " +
+                            "The message was NOT delivered to the wrong waiter. Re-create the AsyncResponse tables (or ALTER the correlation_id columns) with a binary collation.",
+                            _providerName, message.CorrelationId, correlationId);
+                        continue;
+                    }
+
                     await _executors.EnqueueAsync(
                         ChannelName(correlationId),
                         () => DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken),

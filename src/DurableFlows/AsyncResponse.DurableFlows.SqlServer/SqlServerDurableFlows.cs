@@ -1,6 +1,7 @@
 using AsyncResponse;
 using AsyncResponse.DurableFlows.Internal;
 using AsyncResponse.DurableFlows.SqlServer;
+using AsyncResponse.Internal;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -258,11 +259,16 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
                 IF OBJECT_ID(N'{_options.SchemaName}.{_options.TableName}', N'U') IS NULL
                 CREATE TABLE {Table} (
-                    flow_id nvarchar(400) NOT NULL PRIMARY KEY,
+                    flow_id nvarchar(400) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
                     state_json nvarchar(max) NOT NULL,
                     expires_at_utc datetime2 NOT NULL,
                     updated_at_utc datetime2 NOT NULL,
-                    revision bigint NOT NULL CONSTRAINT {Quote($"DF_{_options.TableName}_revision")} DEFAULT 0,
+                    -- Unnamed DEFAULT deliberately: the previous derived name prefixed "DF_" and
+                    -- suffixed "_revision" onto the full table name, so a table name this store
+                    -- otherwise accepts (117 characters) produced a 129-character constraint name
+                    -- and the CREATE failed with error 103 — SQL Server's identifier cap is 128.
+                    -- Nothing reads the constraint by name; the store never drops or alters it.
+                    revision bigint NOT NULL DEFAULT 0,
                     lease_id nvarchar(64) NULL,
                     lease_expires_at_utc datetime2 NULL
                 );
@@ -270,13 +276,84 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'{IndexName}' AND object_id = OBJECT_ID(N'{_options.SchemaName}.{_options.TableName}'))
                     CREATE INDEX {Quote(IndexName)} ON {Table} (expires_at_utc);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqlException ex)
+            {
+                // The batch can break BEFORE the verification below runs: a name held by another
+                // component's table suppresses the guarded CREATE and the index that follows hits
+                // the wrong table, and a name held by a view fails outright with error 2714. Run
+                // the same catalog checks now, on a fresh connection (the objects in question are
+                // somebody else's and already committed), so the operator gets the precise reason.
+                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                throw;
+            }
+
+            // Post-DDL catalog verification inside the DDL transaction (and therefore under the
+            // shared application lock): the existence guard above only asks "is there a user table
+            // with this name", so another component's table silently suppresses creation and a
+            // view or synonym makes the CREATE fail with raw error 2714.
+            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
+        => SqlServerRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "durable-flow",
+            [
+                new(_options.TableName, SqlServerObjectKind.Table,
+                [
+                    new("flow_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
+                    new("state_json", "nvarchar(max)", Nullable: false),
+                    new("expires_at_utc", "datetime2", Nullable: false),
+                    new("updated_at_utc", "datetime2", Nullable: false),
+                    new("revision", "bigint", Nullable: false),
+                    new("lease_id", "nvarchar(64)", Nullable: true),
+                    new("lease_expires_at_utc", "datetime2", Nullable: true)
+                ])
+            ],
+            cancellationToken);
+
+    /// <summary>
+    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
+    /// error into the actionable one. Returns normally when nothing conclusive is found — the
+    /// caller then rethrows the original exception, the honest outcome for a failure that has
+    /// nothing to do with a name collision.
+    /// </summary>
+    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
+    {
+        SqlConnection diagnosis;
+        try
+        {
+            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            return;
+        }
+
+        await using (diagnosis)
+        {
+            try
+            {
+                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException diagnosed)
+            {
+                throw new InvalidOperationException(diagnosed.Message, failure);
+            }
         }
     }
 

@@ -157,5 +157,16 @@ internal static class NatsTransportRetry
 
     /// <summary>Runs the IsTransient operation.</summary>
     public static bool IsTransient(Exception exception)
-        => exception is NatsException or TimeoutException && exception is not OperationCanceledException;
+    {
+        // A JetStream API request that the server ANSWERED with an error is a decision, not a
+        // blip: "stream name already in use", "consumer config would change an immutable field",
+        // "no permission". Those repeat identically on every attempt, so retrying only delays the
+        // report — unless the server itself said it was temporarily unable (5xx, e.g. 503 while a
+        // meta-leader election settles). Everything else in the NatsException family — no
+        // responders, no API response, connection loss — is the transient case.
+        if (exception is NatsJSApiException api)
+            return api.Error.Code >= 500;
+
+        return exception is NatsException or TimeoutException && exception is not OperationCanceledException;
+    }
 }

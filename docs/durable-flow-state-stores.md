@@ -365,7 +365,12 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options)
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
-        modelBuilder.ConfigureAsyncResponseDurableFlows();
+        modelBuilder.ConfigureAsyncResponseDurableFlows(
+            // Flow ids are compared ORDINALLY, so the key column must be case-sensitive. This
+            // package runs no DDL and cannot know your provider — and the SQL Server and MySQL
+            // defaults are case-INSENSITIVE, which folds "flow-a" and "FLOW-A" onto one key.
+            // The bundled PostgreSQL/SQL Server/MySQL stores pin this in their own DDL.
+            flowIdCollation: AsyncResponseFlowIdCollations.PostgreSql);
     }
 }
 
@@ -387,6 +392,13 @@ conditional updates/deletes execute in the database.
 
 After adding `ConfigureAsyncResponseDurableFlows()`, generate and deploy a normal EF migration.
 The package never creates or alters the schema itself.
+
+**Set `flowIdCollation`.** The schema is yours, so the collation of the `flow_id` key column is
+too — and on SQL Server and MySQL the database default is case-insensitive, which makes two flow
+ids differing only in case a single primary key: the second `StartAsync` fails as a duplicate and
+a load returns the other run's state. Pass the constant for your provider
+(`AsyncResponseFlowIdCollations.SqlServer` / `.MySql` / `.PostgreSql` / `.Sqlite`); the bundled
+relational stores pin the equivalent in their own DDL.
 
 ### Application-owned store
 

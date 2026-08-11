@@ -14,27 +14,65 @@ internal static class FlowStateConcurrency
         TimeSpan ttl,
         CancellationToken cancellationToken = default)
     {
-        if (FlowIdTooLong(flowId) is { } tooLong)
-            throw new ArgumentException(tooLong, nameof(flowId));
+        if (FlowIdNotPortable(flowId) is { } rejection)
+            throw new ArgumentException(rejection, nameof(flowId));
 
         state.Revision = 0;
         return store.TryCreateAsync(flowId, state, ttl, cancellationToken);
     }
 
     /// <summary>
-    /// Enforces <see cref="DurableFlowOptions.MaxFlowIdLength"/> on every final id at creation —
-    /// the single door all creates walk through. Without it a long id works on the unbounded
-    /// stores (PostgreSQL, Redis, MongoDB, in-memory) and fails on the 400-character-column ones,
-    /// or works as a root id and starts failing the day a child or scheduled suffix is appended.
-    /// Returns the rejection message, or <c>null</c> when the id fits.
+    /// Enforces the portable flow-id contract on every final id at creation — the single door all
+    /// creates walk through. Three independent limits, because the stores disagree about what an
+    /// id may be, and an id that works on one store and fails on another is not portable:
+    /// <list type="bullet">
+    /// <item>length in UTF-16 characters, for the 400-character <c>flow_id</c> columns (SQL
+    /// Server, MySQL, Oracle, EF Core);</item>
+    /// <item>length in UTF-8 <em>bytes</em>, for Cosmos DB, whose 1023-byte id limit a 400-
+    /// character id made of three-byte characters (CJK, most emoji) exceeds at 1200;</item>
+    /// <item>the characters themselves — Cosmos rejects <c>/</c>, <c>\</c>, <c>?</c> and <c>#</c>
+    /// in an id, and control characters break every store's diagnostics.</item>
+    /// </list>
+    /// Case is deliberately NOT folded here: ids are compared ordinally throughout, and the
+    /// relational stores pin a binary collation on the column so the database agrees.
+    /// Returns the rejection message, or <c>null</c> when the id is portable.
     /// </summary>
-    internal static string? FlowIdTooLong(string flowId)
-        => flowId.Length <= DurableFlowOptions.MaxFlowIdLength
-            ? null
-            : $"Flow id '{flowId[..40]}…' is {flowId.Length} characters; the portable maximum is " +
-              $"{DurableFlowOptions.MaxFlowIdLength} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id " +
-              "column length in the SQL Server, MySQL, Oracle, and EF Core stores). Budget root ids for growth: child flows " +
-              "append \":{stepName}\" to the parent id, and scheduled flows wrap the schedule name as \"sched:{name}:{timestamp}\".";
+    internal static string? FlowIdNotPortable(string flowId)
+    {
+        if (flowId.Length > DurableFlowOptions.MaxFlowIdLength)
+        {
+            return $"Flow id '{Excerpt(flowId)}' is {flowId.Length} characters; the portable maximum is " +
+                $"{DurableFlowOptions.MaxFlowIdLength} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id " +
+                "column length in the SQL Server, MySQL, Oracle, and EF Core stores). " + BudgetGuidance;
+        }
+
+        var utf8Bytes = System.Text.Encoding.UTF8.GetByteCount(flowId);
+        if (utf8Bytes > DurableFlowOptions.MaxFlowIdBytes)
+        {
+            return $"Flow id '{Excerpt(flowId)}' is {utf8Bytes} UTF-8 bytes; the portable maximum is " +
+                $"{DurableFlowOptions.MaxFlowIdBytes} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdBytes)} — the Cosmos DB " +
+                "id limit). Non-ASCII characters cost up to three bytes each, so a character count alone does not bound it. " + BudgetGuidance;
+        }
+
+        foreach (var character in flowId)
+        {
+            if (character is '/' or '\\' or '?' or '#' || char.IsControl(character))
+            {
+                return $"Flow id '{Excerpt(flowId)}' contains the character '{(char.IsControl(character) ? $"\\u{(int)character:x4}" : character.ToString())}', " +
+                    "which is not portable: Cosmos DB rejects '/', '\\', '?' and '#' in an id, and control characters corrupt " +
+                    "diagnostics. Use a separator the stores agree on, such as ':' or '-'.";
+            }
+        }
+
+        return null;
+    }
+
+    private const string BudgetGuidance =
+        "Budget root ids for growth: child flows append \":{stepName}\" to the parent id, and scheduled flows wrap the schedule " +
+        "name as \"sched:{name}:{timestamp}\".";
+
+    private static string Excerpt(string flowId)
+        => flowId.Length <= 40 ? flowId : string.Concat(flowId.AsSpan(0, 40), "…");
 
     public static async Task<FlowExecutionLease?> TryAcquireExecutionLeaseAsync(
         IFlowStateStore store,

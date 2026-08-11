@@ -72,6 +72,244 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task SharedSchema_CrossComponentNameCollisions_FailActionablyInBothOrders()
+    {
+        // IF OBJECT_ID(N'…', N'U') answers only "is there a USER TABLE with this name", so the
+        // component that starts second either silently skipped its own CREATE (and failed later on
+        // a column that does not exist) or hit raw error 2714. Post-DDL catalog verification must
+        // fail it up front, whichever order the two components start in.
+        await WithSchemaAsync("sql_collide_a", async schema =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "shared_name";
+            await new SqlServerTransportStore(Options.Create(transportOptions)).EnsureCreatedAsync();
+
+            // The channel's message table now lands on the transport's table: same kind, wrong
+            // shape. Its CREATE is suppressed and the rest of its batch runs against the wrong
+            // table, which must surface as the collision it is rather than a raw SqlException.
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.MessageTable = "shared_name";
+            var channel = new SqlServerChannelSql(Options.Create(channelOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("shared_name", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("missing the column", ex.Message, StringComparison.Ordinal);
+            Assert.IsType<SqlException>(ex.InnerException);
+        });
+
+        await WithSchemaAsync("sql_collide_b", async schema =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.MessageTable = "shared_name";
+            await new SqlServerChannelSql(Options.Create(channelOptions)).EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "shared_name";
+            var transport = new SqlServerTransportStore(Options.Create(transportOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => transport.EnsureCreatedAsync());
+            Assert.Contains("shared_name", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("missing the column", ex.Message, StringComparison.Ordinal);
+            Assert.IsType<SqlException>(ex.InnerException);
+        });
+    }
+
+    [Fact]
+    public async Task NameHeldByAnotherObjectKind_FailsVerificationInsteadOfRawError2714()
+    {
+        // A view (or synonym, or procedure) occupying the name slips past an existence guard that
+        // only looks for user tables: the CREATE then failed with a bare "There is already an
+        // object named …" and no hint about which component or what to do.
+        await WithSchemaAsync("sql_kind_clash", async schema =>
+        {
+            // Separate batches: CREATE SCHEMA has to commit before the view can reference it, and
+            // CREATE VIEW must be the first statement in its own batch.
+            await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
+            await ExecuteAsync($"CREATE VIEW [{schema}].[occupied] AS SELECT 1 AS one;");
+
+            var options = ChannelOptions(schema);
+            options.MessageTable = "occupied";
+            var channel = new SqlServerChannelSql(Options.Create(options));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("occupied", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("a view", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task MaximumLengthFlowTableName_CreatesWithoutBreachingTheIdentifierCap()
+    {
+        // The revision column's default used to be NAMED "DF_{table}_revision", deriving a
+        // 129-character identifier from a 117-character table name the store otherwise accepts —
+        // over SQL Server's 128-character cap, so CREATE TABLE failed with error 103. The default
+        // is unnamed now; the table must simply create and round-trip.
+        await WithSchemaAsync("sql_flow_longname", async schema =>
+        {
+            var options = new AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions
+            {
+                ConnectionString = Fixture.SqlServerConnectionString,
+                SchemaName = schema,
+                TableName = new string('f', 117)
+            };
+            var store = new AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore(Options.Create(options));
+
+            Assert.True(await store.TryCreateAsync(
+                "long-table-flow",
+                new FlowState { FlowId = "long-table-flow", Status = FlowRunStatus.Running },
+                TimeSpan.FromMinutes(5)));
+            var loaded = await store.LoadAsync("long-table-flow");
+            Assert.Equal(0, loaded!.Revision);
+        });
+    }
+
+    [Fact]
+    public async Task IdColumns_ArePinnedToABinaryCollation_SoCaseVariantIdsStayDistinct()
+    {
+        // The database collation is case-INSENSITIVE by default, which made 'x' and 'X' the same
+        // key: the channel's correlation lookup cross-matched, and the flow store's primary key
+        // rejected the second id. Every column holding an id the library compares ordinally must
+        // therefore carry its own binary collation, whatever the database is set to.
+        await WithSchemaAsync("sql_collation", async schema =>
+        {
+            var channelOptions = ChannelOptions(schema);
+            await new SqlServerChannelSql(Options.Create(channelOptions)).EnsureCreatedAsync();
+
+            var transportOptions = TransportOptions(schema);
+            await new SqlServerTransportStore(Options.Create(transportOptions)).EnsureCreatedAsync();
+
+            var flowOptions = new AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions
+            {
+                ConnectionString = Fixture.SqlServerConnectionString,
+                SchemaName = schema
+            };
+            var flowStore = new AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore(Options.Create(flowOptions));
+            await flowStore.TryCreateAsync(
+                "collation-probe",
+                new FlowState { FlowId = "collation-probe", Status = FlowRunStatus.Running },
+                TimeSpan.FromMinutes(5));
+
+            var collations = new Dictionary<string, string>(StringComparer.Ordinal);
+            await using (var connection = new SqlConnection(Fixture.SqlServerConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    """
+                    SELECT t.name + N'.' + c.name, ISNULL(c.collation_name, N'')
+                    FROM sys.columns c
+                    JOIN sys.tables t ON t.object_id = c.object_id
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE s.name = @schema AND c.name IN (N'correlation_id', N'flow_id', N'queue');
+                    """;
+                command.Parameters.AddWithValue("@schema", schema);
+                await using var reader = await command.ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                    collations[reader.GetString(0)] = reader.GetString(1);
+            }
+
+            // Channel (3 tables) + transport queue + flow id: every one of them, not just the ones
+            // a given test happens to exercise.
+            Assert.Equal(5, collations.Count);
+            Assert.All(collations, entry => Assert.Contains("_BIN", entry.Value, StringComparison.OrdinalIgnoreCase));
+
+            // And the end-to-end consequence: two flow ids differing only in case are two flows.
+            Assert.True(await flowStore.TryCreateAsync(
+                "CASE-FLOW",
+                new FlowState { FlowId = "CASE-FLOW", Status = FlowRunStatus.Running },
+                TimeSpan.FromMinutes(5)));
+            Assert.True(await flowStore.TryCreateAsync(
+                "case-flow",
+                new FlowState { FlowId = "case-flow", Status = FlowRunStatus.Running },
+                TimeSpan.FromMinutes(5)));
+            Assert.Equal("CASE-FLOW", (await flowStore.LoadAsync("CASE-FLOW"))!.FlowId);
+            Assert.Equal("case-flow", (await flowStore.LoadAsync("case-flow"))!.FlowId);
+        });
+    }
+
+    [Fact]
+    public async Task LegacyCaseInsensitiveTables_DoNotDeliverAcrossCorrelationIds()
+    {
+        // The collation above protects tables this build creates. Tables created by an EARLIER
+        // build inherit the database's case-insensitive collation, and re-collating a primary-key
+        // column is not something an upgrade can do silently — so the dispatch loop re-checks the
+        // returned correlation id ordinally. Here the tables are deliberately created the old way:
+        // the store returns the wrong-case row, and the channel must refuse to deliver it.
+        var schema = NewSchema("sql_legacy_ci");
+        ServiceProvider? provider = null;
+        try
+        {
+            await CreateLegacyCaseInsensitiveChannelSchemaAsync(schema);
+            provider = BuildProvider(schema, options => options.AutoCreateSchema = false);
+            var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+            var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+
+            await using var upper = await subscriber.CreateResponseWaiter<OperationResult>("LEGACY-CI", timeout: TimeSpan.FromSeconds(5));
+            await publisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, "legacy-ci");
+
+            // The lower-case publish belongs to a different conversation. Pre-fix the sweep matched
+            // it case-insensitively and completed this waiter with somebody else's response; now
+            // the ordinal re-check refuses to deliver it, however long the sweep runs.
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            Assert.False(upper.ResponseTask.IsCompleted);
+        }
+        finally
+        {
+            if (provider is not null)
+                await provider.DisposeAsync();
+            await DropSchemaAsync(schema);
+        }
+    }
+
+    /// <summary>
+    /// The channel schema as an EARLIER build created it: no COLLATE clause, so the columns
+    /// inherit the database collation (case-insensitive on a default SQL Server).
+    /// </summary>
+    private async Task CreateLegacyCaseInsensitiveChannelSchemaAsync(string schema)
+    {
+        var options = ChannelOptions(schema);
+        await ExecuteAsync(
+            $"""
+            IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');
+
+            CREATE TABLE [{schema}].[{options.RecoveryStateTable}] (
+                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                registration_id uniqueidentifier NOT NULL,
+                state_json nvarchar(max) NOT NULL,
+                expires_at datetime2 NOT NULL,
+                registered_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                PRIMARY KEY (correlation_id, registration_id)
+            );
+
+            CREATE TABLE [{schema}].[{options.MessageTable}] (
+                id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                envelope_json nvarchar(max) NOT NULL,
+                created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                expires_at datetime2 NOT NULL,
+                acked_at datetime2 NULL,
+                acked_seq bigint NULL,
+                recovery_claimed bit NOT NULL DEFAULT 0
+            );
+            CREATE SEQUENCE [{schema}].[{options.MessageTable}_ack_seq] AS bigint START WITH 1;
+
+            CREATE TABLE [{schema}].[{options.SubscriberTable}] (
+                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                registration_id uniqueidentifier NOT NULL,
+                instance_id nvarchar(200) NOT NULL,
+                expires_at datetime2 NOT NULL,
+                PRIMARY KEY (correlation_id, registration_id)
+            );
+            """);
+    }
+
+    private async Task ExecuteAsync(string sql)
+    {
+        await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
     public async Task ManagedSchemaValidation_MissingAckSequenceObjects_FailsActionably_AndPassesAfterTheDocumentedMigration()
     {
         // A pre-1.0 manually managed schema (AutoCreateSchema = false) lacks acked_seq and its
@@ -856,14 +1094,19 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
 
     private async Task DropSchemaAsync(string schema)
     {
-        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's tables and sequences
-        // (the channel's monotonic ack sequence) first, then the schema.
+        // SQL Server has no DROP SCHEMA ... CASCADE: drop the schema's views (a collision test may
+        // have planted one), tables, and sequences (the channel's monotonic ack sequence) first,
+        // then the schema — which refuses to go while anything still references it.
         await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
             DECLARE @drop nvarchar(max) = N'';
+            SELECT @drop += N'DROP VIEW ' + QUOTENAME(s.name) + N'.' + QUOTENAME(v.name) + N';'
+            FROM sys.views v
+            JOIN sys.schemas s ON v.schema_id = s.schema_id
+            WHERE s.name = @schema;
             SELECT @drop += N'DROP TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N';'
             FROM sys.tables t
             JOIN sys.schemas s ON t.schema_id = s.schema_id

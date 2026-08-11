@@ -98,7 +98,10 @@ public sealed class CronSchedule
         // still applies — DayMatches ANDs the two masks unless BOTH fields are explicitly
         // restricted. That keeps "0 0 */2 * *" at every other day (not every day) without turning
         // "0 0 */2 * FRI" into odd-days-OR-Fridays (crontab(5): odd Fridays only).
-        static bool IsStarShaped(string field) => field is "?" || field.StartsWith('*');
+        // '?' is documented as a synonym for '*' in the day fields, so it carries the flag on the
+        // same terms — including when stepped: "?/2" must behave exactly like "*/2", not fall
+        // through to the explicitly-restricted branch and silently flip the dom/dow rule to OR.
+        static bool IsStarShaped(string field) => field.StartsWith('*') || field.StartsWith('?');
     }
 
     /// <summary>
@@ -111,8 +114,11 @@ public sealed class CronSchedule
         // `afterUtc`, then scan forward. The scan is bounded, not clever — correctness and DST
         // honesty beat arithmetic shortcuts at one iteration per minute only in the worst field.
         var local = TimeZoneInfo.ConvertTime(afterUtc, TimeZone);
-        var candidate = new DateTime(local.Year, local.Month, local.Day, local.Hour, local.Minute, 0, DateTimeKind.Unspecified)
-            .AddMinutes(1);
+        var minuteAligned = new DateTime(local.Year, local.Month, local.Day, local.Hour, local.Minute, 0, DateTimeKind.Unspecified);
+        if (minuteAligned >= LastRepresentableMinute)
+            return null; // No whole minute after this one exists to schedule.
+
+        var candidate = minuteAligned.AddMinutes(1);
 
         // Horizon: 400 Gregorian years — a full calendar cycle (146 097 days, exactly 20 871
         // weeks), so any (month, day, weekday) combination the calendar ever produces occurs
@@ -120,10 +126,30 @@ public sealed class CronSchedule
         // of unsatisfiability, not a heuristic: "0 0 29 2 */7" (Feb 29 on a Sunday, gaps of up to
         // 40 years around skipped century leap days) resolves; "Feb 30" is proven impossible.
         // The scan stays cheap because misses skip by month/day (an impossible date walks a few
-        // dozen candidates per year, not half a million minutes). The cap keeps the in-loop
-        // day/month jumps (at most ~1 month ahead) inside DateTime.MaxValue for far-future input.
-        var horizon = candidate < HorizonCap ? candidate.AddYears(400) : DateTime.MaxValue.AddDays(-366);
+        // dozen candidates per year, not half a million minutes). The horizon saturates at
+        // DateTime.MaxValue rather than being pulled BACK to a fixed cap: a cap below the
+        // candidate would end the loop before its first iteration and report even "* * * * *"
+        // as unsatisfiable.
+        var horizon = candidate < HorizonCap ? candidate.AddYears(400) : DateTime.MaxValue;
 
+        try
+        {
+            return Scan(candidate, horizon, afterUtc);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // The scan walked off the end of the representable calendar: an advance past
+            // DateTime.MaxValue, or a matched wall time whose UTC instant (wall minus a positive
+            // offset) does not exist as a DateTimeOffset. Either way there is no further
+            // occurrence to return, which is exactly what null means. Nothing else in the scan
+            // can raise this — the matchers are bit tests and the time-zone lookups take only
+            // in-range values.
+            return null;
+        }
+    }
+
+    private DateTimeOffset? Scan(DateTime candidate, DateTime horizon, DateTimeOffset afterUtc)
+    {
         while (candidate < horizon)
         {
             if (!MonthMatches(candidate.Month))
@@ -225,8 +251,13 @@ public sealed class CronSchedule
     private static readonly string[] MonthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
     private static readonly string[] DayNames = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
-    // Latest start for which "candidate + 400 years + in-loop jumps" stays inside DateTime.
-    private static readonly DateTime HorizonCap = DateTime.MaxValue.AddDays(-366).AddYears(-400);
+    // Latest start for which "candidate + 400 years" stays inside DateTime; past it the horizon
+    // saturates at DateTime.MaxValue instead.
+    private static readonly DateTime HorizonCap = DateTime.MaxValue.AddYears(-400);
+
+    // The last whole minute DateTime can represent; a start at or past it has no next minute.
+    private static readonly DateTime LastRepresentableMinute =
+        new(9999, 12, 31, 23, 59, 0, DateTimeKind.Unspecified);
 
     private static ulong ParseField(string expression, string field, int min, int max, string[]? names, bool allowQuestionMark)
     {

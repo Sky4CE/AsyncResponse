@@ -1,3 +1,4 @@
+using AsyncResponse.Internal;
 using Microsoft.Data.SqlClient;
 using System.Data;
 
@@ -112,7 +113,7 @@ internal sealed class SqlServerChannelSql
 
                 IF OBJECT_ID(N'{RecoveryTable}', N'U') IS NULL
                 CREATE TABLE {RecoveryTable} (
-                    correlation_id nvarchar(400) NOT NULL,
+                    correlation_id nvarchar(400) COLLATE Latin1_General_100_BIN2 NOT NULL,
                     registration_id uniqueidentifier NOT NULL,
                     state_json nvarchar(max) NOT NULL,
                     expires_at datetime2 NOT NULL,
@@ -126,7 +127,7 @@ internal sealed class SqlServerChannelSql
                 IF OBJECT_ID(N'{MessageTable}', N'U') IS NULL
                 CREATE TABLE {MessageTable} (
                     id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
-                    correlation_id nvarchar(400) NOT NULL,
+                    correlation_id nvarchar(400) COLLATE Latin1_General_100_BIN2 NOT NULL,
                     envelope_json nvarchar(max) NOT NULL,
                     created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
                     expires_at datetime2 NOT NULL,
@@ -147,7 +148,7 @@ internal sealed class SqlServerChannelSql
 
                 IF OBJECT_ID(N'{SubscriberTable}', N'U') IS NULL
                 CREATE TABLE {SubscriberTable} (
-                    correlation_id nvarchar(400) NOT NULL,
+                    correlation_id nvarchar(400) COLLATE Latin1_General_100_BIN2 NOT NULL,
                     registration_id uniqueidentifier NOT NULL,
                     instance_id nvarchar(200) NOT NULL,
                     expires_at datetime2 NOT NULL,
@@ -157,7 +158,24 @@ internal sealed class SqlServerChannelSql
                     CREATE INDEX {Quote(IndexName(_options.SubscriberTable, "expires"))}
                         ON {SubscriberTable} (expires_at);
                 """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqlException ex)
+            {
+                // The batch can break BEFORE the verification below ever runs: a name held by
+                // another component's table suppresses the guarded CREATE and the statements that
+                // follow (an index over columns that table lacks, the acked_seq ALTER) hit the
+                // wrong table, and a name held by a view fails outright with error 2714. Run the
+                // very same catalog checks now — on a fresh connection, since the objects in
+                // question are somebody else's and already committed — so the operator gets the
+                // precise reason instead of a raw provider error.
+                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                throw;
+            }
+
+            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             _created = true;
         }
@@ -166,6 +184,80 @@ internal sealed class SqlServerChannelSql
             _ensureGate.Release();
         }
     }
+
+    /// <summary>
+    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
+    /// error into the actionable one. Returns normally when nothing conclusive is found — the
+    /// caller then rethrows the original exception, which is the honest outcome for a failure that
+    /// has nothing to do with a name collision (permissions, a full disk, a dropped connection).
+    /// </summary>
+    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
+    {
+        SqlConnection diagnosis;
+        try
+        {
+            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            return; // The server is the problem, not the schema; the original error says so.
+        }
+
+        await using (diagnosis)
+        {
+            try
+            {
+                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException diagnosed)
+            {
+                throw new InvalidOperationException(diagnosed.Message, failure);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Post-DDL catalog verification, inside the DDL transaction (and therefore under the shared
+    /// application lock). The existence guards above only ask "is there a user table with this
+    /// name": a name held by another AsyncResponse component's table makes them skip creation
+    /// silently, and a name held by a view or synonym makes the CREATE fail with raw error 2714.
+    /// </summary>
+    private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
+        => SqlServerRelationVerifier.VerifyAsync(
+            connection,
+            transaction,
+            _options.SchemaName,
+            "channel",
+            [
+                new(_options.RecoveryStateTable, SqlServerObjectKind.Table,
+                [
+                    new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
+                    new("registration_id", "uniqueidentifier", Nullable: false),
+                    new("state_json", "nvarchar(max)", Nullable: false),
+                    new("expires_at", "datetime2", Nullable: false),
+                    new("registered_at", "datetime2", Nullable: false)
+                ]),
+                new(_options.MessageTable, SqlServerObjectKind.Table,
+                [
+                    new("id", "uniqueidentifier", Nullable: false),
+                    new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
+                    new("envelope_json", "nvarchar(max)", Nullable: false),
+                    new("created_at", "datetime2", Nullable: false),
+                    new("expires_at", "datetime2", Nullable: false),
+                    new("acked_at", "datetime2", Nullable: true),
+                    new("acked_seq", "bigint", Nullable: true),
+                    new("recovery_claimed", "bit", Nullable: false)
+                ]),
+                new(_options.SubscriberTable, SqlServerObjectKind.Table,
+                [
+                    new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
+                    new("registration_id", "uniqueidentifier", Nullable: false),
+                    new("instance_id", "nvarchar(200)", Nullable: false),
+                    new("expires_at", "datetime2", Nullable: false)
+                ]),
+                new(AckSequenceName, SqlServerObjectKind.Sequence)
+            ],
+            cancellationToken);
 
     private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
     {

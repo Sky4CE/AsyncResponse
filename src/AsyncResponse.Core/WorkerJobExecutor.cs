@@ -48,6 +48,9 @@ internal sealed class WorkerJobExecutor(
     {
         ArgumentNullException.ThrowIfNull(job);
 
+        // Armed only on the skew-proven early-execution path below; disposed with the invocation.
+        IDisposable? forcedEarly = null;
+
         // Reject a job stamped with an unsupported schema rather than invoke a possibly-incompatible
         // method shape. Throwing routes the job through the transport's normal
         // failure/dead-letter handling. This is the single choke point every transport shares.
@@ -98,6 +101,13 @@ internal sealed class WorkerJobExecutor(
 
                 if (stalled && job.RedelayStallCount >= RedelayStallExecuteThreshold)
                 {
+                    // The proof dies with this envelope. Anything the execution below re-publishes
+                    // is a NEW message whose stall counters start at zero, so a durable timer that
+                    // suspends again would rebuild the same proof from scratch on every lap and
+                    // never finish. The marker lets such a step wait out its remainder in process
+                    // instead — see WorkerJobSkewScope.
+                    forcedEarly = WorkerJobSkewScope.Enter();
+
                     _logger.LogWarning(
                         "Worker job {Target}.{Method} was redelivered {Remaining} before its due time {NotBeforeUtc} with no progress over {StallCount} consecutive hops ({LastRemaining} previously); " +
                         "the publishing and delivery-gating clocks disagree (clock skew). Executing it now instead of re-publishing.",
@@ -152,6 +162,10 @@ internal sealed class WorkerJobExecutor(
             AsyncResponseDiagnostics.SetError(activity, ex);
             AsyncResponseDiagnostics.RecordWorkerOutcome("failed");
             throw;
+        }
+        finally
+        {
+            forcedEarly?.Dispose();
         }
     }
 }
