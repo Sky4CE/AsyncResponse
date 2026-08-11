@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="2">2</td>
+<td class="limit-width right" title="4">4</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="2">2</td>
+<td class="limit-width right" title="4">4</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="161">161</td>
+<td class="limit-width right" title="172">172</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="2 of 2">100%</td>
+<td class="limit-width right" title="4 of 4">100%</td>
 </tr>
 </table>
 </div>
@@ -71,15 +71,15 @@
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="8">8</td>
+<td class="limit-width right" title="10">10</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="8">8</td>
+<td class="limit-width right" title="10">10</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="8 of 8">100%</td>
+<td class="limit-width right" title="10 of 10">100%</td>
 </tr>
 </table>
 </div>
@@ -108,7 +108,7 @@
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
 <tr><td title="ExecuteAsync&lt;T&gt;(System.Func&lt;System.Threading.CancellationToken, System.Threading.Tasks.Task&lt;T&gt;&gt;, int, System.TimeSpan, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line156" class="navigatetohash">ExecuteAsync&lt;T&gt;(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title="IsTransient(System.Exception)"><a href="#file0_line160" class="navigatetohash">IsTransient(...)</a></td><td>100%</td><td>6</td><td>6</td><td>100%</td></tr>
+<tr><td title="IsTransient(System.Exception)"><a href="#file0_line167" class="navigatetohash">IsTransient(...)</a></td><td>100%</td><td>8</td><td>8</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -277,17 +277,28 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line157"></a><code>157</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line158"></a><code>158</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Runs&nbsp;the&nbsp;IsTransient&nbsp;operation.&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line159"></a><code>159</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;static&nbsp;bool&nbsp;IsTransient(Exception&nbsp;exception)</code></td></tr>
-<tr class="coverableline" title="Covered (5 visits, 6 of 6 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '5', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">5</td><td class="rightmargin right"><a id="file0_line160"></a><code>160</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;exception&nbsp;is&nbsp;NatsException&nbsp;or&nbsp;TimeoutException&nbsp;&amp;&amp;&nbsp;exception&nbsp;is&nbsp;not&nbsp;OperationCanceledException;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line161"></a><code>161</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line160"></a><code>160</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line161"></a><code>161</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;A&nbsp;JetStream&nbsp;API&nbsp;request&nbsp;that&nbsp;the&nbsp;server&nbsp;ANSWERED&nbsp;with&nbsp;an&nbsp;error&nbsp;is&nbsp;a&nbsp;decision,&nbsp;not&nbsp;a</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line162"></a><code>162</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;blip:&nbsp;&quot;stream&nbsp;name&nbsp;already&nbsp;in&nbsp;use&quot;,&nbsp;&quot;consumer&nbsp;config&nbsp;would&nbsp;change&nbsp;an&nbsp;immutable&nbsp;field&quot;,</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line163"></a><code>163</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;&quot;no&nbsp;permission&quot;.&nbsp;Those&nbsp;repeat&nbsp;identically&nbsp;on&nbsp;every&nbsp;attempt,&nbsp;so&nbsp;retrying&nbsp;only&nbsp;delays&nbsp;the</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line164"></a><code>164</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;report&nbsp;—&nbsp;unless&nbsp;the&nbsp;server&nbsp;itself&nbsp;said&nbsp;it&nbsp;was&nbsp;temporarily&nbsp;unable&nbsp;(5xx,&nbsp;e.g.&nbsp;503&nbsp;while&nbsp;a</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line165"></a><code>165</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;meta-leader&nbsp;election&nbsp;settles).&nbsp;Everything&nbsp;else&nbsp;in&nbsp;the&nbsp;NatsException&nbsp;family&nbsp;—&nbsp;no</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line166"></a><code>166</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;responders,&nbsp;no&nbsp;API&nbsp;response,&nbsp;connection&nbsp;loss&nbsp;—&nbsp;is&nbsp;the&nbsp;transient&nbsp;case.</code></td></tr>
+<tr class="coverableline" title="Covered (4 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '4', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">4</td><td class="rightmargin right"><a id="file0_line167"></a><code>167</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(exception&nbsp;is&nbsp;NatsJSApiException&nbsp;api)</code></td></tr>
+<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line168"></a><code>168</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;api.Error.Code&nbsp;&gt;=&nbsp;500;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line169"></a><code>169</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 6 of 6 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line170"></a><code>170</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;exception&nbsp;is&nbsp;NatsException&nbsp;or&nbsp;TimeoutException&nbsp;&amp;&amp;&nbsp;exception&nbsp;is&nbsp;not&nbsp;OperationCanceledException;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line171"></a><code>171</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line172"></a><code>172</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/11/2026 - 21:35:39<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/11/2026 - 23:20:42<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
 <a href="#file0_line156" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - ExecuteAsync&lt;T&gt;(System.Func&lt;System.Threading.CancellationToken, System.Threading.Tasks.Task&lt;T&gt;&gt;, int, System.TimeSpan, System.TimeSpan, System.Threading.CancellationToken)"><i class="icon-cube"></i>ExecuteAsync&lt;T&gt;(System.Func&lt;System.Threading.CancellationToken, System.Threading.Tasks.Task&lt;T&gt;&gt;, int, System.TimeSpan, System.TimeSpan, System.Threading.CancellationToken)</a><br />
-<a href="#file0_line160" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsTransient(System.Exception)"><i class="icon-cube"></i>IsTransient(System.Exception)</a><br />
+<a href="#file0_line167" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsTransient(System.Exception)"><i class="icon-cube"></i>IsTransient(System.Exception)</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>
