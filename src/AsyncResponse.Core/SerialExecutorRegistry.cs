@@ -26,6 +26,11 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
     // an unpruned tombstone only ever delays a reused correlation id briefly.
     internal static readonly TimeSpan TombstoneLifetime = TimeSpan.FromSeconds(30);
 
+    // Upper bound on how long retirement waits for in-flight enqueues to drain. A producer can be
+    // parked indefinitely awaiting queue capacity with a token that never fires, and teardown
+    // paths await RemoveAsync directly — they must not inherit that hang.
+    internal static readonly TimeSpan EnqueueDrainLimit = TimeSpan.FromSeconds(30);
+
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime> _tombstones = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _registrations = new(StringComparer.Ordinal);
@@ -187,7 +192,23 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
 
         try
         {
-            await waitForEnqueues.ConfigureAwait(false);
+            try
+            {
+                // Bounded wait: an admitted enqueue can be parked indefinitely on a full queue
+                // with a token that never fires. Proceeding after the limit is safe — disposal
+                // completes the executor's writer, which unparks the wedged producer, and its
+                // retry then lands on the tombstone/recreate machinery built for exactly the
+                // enqueue-races-retirement case.
+                await waitForEnqueues.WaitAsync(EnqueueDrainLimit).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "Timed out after {DrainLimit} waiting for in-flight enqueues on channel {Channel} to drain; disposing the executor anyway.",
+                    EnqueueDrainLimit,
+                    channel);
+            }
+
             await entry.Executor.DisposeAsync().ConfigureAwait(false);
         }
         finally

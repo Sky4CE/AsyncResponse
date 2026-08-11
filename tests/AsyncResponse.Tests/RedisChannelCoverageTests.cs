@@ -105,13 +105,15 @@ public sealed class RedisChannelCoverageTests
     /// Publishes keep reaching nobody while PUBSUB NUMSUB keeps reporting a live waiter — a
     /// contradiction (subscription landing on another node, or propagation lag). Consuming
     /// recovery registrations on that evidence would strip a live waiter of its recovery arm, so
-    /// after the bounded retry the publish leaves all state intact.
+    /// after the bounded retry the publish leaves all state intact — and surfaces the
+    /// non-delivery to the caller instead of silently dropping the payload, so the caller's
+    /// retry/redelivery machinery re-attempts once the subscription is visible.
     /// </summary>
     [Theory]
     [InlineData(PublishKind.Response)]
     [InlineData(PublishKind.RawJson)]
     [InlineData(PublishKind.Exception)]
-    public async Task Publish_LeavesRecoveryIntactWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
+    public async Task Publish_LeavesRecoveryIntactAndThrowsWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
     {
         using var activities = new AsyncResponseActivityCollector();
         _liveSubscribers = 1;
@@ -121,9 +123,12 @@ public sealed class RedisChannelCoverageTests
         _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync([NewRecoveryState("corr-contradiction")]);
 
-        await PublishAsync(CreateChannel(), kind, "corr-contradiction");
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishAsync(CreateChannel(), kind, "corr-contradiction"));
+        Assert.Contains("found no subscribers twice", exception.Message);
 
-        // Bounded: one re-publish, then hands off to the intact registration instead of looping.
+        // Bounded: one re-publish, then the failure surfaces with the registration intact instead
+        // of looping or silently dropping the payload.
         _subscriber.Verify(
             instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
             Times.Exactly(2));

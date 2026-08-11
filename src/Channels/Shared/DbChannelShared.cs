@@ -533,8 +533,7 @@ internal abstract class DbAsyncResponseChannelBase :
                 group.TryRemove(subscription.Id, out _);
             }
 
-            if (group.IsEmpty)
-                _subscriptions.TryRemove(correlationId, out _);
+            UnlinkIfEmpty(correlationId, group);
 
             await _executors.RemoveAsync(ChannelName(correlationId)).ConfigureAwait(false);
         }
@@ -555,8 +554,20 @@ internal abstract class DbAsyncResponseChannelBase :
         // be silently dropped. In the reversed window (registered, not yet visible) the delivery
         // just waits for the next sweep or falls back to lost-subscriber recovery.
         _executors.OnSubscriptionRegistered(ChannelName(correlationId));
-        var group = _subscriptions.GetOrAdd(correlationId, _ => new ConcurrentDictionary<Guid, IDbSubscription>());
-        group[subscription.Id] = subscription;
+        while (true)
+        {
+            var group = _subscriptions.GetOrAdd(correlationId, _ => new ConcurrentDictionary<Guid, IDbSubscription>());
+            group[subscription.Id] = subscription;
+
+            // A concurrent RemoveSubscription may have unlinked this group between the GetOrAdd
+            // and the insert above (its emptiness check cannot see the in-flight insert). If the
+            // group this subscription landed in is no longer the mapped one, move it to the live
+            // group so it stays reachable to every dispatch path.
+            if (_subscriptions.TryGetValue(correlationId, out var current) && ReferenceEquals(current, group))
+                return;
+
+            group.TryRemove(subscription.Id, out _);
+        }
     }
 
     private void RemoveSubscription(string correlationId, Guid registrationId)
@@ -566,8 +577,32 @@ internal abstract class DbAsyncResponseChannelBase :
 
         if (group.TryRemove(registrationId, out _))
             _executors.OnSubscriptionRetired(ChannelName(correlationId));
+        UnlinkIfEmpty(correlationId, group);
+    }
+
+    // Unlinks an emptied subscription group from the map without orphaning a concurrent
+    // registration: the emptiness read and the map removal cannot be one atomic step, so a
+    // waiter registered for a reused correlation id in that window would land in an unreachable
+    // group and time out despite its response being published. Unlink only our exact group,
+    // then re-link (or merge) anything a racing AddSubscription slipped into it.
+    private void UnlinkIfEmpty(string correlationId, ConcurrentDictionary<Guid, IDbSubscription> group)
+    {
+        if (!group.IsEmpty)
+            return;
+
+        if (!((ICollection<KeyValuePair<string, ConcurrentDictionary<Guid, IDbSubscription>>>)_subscriptions)
+                .Remove(new KeyValuePair<string, ConcurrentDictionary<Guid, IDbSubscription>>(correlationId, group)))
+            return;
+
         if (group.IsEmpty)
-            _subscriptions.TryRemove(correlationId, out _);
+            return;
+
+        var merged = _subscriptions.GetOrAdd(correlationId, group);
+        if (ReferenceEquals(merged, group))
+            return;
+
+        foreach (var entry in group)
+            merged[entry.Key] = entry.Value;
     }
 
     private void ThrowIfDisposed()

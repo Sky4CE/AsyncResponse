@@ -118,27 +118,49 @@ internal abstract class MongoDbSubscriberService : BackgroundService
 
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
-        try
+        // Retry with backoff, mirroring the channel-side listener: a transient watch failure
+        // (network blip, replica-set stepdown) must not permanently degrade this subscriber from
+        // push wake to poll-only latency for the rest of the process's uptime.
+        var failures = 0;
+        while (!cancellationToken.IsCancellationRequested)
         {
-            await _store.WatchQueueAsync(Queue, () =>
+            try
             {
-                _signals.Writer.TryWrite(true);
-                return Task.CompletedTask;
-            }, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex) when (MongoDbTransportStore.IsChangeStreamUnsupported(ex))
-        {
-            Logger.LogInformation(
-                "MongoDB change streams are unavailable for queue {Queue} (the server is not a replica set); polling continues at {PollDelay}.",
-                Queue,
-                SubscriberOptions.EmptyPollDelay);
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "MongoDB change-stream wake for queue {Queue} stopped; polling continues.", Queue);
+                await _store.WatchQueueAsync(Queue, () =>
+                {
+                    _signals.Writer.TryWrite(true);
+                    return Task.CompletedTask;
+                }, cancellationToken).ConfigureAwait(false);
+                failures = 0;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex) when (MongoDbTransportStore.IsChangeStreamUnsupported(ex))
+            {
+                // Structural, not transient: a standalone server never grows change streams, so
+                // retrying is pointless — the poll loop is the permanent delivery path here.
+                Logger.LogInformation(
+                    "MongoDB change streams are unavailable for queue {Queue} (the server is not a replica set); polling continues at {PollDelay}.",
+                    Queue,
+                    SubscriberOptions.EmptyPollDelay);
+                return;
+            }
+            catch (Exception ex)
+            {
+                failures++;
+                var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
+                Logger.LogWarning(ex, "MongoDB change-stream wake for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay);
+                try
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
         }
     }
 

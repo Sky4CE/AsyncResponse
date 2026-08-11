@@ -25,7 +25,14 @@ public static class PostgreSqlAsyncResponseTransportServiceCollectionExtensions
         services.Configure(configure);
 
         services.TryAddSingleton<PostgreSqlTransportStore>();
-        services.TryAddSingleton<PostgreSqlWorkerTransport>();
+        // Factory registration so the transport shares the singleton store: DI would otherwise
+        // pick the public constructor (internal ctors are invisible to it), giving the publisher
+        // a private store whose in-process MessagePublished event the subscribers never observe —
+        // silently downgrading every same-process publish from instant wake to poll-interval
+        // latency. Mirrors the MongoDB transport's factory registration.
+        services.TryAddSingleton(provider => new PostgreSqlWorkerTransport(
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseTransportOptions>>(),
+            provider.GetRequiredService<PostgreSqlTransportStore>()));
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider => provider.GetRequiredService<PostgreSqlWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, PostgreSqlReplyTargetProvider>());
         services.AddSingleton(provider =>

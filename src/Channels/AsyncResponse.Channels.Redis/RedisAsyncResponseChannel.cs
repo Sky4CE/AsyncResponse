@@ -633,12 +633,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +
+                            "reporting one; the payload was not delivered and recovery registrations were left intact. Retry the publish " +
+                            "once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 
@@ -723,12 +729,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +
+                            "reporting one; the payload was not delivered and recovery registrations were left intact. Retry the publish " +
+                            "once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 
@@ -821,12 +833,18 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"Redis delivery for correlationId '{correlationId}' found no subscribers twice while the liveness probe kept " +
+                            "reporting one; the payload was not delivered and recovery registrations were left intact. Retry the publish " +
+                            "once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 

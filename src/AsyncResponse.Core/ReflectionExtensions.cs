@@ -369,16 +369,21 @@ internal static class ReflectionExtensions
                 return JsonSerializer.Deserialize(je, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
             }
 
-            // JSON in a string
-            if (value is string s && !_isString)
-            {
-                return JsonSerializer.Deserialize(s, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
-            }
-
-            // Already the correct CLR type (a boxed value also satisfies its nullable counterpart)
+            // Already the correct CLR type (a boxed value also satisfies its nullable counterpart).
+            // This must precede the JSON-in-a-string fallback: values that crossed a serialization
+            // boundary arrive as JsonElement (see AsyncResponseJsonContext), so a raw string here
+            // is a LIVE in-memory value (a literal captured by the callback expression, or the
+            // CorrelationId placeholder) — JSON-parsing it into an object-typed parameter would
+            // throw on any plain string like "ORD-42".
             if (targetType.IsInstanceOfType(value) || (_underlyingType?.IsInstanceOfType(value) ?? false))
             {
                 return value;
+            }
+
+            // JSON in a string (a target the string cannot satisfy directly)
+            if (value is string s && !_isString)
+            {
+                return JsonSerializer.Deserialize(s, AsyncResponseJson.GetTypeInfo(targetType, AsyncResponseJson.CaseInsensitive));
             }
 
             // Null handling

@@ -83,6 +83,18 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(ContainerName)} must be configured.");
         if (string.IsNullOrWhiteSpace(PartitionKeyPath) || !PartitionKeyPath.StartsWith("/", StringComparison.Ordinal))
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(PartitionKeyPath)} must start with '/'.");
+        // Every store operation addresses documents with new PartitionKey(flowId), and the ledger
+        // document only carries the flow id under 'id' and 'flowId' — any other partition-key path
+        // would make every write fail with a Cosmos partition-key-mismatch error at runtime, so
+        // reject it up front instead of letting validation pass on a doomed configuration.
+        if (!string.Equals(PartitionKeyPath, "/flowId", StringComparison.Ordinal)
+            && !string.Equals(PartitionKeyPath, "/id", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(CosmosDurableFlowOptions)}.{nameof(PartitionKeyPath)} must be '/flowId' or '/id': the store " +
+                "partitions every operation by the flow id, and the ledger document carries no other property to " +
+                $"satisfy a container partitioned on '{PartitionKeyPath}'.");
+        }
         if (Throughput is <= 0)
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(Throughput)} must be positive when configured.");
         if (MaxStateBytes is <= 0)

@@ -116,20 +116,39 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
 
     private async Task ListenLoopAsync(CancellationToken cancellationToken)
     {
-        try
+        // Retry with backoff, mirroring the channel-side listener: a transient LISTEN failure
+        // (network blip, failover) must not permanently degrade this subscriber from push wake
+        // to poll-only latency for the rest of the process's uptime.
+        var failures = 0;
+        while (!cancellationToken.IsCancellationRequested)
         {
-            await _store.ExecuteListenAsync(() =>
+            try
             {
-                _signals.Writer.TryWrite(true);
-                return Task.CompletedTask;
-            }, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            Logger.LogDebug(ex, "PostgreSQL LISTEN helper for queue {Queue} stopped; polling continues.", Queue);
+                await _store.ExecuteListenAsync(() =>
+                {
+                    _signals.Writer.TryWrite(true);
+                    return Task.CompletedTask;
+                }, cancellationToken).ConfigureAwait(false);
+                failures = 0;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                failures++;
+                var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
+                Logger.LogWarning(ex, "PostgreSQL LISTEN helper for queue {Queue} failed; retrying in {RetryDelay} (polling continues meanwhile).", Queue, delay);
+                try
+                {
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
         }
     }
 

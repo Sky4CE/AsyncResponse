@@ -26,7 +26,14 @@ public static class SqlServerAsyncResponseTransportServiceCollectionExtensions
         services.Configure(configure);
 
         services.TryAddSingleton<SqlServerTransportStore>();
-        services.TryAddSingleton<SqlServerWorkerTransport>();
+        // Factory registration so the transport shares the singleton store: DI would otherwise
+        // pick the public one-arg constructor (internal ctors are invisible to it), giving the
+        // publisher a private store whose in-process MessagePublished event the subscribers never
+        // observe — silently downgrading every same-process publish from instant wake to
+        // poll-interval latency.
+        services.TryAddSingleton(provider => new SqlServerWorkerTransport(
+            provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<SqlServerAsyncResponseTransportOptions>>(),
+            provider.GetRequiredService<SqlServerTransportStore>()));
         services.Replace(ServiceDescriptor.Singleton<IWorkerTransport>(provider => provider.GetRequiredService<SqlServerWorkerTransport>()));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseReplyTargetProvider, SqlServerReplyTargetProvider>());
         services.AddSingleton(provider =>

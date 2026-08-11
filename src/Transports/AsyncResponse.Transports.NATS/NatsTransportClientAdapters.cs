@@ -51,7 +51,15 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
         var config = new StreamConfig(stream, [subject])
         {
             MaxMsgs = maxMessages ?? -1,
-            Retention = StreamConfigRetention.Limits
+            // Work-queue retention removes each message once it is acked, so the stream only ever
+            // holds the unprocessed backlog. Limits retention kept acked messages forever, letting
+            // MaxMsgs eviction silently discard the oldest *unprocessed* jobs once the cap filled
+            // up with already-acked traffic.
+            Retention = StreamConfigRetention.Workqueue,
+            // If the unprocessed backlog itself reaches MaxMsgs, refuse new publishes (a failed
+            // PubAck the publisher's retry/exception path surfaces) instead of silently evicting
+            // the oldest pending jobs.
+            Discard = StreamConfigDiscard.New
         };
         await _jetStream.CreateOrUpdateStreamAsync(config, cancellationToken).ConfigureAwait(false);
     }

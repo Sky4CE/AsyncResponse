@@ -38,6 +38,7 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
 
     protected RabbitMqAsyncResponseOptions TransportOptions { get; }
     protected ILogger Logger { get; }
+    protected string QueueName => _queue;
 
     /// <summary>
     /// Maximum delivery attempts before a failing <see cref="RabbitMqAckMode.AckAfterHandlerCompletes"/> handler
@@ -268,7 +269,6 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
-            await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -277,6 +277,24 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             var requeue = MaxDeliveryAttempts <= 0
                 || ResolveDeliveryAttempt(delivery) < MaxDeliveryAttempts;
             await channel.BasicNackAsync(delivery.DeliveryTag, requeue, CancellationToken.None).ConfigureAwait(false);
+            return;
+        }
+
+        // The ACK sits outside the handler's try/catch: a transient BasicAck failure after a
+        // successful handler must not be NACKed — the broker would redeliver and re-run side
+        // effects that already completed. The un-ACKed delivery is redelivered anyway when the
+        // channel closes, which is the unavoidable at-least-once floor.
+        try
+        {
+            await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after a successful handler; the broker will redeliver it when the channel closes.",
+                delivery.DeliveryTag,
+                QueueName);
         }
     }
 }

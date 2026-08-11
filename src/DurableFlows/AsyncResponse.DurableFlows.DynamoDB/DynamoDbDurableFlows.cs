@@ -71,6 +71,22 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
             throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(TableName)} must be configured.");
         if (string.IsNullOrWhiteSpace(TimeToLiveAttributeName))
             throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(TimeToLiveAttributeName)} must be configured.");
+        // A TTL attribute colliding with one of the store's own attributes would let the later
+        // item-initializer assignment silently overwrite the TTL value (e.g. with the revision
+        // number), making every new flow read back as already-expired with no error anywhere.
+        if (TimeToLiveAttributeName is DynamoDbFlowStateStore.FlowIdAttribute
+            or DynamoDbFlowStateStore.StateJsonAttribute
+            or DynamoDbFlowStateStore.UpdatedAtAttribute
+            or DynamoDbFlowStateStore.RevisionAttribute
+            or DynamoDbFlowStateStore.LeaseIdAttribute
+            or DynamoDbFlowStateStore.LeaseExpiresAtAttribute)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(DynamoDbDurableFlowOptions)}.{nameof(TimeToLiveAttributeName)} must not collide with one of the " +
+                $"store's own attributes ('{DynamoDbFlowStateStore.FlowIdAttribute}', '{DynamoDbFlowStateStore.StateJsonAttribute}', " +
+                $"'{DynamoDbFlowStateStore.UpdatedAtAttribute}', '{DynamoDbFlowStateStore.RevisionAttribute}', " +
+                $"'{DynamoDbFlowStateStore.LeaseIdAttribute}', '{DynamoDbFlowStateStore.LeaseExpiresAtAttribute}').");
+        }
         if (MaxStateBytes is <= 0)
             throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
     }
@@ -79,12 +95,12 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
 /// <summary>DynamoDB implementation of <see cref="IFlowStateStore"/>.</summary>
 public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
 {
-    private const string FlowIdAttribute = "flow_id";
-    private const string StateJsonAttribute = "state_json";
-    private const string UpdatedAtAttribute = "updated_at";
-    private const string RevisionAttribute = "revision";
-    private const string LeaseIdAttribute = "lease_id";
-    private const string LeaseExpiresAtAttribute = "lease_expires_at_ms";
+    internal const string FlowIdAttribute = "flow_id";
+    internal const string StateJsonAttribute = "state_json";
+    internal const string UpdatedAtAttribute = "updated_at";
+    internal const string RevisionAttribute = "revision";
+    internal const string LeaseIdAttribute = "lease_id";
+    internal const string LeaseExpiresAtAttribute = "lease_expires_at_ms";
 
     // Time authority: this store keeps the app clock (DateTimeOffset.UtcNow) for expiry and lease
     // comparisons. DynamoDB condition expressions evaluate client-supplied values only — there is

@@ -347,11 +347,42 @@ public class NatsWorkerTransportTests
     }
 
     [Fact]
-    public async Task PublishAsync_OmitsHeader_WhenNoCorrelationId()
+    public async Task PublishAsync_OmitsCorrelationHeader_ButAlwaysCarriesMsgId_WhenNoCorrelationId()
     {
         var transport = CreateTransport();
         await transport.PublishAsync(CreateJob(correlationId: null));
-        Assert.Null(_jetStream.Published[0].Headers);
+
+        // Every publish carries a Nats-Msg-Id so a retried publish is deduplicated by JetStream
+        // instead of enqueuing the same worker job twice; the correlation header alone is omitted.
+        var headers = _jetStream.Published[0].Headers;
+        Assert.NotNull(headers);
+        var messageId = Assert.Contains("Nats-Msg-Id", headers);
+        Assert.False(string.IsNullOrWhiteSpace(messageId));
+        Assert.DoesNotContain("AR-Correlation-Id", headers);
+    }
+
+    [Fact]
+    public async Task PublishAsync_CarriesDedupMsgId_DistinctPerLogicalPublish()
+    {
+        var transport = CreateTransport(new NatsAsyncResponseTransportOptions
+        {
+            PublishMaxAttempts = 3,
+            PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+            PublishRetryMaxDelay = TimeSpan.FromMilliseconds(2)
+        });
+        _jetStream.PublishFailureForAttempt = attempt => attempt == 1 ? new TimeoutException("transient") : null;
+
+        // The dedup id is generated once outside the retry loop, so the broker sees the same
+        // Nats-Msg-Id on the retried attempt (JetStream drops the duplicate when the first
+        // attempt actually landed); a subsequent logical publish must carry a fresh id.
+        await transport.PublishAsync(CreateJob());
+        await transport.PublishAsync(CreateJob());
+
+        Assert.Equal(2, _jetStream.Published.Count);
+        var firstId = Assert.Contains("Nats-Msg-Id", _jetStream.Published[0].Headers!);
+        var secondId = Assert.Contains("Nats-Msg-Id", _jetStream.Published[1].Headers!);
+        Assert.False(string.IsNullOrWhiteSpace(firstId));
+        Assert.NotEqual(firstId, secondId);
     }
 
     [Fact]

@@ -127,7 +127,11 @@ public sealed class MongoDbStoreQueryTests
         // cross-process fan-out: multiple processes may each win delivery.
         Assert.Equal(new BsonBinaryData(messageId, GuidRepresentation.Standard), filter["_id"].AsBsonBinaryData);
         Assert.False(filter["recovery_claimed"].AsBoolean);
-        Assert.True(filter.Contains("expires_at"));
+        // Expiry is compared on the SERVER clock ($expr: expires_at > $$NOW), matching the
+        // server-stamped expires_at — an app-clock comparison would refuse live claims under skew.
+        Assert.Equal(
+            new BsonDocument("$gt", new BsonArray { "$expires_at", "$$NOW" }),
+            filter["$expr"].AsBsonDocument);
 
         var set = update.AsBsonArray[0]["$set"].AsBsonDocument;
         Assert.Equal(new BsonArray { "$acked_at", "$$NOW" }, set["acked_at"]["$ifNull"].AsBsonArray);

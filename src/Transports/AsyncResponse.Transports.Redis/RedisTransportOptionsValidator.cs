@@ -25,6 +25,20 @@ internal static class RedisTransportOptionsValidator
         _ = Required(options.PayloadField, nameof(options.PayloadField));
         _ = Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
+        // Worker and response subscribers must never share one stream: a Redis stream is not
+        // partitioned between consumer groups — every entry is visible to every group — so a
+        // shared stream would feed worker jobs to the response ingress and responses to the
+        // worker dispatcher. Compare the resolved names so an explicit value colliding with the
+        // other role's derived default is caught too.
+        var schema = new RedisTransportKeySchema(options);
+        if (StringComparer.Ordinal.Equals(schema.WorkerStream.ToString(), schema.ResponseStream.ToString()))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(options.WorkerStream)} and " +
+                $"{nameof(options.ResponseStream)} must resolve to distinct streams so worker and response " +
+                "subscribers do not consume each other's messages.");
+        }
+
         // OperationTimeout arms a CancellationTokenSource per command; the retry delays feed
         // Task.Delay — all timer-armed, so all carry the .NET timer ceiling.
         AsyncResponseChannelOptions.EnsureTimerBacked(options.OperationTimeout, nameof(RedisAsyncResponseTransportOptions), nameof(options.OperationTimeout));

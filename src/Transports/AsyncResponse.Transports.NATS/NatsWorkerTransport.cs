@@ -61,12 +61,15 @@ public sealed class NatsWorkerTransport : IWorkerTransport
             if (_options.CreateStreams)
                 await EnsureWorkerStreamOnceAsync(cancellationToken).ConfigureAwait(false);
 
-            var headers = string.IsNullOrWhiteSpace(job.CorrelationId)
-                ? null
-                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    [_options.CorrelationIdHeader] = job.CorrelationId!
-                };
+            // Stable id outside the retry loop so a retried publish is deduplicated by JetStream
+            // (Nats-Msg-Id within the stream's duplicate window) rather than enqueuing the same
+            // worker job twice when a PubAck is lost after the broker already persisted the message.
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Nats-Msg-Id"] = Guid.NewGuid().ToString("N")
+            };
+            if (!string.IsNullOrWhiteSpace(job.CorrelationId))
+                headers[_options.CorrelationIdHeader] = job.CorrelationId!;
 
             var payload = AsyncResponseJson.Serialize(job);
             var sequence = await NatsTransportRetry.ExecuteAsync(

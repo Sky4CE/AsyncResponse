@@ -326,7 +326,7 @@ internal sealed class MongoDbChannelStore : IDisposable
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.CorrelationId, correlationId)
                      & Builders<MongoChannelMessageDocument>.Filter.Gte(item => item.CreatedAtUtc, sinceUtc.UtcDateTime)
-                     & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+                     & NotExpiredOnServerClock<MongoChannelMessageDocument>();
         if (afterCreatedAtUtc is not null)
         {
             var afterCreated = afterCreatedAtUtc.Value.UtcDateTime;
@@ -382,7 +382,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     internal static FilterDefinition<MongoChannelMessageDocument> BuildDeliveryClaimFilter(Guid messageId)
         => Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
            & Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.RecoveryClaimed, false)
-           & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+           & NotExpiredOnServerClock<MongoChannelMessageDocument>();
 
     internal static UpdateDefinition<MongoChannelMessageDocument> BuildDeliveryClaimUpdate(long ackSeq)
         => Builders<MongoChannelMessageDocument>.Update.Pipeline(new[]
@@ -464,7 +464,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var filter = Builders<MongoChannelMessageDocument>.Filter.Eq(item => item.Id, messageId)
-                     & Builders<MongoChannelMessageDocument>.Filter.Gt(item => item.ExpiresAtUtc, DateTime.UtcNow);
+                     & NotExpiredOnServerClock<MongoChannelMessageDocument>();
         // Direct member projection, not an anonymous type: anonymous projections lower to the
         // RequiresUnreferencedCode Expression.New(ctor, args, members) overload, which the ILC
         // trim analysis rejects (Roslyn's analyzer skips compiler-lowered expression trees, so
@@ -556,9 +556,9 @@ internal sealed class MongoDbChannelStore : IDisposable
     }
 
     /// <summary>
-    /// Server-clock expiry filter (<c>$expr: expires_at &gt; $$NOW</c>): liveness and recovery
-    /// expiry are stamped with $$NOW, so comparing them against the app clock would reintroduce
-    /// the clock-skew hole the server-side stamps exist to close.
+    /// Server-clock expiry filter (<c>$expr: expires_at &gt; $$NOW</c>): message, liveness, and
+    /// recovery expiry are all stamped with $$NOW, so comparing them against the app clock would
+    /// reintroduce the clock-skew hole the server-side stamps exist to close.
     /// </summary>
     internal static FilterDefinition<TDocument> NotExpiredOnServerClock<TDocument>()
         => new BsonDocument("$expr", new BsonDocument("$gt", new BsonArray { "$expires_at", "$$NOW" }));
