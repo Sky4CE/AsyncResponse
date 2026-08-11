@@ -3,18 +3,18 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/11/2026 - 20:47:27 |
+| Generated on: | 08/11/2026 - 21:35:39 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 477 |
 | Files: | 211 |
-| **Line coverage:** | 98.1% (27883 of 28420) |
-| Covered lines: | 27883 |
-| Uncovered lines: | 537 |
-| Coverable lines: | 28420 |
-| Total lines: | 42354 |
-| **Branch coverage:** | 94% (10068 of 10708) |
-| Covered branches: | 10068 |
+| **Line coverage:** | 98.1% (27891 of 28429) |
+| Covered lines: | 27891 |
+| Uncovered lines: | 538 |
+| Coverable lines: | 28429 |
+| Total lines: | 42370 |
+| **Branch coverage:** | 93.9% (10065 of 10708) |
+| Covered branches: | 10065 |
 | Total branches: | 10708 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
@@ -197,7 +197,7 @@
 |AsyncResponse.DurableFlowContext<TFlow, TInput>|93.8%|85.8%|
 |AsyncResponse.DurableFlowContext<TResponse>|93.8%|85.8%|
 |AsyncResponse.DurableFlowContext<TResult>|93.8%|85.8%|
-|AsyncResponse.DurableFlowExecutor|98.7%|95.6%|
+|AsyncResponse.DurableFlowExecutor|98.7%|93.8%|
 |AsyncResponse.DurableFlowObserverLifetimeAudit|100%|37.5%|
 |AsyncResponse.DurableFlowOptions|100%||
 |AsyncResponse.DurableFlowService|100%|100%|
@@ -466,11 +466,11 @@
 |Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCo<br/>llectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.Kafka - 99.8%</summary>
+<details><summary>AsyncResponse.Transports.Kafka - 99.7%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.Kafka**|**99.8%**|**98.7%**|
+|**AsyncResponse.Transports.Kafka**|**99.7%**|**98.7%**|
 |AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions|100%||
 |AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext|100%||
@@ -486,7 +486,7 @@
 |AsyncResponse.Transports.Kafka.KafkaReplyTargetProvider|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaResponseIngressSubscriber|100%||
 |AsyncResponse.Transports.Kafka.KafkaSubscriberOptions|100%|100%|
-|AsyncResponse.Transports.Kafka.KafkaSubscriberService|100%|95.8%|
+|AsyncResponse.Transports.Kafka.KafkaSubscriberService|99.1%|95.8%|
 |AsyncResponse.Transports.Kafka.KafkaTransportClientDefaults|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaTransportHeader|100%|100%|
 |AsyncResponse.Transports.Kafka.KafkaTransportOptionsValidator|100%|100%|
@@ -633,7 +633,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SqlServer**|**99.4%**|**100%**|
+|**AsyncResponse.Transports.SqlServer**|**99.4%**|**99.5%**|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.DbMessageDispatcherBase|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions|100%||
@@ -649,7 +649,7 @@
 |AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransportRetry|100%|100%|
-|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|99.6%|100%|
+|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|99.6%|97.8%|
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerSubscriber|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport|100%|100%|
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportSer<br/>viceCollectionExtensions|100%|100%|

@@ -1,22 +1,22 @@
 Summary - AsyncResponse (Release / net8.0+net10.0 / unit+integration)
-  Generated on: 08/11/2026 - 20:47:27
+  Generated on: 08/11/2026 - 21:35:39
   Parser: MultiReport (16x Cobertura)
   Assemblies: 27
   Classes: 477
   Files: 211
   Line coverage: 98.1%
-  Covered lines: 27883
-  Uncovered lines: 537
-  Coverable lines: 28420
-  Total lines: 42354
-  Branch coverage: 94% (10068 of 10708)
-  Covered branches: 10068
+  Covered lines: 27891
+  Uncovered lines: 538
+  Coverable lines: 28429
+  Total lines: 42370
+  Branch coverage: 93.9% (10065 of 10708)
+  Covered branches: 10065
   Total branches: 10708
-  Method coverage: 99.2% (3101 of 3126)
-  Full method coverage: 94.5% (2955 of 3126)
-  Covered methods: 3101
+  Method coverage: 99.2% (3102 of 3127)
+  Full method coverage: 94.4% (2955 of 3127)
+  Covered methods: 3102
   Fully covered methods: 2955
-  Total methods: 3126
+  Total methods: 3127
 
 AsyncResponse.Abstractions                                                                                           98.2%
   AsyncResponse.AsyncResponseContext                                                                                  100%
@@ -368,7 +368,7 @@ AsyncResponse.Transports.GooglePubSub                                           
   AsyncResponse.Transports.GooglePubSub.QueuedGooglePubSubMessageDispatcher                                           100%
   Microsoft.Extensions.DependencyInjection.GooglePubSubAsyncResponseServiceCollectionExtensions                       100%
 
-AsyncResponse.Transports.Kafka                                                                                       99.8%
+AsyncResponse.Transports.Kafka                                                                                       99.7%
   AsyncResponse.Transports.Kafka.AwaitingKafkaMessageDispatcher                                                       100%
   AsyncResponse.Transports.Kafka.KafkaAsyncResponseTransportOptions                                                   100%
   AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext                                                        100%
@@ -384,7 +384,7 @@ AsyncResponse.Transports.Kafka                                                  
   AsyncResponse.Transports.Kafka.KafkaReplyTargetProvider                                                             100%
   AsyncResponse.Transports.Kafka.KafkaResponseIngressSubscriber                                                       100%
   AsyncResponse.Transports.Kafka.KafkaSubscriberOptions                                                               100%
-  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                               100%
+  AsyncResponse.Transports.Kafka.KafkaSubscriberService                                                              99.1%
   AsyncResponse.Transports.Kafka.KafkaTransportClientDefaults                                                         100%
   AsyncResponse.Transports.Kafka.KafkaTransportHeader                                                                 100%
   AsyncResponse.Transports.Kafka.KafkaTransportOptionsValidator                                                       100%
