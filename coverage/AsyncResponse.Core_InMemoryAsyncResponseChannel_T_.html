@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar10">89%</div>
+<div class="large cardpercentagebar cardpercentagebar9">90%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="246">246</td>
+<td class="limit-width right" title="249">249</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="246 of 274">89.7%</td>
+<td class="limit-width right" title="249 of 274">90.8%</td>
 </tr>
 </table>
 </div>
@@ -116,7 +116,7 @@
 <tr><td title="AsyncResponse.IRawAsyncResponsePublisher.SetRawResponseJson(string, string, System.Threading.CancellationToken)"><a href="#file0_line212" class="navigatetohash">AsyncResponse.IRawAsyncResponsePublisher.SetRawResponseJson(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="SetResponseCore()"><a href="#file0_line219" class="navigatetohash">SetResponseCore()</a></td><td>78.13%</td><td>34</td><td>32</td><td>88.37%</td></tr>
 <tr><td title="SetRawResponseJsonCore()"><a href="#file0_line301" class="navigatetohash">SetRawResponseJsonCore()</a></td><td>75%</td><td>25</td><td>24</td><td>87.18%</td></tr>
-<tr><td title="SetException()"><a href="#file0_line369" class="navigatetohash">SetException()</a></td><td>57.14%</td><td>30</td><td>28</td><td>87.5%</td></tr>
+<tr><td title="SetException()"><a href="#file0_line369" class="navigatetohash">SetException()</a></td><td>71.43%</td><td>30</td><td>28</td><td>87.5%</td></tr>
 <tr><td title="CountActiveSubscribersAsync(string, System.Threading.CancellationToken)"><a href="#file0_line439" class="navigatetohash">CountActiveSubscribersAsync(...)</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="AddSubscription(string, AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase)"><a href="#file0_line448" class="navigatetohash">AddSubscription(...)</a></td><td>100%</td><td>4</td><td>4</td><td>100%</td></tr>
 <tr><td title="SnapshotSubscribers(string)"><a href="#file0_line460" class="navigatetohash">SnapshotSubscribers(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
@@ -548,8 +548,8 @@
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line369"></a><code>369</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ArgumentNullException.ThrowIfNull(exception);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line370"></a><code>370</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line371"></a><code>371</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;using&nbsp;var&nbsp;activity&nbsp;=&nbsp;AsyncResponseDiagnostics.StartActivity(&quot;asyncresponse.set_exception&quot;,&nbsp;ActivityKind.Producer</code></td></tr>
-<tr class="coverableline" title="Partially covered (3 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line372"></a><code>372</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.channel&quot;,&nbsp;&quot;inmemory&quot;);</code></td></tr>
-<tr class="coverableline" title="Partially covered (3 visits, 2 of 4 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line373"></a><code>373</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.exception_type&quot;,&nbsp;exception.GetType().FullName&nbsp;??&nbsp;exception.GetType().Name);</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line372"></a><code>372</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.channel&quot;,&nbsp;&quot;inmemory&quot;);</code></td></tr>
+<tr class="coverableline" title="Partially covered (3 visits, 3 of 4 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line373"></a><code>373</code></td><td class="percentagebar percentagebar70"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.exception_type&quot;,&nbsp;exception.GetType().FullName&nbsp;??&nbsp;exception.GetType().Name);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line374"></a><code>374</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line375"></a><code>375</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseDiagnostics.SetCorrelationId(activity,&nbsp;correlationId);</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line376"></a><code>376</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(string.IsNullOrWhiteSpace(correlationId))</code></td></tr>
@@ -562,7 +562,7 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line383"></a><code>383</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;try</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line384"></a><code>384</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line385"></a><code>385</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;subscribers&nbsp;=&nbsp;SnapshotSubscribers(correlationId);</code></td></tr>
-<tr class="coverableline" title="Partially covered (3 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line386"></a><code>386</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.subscribers&quot;,&nbsp;subscribers.Count);</code></td></tr>
+<tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line386"></a><code>386</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.subscribers&quot;,&nbsp;subscribers.Count);</code></td></tr>
 <tr class="coverableline" title="Covered (3 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line387"></a><code>387</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for&nbsp;(var&nbsp;attempt&nbsp;=&nbsp;0;&nbsp;subscribers.Count&nbsp;==&nbsp;0;&nbsp;attempt++)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line388"></a><code>388</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
 <tr class="coverableline" title="Covered (2 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line389"></a><code>389</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;result&nbsp;=&nbsp;await&nbsp;_lostSubscriberDispatcher</code></td></tr>
@@ -1338,7 +1338,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/10/2026 - 22:28:10<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/11/2026 - 08:00:47<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
