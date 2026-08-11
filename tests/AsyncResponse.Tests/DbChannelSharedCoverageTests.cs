@@ -194,12 +194,12 @@ public sealed class DbChannelSharedCoverageTests
         await using var harness = Harness.Create(Provider.MongoDb, failing: false, pollInterval: TimeSpan.FromSeconds(30));
         var subscription = harness.Subscription("corr-drop").Instance;
         harness.AddSubscription("corr-drop", subscription);
-        Assert.Equal(1, harness.ExecutorRegistrations.Count);
+        Assert.Single(harness.ExecutorRegistrations);
 
         await harness.InvokeAsync("DropLocalSubscriptionsAsync", CancellationToken.None);
 
-        Assert.Equal(0, harness.ExecutorRegistrations.Count);
-        Assert.Equal(0, harness.Subscriptions.Count);
+        Assert.Empty(harness.ExecutorRegistrations);
+        Assert.Empty(harness.Subscriptions);
     }
 
     [Fact]
