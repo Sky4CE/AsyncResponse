@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/11/2026 - 17:05:17 |
+| Generated on: | 08/11/2026 - 20:47:27 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
-| Classes: | 476 |
+| Classes: | 477 |
 | Files: | 211 |
-| **Line coverage:** | 97.9% (27742 of 28318) |
-| Covered lines: | 27742 |
-| Uncovered lines: | 576 |
-| Coverable lines: | 28318 |
-| Total lines: | 42183 |
-| **Branch coverage:** | 94% (10042 of 10682) |
-| Covered branches: | 10042 |
-| Total branches: | 10682 |
+| **Line coverage:** | 98.1% (27883 of 28420) |
+| Covered lines: | 27883 |
+| Uncovered lines: | 537 |
+| Coverable lines: | 28420 |
+| Total lines: | 42354 |
+| **Branch coverage:** | 94% (10068 of 10708) |
+| Covered branches: | 10068 |
+| Total branches: | 10708 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -36,6 +36,7 @@
 |AsyncResponse.AsyncResponseRequestContext|100%||
 |AsyncResponse.CallbackParam|100%||
 |AsyncResponse.DurableFlowFailedException|100%||
+|AsyncResponse.DurableFlowIdConflictException|100%||
 |AsyncResponse.FlowState|100%||
 |AsyncResponse.FlowStateSchema|100%||
 |AsyncResponse.IAsyncResponsePayload|100%||
@@ -89,16 +90,16 @@
 |Microsoft.Extensions.DependencyInjection.NatsAsyncResponseChannelServiceCol<br/>lectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.PostgreSQL - 99.1%</summary>
+<details><summary>AsyncResponse.Channels.PostgreSQL - 99.2%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.PostgreSQL**|**99.1%**|**95.8%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.2%|98.8%|
+|**AsyncResponse.Channels.PostgreSQL**|**99.2%**|**95.8%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.4%|98.8%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation|100%||
-|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.2%|98.8%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.4%|98.8%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter<T>|100%||
@@ -143,11 +144,11 @@
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServi<br/>ceCollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Core - 96.6%</summary>
+<details><summary>AsyncResponse.Core - 97%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Core**|**96.6%**|**91.8%**|
+|**AsyncResponse.Core**|**97%**|**91.9%**|
 |AsyncResponse.AsyncResponseBuilder|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
@@ -190,13 +191,13 @@
 |AsyncResponse.CallbackExpressionConverter.ParameterGuard|100%|100%|
 |AsyncResponse.CallbackExpressionConverter<TService>|100%|93.1%|
 |AsyncResponse.ChannelSerialExecutor|100%|100%|
-|AsyncResponse.CronSchedule|97.1%|96.5%|
+|AsyncResponse.CronSchedule|97.2%|95.6%|
 |AsyncResponse.DurableAsyncResponseChannelOptions|100%||
-|AsyncResponse.DurableFlowContext|92.9%|84.6%|
-|AsyncResponse.DurableFlowContext<TFlow, TInput>|92.9%|84.6%|
-|AsyncResponse.DurableFlowContext<TResponse>|92.9%|84.6%|
-|AsyncResponse.DurableFlowContext<TResult>|92.9%|84.6%|
-|AsyncResponse.DurableFlowExecutor|98.7%|95.4%|
+|AsyncResponse.DurableFlowContext|93.8%|85.8%|
+|AsyncResponse.DurableFlowContext<TFlow, TInput>|93.8%|85.8%|
+|AsyncResponse.DurableFlowContext<TResponse>|93.8%|85.8%|
+|AsyncResponse.DurableFlowContext<TResult>|93.8%|85.8%|
+|AsyncResponse.DurableFlowExecutor|98.7%|95.6%|
 |AsyncResponse.DurableFlowObserverLifetimeAudit|100%|37.5%|
 |AsyncResponse.DurableFlowOptions|100%||
 |AsyncResponse.DurableFlowService|100%|100%|
@@ -205,7 +206,7 @@
 |AsyncResponse.FlowExecutionLease|96.8%|87.5%|
 |AsyncResponse.FlowStateConcurrency|100%|100%|
 |AsyncResponse.FlowStateJson|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel|96.8%|90.8%|
+|AsyncResponse.InMemoryAsyncResponseChannel|96.8%|89.7%|
 |AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer<TDeclared<br/>>|100%||
 |AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer<TDeclared<br/>>|100%||
 |AsyncResponse.InMemoryAsyncResponseChannel.Subscription<T>|100%|100%|
@@ -214,7 +215,7 @@
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase<TState>|99%|95.4%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot|100%|100%|
-|AsyncResponse.InMemoryAsyncResponseChannel<T>|96.8%|90.8%|
+|AsyncResponse.InMemoryAsyncResponseChannel<T>|96.8%|89.7%|
 |AsyncResponse.InMemoryAsyncResponseOptions|100%||
 |AsyncResponse.InMemoryAsyncResponseWaiter<T>|100%||
 |AsyncResponse.InMemoryFlowStateStore|97.1%|88.6%|
@@ -223,7 +224,7 @@
 |AsyncResponse.InMemoryRecoveryStateStore.Entry|100%||
 |AsyncResponse.InMemoryRecoveryStateStore.EntryBucket|94%|94.1%|
 |AsyncResponse.InMemoryWorkerHost|88.8%|94.4%|
-|AsyncResponse.InMemoryWorkerTransport|83.1%|71%|
+|AsyncResponse.InMemoryWorkerTransport|86.7%|71%|
 |AsyncResponse.InMemoryWorkerTransport.DelayedJob|100%||
 |AsyncResponse.InMemoryWorkerTransportOptions|100%|100%|
 |AsyncResponse.JsonSafety|100%|100%|
@@ -241,7 +242,7 @@
 |AsyncResponse.ReflectionExtensions<T>|100%|100%|
 |AsyncResponse.RemoteStackTrace|100%|100%|
 |AsyncResponse.ScheduledFlowOptions|100%||
-|AsyncResponse.ScheduledFlowService|63.9%|62.5%|
+|AsyncResponse.ScheduledFlowService|74.4%|59.3%|
 |AsyncResponse.SerialExecutorRegistry|100%|100%|
 |AsyncResponse.SerialExecutorRegistry.ExecutorEntry|100%||
 |AsyncResponse.ShutdownBudgetValidator|100%|100%|
@@ -390,18 +391,18 @@
 |Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollect<br/>ionExtensions|100%||
 
 </details>
-<details><summary>AsyncResponse.Testing - 87.1%</summary>
+<details><summary>AsyncResponse.Testing - 89.1%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Testing**|**87.1%**|**80%**|
+|**AsyncResponse.Testing**|**89.1%**|**80%**|
 |AsyncResponse.Testing.AsyncResponseTestHarness|90.4%|78.7%|
 |AsyncResponse.Testing.AsyncResponseTestHarness.QuiesceProbe|90.9%|75%|
 |AsyncResponse.Testing.AsyncResponseTestHarnessOptions|100%||
-|AsyncResponse.Testing.FlowProbe|88.2%|88.3%|
+|AsyncResponse.Testing.FlowProbe|94.4%|88.3%|
 |AsyncResponse.Testing.FlowProbe.RunWaiter|100%||
 |AsyncResponse.Testing.FlowProbe.Waiter|100%||
-|AsyncResponse.Testing.FlowProbe<T>|88.2%|88.3%|
+|AsyncResponse.Testing.FlowProbe<T>|94.4%|88.3%|
 |AsyncResponse.Testing.FlowRunHandle|73.5%|45.4%|
 |AsyncResponse.Testing.FlowRunHandle<T>|73.5%|45.4%|
 |AsyncResponse.Testing.FlowTestHarness|100%|50%|

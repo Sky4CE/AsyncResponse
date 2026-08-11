@@ -299,7 +299,8 @@ var assemblies = [
       { "name": "AsyncResponse.AsyncResponseReplyTarget", "rp": "AsyncResponse.Abstractions_AsyncResponseReplyTarget.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 48, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.AsyncResponseRequestContext", "rp": "AsyncResponse.Abstractions_AsyncResponseRequestContext.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 48, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.CallbackParam", "rp": "AsyncResponse.Abstractions_CallbackParam.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 81, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowFailedException", "rp": "AsyncResponse.Abstractions_DurableFlowFailedException.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 52, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowFailedException", "rp": "AsyncResponse.Abstractions_DurableFlowFailedException.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 70, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowIdConflictException", "rp": "AsyncResponse.Abstractions_DurableFlowIdConflictException.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 70, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.FlowState", "rp": "AsyncResponse.Abstractions_FlowState.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 167, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.FlowStateSchema", "rp": "AsyncResponse.Abstractions_FlowStateSchema.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 167, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.IAsyncResponsePayload", "rp": "AsyncResponse.Abstractions_IAsyncResponsePayload.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 51, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -314,8 +315,8 @@ var assemblies = [
     "name": "AsyncResponse.Channels.MongoDB",
     "classes": [
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "rp": "AsyncResponse.Channels.MongoDB_DbAsyncResponseChannelBase.html", "cl": 672, "ucl": 5, "cal": 677, "tl": 1548, "cb": 257, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription\u003CT\u003E", "rp": "AsyncResponse.Channels.MongoDB_DbSubscription_T_.html", "cl": 96, "ucl": 0, "cal": 96, "tl": 1548, "cb": 32, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription\u003CT\u003E", "rp": "AsyncResponse.Channels.MongoDB_DbSubscription_T_.html", "cl": 44, "ucl": 0, "cal": 44, "tl": 1548, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription\u003CT\u003E", "rp": "AsyncResponse.Channels.MongoDB_DbSubscription_T_.html", "cl": 96, "ucl": 0, "cal": 96, "tl": 1548, "cb": 32, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation", "rp": "AsyncResponse.Channels.MongoDB_PendingConfirmation.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 1548, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase\u003CT\u003E", "rp": "AsyncResponse.Channels.MongoDB_DbAsyncResponseChannelBase_T_.html", "cl": 672, "ucl": 5, "cal": 677, "tl": 1548, "cb": 257, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.MongoDB.MongoChannelMessageDocument", "rp": "AsyncResponse.Channels.MongoDB_MongoChannelMessageDocument.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 736, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -349,11 +350,11 @@ var assemblies = [
   {
     "name": "AsyncResponse.Channels.PostgreSQL",
     "classes": [
-      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase.html", "cl": 672, "ucl": 5, "cal": 677, "tl": 1548, "cb": 259, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase.html", "cl": 673, "ucl": 4, "cal": 677, "tl": 1548, "cb": 259, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription\u003CT\u003E", "rp": "AsyncResponse.Channels.PostgreSQL_DbSubscription_T_.html", "cl": 44, "ucl": 0, "cal": 44, "tl": 1548, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription\u003CT\u003E", "rp": "AsyncResponse.Channels.PostgreSQL_DbSubscription_T_.html", "cl": 96, "ucl": 0, "cal": 96, "tl": 1548, "cb": 32, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation", "rp": "AsyncResponse.Channels.PostgreSQL_PendingConfirmation.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 1548, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase\u003CT\u003E", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase_T_.html", "cl": 672, "ucl": 5, "cal": 677, "tl": 1548, "cb": 259, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Channels.DbAsyncResponseChannelBase\u003CT\u003E", "rp": "AsyncResponse.Channels.PostgreSQL_DbAsyncResponseChannelBase_T_.html", "cl": 673, "ucl": 4, "cal": 677, "tl": 1548, "cb": 259, "tb": 262, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannel", "rp": "AsyncResponse.Channels.PostgreSQL_PostgreSqlAsyncResponseChannel.html", "cl": 34, "ucl": 0, "cal": 34, "tl": 83, "cb": 4, "tb": 4, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions", "rp": "AsyncResponse.Channels.PostgreSQL_PostgreSqlAsyncResponseChannelOptions.html", "cl": 48, "ucl": 0, "cal": 48, "tl": 152, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseWaiter\u003CT\u003E", "rp": "AsyncResponse.Channels.PostgreSQL_PostgreSqlAsyncResponseWaiter_T_.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 13, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -436,22 +437,22 @@ var assemblies = [
       { "name": "AsyncResponse.CallbackExpressionConverter.ParameterGuard", "rp": "AsyncResponse.Core_ParameterGuard.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 135, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.CallbackExpressionConverter\u003CTService\u003E", "rp": "AsyncResponse.Core_CallbackExpressionConverter_TService_.html", "cl": 53, "ucl": 0, "cal": 53, "tl": 135, "cb": 41, "tb": 44, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ChannelSerialExecutor", "rp": "AsyncResponse.Core_ChannelSerialExecutor.html", "cl": 63, "ucl": 0, "cal": 63, "tl": 164, "cb": 22, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.CronSchedule", "rp": "AsyncResponse.Core_CronSchedule.html", "cl": 138, "ucl": 4, "cal": 142, "tl": 324, "cb": 85, "tb": 88, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.CronSchedule", "rp": "AsyncResponse.Core_CronSchedule.html", "cl": 142, "ucl": 4, "cal": 146, "tl": 344, "cb": 88, "tb": 92, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableAsyncResponseChannelOptions", "rp": "AsyncResponse.Core_DurableAsyncResponseChannelOptions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 166, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowContext", "rp": "AsyncResponse.Core_DurableFlowContext.html", "cl": 355, "ucl": 27, "cal": 382, "tl": 834, "cb": 154, "tb": 182, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "cl": 355, "ucl": 27, "cal": 382, "tl": 834, "cb": 154, "tb": 182, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "cl": 355, "ucl": 27, "cal": 382, "tl": 834, "cb": 154, "tb": 182, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "cl": 355, "ucl": 27, "cal": 382, "tl": 834, "cb": 154, "tb": 182, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowExecutor", "rp": "AsyncResponse.Core_DurableFlowExecutor.html", "cl": 305, "ucl": 4, "cal": 309, "tl": 614, "cb": 105, "tb": 110, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowContext", "rp": "AsyncResponse.Core_DurableFlowContext.html", "cl": 368, "ucl": 24, "cal": 392, "tl": 867, "cb": 158, "tb": 184, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "cl": 368, "ucl": 24, "cal": 392, "tl": 867, "cb": 158, "tb": 184, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "cl": 368, "ucl": 24, "cal": 392, "tl": 867, "cb": 158, "tb": 184, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "rp": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "cl": 368, "ucl": 24, "cal": 392, "tl": 867, "cb": 158, "tb": 184, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowExecutor", "rp": "AsyncResponse.Core_DurableFlowExecutor.html", "cl": 315, "ucl": 4, "cal": 319, "tl": 636, "cb": 109, "tb": 114, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableFlowObserverLifetimeAudit", "rp": "AsyncResponse.Core_DurableFlowObserverLifetimeAudit.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 223, "cb": 6, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.DurableFlowOptions", "rp": "AsyncResponse.Core_DurableFlowOptions.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 65, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.DurableFlowOptions", "rp": "AsyncResponse.Core_DurableFlowOptions.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 76, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableFlowService", "rp": "AsyncResponse.Core_DurableFlowService.html", "cl": 79, "ucl": 0, "cal": 79, "tl": 142, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableFlowService\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Core_DurableFlowService_TFlow__TInput_.html", "cl": 79, "ucl": 0, "cal": 79, "tl": 142, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.DurableFlowSuspendedException", "rp": "AsyncResponse.Core_DurableFlowSuspendedException.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 3, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.FlowExecutionLease", "rp": "AsyncResponse.Core_FlowExecutionLease.html", "cl": 92, "ucl": 3, "cal": 95, "tl": 290, "cb": 14, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.FlowStateConcurrency", "rp": "AsyncResponse.Core_FlowStateConcurrency.html", "cl": 45, "ucl": 0, "cal": 45, "tl": 290, "cb": 16, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.FlowExecutionLease", "rp": "AsyncResponse.Core_FlowExecutionLease.html", "cl": 92, "ucl": 3, "cal": 95, "tl": 308, "cb": 14, "tb": 16, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.FlowStateConcurrency", "rp": "AsyncResponse.Core_FlowStateConcurrency.html", "cl": 53, "ucl": 0, "cal": 53, "tl": 308, "cb": 20, "tb": 20, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.FlowStateJson", "rp": "AsyncResponse.Core_FlowStateJson.html", "cl": 21, "ucl": 0, "cal": 21, "tl": 65, "cb": 8, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.InMemoryAsyncResponseChannel", "rp": "AsyncResponse.Core_InMemoryAsyncResponseChannel.html", "cl": 484, "ucl": 16, "cal": 500, "tl": 1158, "cb": 249, "tb": 274, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.InMemoryAsyncResponseChannel", "rp": "AsyncResponse.Core_InMemoryAsyncResponseChannel.html", "cl": 484, "ucl": 16, "cal": 500, "tl": 1158, "cb": 246, "tb": 274, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer\u003CTDeclared\u003E", "rp": "AsyncResponse.Core_DeclaredWireSerializer_TDeclared_.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 1158, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer\u003CTDeclared\u003E", "rp": "AsyncResponse.Core_DeclaredWireSerializer_TDeclared_.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 1158, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.Subscription\u003CT\u003E", "rp": "AsyncResponse.Core_Subscription_T_.html", "cl": 17, "ucl": 0, "cal": 17, "tl": 1158, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -460,7 +461,7 @@ var assemblies = [
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionBase\u003CTState\u003E", "rp": "AsyncResponse.Core_SubscriptionBase_TState_.html", "cl": 104, "ucl": 1, "cal": 105, "tl": 1158, "cb": 42, "tb": 44, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionGroup", "rp": "AsyncResponse.Core_SubscriptionGroup.html", "cl": 40, "ucl": 0, "cal": 40, "tl": 1158, "cb": 30, "tb": 30, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseChannel.SubscriptionSnapshot", "rp": "AsyncResponse.Core_SubscriptionSnapshot.html", "cl": 6, "ucl": 0, "cal": 6, "tl": 1158, "cb": 4, "tb": 4, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.InMemoryAsyncResponseChannel\u003CT\u003E", "rp": "AsyncResponse.Core_InMemoryAsyncResponseChannel_T_.html", "cl": 484, "ucl": 16, "cal": 500, "tl": 1158, "cb": 249, "tb": 274, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.InMemoryAsyncResponseChannel\u003CT\u003E", "rp": "AsyncResponse.Core_InMemoryAsyncResponseChannel_T_.html", "cl": 484, "ucl": 16, "cal": 500, "tl": 1158, "cb": 246, "tb": 274, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseOptions", "rp": "AsyncResponse.Core_InMemoryAsyncResponseOptions.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 17, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryAsyncResponseWaiter\u003CT\u003E", "rp": "AsyncResponse.Core_InMemoryAsyncResponseWaiter_T_.html", "cl": 5, "ucl": 0, "cal": 5, "tl": 1158, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryFlowStateStore", "rp": "AsyncResponse.Core_InMemoryFlowStateStore.html", "cl": 104, "ucl": 3, "cal": 107, "tl": 240, "cb": 78, "tb": 88, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -469,7 +470,7 @@ var assemblies = [
       { "name": "AsyncResponse.InMemoryRecoveryStateStore.Entry", "rp": "AsyncResponse.Core_Entry.2.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 339, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryRecoveryStateStore.EntryBucket", "rp": "AsyncResponse.Core_EntryBucket.html", "cl": 79, "ucl": 5, "cal": 84, "tl": 339, "cb": 64, "tb": 68, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryWorkerHost", "rp": "AsyncResponse.Core_InMemoryWorkerHost.html", "cl": 48, "ucl": 6, "cal": 54, "tl": 440, "cb": 17, "tb": 18, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.InMemoryWorkerTransport", "rp": "AsyncResponse.Core_InMemoryWorkerTransport.html", "cl": 94, "ucl": 19, "cal": 113, "tl": 440, "cb": 27, "tb": 38, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.InMemoryWorkerTransport", "rp": "AsyncResponse.Core_InMemoryWorkerTransport.html", "cl": 98, "ucl": 15, "cal": 113, "tl": 440, "cb": 27, "tb": 38, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryWorkerTransport.DelayedJob", "rp": "AsyncResponse.Core_DelayedJob.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 440, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.InMemoryWorkerTransportOptions", "rp": "AsyncResponse.Core_InMemoryWorkerTransportOptions.html", "cl": 19, "ucl": 0, "cal": 19, "tl": 440, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.JsonSafety", "rp": "AsyncResponse.Core_JsonSafety.html", "cl": 23, "ucl": 0, "cal": 23, "tl": 97, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -486,8 +487,8 @@ var assemblies = [
       { "name": "AsyncResponse.ReflectionExtensions.InvocationPlan", "rp": "AsyncResponse.Core_InvocationPlan.html", "cl": 15, "ucl": 0, "cal": 15, "tl": 405, "cb": 10, "tb": 10, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ReflectionExtensions\u003CT\u003E", "rp": "AsyncResponse.Core_ReflectionExtensions_T_.html", "cl": 150, "ucl": 0, "cal": 150, "tl": 405, "cb": 92, "tb": 92, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.RemoteStackTrace", "rp": "AsyncResponse.Core_RemoteStackTrace.html", "cl": 4, "ucl": 0, "cal": 4, "tl": 32, "cb": 8, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.ScheduledFlowOptions", "rp": "AsyncResponse.Core_ScheduledFlowOptions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 212, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.ScheduledFlowService", "rp": "AsyncResponse.Core_ScheduledFlowService.html", "cl": 55, "ucl": 31, "cal": 86, "tl": 212, "cb": 20, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.ScheduledFlowOptions", "rp": "AsyncResponse.Core_ScheduledFlowOptions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 215, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.ScheduledFlowService", "rp": "AsyncResponse.Core_ScheduledFlowService.html", "cl": 64, "ucl": 22, "cal": 86, "tl": 215, "cb": 19, "tb": 32, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.SerialExecutorRegistry", "rp": "AsyncResponse.Core_SerialExecutorRegistry.html", "cl": 113, "ucl": 0, "cal": 113, "tl": 272, "cb": 52, "tb": 52, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.SerialExecutorRegistry.ExecutorEntry", "rp": "AsyncResponse.Core_ExecutorEntry.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 272, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.ShutdownBudgetValidator", "rp": "AsyncResponse.Core_ShutdownBudgetValidator.html", "cl": 19, "ucl": 0, "cal": 19, "tl": 59, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -496,9 +497,9 @@ var assemblies = [
       { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList", "rp": "AsyncResponse.Core_AsyncResponseCallbackAllowList.html", "cl": 25, "ucl": 0, "cal": 25, "tl": 120, "cb": 12, "tb": 12, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAllowList.AllowListAuthorizer", "rp": "AsyncResponse.Core_AllowListAuthorizer.html", "cl": 8, "ucl": 0, "cal": 8, "tl": 120, "cb": 6, "tb": 6, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCallbackAuthorizationExtensions", "rp": "AsyncResponse.Core_AsyncResponseCallbackAuthorizationExtensions.html", "cl": 10, "ucl": 0, "cal": 10, "tl": 120, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions.html", "cl": 126, "ucl": 0, "cal": 126, "tl": 348, "cb": 55, "tb": 56, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlow__TInput_.html", "cl": 126, "ucl": 0, "cal": 126, "tl": 348, "cb": 55, "tb": 56, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlowStateStore, TOptions\u003E", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlowStateStore__TOptions_.html", "cl": 126, "ucl": 0, "cal": 126, "tl": 348, "cb": 55, "tb": 56, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions.html", "cl": 134, "ucl": 0, "cal": 134, "tl": 363, "cb": 57, "tb": 58, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlow__TInput_.html", "cl": 134, "ucl": 0, "cal": 134, "tl": 363, "cb": 57, "tb": 58, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlowStateStore, TOptions\u003E", "rp": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlowStateStore__TOptions_.html", "cl": 134, "ucl": 0, "cal": 134, "tl": 363, "cb": 57, "tb": 58, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseHealthCheckExtensions", "rp": "AsyncResponse.Core_AsyncResponseHealthCheckExtensions.html", "cl": 9, "ucl": 0, "cal": 9, "tl": 37, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder", "rp": "AsyncResponse.Core_AsyncResponseRegistrationBuilder.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 24, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "Microsoft.Extensions.Logging.AsyncResponseLoggerExtensions", "rp": "AsyncResponse.Core_AsyncResponseLoggerExtensions.html", "cl": 113, "ucl": 0, "cal": 113, "tl": 367, "cb": 28, "tb": 28, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -614,14 +615,14 @@ var assemblies = [
       { "name": "AsyncResponse.Testing.AsyncResponseTestHarness", "rp": "AsyncResponse.Testing_AsyncResponseTestHarness.html", "cl": 133, "ucl": 14, "cal": 147, "tl": 424, "cb": 52, "tb": 66, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.AsyncResponseTestHarness.QuiesceProbe", "rp": "AsyncResponse.Testing_QuiesceProbe.html", "cl": 20, "ucl": 2, "cal": 22, "tl": 424, "cb": 6, "tb": 8, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.AsyncResponseTestHarnessOptions", "rp": "AsyncResponse.Testing_AsyncResponseTestHarnessOptions.html", "cl": 2, "ucl": 0, "cal": 2, "tl": 424, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowProbe", "rp": "AsyncResponse.Testing_FlowProbe.html", "cl": 90, "ucl": 12, "cal": 102, "tl": 435, "cb": 53, "tb": 60, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowProbe.RunWaiter", "rp": "AsyncResponse.Testing_RunWaiter.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 435, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowProbe.Waiter", "rp": "AsyncResponse.Testing_Waiter.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 435, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowProbe\u003CT\u003E", "rp": "AsyncResponse.Testing_FlowProbe_T_.html", "cl": 90, "ucl": 12, "cal": 102, "tl": 435, "cb": 53, "tb": 60, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowRunHandle", "rp": "AsyncResponse.Testing_FlowRunHandle.html", "cl": 39, "ucl": 14, "cal": 53, "tl": 435, "cb": 10, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowRunHandle\u003CT\u003E", "rp": "AsyncResponse.Testing_FlowRunHandle_T_.html", "cl": 39, "ucl": 14, "cal": 53, "tl": 435, "cb": 10, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowTestHarness", "rp": "AsyncResponse.Testing_FlowTestHarness.html", "cl": 22, "ucl": 0, "cal": 22, "tl": 435, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
-      { "name": "AsyncResponse.Testing.FlowTestHarness\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Testing_FlowTestHarness_TFlow__TInput_.html", "cl": 22, "ucl": 0, "cal": 22, "tl": 435, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowProbe", "rp": "AsyncResponse.Testing_FlowProbe.html", "cl": 103, "ucl": 6, "cal": 109, "tl": 466, "cb": 53, "tb": 60, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowProbe.RunWaiter", "rp": "AsyncResponse.Testing_RunWaiter.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 466, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowProbe.Waiter", "rp": "AsyncResponse.Testing_Waiter.html", "cl": 1, "ucl": 0, "cal": 1, "tl": 466, "cb": 0, "tb": 0, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowProbe\u003CT\u003E", "rp": "AsyncResponse.Testing_FlowProbe_T_.html", "cl": 103, "ucl": 6, "cal": 109, "tl": 466, "cb": 53, "tb": 60, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowRunHandle", "rp": "AsyncResponse.Testing_FlowRunHandle.html", "cl": 39, "ucl": 14, "cal": 53, "tl": 466, "cb": 10, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowRunHandle\u003CT\u003E", "rp": "AsyncResponse.Testing_FlowRunHandle_T_.html", "cl": 39, "ucl": 14, "cal": 53, "tl": 466, "cb": 10, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowTestHarness", "rp": "AsyncResponse.Testing_FlowTestHarness.html", "cl": 22, "ucl": 0, "cal": 22, "tl": 466, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
+      { "name": "AsyncResponse.Testing.FlowTestHarness\u003CTFlow, TInput\u003E", "rp": "AsyncResponse.Testing_FlowTestHarness_TFlow__TInput_.html", "cl": 22, "ucl": 0, "cal": 22, "tl": 466, "cb": 1, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.SimulatedCrashException", "rp": "AsyncResponse.Testing_SimulatedCrashException.html", "cl": 3, "ucl": 0, "cal": 3, "tl": 18, "cb": 2, "tb": 2, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.VirtualTimeProvider", "rp": "AsyncResponse.Testing_VirtualTimeProvider.html", "cl": 83, "ucl": 16, "cal": 99, "tl": 234, "cb": 37, "tb": 40, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
       { "name": "AsyncResponse.Testing.VirtualTimeProvider.VirtualTimer", "rp": "AsyncResponse.Testing_VirtualTimer.html", "cl": 38, "ucl": 3, "cal": 41, "tl": 234, "cb": 19, "tb": 22, "cm": 0, "fcm": 0, "tm": 0, "lch": [], "bch": [], "mch": [], "mfch": [], "hc": [], "metrics": { } },
@@ -986,49 +987,25 @@ var riskHotspots = [
       { "value": 36, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 161,
-    "metrics": [
-      { "value": 37, "exceeded": true },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 161,
-    "metrics": [
-      { "value": 37, "exceeded": true },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 161,
-    "metrics": [
-      { "value": 37, "exceeded": true },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 161,
-    "metrics": [
-      { "value": 37, "exceeded": true },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 460,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 493,
     "metrics": [
       { "value": 36, "exceeded": true },
       { "value": 36, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 460,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 493,
     "metrics": [
       { "value": 36, "exceeded": true },
       { "value": 36, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 460,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 493,
     "metrics": [
       { "value": 36, "exceeded": true },
       { "value": 36, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 460,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "AwaitStepCoreAsync()", "methodShortName": "AwaitStepCoreAsync()", "fileIndex": 0, "line": 493,
     "metrics": [
       { "value": 36, "exceeded": true },
       { "value": 36, "exceeded": true },
@@ -1082,13 +1059,37 @@ var riskHotspots = [
       { "value": 22, "exceeded": true },
     ]},
   {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 379,
+    "metrics": [
+      { "value": 31, "exceeded": true },
+      { "value": 30, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 379,
+    "metrics": [
+      { "value": 31, "exceeded": true },
+      { "value": 30, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 379,
+    "metrics": [
+      { "value": 31, "exceeded": true },
+      { "value": 30, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 379,
+    "metrics": [
+      { "value": 31, "exceeded": true },
+      { "value": 30, "exceeded": true },
+    ]},
+  {
     "assembly": "AsyncResponse.Core", "class": "AsyncResponse.AsyncResponseEnvelopeConverter\u003CT\u003E", "reportPath": "AsyncResponse.Core_AsyncResponseEnvelopeConverter_T_.html", "methodName": "Read(ref System.Text.Json.Utf8JsonReader, System.Type, System.Text.Json.JsonSerializerOptions)", "methodShortName": "Read(...)", "fileIndex": 0, "line": 101,
     "metrics": [
       { "value": 30, "exceeded": false },
       { "value": 30, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "ParseField(string, string, int, int, string[], bool)", "methodShortName": "ParseField(...)", "fileIndex": 0, "line": 217,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "ParseField(string, string, int, int, string[], bool)", "methodShortName": "ParseField(...)", "fileIndex": 0, "line": 233,
     "metrics": [
       { "value": 30, "exceeded": false },
       { "value": 30, "exceeded": true },
@@ -1115,30 +1116,6 @@ var riskHotspots = [
     "assembly": "AsyncResponse.Channels.NATS", "class": "AsyncResponse.Channels.NATS.NatsAsyncResponseChannel\u003CT\u003E", "reportPath": "AsyncResponse.Channels.NATS_NatsAsyncResponseChannel_T_.html", "methodName": "ProcessResponseAsync()", "methodShortName": "ProcessResponseAsync()", "fileIndex": 0, "line": 368,
     "metrics": [
       { "value": 28, "exceeded": false },
-      { "value": 28, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 355,
-    "metrics": [
-      { "value": 29, "exceeded": false },
-      { "value": 28, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 355,
-    "metrics": [
-      { "value": 29, "exceeded": false },
-      { "value": 28, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 355,
-    "metrics": [
-      { "value": 29, "exceeded": false },
-      { "value": 28, "exceeded": true },
-    ]},
-  {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "AwaitChildFlowAsync()", "methodShortName": "AwaitChildFlowAsync()", "fileIndex": 0, "line": 355,
-    "metrics": [
-      { "value": 29, "exceeded": false },
       { "value": 28, "exceeded": true },
     ]},
   {
@@ -1203,6 +1180,12 @@ var riskHotspots = [
     ]},
   {
     "assembly": "AsyncResponse.Channels.Redis", "class": "AsyncResponse.Channels.Redis.RedisAsyncResponseChannel\u003CT\u003E", "reportPath": "AsyncResponse.Channels.Redis_RedisAsyncResponseChannel_T_.html", "methodName": "ProcessRedisMessageAsync()", "methodShortName": "ProcessRedisMessageAsync()", "fileIndex": 0, "line": 327,
+    "metrics": [
+      { "value": 26, "exceeded": false },
+      { "value": 26, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "GetNextOccurrence(System.DateTimeOffset)", "methodShortName": "GetNextOccurrence(...)", "fileIndex": 0, "line": 113,
     "metrics": [
       { "value": 26, "exceeded": false },
       { "value": 26, "exceeded": true },
@@ -1400,12 +1383,6 @@ var riskHotspots = [
       { "value": 22, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "GetNextOccurrence(System.DateTimeOffset)", "methodShortName": "GetNextOccurrence(...)", "fileIndex": 0, "line": 114,
-    "metrics": [
-      { "value": 22, "exceeded": false },
-      { "value": 22, "exceeded": true },
-    ]},
-  {
     "assembly": "AsyncResponse.Core", "class": "AsyncResponse.InMemoryFlowStateStore", "reportPath": "AsyncResponse.Core_InMemoryFlowStateStore.html", "methodName": "TryChangeLeaseAsync(string, string, System.TimeSpan, bool, System.Threading.CancellationToken)", "methodShortName": "TryChangeLeaseAsync(...)", "fileIndex": 0, "line": 187,
     "metrics": [
       { "value": 22, "exceeded": false },
@@ -1520,6 +1497,30 @@ var riskHotspots = [
       { "value": 20, "exceeded": true },
     ]},
   {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext", "reportPath": "AsyncResponse.Core_DurableFlowContext.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 167,
+    "metrics": [
+      { "value": 26, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TFlow__TInput_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 167,
+    "metrics": [
+      { "value": 26, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResponse\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResponse_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 167,
+    "metrics": [
+      { "value": 26, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.DurableFlowContext\u003CTResult\u003E", "reportPath": "AsyncResponse.Core_DurableFlowContext_TResult_.html", "methodName": "DelayCoreAsync()", "methodShortName": "DelayCoreAsync()", "fileIndex": 0, "line": 167,
+    "metrics": [
+      { "value": 26, "exceeded": false },
+      { "value": 20, "exceeded": true },
+    ]},
+  {
     "assembly": "AsyncResponse.Core", "class": "AsyncResponse.InMemoryFlowStateStore", "reportPath": "AsyncResponse.Core_InMemoryFlowStateStore.html", "methodName": "TryUpdateAsync(string, AsyncResponse.FlowState, long, System.TimeSpan, string, System.Threading.CancellationToken)", "methodShortName": "TryUpdateAsync(...)", "fileIndex": 0, "line": 84,
     "metrics": [
       { "value": 20, "exceeded": false },
@@ -1538,19 +1539,19 @@ var riskHotspots = [
       { "value": 20, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 291,
+    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 306,
     "metrics": [
       { "value": 20, "exceeded": false },
       { "value": 20, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlow__TInput_.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 291,
+    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlow, TInput\u003E", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlow__TInput_.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 306,
     "metrics": [
       { "value": 20, "exceeded": false },
       { "value": 20, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlowStateStore, TOptions\u003E", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlowStateStore__TOptions_.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 291,
+    "assembly": "AsyncResponse.Core", "class": "Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExtensions\u003CTFlowStateStore, TOptions\u003E", "reportPath": "AsyncResponse.Core_AsyncResponseCoreServiceCollectionExtensions_TFlowStateStore__TOptions_.html", "methodName": "WithInMemoryChannel(Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder, System.Action\u003CAsyncResponse.InMemoryAsyncResponseOptions\u003E)", "methodShortName": "WithInMemoryChannel(...)", "fileIndex": 0, "line": 306,
     "metrics": [
       { "value": 20, "exceeded": false },
       { "value": 20, "exceeded": true },
@@ -1856,7 +1857,7 @@ var riskHotspots = [
       { "value": 16, "exceeded": true },
     ]},
   {
-    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "ParseValue(string, string, string, int, int, string[])", "methodShortName": "ParseValue(...)", "fileIndex": 0, "line": 274,
+    "assembly": "AsyncResponse.Core", "class": "AsyncResponse.CronSchedule", "reportPath": "AsyncResponse.Core_CronSchedule.html", "methodName": "ParseValue(string, string, string, int, int, string[])", "methodShortName": "ParseValue(...)", "fileIndex": 0, "line": 290,
     "metrics": [
       { "value": 16, "exceeded": false },
       { "value": 16, "exceeded": true },
