@@ -3,19 +3,19 @@
 
 |||
 |:---|:---|
-| Generated on: | 08/11/2026 - 23:20:42 |
+| Generated on: | 08/12/2026 - 14:04:20 |
 | Parser: | MultiReport (16x Cobertura) |
 | Assemblies: | 27 |
 | Classes: | 482 |
 | Files: | 213 |
-| **Line coverage:** | 97.8% (28456 of 29083) |
-| Covered lines: | 28456 |
-| Uncovered lines: | 627 |
-| Coverable lines: | 29083 |
-| Total lines: | 43147 |
-| **Branch coverage:** | 93.4% (10411 of 11136) |
-| Covered branches: | 10411 |
-| Total branches: | 11136 |
+| **Line coverage:** | 97.7% (28692 of 29340) |
+| Covered lines: | 28692 |
+| Uncovered lines: | 648 |
+| Coverable lines: | 29340 |
+| Total lines: | 43482 |
+| **Branch coverage:** | 93.3% (10503 of 11248) |
+| Covered branches: | 10503 |
+| Total branches: | 11248 |
 | **Method coverage:** | [Feature is only available for sponsors](https://reportgenerator.io/pro) |
 
 </details>
@@ -125,23 +125,23 @@
 |Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectio<br/>nExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Channels.SqlServer - 99.7%</summary>
+<details><summary>AsyncResponse.Channels.SqlServer - 99.4%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Channels.SqlServer**|**99.7%**|**98%**|
-|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.7%|98.8%|
+|**AsyncResponse.Channels.SqlServer**|**99.4%**|**96.5%**|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase|99.1%|97.3%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.DbSubscription<T>|100%|100%|
 |AsyncResponse.Channels.DbAsyncResponseChannelBase.PendingConfirmation|100%||
-|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.7%|98.8%|
+|AsyncResponse.Channels.DbAsyncResponseChannelBase<T>|99.1%|97.3%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannel|100%|100%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseWaiter<T>|100%||
 |AsyncResponse.Channels.SqlServer.SqlServerChannelSql|99.8%|98.2%|
 |AsyncResponse.Channels.SqlServer.SqlServerRecoveryStateStore|100%|100%|
 |AsyncResponse.Channels.SqlServer.SqlServerTransientFaults|100%|100%|
-|AsyncResponse.Internal.SqlServerRelationVerifier|100%|92.5%|
+|AsyncResponse.Internal.SqlServerRelationVerifier|100%|89.5%|
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServi<br/>ceCollectionExtensions|100%|100%|
 
 </details>
@@ -153,7 +153,7 @@
 |AsyncResponse.AsyncResponseBuilder|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
 |AsyncResponse.AsyncResponseBuilder<T>|100%|100%|
-|AsyncResponse.AsyncResponseBuilderBase|94%|90%|
+|AsyncResponse.AsyncResponseBuilderBase|94.2%|90.9%|
 |AsyncResponse.AsyncResponseChannelMarker|100%||
 |AsyncResponse.AsyncResponseChannelOptions|100%|100%|
 |AsyncResponse.AsyncResponseContextPropagation|100%|96.6%|
@@ -205,7 +205,7 @@
 |AsyncResponse.DurableFlowService<TFlow, TInput>|100%|100%|
 |AsyncResponse.DurableFlowSuspendedException|100%||
 |AsyncResponse.FlowExecutionLease|96.8%|87.5%|
-|AsyncResponse.FlowStateConcurrency|100%|97.6%|
+|AsyncResponse.FlowStateConcurrency|100%|97.8%|
 |AsyncResponse.FlowStateJson|100%|100%|
 |AsyncResponse.InMemoryAsyncResponseChannel|96.8%|89.7%|
 |AsyncResponse.InMemoryAsyncResponseChannel.DeclaredWireSerializer<TDeclared<br/>>|100%||
@@ -300,18 +300,18 @@
 |Microsoft.Extensions.DependencyInjection.DynamoDbDurableFlowServiceCollecti<br/>onExtensions|100%|75%|
 
 </details>
-<details><summary>AsyncResponse.DurableFlows.EFCore - 99.4%</summary>
+<details><summary>AsyncResponse.DurableFlows.EFCore - 99.2%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.EFCore**|**99.4%**|**94.4%**|
+|**AsyncResponse.DurableFlows.EFCore**|**99.2%**|**93.4%**|
 |AsyncResponse.DurableFlows.EFCore.DurableFlowStateRecord|100%||
 |AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowModelBuilderExtensions|100%|100%|
 |AsyncResponse.DurableFlows.EFCore.EFCoreDurableFlowOptions|100%||
 |AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.ContextLease<TContex<br/>t>|100%|100%|
 |AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.ContextLease<TContex<br/>t>|100%||
 |AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore.StateRow<TContext>|100%||
-|AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>|100%|100%|
+|AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>|97%|90.9%|
 |AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>|99.2%|85%|
 |AsyncResponse.DurableFlows.EFCore.EFCoreFlowStateStore<TContext>|99.2%|83.3%|
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|100%|100%|
@@ -333,15 +333,15 @@
 |Microsoft.Extensions.DependencyInjection.MongoDurableFlowServiceCollectionE<br/>xtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.DurableFlows.MySql - 99.5%</summary>
+<details><summary>AsyncResponse.DurableFlows.MySql - 99.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.MySql**|**99.5%**|**96.2%**|
+|**AsyncResponse.DurableFlows.MySql**|**99.6%**|**96.4%**|
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|100%|100%|
 |AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException|100%||
 |AsyncResponse.DurableFlows.MySql.MySqlDurableFlowOptions|100%|100%|
-|AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore|99.3%|81.2%|
+|AsyncResponse.DurableFlows.MySql.MySqlFlowStateStore|99.4%|85%|
 |Microsoft.Extensions.DependencyInjection.MySqlDurableFlowServiceCollectionE<br/>xtensions|100%||
 
 </details>
@@ -382,16 +382,16 @@
 |Microsoft.Extensions.DependencyInjection.SqliteDurableFlowServiceCollection<br/>Extensions|100%||
 
 </details>
-<details><summary>AsyncResponse.DurableFlows.SqlServer - 82.9%</summary>
+<details><summary>AsyncResponse.DurableFlows.SqlServer - 80.4%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.DurableFlows.SqlServer**|**82.9%**|**63.3%**|
+|**AsyncResponse.DurableFlows.SqlServer**|**80.4%**|**63.2%**|
 |AsyncResponse.DurableFlows.Internal.DurableFlowStoreShared|100%|100%|
 |AsyncResponse.DurableFlows.Internal.FlowStateTooLargeException|100%||
 |AsyncResponse.DurableFlows.SqlServer.SqlServerDurableFlowOptions|100%|100%|
-|AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore|93.7%|72.2%|
-|AsyncResponse.Internal.SqlServerRelationVerifier|55.9%|42.5%|
+|AsyncResponse.DurableFlows.SqlServer.SqlServerFlowStateStore|95.1%|72.2%|
+|AsyncResponse.Internal.SqlServerRelationVerifier|56%|45.8%|
 |Microsoft.Extensions.DependencyInjection.SqlServerDurableFlowServiceCollect<br/>ionExtensions|100%||
 
 </details>
@@ -421,14 +421,14 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.AzureServiceBus**|**97.8%**|**92.3%**|
+|**AsyncResponse.Transports.AzureServiceBus**|**97.8%**|**95.7%**|
 |AsyncResponse.Transports.AzureServiceBus.AwaitingAzureServiceBusMessageDisp<br/>atcher|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusAsyncResponseOption<br/>s|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusBackgroundFailureCo<br/>ntext|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientAdapter|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusClientResolver|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusCorrelationIdExtrac<br/>tor|98.4%|98.2%|
-|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|100%|75%|
+|AsyncResponse.Transports.AzureServiceBus.AzureServiceBusMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOptionsValidator|100%|100%|
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusOutboundMessage|100%||
 |AsyncResponse.Transports.AzureServiceBus.AzureServiceBusReceiverAdapter|100%|100%|
@@ -583,7 +583,7 @@
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.RabbitMQ**|**100%**|**92%**|
+|**AsyncResponse.Transports.RabbitMQ**|**100%**|**96.5%**|
 |AsyncResponse.Transports.RabbitMQ.AwaitingRabbitMqMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.RabbitMQ.QueuedRabbitMqMessageDispatcher|100%|100%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions|100%||
@@ -593,7 +593,7 @@
 |AsyncResponse.Transports.RabbitMQ.RabbitMqConnectionFactoryAdapter|100%|100%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqDelivery|100%||
-|AsyncResponse.Transports.RabbitMQ.RabbitMqMessageDispatcher|100%|82.1%|
+|AsyncResponse.Transports.RabbitMQ.RabbitMqMessageDispatcher|100%|98.2%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqOptionsValidator|100%|100%|
 |AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetOptions|100%||
 |AsyncResponse.Transports.RabbitMQ.RabbitMqReplyTargetProvider|100%|100%|
@@ -633,12 +633,12 @@
 |Microsoft.Extensions.DependencyInjection.RedisAsyncResponseTransportService<br/>CollectionExtensions|100%|100%|
 
 </details>
-<details><summary>AsyncResponse.Transports.SqlServer - 98.6%</summary>
+<details><summary>AsyncResponse.Transports.SqlServer - 99.6%</summary>
 
 |**Name**|**Line**|**Branch**|
 |:---|---:|---:|
-|**AsyncResponse.Transports.SqlServer**|**98.6%**|**99.1%**|
-|AsyncResponse.Internal.SqlServerRelationVerifier|100%|98.3%|
+|**AsyncResponse.Transports.SqlServer**|**99.6%**|**96.4%**|
+|AsyncResponse.Internal.SqlServerRelationVerifier|100%|90.9%|
 |AsyncResponse.Transports.DbCorrelationIdExtractor|100%|100%|
 |AsyncResponse.Transports.DbMessageDispatcherBase|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerAsyncResponseTransportOptions|100%||
@@ -649,12 +649,12 @@
 |AsyncResponse.Transports.SqlServer.SqlServerReplyTargetProvider|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerResponseIngressSubscriber|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerSubscriberOptions|100%|100%|
-|AsyncResponse.Transports.SqlServer.SqlServerSubscriberService|100%|100%|
+|AsyncResponse.Transports.SqlServer.SqlServerSubscriberService|93.6%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransientFaults|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransportDelivery|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerTransportOptionsValidator|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerTransportRetry|100%|100%|
-|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|95.2%|100%|
+|AsyncResponse.Transports.SqlServer.SqlServerTransportStore|100%|100%|
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerSubscriber|100%||
 |AsyncResponse.Transports.SqlServer.SqlServerWorkerTransport|100%|92.8%|
 |Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseTransportSer<br/>viceCollectionExtensions|100%|100%|
