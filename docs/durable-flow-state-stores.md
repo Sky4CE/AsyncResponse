@@ -398,7 +398,10 @@ too — and on SQL Server and MySQL the database default is case-insensitive, wh
 ids differing only in case a single primary key: the second `StartAsync` fails as a duplicate and
 a load returns the other run's state. Pass the constant for your provider
 (`AsyncResponseFlowIdCollations.SqlServer` / `.MySql` / `.PostgreSql` / `.Sqlite`); the bundled
-relational stores pin the equivalent in their own DDL.
+relational stores pin the equivalent in their own DDL. On those two providers the store **fails at
+startup** if the mapping does not declare one — the choice stays yours, but it has to be a choice.
+Only a binary collation qualifies: a merely case-sensitive one still folds accents (`_CS_AI`) or
+full-width forms (any collation without `_WS`).
 
 ### Application-owned store
 

@@ -158,6 +158,27 @@ public sealed class SqlServerOptionsTests
             nameof(SqlServerAsyncResponseTransportOptions.SchemaName));
     }
 
+    [Theory]
+    [InlineData("worker ")]
+    [InlineData(" worker")]
+    public void TransportOptions_RejectQueueNamesWithSurroundingSpaces(string queueName)
+    {
+        // Probed on SQL Server 2022: `queue = N'worker'` returns the rows of BOTH 'worker' and
+        // 'worker ' — equality pads the shorter operand even under Latin1_General_100_BIN2. The
+        // three queues share one table and are told apart only by that column, so names the
+        // DATABASE cannot distinguish make the worker and response subscribers consume each
+        // other's messages. Ordinal distinctness alone does not see it.
+        AssertTransportInvalid(options => options.WorkerQueue = queueName, "space");
+        AssertTransportInvalid(options => options.ResponseQueue = queueName, "space");
+        AssertTransportInvalid(options => options.DeadLetterQueue = queueName, "space");
+    }
+
+    [Fact]
+    public void TransportOptions_RejectQueueNamesLongerThanTheColumn()
+        => AssertTransportInvalid(
+            options => options.WorkerQueue = new string('w', SqlServerTransportOptionsValidator.MaxQueueNameLength + 1),
+            "nvarchar(200)");
+
     [Fact]
     public void TransportOptions_RejectOverLimitIdentifiersAndAcceptTheCap()
     {

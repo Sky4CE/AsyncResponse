@@ -33,6 +33,28 @@ public class AsyncResponseBuilderTests
             .ReturnsAsync(_waiter.Object);
     }
 
+    [Theory]
+    // Longer than the correlation_id column every relational channel declares: accepted here, it
+    // would truncate or fail at the FIRST database write, halfway through a conversation.
+    [InlineData(401, ' ', "portable maximum is 400")]
+    // Surrounding spaces: SQL Server pads the shorter operand of an equality comparison — binary
+    // collations included — so "abc " and "abc" are one key to the database while the library
+    // compares them ordinally and would route their responses to different waiters.
+    [InlineData(0, ' ', "begins or ends with a space")]
+    public void For_WithACorrelationIdTheDatabaseCannotKeepDistinct_IsRejected(int repeat, char character, string expected)
+    {
+        var correlationId = repeat > 0 ? new string('c', repeat) : $"corr-a{character}";
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>(correlationId));
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void For_AcceptsACorrelationIdAtTheLengthCapExactly()
+        => new AsyncResponseBuilder(_subscriber.Object)
+            .For<OperationResult>(new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength));
+
     [Fact]
     public async Task WaitAsync_TriggerRunsAfterSubscription()
     {

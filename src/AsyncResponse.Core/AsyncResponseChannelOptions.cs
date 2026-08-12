@@ -54,6 +54,41 @@ public abstract class AsyncResponseChannelOptions
     internal static readonly TimeSpan MaxPersistenceTtl = TimeSpan.FromDays(3650);
 
     /// <summary>
+    /// The portable correlation-id length in UTF-16 code units — the width of the
+    /// <c>correlation_id</c> column in the SQL Server channel's tables, and the tightest bound any
+    /// bundled channel imposes. Validated where a correlation id enters the library so an
+    /// over-long id is rejected at the call site instead of truncating or failing at its first
+    /// database write, halfway through a conversation.
+    /// </summary>
+    public const int MaxCorrelationIdLength = 400;
+
+    /// <summary>
+    /// Applies the portable correlation-id contract, returning the rejection message or
+    /// <c>null</c>. Length is bounded by the relational column; surrounding spaces are rejected
+    /// because SQL Server pads the shorter operand of an equality comparison — even under a binary
+    /// collation — so <c>"abc "</c> and <c>"abc"</c> are ONE key to the database while the library
+    /// compares them ordinally and would route their responses to different waiters.
+    /// </summary>
+    internal static string? CorrelationIdNotPortable(string correlationId)
+    {
+        if (correlationId.Length > MaxCorrelationIdLength)
+        {
+            return $"CorrelationId is {correlationId.Length} UTF-16 code units; the portable maximum is {MaxCorrelationIdLength} " +
+                $"({nameof(AsyncResponseChannelOptions)}.{nameof(MaxCorrelationIdLength)} — the correlation_id column width in the " +
+                "SQL Server channel). A longer id is truncated or rejected at its first database write.";
+        }
+
+        if (correlationId[0] == ' ' || correlationId[^1] == ' ')
+        {
+            return "CorrelationId begins or ends with a space. SQL Server pads the shorter operand of an equality comparison " +
+                "(binary collations included), so an id with surrounding spaces is the SAME key as one without to the database, " +
+                "while the library compares ids ordinally — a response could reach the wrong waiter. Trim the id.";
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Guards a RESOLVED per-waiter timeout (explicit, <see cref="DefaultTimeout"/>, or the
     /// <see cref="RecoveryStateExpiry"/> fallback) before any subscribe/persist side effect:
     /// positive (one rule for every channel — zero and the never-firing -1 ms sentinel included)

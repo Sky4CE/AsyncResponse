@@ -13,8 +13,15 @@ internal static class SqlServerTransportOptionsValidator
         Required(options.CorrelationIdHeader, nameof(options.CorrelationIdHeader));
         Required(options.DefaultReplyTargetName, nameof(options.DefaultReplyTargetName));
 
-        // All three logical queues share one table, distinguished only by the queue column. Equal
-        // names would make subscribers consume each other's rows (or re-consume dead letters).
+        // The three logical queues share one table, distinguished only by the queue column, so
+        // names that the DATABASE considers equal are as dangerous as identical ones. SQL Server
+        // pads the shorter operand of an `=` comparison with spaces before comparing — even under
+        // a binary collation — so 'worker' and 'worker ' match each other's rows and both
+        // subscribers would consume both queues. Ordinal distinctness alone does not see that.
+        ValidateQueueName(options.WorkerQueue, nameof(options.WorkerQueue));
+        ValidateQueueName(options.ResponseQueue, nameof(options.ResponseQueue));
+        ValidateQueueName(options.DeadLetterQueue, nameof(options.DeadLetterQueue));
+
         if (StringComparer.Ordinal.Equals(options.WorkerQueue, options.ResponseQueue)
             || StringComparer.Ordinal.Equals(options.WorkerQueue, options.DeadLetterQueue)
             || StringComparer.Ordinal.Equals(options.ResponseQueue, options.DeadLetterQueue))
@@ -91,6 +98,33 @@ internal static class SqlServerTransportOptionsValidator
                 throw new InvalidOperationException($"{nameof(SqlServerSubscriberOptions)}.{nameof(subscriber.AckMode)} ({role}) has unsupported value '{subscriber.AckMode}'.");
         }
     }
+
+    /// <summary>
+    /// A queue name is a database KEY, not free text: it is stored in <c>nvarchar(200)</c> and
+    /// matched with <c>=</c>, whose space padding makes trailing blanks invisible to the database
+    /// while the library still treats the names as distinct. Leading blanks are rejected on the
+    /// same principle — they survive comparison but make two names indistinguishable in logs.
+    /// </summary>
+    public static void ValidateQueueName(string value, string name)
+    {
+        if (value.Length > MaxQueueNameLength)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseTransportOptions)}.{name} is {value.Length} characters; the queue column is " +
+                $"nvarchar({MaxQueueNameLength}), so a longer name is truncated or rejected at the first publish.");
+        }
+
+        if (value[0] == ' ' || value[^1] == ' ')
+        {
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseTransportOptions)}.{name} '{value}' begins or ends with a space. SQL Server pads " +
+                "the shorter operand of an equality comparison, so a trailing space is invisible to the queue lookup — two names " +
+                "differing only in trailing spaces would consume each other's messages. Remove the surrounding spaces.");
+        }
+    }
+
+    /// <summary>The queue column's width: <c>queue nvarchar(200)</c> in the transport's DDL.</summary>
+    public const int MaxQueueNameLength = 200;
 
     public static string Required(string? value, string name)
         => !string.IsNullOrWhiteSpace(value)

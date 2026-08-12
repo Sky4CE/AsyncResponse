@@ -287,7 +287,13 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                 // the wrong table, and a name held by a view fails outright with error 2714. Run
                 // the same catalog checks now, on a fresh connection (the objects in question are
                 // somebody else's and already committed), so the operator gets the precise reason.
-                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                await SqlServerRelationVerifier.ThrowDiagnosedCollisionAsync(
+                    OpenConnectionAsync,
+                    ex,
+                    _options.SchemaName,
+                    "durable-flow",
+                    ExpectedObjects(),
+                    cancellationToken).ConfigureAwait(false);
                 throw;
             }
 
@@ -295,9 +301,16 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             // shared application lock): the existence guard above only asks "is there a user table
             // with this name", so another component's table silently suppresses creation and a
             // view or synonym makes the CREATE fail with raw error 2714.
-            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            // Verified AFTER the commit, on the same connection but outside the transaction. The
+            // checks read the catalog, and a transaction that has just run DDL still holds
+            // schema-modification locks — catalog reads under those deadlock (error 1205) against
+            // this store's own live traffic, which is already polling by the time a later
+            // EnsureCreated re-runs. Correctness does not need the transaction: the application
+            // lock serialized the DDL, and what these checks look for is somebody ELSE'S committed
+            // object occupying a name, never our own uncommitted work.
+            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -312,6 +325,12 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             transaction,
             _options.SchemaName,
             "durable-flow",
+            ExpectedObjects(),
+            cancellationToken);
+
+    /// <summary>The catalog shape this store's DDL intends — the single source for both the
+    /// post-DDL verification and the failed-batch diagnosis.</summary>
+    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.TableName, SqlServerObjectKind.Table,
                 [
@@ -322,40 +341,10 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                     new("revision", "bigint", Nullable: false),
                     new("lease_id", "nvarchar(64)", Nullable: true),
                     new("lease_expires_at_utc", "datetime2", Nullable: true)
-                ])
-            ],
-            cancellationToken);
+                ],
+                PrimaryKey: ["flow_id"])
+            ];
 
-    /// <summary>
-    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
-    /// error into the actionable one. Returns normally when nothing conclusive is found — the
-    /// caller then rethrows the original exception, the honest outcome for a failure that has
-    /// nothing to do with a name collision.
-    /// </summary>
-    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
-    {
-        SqlConnection diagnosis;
-        try
-        {
-            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (SqlException)
-        {
-            return;
-        }
-
-        await using (diagnosis)
-        {
-            try
-            {
-                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException diagnosed)
-            {
-                throw new InvalidOperationException(diagnosed.Message, failure);
-            }
-        }
-    }
 
     private async Task<bool> UpdateLeaseAsync(
         string flowId,

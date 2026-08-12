@@ -171,12 +171,26 @@ internal sealed class SqlServerChannelSql
                 // very same catalog checks now — on a fresh connection, since the objects in
                 // question are somebody else's and already committed — so the operator gets the
                 // precise reason instead of a raw provider error.
-                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                await SqlServerRelationVerifier.ThrowDiagnosedCollisionAsync(
+                    OpenConnectionAsync,
+                    ex,
+                    _options.SchemaName,
+                    "channel",
+                    ExpectedObjects(),
+                    cancellationToken).ConfigureAwait(false);
                 throw;
             }
 
-            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            // Verified AFTER the commit, on the same connection but outside the transaction. The
+            // checks read the catalog, and a transaction that has just run DDL still holds
+            // schema-modification locks — catalog reads under those deadlock (error 1205) against
+            // this store's own live traffic, which is already polling by the time a later
+            // EnsureCreated re-runs. Correctness does not need the transaction: the application
+            // lock serialized the DDL, and what these checks look for is somebody ELSE'S committed
+            // object occupying a name, never our own uncommitted work.
+            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -185,36 +199,6 @@ internal sealed class SqlServerChannelSql
         }
     }
 
-    /// <summary>
-    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
-    /// error into the actionable one. Returns normally when nothing conclusive is found — the
-    /// caller then rethrows the original exception, which is the honest outcome for a failure that
-    /// has nothing to do with a name collision (permissions, a full disk, a dropped connection).
-    /// </summary>
-    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
-    {
-        SqlConnection diagnosis;
-        try
-        {
-            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (SqlException)
-        {
-            return; // The server is the problem, not the schema; the original error says so.
-        }
-
-        await using (diagnosis)
-        {
-            try
-            {
-                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException diagnosed)
-            {
-                throw new InvalidOperationException(diagnosed.Message, failure);
-            }
-        }
-    }
 
     /// <summary>
     /// Post-DDL catalog verification, inside the DDL transaction (and therefore under the shared
@@ -228,6 +212,12 @@ internal sealed class SqlServerChannelSql
             transaction,
             _options.SchemaName,
             "channel",
+            ExpectedObjects(),
+            cancellationToken);
+
+    /// <summary>The catalog shape this store's DDL intends — the single source for both the
+    /// post-DDL verification and the failed-batch diagnosis.</summary>
+    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.RecoveryStateTable, SqlServerObjectKind.Table,
                 [
@@ -235,29 +225,31 @@ internal sealed class SqlServerChannelSql
                     new("registration_id", "uniqueidentifier", Nullable: false),
                     new("state_json", "nvarchar(max)", Nullable: false),
                     new("expires_at", "datetime2", Nullable: false),
-                    new("registered_at", "datetime2", Nullable: false)
-                ]),
+                    new("registered_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())")
+                ],
+                PrimaryKey: ["correlation_id", "registration_id"]),
                 new(_options.MessageTable, SqlServerObjectKind.Table,
                 [
                     new("id", "uniqueidentifier", Nullable: false),
                     new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("envelope_json", "nvarchar(max)", Nullable: false),
-                    new("created_at", "datetime2", Nullable: false),
+                    new("created_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
                     new("expires_at", "datetime2", Nullable: false),
                     new("acked_at", "datetime2", Nullable: true),
                     new("acked_seq", "bigint", Nullable: true),
-                    new("recovery_claimed", "bit", Nullable: false)
-                ]),
+                    new("recovery_claimed", "bit", Nullable: false, DefaultExpression: "((0))")
+                ],
+                PrimaryKey: ["id"]),
                 new(_options.SubscriberTable, SqlServerObjectKind.Table,
                 [
                     new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("registration_id", "uniqueidentifier", Nullable: false),
                     new("instance_id", "nvarchar(200)", Nullable: false),
                     new("expires_at", "datetime2", Nullable: false)
-                ]),
+                ],
+                PrimaryKey: ["correlation_id", "registration_id"]),
                 new(AckSequenceName, SqlServerObjectKind.Sequence)
-            ],
-            cancellationToken);
+            ];
 
     private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)
     {

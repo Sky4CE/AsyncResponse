@@ -283,7 +283,26 @@ public class ScheduledFlowTests
             name,
             "0 * * * *",
             occurrence => new ReportInput(occurrence)));
-        Assert.Contains("portable flow-id maximum", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("portable maximum is 400", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // Every rule of the portable contract, not just the length one: a name carrying any of these
+    // registered cleanly and then failed on EVERY occurrence at 3 a.m., logged and discarded.
+    // A name's own trailing space is NOT one of them: it lands mid-id ("sched:nightly :…"), where
+    // no store folds it — only surrounding spaces are invisible to a padded comparison.
+    [InlineData("reports/nightly", "not portable")]
+    [InlineData("nightly?", "not portable")]
+    [InlineData("nightly#1", "not portable")]
+    public void ScheduleName_ThatMakesOccurrenceIdsNonPortable_FailsAtRegistration(string name, string expectedMessage)
+    {
+        var services = new ServiceCollection();
+        var builder = services.AddAsyncResponse();
+        var ex = Assert.Throws<ArgumentException>(() => builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+            name,
+            "0 * * * *",
+            occurrence => new ReportInput(occurrence)));
+        Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -26,12 +26,17 @@ internal static class FlowStateConcurrency
     /// creates walk through. Three independent limits, because the stores disagree about what an
     /// id may be, and an id that works on one store and fails on another is not portable:
     /// <list type="bullet">
-    /// <item>length in UTF-16 characters, for the 400-character <c>flow_id</c> columns (SQL
-    /// Server, MySQL, Oracle, EF Core);</item>
-    /// <item>length in UTF-8 <em>bytes</em>, for Cosmos DB, whose 1023-byte id limit a 400-
-    /// character id made of three-byte characters (CJK, most emoji) exceeds at 1200;</item>
+    /// <item>length in UTF-16 code units, for the 400-unit <c>flow_id</c> columns (SQL Server,
+    /// MySQL, Oracle, EF Core);</item>
+    /// <item>length in UTF-8 <em>bytes</em>, for Cosmos DB, whose 1023-byte id limit a 400-unit id
+    /// exceeds once the characters are non-ASCII (up to three bytes per unit, four for a
+    /// surrogate pair);</item>
     /// <item>the characters themselves — Cosmos rejects <c>/</c>, <c>\</c>, <c>?</c> and <c>#</c>
-    /// in an id, and control characters break every store's diagnostics.</item>
+    /// in an id, and control characters break every store's diagnostics;</item>
+    /// <item>no surrounding spaces — SQL Server pads the shorter operand of an equality
+    /// comparison (binary collations included) and MySQL's <c>utf8mb4_bin</c> is PAD SPACE, so
+    /// <c>flow</c> and <c>flow&#160;</c> are ONE key to those databases while the engine treats
+    /// them as two runs.</item>
     /// </list>
     /// Case is deliberately NOT folded here: ids are compared ordinally throughout, and the
     /// relational stores pin a binary collation on the column so the database agrees.
@@ -41,7 +46,7 @@ internal static class FlowStateConcurrency
     {
         if (flowId.Length > DurableFlowOptions.MaxFlowIdLength)
         {
-            return $"Flow id '{Excerpt(flowId)}' is {flowId.Length} characters; the portable maximum is " +
+            return $"Flow id '{Excerpt(flowId)}' is {flowId.Length} UTF-16 code units; the portable maximum is " +
                 $"{DurableFlowOptions.MaxFlowIdLength} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id " +
                 "column length in the SQL Server, MySQL, Oracle, and EF Core stores). " + BudgetGuidance;
         }
@@ -51,7 +56,16 @@ internal static class FlowStateConcurrency
         {
             return $"Flow id '{Excerpt(flowId)}' is {utf8Bytes} UTF-8 bytes; the portable maximum is " +
                 $"{DurableFlowOptions.MaxFlowIdBytes} ({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdBytes)} — the Cosmos DB " +
-                "id limit). Non-ASCII characters cost up to three bytes each, so a character count alone does not bound it. " + BudgetGuidance;
+                "id limit). A non-ASCII character costs up to three bytes (four for a surrogate pair), so a count of characters " +
+                "does not bound the byte length. " + BudgetGuidance;
+        }
+
+        if (flowId[0] == ' ' || flowId[^1] == ' ')
+        {
+            return $"Flow id '{Excerpt(flowId)}' begins or ends with a space. SQL Server pads the shorter operand of an equality " +
+                "comparison — binary collations included — and MySQL's utf8mb4_bin is PAD SPACE, so an id with trailing spaces is " +
+                "the SAME key as one without to those stores, while the engine compares them ordinally and treats them as two " +
+                "different flows. Trim the id.";
         }
 
         foreach (var character in flowId)

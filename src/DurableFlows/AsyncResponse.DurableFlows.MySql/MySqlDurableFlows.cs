@@ -231,7 +231,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -241,27 +241,71 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                CREATE TABLE IF NOT EXISTS {Table} (
-                    flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
-                    state_json longtext NOT NULL,
-                    expires_at_utc datetime(6) NOT NULL,
-                    updated_at_utc datetime(6) NOT NULL,
-                    revision bigint NOT NULL DEFAULT 0,
-                    lease_id varchar(64) NULL,
-                    lease_expires_at_utc datetime(6) NULL,
-                    INDEX {IndexName} (expires_at_utc)
-                );
-                """;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            if (_options.AutoCreateSchema)
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE IF NOT EXISTS {Table} (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        INDEX {IndexName} (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
 
+            await VerifyFlowIdCollationAsync(connection, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
         {
             _ensureGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Checks the flow_id column's EFFECTIVE collation, independently of who created the table.
+    /// <c>CREATE TABLE IF NOT EXISTS</c> leaves a table made by an earlier build (or by hand)
+    /// exactly as it was, and <c>AutoCreateSchema = false</c> issues no DDL at all — so the
+    /// COLLATE clause above only ever protects a table this build created. MySQL's default
+    /// collation is case-insensitive, which makes two flow ids differing only in case one primary
+    /// key: the second create fails as a duplicate and a load returns the other run's state.
+    /// </summary>
+    private async Task VerifyFlowIdCollationAsync(MySqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT COLLATION_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = 'flow_id';
+            """;
+        command.Parameters.AddWithValue("@table", _options.TableName);
+
+        var collation = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+        if (collation is null)
+        {
+            // No such column: either the table does not exist (AutoCreateSchema = false and the
+            // migration has not run) or a different table owns the name. Both surface at the first
+            // query with a clear MySQL error, and failing here would break the documented
+            // "create it yourself, later" workflow.
+            return;
+        }
+
+        if (!collation.EndsWith("_bin", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"The MySQL durable-flow table '{_options.TableName}' stores flow_id with the collation '{collation}', which is not " +
+                "binary. Flow ids are compared ordinally by the engine, so ids differing only in case (or accent, or width) collide " +
+                "on the primary key: the second flow fails to start and a load returns the other run's state. Fix it with " +
+                $"ALTER TABLE `{_options.TableName}` MODIFY flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL; " +
+                "(tables this build creates get that collation automatically).");
         }
     }
 

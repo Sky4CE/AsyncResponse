@@ -20,8 +20,67 @@ internal sealed class TestFlowDbContext(DbContextOptions<TestFlowDbContext> opti
 /// <summary>A context that forgot to call <c>ConfigureAsyncResponseDurableFlows()</c>.</summary>
 internal sealed class UnmappedFlowDbContext(DbContextOptions<UnmappedFlowDbContext> options) : DbContext(options);
 
+/// <summary>Mapped without a flow-id collation — the default that is unsafe on SQL Server/MySQL.</summary>
+internal sealed class UncollatedFlowDbContext(DbContextOptions<UncollatedFlowDbContext> options) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+        => modelBuilder.ConfigureAsyncResponseDurableFlows();
+}
+
+/// <summary>Mapped WITH the SQL Server collation, the way the docs prescribe.</summary>
+internal sealed class CollatedFlowDbContext(DbContextOptions<CollatedFlowDbContext> options) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+        => modelBuilder.ConfigureAsyncResponseDurableFlows(
+            flowIdCollation: AsyncResponseFlowIdCollations.SqlServer);
+}
+
 public sealed class EFCoreDurableFlowStateStoreTests
 {
+    [Fact]
+    public async Task EFCoreStore_OnACaseFoldingProvider_RefusesAMappingWithoutAFlowIdCollation()
+    {
+        // The schema is the application's, so this package cannot pin the collation itself — but
+        // it must not run silently against a mapping that leaves flow_id to a provider whose
+        // default folds case. On SQL Server that makes 'flow-a' and 'FLOW-A' one primary key: the
+        // second StartAsync fails as a duplicate and a load returns the other run's state.
+        // No server is contacted here — building the model is enough to decide.
+        var services = new ServiceCollection();
+        services.AddDbContext<UncollatedFlowDbContext>(options => options.UseSqlServer("Server=unused;Database=unused;"));
+        await using var provider = services.BuildServiceProvider();
+
+        var store = new EFCoreFlowStateStore<UncollatedFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions()));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.LoadAsync("any-flow"));
+        Assert.Contains("without a collation", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(AsyncResponseFlowIdCollations), exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EFCoreStore_OnACaseFoldingProvider_AcceptsAMappingThatDeclaresTheCollation()
+    {
+        // The counterpart, and the load-bearing half: the declaration has to reach the store
+        // through the RUNTIME model. EF Core strips relational configuration the runtime never
+        // reads (asking a runtime property for its collation throws), so the mapping records the
+        // choice as a model annotation — if that annotation did not survive, this fact fails and
+        // the guard above would be rejecting correctly-configured applications.
+        var services = new ServiceCollection();
+        services.AddDbContext<CollatedFlowDbContext>(options => options.UseSqlServer("Server=unused;Database=unused;"));
+        await using var provider = services.BuildServiceProvider();
+
+        var store = new EFCoreFlowStateStore<CollatedFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions()));
+
+        // Past the mapping check, the connection attempt is what fails — never the collation guard.
+        var exception = await Record.ExceptionAsync(() => store.LoadAsync("any-flow"));
+        Assert.NotNull(exception);
+        Assert.DoesNotContain("without a collation", exception.ToString(), StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task EFCoreStore_RoundTrips_Expires_Deletes_WithScopedDbContext()
     {

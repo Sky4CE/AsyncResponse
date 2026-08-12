@@ -236,7 +236,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
         ServiceProvider? provider = null;
         try
         {
-            await CreateLegacyCaseInsensitiveChannelSchemaAsync(schema);
+            await CreateLegacyChannelSchemaAsync(schema, "Latin1_General_100_CI_AS");
             provider = BuildProvider(schema, options => options.AutoCreateSchema = false);
             var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
             var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
@@ -262,7 +262,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     /// The channel schema as an EARLIER build created it: no COLLATE clause, so the columns
     /// inherit the database collation (case-insensitive on a default SQL Server).
     /// </summary>
-    private async Task CreateLegacyCaseInsensitiveChannelSchemaAsync(string schema)
+    private async Task CreateLegacyChannelSchemaAsync(string schema, string collation)
     {
         var options = ChannelOptions(schema);
         await ExecuteAsync(
@@ -270,7 +270,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');
 
             CREATE TABLE [{schema}].[{options.RecoveryStateTable}] (
-                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                correlation_id nvarchar(400) COLLATE {collation} NOT NULL,
                 registration_id uniqueidentifier NOT NULL,
                 state_json nvarchar(max) NOT NULL,
                 expires_at datetime2 NOT NULL,
@@ -280,7 +280,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
 
             CREATE TABLE [{schema}].[{options.MessageTable}] (
                 id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
-                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                correlation_id nvarchar(400) COLLATE {collation} NOT NULL,
                 envelope_json nvarchar(max) NOT NULL,
                 created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
                 expires_at datetime2 NOT NULL,
@@ -291,7 +291,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             CREATE SEQUENCE [{schema}].[{options.MessageTable}_ack_seq] AS bigint START WITH 1;
 
             CREATE TABLE [{schema}].[{options.SubscriberTable}] (
-                correlation_id nvarchar(400) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                correlation_id nvarchar(400) COLLATE {collation} NOT NULL,
                 registration_id uniqueidentifier NOT NULL,
                 instance_id nvarchar(200) NOT NULL,
                 expires_at datetime2 NOT NULL,
@@ -307,6 +307,132 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync();
+    }
+
+    [Fact]
+    public async Task ClaimedRow_FromASpacePaddedQueue_IsReleasedUntouched_NotDeliveredToTheWrongSubscriber()
+    {
+        // Startup validation now rejects queue names with surrounding spaces, so this row can only
+        // come from an EARLIER build (or another writer) — which is exactly why the claim path
+        // re-checks. SQL Server's `=` pads the shorter operand under every collation, binary ones
+        // included, so `queue = N'worker'` selects this 'worker ' row: without the guard the worker
+        // subscriber would execute a message addressed to a different queue.
+        await WithSchemaAsync("sql_padded_queue", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            // Insert the padded row directly: the store's own publish path would reject the name.
+            // Literal braces cannot appear directly inside a single-$ interpolated raw string.
+            var payloadJson = """{"kind":"other-queue"}""";
+            var emptyJson = "{}";
+            var paddedId = Guid.NewGuid();
+            await ExecuteAsync(
+                $"""
+                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, headers_json)
+                VALUES ('{paddedId}', N'{options.WorkerQueue} ', N'{payloadJson}', N'{emptyJson}');
+                """);
+
+            Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
+
+            // Released exactly as it was: unlocked, and with the attempt the claim charged rolled
+            // back — otherwise repeated mis-claims would walk it to its delivery limit.
+            await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+            await connection.OpenAsync();
+            await using var check = connection.CreateCommand();
+            check.CommandText =
+                $"SELECT attempts, CASE WHEN lock_id IS NULL THEN 1 ELSE 0 END FROM [{schema}].[{options.MessageTable}] WHERE id = @id;";
+            check.Parameters.AddWithValue("@id", paddedId);
+            await using var reader = await check.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+            Assert.Equal(0, reader.GetInt32(0));
+            Assert.Equal(1, reader.GetInt32(1));
+        });
+    }
+
+    [Fact]
+    public async Task CaseSensitiveButNonBinaryCollation_IsRejected()
+    {
+        // A merely case-SENSITIVE collation is not ordinal: probed on SQL Server 2022,
+        // Latin1_General_100_CS_AS still folds full-width forms ('ab' = 'ａｂ'), and _CS_AI folds
+        // accents. Only a binary collation compares by code point, which is what the id contract
+        // promises — so accepting any _CS_ collation (as an earlier build did) left ids colliding.
+        await WithSchemaAsync("sql_cs_as", async schema =>
+        {
+            var options = ChannelOptions(schema);
+            options.AutoCreateSchema = false;
+            await CreateLegacyChannelSchemaAsync(schema, "Latin1_General_100_CS_AS");
+
+            var managed = ChannelOptions(schema);
+            var channel = new SqlServerChannelSql(Options.Create(managed));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("is not binary", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("Latin1_General_100_CS_AS", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task TableMissingARequiredDefault_OrItsPrimaryKey_IsRejected()
+    {
+        // The store never names these columns on insert, so a table without their defaults fails
+        // every insert with error 515 — and one without the primary key silently accepts the
+        // duplicates the idempotent publish relies on it to reject. Both used to pass verification.
+        await WithSchemaAsync("sql_no_default", async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            var emptyJsonDefault = "{}";
+            await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
+            // Exactly ONE default is missing, so the message must name that column and no other.
+            await ExecuteAsync(
+                $"""
+                CREATE TABLE [{schema}].[jobs] (
+                    id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+                    queue nvarchar(200) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    payload_json nvarchar(max) NOT NULL,
+                    headers_json nvarchar(max) NOT NULL DEFAULT N'{emptyJsonDefault}',
+                    created_at datetime2 NOT NULL,
+                    available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    locked_until datetime2 NULL,
+                    lock_id uniqueidentifier NULL,
+                    attempts int NOT NULL DEFAULT 0,
+                    dead_letter_reason nvarchar(max) NULL
+                );
+                """);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync());
+            Assert.Contains("created_at", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("has no default", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithSchemaAsync("sql_no_pk", async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            var emptyJsonDefault = "{}";
+            await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
+            await ExecuteAsync(
+                $"""
+                CREATE TABLE [{schema}].[jobs] (
+                    id uniqueidentifier NOT NULL,
+                    queue nvarchar(200) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    payload_json nvarchar(max) NOT NULL,
+                    headers_json nvarchar(max) NOT NULL DEFAULT N'{emptyJsonDefault}',
+                    created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    locked_until datetime2 NULL,
+                    lock_id uniqueidentifier NULL,
+                    attempts int NOT NULL DEFAULT 0,
+                    dead_letter_reason nvarchar(max) NULL
+                );
+                """);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync());
+            Assert.Contains("has no primary key", ex.Message, StringComparison.Ordinal);
+        });
     }
 
     [Fact]

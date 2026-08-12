@@ -32,13 +32,33 @@ internal static class SqlServerRelationVerifier
     /// Server deployments) the database treats <c>foo</c> and <c>FOO</c> as the same key, so two
     /// distinct ids collide: lookups cross-match and primary keys reject the second id.
     /// </summary>
-    internal readonly record struct ExpectedColumn(string Name, string Type, bool Nullable, bool RequiresBinaryCollation = false);
+    /// <remarks>
+    /// <c>DefaultExpression</c> is the exact <c>sys.default_constraints.definition</c> rendering,
+    /// given for the columns the store never names on insert and therefore DEPENDS on:
+    /// <c>(sysutcdatetime())</c>, <c>((0))</c>, <c>(N'{}')</c>. <c>null</c> means the store always
+    /// supplies the value itself.
+    /// </remarks>
+    internal readonly record struct ExpectedColumn(
+        string Name,
+        string Type,
+        bool Nullable,
+        bool RequiresBinaryCollation = false,
+        string? DefaultExpression = null);
 
     /// <summary>
     /// One expected object: a user table (verified against <paramref name="Columns"/> when given)
     /// or a sequence (verified <c>bigint</c>, increment 1, no cycle).
     /// </summary>
-    internal readonly record struct ExpectedObject(string Name, SqlServerObjectKind Kind, ExpectedColumn[]? Columns = null);
+    /// <remarks>
+    /// <c>PrimaryKey</c> lists the key columns in order, when the store's correctness depends on
+    /// them: the idempotent-publish insert and the per-id upsert rely on the primary key REJECTING
+    /// a duplicate. A same-name table without it accepts every duplicate silently.
+    /// </remarks>
+    internal readonly record struct ExpectedObject(
+        string Name,
+        SqlServerObjectKind Kind,
+        ExpectedColumn[]? Columns = null,
+        string[]? PrimaryKey = null);
 
     /// <summary>
     /// Verifies every expected object. Pass the DDL transaction so the checks see uncommitted
@@ -78,12 +98,53 @@ internal static class SqlServerRelationVerifier
         var present = expected.Where(e => actual.ContainsKey(e.Name)).ToArray();
         await VerifySequencesAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyTableColumnsAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
+        await VerifyPrimaryKeysAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
 
         foreach (var expectedObject in expected)
         {
             if (!actual.ContainsKey(expectedObject.Name))
                 throw new InvalidOperationException(
                     $"The SQL Server {componentName} store expected '{schemaName}.{expectedObject.Name}' to exist after schema creation, but it does not.");
+        }
+    }
+
+    /// <summary>
+    /// Turns a FAILED DDL batch into the actionable diagnosis, or lets the original error stand.
+    /// The batch can die before <see cref="VerifyAsync"/> ever runs — a name held by another
+    /// component's table suppresses the guarded CREATE and the statements after it hit the wrong
+    /// table; a name held by a view fails outright with error 2714. Re-running the checks on a
+    /// FRESH connection (the colliding objects are somebody else's and already committed) recovers
+    /// the precise reason. When they find nothing, the caller rethrows: a failure from permissions,
+    /// a full disk, or a dropped connection is not a collision and must not be reported as one.
+    /// </summary>
+    public static async Task ThrowDiagnosedCollisionAsync(
+        Func<CancellationToken, Task<SqlConnection>> openConnectionAsync,
+        SqlException failure,
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> expected,
+        CancellationToken cancellationToken)
+    {
+        SqlConnection diagnosis;
+        try
+        {
+            diagnosis = await openConnectionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqlException)
+        {
+            return; // The server is the problem, not the schema; the original error says so.
+        }
+
+        await using (diagnosis)
+        {
+            try
+            {
+                await VerifyAsync(diagnosis, transaction: null, schemaName, componentName, expected, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException diagnosed)
+            {
+                throw new InvalidOperationException(diagnosed.Message, failure);
+            }
         }
     }
 
@@ -182,11 +243,13 @@ internal static class SqlServerRelationVerifier
         command.CommandText =
             $"""
             SELECT o.name, c.name, t.name, c.max_length, c.is_nullable, ISNULL(c.collation_name, N''),
-                   CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 THEN 1 ELSE 0 END
+                   CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 THEN 1 ELSE 0 END,
+                   ISNULL(dc.definition, N'')
             FROM sys.columns c
             JOIN sys.objects o ON o.object_id = c.object_id
             JOIN sys.schemas s ON s.schema_id = o.schema_id
             JOIN sys.types t ON t.user_type_id = c.user_type_id
+            LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
             WHERE s.name = @schema AND o.name IN ({NameParameters(command, tables.Select(e => e.Name))});
             """;
         command.Parameters.AddWithValue("@schema", schemaName);
@@ -200,7 +263,8 @@ internal static class SqlServerRelationVerifier
                     Type: RenderType(reader.GetString(2), reader.GetInt16(3)),
                     Nullable: reader.GetBoolean(4),
                     Collation: reader.GetString(5),
-                    Writable: reader.GetInt32(6) == 1);
+                    Writable: reader.GetInt32(6) == 1,
+                    Default: reader.GetString(7));
             }
         }
 
@@ -220,14 +284,32 @@ internal static class SqlServerRelationVerifier
                         $"does not match the expected shape: expected {column.Type}{(column.Nullable ? " NULL" : " NOT NULL")}; " +
                         $"found {found.Type}{(found.Nullable ? " NULL" : " NOT NULL")}. " + CollisionGuidance);
 
-                if (column.RequiresBinaryCollation && !IsCaseSensitive(found.Collation))
+                if (column.RequiresBinaryCollation && !IsOrdinalCollation(found.Collation))
                     throw new InvalidOperationException(
                         $"The SQL Server {componentName} store's column '{schemaName}.{table.Name}.{column.Name}' uses the " +
-                        $"case-insensitive collation '{found.Collation}'. That column stores an identity the library compares " +
-                        "ordinally, so the database would treat distinct ids such as 'id-a' and 'ID-A' as one key — cross-matching " +
-                        "lookups and rejecting the second id on insert. Recreate the table (new deployments get " +
-                        "COLLATE Latin1_General_100_BIN2 automatically), or ALTER the column to a binary or _CS_ collation after " +
-                        "dropping the keys and indexes that reference it.");
+                        $"collation '{found.Collation}', which is not binary. That column stores an identity the library compares " +
+                        "ORDINALLY, and any non-binary collation folds something the library treats as distinct — case under a _CI_ " +
+                        "collation, accents under _AI, full-width forms under any collation without _WS. Distinct ids would then " +
+                        "collide on one key: lookups cross-match and the second id is rejected on insert. Recreate the table (new " +
+                        "deployments get COLLATE Latin1_General_100_BIN2 automatically), or ALTER the column to a _BIN2 collation " +
+                        "after dropping the keys and indexes that reference it.");
+
+                // A default the store RELIES on (it never names the column on insert) must exist
+                // and must compute what the store expects: a missing one fails every insert with
+                // error 515, and a different one silently changes behavior — a shifted created_at
+                // moves every watermark comparison, a future available_at strands the job forever.
+                if (column.DefaultExpression is { } expectedDefault
+                    && !string.Equals(found.Default, expectedDefault, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"The SQL Server {componentName} store's column '{schemaName}.{table.Name}.{column.Name}' " +
+                        $"{(found.Default.Length == 0 ? "has no default" : $"defaults to {found.Default}")}, but the store never names " +
+                        $"it on insert and depends on the default {expectedDefault}. " +
+                        (found.Default.Length == 0
+                            ? "Every insert would fail with error 515. "
+                            : "The rows would carry values the store's own time and visibility logic does not expect. ") +
+                        CollisionGuidance);
+                }
             }
 
             // Extra columns are fine only when inserts that do not name them can still succeed.
@@ -247,6 +329,68 @@ internal static class SqlServerRelationVerifier
     }
 
     /// <summary>
+    /// The primary key is load-bearing, not decoration: the transport's insert-if-absent publish
+    /// and the flow store's per-id upsert both rely on it to reject a duplicate. A same-name table
+    /// carrying the right columns but no key (or a key over different columns) passes every other
+    /// check here and then silently accepts duplicate rows.
+    /// </summary>
+    private static async Task VerifyPrimaryKeysAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> expected,
+        CancellationToken cancellationToken)
+    {
+        var keyed = expected.Where(e => e.PrimaryKey is not null).ToArray();
+        if (keyed.Length == 0)
+            return;
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT o.name, col.name, ic.key_ordinal
+            FROM sys.indexes i
+            JOIN sys.objects o ON o.object_id = i.object_id
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns col ON col.object_id = i.object_id AND col.column_id = ic.column_id
+            WHERE i.is_primary_key = 1 AND s.name = @schema
+              AND o.name IN ({NameParameters(command, keyed.Select(e => e.Name))});
+            """;
+        command.Parameters.AddWithValue("@schema", schemaName);
+
+        var actual = new Dictionary<string, List<(byte Ordinal, string Column)>>(StringComparer.Ordinal);
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (!actual.TryGetValue(reader.GetString(0), out var columns))
+                    actual[reader.GetString(0)] = columns = [];
+                columns.Add((reader.GetByte(2), reader.GetString(1)));
+            }
+        }
+
+        foreach (var table in keyed)
+        {
+            var found = actual.TryGetValue(table.Name, out var columns)
+                ? columns.OrderBy(c => c.Ordinal).Select(c => c.Column).ToArray()
+                : [];
+
+            if (!found.AsSpan().SequenceEqual(table.PrimaryKey!))
+            {
+                throw new InvalidOperationException(
+                    $"The SQL Server {componentName} store's table '{schemaName}.{table.Name}' " +
+                    $"{(found.Length == 0 ? "has no primary key" : $"has a primary key over ({string.Join(", ", found)})")}, " +
+                    $"but the store's idempotent writes rely on a primary key over ({string.Join(", ", table.PrimaryKey!)}) to reject " +
+                    "duplicates. Without it a retried publish or a concurrent create is accepted twice instead of deduplicated. " +
+                    CollisionGuidance);
+            }
+        }
+    }
+
+    /// <summary>
     /// Renders a <c>sys.types</c> row the way the DDL declares it. <c>max_length</c> is in bytes,
     /// so the Unicode types halve it, and -1 is the <c>(max)</c> sentinel.
     /// </summary>
@@ -257,13 +401,13 @@ internal static class SqlServerRelationVerifier
         _ => typeName
     };
 
-    // Binary collations sort and compare by code point, which is what an ordinal comparison needs;
-    // an explicitly case-sensitive collation distinguishes the ids just as well, so deployments on
-    // a _CS_ database are not forced to rebuild.
-    private static bool IsCaseSensitive(string collation)
-        => collation.Contains("_BIN", StringComparison.OrdinalIgnoreCase)
-            || collation.Contains("_CS_", StringComparison.OrdinalIgnoreCase)
-            || collation.EndsWith("_CS", StringComparison.OrdinalIgnoreCase);
+    // ONLY a binary collation compares by code point, which is what an ordinal contract requires.
+    // A merely case-SENSITIVE collation is not enough: _CS_AI still folds accents (probed on SQL
+    // Server 2022: 'cafe' = 'café'), and even _CS_AS is width-insensitive unless it also carries
+    // _WS ('ab' = the full-width 'ａｂ'). Two ids the engine considers different would still
+    // collide on the key.
+    private static bool IsOrdinalCollation(string collation)
+        => collation.Contains("_BIN", StringComparison.OrdinalIgnoreCase);
 
     private static string NameParameters(SqlCommand command, IEnumerable<string> names)
     {
@@ -299,7 +443,7 @@ internal static class SqlServerRelationVerifier
     private const string CollisionGuidance =
         "Give this component its own object names (or its own schema) so two AsyncResponse components cannot share one name.";
 
-    private readonly record struct ActualColumn(string Type, bool Nullable, string Collation, bool Writable);
+    private readonly record struct ActualColumn(string Type, bool Nullable, string Collation, bool Writable, string Default);
 }
 
 /// <summary>The SQL Server object kinds an AsyncResponse store creates.</summary>

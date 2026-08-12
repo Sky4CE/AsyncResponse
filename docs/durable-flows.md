@@ -200,9 +200,12 @@ store and fail on another. Every final id — root, composed child, scheduled oc
 - fit `DurableFlowOptions.MaxFlowIdLength` (400 characters — the `flow_id` column length in the
   SQL Server, MySQL, Oracle, and EF Core stores);
 - fit `DurableFlowOptions.MaxFlowIdBytes` (1023 UTF-8 bytes — the Cosmos DB id limit; a
-  400-character id of three-byte characters is 1200 bytes, so the character count alone does not
-  bound it);
-- avoid `/`, `\`, `?`, `#` (Cosmos rejects them in an id) and control characters.
+  400-unit id of non-ASCII characters reaches 1200 bytes, so the count of code units alone does
+  not bound it);
+- avoid `/`, `\`, `?`, `#` (Cosmos rejects them in an id) and control characters;
+- carry no leading or trailing space — SQL Server pads the shorter operand of an equality
+  comparison (binary collations included) and MySQL's `utf8mb4_bin` is PAD SPACE, so `flow` and
+  `flow ` are one key to those stores while the engine counts two flows.
 
 Ids are compared **ordinally** everywhere, and the relational stores pin a binary collation on the
 column so the database agrees — `flow-a` and `FLOW-A` are two different flows, not one. Budget

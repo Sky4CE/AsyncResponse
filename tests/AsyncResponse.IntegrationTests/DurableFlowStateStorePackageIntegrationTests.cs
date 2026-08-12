@@ -225,6 +225,64 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task MySqlPackageStore_RejectsAnExistingCaseInsensitiveFlowIdColumn(bool autoCreateSchema)
+    {
+        // The COLLATE clause in this store's DDL only ever protects a table THIS build created:
+        // CREATE TABLE IF NOT EXISTS leaves an earlier build's table exactly as it was, and
+        // AutoCreateSchema = false issues no DDL at all. MySQL's default collation is
+        // case-insensitive (utf8mb4_0900_ai_ci on 8.x), which makes two flow ids differing only in
+        // case one primary key — so the effective collation is verified through information_schema
+        // on both paths, not inferred from having run the DDL.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_ci", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        INDEX `{table}_expires_idx` (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = autoCreateSchema
+                }));
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("case-check", CreateState("case-check"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("is not binary", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("COLLATE utf8mb4_bin", exception.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
     [Fact]
     public async Task MySqlPackageStore_RejectsIncompleteExistingSchema()
     {
@@ -239,7 +297,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                 command.CommandText =
                     $"""
                     CREATE TABLE `{table}` (
-                        flow_id varchar(400) NOT NULL PRIMARY KEY,
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
                         state_json longtext NOT NULL,
                         expires_at_utc datetime(6) NOT NULL,
                         updated_at_utc datetime(6) NOT NULL,

@@ -249,6 +249,44 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ### Fixed
 
+- **SQL Server queue names differing only in trailing spaces cross-routed messages.** The three
+  logical queues share one table and are told apart by the `queue` column alone — but SQL Server
+  pads the shorter operand of an equality comparison, under *every* collation including
+  `Latin1_General_100_BIN2`, so `queue = N'worker'` returns the rows of both `worker` and
+  `worker ` (verified on SQL Server 2022). Ordinal distinctness at startup could not see it, and
+  the worker and response subscribers consumed each other's messages. Queue names with leading or
+  trailing spaces are now rejected at startup, over-long ones too, and the claim path re-checks the
+  returned queue ordinally — releasing a mis-claimed row *and rolling back the attempt it charged*,
+  so repeated mis-claims cannot walk another queue's message to its dead-letter limit.
+- **The ordinal-identity contract now requires a genuinely binary collation.** Accepting any
+  case-sensitive collation was not enough: `_CS_AI` folds accents (`cafe` = `café`) and even
+  `_CS_AS` folds width (`ab` = `ａｂ`) unless it carries `_WS` — both probed on SQL Server 2022. The
+  verifier requires `_BIN`/`_BIN2`, with remediation in the message.
+- **Ids with surrounding spaces are rejected** — flow ids and correlation ids alike. The same
+  padding rule (and MySQL's PAD SPACE `utf8mb4_bin`) makes `"flow"` and `"flow "` one key to the
+  database while the library compares them ordinally and counts two flows, or routes two
+  conversations.
+- **Public string bounds are enforced where the value enters**, not at its first database write:
+  correlation ids at 400 UTF-16 code units (the new `AsyncResponseChannelOptions.MaxCorrelationIdLength`)
+  and SQL Server queue names at 200, both matching the column that stores them.
+- **Scheduled-flow registration validates the whole portable contract**, by running the occurrence
+  id the scheduler will actually mint through the same check the store's create uses. Duplicating
+  only the length rule let a name containing `/`, `?` or `#` register cleanly and then fail on
+  *every* occurrence at 3 a.m., logged and discarded.
+- **EF Core refuses to start against a mapping that leaves `flow_id` uncollated on a case-folding
+  provider** (SQL Server, MySQL). The choice is still the application's — this package owns no DDL
+  — but silence is no longer the default. The decision is recorded as a model annotation, because
+  EF Core strips relational configuration the runtime never reads and asking a runtime property
+  for its collation throws.
+- **MySQL verifies the effective `flow_id` collation through `information_schema`**, independently
+  of its own DDL. `CREATE TABLE IF NOT EXISTS` leaves a table an earlier build created exactly as
+  it was, and `AutoCreateSchema = false` issues no DDL at all, so the `COLLATE` clause only ever
+  protected tables this build created. The check carries the exact `ALTER TABLE`.
+- **SQL Server schema verification covers operational defaults and primary keys.** A pre-existing
+  table missing the `created_at` / `available_at` / `attempts` / `recovery_claimed` defaults passed
+  verification and failed every insert with error 515; a behavior-changing default (a shifted
+  `created_at`, a future `available_at`) passed silently; and a table with no primary key passed
+  while quietly accepting the duplicates the idempotent publish relies on it to reject.
 - **A response could be delivered to a waiter whose correlation id differs only in case.** The
   database channels query one exact correlation id and forwarded every returned row, but "exact"
   is the database's opinion: SQL Server columns inherit the database collation, and the common

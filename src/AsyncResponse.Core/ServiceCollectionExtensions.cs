@@ -185,17 +185,16 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         configure?.Invoke(options);
         ArgumentNullException.ThrowIfNull(options.TimeZone, $"{nameof(ScheduledFlowOptions)}.{nameof(ScheduledFlowOptions.TimeZone)}");
 
-        // Validate the FINAL occurrence-id length now: a name that fits on its own would
-        // otherwise register cleanly and fail on every occurrence at 3 a.m. — and only on the
-        // stores whose flow_id column is 400 characters.
-        var occurrenceIdLength = ScheduledFlowService.OccurrenceFlowId(name, DateTimeOffset.UnixEpoch).Length;
-        if (occurrenceIdLength > DurableFlowOptions.MaxFlowIdLength)
+        // Validate the FINAL occurrence id against the WHOLE portable contract now — length,
+        // bytes, characters, surrounding spaces — by running the id the scheduler will actually
+        // mint through the same check the store's create uses. Duplicating one of those rules here
+        // let a name containing '/' (or enough multi-byte characters) register cleanly and then
+        // fail on every occurrence at 3 a.m., logged and dropped.
+        var occurrenceId = ScheduledFlowService.OccurrenceFlowId(name, DateTimeOffset.UnixEpoch);
+        if (FlowStateConcurrency.FlowIdNotPortable(occurrenceId) is { } rejection)
         {
             throw new ArgumentException(
-                $"The scheduled flow name '{name}' produces {occurrenceIdLength}-character occurrence ids (sched:{{name}}:{{timestamp}}); " +
-                $"the portable flow-id maximum is {DurableFlowOptions.MaxFlowIdLength} characters " +
-                $"({nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.MaxFlowIdLength)} — the flow_id column length in the " +
-                "SQL Server, MySQL, Oracle, and EF Core stores). Use a shorter name.",
+                $"The scheduled flow name '{name}' produces occurrence ids (sched:{{name}}:{{timestamp}}) that are not portable. {rejection}",
                 nameof(name));
         }
 

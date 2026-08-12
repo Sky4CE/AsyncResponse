@@ -14,9 +14,15 @@ internal abstract class AsyncResponseBuilderBase(
 
     /// <summary>Validates the supplied options.</summary>
     protected static string ValidateCorrelationId(string correlationId)
-        => !string.IsNullOrWhiteSpace(correlationId)
-            ? correlationId
-            : throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+            throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+
+        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is { } rejection)
+            throw new ArgumentException(rejection, nameof(correlationId));
+
+        return correlationId;
+    }
 
     /// <inheritdoc cref="IAsyncResponseBuilder.EnqueueWorkerAsync(ReflectionCallDto, CancellationToken)" />
     [RequiresUnreferencedCode("The descriptor names its target service and method as strings, resolved by reflection when the " +

@@ -147,7 +147,13 @@ internal sealed class SqlServerTransportStore
                 // the wrong table, and a name held by a view fails outright with error 2714. Run
                 // the same catalog checks now, on a fresh connection (the objects in question are
                 // somebody else's and already committed), so the operator gets the precise reason.
-                await ThrowDiagnosedCollisionAsync(ex, cancellationToken).ConfigureAwait(false);
+                await SqlServerRelationVerifier.ThrowDiagnosedCollisionAsync(
+                    OpenConnectionAsync,
+                    ex,
+                    _options.SchemaName,
+                    "transport",
+                    ExpectedObjects(),
+                    cancellationToken).ConfigureAwait(false);
                 throw;
             }
 
@@ -155,9 +161,16 @@ internal sealed class SqlServerTransportStore
             // shared application lock): the existence guard above only asks "is there a user table
             // with this name", so another component's table silently suppresses creation and a
             // view or synonym makes the CREATE fail with raw error 2714.
-            await VerifyRelationsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            // Verified AFTER the commit, on the same connection but outside the transaction. The
+            // checks read the catalog, and a transaction that has just run DDL still holds
+            // schema-modification locks — catalog reads under those deadlock (error 1205) against
+            // this store's own live traffic, which is already polling by the time a later
+            // EnsureCreated re-runs. Correctness does not need the transaction: the application
+            // lock serialized the DDL, and what these checks look for is somebody ELSE'S committed
+            // object occupying a name, never our own uncommitted work.
+            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -172,53 +185,29 @@ internal sealed class SqlServerTransportStore
             transaction,
             _options.SchemaName,
             "transport",
+            ExpectedObjects(),
+            cancellationToken);
+
+    /// <summary>The catalog shape this store's DDL intends — the single source for both the
+    /// post-DDL verification and the failed-batch diagnosis.</summary>
+    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.MessageTable, SqlServerObjectKind.Table,
                 [
                     new("id", "uniqueidentifier", Nullable: false),
                     new("queue", "nvarchar(200)", Nullable: false, RequiresBinaryCollation: true),
                     new("payload_json", "nvarchar(max)", Nullable: false),
-                    new("headers_json", "nvarchar(max)", Nullable: false),
-                    new("created_at", "datetime2", Nullable: false),
-                    new("available_at", "datetime2", Nullable: false),
+                    new("headers_json", "nvarchar(max)", Nullable: false, DefaultExpression: "(N'{}')"),
+                    new("created_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
+                    new("available_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
                     new("locked_until", "datetime2", Nullable: true),
                     new("lock_id", "uniqueidentifier", Nullable: true),
-                    new("attempts", "int", Nullable: false),
+                    new("attempts", "int", Nullable: false, DefaultExpression: "((0))"),
                     new("dead_letter_reason", "nvarchar(max)", Nullable: true)
-                ])
-            ],
-            cancellationToken);
+                ],
+                PrimaryKey: ["id"])
+            ];
 
-    /// <summary>
-    /// Re-runs the catalog verification after the DDL batch itself failed, to turn the provider's
-    /// error into the actionable one. Returns normally when nothing conclusive is found — the
-    /// caller then rethrows the original exception, the honest outcome for a failure that has
-    /// nothing to do with a name collision.
-    /// </summary>
-    private async Task ThrowDiagnosedCollisionAsync(SqlException failure, CancellationToken cancellationToken)
-    {
-        SqlConnection diagnosis;
-        try
-        {
-            diagnosis = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (SqlException)
-        {
-            return;
-        }
-
-        await using (diagnosis)
-        {
-            try
-            {
-                await VerifyRelationsAsync(diagnosis, transaction: null, cancellationToken).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException diagnosed)
-            {
-                throw new InvalidOperationException(diagnosed.Message, failure);
-            }
-        }
-    }
 
     /// <summary>
     /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
@@ -270,14 +259,33 @@ internal sealed class SqlServerTransportStore
             return null;
 
         var id = reader.GetGuid(0);
+        var claimedQueue = reader.GetString(1);
         var payload = reader.GetString(2);
         var headerJson = reader.GetString(3);
         var attempt = reader.GetInt32(4);
         var headers = DeserializeHeaders(headerJson);
 
+        // The row was selected with `queue = @queue`, but SQL Server pads the shorter operand of an
+        // equality comparison with spaces — under every collation, binary ones included — so a row
+        // whose queue differs only in trailing blanks matches. Startup validation rejects such
+        // names, and this re-check is the second half of that guarantee: it also covers rows an
+        // OLDER build (or another writer) put in the table. Claiming it already incremented the
+        // attempt and took the lock, so the lease is released rather than left to expire.
+        if (!string.Equals(claimedQueue, queue, StringComparison.Ordinal))
+        {
+            _logger?.LogError(
+                "The SQL Server transport claimed a row from queue '{ClaimedQueue}' while polling queue '{RequestedQueue}'. " +
+                "SQL Server's equality comparison ignores trailing spaces, so those two names are the same key to the database. " +
+                "The row was released untouched instead of being handled by the wrong subscriber; remove the trailing spaces from " +
+                "the configured queue names.",
+                claimedQueue, queue);
+            await ReleaseMisclaimedAsync(id, lockId).ConfigureAwait(false);
+            return null;
+        }
+
         return new SqlServerTransportDelivery(
             id,
-            reader.GetString(1),
+            claimedQueue,
             payload,
             headers,
             attempt,
@@ -376,6 +384,28 @@ internal sealed class SqlServerTransportStore
         command.Parameters.AddWithValue("@lock_id", lockId);
         command.Parameters.AddWithValue("@lock_timeout_ms", (long)lockTimeout.TotalMilliseconds);
         return await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false) > 0;
+    }
+
+    /// <summary>
+    /// Puts a row claimed by mistake back exactly as it was — including undoing the attempt the
+    /// claim charged it. A plain NAK would leave that increment behind, so repeated mis-claims
+    /// would walk somebody else's message to its delivery limit and dead-letter it.
+    /// </summary>
+    private async ValueTask ReleaseMisclaimedAsync(Guid id, Guid lockId)
+    {
+        await using var connection = await OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            $"""
+            UPDATE {MessageTable}
+            SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                locked_until = NULL,
+                lock_id = NULL
+            WHERE id = @id AND lock_id = @lock_id;
+            """;
+        command.Parameters.AddWithValue("@id", id);
+        command.Parameters.AddWithValue("@lock_id", lockId);
+        await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     private async ValueTask NakAsync(Guid id, Guid lockId, TimeSpan delay)

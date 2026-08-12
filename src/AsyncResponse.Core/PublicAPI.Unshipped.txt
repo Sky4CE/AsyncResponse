@@ -1,5 +1,6 @@
 #nullable enable
 AsyncResponse.AsyncResponseChannelOptions
+const AsyncResponse.AsyncResponseChannelOptions.MaxCorrelationIdLength = 400 -> int
 AsyncResponse.AsyncResponseChannelOptions.AsyncResponseChannelOptions() -> void
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.get -> System.TimeSpan?
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.set -> void

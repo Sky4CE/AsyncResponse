@@ -3,6 +3,7 @@ using AsyncResponse;
 using AsyncResponse.DurableFlows.EFCore;
 using AsyncResponse.DurableFlows.Internal;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -118,6 +119,14 @@ public static class EFCoreDurableFlowModelBuilderExtensions
     public const string DefaultTableName = "asyncresponse_flow_state";
 
     /// <summary>
+    /// Model annotation recording the <c>flowIdCollation</c> the mapping was configured with. The
+    /// store reads it at startup to refuse a case-folding provider left on its default; the
+    /// property's own collation cannot be used for that, because EF Core strips relational
+    /// configuration the runtime never reads out of the runtime model.
+    /// </summary>
+    internal const string FlowIdCollationAnnotation = "AsyncResponse:FlowIdCollation";
+
+    /// <summary>
     /// Maps <see cref="DurableFlowStateRecord"/> to the durable-flow state table. Call from
     /// <c>OnModelCreating</c>; the table then flows through the application's normal EF Core
     /// migrations (or <c>EnsureCreated</c>) like any other entity.
@@ -151,7 +160,12 @@ public static class EFCoreDurableFlowModelBuilderExtensions
             // provider's index-key size limit (SQL Server 900 bytes, MySQL 3072 bytes).
             entity.Property(r => r.FlowId).HasColumnName("flow_id").HasMaxLength(400);
             if (!string.IsNullOrWhiteSpace(flowIdCollation))
+            {
                 entity.Property(r => r.FlowId).UseCollation(flowIdCollation);
+                // Also recorded as a model annotation, which survives into the runtime model the
+                // store can actually read at startup.
+                entity.HasAnnotation(FlowIdCollationAnnotation, flowIdCollation);
+            }
             entity.Property(r => r.StateJson).HasColumnName("state_json").IsRequired();
             entity.Property(r => r.ExpiresAtUtc).HasColumnName("expires_at_utc");
             entity.Property(r => r.UpdatedAtUtc).HasColumnName("updated_at_utc");
@@ -402,14 +416,48 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         if (_modelChecked)
             return;
 
-        if (context.Model.FindEntityType(typeof(DurableFlowStateRecord)) is null)
-            throw new InvalidOperationException(
+        var entity = context.Model.FindEntityType(typeof(DurableFlowStateRecord))
+            ?? throw new InvalidOperationException(
                 $"'{typeof(TContext).Name}' does not map {nameof(DurableFlowStateRecord)}. Call " +
                 $"modelBuilder.{nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows)}() " +
                 "in OnModelCreating and add a migration for the durable-flow state table.");
 
+        // The flow_id column is a KEY the engine compares ordinally. This package owns no DDL, so
+        // it cannot pin the collation itself — but it can refuse to run against a mapping that
+        // leaves it to a provider whose default folds case. On SQL Server and MySQL that default
+        // makes 'flow-a' and 'FLOW-A' one primary key: the second StartAsync fails as a duplicate
+        // and a load returns the other run's state. Silence there is not an acceptable default.
+        // Read the decision from the annotation the mapping records, not from the property's
+        // collation: EF Core strips relational configuration the runtime never reads out of
+        // context.Model, and asking a runtime property for its collation throws outright.
+        var collation = entity.FindAnnotation(EFCoreDurableFlowModelBuilderExtensions.FlowIdCollationAnnotation)?.Value as string;
+        if (string.IsNullOrWhiteSpace(collation) && CaseFoldingProvider(context.Database.ProviderName) is { } provider)
+        {
+            throw new InvalidOperationException(
+                $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} without a " +
+                $"collation, and {provider} defaults to a case-insensitive one. Flow ids are compared ordinally, so two ids differing " +
+                "only in case would collide on the primary key — the second flow fails to start and a load returns the other run's " +
+                $"state. Pass the matching {nameof(AsyncResponseFlowIdCollations)} constant to " +
+                $"{nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows)}(flowIdCollation: …) and add a " +
+                "migration; on a database that is already case-sensitive, pass the collation it uses to record that intent.");
+        }
+
         _modelChecked = true;
     }
+
+    /// <summary>
+    /// Names the provider when its DEFAULT collation folds case, or <c>null</c> when the default is
+    /// already ordinal (PostgreSQL and SQLite compare byte-wise) or the provider is unknown — a
+    /// third-party provider gets the benefit of the doubt rather than a startup failure it has no
+    /// documented way to satisfy.
+    /// </summary>
+    private static string? CaseFoldingProvider(string? providerName) => providerName switch
+    {
+        not null when providerName.Contains("SqlServer", StringComparison.OrdinalIgnoreCase) => "SQL Server",
+        not null when providerName.Contains("MySql", StringComparison.OrdinalIgnoreCase)
+            || providerName.Contains("Pomelo", StringComparison.OrdinalIgnoreCase) => "MySQL",
+        _ => null
+    };
 
     private readonly struct ContextLease : IAsyncDisposable
     {

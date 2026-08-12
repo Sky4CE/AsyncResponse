@@ -132,6 +132,28 @@ public class DurableChildFlowTests
         Assert.Contains(expectedMessage, ex.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("flow-a ")]
+    [InlineData(" flow-a")]
+    public async Task RootFlowId_WithSurroundingSpaces_IsRejectedAtStart(string flowId)
+    {
+        // Probed on SQL Server 2022: equality pads the shorter operand even under
+        // Latin1_General_100_BIN2, and MySQL's utf8mb4_bin is PAD SPACE — so 'flow-a ' and
+        // 'flow-a' are ONE primary key to those stores, while the engine compares ids ordinally
+        // and believes it started two different runs. The second create fails as a duplicate and a
+        // load returns the other run's state.
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(new ChildFlowProbe());
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(
+            new RecursiveChildInput(0),
+            flowId));
+        Assert.Contains("begins or ends with a space", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task ChildFlowId_ComposedBeyondThePortableMaximum_FailsTheParentTerminally()
     {
