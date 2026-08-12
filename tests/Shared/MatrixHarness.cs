@@ -1324,7 +1324,13 @@ public sealed class MatrixFlowDbContext(DbContextOptions<MatrixFlowDbContext> op
 
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)
-        => modelBuilder.ConfigureAsyncResponseDurableFlows(schema: schema.Name);
+        // The matrix runs its EF Core cells on SQL Server, whose default collation is
+        // case-insensitive — which would fold two flow ids the engine treats as distinct onto one
+        // primary key. Declaring the collation is exactly what an application must do here, so the
+        // minimum the matrix writes includes it.
+        => modelBuilder.ConfigureAsyncResponseDurableFlows(
+            schema: schema.Name,
+            flowIdCollation: AsyncResponseFlowIdCollations.SqlServer);
 }
 
 /// <summary>
