@@ -112,6 +112,16 @@ Related: the domain payload JSON is **no longer embedded in
 payload (which may contain PII) does not leak into generic exception logs that print `ex.Message`.
 Log `PayloadJson` deliberately, where you intend to.
 
+### The library never logs a message body
+
+At every log level, including `Debug`. This matters most at the ingress, where every inbound
+response and every worker job passes through: a worker envelope carries the job's arguments and
+whatever the context propagators captured (tenant, auth, trace baggage), so logging it whole would
+put all of that in the application log the moment someone turned Debug on to diagnose something
+else. What is logged instead is a byte length and a SHA-256 prefix of the body — enough to line the
+entry up with whatever the broker's own capture tooling recorded — plus routing metadata that is
+safe by construction: the correlation id, the reply target, and the target service and method.
+
 ## Explicit correlation id
 
 `IAsyncResponsePublisher.SetResponse`/`SetException` take the correlation id as a **required**

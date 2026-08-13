@@ -574,7 +574,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // When no correlation id is provided, fall back to the ambient context.
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the response"))
             return;
 
         var channel = _keys.Channel(correlationId);
@@ -672,7 +672,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the raw response", dropContractViolations: true))
             return;
 
         var channel = _keys.Channel(correlationId);
@@ -766,7 +766,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the exception", exception))
             return;
 
         var channel = _keys.Channel(correlationId);

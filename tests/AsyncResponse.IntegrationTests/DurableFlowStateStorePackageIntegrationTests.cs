@@ -331,6 +331,61 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Fact]
+    public async Task MySqlPackageStore_AcceptsAMoreGenerousColumnShape()
+    {
+        // The false-positive guard for the shape check: widths and precisions are MINIMA, not exact
+        // matches. A schema that gives flow_id more room than the contract needs, or a wider
+        // lease_id, satisfies every promise the store makes — and had the check been written as
+        // equality it would pass every rejection case above while failing this perfectly good
+        // table at startup, which is the worse bug of the two.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_wide", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(700) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(128) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        INDEX `{table}_expires_idx` (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            // Starts, and works: the whole ledger contract on the more generous shape.
+            Assert.True(await store.TryCreateAsync("wide", CreateState("wide"), TimeSpan.FromMinutes(5)));
+            Assert.NotNull(await store.LoadAsync("wide"));
+            Assert.True(await store.TryAcquireLeaseAsync("wide", "owner", TimeSpan.FromMinutes(1)));
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task MySqlPackageStore_AcceptsAUniqueIndexInsteadOfAPrimaryKey()
     {
         // The false-positive guard for the rejection below, and the reason the check asks about
@@ -409,9 +464,81 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Theory]
+    // Narrower than the public flow-id contract: passes a name-only check, then truncates or errors
+    // on the first long id. 400 characters is what the engine promises to carry.
+    [InlineData("flow_id varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY", "flow_id", "at least 400")]
+    // datetime with no sub-second precision: every lease and expiry comparison this store makes runs
+    // on UTC_TIMESTAMP(6), so a whole-second column rounds the fencing arithmetic and two workers
+    // can hold one lease.
+    [InlineData("expires_at_utc datetime NOT NULL", "expires_at_utc", "at least 6")]
+    // NOT NULL where the store writes NULL: releasing a lease sets lease_id = NULL and would fail.
+    [InlineData("lease_id varchar(64) NOT NULL", "lease_id", "NOT NULL")]
+    // Wrong type outright, which is the first rule the check applies: a `text` state_json tops out
+    // at 64 KiB where the store writes ledgers into a `longtext`.
+    [InlineData("state_json text NOT NULL", "state_json", "is a 'text'")]
+    public async Task MySqlPackageStore_RejectsAColumnWhoseShapeCannotServeTheStore(
+        string columnDeclaration,
+        string columnName,
+        string expectedReason)
+    {
+        // Names alone are not a shape. Every one of these tables has all seven columns with the
+        // right names and a binary-collated primary key, and every one of them breaks the store at
+        // runtime rather than at startup.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_shape", 64);
+        var columns = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["flow_id"] = "flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY",
+            ["state_json"] = "state_json longtext NOT NULL",
+            ["expires_at_utc"] = "expires_at_utc datetime(6) NOT NULL",
+            ["updated_at_utc"] = "updated_at_utc datetime(6) NOT NULL",
+            ["revision"] = "revision bigint NOT NULL DEFAULT 0",
+            ["lease_id"] = "lease_id varchar(64) NULL",
+            ["lease_expires_at_utc"] = "lease_expires_at_utc datetime(6) NULL"
+        };
+        columns[columnName] = columnDeclaration;
+
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText = $"CREATE TABLE `{table}` ({string.Join(", ", columns.Values)});";
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("shape", CreateState("shape"), TimeSpan.FromMinutes(5)));
+            Assert.Contains(columnName, ex.Message, StringComparison.Ordinal);
+            Assert.Contains(expectedReason, ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Theory]
     // No key at all, and a COMPOSITE primary key: both permit two rows with the same flow_id.
     [InlineData("")]
     [InlineData(", PRIMARY KEY (flow_id, revision)")]
+    // A PREFIX key fails the OPPOSITE way: it constrains only the first 100 characters, so two
+    // distinct 101-character ids collide on 1062 and the second flow never starts. Prefix keys are
+    // a common way to fit an index under MySQL's key-length limit, so this is a plausible schema.
+    [InlineData(", UNIQUE KEY flow_prefix_uq (flow_id(100))")]
     public async Task MySqlPackageStore_RejectsATableWithoutAUniqueKeyOnFlowIdAlone(string keyClause)
     {
         // Starting a flow is an insert-if-absent, and this store learns "it already exists" from
@@ -454,7 +581,7 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
 
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => store.TryCreateAsync("dup", CreateState("dup"), TimeSpan.FromMinutes(5)));
-            Assert.Contains("no unique key on flow_id alone", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("no unique key on the whole of flow_id", ex.Message, StringComparison.Ordinal);
             Assert.Contains("ADD PRIMARY KEY (flow_id)", ex.Message, StringComparison.Ordinal);
         }
         finally

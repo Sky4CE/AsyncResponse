@@ -37,6 +37,31 @@ public sealed class CapturingLogger<T> : ILogger<T>
         get { lock (_entries) return [.. _entries]; }
     }
 
+    /// <summary>
+    /// Waits for the logger itself to record a matching entry. The scheduler's own work is the
+    /// thing under test in some of these facts, and it does not always enqueue a worker job —
+    /// an input factory that throws, for instance, fails before anything reaches the queue. Waiting
+    /// for worker idleness there proves nothing: the queue is already idle, so the assertion runs
+    /// against whatever the scheduler happens to have logged by then, and passes or fails with the
+    /// machine's load. Wait for the signal the assertion is actually about.
+    /// </summary>
+    public async Task<(LogLevel Level, string Message)> WaitForEntryAsync(
+        Func<(LogLevel Level, string Message), bool> match,
+        string expectation)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            if (Entries.FirstOrDefault(match) is { Message: not null } found)
+                return found;
+
+            if (DateTime.UtcNow > deadline)
+                throw new TimeoutException($"Timed out waiting for {expectation}. Logged: [{string.Join("; ", Entries.Select(entry => $"{entry.Level}: {entry.Message}"))}]");
+
+            await Task.Delay(20);
+        }
+    }
+
     IDisposable? ILogger.BeginScope<TState>(TState state) => null;
 
     bool ILogger.IsEnabled(LogLevel logLevel) => true;
@@ -159,14 +184,18 @@ public class ScheduledFlowTests
         });
 
         await harness.AdvanceAsync(TimeSpan.FromMinutes(31));
-        await harness.Engine.WaitForWorkerIdleAsync();
 
         // NOTHING was started — the user's input factory threw before any store call. Pre-fix the
         // broad InvalidOperationException catch classified this as the benign deterministic-id
         // duplicate and logged "already started with different input … ran exactly once" — a
         // successful occurrence report for an occurrence that never ran. It is a failed start.
-        var error = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
+        // Waited for through the scheduler's own log rather than worker idleness: this occurrence
+        // never reaches the worker queue, so the queue is idle from the start and proves nothing.
+        var error = await logger.WaitForEntryAsync(
+            entry => entry.Level == LogLevel.Error,
+            "the scheduler to log the failed start");
         Assert.Contains("failed to start occurrence", error.Message, StringComparison.Ordinal);
+        Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Error);
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("already started with different input", StringComparison.Ordinal));
     }
 
@@ -209,8 +238,14 @@ public class ScheduledFlowTests
         Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
 
         Assert.Single(recorder.Entries);
-        Assert.Contains(logger.Entries, entry => entry.Level == LogLevel.Warning
-            && entry.Message.Contains("not deterministic across replicas", StringComparison.Ordinal));
+
+        // Same reasoning as the fact above, one step removed: the assertion is about the LOSER
+        // replica's log line, and the winner's run finishing says nothing about when the loser
+        // reached its catch. Wait for the line itself.
+        await logger.WaitForEntryAsync(
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("not deterministic across replicas", StringComparison.Ordinal),
+            "the losing replica to report the benign duplicate");
         Assert.DoesNotContain(logger.Entries, entry => entry.Level == LogLevel.Error);
     }
 

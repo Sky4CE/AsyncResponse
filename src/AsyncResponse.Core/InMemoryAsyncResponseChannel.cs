@@ -220,7 +220,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the response"))
             return;
 
         try
@@ -297,7 +297,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         activity?.SetTag("asyncresponse.channel", "inmemory");
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the raw response", dropContractViolations: true))
             return;
 
         try
@@ -364,7 +364,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the exception", exception))
             return;
 
         try

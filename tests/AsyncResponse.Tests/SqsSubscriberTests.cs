@@ -575,6 +575,48 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task ClientAdapter_RoundsSubSecondDurationsUp_NeverDownToZero()
+    {
+        // SQS speaks whole seconds, so every duration crosses an int conversion — and truncating
+        // is not a rounding nicety. A 500 ms visibility timeout floored to 0 makes the message
+        // visible again the instant it is received, so a second consumer picks it up while the
+        // first is still handling it: concurrent duplicate handling, which is precisely what the
+        // visibility timeout exists to prevent. A redelivery delay floored to 0 is a hot retry
+        // loop for the same reason. All three of these values are accepted by options validation.
+        var sdkClient = new Mock<IAmazonSQS>();
+        ReceiveMessageRequest? captured = null;
+        var visibilityChanges = new List<int>();
+        sdkClient
+            .Setup(c => c.ReceiveMessageAsync(It.IsAny<ReceiveMessageRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<ReceiveMessageRequest, CancellationToken>((request, _) => captured = request)
+            .ReturnsAsync(new ReceiveMessageResponse
+            {
+                Messages = [new Message { MessageId = "m-1", Body = "{}", ReceiptHandle = "receipt-1" }]
+            });
+        sdkClient
+            .Setup(c => c.ChangeMessageVisibilityAsync("https://queue-url", "receipt-1", It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Callback<string, string, int?, CancellationToken>((_, _, seconds, _) => visibilityChanges.Add(seconds ?? -1))
+            .ReturnsAsync(new ChangeMessageVisibilityResponse());
+        var adapter = new SqsClientAdapter(sdkClient.Object, ownsClient: false);
+
+        var deliveries = await adapter.ReceiveMessagesAsync(new SqsReceiveRequest(
+            "https://queue-url",
+            MaxMessages: 1,
+            WaitTime: TimeSpan.FromMilliseconds(500),
+            VisibilityTimeout: TimeSpan.FromMilliseconds(500)));
+        var delivery = Assert.Single(deliveries);
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromMilliseconds(1));
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(1.2));
+        // Zero survives as zero: "make it visible now" is a legitimate request, not a rounding case.
+        await delivery.ChangeVisibilityAsync(TimeSpan.Zero);
+
+        Assert.NotNull(captured);
+        Assert.Equal(1, captured.WaitTimeSeconds);
+        Assert.Equal(1, captured.VisibilityTimeout);
+        Assert.Equal([1, 2, 0], visibilityChanges);
+    }
+
+    [Fact]
     public async Task ClientAdapter_ReceiveWithoutMessages_ReturnsEmpty()
     {
         var sdkClient = new Mock<IAmazonSQS>();

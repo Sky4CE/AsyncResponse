@@ -269,10 +269,6 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         }
     }
 
-    /// <summary>The columns this store reads and writes; a table missing any of them cannot serve it.</summary>
-    private static readonly string[] RequiredColumns =
-        ["flow_id", "state_json", "expires_at_utc", "updated_at_utc", "revision", "lease_id", "lease_expires_at_utc"];
-
     /// <summary>
     /// Checks the table this store will actually use, independently of who created it.
     /// <c>CREATE TABLE IF NOT EXISTS</c> leaves a table made by an earlier build (or by hand)
@@ -296,19 +292,28 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     /// </summary>
     private async Task VerifyFlowTableAsync(MySqlConnection connection, CancellationToken cancellationToken)
     {
-        var columns = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var columns = new Dictionary<string, ActualColumn>(StringComparer.OrdinalIgnoreCase);
         await using (var command = connection.CreateCommand())
         {
             command.CommandText =
                 """
-                SELECT COLUMN_NAME, COLLATION_NAME
+                SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLLATION_NAME, IS_NULLABLE,
+                       CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION
                 FROM information_schema.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table;
                 """;
             command.Parameters.AddWithValue("@table", _options.TableName);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                columns[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
+            {
+                columns[reader.GetString(0)] = new ActualColumn(
+                    DataType: reader.GetString(1),
+                    ColumnType: reader.GetString(2),
+                    Collation: reader.IsDBNull(3) ? null : reader.GetString(3),
+                    Nullable: string.Equals(reader.GetString(4), "YES", StringComparison.OrdinalIgnoreCase),
+                    MaxLength: reader.IsDBNull(5) ? null : reader.GetInt64(5),
+                    DateTimePrecision: reader.IsDBNull(6) ? null : reader.GetInt64(6));
+            }
         }
 
         if (columns.Count == 0)
@@ -319,19 +324,29 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             return;
         }
 
-        foreach (var required in RequiredColumns)
+        foreach (var expected in ExpectedColumns)
         {
-            if (!columns.ContainsKey(required))
+            if (!columns.TryGetValue(expected.Name, out var actual))
             {
                 throw new InvalidOperationException(
-                    $"The MySQL durable-flow table '{_options.TableName}' has no '{required}' column. It was created by an earlier " +
-                    "build or by hand and does not match the shape this store reads and writes " +
-                    $"({string.Join(", ", RequiredColumns)}). Re-create it, or add the missing columns — the DDL is in " +
-                    "docs/durable-flow-state-stores.md.");
+                    $"The MySQL durable-flow table '{_options.TableName}' has no '{expected.Name}' column. It was created by an " +
+                    "earlier build or by hand and does not match the shape this store reads and writes " +
+                    $"({string.Join(", ", ExpectedColumns.Select(column => $"{column.Name} {column.Declaration}"))}). Re-create it, " +
+                    "or add the missing columns — the DDL is in docs/durable-flow-state-stores.md.");
+            }
+
+            if (expected.Mismatch(actual) is { } mismatch)
+            {
+                throw new InvalidOperationException(
+                    $"The MySQL durable-flow table '{_options.TableName}' declares {expected.Name} as '{actual.ColumnType}" +
+                    $"{(actual.Nullable ? " NULL" : " NOT NULL")}', which {mismatch}. This store needs " +
+                    $"{expected.Name} {expected.Declaration}. Fix it with " +
+                    $"ALTER TABLE `{_options.TableName}` MODIFY {expected.Name} {expected.Declaration}; " +
+                    "(tables this build creates get that shape automatically).");
             }
         }
 
-        var collation = columns["flow_id"];
+        var collation = columns["flow_id"].Collation;
         if (collation is null || !collation.EndsWith("_bin", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
@@ -345,11 +360,76 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>One column as <c>information_schema</c> reports it.</summary>
+    private readonly record struct ActualColumn(
+        string DataType,
+        string ColumnType,
+        string? Collation,
+        bool Nullable,
+        long? MaxLength,
+        long? DateTimePrecision);
+
     /// <summary>
-    /// Requires a unique index keyed on flow_id and nothing else. The PRIMARY KEY this store's DDL
-    /// declares is the usual one, but any single-column unique index raises the 1062 that
-    /// <see cref="TryCreateAsync"/> reads as "already exists", so all of them are accepted. A
-    /// COMPOSITE unique key is not: it permits two rows with the same flow_id.
+    /// What this store needs from one column, and the check that says so. Widths and precisions are
+    /// MINIMA rather than exact matches: a wider flow_id or a higher-precision timestamp still
+    /// satisfies every promise the store makes, and rejecting a more generous schema would be a
+    /// false alarm. Too NARROW is not — <c>varchar(10)</c> passes a name-only check and then
+    /// truncates or errors on the first 400-character id the public contract permits.
+    /// </summary>
+    private sealed record ExpectedColumn(string Name, string Declaration, string DataType, bool Nullable, long? Minimum = null)
+    {
+        internal string? Mismatch(ActualColumn actual)
+        {
+            if (!string.Equals(actual.DataType, DataType, StringComparison.OrdinalIgnoreCase))
+                return $"is a '{actual.DataType}'";
+            if (actual.Nullable != Nullable)
+                return Nullable ? "is NOT NULL (this store writes NULL to it)" : "is nullable";
+            if (Minimum is not { } minimum)
+                return null;
+
+            // CHARACTER_MAXIMUM_LENGTH for the string columns, DATETIME_PRECISION for the
+            // timestamps: a datetime(0) column silently rounds the sub-second lease arithmetic this
+            // store runs on UTC_TIMESTAMP(6), which is how two workers end up holding one lease.
+            var actualSize = actual.MaxLength ?? actual.DateTimePrecision;
+            return actualSize is { } size && size >= minimum
+                ? null
+                : $"holds {actualSize?.ToString() ?? "an unknown size"} where at least {minimum} is required";
+        }
+    }
+
+    /// <summary>
+    /// The shape this store reads and writes. No default expressions are verified because none are
+    /// load-bearing: every write names every column except the two lease fields, whose absence
+    /// means NULL.
+    /// </summary>
+    private static readonly ExpectedColumn[] ExpectedColumns =
+    [
+        new("flow_id", "varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL", "varchar", Nullable: false, Minimum: 400),
+        new("state_json", "longtext NOT NULL", "longtext", Nullable: false),
+        new("expires_at_utc", "datetime(6) NOT NULL", "datetime", Nullable: false, Minimum: 6),
+        new("updated_at_utc", "datetime(6) NOT NULL", "datetime", Nullable: false, Minimum: 6),
+        new("revision", "bigint NOT NULL DEFAULT 0", "bigint", Nullable: false),
+        new("lease_id", "varchar(64) NULL", "varchar", Nullable: true, Minimum: 64),
+        new("lease_expires_at_utc", "datetime(6) NULL", "datetime", Nullable: true, Minimum: 6)
+    ];
+
+    /// <summary>
+    /// Requires a unique index keyed on the WHOLE of flow_id and nothing else. The PRIMARY KEY this
+    /// store's DDL declares is the usual one, but any single-column unique index raises the 1062
+    /// that <see cref="TryCreateAsync"/> reads as "already exists", so all of them are accepted.
+    /// Two shapes are not:
+    /// <list type="bullet">
+    /// <item><description>
+    /// A COMPOSITE unique key — it permits two rows with the same flow_id.
+    /// </description></item>
+    /// <item><description>
+    /// A PREFIX key (<c>UNIQUE (flow_id(100))</c>, <c>SUB_PART = 100</c>) — the opposite failure,
+    /// and the reason this asks about SUB_PART. It constrains only the first N characters, so two
+    /// ids the library treats as distinct collide on 1062 and the second flow never starts. Ids run
+    /// to 400 characters by contract, and prefix keys are a common way to fit an index under
+    /// MySQL's key-length limit, so this is a plausible hand-written schema, not a hypothetical.
+    /// </description></item>
+    /// </list>
     /// </summary>
     private async Task VerifyFlowIdIsUniqueAsync(MySqlConnection connection, CancellationToken cancellationToken)
     {
@@ -360,6 +440,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             FROM information_schema.STATISTICS s
             WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = @table
               AND s.NON_UNIQUE = 0 AND s.COLUMN_NAME = 'flow_id' AND s.SEQ_IN_INDEX = 1
+              AND s.SUB_PART IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM information_schema.STATISTICS o
                   WHERE o.TABLE_SCHEMA = s.TABLE_SCHEMA AND o.TABLE_NAME = s.TABLE_NAME
@@ -372,11 +453,12 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             return;
 
         throw new InvalidOperationException(
-            $"The MySQL durable-flow table '{_options.TableName}' has no unique key on flow_id alone. Starting a flow is an " +
-            "insert-if-absent, and this store learns that a ledger already exists from MySQL's duplicate-key error — without that " +
-            "key nothing reports the duplicate, so two concurrent starts of the same flow id both succeed and the flow runs twice. " +
-            $"Fix it with ALTER TABLE `{_options.TableName}` ADD PRIMARY KEY (flow_id); (tables this build creates declare it " +
-            "automatically).");
+            $"The MySQL durable-flow table '{_options.TableName}' has no unique key on the whole of flow_id. Starting a flow is an " +
+            "insert-if-absent, and this store learns that a ledger already exists from MySQL's duplicate-key error. Without such a " +
+            "key nothing reports the duplicate, so two concurrent starts of one flow id both succeed and the flow runs twice; with " +
+            "a PREFIX key (flow_id(n)) the opposite happens, and two distinct ids sharing their first n characters collide so the " +
+            $"second never starts. Fix it with ALTER TABLE `{_options.TableName}` ADD PRIMARY KEY (flow_id); (tables this build " +
+            "creates declare it automatically).");
     }
 
     private async Task<bool> UpdateLeaseAsync(

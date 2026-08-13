@@ -635,7 +635,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the response"))
             return;
 
         var subject = _subjects.ResponseSubject(correlationId);
@@ -717,7 +717,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the raw response", dropContractViolations: true))
             return;
 
         var subject = _subjects.ResponseSubject(correlationId);
@@ -802,7 +802,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the exception", exception))
             return;
 
         var subject = _subjects.ResponseSubject(correlationId);

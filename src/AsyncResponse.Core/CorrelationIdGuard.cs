@@ -12,11 +12,14 @@ namespace AsyncResponse;
 /// space-padded one is the SAME key as its trimmed form to a database while the library compares
 /// ids ordinally — a response stored under it can surface at another waiter.
 /// <para>
-/// The two sides of a channel answer differently on purpose, matching what each caller can do
-/// about it. Subscribing takes the id from the application, so a violation is an argument error and
-/// throws. Publishing may be driven by an inbound broker message, where throwing turns one bad id
-/// into an endless redelivery loop — so it takes the route blank ids already take: log loudly,
-/// acknowledge, and never write the row.
+/// Two failures, told apart because callers can do different things about them. A BLANK id carries
+/// no information to act on, so it is logged and skipped wherever it appears — that has always been
+/// the behaviour and an inbound message with no id can only be dropped. A NON-BLANK id that breaks
+/// the contract is a caller bug: the library throws it back at every public entry point, because
+/// swallowing it turns a typo into a waiter that simply times out much later, with nothing at the
+/// call site to explain why. Only the untrusted edge — <see cref="IAsyncResponseIngress"/> and the
+/// raw publish path it drives — downgrades that to a drop, since a broker message that throws comes
+/// straight back around on redelivery, forever.
 /// </para>
 /// </summary>
 internal static class CorrelationIdGuard
@@ -35,10 +38,33 @@ internal static class CorrelationIdGuard
     }
 
     /// <summary>
-    /// Reports whether a PUBLISH must be abandoned because its correlation id cannot route,
-    /// having already logged the reason and marked <paramref name="activity"/>. Returns
-    /// <c>false</c> — and narrows <paramref name="correlationId"/> to non-null — when the publish
-    /// may proceed.
+    /// Classifies an id without acting on it: the shared answer behind every caller below, and
+    /// behind the ingress's own drop decision.
+    /// </summary>
+    internal static bool IsUnroutable([NotNullWhen(false)] string? correlationId, out UnroutableReason reason)
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            reason = new("correlation_id_null", "no correlation id", ContractViolation: false);
+            return true;
+        }
+
+        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is { } rejection)
+        {
+            reason = new("correlation_id_not_portable", rejection, ContractViolation: true);
+            return true;
+        }
+
+        reason = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Guards a PUBLISH. Returns <c>false</c> — narrowing <paramref name="correlationId"/> to
+    /// non-null — when the publish may proceed, and <c>true</c> when it must be abandoned, having
+    /// already logged the reason and marked <paramref name="activity"/>. A non-blank id that breaks
+    /// the contract throws instead, unless <paramref name="dropContractViolations"/> says this
+    /// caller is the untrusted edge.
     /// </summary>
     /// <param name="correlationId">The id the publish was addressed to.</param>
     /// <param name="logger">The publishing channel's logger.</param>
@@ -48,35 +74,50 @@ internal static class CorrelationIdGuard
     /// The exception a <c>SetException</c> publish was carrying; included in the log so the
     /// technical failure it described is not lost along with its unroutable id.
     /// </param>
-    internal static bool IsUnroutable(
+    /// <param name="dropContractViolations">
+    /// <c>true</c> only on the raw publish path, which exists to serve inbound broker messages:
+    /// throwing there would fail the delivery, and the transport would redeliver an id that can
+    /// never become valid. The ingress rejects such ids before this point; this is the backstop.
+    /// </param>
+    internal static bool IsUnpublishable(
         [NotNullWhen(false)] string? correlationId,
         ILogger logger,
         Activity? activity,
         string what,
-        Exception? dropped = null)
+        Exception? dropped = null,
+        bool dropContractViolations = false)
     {
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            if (dropped is null)
-                logger.LogWarning("CorrelationId is null; cannot publish {What}.", what);
-            else
-                logger.LogWarning("CorrelationId is null; cannot publish {What}. Exception: {ExceptionMessage}", what, dropped.Message);
-
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", $"CorrelationId is null; cannot publish {what}.");
-            return true;
-        }
-
-        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is not { } rejection)
+        if (!IsUnroutable(correlationId, out var reason))
             return false;
 
-        // Error, not warning: unlike a missing id this one looks routable, so it would otherwise
-        // fail much later — at the storage write, or worse, at somebody else's waiter.
-        if (dropped is null)
-            logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection}", what, rejection);
-        else
-            logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection} Exception: {ExceptionMessage}", what, rejection, dropped.Message);
+        if (reason.ContractViolation && !dropContractViolations)
+            throw new ArgumentException(reason.Description, nameof(correlationId));
 
-        AsyncResponseDiagnostics.SetError(activity, "correlation_id_not_portable", rejection);
+        if (reason.ContractViolation)
+        {
+            // Error, not warning: unlike a missing id this one looks routable, so left alone it
+            // would fail much later — at the storage write, or worse, at somebody else's waiter.
+            if (dropped is null)
+                logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection}", what, reason.Description);
+            else
+                logger.LogError("Cannot publish {What}; the correlation id is outside the portable contract. {Rejection} Exception: {ExceptionMessage}", what, reason.Description, dropped.Message);
+        }
+        else if (dropped is null)
+        {
+            logger.LogWarning("CorrelationId is null; cannot publish {What}.", what);
+        }
+        else
+        {
+            logger.LogWarning("CorrelationId is null; cannot publish {What}. Exception: {ExceptionMessage}", what, dropped.Message);
+        }
+
+        AsyncResponseDiagnostics.SetError(activity, reason.ErrorType, $"Cannot publish {what}: {reason.Description}.");
         return true;
     }
+
+    /// <summary>
+    /// Why an id cannot route: the span's <c>error.type</c> tag, the human-readable phrase, and
+    /// whether it is a caller's contract violation (throwable) rather than a missing id.
+    /// </summary>
+    internal readonly record struct UnroutableReason(string ErrorType, string Description, bool ContractViolation);
 }

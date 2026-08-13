@@ -104,12 +104,12 @@ internal sealed class SqsClientAdapter(
         {
             QueueUrl = request.QueueUrl,
             MaxNumberOfMessages = request.MaxMessages,
-            WaitTimeSeconds = (int)request.WaitTime.TotalSeconds,
+            WaitTimeSeconds = WholeSeconds(request.WaitTime),
             MessageSystemAttributeNames = [MessageSystemAttributeName.ApproximateReceiveCount],
             MessageAttributeNames = ["All"]
         };
         if (request.VisibilityTimeout is { } visibilityTimeout)
-            receive.VisibilityTimeout = (int)visibilityTimeout.TotalSeconds;
+            receive.VisibilityTimeout = WholeSeconds(visibilityTimeout);
 
         var response = await inner.ReceiveMessageAsync(receive, cancellationToken).ConfigureAwait(false);
         // AWS SDK v4 leaves collections null when the response carries no items.
@@ -155,9 +155,21 @@ internal sealed class SqsClientAdapter(
             delay => new ValueTask(inner.ChangeMessageVisibilityAsync(
                 queueUrl,
                 receiptHandle,
-                (int)delay.TotalSeconds,
+                WholeSeconds(delay),
                 CancellationToken.None)));
     }
+
+    /// <summary>
+    /// Converts a duration to the whole seconds SQS speaks, rounding UP so a positive value never
+    /// becomes zero. Truncation is not a rounding nicety here: a 500 ms visibility timeout floored
+    /// to 0 makes the message visible again immediately, and a second consumer picks it up while
+    /// the first is still handling it — the exactly-one-handler guarantee the timeout exists for.
+    /// A redelivery delay floored to 0 is a hot retry loop for the same reason. Zero itself is
+    /// preserved, because "make it visible now" is a legitimate request. This matches the delayed
+    /// publish path, which already rounds up.
+    /// </summary>
+    private static int WholeSeconds(TimeSpan value)
+        => value <= TimeSpan.Zero ? 0 : (int)Math.Min(Math.Ceiling(value.TotalSeconds), int.MaxValue);
 
     /// <summary>Releases resources held by this instance.</summary>
     public ValueTask DisposeAsync()

@@ -259,18 +259,15 @@ public abstract class ChannelConformanceSuite
     }
 
     [Fact]
-    public async Task Contract_EveryPublishEntryPointDropsANonPortableCorrelationId()
+    public async Task Contract_EveryPublishEntryPointRefusesANonPortableCorrelationId()
     {
-        // Publishing may be driven by an inbound broker message, where throwing turns one bad id
-        // into an endless redelivery loop — so it takes the route a blank id already takes: logged,
-        // acknowledged, and never written. What matters is that the row never lands. To a database
-        // 'abc ' and 'abc' are ONE key, while the library compares them ordinally, so a stored
-        // padded row is a response sitting in another conversation's mailbox.
-        // All THREE publish entry points are covered, because they are three separate guards:
-        // the typed publish, the raw-JSON ingress path, and the exception publish.
-        // On delivery this pins the contract rather than proving a fix — the channels already
-        // refuse a mismatched delivery downstream (ordinal keys in memory, the dispatch re-check on
-        // the relational stores). What is new is that nothing is written or thrown on the way in.
+        // To a database 'abc ' and 'abc' are ONE key, while the library compares them ordinally, so
+        // a stored padded row is a response sitting in another conversation's mailbox. Every publish
+        // entry point refuses to write one — but the PUBLIC ones throw, because they are called by
+        // application code and swallowing a typo there just leaves a waiter to time out later with
+        // nothing at the call site to explain why. Only the raw path, which exists to serve inbound
+        // broker messages, drops instead: throwing there fails the delivery and the transport
+        // redelivers an id that can never become valid.
         await using var harness = await CreateHarnessAsync();
         var correlationId = NewCorrelationId("padded");
         var padded = correlationId + " ";
@@ -279,18 +276,44 @@ public abstract class ChannelConformanceSuite
         await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
             correlationId, timeout: WaiterTimeout);
 
-        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "smuggled"), padded);
+        await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "smuggled"), padded));
+        await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "too long"), overlong));
+        await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => harness.Publisher.SetException(new InvalidOperationException("smuggled failure"), padded));
+
+        // The raw path takes the ingress's answer: acknowledged, logged, never written.
         await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"smuggled raw"}""", padded);
-        await harness.Publisher.SetException(new InvalidOperationException("smuggled failure"), padded);
-        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "too long"), overlong);
 
         await Task.Delay(SettleDelay);
         Assert.False(waiter.ResponseTask.IsCompleted);
 
-        // The waiter is still armed for its own id — the drops cost it nothing.
+        // The waiter is still armed for its own id — the refusals cost it nothing.
         await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "mine"), correlationId);
         var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
         Assert.Equal("mine", result.Message);
+    }
+
+    [Fact]
+    public async Task Contract_ABlankCorrelationIdPublishIsANoOp_NotAThrow()
+    {
+        // The deliberate carve-out beside the fact above, and the reason the two are not one rule.
+        // A blank id is not a caller's typo to hand back — there is no id to complain about and
+        // nothing to route — so it keeps the log-and-skip it has always had, on every channel.
+        // Without this the natural simplification is "any bad id throws", which would break every
+        // adapter that legitimately hands the publisher whatever it failed to extract.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("blank-sibling");
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "nowhere"), " ");
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"nowhere raw"}""", " ");
+        await harness.Publisher.SetException(new InvalidOperationException("nowhere failure"), " ");
+
+        await Task.Delay(SettleDelay);
+        Assert.False(waiter.ResponseTask.IsCompleted);
     }
 
     [Fact]

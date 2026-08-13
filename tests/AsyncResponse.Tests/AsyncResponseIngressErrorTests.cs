@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -83,6 +84,48 @@ public class AsyncResponseIngressErrorTests
         Assert.Null(publisher.Exception);
     }
 
+    [Fact]
+    public async Task HandleWorkerMessageAsync_WithAnUnparseableEnvelope_StillNeverLogsIt()
+    {
+        // The other half of the worker path: a body that never becomes an envelope at all. It takes
+        // a different route — the failure is thrown out of deserialization, before any field has
+        // been read — so the "log safe metadata once parsed" step never runs and the only thing
+        // standing between the body and the log is the digest line. A malformed body is exactly the
+        // one an operator turns Debug on to inspect, which is when it would have leaked.
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => ingress.HandleWorkerMessageAsync("""{"Call":{"broken":"card 4111-1111-1111-1111"}"""));
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("corr-e ")]
+    [InlineData(" corr-e")]
+    [InlineData("looooong")]
+    public async Task HandleResponseMessageAsync_NonPortableCorrelationId_DropsMessageWithoutLoggingIt(string correlationId)
+    {
+        // The drop branch logs at ERROR — the loudest level in this file, and the one most likely
+        // to be on — so it is also the branch where a body would be most exposed. Same rule: the
+        // digest, never the payload.
+        if (correlationId == "looooong")
+            correlationId = new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength + 1);
+
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var rawPublisher = new ThrowingRawPublisher();
+        var ingress = CreateIngress(rawPublisher, new RecordingPublisher(), logger);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"card 4111-1111-1111-1111"}""", correlationId);
+
+        Assert.Equal(0, rawPublisher.RawJsonCalls);
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
+        Assert.Contains(logger.Entries, entry =>
+            entry.Level == LogLevel.Error && entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Theory]
     [InlineData("corr-e ")]
     [InlineData(" corr-e")]
@@ -119,9 +162,59 @@ public class AsyncResponseIngressErrorTests
         await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync("{not-json"));
     }
 
+    [Fact]
+    public async Task HandleResponseMessageAsync_NeverLogsThePayloadBody()
+    {
+        // Response payloads carry application data — this project's own security policy keeps them
+        // out of logs (docs/security.md), and the ingress states that policy in a comment fifteen
+        // lines above where it used to log the entire body at Debug. Debug is on in plenty of
+        // production deployments, and this is the first place every inbound response passes.
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"card 4111-1111-1111-1111"}""", "corr-log");
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
+        // Still traceable: size and content hash line the entry up with broker-side capture.
+        Assert.Contains(logger.Entries, entry =>
+            entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase)
+            && entry.Message.Contains("corr-log", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HandleWorkerMessageAsync_NeverLogsTheEnvelope()
+    {
+        // Worse than a response body: the worker envelope carries the job's ARGUMENTS and whatever
+        // the context propagators captured — tenant, auth, trace baggage. Execution fails here (no
+        // such service is registered), which is the point: neither the happy path nor the failure
+        // path may put the envelope in the log.
+        var logger = new CapturingLogger<AsyncResponseIngress>();
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
+        var envelope = AsyncResponseJson.Serialize(new WorkerJobEnvelope
+        {
+            CorrelationId = "corr-worker",
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "Contoso.IBilling",
+                MethodName = "Charge",
+                Params = [CallbackParam.ForValue("card 4111-1111-1111-1111")]
+            },
+            Context = new Dictionary<string, string> { ["tenant"] = "acme-secret" }
+        });
+
+        await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync(envelope));
+
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("acme-secret", StringComparison.Ordinal));
+        // Safe routing metadata is still logged — the service and method are the point of the line.
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("Contoso.IBilling.Charge", StringComparison.Ordinal));
+    }
+
     private static AsyncResponseIngress CreateIngress(
         IRawAsyncResponsePublisher rawPublisher,
-        IAsyncResponsePublisher publisher)
+        IAsyncResponsePublisher publisher,
+        ILogger<AsyncResponseIngress>? logger = null)
     {
         var provider = new ServiceCollection().BuildServiceProvider();
         return new AsyncResponseIngress(
@@ -129,7 +222,7 @@ public class AsyncResponseIngressErrorTests
             publisher,
             new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance),
             new AsyncResponseContextPropagation([]),
-            NullLogger<AsyncResponseIngress>.Instance);
+            logger ?? NullLogger<AsyncResponseIngress>.Instance);
     }
 
     private sealed class ThrowingRawPublisher(Exception? _exception = null, int _failures = int.MaxValue) : IRawAsyncResponsePublisher

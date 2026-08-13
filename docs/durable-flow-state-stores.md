@@ -265,11 +265,14 @@ CREATE TABLE asyncresponse_flow_state (
 );
 ```
 
-The **primary key on `flow_id` alone** is the one to keep if you change anything: starting a flow is
-an insert-if-absent, and the store learns that a ledger already exists from MySQL's duplicate-key
-error. Without that key nothing reports the duplicate, so two concurrent starts of the same flow id
-both succeed and the flow runs twice. (Any single-column unique index does the job; a composite one
-does not.)
+The **primary key on the whole of `flow_id`** is the one to keep if you change anything: starting a
+flow is an insert-if-absent, and the store learns that a ledger already exists from MySQL's
+duplicate-key error. Without that key nothing reports the duplicate, so two concurrent starts of the
+same flow id both succeed and the flow runs twice. Any single-column unique index does the job; a
+composite one does not, and neither does a **prefix** key (`UNIQUE (flow_id(100))`) — a common way
+to fit an index under MySQL's key-length limit, but it constrains only the first *n* characters, so
+two distinct ids sharing that prefix collide and the second flow never starts. Startup verification
+refuses all three, along with columns too narrow or too coarse to hold what the store writes.
 
 ### SQLite
 

@@ -305,7 +305,7 @@ internal abstract class DbAsyncResponseChannelBase :
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the response"))
             return;
 
         try
@@ -365,7 +365,7 @@ internal abstract class DbAsyncResponseChannelBase :
         activity?.SetTag("asyncresponse.channel", _activityTag);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the raw response", dropContractViolations: true))
             return;
 
         try
@@ -429,7 +429,7 @@ internal abstract class DbAsyncResponseChannelBase :
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
+        if (CorrelationIdGuard.IsUnpublishable(correlationId, _logger, activity, "the exception", exception))
             return;
 
         try

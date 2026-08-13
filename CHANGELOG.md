@@ -270,7 +270,25 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   reported success and the ledger got two rows. Startup verification (which runs whether or not
   `AutoCreateSchema` is on) now checks the unique key and the full column shape alongside the
   collation, matching what the PostgreSQL and SQL Server stores already verified, and an incomplete
-  table fails with the shape it needs instead of a raw provider error.
+  table fails with the shape it needs instead of a raw provider error. A **prefix** key
+  (`UNIQUE (flow_id(100))`) is refused as well, and fails the opposite way: it constrains only the
+  first *n* characters, so two distinct ids sharing that prefix collide on 1062 and the second flow
+  never starts. Column checks are real ones — type, width, sub-second precision, and nullability —
+  because names alone let `flow_id varchar(10)` pass startup and then truncate the 400-character
+  ids the public contract permits, and let a whole-second `datetime` round the lease arithmetic
+  this store runs on `UTC_TIMESTAMP(6)`. Widths and precisions are minima, so a more generous
+  schema still starts.
+- **Ingress no longer logs message bodies.** The response path logged the raw JSON and the worker
+  path logged the entire envelope — arguments and propagated context included — at Debug, in the
+  same file whose comments state that payloads stay out of logs by policy (docs/security.md).
+  Both now log a byte length and a SHA-256 prefix, enough to line an entry up with broker-side
+  capture, plus safe routing metadata: the correlation id, and the target service and method once
+  the envelope has been read.
+- **Positive sub-second SQS durations no longer truncate to zero.** `VisibilityTimeout`,
+  `ReceiveWaitTime`, and the redelivery delay each crossed an `(int)TotalSeconds` conversion, so a
+  validated 500 ms visibility timeout became 0 — the message went visible again the instant it was
+  received and a second consumer could handle it concurrently, which is exactly what the timeout
+  exists to prevent. They now round up, matching the delayed-publish path; zero stays zero.
 - **The EF Core store accepted any non-blank `flowIdCollation`**, including valid but case-folding
   ones such as `Latin1_General_100_CS_AS`. "I chose a collation" and "I chose an ordinal one" are
   different claims and only the second is what the primary key needs, so the declared value is now
@@ -288,11 +306,13 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   and SQL Server queue names at 200, both matching the column that stores them. Correlation ids are
   checked at *every* channel boundary — the fluent builder, `IAsyncResponseSubscriber`,
   `IAsyncResponsePublisher`, the raw publish path, and `IAsyncResponseIngress` — on all six
-  channels, with a conformance contract pinning it. The two sides answer differently on purpose:
-  subscribing takes the id from the application, so a violation throws before any subscription or
-  recovery state exists; publishing may be driven by an inbound broker message, where throwing
-  turns one bad id into an endless redelivery loop, so it takes the route blank ids already take —
-  logged at error level, acknowledged, never written.
+  channels, with a conformance contract pinning it. Every public entry point *throws* on a
+  non-blank id that breaks the contract — swallowing a caller's typo only leaves a waiter to time
+  out much later, with nothing at the call site to explain why. The untrusted edge is the one
+  exception: `IAsyncResponseIngress` and the internal raw publish path it drives log the id at
+  error level, acknowledge, and never write, because a broker message that throws comes straight
+  back around on redelivery, forever. A blank id keeps its long-standing log-and-skip on the
+  publish side, since there is nothing to act on.
 - **Named SQL Server reply targets are validated as queue names.** A reply target's queue reaches
   the same `nvarchar(200)` column by a different route — it is handed to remote publishers as the
   reply address — so an over-long name failed their insert and a space-padded one landed rows the

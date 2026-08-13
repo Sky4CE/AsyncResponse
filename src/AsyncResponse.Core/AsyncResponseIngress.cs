@@ -18,32 +18,16 @@ internal sealed class AsyncResponseIngress(
     ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
 {
     /// <summary>
-    /// Names why an id extracted from an untrusted broker message cannot route, or reports that it
-    /// can. Two ways to fail, one answer: missing outright, or present but outside the portable
-    /// contract — over-long, or space-padded, which a relational store treats as the SAME key as
-    /// the trimmed form while the library compares ids ordinally, so storing a payload under it
-    /// could surface that payload at another conversation's waiter.
+    /// A message body's size and a short content hash — the only things about a payload that are
+    /// safe to log. Response payloads and worker-job arguments carry application data, which stays
+    /// out of logs by policy (docs/security.md); these two are enough to line a log entry up with
+    /// whatever the broker's own capture tooling recorded.
     /// </summary>
-    private static bool IsUnroutable([NotNullWhen(false)] string? correlationId, out UnroutableReason reason)
+    private static (int Length, string Sha256Prefix) Digest(string messageJson)
     {
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            reason = new("correlation_id_null", "no correlation id");
-            return true;
-        }
-
-        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is { } rejection)
-        {
-            reason = new("correlation_id_not_portable", $"an unusable correlation id — {rejection}");
-            return true;
-        }
-
-        reason = default;
-        return false;
+        var bytes = Encoding.UTF8.GetBytes(messageJson);
+        return (bytes.Length, Convert.ToHexString(SHA256.HashData(bytes).AsSpan(0, 8)));
     }
-
-    /// <summary>The span's <c>error.type</c> tag and the human-readable phrase, for one drop cause.</summary>
-    private readonly record struct UnroutableReason(string ErrorType, string Description);
 
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
@@ -53,29 +37,36 @@ internal sealed class AsyncResponseIngress(
             ActivityKind.Consumer,
             correlationId);
 
-        if (IsUnroutable(correlationId, out var unroutable))
+        // An id extracted from an untrusted broker message is unroutable in two ways — missing
+        // outright, or present but outside the portable contract (over-long, or space-padded, which
+        // a relational store treats as the SAME key as the trimmed form while the library compares
+        // ids ordinally, so storing a payload under it could surface it at another conversation's
+        // waiter). Here they get one answer, which is the OPPOSITE of the answer a public publisher
+        // gives: deliberately acknowledged, not thrown, because the message can never route and
+        // redelivery would retry it forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap)
+        // or burn dead-letter attempts on brokers that do. Error-level log + counter make the drop
+        // loud — every occurrence is a producer-side contract violation.
+        if (CorrelationIdGuard.IsUnroutable(correlationId, out var unroutable))
         {
-            // Deliberately acknowledged, not thrown: the message can never route, so redelivery
-            // would retry it forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap) or
-            // burn dead-letter attempts on brokers that do. Error-level log + counter make the drop
-            // loud — every occurrence is a producer-side contract violation. Only metadata is
-            // logged: response payloads may carry PII and stay out of logs by policy
-            // (docs/security.md); the byte length and hash prefix are enough to correlate with
-            // broker-side capture tooling.
-            var payloadBytes = Encoding.UTF8.GetBytes(messageJson);
+            var (length, sha256) = Digest(messageJson);
             _logger.LogError(
-                "Ingress received a response message with {UnroutableReason}; it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                "Ingress received a response message with an unusable correlation id ({UnroutableReason}); it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
                 unroutable.Description,
-                payloadBytes.Length,
-                Convert.ToHexString(SHA256.HashData(payloadBytes).AsSpan(0, 8)));
-            AsyncResponseDiagnostics.SetError(activity, unroutable.ErrorType, $"Inbound response message has {unroutable.Description}.");
+                length,
+                sha256);
+            AsyncResponseDiagnostics.SetError(activity, unroutable.ErrorType, $"Inbound response message has an unusable correlation id: {unroutable.Description}.");
             AsyncResponseDiagnostics.RecordUnroutableResponse();
             return;
         }
 
         try
         {
-            _logger.LogDebug("Ingress received inbound response message: {Message}", messageJson);
+            var (payloadLength, payloadSha256) = Digest(messageJson);
+            _logger.LogDebug(
+                "Ingress received an inbound response message for {CorrelationId}. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                correlationId,
+                payloadLength,
+                payloadSha256);
 
             // A transient infrastructure fault (channel store briefly unreachable, recovery-state
             // read hiccup, resume-callback dependency blip) must not finalize the waiter on the
@@ -126,13 +117,26 @@ internal sealed class AsyncResponseIngress(
 
         try
         {
-            _logger.LogDebug("Ingress received worker job: {Payload}", messageJson);
+            // The envelope is the WORST thing in the library to log whole: it carries the job's
+            // arguments and whatever the context propagators captured (tenant, auth, trace baggage).
+            // Size and hash first, so a message that fails to even parse is still traceable, then
+            // the routing metadata once it has been read.
+            var (length, sha256) = Digest(messageJson);
+            _logger.LogDebug(
+                "Ingress received a worker job. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                length,
+                sha256);
 
             var job = JsonSafety.SafeDeserialize<WorkerJobEnvelope>(messageJson)
                 ?? throw new InvalidDataException("Worker message deserialized to null.");
             AsyncResponseDiagnostics.SetCorrelationId(activity, job.CorrelationId);
             AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
             AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+            _logger.LogDebug(
+                "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
+                job.CorrelationId,
+                job.Call?.ServiceInterfaceFullName,
+                job.Call?.MethodName);
 
             // The job crossed a serialization boundary (broker → ingress): restore any ambient
             // context its propagators captured before executing it.
