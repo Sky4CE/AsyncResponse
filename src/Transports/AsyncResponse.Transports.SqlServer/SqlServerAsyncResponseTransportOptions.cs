@@ -106,6 +106,12 @@ public sealed class SqlServerAsyncResponseTransportOptions
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentException.ThrowIfNullOrWhiteSpace(responseQueue);
+        // A reply target's queue is a row key in the same nvarchar(200) column as the transport's
+        // own queues; rejected here so the misconfiguration surfaces at registration rather than at
+        // the first reply. Resolution re-checks it, because the dictionary is publicly mutable.
+        SqlServerTransportOptionsValidator.ValidateQueueName(
+            responseQueue,
+            $"{nameof(ReplyTargets)}[\"{name}\"].{nameof(SqlServerReplyTargetOptions.ResponseQueue)}");
 
         ReplyTargets[name] = new SqlServerReplyTargetOptions { ResponseQueue = responseQueue };
         return this;

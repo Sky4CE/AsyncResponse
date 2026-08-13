@@ -255,9 +255,26 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   `Latin1_General_100_BIN2`, so `queue = N'worker'` returns the rows of both `worker` and
   `worker ` (verified on SQL Server 2022). Ordinal distinctness at startup could not see it, and
   the worker and response subscribers consumed each other's messages. Queue names with leading or
-  trailing spaces are now rejected at startup, over-long ones too, and the claim path re-checks the
-  returned queue ordinally — releasing a mis-claimed row *and rolling back the attempt it charged*,
-  so repeated mis-claims cannot walk another queue's message to its dead-letter limit.
+  trailing spaces are now rejected at startup, over-long ones too, and the claim query itself is
+  exact — `queue = @queue AND queue + N'.' = @queue + N'.' COLLATE Latin1_General_100_BIN2` — so a
+  mismatched row is never selected in the first place. Exactness has to live in the `SELECT`: a row
+  rejected *after* the claim goes straight back to the head of `ORDER BY created_at`, and the next
+  poll picks it again, so a single stale row would block its queue forever. The sentinel makes the
+  last character non-blank, which is what defeats the padding; the explicit collation defeats the
+  folding; and keeping the plain comparison as the driver preserves the claim index seek — verified
+  on SQL Server 2022 against binary, case-insensitive, and `varchar` queue columns alike. The
+  dead-letter prune uses the same predicate, so it cannot delete a neighbouring queue's rows.
+- **A MySQL durable-flow table with no unique key on `flow_id` silently ran flows twice.** Starting
+  a flow is an insert-if-absent and the store detects "already exists" from MySQL's duplicate-key
+  error 1062 — with no such key nothing raises 1062, so two concurrent starts of one flow id both
+  reported success and the ledger got two rows. Startup verification (which runs whether or not
+  `AutoCreateSchema` is on) now checks the unique key and the full column shape alongside the
+  collation, matching what the PostgreSQL and SQL Server stores already verified, and an incomplete
+  table fails with the shape it needs instead of a raw provider error.
+- **The EF Core store accepted any non-blank `flowIdCollation`**, including valid but case-folding
+  ones such as `Latin1_General_100_CS_AS`. "I chose a collation" and "I chose an ordinal one" are
+  different claims and only the second is what the primary key needs, so the declared value is now
+  checked against the provider's own rule (`_BIN`/`_BIN2` on SQL Server, `_bin` on MySQL).
 - **The ordinal-identity contract now requires a genuinely binary collation.** Accepting any
   case-sensitive collation was not enough: `_CS_AI` folds accents (`cafe` = `café`) and even
   `_CS_AS` folds width (`ab` = `ａｂ`) unless it carries `_WS` — both probed on SQL Server 2022. The
@@ -268,7 +285,19 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   conversations.
 - **Public string bounds are enforced where the value enters**, not at its first database write:
   correlation ids at 400 UTF-16 code units (the new `AsyncResponseChannelOptions.MaxCorrelationIdLength`)
-  and SQL Server queue names at 200, both matching the column that stores them.
+  and SQL Server queue names at 200, both matching the column that stores them. Correlation ids are
+  checked at *every* channel boundary — the fluent builder, `IAsyncResponseSubscriber`,
+  `IAsyncResponsePublisher`, the raw publish path, and `IAsyncResponseIngress` — on all six
+  channels, with a conformance contract pinning it. The two sides answer differently on purpose:
+  subscribing takes the id from the application, so a violation throws before any subscription or
+  recovery state exists; publishing may be driven by an inbound broker message, where throwing
+  turns one bad id into an endless redelivery loop, so it takes the route blank ids already take —
+  logged at error level, acknowledged, never written.
+- **Named SQL Server reply targets are validated as queue names.** A reply target's queue reaches
+  the same `nvarchar(200)` column by a different route — it is handed to remote publishers as the
+  reply address — so an over-long name failed their insert and a space-padded one landed rows the
+  exact-matching claim predicate never returns. Checked at `AddReplyTarget` and again when the target
+  is resolved, since `ReplyTargets` is publicly mutable.
 - **Scheduled-flow registration validates the whole portable contract**, by running the occurrence
   id the scheduler will actually mint through the same check the store's create uses. Duplicating
   only the length rule let a name containing `/`, `?` or `#` register cleanly and then fail on

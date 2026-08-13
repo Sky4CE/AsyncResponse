@@ -83,6 +83,31 @@ public class AsyncResponseIngressErrorTests
         Assert.Null(publisher.Exception);
     }
 
+    [Theory]
+    [InlineData("corr-e ")]
+    [InlineData(" corr-e")]
+    [InlineData("looooong")]
+    public async Task HandleResponseMessageAsync_NonPortableCorrelationId_DropsMessage(string correlationId)
+    {
+        // An id extracted from an untrusted broker message can be unroutable without being blank.
+        // A padded one is the SAME key as its trimmed form to a relational store while the library
+        // compares ids ordinally, so publishing it could surface this payload at another
+        // conversation's waiter; an over-long one is truncated or rejected at that first write.
+        // Dropped like a blank id — acknowledged and logged — because throwing would turn one bad
+        // producer into an endless redelivery loop.
+        if (correlationId == "looooong")
+            correlationId = new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength + 1);
+
+        var rawPublisher = new ThrowingRawPublisher();
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", correlationId);
+
+        Assert.Equal(0, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
+    }
+
     [Fact]
     public async Task HandleWorkerMessageAsync_InvalidPayload_PropagatesForTransportRetryOrDeadLetter()
     {

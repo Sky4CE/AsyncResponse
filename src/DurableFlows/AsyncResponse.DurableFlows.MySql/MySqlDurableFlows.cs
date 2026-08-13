@@ -260,7 +260,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await VerifyFlowIdCollationAsync(connection, cancellationToken).ConfigureAwait(false);
+            await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -269,44 +269,114 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         }
     }
 
+    /// <summary>The columns this store reads and writes; a table missing any of them cannot serve it.</summary>
+    private static readonly string[] RequiredColumns =
+        ["flow_id", "state_json", "expires_at_utc", "updated_at_utc", "revision", "lease_id", "lease_expires_at_utc"];
+
     /// <summary>
-    /// Checks the flow_id column's EFFECTIVE collation, independently of who created the table.
+    /// Checks the table this store will actually use, independently of who created it.
     /// <c>CREATE TABLE IF NOT EXISTS</c> leaves a table made by an earlier build (or by hand)
-    /// exactly as it was, and <c>AutoCreateSchema = false</c> issues no DDL at all — so the
-    /// COLLATE clause above only ever protects a table this build created. MySQL's default
-    /// collation is case-insensitive, which makes two flow ids differing only in case one primary
-    /// key: the second create fails as a duplicate and a load returns the other run's state.
+    /// exactly as it was, and <c>AutoCreateSchema = false</c> issues no DDL at all — so the DDL
+    /// above only ever protects a table this build created. Two properties of that table are
+    /// load-bearing and both fail SILENTLY when absent, which is why they are checked at startup
+    /// rather than left to the first query:
+    /// <list type="bullet">
+    /// <item><description>
+    /// A UNIQUE key on flow_id alone. <see cref="TryCreateAsync"/> is the engine's insert-if-absent
+    /// primitive and detects "already exists" from MySQL's duplicate-key error 1062 — with no such
+    /// key nothing raises 1062, so two concurrent starts of ONE flow id both report success and the
+    /// ledger gets two rows.
+    /// </description></item>
+    /// <item><description>
+    /// A binary collation on flow_id. MySQL's default is case-insensitive, which makes two ids
+    /// differing only in case (or accent, or width) one key: the second start fails as a duplicate
+    /// and a load returns the other run's state.
+    /// </description></item>
+    /// </list>
     /// </summary>
-    private async Task VerifyFlowIdCollationAsync(MySqlConnection connection, CancellationToken cancellationToken)
+    private async Task VerifyFlowTableAsync(MySqlConnection connection, CancellationToken cancellationToken)
+    {
+        var columns = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                """
+                SELECT COLUMN_NAME, COLLATION_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table;
+                """;
+            command.Parameters.AddWithValue("@table", _options.TableName);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                columns[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
+        }
+
+        if (columns.Count == 0)
+        {
+            // The table does not exist: AutoCreateSchema = false and the migration has not run yet.
+            // That surfaces at the first query with a clear MySQL error, and failing here would
+            // break the documented "create it yourself, later" workflow.
+            return;
+        }
+
+        foreach (var required in RequiredColumns)
+        {
+            if (!columns.ContainsKey(required))
+            {
+                throw new InvalidOperationException(
+                    $"The MySQL durable-flow table '{_options.TableName}' has no '{required}' column. It was created by an earlier " +
+                    "build or by hand and does not match the shape this store reads and writes " +
+                    $"({string.Join(", ", RequiredColumns)}). Re-create it, or add the missing columns — the DDL is in " +
+                    "docs/durable-flow-state-stores.md.");
+            }
+        }
+
+        var collation = columns["flow_id"];
+        if (collation is null || !collation.EndsWith("_bin", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"The MySQL durable-flow table '{_options.TableName}' stores flow_id with the collation '{collation ?? "(none)"}', " +
+                "which is not binary. Flow ids are compared ordinally by the engine, so ids differing only in case (or accent, or " +
+                "width) collide on the primary key: the second flow fails to start and a load returns the other run's state. Fix it " +
+                $"with ALTER TABLE `{_options.TableName}` MODIFY flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT " +
+                "NULL; (tables this build creates get that collation automatically).");
+        }
+
+        await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Requires a unique index keyed on flow_id and nothing else. The PRIMARY KEY this store's DDL
+    /// declares is the usual one, but any single-column unique index raises the 1062 that
+    /// <see cref="TryCreateAsync"/> reads as "already exists", so all of them are accepted. A
+    /// COMPOSITE unique key is not: it permits two rows with the same flow_id.
+    /// </summary>
+    private async Task VerifyFlowIdIsUniqueAsync(MySqlConnection connection, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.CommandText =
             """
-            SELECT COLLATION_NAME
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = 'flow_id';
+            SELECT 1
+            FROM information_schema.STATISTICS s
+            WHERE s.TABLE_SCHEMA = DATABASE() AND s.TABLE_NAME = @table
+              AND s.NON_UNIQUE = 0 AND s.COLUMN_NAME = 'flow_id' AND s.SEQ_IN_INDEX = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM information_schema.STATISTICS o
+                  WHERE o.TABLE_SCHEMA = s.TABLE_SCHEMA AND o.TABLE_NAME = s.TABLE_NAME
+                    AND o.INDEX_NAME = s.INDEX_NAME AND o.SEQ_IN_INDEX > 1)
+            LIMIT 1;
             """;
         command.Parameters.AddWithValue("@table", _options.TableName);
 
-        var collation = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
-        if (collation is null)
-        {
-            // No such column: either the table does not exist (AutoCreateSchema = false and the
-            // migration has not run) or a different table owns the name. Both surface at the first
-            // query with a clear MySQL error, and failing here would break the documented
-            // "create it yourself, later" workflow.
+        if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null)
             return;
-        }
 
-        if (!collation.EndsWith("_bin", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException(
-                $"The MySQL durable-flow table '{_options.TableName}' stores flow_id with the collation '{collation}', which is not " +
-                "binary. Flow ids are compared ordinally by the engine, so ids differing only in case (or accent, or width) collide " +
-                "on the primary key: the second flow fails to start and a load returns the other run's state. Fix it with " +
-                $"ALTER TABLE `{_options.TableName}` MODIFY flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL; " +
-                "(tables this build creates get that collation automatically).");
-        }
+        throw new InvalidOperationException(
+            $"The MySQL durable-flow table '{_options.TableName}' has no unique key on flow_id alone. Starting a flow is an " +
+            "insert-if-absent, and this store learns that a ledger already exists from MySQL's duplicate-key error — without that " +
+            "key nothing reports the duplicate, so two concurrent starts of the same flow id both succeed and the flow runs twice. " +
+            $"Fix it with ALTER TABLE `{_options.TableName}` ADD PRIMARY KEY (flow_id); (tables this build creates declare it " +
+            "automatically).");
     }
 
     private async Task<bool> UpdateLeaseAsync(

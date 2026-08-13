@@ -93,8 +93,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         Func<T, ValueTask<bool>>? completionPredicate,
         TimeSpan? timeout) where T : IAsyncResponsePayload
     {
-        if (string.IsNullOrWhiteSpace(correlationId))
-            throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+        CorrelationIdGuard.ThrowIfUnusable(correlationId);
 
         // Recovery callbacks only make sense if the payload can say whether a late response should
         // resume or fail the flow. On this durable channel that decision is real (it survives a
@@ -636,12 +635,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the response.");
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the response.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
             return;
-        }
 
         var subject = _subjects.ResponseSubject(correlationId);
         try
@@ -722,12 +717,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
             return;
-        }
 
         var subject = _subjects.ResponseSubject(correlationId);
         try
@@ -811,12 +802,8 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the exception.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
             return;
-        }
 
         var subject = _subjects.ResponseSubject(correlationId);
         try

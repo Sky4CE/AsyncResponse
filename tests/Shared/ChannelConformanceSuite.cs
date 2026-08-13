@@ -230,6 +230,88 @@ public abstract class ChannelConformanceSuite
         Assert.Equal("for-upper", upperResult.Message);
     }
 
+    [Theory]
+    // Over the portable length: rejected or silently truncated at the first relational write.
+    [InlineData("length")]
+    // Surrounding spaces: SQL Server pads the shorter operand of `=` under EVERY collation, binary
+    // ones included, so this id and its trimmed form are ONE key to the database while the library
+    // compares them ordinally — the wrong waiter can be handed the response.
+    [InlineData("trailing-space")]
+    [InlineData("leading-space")]
+    public async Task Contract_ANonPortableCorrelationIdIsRefusedWhenSubscribing(string violation)
+    {
+        // Every channel applies the same contract at the same boundary, whatever its own storage
+        // could tolerate: an id the SQL Server channel cannot key on must not be accepted by the
+        // Redis one either, or the same application code stops working when the channel changes.
+        // Subscribing takes the id from the application, so a violation is an argument error —
+        // thrown before any subscription or recovery state exists to leak.
+        await using var harness = await CreateHarnessAsync();
+        var valid = NewCorrelationId("portable");
+        var correlationId = violation switch
+        {
+            "length" => valid + new string('x', AsyncResponseChannelOptions.MaxCorrelationIdLength),
+            "trailing-space" => valid + " ",
+            _ => " " + valid
+        };
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => harness.Subscriber.CreateResponseWaiter<ConformanceResult>(correlationId, timeout: WaiterTimeout));
+    }
+
+    [Fact]
+    public async Task Contract_EveryPublishEntryPointDropsANonPortableCorrelationId()
+    {
+        // Publishing may be driven by an inbound broker message, where throwing turns one bad id
+        // into an endless redelivery loop — so it takes the route a blank id already takes: logged,
+        // acknowledged, and never written. What matters is that the row never lands. To a database
+        // 'abc ' and 'abc' are ONE key, while the library compares them ordinally, so a stored
+        // padded row is a response sitting in another conversation's mailbox.
+        // All THREE publish entry points are covered, because they are three separate guards:
+        // the typed publish, the raw-JSON ingress path, and the exception publish.
+        // On delivery this pins the contract rather than proving a fix — the channels already
+        // refuse a mismatched delivery downstream (ordinal keys in memory, the dispatch re-check on
+        // the relational stores). What is new is that nothing is written or thrown on the way in.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("padded");
+        var padded = correlationId + " ";
+        var overlong = correlationId + new string('x', AsyncResponseChannelOptions.MaxCorrelationIdLength);
+
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "smuggled"), padded);
+        await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"smuggled raw"}""", padded);
+        await harness.Publisher.SetException(new InvalidOperationException("smuggled failure"), padded);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "too long"), overlong);
+
+        await Task.Delay(SettleDelay);
+        Assert.False(waiter.ResponseTask.IsCompleted);
+
+        // The waiter is still armed for its own id — the drops cost it nothing.
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "mine"), correlationId);
+        var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("mine", result.Message);
+    }
+
+    [Fact]
+    public async Task Contract_ACorrelationIdExactlyAtThePortableLimitIsAccepted()
+    {
+        // The other half of a bound: an id AT the documented maximum has to work, on both sides of
+        // the channel. An off-by-one here would reject ids the contract promises to carry, and
+        // every test above uses short ids, so nothing else would catch it.
+        await using var harness = await CreateHarnessAsync();
+        var prefix = NewCorrelationId("at-cap");
+        var correlationId = prefix + new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength - prefix.Length);
+        Assert.Equal(AsyncResponseChannelOptions.MaxCorrelationIdLength, correlationId.Length);
+
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "at the cap"), correlationId);
+
+        var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("at the cap", result.Message);
+    }
+
     // ----- f/g/h. Lost-subscriber routing -----
 
     [Fact]

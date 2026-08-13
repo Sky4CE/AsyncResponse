@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -16,6 +17,34 @@ internal sealed class AsyncResponseIngress(
     AsyncResponseContextPropagation _propagation,
     ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
 {
+    /// <summary>
+    /// Names why an id extracted from an untrusted broker message cannot route, or reports that it
+    /// can. Two ways to fail, one answer: missing outright, or present but outside the portable
+    /// contract — over-long, or space-padded, which a relational store treats as the SAME key as
+    /// the trimmed form while the library compares ids ordinally, so storing a payload under it
+    /// could surface that payload at another conversation's waiter.
+    /// </summary>
+    private static bool IsUnroutable([NotNullWhen(false)] string? correlationId, out UnroutableReason reason)
+    {
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            reason = new("correlation_id_null", "no correlation id");
+            return true;
+        }
+
+        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is { } rejection)
+        {
+            reason = new("correlation_id_not_portable", $"an unusable correlation id — {rejection}");
+            return true;
+        }
+
+        reason = default;
+        return false;
+    }
+
+    /// <summary>The span's <c>error.type</c> tag and the human-readable phrase, for one drop cause.</summary>
+    private readonly record struct UnroutableReason(string ErrorType, string Description);
+
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
     {
@@ -24,21 +53,22 @@ internal sealed class AsyncResponseIngress(
             ActivityKind.Consumer,
             correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
+        if (IsUnroutable(correlationId, out var unroutable))
         {
-            // Deliberately acknowledged, not thrown: without a correlation id the message can
-            // never route, so redelivery would retry it forever (RabbitMQ's default
-            // MaxDeliveryAttempts = 0 has no cap) or burn dead-letter attempts on brokers that do.
-            // Error-level log + counter make the drop loud — every occurrence is a producer-side
-            // contract violation. Only metadata is logged: response payloads may carry PII and
-            // stay out of logs by policy (docs/security.md); the byte length and hash prefix are
-            // enough to correlate with broker-side capture tooling.
+            // Deliberately acknowledged, not thrown: the message can never route, so redelivery
+            // would retry it forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap) or
+            // burn dead-letter attempts on brokers that do. Error-level log + counter make the drop
+            // loud — every occurrence is a producer-side contract violation. Only metadata is
+            // logged: response payloads may carry PII and stay out of logs by policy
+            // (docs/security.md); the byte length and hash prefix are enough to correlate with
+            // broker-side capture tooling.
             var payloadBytes = Encoding.UTF8.GetBytes(messageJson);
             _logger.LogError(
-                "Ingress received a response message with no correlation id; it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                "Ingress received a response message with {UnroutableReason}; it cannot be routed and is acknowledged without dispatch. Payload: {PayloadLength} bytes, sha256 {PayloadSha256Prefix}.",
+                unroutable.Description,
                 payloadBytes.Length,
                 Convert.ToHexString(SHA256.HashData(payloadBytes).AsSpan(0, 8)));
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "No correlation id on the inbound response message.");
+            AsyncResponseDiagnostics.SetError(activity, unroutable.ErrorType, $"Inbound response message has {unroutable.Description}.");
             AsyncResponseDiagnostics.RecordUnroutableResponse();
             return;
         }

@@ -91,6 +91,46 @@ public sealed class DurableFlowStateRecord
 }
 
 /// <summary>
+/// What a provider needs from the <c>flow_id</c> collation, when it needs anything at all. Kept
+/// apart from the store so the rules are one table rather than a chain of conditions inside a
+/// generic type — and so both branches can be exercised without dragging in every EF Core provider.
+/// </summary>
+internal static class FlowIdCollationRules
+{
+    /// <summary>
+    /// The rules for a provider whose DEFAULT collation folds case, or <c>null</c> when the default
+    /// is already ordinal (PostgreSQL and SQLite compare byte-wise) or the provider is unknown — a
+    /// third-party provider gets the benefit of the doubt rather than a startup failure it has no
+    /// documented way to satisfy.
+    /// </summary>
+    internal static CaseFoldingProviderRules? CaseFoldingProvider(string? providerName) => providerName switch
+    {
+        not null when providerName.Contains("SqlServer", StringComparison.OrdinalIgnoreCase) => new(
+            "SQL Server",
+            nameof(AsyncResponseFlowIdCollations.SqlServer),
+            AsyncResponseFlowIdCollations.SqlServer,
+            "_BIN2 collation",
+            static c => c.Contains("_BIN", StringComparison.OrdinalIgnoreCase)),
+        not null when providerName.Contains("MySql", StringComparison.OrdinalIgnoreCase)
+            || providerName.Contains("Pomelo", StringComparison.OrdinalIgnoreCase) => new(
+            "MySQL",
+            nameof(AsyncResponseFlowIdCollations.MySql),
+            AsyncResponseFlowIdCollations.MySql,
+            "_bin collation",
+            static c => c.EndsWith("_bin", StringComparison.OrdinalIgnoreCase)),
+        _ => null
+    };
+
+    /// <summary>One provider's answer to "which collations compare byte-wise, and what to suggest".</summary>
+    internal sealed record CaseFoldingProviderRules(
+        string Name,
+        string ConstantName,
+        string Recommended,
+        string OrdinalDescription,
+        Func<string, bool> IsOrdinal);
+}
+
+/// <summary>
 /// Well-known case-sensitive collations for the <c>flow_id</c> key column, one per mainstream
 /// provider. Pass one to <see cref="EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows"/>
 /// when the database's own collation is case-insensitive — the SQL Server and MySQL defaults are,
@@ -430,34 +470,42 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         // Read the decision from the annotation the mapping records, not from the property's
         // collation: EF Core strips relational configuration the runtime never reads out of
         // context.Model, and asking a runtime property for its collation throws outright.
+        if (FlowIdCollationRules.CaseFoldingProvider(context.Database.ProviderName) is not { } provider)
+        {
+            _modelChecked = true;
+            return;
+        }
+
         var collation = entity.FindAnnotation(EFCoreDurableFlowModelBuilderExtensions.FlowIdCollationAnnotation)?.Value as string;
-        if (string.IsNullOrWhiteSpace(collation) && CaseFoldingProvider(context.Database.ProviderName) is { } provider)
+        if (string.IsNullOrWhiteSpace(collation))
         {
             throw new InvalidOperationException(
                 $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} without a " +
-                $"collation, and {provider} defaults to a case-insensitive one. Flow ids are compared ordinally, so two ids differing " +
-                "only in case would collide on the primary key — the second flow fails to start and a load returns the other run's " +
-                $"state. Pass the matching {nameof(AsyncResponseFlowIdCollations)} constant to " +
+                $"collation, and {provider.Name} defaults to a case-insensitive one. Flow ids are compared ordinally, so two ids " +
+                "differing only in case would collide on the primary key — the second flow fails to start and a load returns the " +
+                $"other run's state. Pass {nameof(AsyncResponseFlowIdCollations)}.{provider.ConstantName} to " +
                 $"{nameof(EFCoreDurableFlowModelBuilderExtensions.ConfigureAsyncResponseDurableFlows)}(flowIdCollation: …) and add a " +
-                "migration; on a database that is already case-sensitive, pass the collation it uses to record that intent.");
+                "migration.");
+        }
+
+        // A declared collation is a claim, not a proof: "I chose one" and "I chose an ordinal one"
+        // are different statements, and only the second is what the primary key needs. On these
+        // providers the difference is namable, so name it — Latin1_General_100_CS_AS is a perfectly
+        // valid SQL Server collation that still folds full-width forms, and every _CS_AI collation
+        // folds accents. Only _BIN/_BIN2 (SQL Server) and _bin (MySQL) compare byte-wise.
+        if (!provider.IsOrdinal(collation))
+        {
+            throw new InvalidOperationException(
+                $"'{typeof(TContext).Name}' maps {nameof(DurableFlowStateRecord)}.{nameof(DurableFlowStateRecord.FlowId)} with the " +
+                $"collation '{collation}', which {provider.Name} does not compare byte-wise. Case sensitivity alone is not enough: a " +
+                "case-sensitive collation still folds accents or full-width forms, so two flow ids the library treats as distinct " +
+                "collide on the primary key — the second flow fails to start and a load returns the other run's state. Pass " +
+                $"{nameof(AsyncResponseFlowIdCollations)}.{provider.ConstantName} ('{provider.Recommended}') instead, or another " +
+                $"{provider.OrdinalDescription}, and add a migration.");
         }
 
         _modelChecked = true;
     }
-
-    /// <summary>
-    /// Names the provider when its DEFAULT collation folds case, or <c>null</c> when the default is
-    /// already ordinal (PostgreSQL and SQLite compare byte-wise) or the provider is unknown — a
-    /// third-party provider gets the benefit of the doubt rather than a startup failure it has no
-    /// documented way to satisfy.
-    /// </summary>
-    private static string? CaseFoldingProvider(string? providerName) => providerName switch
-    {
-        not null when providerName.Contains("SqlServer", StringComparison.OrdinalIgnoreCase) => "SQL Server",
-        not null when providerName.Contains("MySql", StringComparison.OrdinalIgnoreCase)
-            || providerName.Contains("Pomelo", StringComparison.OrdinalIgnoreCase) => "MySQL",
-        _ => null
-    };
 
     private readonly struct ContextLease : IAsyncDisposable
     {

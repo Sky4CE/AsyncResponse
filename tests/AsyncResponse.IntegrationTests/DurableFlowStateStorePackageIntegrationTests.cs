@@ -314,8 +314,148 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                     TableName = table
                 }));
 
-            await Assert.ThrowsAsync<MySqlException>(
+            // A raw provider error ("Unknown column 'revision'") tells the operator what broke but
+            // not what to do; startup verification names the shape it needs instead.
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => store.TryCreateAsync("incomplete", CreateState("incomplete"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("no 'revision' column", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MySqlPackageStore_AcceptsAUniqueIndexInsteadOfAPrimaryKey()
+    {
+        // The false-positive guard for the rejection below, and the reason the check asks about
+        // unique KEYS rather than the PRIMARY one: any single-column unique index raises the 1062
+        // that TryCreateAsync reads as "already exists", so a table keyed that way is correct and
+        // must start. A check that looked for INDEX_NAME = 'PRIMARY' would fail every one of them
+        // at startup — a worse outcome than the bug it fixes.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_uq", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        UNIQUE KEY `{table}_flow_uq` (flow_id),
+                        INDEX `{table}_expires_idx` (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            // Starts, and the insert-if-absent contract actually holds on this shape.
+            Assert.True(await store.TryCreateAsync("uq", CreateState("uq"), TimeSpan.FromMinutes(5)));
+            Assert.False(await store.TryCreateAsync("uq", CreateState("uq"), TimeSpan.FromMinutes(5)));
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MySqlPackageStore_DoesNotFailStartupWhenTheManualTableHasNotBeenCreatedYet()
+    {
+        // The documented "provision it yourself, later" workflow: with AutoCreateSchema off and no
+        // table yet, verification has nothing to inspect and must stay out of the way. Failing here
+        // would turn a migration that has not run into a startup crash — the table's absence is
+        // already reported, clearly, by the first query that needs it.
+        await WaitForMySqlAsync();
+        var store = new MySqlFlowStateStore(
+            Options.Create(new MySqlDurableFlowOptions
+            {
+                ConnectionString = Fixture.MySqlConnectionString,
+                TableName = NewIdentifier("df_mysql_absent", 64),
+                AutoCreateSchema = false
+            }));
+
+        var ex = await Record.ExceptionAsync(
+            () => store.TryCreateAsync("absent", CreateState("absent"), TimeSpan.FromMinutes(5)));
+
+        // MySQL's own "table doesn't exist", not one of this store's verification errors.
+        Assert.IsType<MySqlException>(ex);
+    }
+
+    [Theory]
+    // No key at all, and a COMPOSITE primary key: both permit two rows with the same flow_id.
+    [InlineData("")]
+    [InlineData(", PRIMARY KEY (flow_id, revision)")]
+    public async Task MySqlPackageStore_RejectsATableWithoutAUniqueKeyOnFlowIdAlone(string keyClause)
+    {
+        // Starting a flow is an insert-if-absent, and this store learns "it already exists" from
+        // MySQL's duplicate-key error 1062. Nothing else reports it — so on a table with no unique
+        // key on flow_id, two concurrent starts of ONE flow id both INSERT and both return true,
+        // and the flow runs twice off two ledgers. The collation check alone passed this table.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_nokey", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        INDEX `{table}_expires_idx` (expires_at_utc){keyClause}
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    // The point of the check: it must not depend on having run the DDL, because a
+                    // table this build did not create is precisely the case it exists for.
+                    AutoCreateSchema = false
+                }));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("dup", CreateState("dup"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("no unique key on flow_id alone", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("ADD PRIMARY KEY (flow_id)", ex.Message, StringComparison.Ordinal);
         }
         finally
         {

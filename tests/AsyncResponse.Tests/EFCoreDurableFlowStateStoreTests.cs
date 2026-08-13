@@ -35,6 +35,16 @@ internal sealed class CollatedFlowDbContext(DbContextOptions<CollatedFlowDbConte
             flowIdCollation: AsyncResponseFlowIdCollations.SqlServer);
 }
 
+/// <summary>
+/// Mapped with a real, case-SENSITIVE SQL Server collation that still folds accents and full-width
+/// forms — the plausible wrong answer, and the one a "declared something" check would accept.
+/// </summary>
+internal sealed class CaseSensitiveFlowDbContext(DbContextOptions<CaseSensitiveFlowDbContext> options) : DbContext(options)
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+        => modelBuilder.ConfigureAsyncResponseDurableFlows(flowIdCollation: "Latin1_General_100_CS_AS");
+}
+
 public sealed class EFCoreDurableFlowStateStoreTests
 {
     [Fact]
@@ -80,6 +90,64 @@ public sealed class EFCoreDurableFlowStateStoreTests
         Assert.NotNull(exception);
         Assert.DoesNotContain("without a collation", exception.ToString(), StringComparison.Ordinal);
     }
+
+    [Fact]
+    public async Task EFCoreStore_OnACaseFoldingProvider_RefusesADeclaredCollationThatIsNotOrdinal()
+    {
+        // "I declared a collation" and "I declared an ordinal one" are different claims, and only
+        // the second is what the primary key needs. Latin1_General_100_CS_AS is a perfectly valid
+        // SQL Server collation — and case-sensitive, which is the intuitive answer — yet probed on
+        // SQL Server 2022 it still reports 'ab' = 'ａｂ'; every _CS_AI collation folds accents the
+        // same way. Only _BIN2 compares by code point, so only _BIN2 may pass.
+        var services = new ServiceCollection();
+        services.AddDbContext<CaseSensitiveFlowDbContext>(options => options.UseSqlServer("Server=unused;Database=unused;"));
+        await using var provider = services.BuildServiceProvider();
+
+        var store = new EFCoreFlowStateStore<CaseSensitiveFlowDbContext>(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            Options.Create(new EFCoreDurableFlowOptions()));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.LoadAsync("any-flow"));
+        Assert.Contains("Latin1_General_100_CS_AS", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not compare byte-wise", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(AsyncResponseFlowIdCollations.SqlServer, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // SQL Server: only a binary collation is ordinal. _CS_AS is the plausible wrong answer (it is
+    // case-sensitive and still folds full-width forms); _CS_AI additionally folds accents.
+    [InlineData("Microsoft.EntityFrameworkCore.SqlServer", "Latin1_General_100_BIN2", true)]
+    [InlineData("Microsoft.EntityFrameworkCore.SqlServer", "Latin1_General_BIN", true)]
+    [InlineData("Microsoft.EntityFrameworkCore.SqlServer", "Latin1_General_100_CS_AS", false)]
+    [InlineData("Microsoft.EntityFrameworkCore.SqlServer", "SQL_Latin1_General_CP1_CI_AS", false)]
+    // MySQL, through both the official provider id and Pomelo's.
+    [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_bin", true)]
+    [InlineData("MySql.EntityFrameworkCore", "utf8mb4_bin", true)]
+    [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_0900_as_cs", false)]
+    [InlineData("Pomelo.EntityFrameworkCore.MySql", "utf8mb4_0900_ai_ci", false)]
+    public void FlowIdCollationRules_NameWhatIsOrdinalPerProvider(string providerName, string collation, bool ordinal)
+    {
+        // The MySQL branch cannot be reached through a DbContext here — the test project references
+        // no MySQL provider — so the rule table is exercised directly. Without this, half the guard
+        // ships on the strength of the SQL Server branch alone.
+        var rules = FlowIdCollationRules.CaseFoldingProvider(providerName);
+
+        Assert.NotNull(rules);
+        Assert.Equal(ordinal, rules.IsOrdinal(collation));
+        Assert.True(rules.IsOrdinal(rules.Recommended), "the constant this provider recommends must satisfy its own rule");
+    }
+
+    [Theory]
+    // Byte-wise by default: nothing to declare, so nothing to refuse.
+    [InlineData("Npgsql.EntityFrameworkCore.PostgreSQL")]
+    [InlineData("Microsoft.EntityFrameworkCore.Sqlite")]
+    // Unknown third-party provider: the benefit of the doubt, not a startup failure it has no
+    // documented way to satisfy.
+    [InlineData("Contoso.EntityFrameworkCore.Something")]
+    [InlineData(null)]
+    public void FlowIdCollationRules_LeaveNonCaseFoldingProvidersAlone(string? providerName)
+        => Assert.Null(FlowIdCollationRules.CaseFoldingProvider(providerName));
 
     [Fact]
     public async Task EFCoreStore_RoundTrips_Expires_Deletes_WithScopedDbContext()

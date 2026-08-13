@@ -15,9 +15,19 @@ internal sealed class SqlServerReplyTargetProvider(
             : name;
 
         var target = ResolveTarget(options, targetName);
-        var responseQueue = SqlServerTransportOptionsValidator.Required(
-            target.ResponseQueue,
-            $"{nameof(SqlServerReplyTargetOptions)}.{nameof(SqlServerReplyTargetOptions.ResponseQueue)}");
+        var queueOptionName = StringComparer.Ordinal.Equals(targetName, options.DefaultReplyTargetName)
+            ? $"{nameof(SqlServerReplyTargetOptions)}.{nameof(SqlServerReplyTargetOptions.ResponseQueue)}"
+            : $"{nameof(SqlServerAsyncResponseTransportOptions.ReplyTargets)}[\"{targetName}\"]." +
+              $"{nameof(SqlServerReplyTargetOptions.ResponseQueue)}";
+        var responseQueue = SqlServerTransportOptionsValidator.Required(target.ResponseQueue, queueOptionName);
+
+        // ValidateCommon covers the three transport-wide queues, but a NAMED reply target's queue
+        // reaches the same nvarchar(200) column by a different route: it is emitted as the reply
+        // address and as the "queue" property a remote publisher inserts with. Unvalidated, an
+        // over-long name fails the insert outright and a space-padded one lands a row that the
+        // exact-matching claim predicate will never hand to any subscriber. Validated here rather
+        // than in ValidateCommon so a target added by mutating the dictionary directly is covered.
+        SqlServerTransportOptionsValidator.ValidateQueueName(responseQueue, queueOptionName);
 
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {

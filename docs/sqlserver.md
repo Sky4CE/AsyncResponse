@@ -103,6 +103,38 @@ The packages do **not** create the database itself: point `ConnectionString` at 
 `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
 distinct even when they share the same schema.
 
+When your migration owns the transport table, match this shape — the `queue` column in particular:
+
+```sql
+CREATE TABLE dbo.asyncresponse_transport_messages (
+    id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+    -- nvarchar, not varchar or nchar: queue names are Unicode, and a blank-padded nchar column
+    -- cannot be matched exactly at all. The binary collation is belt-and-braces — the claim
+    -- predicate carries its own COLLATE — but it makes the intent visible in the schema.
+    queue nvarchar(200) COLLATE Latin1_General_100_BIN2 NOT NULL,
+    payload_json nvarchar(max) NOT NULL,
+    headers_json nvarchar(max) NOT NULL DEFAULT N'{}',
+    created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    locked_until datetime2 NULL,
+    lock_id uniqueidentifier NULL,
+    attempts int NOT NULL DEFAULT 0,
+    dead_letter_reason nvarchar(max) NULL
+);
+CREATE INDEX asyncresponse_transport_messages_claim_idx
+    ON dbo.asyncresponse_transport_messages (queue, available_at, locked_until, created_at);
+CREATE INDEX asyncresponse_transport_messages_created_idx
+    ON dbo.asyncresponse_transport_messages (created_at);
+```
+
+The three logical queues share this one table and are told apart by the `queue` column alone, so
+the claim query matches it exactly — `queue = @queue AND queue + N'.' = @queue + N'.' COLLATE
+Latin1_General_100_BIN2`. The sentinel is there because SQL Server pads the shorter operand of an
+equality comparison with spaces under *every* collation, binary ones included, so `worker ` would
+otherwise answer a query for `worker`; the explicit collation is there because a column left on a
+case-insensitive server default would otherwise answer with `WORKER`. The plain comparison is kept
+as the driver so the claim index is still seeked.
+
 ### Upgrading a manually managed schema
 
 1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`

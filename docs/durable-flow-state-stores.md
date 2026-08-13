@@ -247,6 +247,30 @@ builder.Services.AddAsyncResponse()
     });
 ```
 
+With `AutoCreateSchema = false` the table is yours to provision. Two properties of it are
+load-bearing, and the store verifies both at startup rather than letting them fail silently later:
+
+```sql
+CREATE TABLE asyncresponse_flow_state (
+    -- Binary collation: the default folds case, which makes two flow ids the library treats as
+    -- distinct collide on the key.
+    flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+    state_json longtext NOT NULL,
+    expires_at_utc datetime(6) NOT NULL,
+    updated_at_utc datetime(6) NOT NULL,
+    revision bigint NOT NULL DEFAULT 0,
+    lease_id varchar(64) NULL,
+    lease_expires_at_utc datetime(6) NULL,
+    INDEX asyncresponse_flow_state_expires_idx (expires_at_utc)
+);
+```
+
+The **primary key on `flow_id` alone** is the one to keep if you change anything: starting a flow is
+an insert-if-absent, and the store learns that a ledger already exists from MySQL's duplicate-key
+error. Without that key nothing reports the duplicate, so two concurrent starts of the same flow id
+both succeed and the flow runs twice. (Any single-column unique index does the job; a composite one
+does not.)
+
 ### SQLite
 
 > The store sets `PRAGMA journal_mode=WAL` when it auto-creates the schema: concurrent flow
@@ -399,9 +423,9 @@ ids differing only in case a single primary key: the second `StartAsync` fails a
 a load returns the other run's state. Pass the constant for your provider
 (`AsyncResponseFlowIdCollations.SqlServer` / `.MySql` / `.PostgreSql` / `.Sqlite`); the bundled
 relational stores pin the equivalent in their own DDL. On those two providers the store **fails at
-startup** if the mapping does not declare one — the choice stays yours, but it has to be a choice.
-Only a binary collation qualifies: a merely case-sensitive one still folds accents (`_CS_AI`) or
-full-width forms (any collation without `_WS`).
+startup** if the mapping does not declare one, and equally if it declares one that is not ordinal —
+`_BIN2` on SQL Server, `_bin` on MySQL. Only a binary collation qualifies: a merely case-sensitive
+one still folds accents (`_CS_AI`) or full-width forms (any collation without `_WS`).
 
 ### Application-owned store
 

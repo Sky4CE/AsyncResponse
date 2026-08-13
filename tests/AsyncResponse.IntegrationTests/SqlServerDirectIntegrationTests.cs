@@ -310,13 +310,15 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
-    public async Task ClaimedRow_FromASpacePaddedQueue_IsReleasedUntouched_NotDeliveredToTheWrongSubscriber()
+    public async Task ASpacePaddedQueueRow_IsNeverClaimed_AndDoesNotStarveTheRowsBehindIt()
     {
         // Startup validation now rejects queue names with surrounding spaces, so this row can only
-        // come from an EARLIER build (or another writer) — which is exactly why the claim path
-        // re-checks. SQL Server's `=` pads the shorter operand under every collation, binary ones
-        // included, so `queue = N'worker'` selects this 'worker ' row: without the guard the worker
-        // subscriber would execute a message addressed to a different queue.
+        // come from an EARLIER build (or another writer). SQL Server's `=` pads the shorter operand
+        // under every collation, binary ones included, so `queue = N'worker'` matches this 'worker '
+        // row — and it is the OLDEST, so `ORDER BY created_at` puts it first in line on every poll.
+        // Rejecting it after the claim is not enough: the claim is what puts it back at the head of
+        // the queue, and the poll that follows selects it again, forever. The exclusion has to
+        // happen in the SELECT, so the valid row behind it is claimed on the very first try.
         await WithSchemaAsync("sql_padded_queue", async schema =>
         {
             var options = TransportOptions(schema);
@@ -330,14 +332,38 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             var paddedId = Guid.NewGuid();
             await ExecuteAsync(
                 $"""
-                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, headers_json)
-                VALUES ('{paddedId}', N'{options.WorkerQueue} ', N'{payloadJson}', N'{emptyJson}');
+                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, headers_json, created_at)
+                VALUES ('{paddedId}', N'{options.WorkerQueue} ', N'{payloadJson}', N'{emptyJson}', DATEADD(minute, -5, SYSUTCDATETIME()));
                 """);
 
+            var firstId = Guid.NewGuid();
+            var secondId = Guid.NewGuid();
+            await store.PublishAsync(firstId, options.WorkerQueue, """{"kind":"mine"}""", null, CancellationToken.None);
+            await store.PublishAsync(secondId, options.WorkerQueue, """{"kind":"mine-too"}""", null, CancellationToken.None);
+
+            // The queue is not blocked: the first claim returns a valid row, not null.
+            var delivery = await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None);
+            Assert.NotNull(delivery);
+            Assert.Equal(firstId, delivery.Id);
+            Assert.Equal("""{"kind":"mine"}""", delivery.Payload);
+            await delivery.AckAsync();
+
+            // And the BATCH path drains the rest rather than stopping at the head. This is where
+            // the starvation actually bit: ClaimBatchAsync yields until a claim returns null, so a
+            // single unclaimable row at the front of the ordering ended every batch at zero.
+            var batch = new List<SqlServerTransportDelivery>();
+            await foreach (var claimed in store.ClaimBatchAsync(options.WorkerQueue, 5, options.LockTimeout, CancellationToken.None))
+                batch.Add(claimed);
+            Assert.Equal([secondId], batch.Select(claimed => claimed.Id));
+            foreach (var claimed in batch)
+                await claimed.AckAsync();
+
+            // And the padded row is not treated as a fallback either — it stays invisible.
             Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
 
-            // Released exactly as it was: unlocked, and with the attempt the claim charged rolled
-            // back — otherwise repeated mis-claims would walk it to its delivery limit.
+            // Untouched, because it was never claimed: no attempt charged, no lease taken. A row
+            // that is claimed and then released would have to have its attempt refunded, or
+            // repeated polls would walk somebody else's message to its delivery limit.
             await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
             await connection.OpenAsync();
             await using var check = connection.CreateCommand();
@@ -348,6 +374,116 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             Assert.True(await reader.ReadAsync());
             Assert.Equal(0, reader.GetInt32(0));
             Assert.Equal(1, reader.GetInt32(1));
+        });
+    }
+
+    [Fact]
+    public async Task DeadLetterPrune_DeletesOnlyItsOwnQueuesRows()
+    {
+        // The retention prune is a DELETE keyed on the same shared queue column, so it inherits the
+        // same padding rule — and here the consequence is not a mis-delivery but data loss: an
+        // unqualified `queue = @queue` would delete a NEIGHBOURING queue's rows whose name differs
+        // only in trailing blanks, silently, on a timer.
+        await WithSchemaAsync("sql_dlq_prune", async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.DeadLetterRetention = TimeSpan.FromSeconds(1);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            var payloadJson = """{"kind":"old"}""";
+            var emptyJson = "{}";
+            var expiredId = Guid.NewGuid();
+            var paddedNeighbourId = Guid.NewGuid();
+            await ExecuteAsync(
+                $"""
+                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, headers_json, created_at)
+                VALUES ('{expiredId}', N'{options.DeadLetterQueue}', N'{payloadJson}', N'{emptyJson}', DATEADD(minute, -5, SYSUTCDATETIME())),
+                       ('{paddedNeighbourId}', N'{options.DeadLetterQueue} ', N'{payloadJson}', N'{emptyJson}', DATEADD(minute, -5, SYSUTCDATETIME()));
+                """);
+
+            // A publish is what triggers the throttled prune, and a store this fresh has never run
+            // one, so the first publish is due immediately.
+            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, """{"kind":"trigger"}""", null, CancellationToken.None);
+
+            await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+            await connection.OpenAsync();
+            await using var check = connection.CreateCommand();
+            check.CommandText = $"SELECT id FROM [{schema}].[{options.MessageTable}] WHERE id IN (@expired, @neighbour);";
+            check.Parameters.AddWithValue("@expired", expiredId);
+            check.Parameters.AddWithValue("@neighbour", paddedNeighbourId);
+            var surviving = new List<Guid>();
+            await using (var reader = await check.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync())
+                    surviving.Add(reader.GetGuid(0));
+            }
+
+            Assert.Equal([paddedNeighbourId], surviving);
+        });
+    }
+
+    [Fact]
+    public async Task ACaseFoldedQueueRow_IsNeverClaimed_OnALegacyCaseInsensitiveTable()
+        => await AssertLegacyQueueColumnClaimsExactlyAsync("sql_ci_queue", "nvarchar(200) COLLATE Latin1_General_100_CI_AS");
+
+    [Fact]
+    public async Task ExactQueueMatching_SurvivesANonUnicodeQueueColumn()
+        => await AssertLegacyQueueColumnClaimsExactlyAsync("sql_varchar_queue", "varchar(200)");
+
+    /// <summary>
+    /// The exact-match predicate has to survive a table this build did NOT create: with
+    /// AutoCreateSchema off there is no COLLATE clause to lean on, so the column carries the server
+    /// default (which folds case, making <c>queue = N'worker'</c> match 'WORKER'), and its type is
+    /// whatever the migration chose. Both are covered by the same claim, from opposite directions:
+    /// the case-folding column must NOT over-match, and the varchar column must still match at all
+    /// — the intuitive byte-count formulation (<c>DATALENGTH(queue) = DATALENGTH(@queue)</c>)
+    /// compares 1-byte characters against 2-byte ones and silently claims nothing, forever.
+    /// </summary>
+    private async Task AssertLegacyQueueColumnClaimsExactlyAsync(string prefix, string queueColumnType)
+    {
+        await WithSchemaAsync(prefix, async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.AutoCreateSchema = false;
+            var emptyJson = "{}";
+            await ExecuteAsync(
+                $"""
+                IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');
+
+                CREATE TABLE [{schema}].[{options.MessageTable}] (
+                    id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+                    queue {queueColumnType} NOT NULL,
+                    payload_json nvarchar(max) NOT NULL,
+                    headers_json nvarchar(max) NOT NULL DEFAULT N'{emptyJson}',
+                    created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    locked_until datetime2 NULL,
+                    lock_id uniqueidentifier NULL,
+                    attempts int NOT NULL DEFAULT 0,
+                    dead_letter_reason nvarchar(max) NULL
+                );
+                """);
+
+            var store = new SqlServerTransportStore(Options.Create(options));
+            var payloadJson = """{"kind":"other-queue"}""";
+            // Two decoys, both older than the valid row so they sort ahead of it: one differing only
+            // in case, one only in a trailing space.
+            await ExecuteAsync(
+                $"""
+                INSERT INTO [{schema}].[{options.MessageTable}] (id, queue, payload_json, headers_json, created_at)
+                VALUES ('{Guid.NewGuid()}', N'{options.WorkerQueue.ToUpperInvariant()}', N'{payloadJson}', N'{emptyJson}', DATEADD(minute, -5, SYSUTCDATETIME())),
+                       ('{Guid.NewGuid()}', N'{options.WorkerQueue} ', N'{payloadJson}', N'{emptyJson}', DATEADD(minute, -4, SYSUTCDATETIME()));
+                """);
+
+            var validId = Guid.NewGuid();
+            await store.PublishAsync(validId, options.WorkerQueue, """{"kind":"mine"}""", null, CancellationToken.None);
+
+            var delivery = await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None);
+            Assert.NotNull(delivery);
+            Assert.Equal(validId, delivery.Id);
+            await delivery.AckAsync();
+            Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
         });
     }
 

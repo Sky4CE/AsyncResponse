@@ -42,6 +42,39 @@ internal sealed class SqlServerTransportStore
     // Interpolated into DDL: literal braces cannot appear directly inside the interpolated raw string.
     private const string EmptyJsonObject = "{}";
 
+    /// <summary>
+    /// An EXACT queue-name predicate — the only kind this table can be filtered by safely, because
+    /// its three logical queues share one table and are told apart by nothing but this column.
+    /// <c>queue = @queue</c> alone is not exact in two independent ways: SQL Server pads the shorter
+    /// operand of an equality comparison with spaces (under EVERY collation, binary ones included),
+    /// so <c>'worker '</c> answers a query for <c>'worker'</c>; and on a table an older build or a
+    /// hand-written migration left with the server's default collation, the comparison also folds
+    /// case, accent, and width.
+    /// <para>
+    /// The second comparison closes both. Appending a non-blank sentinel to each side makes the
+    /// last character non-blank, so the padding SQL Server may add can no longer bridge two
+    /// different strings — <c>'worker .'</c> versus <c>'worker. '</c> differ at the seventh
+    /// character — and the explicit collation makes the comparison ordinal whatever the column's
+    /// own collation is. The first comparison is kept as the seekable driver, so the claim index is
+    /// still used and this only filters the rows it returns.
+    /// </para>
+    /// <para>
+    /// Verified on SQL Server 2022, which is also why the shape is this one and not the more
+    /// obvious <c>DATALENGTH(queue) = DATALENGTH(@queue)</c>: byte counts are meaningless across
+    /// types, so that form silently matches NOTHING on a <c>varchar</c> column, and pushing the
+    /// explicit collation onto the driver comparison costs the index seek on a case-folding column.
+    /// This form keeps an Index Seek on both, and was measured exact against <c>nvarchar</c>
+    /// binary, <c>nvarchar</c> case-insensitive, and <c>varchar</c> columns alike.
+    /// </para>
+    /// <para>
+    /// Exactness belongs HERE rather than in a post-claim re-check: a row the query returns has
+    /// already been claimed, and releasing it leaves it first in line for the very next poll, which
+    /// starves every valid row behind it.
+    /// </para>
+    /// </summary>
+    private const string ExactQueueMatch =
+        "queue = @queue AND queue + N'.' = @queue + N'.' COLLATE Latin1_General_100_BIN2";
+
     private readonly string _connectionString;
     private readonly SqlServerAsyncResponseTransportOptions _options;
     private readonly ILogger<SqlServerTransportStore>? _logger;
@@ -208,7 +241,6 @@ internal sealed class SqlServerTransportStore
                 PrimaryKey: ["id"])
             ];
 
-
     /// <summary>
     /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
     /// (insert-if-absent) rather than inserting a duplicate job.
@@ -237,9 +269,9 @@ internal sealed class SqlServerTransportStore
         command.CommandText =
             $"""
             WITH next AS (
-                SELECT TOP (1) id, queue, payload_json, headers_json, attempts, locked_until, lock_id
+                SELECT TOP (1) id, payload_json, headers_json, attempts, locked_until, lock_id
                 FROM {MessageTable} WITH (UPDLOCK, ROWLOCK, READPAST)
-                WHERE queue = @queue
+                WHERE {ExactQueueMatch}
                   AND available_at <= SYSUTCDATETIME()
                   AND (locked_until IS NULL OR locked_until <= SYSUTCDATETIME())
                 ORDER BY created_at
@@ -248,7 +280,7 @@ internal sealed class SqlServerTransportStore
             SET attempts = attempts + 1,
                 locked_until = {AddMilliseconds("@lock_timeout_ms")},
                 lock_id = @lock_id
-            OUTPUT inserted.id, inserted.queue, inserted.payload_json, inserted.headers_json, inserted.attempts;
+            OUTPUT inserted.id, inserted.payload_json, inserted.headers_json, inserted.attempts;
             """;
         command.Parameters.AddWithValue("@queue", queue);
         command.Parameters.AddWithValue("@lock_timeout_ms", (long)lockTimeout.TotalMilliseconds);
@@ -259,33 +291,17 @@ internal sealed class SqlServerTransportStore
             return null;
 
         var id = reader.GetGuid(0);
-        var claimedQueue = reader.GetString(1);
-        var payload = reader.GetString(2);
-        var headerJson = reader.GetString(3);
-        var attempt = reader.GetInt32(4);
+        var payload = reader.GetString(1);
+        var headerJson = reader.GetString(2);
+        var attempt = reader.GetInt32(3);
         var headers = DeserializeHeaders(headerJson);
 
-        // The row was selected with `queue = @queue`, but SQL Server pads the shorter operand of an
-        // equality comparison with spaces — under every collation, binary ones included — so a row
-        // whose queue differs only in trailing blanks matches. Startup validation rejects such
-        // names, and this re-check is the second half of that guarantee: it also covers rows an
-        // OLDER build (or another writer) put in the table. Claiming it already incremented the
-        // attempt and took the lock, so the lease is released rather than left to expire.
-        if (!string.Equals(claimedQueue, queue, StringComparison.Ordinal))
-        {
-            _logger?.LogError(
-                "The SQL Server transport claimed a row from queue '{ClaimedQueue}' while polling queue '{RequestedQueue}'. " +
-                "SQL Server's equality comparison ignores trailing spaces, so those two names are the same key to the database. " +
-                "The row was released untouched instead of being handled by the wrong subscriber; remove the trailing spaces from " +
-                "the configured queue names.",
-                claimedQueue, queue);
-            await ReleaseMisclaimedAsync(id, lockId).ConfigureAwait(false);
-            return null;
-        }
-
+        // The claim predicate matches the queue exactly (see ExactQueueMatch), so the claimed row's
+        // queue IS the requested one — no post-claim re-check, and therefore no row that gets
+        // claimed, rejected, and released back to the head of the same ordering on every poll.
         return new SqlServerTransportDelivery(
             id,
-            claimedQueue,
+            queue,
             payload,
             headers,
             attempt,
@@ -384,28 +400,6 @@ internal sealed class SqlServerTransportStore
         command.Parameters.AddWithValue("@lock_id", lockId);
         command.Parameters.AddWithValue("@lock_timeout_ms", (long)lockTimeout.TotalMilliseconds);
         return await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false) > 0;
-    }
-
-    /// <summary>
-    /// Puts a row claimed by mistake back exactly as it was — including undoing the attempt the
-    /// claim charged it. A plain NAK would leave that increment behind, so repeated mis-claims
-    /// would walk somebody else's message to its delivery limit and dead-letter it.
-    /// </summary>
-    private async ValueTask ReleaseMisclaimedAsync(Guid id, Guid lockId)
-    {
-        await using var connection = await OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            UPDATE {MessageTable}
-            SET attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
-                locked_until = NULL,
-                lock_id = NULL
-            WHERE id = @id AND lock_id = @lock_id;
-            """;
-        command.Parameters.AddWithValue("@id", id);
-        command.Parameters.AddWithValue("@lock_id", lockId);
-        await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     private async ValueTask NakAsync(Guid id, Guid lockId, TimeSpan delay)
@@ -508,7 +502,7 @@ internal sealed class SqlServerTransportStore
 
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM {MessageTable} WHERE queue = @queue AND created_at < {AddMilliseconds("@negative_retention_ms")};";
+        command.CommandText = $"DELETE FROM {MessageTable} WHERE {ExactQueueMatch} AND created_at < {AddMilliseconds("@negative_retention_ms")};";
         command.Parameters.AddWithValue("@queue", _options.DeadLetterQueue);
         command.Parameters.AddWithValue("@negative_retention_ms", -(long)retention.TotalMilliseconds);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);

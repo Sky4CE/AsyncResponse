@@ -332,6 +332,76 @@ public sealed class SqlServerOptionsTests
         Assert.Equal("acme", target.Properties["tenant"]);
     }
 
+    [Theory]
+    [InlineData("regional_responses ")]
+    [InlineData(" regional_responses")]
+    public void AddReplyTarget_RejectsAQueueNameWithSurroundingSpaces(string queueName)
+    {
+        // A reply target's queue is a row key in the same nvarchar(200) column as the transport's
+        // own three queues, reached by a different route: it is handed to remote publishers as the
+        // reply address. A padded name lands rows the exact-matching claim predicate never returns, so
+        // the reply is accepted and then never delivered.
+        var options = TransportOptions();
+
+        var ex = Assert.Throws<InvalidOperationException>(() => options.AddReplyTarget("regional", queueName));
+
+        Assert.Contains("begins or ends with a space", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("regional", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AddReplyTarget_RejectsAnOverlongQueueName()
+    {
+        // 201 characters does not fit nvarchar(200): unvalidated, the remote publisher's insert
+        // fails outright, at reply time, on the far side of the system boundary.
+        var options = TransportOptions();
+
+        var ex = Assert.Throws<InvalidOperationException>(() => options.AddReplyTarget(
+            "regional",
+            new string('r', SqlServerTransportOptionsValidator.MaxQueueNameLength + 1)));
+
+        Assert.Contains("nvarchar(200)", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("regional", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("overlong")]
+    [InlineData("padded")]
+    public void ReplyTargetProvider_RejectsABadQueueName_AddedByMutatingTheDictionary(string violation)
+    {
+        // ReplyTargets is publicly mutable, so AddReplyTarget's fail-fast is not the only way in;
+        // resolution re-checks, and covers both rules the queue-name contract carries.
+        var options = TransportOptions();
+        options.ReplyTargets["regional"] = new SqlServerReplyTargetOptions
+        {
+            ResponseQueue = violation == "overlong"
+                ? new string('r', SqlServerTransportOptionsValidator.MaxQueueNameLength + 1)
+                : "regional_responses "
+        };
+        var provider = new SqlServerReplyTargetProvider(Options.Create(options));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => provider.GetReplyTarget("regional"));
+
+        Assert.Contains(
+            violation == "overlong" ? "nvarchar(200)" : "begins or ends with a space",
+            ex.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("regional", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReplyTargetProvider_AcceptsAValidNamedQueue()
+    {
+        // The false-positive guard for the two rejections above: a legal name at the cap must still
+        // resolve, or the validation would break every correctly configured reply target.
+        var options = TransportOptions();
+        var atCap = new string('r', SqlServerTransportOptionsValidator.MaxQueueNameLength);
+        options.AddReplyTarget("regional", atCap);
+        var provider = new SqlServerReplyTargetProvider(Options.Create(options));
+
+        Assert.Equal(atCap, provider.GetReplyTarget("regional").Address);
+    }
+
     [Fact]
     public void ReplyTargetProvider_UnknownName_Throws()
     {

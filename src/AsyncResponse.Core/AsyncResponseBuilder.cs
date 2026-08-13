@@ -15,12 +15,7 @@ internal abstract class AsyncResponseBuilderBase(
     /// <summary>Validates the supplied options.</summary>
     protected static string ValidateCorrelationId(string correlationId)
     {
-        if (string.IsNullOrWhiteSpace(correlationId))
-            throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
-
-        if (AsyncResponseChannelOptions.CorrelationIdNotPortable(correlationId) is { } rejection)
-            throw new ArgumentException(rejection, nameof(correlationId));
-
+        CorrelationIdGuard.ThrowIfUnusable(correlationId);
         return correlationId;
     }
 

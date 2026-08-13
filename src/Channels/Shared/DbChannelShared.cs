@@ -154,8 +154,7 @@ internal abstract class DbAsyncResponseChannelBase :
         Func<T, ValueTask<bool>>? completionPredicate,
         TimeSpan? timeout) where T : IAsyncResponsePayload
     {
-        if (string.IsNullOrWhiteSpace(correlationId))
-            throw new ArgumentNullException(nameof(correlationId), "CorrelationId must not be empty or whitespace.");
+        CorrelationIdGuard.ThrowIfUnusable(correlationId);
 
         if ((resumeCallback is not null || failureCallback is not null)
             && !AsyncResponsePayloadReflection.OverridesOnRecovery(typeof(T)))
@@ -306,12 +305,8 @@ internal abstract class DbAsyncResponseChannelBase :
         AsyncResponseDiagnostics.SetPayloadType(activity, typeof(T));
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the response.");
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the response.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the response"))
             return;
-        }
 
         try
         {
@@ -370,12 +365,8 @@ internal abstract class DbAsyncResponseChannelBase :
         activity?.SetTag("asyncresponse.channel", _activityTag);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the raw response.");
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the raw response.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the raw response"))
             return;
-        }
 
         try
         {
@@ -438,12 +429,8 @@ internal abstract class DbAsyncResponseChannelBase :
         activity?.SetTag("asyncresponse.exception_type", exception.GetType().FullName ?? exception.GetType().Name);
         AsyncResponseDiagnostics.SetCorrelationId(activity, correlationId);
 
-        if (string.IsNullOrWhiteSpace(correlationId))
-        {
-            _logger.LogWarning("CorrelationId is null; cannot publish the exception. Exception: {ExceptionMessage}", exception.Message);
-            AsyncResponseDiagnostics.SetError(activity, "correlation_id_null", "CorrelationId is null; cannot publish the exception.");
+        if (CorrelationIdGuard.IsUnroutable(correlationId, _logger, activity, "the exception", exception))
             return;
-        }
 
         try
         {
