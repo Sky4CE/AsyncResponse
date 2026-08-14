@@ -66,12 +66,12 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar29">71%</div>
+<div class="large cardpercentagebar cardpercentagebar7">92%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="10">10</td>
+<td class="limit-width right" title="13">13</td>
 </tr>
 <tr>
 <th>Total branches:</th>
@@ -79,7 +79,7 @@
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="10 of 14">71.4%</td>
+<td class="limit-width right" title="13 of 14">92.8%</td>
 </tr>
 </table>
 </div>
@@ -112,7 +112,7 @@
 <tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.Threading.CancellationToken)"><a href="#file0_line33" class="navigatetohash">PublishAsync(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="get_MaxPublishDelay()"><a href="#file0_line37" class="navigatetohash">get_MaxPublishDelay()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="PublishAsync(AsyncResponse.WorkerJobEnvelope, System.TimeSpan, System.Threading.CancellationToken)"><a href="#file0_line42" class="navigatetohash">PublishAsync(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title="PublishCoreAsync()"><a href="#file0_line48" class="navigatetohash">PublishCoreAsync()</a></td><td>66.67%</td><td>12</td><td>12</td><td>96.88%</td></tr>
+<tr><td title="PublishCoreAsync()"><a href="#file0_line48" class="navigatetohash">PublishCoreAsync()</a></td><td>75%</td><td>12</td><td>12</td><td>96.88%</td></tr>
 <tr><td title="&lt;PublishCoreAsync()"><a href="#file0_line78" class="navigatetohash">&lt;PublishCoreAsync()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
@@ -176,9 +176,9 @@
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line51"></a><code>51</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;asyncresponse.worker.publish&quot;,</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line52"></a><code>52</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;ActivityKind.Producer,</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line53"></a><code>53</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;job.CorrelationId);</code></td></tr>
-<tr class="coverableline" title="Partially covered (6 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line54"></a><code>54</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.transport&quot;,&nbsp;&quot;mongodb&quot;);</code></td></tr>
-<tr class="coverableline" title="Partially covered (6 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line55"></a><code>55</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;messaging.system&quot;,&nbsp;&quot;mongodb&quot;);</code></td></tr>
-<tr class="coverableline" title="Partially covered (6 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line56"></a><code>56</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;messaging.destination.name&quot;,&nbsp;_options.WorkerQueue);</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line54"></a><code>54</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;asyncresponse.transport&quot;,&nbsp;&quot;mongodb&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line55"></a><code>55</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;messaging.system&quot;,&nbsp;&quot;mongodb&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line56"></a><code>56</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;activity?.SetTag(&quot;messaging.destination.name&quot;,&nbsp;_options.WorkerQueue);</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line57"></a><code>57</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseDiagnostics.SetReplyTarget(activity,&nbsp;job.ReplyTarget);</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line58"></a><code>58</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;AsyncResponseDiagnostics.SetWorker(activity,&nbsp;job.Call);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line59"></a><code>59</code></td><td></td><td class="lightgray"><code></code></td></tr>
@@ -238,7 +238,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/13/2026 - 14:42:32<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 08:45:00<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
