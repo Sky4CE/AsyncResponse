@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786697042447,
+  "lastUpdate": 1786697066973,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -82956,6 +82956,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1665.314875072075,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "11ff8550471b819f0853078821b11bf7f5bc02c8",
+          "message": "fix: reject ill-formed UTF-16 ids, drop the ingress content digest\nRound-20 review findings, each with a regression test.\n- An unpaired surrogate does not just fail validation, it collides: every UTF-8\n  encoder substitutes U+FFFD rather than failing, so a lone U+D800 and a literal\n  U+FFFD share one NATS subject and one recovery key. Rejected in both id\n  contracts; the NATS schema now encodes and decodes strictly.\n- The SHA-256 prefix added last round was a content oracle for low-entropy\n  payloads, and hashed every body before checking whether Debug was on. Removed;\n  size and routing metadata remain.\n- Worker jobs validate their correlation id before the handler runs, so a bad id\n  no longer fails after the side effects and redelivers to repeat them.\n- MySQL verification requires utf8mb4 (latin1_bin passed the collation check and\n  then rejected most non-Latin ids) and refuses extra NOT NULL columns with no\n  default, which made every create fail.\n- MySQL confirms the row exists before reading 1062 as \"already exists\": a legacy\n  prefix key raises it for a different id entirely.\n- The 30 ms NAK assertions raced the database; they now use a far-future delay\n  and release the row explicitly.",
+          "timestamp": "2026-08-14T10:25:36+02:00",
+          "tree_id": "e164f4b2be59885d7290062a563b1d4902a61fbf",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/11ff8550471b819f0853078821b11bf7f5bc02c8"
+        },
+        "date": 1786697066125,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 83335.61117337208,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 47360.41464990234,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 103290.078202984,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 321630.279561039,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 518919.8165099528,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 372350.7245945101,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 450198.9879526751,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 306117.4511436548,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 333377.78370449395,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 335985.37791635306,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 364910.2320829076,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 503626.1079774376,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 524802.1495896047,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 145763.50046965,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 106256.55602950702,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 42953.938944927555,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 33424.65841336088,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4797.051156712946,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 240045.32055652107,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 91117.50148521528,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1637250.7285765742,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1704.031766423867,
             "unit": "flows/s"
           }
         ]
