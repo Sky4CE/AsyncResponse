@@ -103,7 +103,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var command = connection.CreateCommand();
         command.BindByName = true;
         command.CommandText = $"SELECT state_json, revision FROM {Table} WHERE flow_id = :flow_id AND expires_at_utc > {UtcNowSql}";
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -157,7 +157,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
                 INSERT (flow_id, state_json, expires_at_utc, updated_at_utc, revision)
                 VALUES (:flow_id, :state_json, {AddMilliseconds(":ttl_ms")}, {UtcNowSql}, :revision)
             """;
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
         command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = stateJson });
         command.Parameters.Add(new OracleParameter("ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl)));
         command.Parameters.Add(new OracleParameter("revision", revision));
@@ -191,12 +191,12 @@ public sealed class OracleFlowStateStore : IFlowStateStore
               AND expires_at_utc > {UtcNowSql}
               AND (:lease_id IS NULL OR (lease_id = :lease_id AND lease_expires_at_utc > {UtcNowSql}))
             """;
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
         command.Parameters.Add(new OracleParameter("state_json", OracleDbType.NClob) { Value = stateJson });
         command.Parameters.Add(new OracleParameter("ttl_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(ttl)));
         command.Parameters.Add(new OracleParameter("expected_revision", expectedRevision));
         command.Parameters.Add(new OracleParameter("new_revision", state.Revision));
-        command.Parameters.Add(new OracleParameter("lease_id", OracleDbType.NVarchar2) { Value = (object?)leaseId ?? DBNull.Value });
+        command.Parameters.Add(NationalId("lease_id", leaseId));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -213,8 +213,8 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var command = connection.CreateCommand();
         command.BindByName = true;
         command.CommandText = $"UPDATE {Table} SET lease_id = NULL, lease_expires_at_utc = NULL WHERE flow_id = :flow_id AND lease_id = :lease_id";
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("lease_id", leaseId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
+        command.Parameters.Add(NationalId("lease_id", leaseId));
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -227,7 +227,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         await using var command = connection.CreateCommand();
         command.BindByName = true;
         command.CommandText = $"DELETE FROM {Table} WHERE flow_id = :flow_id";
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
@@ -280,15 +280,26 @@ public sealed class OracleFlowStateStore : IFlowStateStore
 
             // Oracle DDL commits implicitly, so everything above is already committed and the
             // checks below run outside any transaction: they read the catalog for OTHER sessions'
-            // committed objects and must never sit on DDL locks of their own.
-            await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
-            _created = true;
+            // committed objects and must never sit on DDL locks of their own. _created latches
+            // only on a VERIFIED table: when the table does not exist yet (AutoCreateSchema =
+            // false, migration not run), verification re-runs on the next operation instead of
+            // being silently skipped for the process lifetime.
+            _created = await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _ensureGate.Release();
         }
     }
+
+    // NVarchar2, never the inferred Varchar2: ids travel to NVARCHAR2 columns, and a Varchar2
+    // bind converts through the DATABASE character set on the wire — on a non-Unicode
+    // NLS_CHARACTERSET (e.g. WE8MSWIN1252) two distinct Unicode ids collapse to one '???' key,
+    // so one flow's row answers another flow's create/load. The verifier enforces NVARCHAR2
+    // columns for exactly this reason; the binds must match it. Internal (not private) so the
+    // unit suite can pin the bind type without an Oracle server.
+    internal static OracleParameter NationalId(string name, string? value)
+        => new(name, OracleDbType.NVarchar2) { Value = (object?)value ?? DBNull.Value };
 
     private static async Task ExecuteIgnoringExistsAsync(OracleConnection connection, string commandText, CancellationToken cancellationToken)
     {
@@ -337,53 +348,24 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     /// The expiry index is deliberately not verified: it is performance-only (loads and pruning
     /// filter on expiry either way), the same standard the sibling stores apply to theirs.
     /// </summary>
-    private async Task VerifyFlowTableAsync(OracleConnection connection, CancellationToken cancellationToken)
+    private async Task<bool> VerifyFlowTableAsync(OracleConnection connection, CancellationToken cancellationToken)
     {
         await VerifyComparisonSemanticsAsync(connection, cancellationToken).ConfigureAwait(false);
 
-        var objectTypes = new List<string>();
-        await using (var command = connection.CreateCommand())
-        {
-            command.BindByName = true;
-            // Only the namespaces that can collide with a table: tables, views, materialized
-            // views, synonyms, and sequences share one namespace (indexes and triggers do not). A
-            // materialized view registers BOTH a TABLE and a MATERIALIZED VIEW row for its name,
-            // so any non-TABLE row disqualifies it.
-            command.CommandText =
-                """
-                SELECT OBJECT_TYPE FROM USER_OBJECTS
-                WHERE OBJECT_NAME = :object_name
-                  AND OBJECT_TYPE IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SYNONYM', 'SEQUENCE')
-                """;
-            command.Parameters.Add(new OracleParameter("object_name", CatalogName));
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                objectTypes.Add(reader.GetString(0));
-        }
-
-        if (objectTypes.Count == 0)
+        if (await ResolveBaseTableAsync(connection, cancellationToken).ConfigureAwait(false) is not { } table)
         {
             // The table does not exist: AutoCreateSchema = false and the migration has not run yet.
             // That surfaces at the first query with a clear ORA-00942, and failing here would break
-            // the documented "create it yourself, later" workflow.
-            return;
-        }
-
-        if (objectTypes.Find(type => !type.Equals("TABLE", StringComparison.OrdinalIgnoreCase)) is { } notATable)
-        {
-            throw new InvalidOperationException(
-                $"The Oracle durable-flow table name '{_options.TableName}' is held by a {notATable}, not a table. Reads against " +
-                "it may even work, but this store's MERGE-based create needs a real table with a unique key on flow_id to detect " +
-                "duplicate flows, so writes would fail — or double-run flows — mid-operation instead of at startup. Point " +
-                $"{nameof(OracleDurableFlowOptions)}.{nameof(OracleDurableFlowOptions.TableName)} at a table, or drop the " +
-                $"{notATable} and let the store create the table.");
+            // the documented "create it yourself, later" workflow. Returning false leaves _created
+            // unlatched, so a table created later is still verified before it is trusted.
+            return false;
         }
 
         var columns = new Dictionary<string, ActualColumn>(StringComparer.OrdinalIgnoreCase);
         await using (var command = connection.CreateCommand())
         {
             command.BindByName = true;
-            // USER_TAB_COLS rather than USER_TAB_COLUMNS: it carries VIRTUAL_COLUMN and
+            // ALL_TAB_COLS rather than ALL_TAB_COLUMNS: it carries VIRTUAL_COLUMN and
             // IDENTITY_COLUMN, and HIDDEN_COLUMN = 'NO' keeps user columns — including INVISIBLE
             // ones, which still break INSERTs that do not name them — while dropping the
             // system-generated ones function-based indexes add. DEFAULT_LENGTH stands in for
@@ -393,10 +375,11 @@ public sealed class OracleFlowStateStore : IFlowStateStore
                 """
                 SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, CHAR_LENGTH, DATA_PRECISION, DATA_SCALE,
                        DEFAULT_LENGTH, VIRTUAL_COLUMN, IDENTITY_COLUMN
-                FROM USER_TAB_COLS
-                WHERE TABLE_NAME = :table_name AND HIDDEN_COLUMN = 'NO'
+                FROM ALL_TAB_COLS
+                WHERE OWNER = :owner AND TABLE_NAME = :table_name AND HIDDEN_COLUMN = 'NO'
                 """;
-            command.Parameters.Add(new OracleParameter("table_name", CatalogName));
+            command.Parameters.Add(new OracleParameter("owner", table.Owner));
+            command.Parameters.Add(new OracleParameter("table_name", table.Name));
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -452,7 +435,124 @@ public sealed class OracleFlowStateStore : IFlowStateStore
                 "it a default, make it nullable, virtual, or identity, or move it to a table of your own.");
         }
 
-        await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);
+        await VerifyFlowIdIsUniqueAsync(connection, table.Owner, table.Name, cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves what the store's unqualified table name actually reaches — the same path Oracle's
+    /// own name resolution takes: an object in CURRENT_SCHEMA, else a private synonym there, else
+    /// a PUBLIC synonym, following synonym chains to the base object. USER_* views describe the
+    /// CONNECTING user, which is the wrong scope whenever a logon trigger sets CURRENT_SCHEMA or
+    /// the table is reached through a synonym: they either go blank (silently skipping every
+    /// check) or report the synonym itself as a disqualifying non-TABLE. Returns null when nothing
+    /// resolves (table absent) or the chain leaves this database (a DB link, unverifiable here);
+    /// throws when the name resolves to a non-TABLE object.
+    /// </summary>
+    private async Task<(string Owner, string Name)?> ResolveBaseTableAsync(OracleConnection connection, CancellationToken cancellationToken)
+    {
+        string? owner;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual";
+            owner = (string?)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        if (string.IsNullOrEmpty(owner))
+            return null;
+
+        var name = CatalogName;
+        // Oracle itself raises ORA-01775 on a looping synonym chain; the bound only keeps a
+        // broken catalog from spinning this check.
+        for (var hop = 0; hop < 10; hop++)
+        {
+            var objectTypes = new List<string>();
+            await using (var command = connection.CreateCommand())
+            {
+                command.BindByName = true;
+                // Only the namespaces that can collide with a table: tables, views, materialized
+                // views, synonyms, and sequences share one namespace (indexes and triggers do
+                // not). A materialized view registers BOTH a TABLE and a MATERIALIZED VIEW row for
+                // its name, so any non-TABLE row disqualifies it.
+                command.CommandText =
+                    """
+                    SELECT OBJECT_TYPE FROM ALL_OBJECTS
+                    WHERE OWNER = :owner AND OBJECT_NAME = :object_name
+                      AND OBJECT_TYPE IN ('TABLE', 'VIEW', 'MATERIALIZED VIEW', 'SYNONYM', 'SEQUENCE')
+                    """;
+                command.Parameters.Add(new OracleParameter("owner", owner));
+                command.Parameters.Add(new OracleParameter("object_name", name));
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    objectTypes.Add(reader.GetString(0));
+            }
+
+            if (objectTypes.Count == 0)
+            {
+                // Nothing in this schema: an unqualified name falls through to a PUBLIC synonym.
+                if (await ResolveSynonymAsync(connection, "PUBLIC", name, cancellationToken).ConfigureAwait(false) is not { } publicTarget)
+                    return null;
+
+                (owner, name) = publicTarget;
+                continue;
+            }
+
+            // Synonyms share the object namespace within a schema, so a SYNONYM row is the only
+            // row: follow it.
+            if (objectTypes.Contains("SYNONYM"))
+            {
+                if (await ResolveSynonymAsync(connection, owner, name, cancellationToken).ConfigureAwait(false) is not { } target)
+                    return null;
+
+                (owner, name) = target;
+                continue;
+            }
+
+            if (objectTypes.Find(type => !type.Equals("TABLE", StringComparison.OrdinalIgnoreCase)) is { } notATable)
+            {
+                throw new InvalidOperationException(
+                    $"The Oracle durable-flow table name '{_options.TableName}' resolves to a {notATable} ({owner}.{name}), not a table. Reads against " +
+                    "it may even work, but this store's MERGE-based create needs a real table with a unique key on flow_id to detect " +
+                    "duplicate flows, so writes would fail — or double-run flows — mid-operation instead of at startup. Point " +
+                    $"{nameof(OracleDurableFlowOptions)}.{nameof(OracleDurableFlowOptions.TableName)} at a table, or drop the " +
+                    $"{notATable} and let the store create the table.");
+            }
+
+            return (owner, name);
+        }
+
+        throw new InvalidOperationException(
+            $"The Oracle durable-flow table name '{_options.TableName}' did not resolve to a base table within 10 synonym hops; " +
+            "the synonym chain is looping or degenerate.");
+    }
+
+    private static async Task<(string Owner, string Name)?> ResolveSynonymAsync(
+        OracleConnection connection,
+        string owner,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.BindByName = true;
+        command.CommandText =
+            """
+            SELECT TABLE_OWNER, TABLE_NAME, DB_LINK FROM ALL_SYNONYMS
+            WHERE OWNER = :owner AND SYNONYM_NAME = :synonym_name
+            """;
+        command.Parameters.Add(new OracleParameter("owner", owner));
+        command.Parameters.Add(new OracleParameter("synonym_name", name));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        // A DB-link synonym points outside this database; the local catalog cannot describe it.
+        if (!await reader.IsDBNullAsync(2, cancellationToken).ConfigureAwait(false))
+            return null;
+
+        if (await reader.IsDBNullAsync(0, cancellationToken).ConfigureAwait(false))
+            return null;
+
+        return (reader.GetString(0), reader.GetString(1));
     }
 
     /// <summary>
@@ -611,7 +711,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     /// catalog and enforces nothing. (Deferrable constraints use a NONUNIQUE index, which is why
     /// the constraint and index arms are both asked.)
     /// </summary>
-    private async Task VerifyFlowIdIsUniqueAsync(OracleConnection connection, CancellationToken cancellationToken)
+    private async Task VerifyFlowIdIsUniqueAsync(OracleConnection connection, string owner, string tableName, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.BindByName = true;
@@ -619,21 +719,22 @@ public sealed class OracleFlowStateStore : IFlowStateStore
             """
             SELECT 1 FROM dual
             WHERE EXISTS (
-                SELECT 1 FROM USER_CONSTRAINTS c
-                WHERE c.TABLE_NAME = :table_name AND c.CONSTRAINT_TYPE IN ('P', 'U') AND c.STATUS = 'ENABLED'
-                  AND EXISTS (SELECT 1 FROM USER_CONS_COLUMNS k
-                              WHERE k.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND k.COLUMN_NAME = 'FLOW_ID')
-                  AND NOT EXISTS (SELECT 1 FROM USER_CONS_COLUMNS o
-                                  WHERE o.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND o.COLUMN_NAME <> 'FLOW_ID'))
+                SELECT 1 FROM ALL_CONSTRAINTS c
+                WHERE c.OWNER = :owner AND c.TABLE_NAME = :table_name AND c.CONSTRAINT_TYPE IN ('P', 'U') AND c.STATUS = 'ENABLED'
+                  AND EXISTS (SELECT 1 FROM ALL_CONS_COLUMNS k
+                              WHERE k.OWNER = c.OWNER AND k.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND k.COLUMN_NAME = 'FLOW_ID')
+                  AND NOT EXISTS (SELECT 1 FROM ALL_CONS_COLUMNS o
+                                  WHERE o.OWNER = c.OWNER AND o.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND o.COLUMN_NAME <> 'FLOW_ID'))
                OR EXISTS (
-                SELECT 1 FROM USER_INDEXES i
-                WHERE i.TABLE_NAME = :table_name AND i.UNIQUENESS = 'UNIQUE'
-                  AND EXISTS (SELECT 1 FROM USER_IND_COLUMNS k
-                              WHERE k.INDEX_NAME = i.INDEX_NAME AND k.COLUMN_NAME = 'FLOW_ID')
-                  AND NOT EXISTS (SELECT 1 FROM USER_IND_COLUMNS o
-                                  WHERE o.INDEX_NAME = i.INDEX_NAME AND o.COLUMN_NAME <> 'FLOW_ID'))
+                SELECT 1 FROM ALL_INDEXES i
+                WHERE i.TABLE_OWNER = :owner AND i.TABLE_NAME = :table_name AND i.UNIQUENESS = 'UNIQUE'
+                  AND EXISTS (SELECT 1 FROM ALL_IND_COLUMNS k
+                              WHERE k.INDEX_OWNER = i.OWNER AND k.INDEX_NAME = i.INDEX_NAME AND k.COLUMN_NAME = 'FLOW_ID')
+                  AND NOT EXISTS (SELECT 1 FROM ALL_IND_COLUMNS o
+                                  WHERE o.INDEX_OWNER = i.OWNER AND o.INDEX_NAME = i.INDEX_NAME AND o.COLUMN_NAME <> 'FLOW_ID'))
             """;
-        command.Parameters.Add(new OracleParameter("table_name", CatalogName));
+        command.Parameters.Add(new OracleParameter("owner", owner));
+        command.Parameters.Add(new OracleParameter("table_name", tableName));
 
         if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null)
             return;
@@ -673,8 +774,8 @@ public sealed class OracleFlowStateStore : IFlowStateStore
               AND expires_at_utc > {UtcNowSql}
               AND {(acquire ? $"(lease_id IS NULL OR lease_expires_at_utc <= {UtcNowSql} OR lease_id = :lease_id)" : $"lease_id = :lease_id AND lease_expires_at_utc > {UtcNowSql}")}
             """;
-        command.Parameters.Add(new OracleParameter("flow_id", flowId));
-        command.Parameters.Add(new OracleParameter("lease_id", leaseId));
+        command.Parameters.Add(NationalId("flow_id", flowId));
+        command.Parameters.Add(NationalId("lease_id", leaseId));
         command.Parameters.Add(new OracleParameter("lease_ms", DurableFlowStoreShared.ServerClockTtlMilliseconds(leaseDuration)));
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }

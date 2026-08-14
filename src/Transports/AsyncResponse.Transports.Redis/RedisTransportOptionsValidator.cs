@@ -39,6 +39,22 @@ internal static class RedisTransportOptionsValidator
                 "subscribers do not consume each other's messages.");
         }
 
+        // Parity with the Kafka/NATS validators: the dead-letter stream must not be a live one.
+        // Streams fan out to every consumer group, so a dead-letter XADD into the worker stream is
+        // read back as a brand-new entry with Attempt=1 — fail, dead-letter, re-read, an unbounded
+        // loop re-running the handler's side effects; aimed at the response stream, poison worker
+        // envelopes complete live waiters. Compare the resolved names so an explicit value
+        // colliding with a derived default is caught too.
+        var deadLetterStream = schema.DeadLetterStream.ToString();
+        if (StringComparer.Ordinal.Equals(deadLetterStream, schema.WorkerStream.ToString())
+            || StringComparer.Ordinal.Equals(deadLetterStream, schema.ResponseStream.ToString()))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RedisAsyncResponseTransportOptions)}.{nameof(options.DeadLetterStream)} must resolve to a stream " +
+                $"distinct from {nameof(options.WorkerStream)} and {nameof(options.ResponseStream)} " +
+                $"(it resolves to '{deadLetterStream}') so dead-lettered messages park instead of re-entering live consumption.");
+        }
+
         // OperationTimeout arms a CancellationTokenSource per command; the retry delays feed
         // Task.Delay — all timer-armed, so all carry the .NET timer ceiling.
         AsyncResponseChannelOptions.EnsureTimerBacked(options.OperationTimeout, nameof(RedisAsyncResponseTransportOptions), nameof(options.OperationTimeout));

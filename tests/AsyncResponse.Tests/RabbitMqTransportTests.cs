@@ -367,7 +367,11 @@ public class RabbitMqTransportTests
         await transport.PublishAsync(WorkerJob("c2", 2));
 
         Assert.Equal(2, factory.Connection.CreateChannelCalls);
-        Assert.Equal(1, first.DisposeCalls); // the dead channel is disposed, not leaked
+        // The dead channel is dereferenced, NOT disposed: a concurrent publisher that took the
+        // lock-free fast path may still hold it, and disposing under that publisher turns its
+        // retryable AlreadyClosedException into a use-after-dispose. The closed channel holds no
+        // broker resources; the client reclaims it when the owning connection is disposed.
+        Assert.Equal(0, first.DisposeCalls);
         Assert.Single(first.Published);
         Assert.Single(second.Published);
         Assert.Equal(0, factory.Connection.DisposeCalls); // the still-open connection is reused
@@ -391,7 +395,9 @@ public class RabbitMqTransportTests
 
         await transport.PublishAsync(WorkerJob("c2", 2));
 
-        Assert.Equal(1, firstChannel.DisposeCalls);
+        // The dead channel object is never disposed directly (a concurrent publisher may hold
+        // it); disposing the dead connection is what reclaims it vendor-side.
+        Assert.Equal(0, firstChannel.DisposeCalls);
         Assert.Equal(1, firstConnection.DisposeCalls);
         Assert.Single(secondChannel.Published);
         Assert.Equal(1, secondConnection.CreateChannelCalls);
@@ -801,6 +807,52 @@ public class RabbitMqTransportTests
             new RabbitMqAsyncResponseOptions { NetworkRecoveryInterval = TimeSpan.FromSeconds(-1) },
             new RabbitMqSubscriberOptions(),
             RabbitMqSubscriberRole.Worker));
+    }
+
+    [Theory]
+    [InlineData("asyncresponse.worker")]   // default WorkerExchange
+    [InlineData("asyncresponse.response")] // default ResponseExchange
+    public void Validator_RejectsADeadLetterExchangeAimedAtALiveExchange(string liveExchange)
+    {
+        // With x-dead-letter-exchange set to a live exchange and no x-dead-letter-routing-key, a
+        // rejected message re-enters with its original routing key and lands right back in the
+        // queue that rejected it — reject-without-requeue becomes a broker-rate loop.
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = liveExchange },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("live exchange", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("asyncresponse.worker")]   // default WorkerQueue
+    [InlineData("asyncresponse.response")] // default ResponseQueue
+    public void Validator_RejectsADeadLetterQueueAimedAtALiveQueue(string liveQueue)
+    {
+        // A dead-letter queue that IS a live queue feeds parked poison straight back into a live
+        // consumer (worker envelopes into the response ingress in the cross-role case).
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "asyncresponse.deadletter", DeadLetterQueue = liveQueue },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterQueue), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("live queue", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validator_AcceptsADistinctDeadLetterTopology()
+    {
+        RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                DeadLetterExchange = "asyncresponse.deadletter",
+                DeadLetterQueue = "asyncresponse.deadletter"
+            },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker);
     }
 
     [Fact]

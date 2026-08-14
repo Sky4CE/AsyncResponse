@@ -93,7 +93,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     {
         if (_subscriberOptions.AckMode is DbAckMode.AckAfterEnqueue)
         {
-            await HandleEarlyAckAsync(delivery).ConfigureAwait(false);
+            await HandleEarlyAckAsync(delivery, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -118,6 +118,13 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 renewalCancellation.Cancel();
                 await renewalTask.ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown, not a handler failure: NAK would burn an attempt and dead-letter
+            // would bury healthy work once the cap is reached. Leave the claim unsettled — the
+            // lease lapses on its own and at-least-once redelivery applies after restart.
+            throw;
         }
         catch (Exception ex)
         {
@@ -228,16 +235,64 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
     }
 
-    private async Task HandleEarlyAckAsync(DbTransportDelivery delivery)
+    private async Task HandleEarlyAckAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        if (_backgroundQueue!.Writer.TryWrite(delivery))
+        if (!_backgroundQueue!.Writer.TryWrite(delivery))
+        {
+            // Saturated: wait for a worker to free a slot instead of NAKing. The subscriber loop
+            // treats every claimed row as progress and re-claims immediately, so NAK-on-full spins
+            // at full database rate — one claim plus one NAK round trip per queued row, each NAK
+            // burning an attempt (and on PostgreSQL notifying the whole fleet to come do the same).
+            // Parking here pauses the claim loop, which is the actual backpressure (mirrors the
+            // RabbitMQ/Kafka/NATS pause); the queue is built with FullMode.Wait for exactly this.
+            _logger.LogDebug("Background queue full for {Provider} {Role}; pausing the claim loop until capacity frees.", _providerName, _role);
+            try
+            {
+                await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
+            {
+                // Subscriber stopping or dispatcher draining while parked: the delivery was never
+                // enqueued, so release it promptly; if the NAK itself fails the lease lapses to
+                // the same effect.
+                try
+                {
+                    await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+                }
+                catch (Exception nakException)
+                {
+                    _logger.LogWarning(
+                        nakException,
+                        "Failed to NAK {Provider} message {MessageId} on queue {Queue} ({Role}) while stopping; the lease will lapse and the {Unit} will be redelivered.",
+                        _providerName,
+                        delivery.Id,
+                        delivery.Queue,
+                        _role,
+                        _unitNoun);
+                }
+
+                return;
+            }
+        }
+
+        // Same rule as the post-handler ACK above: the delivery is already owned by a background
+        // worker, so an ACK failure must not escape and tear down the subscriber — that would
+        // drain the workers (running the handler) while the un-ACKed row is re-claimed and run
+        // again. Swallow and log; the lease lapses and at-least-once redelivery applies.
+        try
         {
             await delivery.AckAsync().ConfigureAwait(false);
         }
-        else
+        catch (Exception ex)
         {
-            _logger.LogDebug("Background queue full for {Provider} {Role}; releasing {Unit} for redelivery.", _providerName, _role, _unitNoun);
-            await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+            _logger.LogWarning(
+                ex,
+                "Failed to ACK {Provider} message {MessageId} on queue {Queue} ({Role}) after enqueueing it for background execution; the lease will lapse and the {Unit} may be redelivered.",
+                _providerName,
+                delivery.Id,
+                delivery.Queue,
+                _role,
+                _unitNoun);
         }
     }
 

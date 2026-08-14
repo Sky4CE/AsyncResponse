@@ -266,6 +266,31 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_ShutdownCancellation_LeavesTheDeliveryUnsettled()
+    {
+        // A handler cancelled by host shutdown is not a handler failure: NACKing would count a
+        // healthy delivery against the cap — and at the cap reject it without requeue, dropping
+        // work whose side effects never ran (no dead-letter exchange configured = discarded
+        // outright). Left un-ACKed, the broker redelivers it when the channel closes.
+        var channel = new FakeDispatcherChannel();
+        var stopping = new CancellationToken(canceled: true);
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, token) => Task.FromException(new OperationCanceledException(token)),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 1 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        // Attempt 1 with MaxDeliveryAttempts = 1 is AT the cap: the old behavior was a
+        // requeue:false NACK here, i.e. the broker discarded the cancelled-but-healthy message.
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 7), channel, stopping);
+
+        Assert.Empty(channel.Acks);
+        Assert.Empty(channel.Nacks);
+    }
+
+    [Fact]
     public async Task Awaiting_BelowMaxDeliveryAttempts_RequeuesForRetry()
     {
         var channel = new FakeDispatcherChannel();

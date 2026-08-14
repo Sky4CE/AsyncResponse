@@ -190,6 +190,55 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_SettlementIgnoresTheStoppingToken()
+    {
+        // A graceful shutdown cancels the subscriber token while a handler is mid-flight; the
+        // XACK for that completed work must still go out. Forwarding the stopping token into the
+        // ack abandons it (WithCancellation drops the command), leaving the entry in the PEL to
+        // be reclaimed and re-run after restart — every sibling transport settles on
+        // CancellationToken.None.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            database,
+            new RedisAsyncResponseTransportOptions(),
+            new RedisSubscriberOptions(),
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), new CancellationToken(canceled: true));
+
+        Assert.Single(database.Acks);
+        Assert.False(Assert.Single(database.AckTokens).CanBeCanceled); // CancellationToken.None, not the stopping token
+    }
+
+    [Fact]
+    public async Task Queued_PostEnqueueSettlementIgnoresTheStoppingToken()
+    {
+        // Same rule on the early-ack path: once the entry is handed to a background worker the
+        // XACK must not be abandoned because shutdown cancelled the poll loop's token — the
+        // worker runs the entry during the drain, and an un-ACKed entry is re-claimed and
+        // re-executed after PendingMessageMinIdleTime.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            database,
+            new RedisAsyncResponseTransportOptions(),
+            new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), new CancellationToken(canceled: true));
+
+        Assert.Single(database.Acks);
+        Assert.False(Assert.Single(database.AckTokens).CanBeCanceled); // CancellationToken.None, not the stopping token
+    }
+
+    [Fact]
     public async Task Awaiting_HandlerFailsBelowMax_LeavesMessagePending()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

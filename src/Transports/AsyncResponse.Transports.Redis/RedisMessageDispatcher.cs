@@ -397,9 +397,12 @@ internal sealed class AwaitingRedisMessageDispatcher(
         // successful handler must not be misread as a handler failure — dead-lettering or leaving
         // it for reclaim here would redeliver (or bury) work whose side effects already completed.
         // Swallow and log instead; the entry stays pending and at-least-once redelivery applies.
+        // Settlement deliberately ignores cancellation (as every sibling transport does): the
+        // handler already completed, and abandoning the XACK on shutdown leaves the entry in the
+        // PEL to be reclaimed and re-run after restart.
         try
         {
-            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+            await AckAsync(delivery, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -486,9 +489,12 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
 
         // The entry now belongs to a background worker, which decrements _pendingCount when it dequeues.
         // Do not touch the counter again here, even if the ACK below fails — otherwise it double-counts.
+        // Settlement deliberately ignores cancellation (as every sibling transport does): a graceful
+        // shutdown drains the background queue and runs this entry, so abandoning the XACK on the
+        // stopping token would leave completed work in the PEL to be reclaimed and re-run.
         try
         {
-            await AckAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+            await AckAsync(delivery, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

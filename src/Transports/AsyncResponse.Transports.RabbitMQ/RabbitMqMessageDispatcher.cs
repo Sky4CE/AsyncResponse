@@ -132,6 +132,33 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 $"{nameof(RabbitMqAsyncResponseOptions.ResponseQueue)} must be distinct so worker and response subscribers do not consume each other's messages.");
         }
 
+        // Parity with the Kafka/NATS validators: a dead-letter destination aimed at a live one
+        // turns reject-without-requeue into a broker-rate loop. With x-dead-letter-exchange set to
+        // a live exchange and no x-dead-letter-routing-key, a rejected message re-enters with its
+        // original routing key and lands right back in the queue that rejected it — or crosses
+        // into the other role's queue, feeding worker envelopes to the response ingress.
+        if (!string.IsNullOrWhiteSpace(transportOptions.DeadLetterExchange)
+            && (StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.WorkerExchange)
+                || StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.ResponseExchange)))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange)} " +
+                $"'{transportOptions.DeadLetterExchange}' must not be a live exchange " +
+                $"({nameof(RabbitMqAsyncResponseOptions.WorkerExchange)}/{nameof(RabbitMqAsyncResponseOptions.ResponseExchange)}): " +
+                "dead-lettered messages would re-enter live routing and loop instead of parking.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(transportOptions.DeadLetterQueue)
+            && (StringComparer.Ordinal.Equals(transportOptions.DeadLetterQueue, transportOptions.WorkerQueue)
+                || StringComparer.Ordinal.Equals(transportOptions.DeadLetterQueue, transportOptions.ResponseQueue)))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.DeadLetterQueue)} " +
+                $"'{transportOptions.DeadLetterQueue}' must not be a live queue " +
+                $"({nameof(RabbitMqAsyncResponseOptions.WorkerQueue)}/{nameof(RabbitMqAsyncResponseOptions.ResponseQueue)}): " +
+                "dead-lettered messages would be consumed as live traffic.");
+        }
+
         if (subscriberOptions.PrefetchCount == 0)
             throw new InvalidOperationException($"{optionPath}.{nameof(RabbitMqSubscriberOptions.PrefetchCount)} must be positive.");
 
@@ -269,6 +296,14 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         try
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // Shutdown, not a handler failure: NACKing here would count a healthy delivery against
+            // the cap — and at the cap reject it without requeue, dropping (or dead-lettering)
+            // work whose side effects never ran. Leave it un-ACKed; the broker redelivers it when
+            // the channel closes.
+            return;
         }
         catch
         {

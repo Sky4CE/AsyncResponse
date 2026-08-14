@@ -289,11 +289,11 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                     $"""
                     CREATE TABLE IF NOT EXISTS {Table} (
                         flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
-                        state_json longtext NOT NULL,
+                        state_json longtext CHARACTER SET utf8mb4 NOT NULL,
                         expires_at_utc datetime(6) NOT NULL,
                         updated_at_utc datetime(6) NOT NULL,
                         revision bigint NOT NULL DEFAULT 0,
-                        lease_id varchar(64) NULL,
+                        lease_id varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
                         lease_expires_at_utc datetime(6) NULL,
                         INDEX {IndexName} (expires_at_utc)
                     );
@@ -435,6 +435,23 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                 "width) collide on the primary key: the second flow fails to start and a load returns the other run's state. Fix it " +
                 $"with ALTER TABLE `{_options.TableName}` MODIFY flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT " +
                 "NULL; (tables this build creates get that collation automatically).");
+        }
+
+        // The ledger JSON needs the same alphabet as the ids it embeds: on a latin1-default
+        // server a table that inherited the database charset stores state_json in latin1, so any
+        // non-Latin-1 state (a name, an emoji in a step result) hard-fails every update under
+        // strict mode or is silently truncated at the first bad byte otherwise — malformed JSON
+        // that deserializes to null, a flow that can neither load nor be re-created.
+        var stateJsonColumn = columns["state_json"];
+        if (stateJsonColumn.CharacterSet is not { } stateJsonCharacterSet
+            || !stateJsonCharacterSet.Equals("utf8mb4", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"The MySQL durable-flow table '{_options.TableName}' stores state_json in the character set " +
+                $"'{stateJsonColumn.CharacterSet ?? "(none)"}', which cannot hold every flow state the engine accepts. The ledger " +
+                "JSON is arbitrary text, so a narrower set rejects updates under strict mode or silently truncates the stored " +
+                $"state otherwise. Fix it with ALTER TABLE `{_options.TableName}` MODIFY state_json longtext CHARACTER SET utf8mb4 " +
+                "NOT NULL; (tables this build creates get that character set automatically).");
         }
 
         await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);

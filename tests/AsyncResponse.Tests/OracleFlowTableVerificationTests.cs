@@ -1,4 +1,5 @@
 using AsyncResponse.DurableFlows.Oracle;
+using Oracle.ManagedDataAccess.Client;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -151,4 +152,23 @@ public sealed class OracleFlowTableVerificationTests
         bool virtualColumn = false,
         bool identity = false)
         => new(dataType, nullable, charLength, precision, scale, hasDefault, virtualColumn, identity);
+
+    [Fact]
+    public void NationalId_BindsAsNVarchar2()
+    {
+        // Ids travel to NVARCHAR2 columns. The two-argument OracleParameter constructor infers
+        // Varchar2, which converts through the DATABASE character set on the wire: on a
+        // non-Unicode NLS_CHARACTERSET two distinct Unicode flow ids collapse to one '???' key,
+        // so one flow's row answers another flow's create and load. Every flow_id/lease_id bind
+        // goes through this helper, so pinning its bind type pins the wire encoding. (The full
+        // collapse repro needs a non-AL32UTF8 server, which the CI container is not — this is
+        // the platform-independent half of that regression coverage.)
+        var flowId = OracleFlowStateStore.NationalId("flow_id", "注文-1");
+        Assert.Equal(OracleDbType.NVarchar2, flowId.OracleDbType);
+        Assert.Equal("注文-1", flowId.Value);
+
+        var nullLease = OracleFlowStateStore.NationalId("lease_id", null);
+        Assert.Equal(OracleDbType.NVarchar2, nullLease.OracleDbType);
+        Assert.Equal(DBNull.Value, nullLease.Value);
+    }
 }

@@ -287,7 +287,7 @@ public sealed class MongoDbDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterEnqueue_Overflow_ReleasesDocumentForRetry()
+    public async Task AckAfterEnqueue_Overflow_PausesTheClaimLoopInsteadOfNaking()
     {
         var calls = new Calls();
         using var entered = new ManualResetEventSlim();
@@ -306,15 +306,77 @@ public sealed class MongoDbDispatcherTests
             NullLogger.Instance,
             MongoDbSubscriberRole.Worker);
 
+        // The gated worker holds the first document; the second fills the capacity-1 queue; the third overflows.
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
         Assert.True(entered.Wait(TimeSpan.FromSeconds(30)));
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
-        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
 
-        await WaitUntilAsync(() => calls.Nak == 1);
-        Assert.Equal(TimeSpan.FromSeconds(5), calls.LastNakDelay);
+        // The overflow claim must park — pausing the claim loop, which is the actual
+        // backpressure — not NAK: the subscriber loop treats every claimed document as progress,
+        // so a NAK-on-full is re-claimed immediately and spins at full database rate, burning an
+        // attempt per lap. No ACK either until the document is actually enqueued.
+        Assert.False(overflow.IsCompleted);
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(2, calls.Ack);
 
         release.Set();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(3, calls.Ack); // every claimed document ACKed exactly once
+    }
+
+    [Fact]
+    public async Task Handler_ShutdownCancellation_PropagatesWithoutSettling()
+    {
+        // A handler cancelled by host shutdown is not a handler failure: routing it through
+        // HandleFailureAsync NAKs (burning an attempt) or, at the cap, dead-letters healthy work.
+        // The cancellation must propagate with the document unsettled — the claim's lease lapses
+        // and at-least-once redelivery applies after restart.
+        var calls = new Calls();
+        var stopping = new CancellationToken(canceled: true);
+        await using var dispatcher = new MongoDbMessageDispatcher(
+            (_, token) => Task.FromException(new OperationCanceledException(token)),
+            new MongoDbAsyncResponseTransportOptions(),
+            new MongoDbSubscriberOptions(),
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(Delivery(calls), stopping));
+
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_AckFailure_DoesNotTearDownTheSubscriber()
+    {
+        // Once TryWrite succeeds the document belongs to a background worker: an ACK failure
+        // after that must not escape HandleAsync — unwinding tears down the subscriber (draining
+        // the worker, which RUNS the handler) while the un-ACKed document's lease lapses, so a
+        // rebuilt subscriber claims and runs the same job a second time. Same rule as the
+        // post-handler ACK: swallow, log, let at-least-once redelivery apply.
+        var calls = new Calls { AckFailure = new InvalidOperationException("ack boom") };
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new MongoDbMessageDispatcher(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new MongoDbAsyncResponseTransportOptions(),
+            new MongoDbSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            MongoDbSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None); // must not throw
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5)); // the enqueued document still executes
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(0, calls.Nak);
     }
 
     [Fact]
@@ -578,6 +640,9 @@ public sealed class MongoDbDispatcherTests
             attempt,
             () =>
             {
+                if (calls.AckFailure is { } ackFailure)
+                    throw ackFailure;
+
                 calls.Ack++;
                 return ValueTask.CompletedTask;
             },
@@ -623,6 +688,7 @@ public sealed class MongoDbDispatcherTests
         public int Nak;
         public int DeadLetter;
         public int Renew;
+        public Exception? AckFailure;
         public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool DeleteOriginalOnDeadLetter;
         public bool DeadLetterResult;

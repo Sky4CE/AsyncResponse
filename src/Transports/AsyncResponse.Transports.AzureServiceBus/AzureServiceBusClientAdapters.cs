@@ -130,7 +130,7 @@ internal sealed class AzureServiceBusReceiverAdapter(
             message.CorrelationId,
             message.SequenceNumber,
             message.DeliveryCount,
-            new Dictionary<string, object?>(message.ApplicationProperties, StringComparer.OrdinalIgnoreCase),
+            CopyApplicationProperties(message.ApplicationProperties),
             () => new ValueTask(inner.CompleteMessageAsync(message, CancellationToken.None)),
             () => new ValueTask(inner.AbandonMessageAsync(message, cancellationToken: CancellationToken.None)),
             (reason, description) => new ValueTask(inner.DeadLetterMessageAsync(
@@ -144,6 +144,19 @@ internal sealed class AzureServiceBusReceiverAdapter(
             // the renewal loop must be interruptible mid-call for the batch (and shutdown) to
             // complete promptly.
             cancellationToken => new ValueTask(inner.RenewMessageLockAsync(message, cancellationToken)));
+
+    // Indexer, not the copying constructor: AMQP application-property names are case-sensitive,
+    // so a message legally carries keys differing only in case — the constructor's internal Add
+    // would throw ArgumentException out of the receive path before any delivery in the batch is
+    // settled, stalling the whole batch. Last-seen wins under the case-insensitive comparer the
+    // lookups rely on (same shape as the SQS and Kafka adapters).
+    private static Dictionary<string, object?> CopyApplicationProperties(IReadOnlyDictionary<string, object> applicationProperties)
+    {
+        var properties = new Dictionary<string, object?>(applicationProperties.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var property in applicationProperties)
+            properties[property.Key] = property.Value;
+        return properties;
+    }
 
     /// <summary>Closes the receiver link.</summary>
     public Task CloseAsync(CancellationToken cancellationToken = default)

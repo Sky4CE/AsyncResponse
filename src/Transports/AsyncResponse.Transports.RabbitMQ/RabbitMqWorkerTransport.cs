@@ -64,12 +64,12 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
 
             // A cached-but-closed channel is treated as absent: a protocol error (404/406 after an
             // exchange delete/redeclare) closes the channel without failing the publish that comes
-            // next, so keeping it would cache a dead channel forever. Dispose before recreating.
-            if (_channel is not null)
-            {
-                await DisposeQuietlyAsync(_channel).ConfigureAwait(false);
-                _channel = null;
-            }
+            // next, so keeping it would cache a dead channel forever. Deliberately dereferenced
+            // WITHOUT disposing: a concurrent publisher that took the lock-free fast path above may
+            // still hold this object, and disposing it under that publisher turns its retryable
+            // AlreadyClosedException into a use-after-dispose. A closed channel holds no broker
+            // resources; the client releases its state when the owning connection is disposed.
+            _channel = null;
 
             // The connection is replaced only when itself closed: with automatic recovery enabled the
             // client object stays open while it reconnects, so this only fires when it is truly dead

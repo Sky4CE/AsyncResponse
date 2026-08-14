@@ -135,6 +135,109 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
     }
 
     [Fact]
+    public async Task OraclePackageStore_ReachesTheTableThroughAPrivateSynonym()
+    {
+        // The standard "app user reaches the schema owner's table through a synonym" deployment:
+        // TableName is a bare identifier, so a synonym is the only way to point the store at a
+        // table living under another name. Verification must resolve the synonym chain the way
+        // Oracle's own name resolution does and verify the BASE table — not reject the name
+        // because the catalog says SYNONYM (r21 did exactly that), and not silently skip the
+        // checks because the owner-scoped views go blank.
+        var connectionString = RequireOracle();
+        await WaitForOracleAsync(connectionString);
+        var baseTable = NewIdentifier("DF_ORA_SYNB", 24).ToUpperInvariant();
+        var synonym = $"{baseTable}_S";
+        try
+        {
+            await ExecuteOracleAsync(
+                connectionString,
+                $"""
+                CREATE TABLE {baseTable} (
+                    flow_id NVARCHAR2(400) NOT NULL PRIMARY KEY,
+                    state_json NCLOB NOT NULL,
+                    expires_at_utc TIMESTAMP(6) NOT NULL,
+                    updated_at_utc TIMESTAMP(6) NOT NULL,
+                    revision NUMBER(19) DEFAULT 0 NOT NULL,
+                    lease_id NVARCHAR2(64) NULL,
+                    lease_expires_at_utc TIMESTAMP(6) NULL
+                )
+                """);
+            await ExecuteOracleAsync(connectionString, $"CREATE SYNONYM {synonym} FOR {baseTable}");
+
+            var store = new OracleFlowStateStore(
+                Options.Create(new OracleDurableFlowOptions
+                {
+                    ConnectionString = connectionString,
+                    TableName = synonym,
+                    AutoCreateSchema = false
+                }));
+
+            // Verification passes through the synonym to the base table's shape and key, and the
+            // store's DML works through it — including ORA-00001 duplicate detection off the base
+            // table's primary key.
+            var flowId = "syn-flow";
+            Assert.True(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
+            Assert.False(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
+            Assert.NotNull(await store.LoadAsync(flowId));
+        }
+        finally
+        {
+            await ExecuteOracleIgnoringMissingAsync(connectionString, $"DROP SYNONYM {synonym}");
+            await DropOracleTableAsync(connectionString, baseTable);
+        }
+    }
+
+    [Fact]
+    public async Task OraclePackageStore_VerifiesATableCreatedAfterFirstUse()
+    {
+        // AutoCreateSchema = false and the migration has not run: the first operation fails on
+        // the missing table, and — the r22 fix — verification must NOT latch as done on that
+        // empty catalog result. When the table appears later with a broken shape (a composite
+        // key never raises ORA-00001 for a duplicate flow id, so two starts of one flow both
+        // insert), the next operation must still verify and reject it instead of trusting the
+        // pre-migration skip for the process lifetime.
+        var connectionString = RequireOracle();
+        await WaitForOracleAsync(connectionString);
+        var table = NewIdentifier("DF_ORA_LATE", 24).ToUpperInvariant();
+        var store = new OracleFlowStateStore(
+            Options.Create(new OracleDurableFlowOptions
+            {
+                ConnectionString = connectionString,
+                TableName = table,
+                AutoCreateSchema = false
+            }));
+        try
+        {
+            // Missing table: the operation fails on the table itself (ORA-00942), not on verification.
+            await Assert.ThrowsAsync<OracleException>(
+                () => store.TryCreateAsync("late", CreateState("late"), TimeSpan.FromMinutes(5)));
+
+            await ExecuteOracleAsync(
+                connectionString,
+                $"""
+                CREATE TABLE {table} (
+                    flow_id NVARCHAR2(400) NOT NULL,
+                    state_json NCLOB NOT NULL,
+                    expires_at_utc TIMESTAMP(6) NOT NULL,
+                    updated_at_utc TIMESTAMP(6) NOT NULL,
+                    revision NUMBER(19) DEFAULT 0 NOT NULL,
+                    lease_id NVARCHAR2(64) NULL,
+                    lease_expires_at_utc TIMESTAMP(6) NULL,
+                    PRIMARY KEY (flow_id, revision)
+                )
+                """);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("late", CreateState("late"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("no enabled unique key", exception.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await DropOracleTableAsync(connectionString, table);
+        }
+    }
+
+    [Fact]
     public async Task OraclePackageStore_RejectsAViewHoldingTheTableName()
     {
         // The name can be held by something that is not a table at all. A simple view over a
@@ -173,7 +276,7 @@ public sealed class OracleCosmosStoreContractTests(OracleCosmosBatchFixture fixt
 
             var exception = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => store.TryCreateAsync("view-check", CreateState("view-check"), TimeSpan.FromMinutes(5)));
-            Assert.Contains("is held by a VIEW", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("resolves to a VIEW", exception.Message, StringComparison.Ordinal);
         }
         finally
         {

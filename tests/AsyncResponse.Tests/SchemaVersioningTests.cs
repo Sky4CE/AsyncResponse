@@ -73,7 +73,9 @@ public class SchemaVersioningTests
         // publisher, and it has to be checked HERE — before the handler runs. Otherwise the job
         // executes, its implicit response publish throws on the id, the transport redelivers, and
         // the handler's side effects happen again on every attempt until the job dead-letters.
-        // Rejecting first turns that into an ordinary poison message.
+        // The rejection DROPS rather than throws (the ingress answer to the identical id class on
+        // the response path): the id can never become portable, and throwing reads as "retry" to
+        // every transport — RabbitMQ's default MaxDeliveryAttempts = 0 would redeliver forever.
         correlationId = correlationId switch
         {
             "looooong" => new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength + 1),
@@ -101,7 +103,8 @@ public class SchemaVersioningTests
             CorrelationId = correlationId
         };
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(job));
+        // Completes cleanly — the transport ACKs — with the handler never invoked.
+        await executor.ExecuteAsync(job);
         Assert.Equal(0, probe.Invocations);
     }
 

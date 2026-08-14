@@ -369,6 +369,63 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Fact]
+    public async Task MySqlPackageStore_RejectsANarrowCharacterSetOnStateJson()
+    {
+        // The ledger JSON needs the same alphabet as the state it embeds: on a latin1-default
+        // server a table that inherited the database charset stores state_json in latin1, so any
+        // non-Latin-1 state (a name, an emoji in a step result) hard-fails every update under
+        // strict mode or is silently truncated at the first bad byte otherwise — malformed JSON
+        // that deserializes to null, a flow that can neither load nor be re-created. Before r22
+        // only flow_id's character set was verified; a compliant flow_id column hid a latin1
+        // state_json.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_json1", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext CHARACTER SET latin1 NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("json", CreateState("json"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("state_json", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("character set 'latin1'", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("utf8mb4", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task MySqlPackageStore_RejectsANarrowCharacterSetOnFlowId()
     {
         // latin1_bin ends in _bin and passes the collation check, yet the column holds almost

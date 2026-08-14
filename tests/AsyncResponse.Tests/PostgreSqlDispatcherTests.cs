@@ -288,7 +288,7 @@ public sealed class PostgreSqlDispatcherTests
     }
 
     [Fact]
-    public async Task AckAfterEnqueue_Overflow_ReleasesRowForRetry()
+    public async Task AckAfterEnqueue_Overflow_PausesTheClaimLoopInsteadOfNaking()
     {
         var calls = new Calls();
         using var entered = new ManualResetEventSlim();
@@ -297,7 +297,46 @@ public sealed class PostgreSqlDispatcherTests
             (_, _) =>
             {
                 entered.Set();
-                release.Wait(TimeSpan.FromSeconds(5));
+                release.Wait(TimeSpan.FromSeconds(30));
+                return Task.CompletedTask;
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        // The gated worker holds the first row; the second fills the capacity-1 queue; the third overflows.
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(30)));
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+
+        // The overflow claim must park — pausing the claim loop, which is the actual
+        // backpressure — not NAK: the subscriber loop treats every claimed row as progress, so a
+        // NAK-on-full is re-claimed immediately and spins at full database rate, burning an
+        // attempt per lap. No ACK either until the row is actually enqueued.
+        Assert.False(overflow.IsCompleted);
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(2, calls.Ack);
+
+        release.Set();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(3, calls.Ack); // every claimed row ACKed exactly once
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_DisposeWhileParkedOnFullQueue_NaksTheParkedRowOnce()
+    {
+        var calls = new Calls();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                entered.Set();
+                release.Wait(TimeSpan.FromSeconds(30));
                 return Task.CompletedTask;
             },
             new PostgreSqlAsyncResponseTransportOptions(),
@@ -306,14 +345,72 @@ public sealed class PostgreSqlDispatcherTests
             PostgreSqlSubscriberRole.Worker);
 
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
-        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(30)));
         await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
-        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery(calls), CancellationToken.None);
+        Assert.False(overflow.IsCompleted);
 
-        await WaitUntilAsync(() => calls.Nak == 1);
-        Assert.Equal(TimeSpan.FromSeconds(5), calls.LastNakDelay);
-
+        // Draining completes the queue writer; the parked write must fall back to one NAK — the
+        // row was never enqueued or ACKed — instead of throwing out of the claim loop.
+        var disposing = dispatcher.DisposeAsync().AsTask();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(5));
         release.Set();
+        await disposing.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(2, calls.Ack); // the two enqueued rows; never the parked one
+    }
+
+    [Fact]
+    public async Task Handler_ShutdownCancellation_PropagatesWithoutSettling()
+    {
+        // A handler cancelled by host shutdown is not a handler failure: routing it through
+        // HandleFailureAsync NAKs (burning an attempt) or, at the cap, dead-letters healthy work.
+        // The cancellation must propagate with the row unsettled — the claim's lease lapses and
+        // at-least-once redelivery applies after restart.
+        var calls = new Calls();
+        var stopping = new CancellationToken(canceled: true);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, token) => Task.FromException(new OperationCanceledException(token)),
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions(),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(Delivery(calls), stopping));
+
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
+    public async Task AckAfterEnqueue_AckFailure_DoesNotTearDownTheSubscriber()
+    {
+        // Once TryWrite succeeds the row belongs to a background worker: an ACK failure after
+        // that must not escape HandleAsync — unwinding tears down the subscriber (draining the
+        // worker, which RUNS the handler) while the un-ACKed row's lease lapses, so a rebuilt
+        // subscriber claims and runs the same job a second time. Same rule as the post-handler
+        // ACK: swallow, log, let at-least-once redelivery apply.
+        var calls = new Calls { AckFailure = new InvalidOperationException("ack boom") };
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new PostgreSqlAsyncResponseTransportOptions(),
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls), CancellationToken.None); // must not throw
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5)); // the enqueued row still executes
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(0, calls.Nak);
     }
 
     [Fact]
@@ -621,6 +718,9 @@ public sealed class PostgreSqlDispatcherTests
             attempt,
             () =>
             {
+                if (calls.AckFailure is { } ackFailure)
+                    throw ackFailure;
+
                 calls.Ack++;
                 return ValueTask.CompletedTask;
             },
@@ -666,6 +766,7 @@ public sealed class PostgreSqlDispatcherTests
         public int Nak;
         public int DeadLetter;
         public int Renew;
+        public Exception? AckFailure;
         public TaskCompletionSource DeadLettered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool DeleteOriginalOnDeadLetter;
         public bool DeadLetterResult;

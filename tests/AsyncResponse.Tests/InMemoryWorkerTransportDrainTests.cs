@@ -151,4 +151,55 @@ public sealed class InMemoryWorkerTransportDrainTests
         Assert.Equal(2, probe.Executed);
         await provider.DisposeAsync();
     }
+
+    [Fact]
+    public async Task BeginShutdownDrain_RacingDelayedPublishes_RetainsEveryWakeUp()
+    {
+        // The drain snapshots pending delayed jobs and appends them to the retention list while a
+        // flow suspending mid-drain appends its own wake-up to the SAME list from PublishAsync.
+        // Both appends must run under _delayedGate: two unsynchronized List<T>.Add calls can lose
+        // an entry (both writing one slot) or throw mid-grow, so SimulateRestartAsync would drop
+        // a wake-up it promised to retain. The race is probabilistic by nature — the loop gives
+        // the interleaving many chances; on correctly locked code the count is deterministic.
+        const int iterations = 60;
+        const int pendingJobs = 48;
+        const int racingJobs = 48;
+        for (var i = 0; i < iterations; i++)
+        {
+            var transport = new InMemoryWorkerTransport();
+            for (var j = 0; j < pendingJobs; j++)
+                await transport.PublishAsync(DelayedJob(), TimeSpan.FromHours(1));
+
+            var retention = transport.BeginRetainingDelayedJobs();
+            using var start = new ManualResetEventSlim();
+            var publisher = Task.Run(() =>
+            {
+                start.Wait(TimeSpan.FromSeconds(30));
+                for (var j = 0; j < racingJobs; j++)
+                    _ = transport.PublishAsync(DelayedJob(), TimeSpan.FromHours(1));
+            });
+            var drainer = Task.Run(() =>
+            {
+                start.Wait(TimeSpan.FromSeconds(30));
+                transport.BeginShutdownDrain();
+            });
+
+            start.Set();
+            await Task.WhenAll(publisher, drainer).WaitAsync(TimeSpan.FromSeconds(30));
+
+            // Every pending job and every mid-drain wake-up retained, none lost to the race.
+            Assert.Equal(pendingJobs + racingJobs, retention.Count);
+        }
+    }
+
+    private static WorkerJobEnvelope DelayedJob()
+        => new()
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IDrainProbe).FullName!,
+                MethodName = nameof(IDrainProbe.RunAsync),
+                Params = []
+            }
+        };
 }

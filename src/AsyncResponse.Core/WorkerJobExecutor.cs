@@ -70,15 +70,20 @@ internal sealed class WorkerJobExecutor(
         // handler's implicit response publish would throw on this id, so the job would fail AFTER
         // its side effects and be redelivered to run them again. A null or blank id is left alone —
         // that is a fire-and-forget job, which has no response to publish.
+        //
+        // Drop, never throw — the same answer the ingress gives the identical id class on the
+        // response path: the id can never become portable, so throwing turns the job into a
+        // poison message that redelivers forever (RabbitMQ's default MaxDeliveryAttempts = 0 has
+        // no cap) or burns dead-letter attempts on brokers that do. Returning cleanly lets the
+        // transport ACK; the Error log + counter make the drop loud.
         if (!string.IsNullOrWhiteSpace(job.CorrelationId)
             && AsyncResponseChannelOptions.CorrelationIdNotPortable(job.CorrelationId) is { } rejection)
         {
-            _logger.LogWarning(
-                "Worker job carries a correlation id outside the portable contract; rejecting it before execution. {Rejection}",
+            _logger.LogError(
+                "Worker job carries a correlation id outside the portable contract; it cannot be executed and is acknowledged without dispatch. {Rejection}",
                 rejection);
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
-            throw new InvalidOperationException(
-                $"Worker job cannot be executed: its correlation id is not portable. {rejection}");
+            return;
         }
 
         // Due-time guard, the shared half of delayed delivery (see IDelayedWorkerTransport): a job

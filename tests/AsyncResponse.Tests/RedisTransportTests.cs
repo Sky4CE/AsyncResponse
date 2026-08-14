@@ -454,6 +454,33 @@ public class RedisTransportTests
         => new()
         {
             { options => options.KeyPrefix = "", nameof(RedisAsyncResponseTransportOptions.KeyPrefix) },
+            // The dead-letter stream must never resolve to a live one: streams fan out to every
+            // consumer group, so a dead-letter XADD into the worker stream comes back as a fresh
+            // Attempt=1 entry (an unbounded fail/dead-letter/re-read loop), and into the response
+            // stream it completes live waiters with worker envelopes. Both the explicit and the
+            // derived-default collision must be caught.
+            {
+                options =>
+                {
+                    options.WorkerStream = "streams:live";
+                    options.DeadLetterStream = "streams:live";
+                },
+                nameof(RedisAsyncResponseTransportOptions.DeadLetterStream)
+            },
+            {
+                // Explicit worker stream colliding with the DERIVED dead-letter default
+                // ({KeyPrefix}:transport:deadletter): only resolved-name comparison sees it.
+                options => options.WorkerStream = "asyncresponse:transport:deadletter",
+                nameof(RedisAsyncResponseTransportOptions.DeadLetterStream)
+            },
+            {
+                options =>
+                {
+                    options.ResponseStream = "streams:replies";
+                    options.DeadLetterStream = "streams:replies";
+                },
+                nameof(RedisAsyncResponseTransportOptions.DeadLetterStream)
+            },
             { options => options.WorkerConsumerGroup = "", nameof(RedisAsyncResponseTransportOptions.WorkerConsumerGroup) },
             { options => options.ResponseConsumerGroup = "", nameof(RedisAsyncResponseTransportOptions.ResponseConsumerGroup) },
             { options => options.CorrelationIdField = "", nameof(RedisAsyncResponseTransportOptions.CorrelationIdField) },
@@ -509,6 +536,7 @@ public class RedisTransportTests
     {
         public List<AddCall> Adds { get; } = [];
         public List<AckCall> Acks { get; } = [];
+        public List<CancellationToken> AckTokens { get; } = [];
         public Queue<StreamEntry[]> ReadBatches { get; } = new();
         public List<CreateGroupCall> CreateGroupCalls { get; } = [];
         public List<ReadGroupCall> ReadGroupCalls { get; } = [];
@@ -584,6 +612,7 @@ public class RedisTransportTests
                 throw AckException;
 
             Acks.Add(new AckCall(stream.ToString(), groupName.ToString(), messageId.ToString()));
+            AckTokens.Add(cancellationToken);
             return Task.FromResult(1L);
         }
 

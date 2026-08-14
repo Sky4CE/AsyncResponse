@@ -813,7 +813,11 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ReleaseDispatch()
         {
-            Volatile.Write(ref _dispatching, 0);
+            // Full fence, not Volatile.Write: the release-store/acquire-load pair below is a
+            // StoreLoad sequence, which x86-64 (and ARM) may reorder — the waiter-count read
+            // could execute before the flag store drains, miss a waiter that parked in between,
+            // and skip the Release, leaving _dispatching == 0 with a parked waiter and no permit.
+            Interlocked.Exchange(ref _dispatching, 0);
             if (Volatile.Read(ref _dispatchWaiterCount) > 0)
                 Volatile.Read(ref _dispatchWaiters)?.Release();
         }

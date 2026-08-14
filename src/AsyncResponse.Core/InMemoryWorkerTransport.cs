@@ -115,16 +115,22 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             pending = [.. _delayedJobs];
             _delayedJobs.Clear();
             retention = _drainRetention;
+
+            // Retention Adds run under the same lock as the delayed-publish Add: a flow
+            // suspending mid-drain appends to this same List concurrently, and two
+            // unsynchronized List<T>.Add calls can silently lose a wake-up or throw mid-grow.
+            if (retention is not null)
+            {
+                foreach (var (job, _) in pending)
+                    retention.Add(job.Envelope);
+            }
         }
 
         foreach (var (job, timer) in pending)
         {
             timer.Dispose();
             if (retention is not null)
-            {
-                retention.Add(job.Envelope);
                 continue;
-            }
 
             DrainLogger?.LogWarning(
                 "Dropping delayed in-memory worker job {Target}.{Method} due at {NotBeforeUtc} at shutdown; in-memory delayed jobs do not survive the process. A durable flow waiting on this wake-up must be resumed explicitly after restart.",
