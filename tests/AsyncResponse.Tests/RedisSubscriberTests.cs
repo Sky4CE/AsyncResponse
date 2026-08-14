@@ -431,4 +431,26 @@ public class RedisSubscriberTests
             CancellationToken cancellationToken)
             => handler(delivery);
     }
+
+    [Fact]
+    public async Task WorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync so a misconfigured subscriber fails host startup synchronously.
+        var subscriber = new RedisWorkerSubscriber(
+            Options.Create(new RedisAsyncResponseTransportOptions
+            {
+                WorkerStream = "workers",
+                WorkerConsumerGroup = "workers-group",
+                WorkerSubscriber = { AckMode = RedisAckMode.AckAfterEnqueue }
+            }),
+            new RedisTransportTests.FakeRedisStreamDatabase(),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RedisWorkerSubscriber>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
+    }
 }

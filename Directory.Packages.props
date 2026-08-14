@@ -25,12 +25,12 @@
   </ItemGroup>
   <!-- Channel / transport provider clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.7" />
+    <PackageVersion Include="AWSSDK.SQS" Version="4.0.100.8" />
     <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
     <PackageVersion Include="Confluent.Kafka" Version="2.15.0" />
     <PackageVersion Include="Google.Cloud.PubSub.V1" Version="3.36.0" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.0.2" />
-    <PackageVersion Include="MongoDB.Driver" Version="3.10.0" />
+    <PackageVersion Include="MongoDB.Driver" Version="3.11.0" />
     <PackageVersion Include="NATS.Net" Version="3.1.0" />
     <PackageVersion Include="Npgsql" Version="10.0.3" />
     <PackageVersion Include="RabbitMQ.Client" Version="7.2.2" />
@@ -38,14 +38,14 @@
   </ItemGroup>
   <!-- Durable-flow state-store clients. -->
   <ItemGroup>
-    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103" />
+    <PackageVersion Include="AWSSDK.DynamoDBv2" Version="4.0.103.1" />
     <PackageVersion Include="Microsoft.Azure.Cosmos" Version="3.62.1" />
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.10" />
     <!-- Explicit native-lib pin overriding the older e_sqlite3 that Microsoft.Data.Sqlite bundles.
          Bump in step with Microsoft.Data.Sqlite above, matching the provider major/minor its
          SQLitePCLRaw bundle expects. Referenced by AsyncResponse.DurableFlows.Sqlite and the tests. -->
     <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.53.3" />
-    <PackageVersion Include="MySqlConnector" Version="2.6.1" />
+    <PackageVersion Include="MySqlConnector" Version="2.6.2" />
     <PackageVersion Include="Newtonsoft.Json" Version="13.0.4" />
     <PackageVersion Include="Oracle.ManagedDataAccess.Core" Version="23.26.300" />
   </ItemGroup>
@@ -53,7 +53,7 @@
        become package dependencies of the shipped libraries. -->
   <ItemGroup>
     <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
-    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.301" />
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.400" />
   </ItemGroup>
   <!-- ==========================================================================================
        Samples, AppHosts and benchmarks (IsPackable=false: never shipped).
@@ -89,7 +89,7 @@
        ========================================================================================== -->
   <ItemGroup>
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.10" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.9.0" />
+    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.10.0" />
     <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.3.3" />
     <PackageVersion Include="Microsoft.Testing.Platform" Version="2.3.3" />
     <PackageVersion Include="Moq" Version="4.20.72" />
@@ -105,9 +105,9 @@
        SQL Server, and that shared source compiles into the multi-targeted unit-test project too.
        ========================================================================================== -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.29" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.29" />
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.29" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.30" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.30" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.30" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.10" />

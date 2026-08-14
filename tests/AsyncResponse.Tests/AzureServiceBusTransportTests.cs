@@ -1168,4 +1168,26 @@ public sealed class AzureServiceBusTransportTests
         public Task CloseAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
+
+    [Fact]
+    public async Task WorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync so a misconfigured subscriber fails host startup synchronously.
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                WorkerSubscriber = { AckMode = AzureServiceBusAckMode.AckAfterEnqueue }
+            }),
+            new FakeServiceBusClient(),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<AzureServiceBusWorkerSubscriber>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
+    }
 }

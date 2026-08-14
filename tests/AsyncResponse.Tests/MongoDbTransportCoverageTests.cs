@@ -221,6 +221,26 @@ public sealed class MongoDbTransportCoverageTests
         return services;
     }
 
+    [Fact]
+    public async Task WorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync so a misconfigured subscriber fails host startup synchronously.
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions
+        {
+            AutoCreateIndexes = false,
+            WorkerSubscriber = { AckMode = MongoDbAckMode.AckAfterEnqueue }
+        });
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        using var store = CreateStore(collection.Object, options);
+        var subscriber = new MongoDbWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), NullLogger<MongoDbWorkerSubscriber>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
+    }
+
     private static T GetProperty<T>(object target, string name)
         => (T)target.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
 

@@ -280,9 +280,12 @@ public class KafkaSubscriberTests
             Mock.Of<IAsyncResponseIngress>(),
             options => options.WorkerSubscriber.AckMode = KafkaAckMode.AckAfterEnqueue);
 
-        await subscriber.StartAsync(CancellationToken.None);
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the fault surfaced only through ExecuteTask (or never, on a fast stop).
+        // Validation now runs in StartAsync so the name of this test is true again.
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => subscriber.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => subscriber.StartAsync(CancellationToken.None));
         Assert.Contains(nameof(KafkaSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
     }
 

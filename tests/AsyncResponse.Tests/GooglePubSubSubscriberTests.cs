@@ -933,7 +933,7 @@ public class GooglePubSubSubscriberTests
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
             });
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
 
         Assert.False(factoryCalled);
     }
@@ -958,7 +958,11 @@ public class GooglePubSubSubscriberTests
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
             });
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync, so it fails host startup synchronously — before the client factory runs.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
 
         Assert.Contains(nameof(GooglePubSubSubscriberOptions.BackgroundWorkerCount), ex.Message, StringComparison.Ordinal);
         Assert.False(factoryCalled);
@@ -989,7 +993,7 @@ public class GooglePubSubSubscriberTests
                 return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
             });
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber, CancellationToken.None));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
 
         Assert.Contains(nameof(GooglePubSubAsyncResponseOptions.HostShutdownTimeout), ex.Message, StringComparison.Ordinal);
         Assert.Contains(nameof(GooglePubSubSubscriberOptions.BackgroundDrainTimeout), ex.Message, StringComparison.Ordinal);
@@ -1206,5 +1210,27 @@ public class GooglePubSubSubscriberTests
         public void Dispose()
         {
         }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync so a misconfigured subscriber fails host startup synchronously.
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                WorkerSubscriber = { AckMode = GooglePubSubAckMode.AckAfterEnqueue }
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            (_, _) => Task.FromResult<IGooglePubSubSubscriberClient>(null!));
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
     }
 }

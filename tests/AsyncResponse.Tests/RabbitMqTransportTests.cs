@@ -755,7 +755,11 @@ public class RabbitMqTransportTests
             NullLogger<RabbitMqWorkerSubscriber>.Instance,
             new FakeConnectionFactory());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber));
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the fault surfaced late or never. Validation now runs in StartAsync so a
+        // misconfigured subscriber fails host startup synchronously.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -767,7 +771,11 @@ public class RabbitMqTransportTests
             NullLogger<RabbitMqResponseIngressSubscriber>.Instance,
             new FakeConnectionFactory());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => InvokeExecuteAsync(subscriber));
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the fault surfaced late or never. Validation now runs in StartAsync so a
+        // misconfigured subscriber fails host startup synchronously.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
     }
 
     [Fact]

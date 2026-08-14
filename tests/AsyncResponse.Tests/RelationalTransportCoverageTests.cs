@@ -133,4 +133,42 @@ public sealed class RelationalTransportCoverageTests
         var pgStore = new PostgreSqlTransportStore(dataSource, pgOptions);
         await Assert.ThrowsAnyAsync<Exception>(() => pgStore.EnsureCreatedAsync());
     }
+
+    [Fact]
+    public async Task PostgreSqlWorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which
+        // BackgroundService.StartAsync no longer runs inline — StartAsync returned without
+        // throwing and the misconfiguration surfaced late or never. Validation now runs in
+        // StartAsync so a misconfigured subscriber fails host startup synchronously.
+        var options = Options.Create(new PostgreSqlAsyncResponseTransportOptions
+        {
+            WorkerSubscriber = { AckMode = PostgreSqlAckMode.AckAfterEnqueue }
+        });
+        // Creating a data source opens no connection; validation throws before the store is touched.
+        await using var dataSource = NpgsqlDataSource.Create("Host=localhost;Username=unused;Password=unused;Database=unused");
+        var store = new PostgreSqlTransportStore(dataSource, options);
+        var subscriber = new PostgreSqlWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), NullLogger<PostgreSqlWorkerSubscriber>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SqlServerWorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
+    {
+        // Same contract as the PostgreSQL fact above: a misconfigured subscriber must fail host
+        // startup synchronously from StartAsync.
+        var options = Options.Create(new SqlServerAsyncResponseTransportOptions
+        {
+            // Validated as present but never opened: validation throws before the store is touched.
+            ConnectionString = "Server=localhost;Database=unused;User Id=unused;Password=unused;TrustServerCertificate=true",
+            WorkerSubscriber = { AckMode = SqlServerAckMode.AckAfterEnqueue }
+        });
+        var store = new SqlServerTransportStore(options);
+        var subscriber = new SqlServerWorkerSubscriber(options, store, Mock.Of<IAsyncResponseIngress>(), NullLogger<SqlServerWorkerSubscriber>.Instance);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => subscriber.StartAsync(CancellationToken.None));
+        Assert.Contains("BackgroundWorkerCount", ex.Message, StringComparison.Ordinal);
+    }
 }

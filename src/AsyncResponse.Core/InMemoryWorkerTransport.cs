@@ -357,15 +357,63 @@ public sealed class InMemoryWorkerTransportOptions
 /// each job via <see cref="WorkerJobExecutor"/>, under the enqueuer's captured
 /// <see cref="ExecutionContext"/> so ambient context flows in-process. Failures are logged and
 /// never break the loop.
+/// <para>
+/// Deliberately a plain <see cref="IHostedService"/>, not a <see cref="BackgroundService"/>:
+/// since Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c>
+/// queues <c>ExecuteAsync</c> to the thread pool and DISCARDS the queued work when the stopping
+/// token fires before the pool runs it. The shutdown-drain hook is installed inside the
+/// execution loop, so a fast start→stop under thread-pool pressure never installed it — pending
+/// delayed jobs were neither dropped loudly nor retained (the test harness's simulated restart
+/// lost retained wake-ups exactly this way), and accepted queued jobs sat unread forever. The
+/// worker loops and the drain hook are part of this host's STARTED contract, so they come up
+/// synchronously inside <see cref="StartAsync"/>, before it returns.
+/// </para>
 /// </summary>
 internal sealed class InMemoryWorkerHost(
     InMemoryWorkerTransport _transport,
     WorkerJobExecutor _executor,
     ILogger<InMemoryWorkerHost> _logger,
-    TimeProvider? _timeProvider = null) : BackgroundService
+    TimeProvider? _timeProvider = null) : IHostedService, IDisposable
 {
-    /// <summary>Runs this background operation until cancellation is requested.</summary>
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    private CancellationTokenSource? _stopping;
+    private Task? _execution;
+
+    /// <summary>Starts the worker loops and installs the shutdown-drain hook, synchronously.</summary>
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _stopping = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _execution = RunAsync(_stopping.Token);
+        return _execution.IsCompleted ? _execution : Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Signals the drain (synchronously, via the stop registration) and waits for the workers to
+    /// finish what was accepted, bounded by <paramref name="cancellationToken"/> — the same
+    /// contract <c>BackgroundService.StopAsync</c> has.
+    /// </summary>
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        if (_execution is null)
+            return;
+
+        try
+        {
+            _stopping!.Cancel();
+        }
+        finally
+        {
+            var cutoff = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var registration = cancellationToken.Register(
+                static state => ((TaskCompletionSource)state!).TrySetResult(), cutoff);
+            await Task.WhenAny(_execution, cutoff.Task).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Parity with <c>BackgroundService.Dispose</c>: cancel, never dispose the source — a
+    /// still-draining worker may hold its token.</summary>
+    public void Dispose() => _stopping?.Cancel();
+
+    private async Task RunAsync(CancellationToken stoppingToken)
     {
         _transport.DrainLogger = _logger;
 

@@ -204,6 +204,63 @@ public sealed class InMemoryWorkerTransportDrainTests
     }
 
     [Fact]
+    public async Task StartThenImmediateStop_UnderThreadPoolPressure_StillDrainsAndRetains()
+    {
+        // Regression (Hosting.Abstractions 10.0.10): BackgroundService.StartAsync stopped invoking
+        // ExecuteAsync inline — it queues it to the thread pool and DISCARDS the queued work when
+        // the stopping token fires before the pool runs it. The shutdown-drain hook was installed
+        // inside ExecuteAsync, so a fast start→stop under pool pressure never installed it:
+        // pending delayed jobs were neither retained nor dropped loudly (SimulateRestartAsync
+        // intermittently lost retained wake-ups exactly this way — the job's leaked timer later
+        // fired into a worker-less channel), and accepted queued jobs sat unread forever. The
+        // host now owns its lifecycle and brings the loops and the drain hook up synchronously
+        // inside StartAsync, so the drain below is deterministic however starved the pool is.
+        var provider = new ServiceCollection().BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        await transport.PublishAsync(DelayedJob(), TimeSpan.FromHours(2));
+        var retention = transport.BeginRetainingDelayedJobs();
+
+        // Saturate the thread pool so anything the host QUEUES (instead of running inline) cannot
+        // execute during the start→stop window: once PendingWorkItemCount is positive, every pool
+        // thread is occupied and later work items wait behind the blockers.
+        using var gate = new ManualResetEventSlim(initialState: false);
+        var blockers = Enumerable.Range(0, Environment.ProcessorCount * 2)
+            .Select(_ => Task.Run(() => gate.Wait()))
+            .ToArray();
+        try
+        {
+            var saturated = DateTime.UtcNow.AddSeconds(5);
+            while (ThreadPool.PendingWorkItemCount == 0 && DateTime.UtcNow < saturated)
+                Thread.Yield();
+            Assert.True(ThreadPool.PendingWorkItemCount > 0, "could not saturate the thread pool");
+
+            await host.StartAsync(CancellationToken.None);
+            var stopping = host.StopAsync(CancellationToken.None);
+
+            // The drain runs synchronously inside StopAsync's cancel, before its first await —
+            // the retained job must already be there, however starved the pool is. On the old
+            // BackgroundService-based host the deferred ExecuteAsync was discarded un-run, no
+            // drain ever happened, and this list stayed empty.
+            var retained = Assert.Single(retention);
+            Assert.Equal(typeof(IDrainProbe).FullName, retained.Call.ServiceInterfaceFullName);
+
+            gate.Set();
+            await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            gate.Set();
+            await Task.WhenAll(blockers);
+            await provider.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task PublishFailureDuringDrain_NeverStrandsTheDrainWithAnUncompletedWriter()
     {
         // Regression (r23): PublishAsync's catch decremented _outstanding without the drain-aware

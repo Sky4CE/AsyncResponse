@@ -70,11 +70,25 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
     }
 
     /// <summary>Runs this background operation until cancellation is requested.</summary>
+    /// <summary>
+    /// Validates subscriber options here rather than at the top of <c>ExecuteAsync</c>: since
+    /// Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c> no
+    /// longer runs <c>ExecuteAsync</c> inline, so a throw there surfaces only through the host's
+    /// background-exception handling — or never, when a fast stop discards the queued work —
+    /// instead of failing host startup synchronously.
+    /// </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        _ = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
+        _ = SubscriptionId; // Resolving the id enforces its Required check at startup too.
+        GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
+        return base.StartAsync(cancellationToken);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionId = SubscriptionId;
-        GooglePubSubMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
         var subscriptionName = SubscriptionName.FromProjectSubscription(projectId, subscriptionId);
 
         // The transport intentionally has no MaxDeliveryAttempts and no library-managed dead-letter

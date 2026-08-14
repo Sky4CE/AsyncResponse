@@ -38,10 +38,21 @@ internal abstract class KafkaSubscriberService : BackgroundService
     protected abstract Task HandleMessageAsync(KafkaDelivery delivery, CancellationToken cancellationToken);
 
     /// <summary>Runs this background operation until cancellation is requested.</summary>
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    /// <summary>
+    /// Validates subscriber options here rather than at the top of <c>ExecuteAsync</c>: since
+    /// Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c> no
+    /// longer runs <c>ExecuteAsync</c> inline, so a throw there surfaces only through the host's
+    /// background-exception handling — or never, when a fast stop discards the queued work —
+    /// instead of failing host startup synchronously.
+    /// </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
     {
         KafkaMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
+        return base.StartAsync(cancellationToken);
+    }
 
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
         var failures = 0;
         while (!stoppingToken.IsCancellationRequested)
         {

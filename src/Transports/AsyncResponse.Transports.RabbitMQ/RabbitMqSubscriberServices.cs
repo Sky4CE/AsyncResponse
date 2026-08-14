@@ -40,10 +40,23 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
     protected abstract Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken);
 
     /// <summary>Runs this background operation until cancellation is requested.</summary>
+    /// <summary>
+    /// Validates subscriber options here rather than at the top of <c>ExecuteAsync</c>: since
+    /// Microsoft.Extensions.Hosting.Abstractions 10.0.10, <c>BackgroundService.StartAsync</c> no
+    /// longer runs <c>ExecuteAsync</c> inline, so a throw there surfaces only through the host's
+    /// background-exception handling — or never, when a fast stop discards the queued work —
+    /// instead of failing host startup synchronously.
+    /// </summary>
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        _ = QueueName; // Resolving the name enforces its Required check at startup too.
+        RabbitMqMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
+        return base.StartAsync(cancellationToken);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
-        RabbitMqMessageDispatcher.ValidateOptions(Options, SubscriberOptions, SubscriberRole);
 
         // basic.nack requeue does not increment the x-death header, so the resolved attempt for a plain
         // requeued delivery never exceeds 2. Warn once at startup instead of silently never enforcing the cap.
