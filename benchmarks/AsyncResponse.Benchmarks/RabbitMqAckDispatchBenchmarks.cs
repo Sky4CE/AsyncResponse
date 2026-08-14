@@ -81,6 +81,8 @@ public class RabbitMqAckDispatchBenchmarks
 
     private sealed class FakeRabbitMqChannel : IRabbitMqChannel
     {
+        public bool IsOpen => true;
+
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
@@ -96,8 +98,8 @@ public class RabbitMqAckDispatchBenchmarks
         public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
             => ValueTask.CompletedTask;
 
-        public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
-            => Task.FromResult("benchmark-consumer");
+        public Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
+            => Task.FromResult(new RabbitMqConsumer("benchmark-consumer", new TaskCompletionSource<string>().Task));
 
         public Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
