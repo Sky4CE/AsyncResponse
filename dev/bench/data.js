@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786724677671,
+  "lastUpdate": 1786724697604,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -84280,6 +84280,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 3673.3190965280673,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "ef99b5af5fb0f7609e15ca3a43ea428c002e4912",
+          "message": "fix: apply round-22 review — poison-drop worker ids, shutdown-vs-failure settlement, store charset/scope verification\nFifteen findings from the full-codebase review, each behavioral fix with a\nred-on-old regression test (proven in a pre-fix worktree: 56 failures, all in\nthe new/updated tests; 4108/4108 green after).\n- Worker jobs with non-portable correlation ids drop-and-ACK (Error + counter)\n  instead of throwing: the id can never become portable, and RabbitMQ's default\n  MaxDeliveryAttempts=0 redelivered the throw forever — the ingress response\n  path documents this exact policy and the worker path now follows it.\n- Shutdown cancellation is no longer read as a handler failure: the shared DB\n  dispatcher rethrows OCE (claim lease lapses, redelivery after restart) and\n  the RabbitMQ awaiting dispatcher leaves the delivery un-ACKed, instead of\n  NAK/dead-letter that buried healthy work at the attempt cap; Redis already\n  had the filter and now also settles (XACK) on CancellationToken.None at both\n  ack sites, so a graceful drain can't leave completed work in the PEL.\n- The r21 NAK-on-full fix reaches the shared DB dispatcher: a full\n  AckAfterEnqueue queue pauses the claim loop (write-await; FullMode.Wait was\n  already set) instead of claim+NAK spinning at database rate, and the\n  post-enqueue ACK is guarded like the late-ACK so an ack blip can't tear down\n  the subscriber while a background worker is mid-handler.\n- Races: in-memory drain retention appends under _delayedGate (was mutating the\n  same List on both sides of the lock; regression test drives the race and\n  fails on the old code); the in-memory channel's dispatch gate releases with\n  Interlocked.Exchange (StoreLoad reorder could strand a parked waiter — not\n  deterministically testable, fixed by memory-model reasoning); the RabbitMQ\n  worker transport no longer disposes a dead cached channel a concurrent\n  fast-path publisher may hold (dead connections still disposed).\n- Validator parity: RabbitMQ rejects DeadLetterExchange/DeadLetterQueue equal\n  to a live exchange/queue (reject-without-requeue fed the loop it was meant to\n  stop); Redis rejects a resolved DeadLetterStream colliding with either live\n  stream, including derived-default collisions.\n- Stores: Oracle binds flow_id/lease_id as NVarchar2 at every site via an\n  internal NationalId helper (inferred Varchar2 converted through the database\n  charset, collapsing Unicode ids to one '???' key on non-AL32UTF8 installs);\n  Oracle verification resolves the table the way Oracle does — CURRENT_SCHEMA,\n  private then public synonyms, DB-link-aware — against ALL_* views, accepts\n  synonym deployments it used to reject, verifies ones it used to skip, and no\n  longer latches _created on an absent table (both proven against the real\n  container); MySQL pins utf8mb4 on state_json/lease_id in its DDL and\n  verifies state_json's charset (latin1 inheritance truncated non-Latin state\n  into unloadable JSON).\n- ASB receiver copies application properties via indexer, last-wins: the\n  case-insensitive Dictionary constructor threw on AMQP keys differing only in\n  case, stalling the whole batch before any settlement.",
+          "timestamp": "2026-08-14T18:05:43+02:00",
+          "tree_id": "c185d7d610c04917f004829e7167a310b42db0ff",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/ef99b5af5fb0f7609e15ca3a43ea428c002e4912"
+        },
+        "date": 1786724696722,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 124201.75531856756,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 63742.013125755344,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 170786.1422757868,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 404439.12382308213,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 659230.5461065844,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 598100.4330247134,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 651177.3286101271,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 491284.61100084503,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 489112.35889108444,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 448663.878968432,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 479892.5040790863,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 636229.4497887718,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 600990.4322323189,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 203875.7597430187,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 146189.08447039203,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 45699.36108637252,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 35477.679998138134,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4837.303348502311,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 284019.90411488037,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 116000.12992014551,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1985781.8022955637,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2464.4765422250593,
             "unit": "flows/s"
           }
         ]
