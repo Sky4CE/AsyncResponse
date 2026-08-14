@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786750266715,
+  "lastUpdate": 1786750293916,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -85604,6 +85604,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1373.098108079518,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "a00941eb9a034d85f6a631ff4667cb0574298caa",
+          "message": "fix: validate subscriber options in StartAsync — Hosting 10.0.10+ defers\n(and can discard) BackgroundService.ExecuteAsync\nAll ten transport subscriber services validated their options at the top of\nExecuteAsync, which BackgroundService.StartAsync no longer runs inline: a\nmisconfiguration stopped failing host startup and surfaced only through\nbackground-exception handling — or never, when a fast stop discarded the\nqueued ExecuteAsync un-run. Each subscriber base now validates in a\nStartAsync override (RabbitMQ/ASB/SQS/GPS also resolve their queue/\nsubscription names there, whose Required checks previously ran only inside\nExecuteAsync), restoring the documented fail-at-startup contract on every\nruntime. ScheduledFlows and the recovery watchdog need no change: one\nlog-and-drops by design, the other is validated by the startup validator.\nSix tests that asserted the fault through ExecuteAsync/ExecuteTask are\nrepointed at StartAsync (one previously hung the suite once validation left\nExecuteAsync — its fake spun in the retry loop forever), and eight new\nper-transport facts pin the contract. Red-on-old: 28/28 fail at HEAD;\n4178/4178 green after, twice.",
+          "timestamp": "2026-08-15T01:12:43+02:00",
+          "tree_id": "0759a5b9187bc7fb323601d01b5534eab28a9c09",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/a00941eb9a034d85f6a631ff4667cb0574298caa"
+        },
+        "date": 1786750293048,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 70238.19457497042,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 37019.9256047575,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 95256.31187373737,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 251483.75414948195,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 547345.3749315818,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 383447.3450105831,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 428082.19178082194,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 280247.0658132209,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 226482.0988549065,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 214518.6202162348,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 326379.2788323455,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 392748.29547239764,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 334103.99989308673,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 102718.6335299094,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 79923.17145374494,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 33022.13275425722,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 22849.90609602591,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4767.031590880001,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 151686.14316744937,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 55371.476159257225,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 955264.9427318667,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1342.2353243479447,
             "unit": "flows/s"
           }
         ]
