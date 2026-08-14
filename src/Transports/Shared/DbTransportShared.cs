@@ -246,6 +246,15 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             // Parking here pauses the claim loop, which is the actual backpressure (mirrors the
             // RabbitMQ/Kafka/NATS pause); the queue is built with FullMode.Wait for exactly this.
             _logger.LogDebug("Background queue full for {Provider} {Role}; pausing the claim loop until capacity frees.", _providerName, _role);
+
+            // The park is unbounded by design, but the claim's lease is not — and in early-ACK
+            // mode the inline path's heartbeat never runs, so nothing renews it. A park longer
+            // than LockTimeout would let the lock lapse, a competing subscriber re-claim and run
+            // the row, and this subscriber enqueue its own copy once the park completes: one job,
+            // two concurrent executions, with the second ack's lock_id fence failing silently.
+            // Arm the same fenced heartbeat as the inline path for exactly the park's duration.
+            using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var renewalTask = RenewLeaseLoopAsync(delivery, renewalCancellation.Token);
             try
             {
                 await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
@@ -272,6 +281,11 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 }
 
                 return;
+            }
+            finally
+            {
+                renewalCancellation.Cancel();
+                await renewalTask.ConfigureAwait(false);
             }
         }
 

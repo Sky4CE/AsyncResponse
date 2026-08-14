@@ -534,9 +534,19 @@ internal sealed class SqlServerTransportStore
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
     {
         var parsed = AsyncResponseJson.Deserialize<Dictionary<string, string>>(json);
-        return parsed is null
-            ? EmptyHeaders
-            : new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);
+        if (parsed is null)
+            return EmptyHeaders;
+
+        // Indexer, not the copying constructor: rows can be written by foreign producers, and JSON
+        // legally carries keys differing only in case — the constructor's internal Add would throw
+        // AFTER the claim already committed attempts+1/lock_id, before any delivery exists, so the
+        // row could never reach HandleFailureAsync or dead-letter: an unkillable poison row that
+        // tears down the subscriber on every re-claim. Last-wins, matching the ASB/SQS receive
+        // adapters.
+        var headers = new Dictionary<string, string>(parsed.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in parsed)
+            headers[pair.Key] = pair.Value;
+        return headers;
     }
 
     private static string Sanitize(string value) => value.Replace('\r', ' ').Replace('\n', ' ');

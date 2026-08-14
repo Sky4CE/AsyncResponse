@@ -166,7 +166,13 @@ internal static class SqlServerRelationVerifier
             """;
         command.Parameters.AddWithValue("@schema", schemaName);
 
-        var actual = new Dictionary<string, string>(StringComparer.Ordinal);
+        // OrdinalIgnoreCase, matching how the server itself matched: under a case-insensitive
+        // catalog collation (the common default) the IN list above returns a foreign object whose
+        // name differs from the configured spelling only in case — keyed ordinally, every
+        // downstream lookup by the CONFIGURED spelling missed it, so the kind/column/PK checks
+        // silently skipped the collision and the final absence loop misreported the object as
+        // "does not exist".
+        var actual = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             actual[reader.GetString(0)] = reader.GetString(1);

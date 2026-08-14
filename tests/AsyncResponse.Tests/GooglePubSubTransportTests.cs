@@ -256,7 +256,7 @@ public class GooglePubSubTransportTests
         publisher.Setup(p => p.ShutdownAsync(timeout)).Returns(Task.CompletedTask);
         var adapter = new GooglePubSubPublisherClientAdapter(publisher.Object);
 
-        var messageId = await adapter.PublishAsync(message);
+        var messageId = await adapter.PublishAsync(message, CancellationToken.None);
         await adapter.ShutdownAsync(timeout);
 
         Assert.Equal("message-id", messageId);
@@ -458,6 +458,52 @@ public class GooglePubSubTransportTests
         Assert.Null(correlationId);
     }
 
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException()
+    {
+        // Regression (r23): DisposeAsync used to Release then Dispose the publisher gate.
+        // SemaphoreSlim.Dispose does not complete pending WaitAsync waiters, so publishers parked
+        // on the gate during dispose hung forever. The gate must stay usable: every post-dispose
+        // publish wakes in turn and gets the transport-named ObjectDisposedException.
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(new FakePublisherClient()));
+
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-disposed")));
+        Assert.Contains(nameof(GooglePubSubWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PublishAsync_AlreadyCancelledToken_DoesNotHandTheMessageToTheClient()
+    {
+        // Regression (r23): the adapter seam had no CancellationToken, so a publish cancelled at
+        // shutdown was still handed to PublisherClient's local batch queue — and DisposeAsync's
+        // ShutdownAsync then actively flushed a message whose caller was told nothing was sent.
+        // The token now travels through the seam and is checked before the hand-off.
+        var publisher = new FakePublisherClient();
+        var transport = new GooglePubSubWorkerTransport(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerTopicId = "jobs"
+            }),
+            () => Task.FromResult<IGooglePubSubPublisherClient>(publisher));
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => transport.PublishAsync(WorkerJob("c-cancelled"), cancelled.Token));
+
+        Assert.Empty(publisher.Messages);
+        await transport.DisposeAsync();
+    }
+
     private static WorkerJobEnvelope WorkerJob(string? correlationId)
         => new()
         {
@@ -497,8 +543,10 @@ public class GooglePubSubTransportTests
         public int ShutdownCalls { get; private set; }
         public TimeSpan? LastShutdownTimeout { get; private set; }
 
-        public Task<string> PublishAsync(PubsubMessage message)
+        public Task<string> PublishAsync(PubsubMessage message, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             lock (_gate)
                 _messages.Add(message);
 

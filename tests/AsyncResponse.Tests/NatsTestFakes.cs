@@ -306,6 +306,9 @@ internal sealed class RecordingDelivery
     /// <summary>When set, every ACK attempt is recorded and then fails with this exception.</summary>
     public Exception? AckException { get; set; }
 
+    /// <summary>When set, every NAK attempt is recorded and then fails with this exception.</summary>
+    public Exception? NakException { get; set; }
+
     public NatsJobDelivery Create(string payload, long numDelivered, string subject = "asyncresponse.transport.worker", IReadOnlyDictionary<string, string>? headers = null)
         => new(
             subject,
@@ -317,7 +320,11 @@ internal sealed class RecordingDelivery
                 Acks++;
                 return AckException is null ? ValueTask.CompletedTask : ValueTask.FromException(AckException);
             },
-            delay => { Naks.Add(delay); return ValueTask.CompletedTask; },
+            delay =>
+            {
+                Naks.Add(delay);
+                return NakException is null ? ValueTask.CompletedTask : ValueTask.FromException(NakException);
+            },
             () => { Terms++; return ValueTask.CompletedTask; });
 }
 

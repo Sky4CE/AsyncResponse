@@ -139,7 +139,26 @@ internal sealed class LostSubscriberCallbackDispatcher(
             }
         }
 
-        firstException?.Throw();
+        if (firstException is not null)
+        {
+            if (!callbackInvoked)
+                firstException.Throw();
+
+            // A sibling registration already consumed the response and its callback succeeded
+            // (shared-correlation registrations are an expected shape — a worker that died
+            // mid-await leaves its registration beside the replacement's). Rethrowing here would
+            // hand the ingress a failure for a response that WAS delivered: its retry loop
+            // re-dispatches (the consumed registration is gone, the failing one keeps failing)
+            // and then escalates via SetException — terminally failing a flow that was correctly
+            // recovered moments earlier. The failed registration was NOT deleted, so its state
+            // remains for a later redelivery to retry and for the watchdog to surface; log the
+            // residual failure loudly instead of letting it poison the delivered response.
+            _logger.LogError(
+                firstException.SourceException,
+                "Lost-response dispatch for correlationId {CorrelationId} on {Channel} partially failed after another registration's callback succeeded; the failed registration stays registered for retry and watchdog visibility.",
+                correlationId,
+                channel);
+        }
 
         return new LostSubscriberDispatchResult(routeMixed ? null : action, callbackInvoked) { RouteMixed = routeMixed };
     }

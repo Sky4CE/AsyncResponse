@@ -592,6 +592,31 @@ public sealed class SqsDispatcherTests
         await Task.Delay(50);
     }
 
+    [Fact]
+    public async Task ShutdownCancellation_LeavesVisibilityUntouched()
+    {
+        // Regression (r23): a graceful drain cancelling the stoppingToken while user code was in
+        // the handler used to land in the generic failure catch — shortening visibility to hasten
+        // a redelivery of work that never ran, as if the handler had failed. Shutdown now rethrows
+        // and leaves the message's visibility timeout to lapse on its own.
+        var calls = new SettlementCalls();
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        await using var dispatcher = SqsMessageDispatcher.Create(
+            (_, _) => throw new OperationCanceledException(stopping.Token),
+            new SqsAsyncResponseOptions(),
+            new SqsSubscriberOptions { RedeliveryDelay = TimeSpan.FromSeconds(5) },
+            NullLogger.Instance,
+            "workers",
+            SqsSubscriberRole.Worker);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(Delivery(calls), stopping.Token));
+
+        Assert.Equal(0, calls.Delete);
+        Assert.Empty(calls.VisibilityChanges);
+    }
+
     private static SqsTransportDelivery Delivery(
         SettlementCalls calls,
         string queueUrl = "https://sqs.us-east-1.amazonaws.com/000000000000/workers",

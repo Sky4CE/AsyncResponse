@@ -706,6 +706,56 @@ public sealed class PostgreSqlDispatcherTests
         Assert.Equal(1, queuedCalls.DeadLetter);
     }
 
+    [Fact]
+    public async Task AckAfterEnqueue_QueueFullPark_RenewsTheClaimLeaseWhileParked()
+    {
+        // Regression (r23): the r22 park-on-full replaced NAK-on-full, but in early-ACK mode the
+        // inline path's lease heartbeat never runs — the parked delivery's claim silently lapsed
+        // at LockTimeout and a competing subscriber re-claimed and ran the same row concurrently.
+        // The park must renew the lease for its whole duration, exactly like the inline path.
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = new PostgreSqlMessageDispatcher(
+            (_, _) =>
+            {
+                handlerStarted.TrySetResult();
+                return releaseHandler.Task;
+            },
+            new PostgreSqlAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromMilliseconds(100) },
+            new PostgreSqlSubscriberOptions().UseAckAfterEnqueue(1, 1, TimeSpan.FromSeconds(5)),
+            NullLogger.Instance,
+            PostgreSqlSubscriberRole.Worker);
+
+        var blocking = new Calls();
+        var queued = new Calls();
+        var parked = new Calls();
+
+        // First delivery occupies the single worker; second fills the queue slot; third parks.
+        await dispatcher.HandleAsync(Delivery(blocking), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.HandleAsync(Delivery(queued), CancellationToken.None);
+        var parkTask = dispatcher.HandleAsync(Delivery(parked), CancellationToken.None);
+        Assert.False(parkTask.IsCompleted);
+
+        // The heartbeat beats at LockTimeout/2 (50 ms here): the parked claim must be renewed
+        // while the park lasts. On the old code no renewal ever fires and this wait times out.
+        await WaitUntilAsync(() => Volatile.Read(ref parked.Renew) >= 2);
+        Assert.False(parkTask.IsCompleted);
+        Assert.Equal(0, parked.Ack);
+        Assert.Equal(0, parked.Nak);
+
+        releaseHandler.TrySetResult();
+        await parkTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, parked.Ack);
+        Assert.Equal(0, parked.Nak);
+
+        // The heartbeat stops with the park: no further renewals accrue afterwards.
+        var renewalsAfterAck = Volatile.Read(ref parked.Renew);
+        await Task.Delay(200);
+        Assert.Equal(renewalsAfterAck, Volatile.Read(ref parked.Renew));
+    }
+
     private static PostgreSqlTransportDelivery Delivery(
         Calls calls,
         int attempt = 1,

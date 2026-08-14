@@ -4,15 +4,24 @@ namespace AsyncResponse.Transports.GooglePubSub;
 
 internal interface IGooglePubSubPublisherClient
 {
-    Task<string> PublishAsync(PubsubMessage message);
+    Task<string> PublishAsync(PubsubMessage message, CancellationToken cancellationToken);
     Task ShutdownAsync(TimeSpan timeout);
 }
 
 internal sealed class GooglePubSubPublisherClientAdapter(PublisherClient inner) : IGooglePubSubPublisherClient
 {
     /// <summary>Publishes the supplied message.</summary>
-    public Task<string> PublishAsync(PubsubMessage message)
-        => inner.PublishAsync(message);
+    public Task<string> PublishAsync(PubsubMessage message, CancellationToken cancellationToken)
+    {
+        // PublisherClient exposes no cancellation: once handed over, the message sits in the
+        // client's local batch queue and WILL be flushed (DisposeAsync's ShutdownAsync completes
+        // only "when all queued messages have been published"). Checking before the hand-off keeps
+        // a publish cancelled at shutdown from being enqueued-then-delivered while its caller was
+        // told nothing was sent; a token firing mid-flight still only abandons the wait — that
+        // residual at-least-once window is inherent to the SDK.
+        cancellationToken.ThrowIfCancellationRequested();
+        return inner.PublishAsync(message).WaitAsync(cancellationToken);
+    }
 
     /// <summary>Runs the ShutdownAsync operation.</summary>
     public Task ShutdownAsync(TimeSpan timeout)

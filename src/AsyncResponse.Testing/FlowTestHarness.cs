@@ -176,32 +176,28 @@ public sealed class FlowRunHandle
     /// </summary>
     public async Task ReplyAsync<T>(T response, string? stepName = null) where T : IAsyncResponsePayload
     {
-        var correlationId = _harness.Probe.LatestAwaitedCorrelationId(FlowId, stepName)
-            ?? (stepName is null
-                ? await WaitForLatestAwaitedAsync().ConfigureAwait(false)
-                : await WaitForAwaitingStepAsync(stepName).ConfigureAwait(false));
+        var correlationId = await NextReplyTargetAsync(stepName).ConfigureAwait(false);
         await _harness.Engine.PublishAsync(response, correlationId).ConfigureAwait(false);
     }
 
     /// <summary>Fails the run's currently awaited step with an exception (a remote failure).</summary>
     public async Task ReplyExceptionAsync(Exception exception, string? stepName = null)
     {
-        var correlationId = _harness.Probe.LatestAwaitedCorrelationId(FlowId, stepName)
-            ?? (stepName is null
-                ? await WaitForLatestAwaitedAsync().ConfigureAwait(false)
-                : await WaitForAwaitingStepAsync(stepName).ConfigureAwait(false));
+        var correlationId = await NextReplyTargetAsync(stepName).ConfigureAwait(false);
         await _harness.Engine.PublishExceptionAsync(exception, correlationId).ConfigureAwait(false);
     }
 
-    private async Task<string> WaitForLatestAwaitedAsync()
-    {
-        var stepEvent = await _harness.Probe.WaitForAsync(
+    // One call resolves the live un-answered wait or parks for the NEXT one — replaying history
+    // here (as the old fallback did) handed back an already-answered or abandoned correlation id,
+    // and the reply published to it was silently dropped.
+    private Task<string> NextReplyTargetAsync(string? stepName)
+        => _harness.Probe.WaitForNextAwaitedAsync(
             FlowId,
-            e => e.Kind == FlowProbe.EventKind.Waiting && e.Step.Kind == DurableFlowStepKind.Awaited,
+            stepName,
             _harness.Engine.RealTimeGuard,
-            $"flow '{FlowId}' to be awaiting any step").ConfigureAwait(false);
-        return stepEvent.Step.CorrelationId!;
-    }
+            stepName is null
+                ? $"flow '{FlowId}' to be awaiting any step"
+                : $"step '{stepName}' of flow '{FlowId}' to be awaiting a response");
 }
 
 /// <summary>One observation recorded by the flow probe.</summary>
@@ -327,48 +323,95 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
 
     internal string? LatestAwaitedCorrelationId(string flowId, string? stepName)
     {
+        lock (_gate)
+            return LatestAwaitedCorrelationIdCore(flowId, stepName);
+    }
+
+    /// <summary>Same as <see cref="LatestAwaitedCorrelationId"/>; the caller holds <c>_gate</c>.</summary>
+    private string? LatestAwaitedCorrelationIdCore(string flowId, string? stepName)
+    {
         if (!_events.TryGetValue(flowId, out var list))
             return null;
 
-        lock (_gate)
+        // Walking backwards, remember the correlation ids of already-answered awaited steps: a
+        // Waiting event whose step has a LATER Completed event is consumed — a reply published
+        // to that dead correlation id is silently dropped by the channel, and the caller's
+        // null-fallback (wait for the run's NEXT awaited step to park) is the correct path.
+        // Progress-aware steps stay un-completed across non-terminal replies, so repeated
+        // replies to the same live correlation id still resolve here. Only the NEWEST Waiting
+        // of each step is considered live at all: a faulted attempt leaves no Completed event
+        // behind, and returning its abandoned correlation id (an older Waiting of a step the
+        // run has since restarted with a fresh id) would park the caller's reply forever.
+        HashSet<string>? answered = null;
+        HashSet<string>? seenWaitingSteps = null;
+        for (var index = list.Count - 1; index >= 0; index--)
         {
-            // Walking backwards, remember the correlation ids of already-answered awaited steps: a
-            // Waiting event whose step has a LATER Completed event is consumed — a reply published
-            // to that dead correlation id is silently dropped by the channel, and the caller's
-            // null-fallback (wait for the run's NEXT awaited step to park) is the correct path.
-            // Progress-aware steps stay un-completed across non-terminal replies, so repeated
-            // replies to the same live correlation id still resolve here. Only the NEWEST Waiting
-            // of each step is considered live at all: a faulted attempt leaves no Completed event
-            // behind, and returning its abandoned correlation id (an older Waiting of a step the
-            // run has since restarted with a fresh id) would park the caller's reply forever.
-            HashSet<string>? answered = null;
-            HashSet<string>? seenWaitingSteps = null;
-            for (var index = list.Count - 1; index >= 0; index--)
+            var candidate = list[index];
+            if (candidate.Kind == EventKind.Completed
+                && candidate.Step.Kind == DurableFlowStepKind.Awaited
+                && candidate.Step.CorrelationId is { } answeredCid)
             {
-                var candidate = list[index];
-                if (candidate.Kind == EventKind.Completed
-                    && candidate.Step.Kind == DurableFlowStepKind.Awaited
-                    && candidate.Step.CorrelationId is { } answeredCid)
-                {
-                    (answered ??= new HashSet<string>(StringComparer.Ordinal)).Add(answeredCid);
+                (answered ??= new HashSet<string>(StringComparer.Ordinal)).Add(answeredCid);
+                continue;
+            }
+
+            if (candidate.Kind == EventKind.Waiting
+                && candidate.Step.Kind == DurableFlowStepKind.Awaited
+                && candidate.Step.CorrelationId is { } correlationId)
+            {
+                var newestForStep = (seenWaitingSteps ??= new HashSet<string>(StringComparer.Ordinal)).Add(candidate.Step.StepName);
+                if (!newestForStep || answered?.Contains(correlationId) == true)
                     continue;
-                }
 
-                if (candidate.Kind == EventKind.Waiting
-                    && candidate.Step.Kind == DurableFlowStepKind.Awaited
-                    && candidate.Step.CorrelationId is { } correlationId)
-                {
-                    var newestForStep = (seenWaitingSteps ??= new HashSet<string>(StringComparer.Ordinal)).Add(candidate.Step.StepName);
-                    if (!newestForStep || answered?.Contains(correlationId) == true)
-                        continue;
-
-                    if (stepName is null || candidate.Step.StepName == stepName)
-                        return correlationId;
-                }
+                if (stepName is null || candidate.Step.StepName == stepName)
+                    return correlationId;
             }
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns the newest un-answered awaited-step correlation id, or waits for the run's NEXT
+    /// awaited park when none is live. The liveness re-check runs under the same gate as the
+    /// waiter registration, so a park recorded between the caller's
+    /// <see cref="LatestAwaitedCorrelationId"/> miss and this call cannot be skipped — and,
+    /// unlike a history replay, an already-answered Waiting is never returned (a reply published
+    /// to a consumed correlation id is silently dropped by the channel).
+    /// </summary>
+    internal async Task<string> WaitForNextAwaitedAsync(
+        string flowId,
+        string? stepName,
+        TimeSpan realTimeGuard,
+        string description)
+    {
+        Waiter waiter;
+        lock (_gate)
+        {
+            if (LatestAwaitedCorrelationIdCore(flowId, stepName) is { } live)
+                return live;
+
+            waiter = new Waiter(
+                flowId,
+                e => e.Kind == EventKind.Waiting
+                    && e.Step.Kind == DurableFlowStepKind.Awaited
+                    && e.Step.CorrelationId is not null
+                    && (stepName is null || e.Step.StepName == stepName),
+                new TaskCompletionSource<FlowProbeEvent>(TaskCreationOptions.RunContinuationsAsynchronously));
+            _waiters.Add(waiter);
+        }
+
+        try
+        {
+            var stepEvent = await AwaitBoundedAsync(waiter.Completion.Task, realTimeGuard, description).ConfigureAwait(false);
+            return stepEvent.Step.CorrelationId!;
+        }
+        finally
+        {
+            // Same cleanup contract as WaitForAsync below: timed-out waiters must not accumulate.
+            lock (_gate)
+                _waiters.Remove(waiter);
+        }
     }
 
     internal async Task<FlowProbeEvent> WaitForAsync(
@@ -382,10 +425,15 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
         {
             if (_events.TryGetValue(flowId, out var list))
             {
-                foreach (var recorded in list)
+                // Replay NEWEST match first: a faulted attempt leaves an older Waiting event for a
+                // step the run has since restarted with a fresh correlation id (nothing ever
+                // Completes the abandoned one), so front-to-back replay handed back the abandoned
+                // event — a reply to its correlation id was silently dropped and the live wait
+                // never resolved.
+                for (var index = list.Count - 1; index >= 0; index--)
                 {
-                    if (predicate(recorded))
-                        return recorded;
+                    if (predicate(list[index]))
+                        return list[index];
                 }
             }
 

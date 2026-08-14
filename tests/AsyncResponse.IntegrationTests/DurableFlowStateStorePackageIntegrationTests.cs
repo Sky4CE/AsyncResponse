@@ -426,6 +426,76 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Fact]
+    public async Task MySqlPackageStore_AutoCreateSchema_RepairsAPreR22StateJsonCharsetInPlace()
+    {
+        // Regression (r23): the state_json charset verification hard-failed every table this
+        // library ITSELF created before the charset was pinned — pre-r22 DDL declared state_json
+        // with no CHARACTER SET, inheriting the server default. CREATE TABLE IF NOT EXISTS cannot
+        // alter an existing table, so an upgrade had no way forward short of a manual ALTER on a
+        // table with live rows. Under AutoCreateSchema the store now repairs the column in place
+        // (MODIFY converts the stored text) and carries on; operator-managed schemas keep the
+        // throw, pinned by MySqlPackageStore_RejectsANarrowCharacterSetOnStateJson above.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_repair", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                // The pre-r22 shape: flow_id was already pinned, state_json inherited the server
+                // default — modeled here as latin1 so the test is deterministic on any server.
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext CHARACTER SET latin1 NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        INDEX `{table}_expires_idx` (expires_at_utc)
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = true
+                }));
+
+            // On the old code this threw the state_json charset error before any operation ran.
+            Assert.True(await store.TryCreateAsync("repair", CreateState("repair"), TimeSpan.FromMinutes(5)));
+
+            await using (var verify = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await verify.OpenAsync();
+                await using var check = verify.CreateCommand();
+                check.CommandText =
+                    """
+                    SELECT CHARACTER_SET_NAME FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table AND COLUMN_NAME = 'state_json';
+                    """;
+                check.Parameters.AddWithValue("@table", table);
+                Assert.Equal("utf8mb4", (string?)await check.ExecuteScalarAsync());
+            }
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task MySqlPackageStore_RejectsANarrowCharacterSetOnFlowId()
     {
         // latin1_bin ends in _bin and passes the collation check, yet the column holds almost

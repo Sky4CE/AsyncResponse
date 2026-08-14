@@ -455,6 +455,32 @@ public sealed class AzureServiceBusDispatcherTests
         await Task.Delay(50);
     }
 
+    [Fact]
+    public async Task ShutdownCancellation_AtMaxAttempts_LeavesMessageUnsettled()
+    {
+        // Regression (r23): a graceful drain cancelling the stoppingToken while user code was in
+        // the handler used to land in the generic failure catch — dead-lettering healthy work at
+        // the delivery-count cap, or abandoning it below (burning a delivery count on work that
+        // never ran). Shutdown now rethrows and leaves the peek lock to lapse on its own.
+        var calls = new SettlementCalls();
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new OperationCanceledException(stopping.Token),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), stopping.Token));
+
+        Assert.Equal(0, calls.Complete);
+        Assert.Equal(0, calls.Abandon);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
     private static AzureServiceBusTransportDelivery Delivery(
         SettlementCalls calls,
         string queue = "workers",

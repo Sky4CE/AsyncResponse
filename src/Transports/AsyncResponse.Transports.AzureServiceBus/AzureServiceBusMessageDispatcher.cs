@@ -193,6 +193,15 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown, not a handler failure: abandoning would burn a delivery count on
+            // work that never ran, and at the cap the branch below would dead-letter healthy
+            // work. Leave the delivery unsettled — the peek lock lapses on its own and
+            // at-least-once redelivery applies after restart (parity with the
+            // RabbitMQ/Redis/Kafka/DB dispatchers).
+            throw;
+        }
         catch (Exception ex)
         {
             if (MaxDeliveryAttempts > 0 && delivery.DeliveryCount >= MaxDeliveryAttempts)

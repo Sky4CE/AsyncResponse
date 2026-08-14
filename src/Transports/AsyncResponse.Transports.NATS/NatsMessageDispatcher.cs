@@ -85,6 +85,15 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         {
             await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown, not a handler failure: NAK would burn a delivery attempt on work
+            // that never ran, and at the attempt cap the failure path would dead-letter — or,
+            // with dead-lettering disabled, TERMINATE — healthy work. Leave the delivery
+            // unsettled; AckWait lapses on its own and at-least-once redelivery applies after
+            // restart (parity with the RabbitMQ/Redis/Kafka/DB dispatchers).
+            throw;
+        }
         catch (Exception ex)
         {
             await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
@@ -141,23 +150,52 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
         // Accept into the background queue and ACK. If the queue is saturated, wait for a worker to
         // free a slot instead of NAKing: the wait blocks the consume loop, so the subscriber stops
         // pulling new messages until capacity frees rather than churning NAK/redeliver cycles.
-        if (_backgroundQueue!.Writer.TryWrite(delivery))
+        if (!_backgroundQueue!.Writer.TryWrite(delivery))
         {
-            await delivery.AckAsync().ConfigureAwait(false);
-            return;
+            try
+            {
+                _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role);
+                await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
+            {
+                // Subscriber stopping or dispatcher disposing while parked: the delivery was never
+                // enqueued, so NAK so JetStream redelivers elsewhere; if the NAK itself fails the
+                // AckWait lapses to the same effect.
+                _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role);
+                try
+                {
+                    await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+                }
+                catch (Exception nakException)
+                {
+                    _logger.LogWarning(
+                        nakException,
+                        "Failed to NAK NATS message on subject {Subject} ({Role}) while stopping; AckWait will lapse and it will be redelivered.",
+                        delivery.Subject,
+                        _role);
+                }
+
+                return;
+            }
         }
 
+        // The ACK sits outside the enqueue try/catch, and never NAKs or escapes: the delivery is
+        // already owned by a background worker, so a NAK would redeliver a job that is being
+        // executed, and a thrown ack failure would unwind the consume loop and rebuild the whole
+        // subscriber — draining the workers mid-handler while the un-ACKed message redelivers
+        // after AckWait and runs again. Swallow and log; at-least-once redelivery applies.
         try
         {
-            _logger.LogDebug("Background queue full for {Role}; pausing the consume loop until capacity frees.", _role);
-            await _backgroundQueue.Writer.WriteAsync(delivery, cancellationToken).ConfigureAwait(false);
             await delivery.AckAsync().ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
+        catch (Exception ex)
         {
-            // Subscriber stopping or dispatcher disposing: NAK so JetStream redelivers elsewhere.
-            _logger.LogDebug("Background queue unavailable for {Role} during shutdown; NAKing message for redelivery.", _role);
-            await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+            _logger.LogWarning(
+                ex,
+                "Failed to ACK NATS message on subject {Subject} ({Role}) after enqueueing it for background execution; it may be redelivered.",
+                delivery.Subject,
+                _role);
         }
     }
 

@@ -197,8 +197,13 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         }
         finally
         {
+            // Release, never Dispose: SemaphoreSlim.Dispose does not complete pending WaitAsync
+            // waiters, so disposing here would strand publishers parked on the gate forever (and
+            // the first woken waiter's finally would throw trying to Release a disposed
+            // semaphore, never handing the permit on). Released, each parked waiter wakes in
+            // turn and observes _disposed; the gate holds no unmanaged resources, so leaving it
+            // undisposed leaks nothing.
             _connectionGate.Release();
-            _connectionGate.Dispose();
         }
     }
 }

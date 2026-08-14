@@ -164,9 +164,24 @@ internal sealed class MongoDbTransportStore : IDisposable
         if (claimed is null)
             return null;
 
-        var headers = claimed.Headers is null
-            ? EmptyHeaders
-            : new Dictionary<string, string>(claimed.Headers, StringComparer.OrdinalIgnoreCase);
+        // Indexer, not the copying constructor: documents can be written by foreign producers, and
+        // BSON legally carries field names differing only in case — the constructor's internal Add
+        // would throw AFTER the claim already stamped attempts+1/lock_id, before any delivery
+        // exists, so the document could never reach HandleFailureAsync or dead-letter: an
+        // unkillable poison document that tears down the subscriber on every re-claim. Last-wins,
+        // matching the ASB/SQS receive adapters.
+        IReadOnlyDictionary<string, string> headers;
+        if (claimed.Headers is null)
+        {
+            headers = EmptyHeaders;
+        }
+        else
+        {
+            var copied = new Dictionary<string, string>(claimed.Headers.Count, StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in claimed.Headers)
+                copied[pair.Key] = pair.Value;
+            headers = copied;
+        }
 
         return new MongoDbTransportDelivery(
             claimed.Id,

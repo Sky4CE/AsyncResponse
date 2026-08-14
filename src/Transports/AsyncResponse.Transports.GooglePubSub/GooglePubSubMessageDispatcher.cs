@@ -224,6 +224,15 @@ internal sealed class AwaitingGooglePubSubMessageDispatcher(
             await ExecuteHandlerAsync(message, subscriberCancellationToken).ConfigureAwait(false);
             return SubscriberClient.Reply.Ack;
         }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown, not a handler failure. Pub/Sub's handler contract offers no
+            // "leave unsettled": the only redelivery primitive is Nack (an expired ack
+            // deadline counts a delivery attempt exactly the same), so Nack is returned here
+            // too — but through this explicit branch so shutdown cancellation is never
+            // mistaken for (or later routed through) a failure policy.
+            return SubscriberClient.Reply.Nack;
+        }
         catch
         {
             return SubscriberClient.Reply.Nack;

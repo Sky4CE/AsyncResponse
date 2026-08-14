@@ -255,7 +255,9 @@ CREATE TABLE asyncresponse_flow_state (
     -- Binary collation: the default folds case, which makes two flow ids the library treats as
     -- distinct collide on the key.
     flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
-    state_json longtext NOT NULL,
+    -- utf8mb4 here too: the ledger JSON embeds the same arbitrary text as flow ids, and a
+    -- narrower inherited charset truncates or rejects non-Latin state. The store verifies this.
+    state_json longtext CHARACTER SET utf8mb4 NOT NULL,
     expires_at_utc datetime(6) NOT NULL,
     updated_at_utc datetime(6) NOT NULL,
     revision bigint NOT NULL DEFAULT 0,

@@ -651,7 +651,7 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-**6,500+ test executions per CI run, none skipped** — 4,000+ unit
+**6,600+ test executions per CI run, none skipped** — 4,100+ unit
 and 2,400+ integration cases against real servers. The unit suite dogfoods the shipped
 [`AsyncResponse.Testing`](docs/testing.md) harness: durable timers, cron schedules,
 production-sized timeouts, crash-at-every-checkpoint matrices, and restart-recovery scenarios all

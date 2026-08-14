@@ -572,6 +572,23 @@ public sealed class SqsTransportTests
             "request-id",
             HttpStatusCode.InternalServerError);
 
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException()
+    {
+        // Regression (r23): DisposeAsync used to Release then Dispose the queue-url gate.
+        // SemaphoreSlim.Dispose does not complete pending WaitAsync waiters, so publishers parked
+        // on the gate during dispose hung forever. The gate must stay usable: every post-dispose
+        // publish wakes in turn and gets the transport-named ObjectDisposedException.
+        var transport = new SqsWorkerTransport(
+            Options.Create(new SqsAsyncResponseOptions { WorkerQueue = "worker-q" }),
+            new FakeSqsClient());
+
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-disposed")));
+        Assert.Contains(nameof(SqsWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
+    }
+
     private static WorkerJobEnvelope WorkerJob(string correlationId)
         => new()
         {

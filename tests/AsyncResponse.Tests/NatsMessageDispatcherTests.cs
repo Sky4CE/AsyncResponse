@@ -109,6 +109,128 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task ShutdownCancellation_AtMaxAttempts_LeavesDeliveryUnsettled()
+    {
+        // Regression (r23): a graceful drain cancelling the stoppingToken while user code was in
+        // the handler used to route the OperationCanceledException through HandleFailureAsync —
+        // dead-lettering (and, with dead-lettering disabled, TERMinating) healthy work that never
+        // ran, or NAKing away a delivery attempt below the cap. Shutdown now rethrows and leaves
+        // the delivery unsettled, like the RabbitMQ/Redis/Kafka/DB dispatchers.
+        var rec = new RecordingDelivery();
+        using var stopping = new CancellationTokenSource();
+        stopping.Cancel();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => throw new OperationCanceledException(stopping.Token),
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 5 });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), stopping.Token));
+
+        Assert.Equal(0, rec.Acks);
+        Assert.Empty(rec.Naks);
+        Assert.Equal(0, rec.Terms);
+        Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
+    public async Task EarlyAck_FastPathAckFailure_IsSwallowedAndDoesNotNak()
+    {
+        // Regression (r23): the fast-path ACK after a successful TryWrite was unguarded, so a
+        // transient ack failure escaped HandleAsync and tore down the whole subscriber while a
+        // background worker was already running the delivery. It is now swallowed and logged;
+        // AckWait redelivery owns the retry.
+        var rec = new RecordingDelivery { AckException = new InvalidOperationException("ack failed") };
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            },
+            new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 4, backgroundDrainTimeout: TimeSpan.FromSeconds(5)));
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 1), CancellationToken.None);
+
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, rec.Acks);
+        Assert.Empty(rec.Naks);
+        Assert.Equal(0, rec.Terms);
+    }
+
+    [Fact]
+    public async Task EarlyAck_AckFailureAfterParkedEnqueue_IsSwallowedAndDoesNotNak()
+    {
+        // Regression (r23): the post-park ACK sat inside the try whose catch NAKs, so an ack
+        // failure after the delivery was already handed to a background worker NAK'd (or, for
+        // non-matching exception types, escaped and tore down the subscriber) a job that was
+        // being executed — JetStream redelivered it into a concurrent duplicate run.
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handlerStarted.TrySetResult();
+                return releaseHandler.Task;
+            },
+            new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5)));
+
+        var blocking = new RecordingDelivery();
+        var queued = new RecordingDelivery();
+        var parked = new RecordingDelivery { AckException = new InvalidOperationException("ack failed") };
+
+        // First delivery occupies the single worker; second fills the queue slot; third parks.
+        await dispatcher.HandleAsync(blocking.Create("payload", numDelivered: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.HandleAsync(queued.Create("payload", numDelivered: 1), CancellationToken.None);
+        var parkTask = dispatcher.HandleAsync(parked.Create("payload", numDelivered: 1), CancellationToken.None);
+        Assert.False(parkTask.IsCompleted);
+
+        releaseHandler.TrySetResult();
+        await parkTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, parked.Acks);
+        Assert.Empty(parked.Naks);
+        Assert.Equal(0, parked.Terms);
+    }
+
+    [Fact]
+    public async Task EarlyAck_NakFailureWhileStopping_IsSwallowed()
+    {
+        // Regression (r23): the shutdown NAK for a delivery that was never enqueued was itself
+        // unguarded — a NAK failure on a closing connection escaped HandleAsync and turned a
+        // graceful stop into a subscriber-teardown error. It is now swallowed; AckWait lapses to
+        // the same redelivery.
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handlerStarted.TrySetResult();
+                return releaseHandler.Task;
+            },
+            new NatsSubscriberOptions().UseAckAfterEnqueue(backgroundWorkerCount: 1, backgroundQueueCapacity: 1, backgroundDrainTimeout: TimeSpan.FromSeconds(5)));
+
+        var blocking = new RecordingDelivery();
+        var queued = new RecordingDelivery();
+        var parked = new RecordingDelivery { NakException = new InvalidOperationException("nak failed") };
+
+        await dispatcher.HandleAsync(blocking.Create("payload", numDelivered: 1), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await dispatcher.HandleAsync(queued.Create("payload", numDelivered: 1), CancellationToken.None);
+
+        using var stopping = new CancellationTokenSource();
+        var parkTask = dispatcher.HandleAsync(parked.Create("payload", numDelivered: 1), stopping.Token);
+        Assert.False(parkTask.IsCompleted);
+
+        stopping.Cancel();
+        await parkTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Single(parked.Naks);
+        Assert.Equal(0, parked.Acks);
+        releaseHandler.TrySetResult();
+    }
+
+    [Fact]
     public async Task AckFailureAfterSuccessfulHandler_DoesNotNakOrDeadLetter()
     {
         // Regression (review fix): the ACK used to sit inside the handler try, so an ack failure

@@ -1,15 +1,26 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using System.Threading.Channels;
 using Xunit;
 
 namespace AsyncResponse.Tests;
+
+/// <summary>
+/// Serialized against the rest of the suite: the drain-race regression below drives a scheduling
+/// race in a tight loop, and its thread-pool burst starves the virtual-clock harness tests'
+/// real-time settle budgets when run alongside them.
+/// </summary>
+[CollectionDefinition(nameof(InMemoryWorkerTransportDrainTests), DisableParallelization = true)]
+public sealed class InMemoryWorkerTransportDrainCollection;
 
 /// <summary>
 /// The in-process transport promises accepted jobs in-process execution, so host shutdown must
 /// drain the bounded queue to completion (stop accepting, then finish what was accepted) rather
 /// than abandoning queued jobs mid-queue.
 /// </summary>
+[Collection(nameof(InMemoryWorkerTransportDrainTests))]
 public sealed class InMemoryWorkerTransportDrainTests
 {
     public interface IDrainProbe
@@ -189,6 +200,125 @@ public sealed class InMemoryWorkerTransportDrainTests
 
             // Every pending job and every mid-drain wake-up retained, none lost to the race.
             Assert.Equal(pendingJobs + racingJobs, retention.Count);
+        }
+    }
+
+    [Fact]
+    public async Task PublishFailureDuringDrain_NeverStrandsTheDrainWithAnUncompletedWriter()
+    {
+        // Regression (r23): PublishAsync's catch decremented _outstanding without the drain-aware
+        // "complete the writer at zero" step OnJobFinished performs. When a cancelled publisher's
+        // decrement was the LAST one after the drain began, the channel stayed open-but-empty and
+        // the worker loop parked forever — shutdown stalled to the host budget. The interleaving
+        // is timing-dependent, so drive it repeatedly; every iteration must end completed.
+        for (var i = 0; i < 200; i++)
+        {
+            var transport = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions { QueueCapacity = 1 }));
+            await transport.PublishAsync(DelayedJob());
+            using var cts = new CancellationTokenSource();
+            var parked = transport.PublishAsync(DelayedJob(), cts.Token);
+            transport.BeginShutdownDrain();
+
+            // Race the cancellation of the parked writer against a worker draining the queued job.
+            var cancel = Task.Run(cts.Cancel);
+            var consume = Task.Run(async () =>
+            {
+                try
+                {
+                    using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await transport.Reader.ReadAsync(readCts.Token);
+                    transport.OnJobFinished();
+                }
+                catch (ChannelClosedException)
+                {
+                    // The writer completed with nothing left to read: the race already settled.
+                }
+            });
+
+            var parkedWon = false;
+            try
+            {
+                await parked;
+                parkedWon = true;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            await cancel;
+            await consume;
+            if (parkedWon)
+            {
+                // The parked write slid into the freed slot: finish it like a worker would.
+                Assert.True(transport.Reader.TryRead(out _));
+                transport.OnJobFinished();
+            }
+
+            await transport.Reader.Completion.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    [Fact]
+    public async Task DelayedFire_RacingShutdownDrain_IsNeverLostBetweenSnapshotAndCount()
+    {
+        // Regression (r23): FireDelayed removed the job from the timer map inside the gate but
+        // incremented _outstanding only after releasing it. A drain running in that window saw
+        // neither the map entry nor the count — it completed the writer underneath the fired
+        // job, which was then dropped. The count now moves inside the gate, atomic with the
+        // removal, so the drain either retains the job or waits for its write.
+        var time = new CapturedTimerTimeProvider();
+        var transport = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions()), time);
+
+        await transport.PublishAsync(DelayedJob(), TimeSpan.FromMinutes(5));
+        Assert.NotNull(time.Callback);
+
+        // Fire the timer on a background thread: its timer.Dispose parks on the gate, freezing
+        // the fire between "removed from the map" and "written to the queue" — exactly the
+        // window a shutdown drain races.
+        var firing = Task.Run(() => time.Callback!(time.State));
+        Assert.True(time.DisposeReached.Wait(TimeSpan.FromSeconds(5)));
+
+        transport.BeginShutdownDrain();
+        time.DisposeGate.Set();
+        await firing;
+
+        // The fired wake-up must survive: on the old code the drain observed zero outstanding,
+        // completed the writer, and the write landed in a closed channel and was dropped.
+        using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var fired = await transport.Reader.ReadAsync(readCts.Token);
+        Assert.Equal(typeof(IDrainProbe).FullName, fired.Job.Call.ServiceInterfaceFullName);
+        transport.OnJobFinished();
+    }
+
+    private sealed class CapturedTimerTimeProvider : TimeProvider
+    {
+        public TimerCallback? Callback;
+        public object? State;
+        public ManualResetEventSlim DisposeGate { get; } = new(initialState: false);
+        public ManualResetEventSlim DisposeReached { get; } = new(initialState: false);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Callback = callback;
+            State = state;
+            return new GateTimer(this);
+        }
+
+        private sealed class GateTimer(CapturedTimerTimeProvider owner) : ITimer
+        {
+            public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+
+            public void Dispose()
+            {
+                owner.DisposeReached.Set();
+                owner.DisposeGate.Wait();
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return ValueTask.CompletedTask;
+            }
         }
     }
 

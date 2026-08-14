@@ -113,6 +113,30 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task SharedSchema_CaseVariantNameCollision_IsDiagnosedNotMisreportedAsAbsent()
+    {
+        // Regression (r23): the post-DDL verification keyed its catalog dictionary ORDINALLY while
+        // the server matched names under its case-insensitive catalog collation. A foreign table
+        // whose name differs from the configured one only in case was found by the server but
+        // missed by every dictionary lookup — the kind/column/key checks silently skipped the
+        // collision and the operator was told the table "does not exist", the one diagnosis that
+        // is provably false. The dictionary now folds case exactly like the catalog.
+        await WithSchemaAsync("sql_collide_case", async schema =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "SHARED_CASE_NAME";
+            await new SqlServerTransportStore(Options.Create(transportOptions)).EnsureCreatedAsync();
+
+            var channelOptions = ChannelOptions(schema);
+            channelOptions.MessageTable = "shared_case_name";
+            var channel = new SqlServerChannelSql(Options.Create(channelOptions));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
+            Assert.Contains("missing the column", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("to exist after schema creation, but it does not", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
     public async Task NameHeldByAnotherObjectKind_FailsVerificationInsteadOfRawError2714()
     {
         // A view (or synonym, or procedure) occupying the name slips past an existence guard that

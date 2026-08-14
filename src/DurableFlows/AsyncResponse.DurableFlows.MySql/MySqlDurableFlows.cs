@@ -446,12 +446,28 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         if (stateJsonColumn.CharacterSet is not { } stateJsonCharacterSet
             || !stateJsonCharacterSet.Equals("utf8mb4", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException(
-                $"The MySQL durable-flow table '{_options.TableName}' stores state_json in the character set " +
-                $"'{stateJsonColumn.CharacterSet ?? "(none)"}', which cannot hold every flow state the engine accepts. The ledger " +
-                "JSON is arbitrary text, so a narrower set rejects updates under strict mode or silently truncates the stored " +
-                $"state otherwise. Fix it with ALTER TABLE `{_options.TableName}` MODIFY state_json longtext CHARACTER SET utf8mb4 " +
-                "NOT NULL; (tables this build creates get that character set automatically).");
+            // Tables created by builds before this charset was pinned declared state_json with no
+            // CHARACTER SET and inherited the server default, so an unconditional throw would
+            // hard-fail every pre-existing deployment on a latin1/utf8mb3-default server with no
+            // way back: CREATE TABLE IF NOT EXISTS cannot alter an existing table. Under
+            // AutoCreateSchema this store owns the DDL, so it repairs the column in place — MODIFY
+            // converts the stored text to utf8mb4, lossless for everything the old charset could
+            // actually represent. Operator-managed schemas keep the throw, with the exact ALTER.
+            if (_options.AutoCreateSchema)
+            {
+                await using var repair = connection.CreateCommand();
+                repair.CommandText = $"ALTER TABLE {Table} MODIFY state_json longtext CHARACTER SET utf8mb4 NOT NULL;";
+                await repair.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"The MySQL durable-flow table '{_options.TableName}' stores state_json in the character set " +
+                    $"'{stateJsonColumn.CharacterSet ?? "(none)"}', which cannot hold every flow state the engine accepts. The ledger " +
+                    "JSON is arbitrary text, so a narrower set rejects updates under strict mode or silently truncates the stored " +
+                    $"state otherwise. Fix it with ALTER TABLE `{_options.TableName}` MODIFY state_json longtext CHARACTER SET utf8mb4 " +
+                    "NOT NULL; (tables this build creates get that character set automatically).");
+            }
         }
 
         await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);

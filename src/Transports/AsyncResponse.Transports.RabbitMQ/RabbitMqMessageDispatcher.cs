@@ -132,20 +132,47 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
                 $"{nameof(RabbitMqAsyncResponseOptions.ResponseQueue)} must be distinct so worker and response subscribers do not consume each other's messages.");
         }
 
-        // Parity with the Kafka/NATS validators: a dead-letter destination aimed at a live one
-        // turns reject-without-requeue into a broker-rate loop. With x-dead-letter-exchange set to
-        // a live exchange and no x-dead-letter-routing-key, a rejected message re-enters with its
-        // original routing key and lands right back in the queue that rejected it — or crosses
-        // into the other role's queue, feeding worker envelopes to the response ingress.
-        if (!string.IsNullOrWhiteSpace(transportOptions.DeadLetterExchange)
-            && (StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.WorkerExchange)
-                || StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.ResponseExchange)))
+        // The publish address is (exchange, routingKey), not the queue name: a direct exchange
+        // fans one routing key out to EVERY queue bound with it, so two distinct queues sharing
+        // one address both receive every publish — worker envelopes delivered to the response
+        // queue complete real waiters through the response ingress.
+        if (StringComparer.Ordinal.Equals(transportOptions.WorkerExchange, transportOptions.ResponseExchange)
+            && StringComparer.Ordinal.Equals(transportOptions.WorkerRoutingKey, transportOptions.ResponseRoutingKey))
         {
             throw new InvalidOperationException(
-                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange)} " +
-                $"'{transportOptions.DeadLetterExchange}' must not be a live exchange " +
-                $"({nameof(RabbitMqAsyncResponseOptions.WorkerExchange)}/{nameof(RabbitMqAsyncResponseOptions.ResponseExchange)}): " +
-                "dead-lettered messages would re-enter live routing and loop instead of parking.");
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.WorkerExchange)}+" +
+                $"{nameof(RabbitMqAsyncResponseOptions.WorkerRoutingKey)} and " +
+                $"{nameof(RabbitMqAsyncResponseOptions.ResponseExchange)}+{nameof(RabbitMqAsyncResponseOptions.ResponseRoutingKey)} " +
+                "must not form the same publish address: the exchange fans that routing key out to both queues, so worker " +
+                "jobs would also be delivered to the response queue (and responses to the worker queue).");
+        }
+
+        // Parity with the Kafka/NATS validators: a dead-letter destination aimed at a live one
+        // turns reject-without-requeue into a broker-rate loop. A rejected message re-enters the
+        // dead-letter exchange under DeadLetterRoutingKey — or its ORIGINAL routing key when that
+        // is blank, which by definition matches the binding of the queue that rejected it. It
+        // loops (or crosses into the other role's queue) only when that (exchange, routing key)
+        // pair is a live binding; a distinct DeadLetterRoutingKey on a shared exchange is a
+        // legitimate topology and must keep starting.
+        if (!string.IsNullOrWhiteSpace(transportOptions.DeadLetterExchange))
+        {
+            var deadLetterAddressIsLive = string.IsNullOrWhiteSpace(transportOptions.DeadLetterRoutingKey)
+                ? StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.WorkerExchange)
+                    || StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.ResponseExchange)
+                : (StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.WorkerExchange)
+                        && StringComparer.Ordinal.Equals(transportOptions.DeadLetterRoutingKey, transportOptions.WorkerRoutingKey))
+                    || (StringComparer.Ordinal.Equals(transportOptions.DeadLetterExchange, transportOptions.ResponseExchange)
+                        && StringComparer.Ordinal.Equals(transportOptions.DeadLetterRoutingKey, transportOptions.ResponseRoutingKey));
+            if (deadLetterAddressIsLive)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange)} " +
+                    $"'{transportOptions.DeadLetterExchange}' plus {nameof(RabbitMqAsyncResponseOptions.DeadLetterRoutingKey)} " +
+                    $"'{transportOptions.DeadLetterRoutingKey ?? "(blank — the message's original routing key)"}' targets a live " +
+                    $"binding ({nameof(RabbitMqAsyncResponseOptions.WorkerExchange)}/{nameof(RabbitMqAsyncResponseOptions.ResponseExchange)}): " +
+                    "dead-lettered messages would re-enter live routing and loop instead of parking. " +
+                    $"Set a {nameof(RabbitMqAsyncResponseOptions.DeadLetterRoutingKey)} that no live queue is bound with, or use a dedicated exchange.");
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(transportOptions.DeadLetterQueue)

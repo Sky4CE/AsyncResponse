@@ -209,6 +209,15 @@ internal sealed class AwaitingSqsMessageDispatcher(
         {
             await ExecuteHandlerAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown, not a handler failure: shortening visibility would hasten a
+            // redelivery of work that never ran as if it had failed. Leave the message
+            // untouched — its visibility timeout lapses on its own and at-least-once
+            // redelivery applies after restart (parity with the RabbitMQ/Redis/Kafka/DB
+            // dispatchers).
+            throw;
+        }
         catch (Exception)
         {
             // SQS has no explicit NACK or dead-letter call: leaving the message undeleted lets it

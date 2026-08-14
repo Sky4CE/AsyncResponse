@@ -108,7 +108,7 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
                 message.Attributes[_options.CorrelationIdAttribute] = job.CorrelationId;
 
             var publisher = await GetPublisherAsync(cancellationToken).ConfigureAwait(false);
-            var messageId = await publisher.PublishAsync(message).WaitAsync(cancellationToken).ConfigureAwait(false);
+            var messageId = await publisher.PublishAsync(message, cancellationToken).ConfigureAwait(false);
             activity?.SetTag("messaging.message.id", messageId);
         }
         catch (Exception ex)
@@ -133,8 +133,13 @@ public sealed class GooglePubSubWorkerTransport : IWorkerTransport, IAsyncDispos
         }
         finally
         {
+            // Release, never Dispose: SemaphoreSlim.Dispose does not complete pending WaitAsync
+            // waiters, so disposing here would strand publishers parked on the gate forever (and
+            // the first woken waiter's finally would throw trying to Release a disposed
+            // semaphore, never handing the permit on). Released, each parked waiter wakes in
+            // turn and observes _disposed; the gate holds no unmanaged resources, so leaving it
+            // undisposed leaks nothing.
             _publisherGate.Release();
-            _publisherGate.Dispose();
         }
     }
 }

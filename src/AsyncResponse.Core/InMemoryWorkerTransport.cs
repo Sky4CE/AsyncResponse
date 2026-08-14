@@ -176,7 +176,11 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         }
         catch (Exception ex)
         {
-            Interlocked.Decrement(ref _outstanding);
+            // OnJobFinished, not a bare decrement: if this failed publish is the last thing the
+            // drain was waiting on (the drain observed the incremented count and declined to
+            // complete the writer), a bare decrement leaves an empty, never-completed channel —
+            // the workers park in ReadAllAsync forever and shutdown stalls to the host's budget.
+            OnJobFinished();
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
         }
@@ -248,13 +252,15 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         {
             if (!_delayedJobs.Remove(delayed, out timer))
                 return; // The shutdown drain already claimed (and dropped) it.
+
+            // Count as outstanding INSIDE the gate, atomically with the removal: incremented
+            // after the lock released, a drain snapshotting in that window saw neither the
+            // timer-map entry nor the count — it neither retained nor waited for this job and
+            // completed the writer underneath the write below.
+            Interlocked.Increment(ref _outstanding);
         }
 
         timer.Dispose();
-
-        // Count as outstanding BEFORE the write, mirroring the immediate path, so a drain that
-        // starts between the fire and the write still waits for this job.
-        Interlocked.Increment(ref _outstanding);
         _ = WriteFiredAsync(delayed.Queued);
     }
 
@@ -266,14 +272,17 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         }
         catch (ChannelClosedException)
         {
-            Interlocked.Decrement(ref _outstanding);
+            // OnJobFinished, not a bare decrement, on both failure paths: if this count is the
+            // last one a drain is waiting on, only the drain-aware decrement completes the writer
+            // (TryComplete on an already-completed channel is a no-op here).
+            OnJobFinished();
             DrainLogger?.LogWarning(
                 "Dropping delayed in-memory worker job {Target}.{Method}: its due time fired after the transport completed its shutdown drain.",
                 queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
         }
         catch (Exception ex)
         {
-            Interlocked.Decrement(ref _outstanding);
+            OnJobFinished();
             DrainLogger?.LogError(ex,
                 "Failed to enqueue fired delayed in-memory worker job {Target}.{Method}.",
                 queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);

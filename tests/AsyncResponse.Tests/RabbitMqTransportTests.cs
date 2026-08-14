@@ -823,7 +823,67 @@ public class RabbitMqTransportTests
             RabbitMqSubscriberRole.Worker));
 
         Assert.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterExchange), ex.Message, StringComparison.Ordinal);
-        Assert.Contains("live exchange", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("live binding", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("asyncresponse.worker")]   // default WorkerExchange
+    [InlineData("asyncresponse.response")] // default ResponseExchange
+    public void Validator_AcceptsADeadLetterExchangeSharedWithALiveExchangeWhenTheRoutingKeyIsDistinct(string liveExchange)
+    {
+        // A single exchange with routing keys separating live from parked traffic is a correct
+        // topology: the DLQ is bound on DeadLetterRoutingKey and the source queues are stamped
+        // x-dead-letter-routing-key, so a rejected message cannot re-enter a live binding. The
+        // guard must only fire when the dead-letter (exchange, routing key) pair IS a live one.
+        RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                DeadLetterExchange = liveExchange,
+                DeadLetterRoutingKey = "asyncresponse.deadletter",
+                DeadLetterQueue = "asyncresponse-deadletter"
+            },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker);
+    }
+
+    [Theory]
+    [InlineData("asyncresponse.worker")]   // WorkerExchange + WorkerRoutingKey
+    [InlineData("asyncresponse.response")] // ResponseExchange + ResponseRoutingKey
+    public void Validator_RejectsADeadLetterRoutingKeyThatIsALiveBinding(string live)
+    {
+        // An explicit DeadLetterRoutingKey equal to a live binding key on the same exchange re-feeds
+        // rejected messages into live consumption exactly like the blank-key case.
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                DeadLetterExchange = live,
+                DeadLetterRoutingKey = live,
+                DeadLetterQueue = "asyncresponse-deadletter"
+            },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.DeadLetterRoutingKey), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validator_RejectsWorkerAndResponsePublishAddressesThatCollide()
+    {
+        // The publish address is (exchange, routingKey), not the queue name: a direct exchange fans
+        // one routing key out to every queue bound with it, so distinct queue names alone still
+        // deliver every worker job to the response queue (and vice versa).
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                WorkerExchange = "asyncresponse",
+                ResponseExchange = "asyncresponse",
+                WorkerRoutingKey = "asyncresponse",
+                ResponseRoutingKey = "asyncresponse"
+            },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        Assert.Contains("publish address", ex.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -953,6 +1013,24 @@ public class RabbitMqTransportTests
             "ExecuteAsync",
             BindingFlags.Instance | BindingFlags.NonPublic)!;
         return (Task)method.Invoke(subscriber, [cancellationToken])!;
+    }
+
+    [Fact]
+    public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException()
+    {
+        // Regression (r23): DisposeAsync used to Release then Dispose the connection gate.
+        // SemaphoreSlim.Dispose does not complete pending WaitAsync waiters, so publishers parked
+        // on the gate during dispose hung forever (and the first woken waiter's finally threw
+        // trying to Release the disposed semaphore). The gate must stay usable: every post-dispose
+        // publish wakes in turn and gets the transport-named ObjectDisposedException.
+        var transport = new RabbitMqWorkerTransport(
+            Options.Create(new RabbitMqAsyncResponseOptions()),
+            new FakeConnectionFactory());
+
+        await transport.DisposeAsync();
+
+        var ex = await Assert.ThrowsAsync<ObjectDisposedException>(() => transport.PublishAsync(WorkerJob("c-disposed", 1)));
+        Assert.Contains(nameof(RabbitMqWorkerTransport), ex.ObjectName, StringComparison.Ordinal);
     }
 
     private static WorkerJobEnvelope WorkerJob(string correlationId, int orderId)

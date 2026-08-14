@@ -301,11 +301,13 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     }
 
     /// <summary>
-    /// Checkpoint save whose TTL covers a sleep: <c>remaining + StateExpiry</c>, saturated at the
-    /// persistence ceiling. The ordinary <see cref="SaveAsync"/> TTL bounds <em>idle</em> time
-    /// between checkpoints; a sleeping run is idle by design for the whole sleep — and because
-    /// <see cref="ThrowIfSleepBeyondLedger"/> caps every sleep at ceiling − StateExpiry, the sum
-    /// here always carries the full StateExpiry margin past the due instant.
+    /// Checkpoint save whose TTL covers a known wait window (a timer's sleep, or an awaited step's
+    /// timeout): <c>remaining + StateExpiry</c>, saturated at the persistence ceiling. The ordinary
+    /// <see cref="SaveAsync"/> TTL bounds <em>idle</em> time between checkpoints; a run parked on a
+    /// timer or an awaited response is idle by design for the whole window — and because
+    /// <see cref="ThrowIfSleepBeyondLedger"/> caps every sleep at ceiling − StateExpiry (and step
+    /// timeouts are timer-bounded far below it), the sum here always carries the full StateExpiry
+    /// margin past the due instant.
     /// </summary>
     private Task SaveForSleepAsync(TimeSpan remaining, CancellationToken cancellationToken)
     {
@@ -550,7 +552,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 checkpoint.PendingPayloadTypeFullName = typeof(TResponse).FullName;
                 checkpoint.Faulted = false;
                 checkpoint.Message = null;
-                await SaveAsync(cancellationToken).ConfigureAwait(false);
+                // The ledger must outlive the wait it records, exactly as SaveForSleepAsync covers
+                // a timer's sleep: with a step timeout longer than StateExpiry, a plain-TTL stamp
+                // expires the row (and with it the lease renewal's anchor) mid-wait — the lease is
+                // marked lost against a row that no longer exists and the run is unrecoverable. A
+                // timeout-less wait keeps the plain stamp: bounding open-ended idleness is what
+                // StateExpiry is documented to do.
+                if (stepTimeout is { } waitWindow)
+                    await SaveForSleepAsync(waitWindow, cancellationToken).ConfigureAwait(false);
+                else
+                    await SaveAsync(cancellationToken).ConfigureAwait(false);
 
                 await trigger(correlationId).ConfigureAwait(false);
                 triggerCompleted = true;
@@ -667,6 +678,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             {
                 return false;
             }
+
+            // Adopt ONLY while the persisted run is still Running. The revision sync below makes
+            // the next checkpoint's CAS succeed, so adopting the revision of a writer that ALSO
+            // transitioned the run (RecoverAsync's escalation into FailAsync marking it Failed, an
+            // operator parking it) would let this execution's next save write the stale in-memory
+            // Status/LastMessage over that transition — resurrecting a terminally Failed run.
+            // Falling through keeps the stale revision, so the next save loses the CAS and the
+            // delivery abandons and retries: the documented outcome for losing a concurrent write.
+            if (persisted.Status is not FlowRunStatus.Running)
+                return false;
 
             // Sync the ledger revision too: the recovery write that completed this step advanced
             // it, and a stale in-memory revision would fail the NEXT checkpoint's compare-and-swap
