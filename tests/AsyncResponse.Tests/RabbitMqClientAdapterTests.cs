@@ -311,7 +311,7 @@ public class RabbitMqClientAdapterTests
         var adapter = new RabbitMqChannelAdapter(channel.Object);
 
         RabbitMqDelivery? received = null;
-        var consumerTag = await adapter.BasicConsumeAsync(
+        var consumer = await adapter.BasicConsumeAsync(
             "q",
             delivery =>
             {
@@ -320,7 +320,8 @@ public class RabbitMqClientAdapterTests
             },
             cts.Token);
 
-        Assert.Equal("consumer-tag", consumerTag);
+        Assert.Equal("consumer-tag", consumer.ConsumerTag);
+        Assert.False(consumer.Terminated.IsCompleted);
         var eventingConsumer = Assert.IsType<AsyncEventingBasicConsumer>(captured);
 
         var properties = new BasicProperties { CorrelationId = "cid", MessageId = "mid" };
@@ -342,5 +343,94 @@ public class RabbitMqClientAdapterTests
         Assert.Equal("rk", received.RoutingKey);
         Assert.Equal("cid", received.BasicProperties.CorrelationId);
         Assert.Equal("payload", Encoding.UTF8.GetString(received.Body.Span));
+    }
+
+    [Fact]
+    public async Task ChannelAdapter_BrokerCancel_CompletesTerminated()
+    {
+        var (adapter, channel) = ConsumableChannel();
+        var consumer = await adapter.BasicConsumeAsync("q", _ => Task.CompletedTask);
+        var eventingConsumer = Assert.IsType<AsyncEventingBasicConsumer>(channel.Captured);
+
+        // Broker-side basic.cancel (queue deleted) raises UnregisteredAsync and nothing else.
+        await eventingConsumer.HandleBasicCancelAsync(consumer.ConsumerTag, CancellationToken.None);
+
+        var reason = await consumer.Terminated.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Contains("cancel", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ChannelAdapter_ChannelShutdown_CompletesTerminatedWithReplyDetails()
+    {
+        var (adapter, channel) = ConsumableChannel();
+        var consumer = await adapter.BasicConsumeAsync("q", _ => Task.CompletedTask);
+
+        // A channel-level protocol close (e.g. 406 precondition-failed) raises ChannelShutdownAsync only.
+        channel.Mock.Raise(
+            c => c.ChannelShutdownAsync += null,
+            channel.Mock.Object,
+            new ShutdownEventArgs(ShutdownInitiator.Peer, 406, "PRECONDITION_FAILED"));
+
+        var reason = await consumer.Terminated.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Contains("406", reason, StringComparison.Ordinal);
+        Assert.Contains("PRECONDITION_FAILED", reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ChannelAdapter_IsOpen_ForwardsToInner()
+    {
+        var channel = new Mock<IChannel>();
+        channel.SetupGet(c => c.IsOpen).Returns(true);
+
+        Assert.True(new RabbitMqChannelAdapter(channel.Object).IsOpen);
+
+        channel.SetupGet(c => c.IsOpen).Returns(false);
+        Assert.False(new RabbitMqChannelAdapter(channel.Object).IsOpen);
+    }
+
+    [Fact]
+    public void ConnectionAdapter_IsOpen_ForwardsToInner()
+    {
+        var connection = new Mock<IConnection>();
+        connection.SetupGet(c => c.IsOpen).Returns(true);
+
+        Assert.True(new RabbitMqConnectionAdapter(connection.Object).IsOpen);
+
+        connection.SetupGet(c => c.IsOpen).Returns(false);
+        Assert.False(new RabbitMqConnectionAdapter(connection.Object).IsOpen);
+    }
+
+    private static (RabbitMqChannelAdapter Adapter, ConsumableChannelMock Channel) ConsumableChannel()
+    {
+        var channel = new ConsumableChannelMock();
+        return (new RabbitMqChannelAdapter(channel.Mock.Object), channel);
+    }
+
+    private sealed class ConsumableChannelMock
+    {
+        public Mock<IChannel> Mock { get; } = new();
+        public IAsyncBasicConsumer? Captured { get; private set; }
+
+        public ConsumableChannelMock()
+            => Mock
+                .Setup(c => c.BasicConsumeAsync(
+                    It.IsAny<string>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<string>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<IDictionary<string, object?>?>(),
+                    It.IsAny<IAsyncBasicConsumer>(),
+                    It.IsAny<CancellationToken>()))
+                .Callback((
+                    string _,
+                    bool _,
+                    string _,
+                    bool _,
+                    bool _,
+                    IDictionary<string, object?>? _,
+                    IAsyncBasicConsumer consumer,
+                    CancellationToken _) => Captured = consumer)
+                .ReturnsAsync("consumer-tag");
     }
 }

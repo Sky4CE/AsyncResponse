@@ -1,3 +1,4 @@
+using AsyncResponse.Channels.Redis;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -26,6 +27,7 @@ public class LostSubscriberRoutingTests
     private readonly Mock<ISubscriber> _subscriber = new();
     private readonly Mock<IDatabase> _database = new();
     private readonly RecoverySpy _spy = new();
+    private readonly CapturingLogger<RedisAsyncResponseChannel> _channelLog = new();
     private readonly IServiceProvider _provider;
 
     public LostSubscriberRoutingTests()
@@ -92,6 +94,10 @@ public class LostSubscriberRoutingTests
 
         var services = new ServiceCollection();
         services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        // Closed-generic registration AFTER the open-generic fallback (last one wins), so the
+        // channel — and the lost-subscriber dispatcher it constructs with its own logger — logs
+        // into the recorder the payload-hygiene tests below assert against.
+        services.AddSingleton<ILogger<RedisAsyncResponseChannel>>(_channelLog);
         services.AddSingleton(_multiplexer.Object);
         services.AddSingleton<IRecoverySpy>(_spy);
         services.AddAsyncResponse().WithRedisChannel();
@@ -226,6 +232,45 @@ public class LostSubscriberRoutingTests
         Assert.Empty(_spy.Failures);
         // Nothing was dispatched: the recovery state is kept.
         _database.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SetResponse_FailedPayload_WarningLogsPayloadLength_NeverThePayloadItself()
+    {
+        // Regression (review fix): the failure route logged the payload JSON at Warning — business
+        // data in production logs. Only the SIZE may appear; the full JSON still travels on
+        // AsyncResponseDomainFailureException.PayloadJson for the callback.
+        ArmRecoveryState();
+        var payload = new OperationResult { Status = OperationStatus.Failed, Message = "PII-SECRET-7d1" };
+
+        await Publisher.SetResponse(payload, CorrelationId);
+
+        var failure = Assert.IsType<AsyncResponseDomainFailureException>(Assert.Single(_spy.Failures));
+        Assert.Contains("PII-SECRET-7d1", failure.PayloadJson); // the exception carries it; the log must not
+        Assert.DoesNotContain(_channelLog.Entries, entry => entry.Message.Contains("PII-SECRET-7d1", StringComparison.Ordinal));
+        var warning = Assert.Single(_channelLog.Entries, entry =>
+            entry.Level == LogLevel.Warning
+            && entry.Message.Contains("declined to resume, invoking failure callback", StringComparison.Ordinal));
+        Assert.Contains($"Payload: {failure.PayloadJson!.Length} UTF-16 code units", warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SetResponse_FailedPayload_WithoutFailureCallback_ErrorLogsPayloadLength_NeverThePayloadItself()
+    {
+        // Same rule on the no-callback branch, which logs at Error — the level most likely to be
+        // enabled, so also the branch where the payload body was most exposed.
+        ArmRecoveryState(includeFailureCallback: false);
+        var payload = new OperationResult { Status = OperationStatus.Failed, Message = "PII-SECRET-7d1" };
+
+        await Publisher.SetResponse(payload, CorrelationId);
+
+        Assert.Empty(_spy.Failures);
+        Assert.DoesNotContain(_channelLog.Entries, entry => entry.Message.Contains("PII-SECRET-7d1", StringComparison.Ordinal));
+        var error = Assert.Single(_channelLog.Entries, entry =>
+            entry.Level == LogLevel.Error
+            && entry.Message.Contains("no failure callback is available", StringComparison.Ordinal));
+        var expectedLength = AsyncResponseJson.Serialize(payload, typeof(OperationResult)).Length;
+        Assert.Contains($"Payload: {expectedLength} UTF-16 code units", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

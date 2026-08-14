@@ -41,3 +41,5 @@ AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.Validate()
 const AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.ChannelName = "SqlServer" -> string!
 Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions
 static Microsoft.Extensions.DependencyInjection.SqlServerAsyncResponseChannelServiceCollectionExtensions.WithSqlServerChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.FullSweepInterval.get -> System.TimeSpan?
+AsyncResponse.Channels.SqlServer.SqlServerAsyncResponseChannelOptions.FullSweepInterval.set -> void

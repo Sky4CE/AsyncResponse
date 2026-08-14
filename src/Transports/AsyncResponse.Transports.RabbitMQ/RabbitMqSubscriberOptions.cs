@@ -99,7 +99,8 @@ public sealed class RabbitMqSubscriberOptions
 
     /// <summary>
     /// Maximum number of deliveries waiting in the background queue for
-    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>. When full, the delivery is NACKed with requeue.
+    /// <see cref="RabbitMqAckMode.AckAfterEnqueue"/>. When full, the channel's delivery loop pauses
+    /// (deliveries are dispatched per channel, sequentially) until a worker frees capacity.
     /// </summary>
     public int BackgroundQueueCapacity { get; set; }
 

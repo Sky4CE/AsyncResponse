@@ -52,21 +52,48 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
     private async Task<IRabbitMqChannel> GetChannelAsync(CancellationToken cancellationToken)
     {
         var channel = Volatile.Read(ref _channel);
-        if (channel is not null)
+        if (channel is not null && channel.IsOpen)
             return channel;
 
         await _connectionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_channel is not null)
+            if (_channel is not null && _channel.IsOpen)
                 return _channel;
+
+            // A cached-but-closed channel is treated as absent: a protocol error (404/406 after an
+            // exchange delete/redeclare) closes the channel without failing the publish that comes
+            // next, so keeping it would cache a dead channel forever. Dispose before recreating.
+            if (_channel is not null)
+            {
+                await DisposeQuietlyAsync(_channel).ConfigureAwait(false);
+                _channel = null;
+            }
+
+            // The connection is replaced only when itself closed: with automatic recovery enabled the
+            // client object stays open while it reconnects, so this only fires when it is truly dead
+            // (e.g. AutomaticRecoveryEnabled = false).
+            if (_connection is not null && !_connection.IsOpen)
+            {
+                await DisposeQuietlyAsync(_connection).ConfigureAwait(false);
+                _connection = null;
+            }
 
             // ??= only assigns when the await succeeds, so a failed connect leaves _connection null and
             // the next publish retries. A successful connection is reused even if channel/topology setup fails.
             _connection ??= await _connectionFactory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
             var created = await _connection.CreateChannelAsync(publisherConfirmations: true, cancellationToken).ConfigureAwait(false);
-            await RabbitMqTopology.EnsureWorkerAsync(created, _options, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await RabbitMqTopology.EnsureWorkerAsync(created, _options, cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Not cached yet, so nothing else ever disposes it: release the channel here or leak it.
+                await DisposeQuietlyAsync(created).ConfigureAwait(false);
+                throw;
+            }
 
             // Publish the channel only once it is fully initialized; if anything above threw, _channel stays
             // null so a later publish recreates it instead of awaiting a permanently faulted task.
@@ -76,6 +103,18 @@ public sealed class RabbitMqWorkerTransport : IWorkerTransport, IAsyncDisposable
         finally
         {
             _connectionGate.Release();
+        }
+    }
+
+    private static async ValueTask DisposeQuietlyAsync(IAsyncDisposable resource)
+    {
+        try
+        {
+            await resource.DisposeAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best effort: the broker side of a dead channel/connection is already gone.
         }
     }
 

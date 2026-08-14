@@ -39,3 +39,5 @@ AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.Validate
 const AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.ChannelName = "PostgreSQL" -> string!
 Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions
 static Microsoft.Extensions.DependencyInjection.PostgreSqlAsyncResponseChannelServiceCollectionExtensions.WithPostgreSqlChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.FullSweepInterval.get -> System.TimeSpan?
+AsyncResponse.Channels.PostgreSQL.PostgreSqlAsyncResponseChannelOptions.FullSweepInterval.set -> void

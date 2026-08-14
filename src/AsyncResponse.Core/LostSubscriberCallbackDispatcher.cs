@@ -67,7 +67,8 @@ internal readonly record struct LostSubscriberDispatchResult(RecoveryAction? Act
 internal sealed class LostSubscriberCallbackDispatcher(
     IServiceScopeFactory _scopeFactory,
     AsyncResponseContextPropagation _propagation,
-    ILogger _logger)
+    ILogger _logger,
+    TimeProvider? _timeProvider = null)
 {
     /// <summary>
     /// Loads every recovery registration for <paramref name="correlationId"/> and dispatches a lost
@@ -374,13 +375,18 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // JSON metadata — the callback still fires, just without the diagnostic JSON.
         }
 
+        // Size only, never the JSON itself: these run at Error/Warning in production, and the
+        // payload body is business data (the same rule the ingress applies — no content, not even
+        // a hash). The full JSON still travels on AsyncResponseDomainFailureException.PayloadJson,
+        // which deliberately keeps it out of Exception.Message and therefore out of generic
+        // exception logging.
         if (recoveryState.FailureCallback == null)
         {
-            _logger.LogError("No subscribers for channel {Channel} and the response declined to resume, but no failure callback is available; the response is NOT routed to resume. Payload: {Payload}", channel, payloadJson);
+            _logger.LogError("No subscribers for channel {Channel} and the response declined to resume, but no failure callback is available; the response is NOT routed to resume. Payload: {PayloadLength} UTF-16 code units.", channel, payloadJson?.Length ?? 0);
             return false;
         }
 
-        _logger.LogWarning("No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {Payload}", channel, payloadJson);
+        _logger.LogWarning("No subscribers for channel {Channel}; response declined to resume, invoking failure callback. Payload: {PayloadLength} UTF-16 code units.", channel, payloadJson?.Length ?? 0);
 
         var domainFailure = new AsyncResponseDomainFailureException(
             recoveryState.CorrelationId,
@@ -410,7 +416,8 @@ internal sealed class LostSubscriberCallbackDispatcher(
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
-                CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None,
+                _timeProvider).ConfigureAwait(false);
 
             _logger.LogInformation("Failure callback invoked for channel {Channel}.", channel);
 

@@ -352,6 +352,69 @@ public class RabbitMqTransportTests
     }
 
     [Fact]
+    public async Task WorkerTransport_RecreatesChannelWhenCachedChannelIsClosed()
+    {
+        var first = new FakeRabbitMqChannel();
+        var second = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(first, second);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("c1", 1));
+        // A protocol error (404/406 after an exchange delete/redeclare) closes the channel server-side;
+        // the cached object silently goes dead. The next publish must not use it forever.
+        first.IsOpen = false;
+
+        await transport.PublishAsync(WorkerJob("c2", 2));
+
+        Assert.Equal(2, factory.Connection.CreateChannelCalls);
+        Assert.Equal(1, first.DisposeCalls); // the dead channel is disposed, not leaked
+        Assert.Single(first.Published);
+        Assert.Single(second.Published);
+        Assert.Equal(0, factory.Connection.DisposeCalls); // the still-open connection is reused
+    }
+
+    [Fact]
+    public async Task WorkerTransport_RecreatesConnectionWhenCachedConnectionIsClosed()
+    {
+        var firstChannel = new FakeRabbitMqChannel();
+        var secondChannel = new FakeRabbitMqChannel();
+        var firstConnection = new FakeRabbitMqConnection(firstChannel);
+        var secondConnection = new FakeRabbitMqConnection(secondChannel);
+        var factory = new SequencedConnectionFactory(firstConnection, secondConnection);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await transport.PublishAsync(WorkerJob("c1", 1));
+        // With AutomaticRecoveryEnabled = false a dropped connection stays closed for good and its
+        // cached channel dies with it; both must be replaced, not returned from the cache.
+        firstChannel.IsOpen = false;
+        firstConnection.IsOpen = false;
+
+        await transport.PublishAsync(WorkerJob("c2", 2));
+
+        Assert.Equal(1, firstChannel.DisposeCalls);
+        Assert.Equal(1, firstConnection.DisposeCalls);
+        Assert.Single(secondChannel.Published);
+        Assert.Equal(1, secondConnection.CreateChannelCalls);
+    }
+
+    [Fact]
+    public async Task WorkerTransport_WhenTopologySetupFails_DisposesCreatedChannelAndRecovers()
+    {
+        var first = new FakeRabbitMqChannel { ThrowOnExchangeDeclare = new InvalidOperationException("declare boom") };
+        var second = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(first, second);
+        var transport = new RabbitMqWorkerTransport(Options.Create(new RabbitMqAsyncResponseOptions()), factory);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.PublishAsync(WorkerJob("c1", 1)));
+        Assert.Equal(1, first.DisposeCalls); // the never-cached channel is released, not leaked
+
+        // The transport retries with a fresh channel on the reused connection.
+        await transport.PublishAsync(WorkerJob("c2", 2));
+        Assert.Single(second.Published);
+        Assert.Equal(2, factory.Connection.CreateChannelCalls);
+    }
+
+    [Fact]
     public async Task WorkerTransport_DisposeAsync_SwallowsCloseFailures()
     {
         var channel = new FakeRabbitMqChannel { ThrowOnClose = new InvalidOperationException("channel close boom") };
@@ -758,6 +821,73 @@ public class RabbitMqTransportTests
         Assert.Equal(1, factory.Attempts);
     }
 
+    [Fact]
+    public async Task Subscriber_WhenConsumerTerminatesMidRun_RebuildsSubscription()
+    {
+        var firstChannel = new FakeRabbitMqChannel();
+        var secondChannel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(firstChannel, secondChannel);
+        var logger = new CapturingLogger<RabbitMqWorkerSubscriber>();
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions
+            {
+                WorkerExchange = "worker.ex",
+                WorkerQueue = "worker.q",
+                WorkerRoutingKey = "worker.rk",
+                NetworkRecoveryInterval = TimeSpan.FromMilliseconds(20)
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            logger,
+            factory);
+
+        await using var host = new HostedServiceRun(subscriber);
+        await firstChannel.WaitForConsumerAsync();
+
+        // Broker-side basic.cancel (queue deleted) or channel-level close: deliveries stop while the
+        // host keeps running; nothing throws into the subscriber on its own.
+        firstChannel.TerminateConsumer("the broker canceled the consumer");
+
+        // The retry loop must dispose the dead channel/connection and consume again on a fresh channel.
+        await secondChannel.WaitForConsumerAsync();
+        Assert.Equal(1, firstChannel.DisposeCalls);
+        Assert.True(factory.Connection.DisposeCalls >= 1);
+        Assert.Contains(
+            logger.Snapshot(),
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("worker.q", StringComparison.Ordinal)
+                && entry.Exception?.Message.Contains("stopped receiving", StringComparison.Ordinal) == true);
+    }
+
+    [Fact]
+    public async Task Subscriber_NormalHostStop_ExitsCleanlyWithoutRebuild()
+    {
+        var channel = new FakeRabbitMqChannel();
+        var factory = new FakeConnectionFactory(channel);
+        var subscriber = new RabbitMqWorkerSubscriber(
+            Options.Create(new RabbitMqAsyncResponseOptions
+            {
+                WorkerExchange = "worker.ex",
+                WorkerQueue = "worker.q",
+                WorkerRoutingKey = "worker.rk"
+            }),
+            Mock.Of<IAsyncResponseIngress>(),
+            NullLogger<RabbitMqWorkerSubscriber>.Instance,
+            factory);
+
+        await using (new HostedServiceRun(subscriber))
+        {
+            await channel.WaitForConsumerAsync();
+        }
+
+        // Clean shutdown cancels the consumer, which completes the termination task too (cancel-ok
+        // raises UnregisteredAsync); the stopping-token guard must keep that from causing a rebuild.
+        Assert.Equal("consumer-tag", Assert.Single(channel.Cancels));
+        Assert.Equal(1, channel.ConsumeCalls);
+        Assert.Equal(1, factory.Connection.CreateChannelCalls);
+        Assert.Equal(1, channel.CloseCalls);
+        Assert.Equal(1, factory.Connection.CloseCalls);
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition)
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -829,27 +959,41 @@ public class RabbitMqTransportTests
         }
     }
 
-    private sealed class FakeConnectionFactory(IRabbitMqChannel? channel = null) : IRabbitMqConnectionFactory
+    private sealed class FakeConnectionFactory(params IRabbitMqChannel[] channels) : IRabbitMqConnectionFactory
     {
-        public FakeRabbitMqConnection Connection { get; } = new(channel ?? new FakeRabbitMqChannel());
+        public FakeRabbitMqConnection Connection { get; } =
+            new(channels.Length == 0 ? [new FakeRabbitMqChannel()] : channels);
 
         public Task<IRabbitMqConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
             => Task.FromResult<IRabbitMqConnection>(Connection);
     }
 
-    private sealed class FakeRabbitMqConnection(IRabbitMqChannel channel) : IRabbitMqConnection
+    private sealed class SequencedConnectionFactory(params IRabbitMqConnection[] connections) : IRabbitMqConnectionFactory
     {
+        private int _attempts;
+
+        public Task<IRabbitMqConnection> CreateConnectionAsync(CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref _attempts) - 1, connections.Length - 1);
+            return Task.FromResult(connections[index]);
+        }
+    }
+
+    private sealed class FakeRabbitMqConnection(params IRabbitMqChannel[] channels) : IRabbitMqConnection
+    {
+        public bool IsOpen { get; set; } = true;
         public int CloseCalls { get; private set; }
         public int DisposeCalls { get; private set; }
         public int CreateChannelCalls { get; private set; }
         public bool? PublisherConfirmationsRequested { get; private set; }
         public Exception? ThrowOnClose { get; set; }
 
+        // Sequential channels (last repeats) so channel-recreation tests can hand out a fresh one.
         public Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default)
         {
             CreateChannelCalls++;
             PublisherConfirmationsRequested = publisherConfirmations;
-            return Task.FromResult(channel);
+            return Task.FromResult(channels[Math.Min(CreateChannelCalls - 1, channels.Length - 1)]);
         }
 
         public Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
@@ -870,22 +1014,30 @@ public class RabbitMqTransportTests
     private sealed class FakeRabbitMqChannel : IRabbitMqChannel
     {
         private readonly TaskCompletionSource _consumerReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<string> _terminated = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private Func<RabbitMqDelivery, Task>? _handler;
 
+        public bool IsOpen { get; set; } = true;
         public List<(string Exchange, string Type, bool Durable, bool AutoDelete)> ExchangeDeclares { get; } = [];
         public List<(string Queue, bool Durable, bool Exclusive, bool AutoDelete, IDictionary<string, object?>? Arguments)> QueueDeclares { get; } = [];
         public List<(string Queue, string Exchange, string RoutingKey)> QueueBinds { get; } = [];
         public List<(string Exchange, string RoutingKey, BasicProperties Properties, ReadOnlyMemory<byte> Body)> Published { get; } = [];
         public List<ulong> Acks { get; } = [];
         public List<(ulong DeliveryTag, bool Requeue)> Nacks { get; } = [];
+        public List<string> Cancels { get; } = [];
+        public int ConsumeCalls { get; private set; }
         public ushort PrefetchCount { get; private set; }
         public int CloseCalls { get; private set; }
         public int DisposeCalls { get; private set; }
         public Exception? ThrowOnPublish { get; init; }
         public Exception? ThrowOnClose { get; init; }
+        public Exception? ThrowOnExchangeDeclare { get; init; }
 
         public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         {
+            if (ThrowOnExchangeDeclare is not null)
+                throw ThrowOnExchangeDeclare;
+
             ExchangeDeclares.Add((exchange, type, durable, autoDelete));
             return Task.CompletedTask;
         }
@@ -917,11 +1069,12 @@ public class RabbitMqTransportTests
             return ValueTask.CompletedTask;
         }
 
-        public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
+        public Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
         {
+            ConsumeCalls++;
             _handler = handler;
             _consumerReady.TrySetResult();
-            return Task.FromResult("consumer-tag");
+            return Task.FromResult(new RabbitMqConsumer("consumer-tag", _terminated.Task));
         }
 
         public Task WaitForConsumerAsync() => _consumerReady.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -929,8 +1082,17 @@ public class RabbitMqTransportTests
         public Task DeliverAsync(RabbitMqDelivery delivery)
             => (_handler ?? throw new InvalidOperationException("Consumer was not started."))(delivery);
 
+        /// <summary>Simulates a broker-side basic.cancel or a channel-level close: deliveries stop, no call fails.</summary>
+        public void TerminateConsumer(string reason) => _terminated.TrySetResult(reason);
+
         public Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default)
-            => Task.CompletedTask;
+        {
+            Cancels.Add(consumerTag);
+            // The real adapter completes the termination task on a client cancel too (cancel-ok raises
+            // UnregisteredAsync); mirror that so shutdown tests exercise the stopping-token guard.
+            _terminated.TrySetResult("client-initiated cancel");
+            return Task.CompletedTask;
+        }
 
         public ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default)
         {

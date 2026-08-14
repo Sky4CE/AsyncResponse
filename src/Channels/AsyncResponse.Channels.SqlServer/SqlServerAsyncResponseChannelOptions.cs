@@ -81,6 +81,16 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
     public TimeSpan IdlePollInterval { get; set; } = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// Minimum interval between full safety-net sweeps. A full sweep queries the store once per
+    /// subscribed correlation id, so its idle cost is W queries per poll tick with W in-flight
+    /// waiters. CAUTION on this provider: SQL Server has no push wake, so the poll sweep IS
+    /// cross-process delivery — raising this raises delivery latency for every response published
+    /// from another process, not just lost-wake recovery. Leave null (the default: sweep on every
+    /// poll tick) unless idle database load from many concurrent waiters outweighs that latency.
+    /// </summary>
+    public TimeSpan? FullSweepInterval { get; set; }
+
+    /// <summary>
     /// Number of pending response messages loaded per subscribed correlation id per sweep pass.
     /// Default: 64.
     /// </summary>
@@ -135,6 +145,8 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ActivePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(ActivePollInterval));
         EnsureTimerBacked(IdlePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(IdlePollInterval));
+        if (FullSweepInterval is { } fullSweepInterval)
+            EnsureTimerBacked(fullSweepInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(FullSweepInterval));
         EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
         EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(SqlServerAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 

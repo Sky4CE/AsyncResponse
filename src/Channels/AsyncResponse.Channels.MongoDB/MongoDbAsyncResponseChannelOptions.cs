@@ -91,6 +91,16 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
     public TimeSpan ListenerPollInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
+    /// Minimum interval between full safety-net sweeps. A full sweep queries the store once per
+    /// subscribed correlation id, so its idle cost is W queries per <see cref="ListenerPollInterval"/>
+    /// tick with W in-flight waiters. On this provider the sweep only covers wakes lost in failure
+    /// windows (change streams carry normal delivery), so raising this bounds idle database load
+    /// without touching normal delivery latency — it stretches only the worst-case recovery of a
+    /// LOST wake. Null (the default) sweeps on every poll tick.
+    /// </summary>
+    public TimeSpan? FullSweepInterval { get; set; }
+
+    /// <summary>
     /// Number of pending response messages loaded per subscribed correlation id per dispatch pass.
     /// Default: 64.
     /// </summary>
@@ -154,6 +164,8 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ListenerPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(ListenerPollInterval));
+        if (FullSweepInterval is { } fullSweepInterval)
+            EnsureTimerBacked(fullSweepInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(FullSweepInterval));
         EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
         EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 

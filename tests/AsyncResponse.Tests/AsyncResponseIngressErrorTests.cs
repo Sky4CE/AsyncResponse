@@ -1,3 +1,4 @@
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -245,6 +246,44 @@ public class AsyncResponseIngressErrorTests
         await ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-\ud800");
 
         Assert.Equal(0, rawPublisher.RawJsonCalls);
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_RetryBackoff_RunsOnTheInjectedTimeProvider()
+    {
+        // Regression (review fix): the ingress armed its transient-retry backoff on the system
+        // clock even when the host registered a TimeProvider, so virtual-time tests (and any
+        // deployment steering time) saw the retry fire on real time. Built through DI rather than
+        // the direct-construction helper because the fix under test is precisely that the
+        // library's own registration forwards a registered TimeProvider into the retry.
+        var time = new VirtualTimeProvider();
+        var rawPublisher = new ThrowingRawPublisher(new TimeoutException("store blip"), _failures: 1);
+        var publisher = new RecordingPublisher();
+
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        // Registered BEFORE AddAsyncResponse: the library's TryAdd registrations yield to these.
+        services.AddSingleton<TimeProvider>(time);
+        services.AddSingleton<IRawAsyncResponsePublisher>(rawPublisher);
+        services.AddSingleton<IAsyncResponsePublisher>(publisher);
+        services.AddAsyncResponse();
+        await using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var handling = ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-tp");
+
+        // The first attempt failed and the retry is parked on the VIRTUAL clock: ample real time
+        // passes and the handling must still be pending (the old code's 125-250ms system-clock
+        // backoff would long since have fired and completed it).
+        await Task.Delay(TimeSpan.FromMilliseconds(600));
+        Assert.False(handling.IsCompleted, "the retry backoff ran on the system clock instead of the injected TimeProvider");
+        Assert.Equal(1, rawPublisher.RawJsonCalls);
+
+        time.Advance(TimeSpan.FromSeconds(2));
+        await handling.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(2, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
     }
 
     private static AsyncResponseIngress CreateIngress(

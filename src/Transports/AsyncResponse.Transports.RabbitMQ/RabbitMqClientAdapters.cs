@@ -48,12 +48,16 @@ internal sealed class RabbitMqConnectionFactoryAdapter(
 
 internal interface IRabbitMqConnection : IAsyncDisposable
 {
+    /// <summary>False once the connection is closed for good; with automatic recovery enabled the client object stays open while it reconnects.</summary>
+    bool IsOpen { get; }
     Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default);
     Task CloseAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
 }
 
 internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqConnection
 {
+    public bool IsOpen => inner.IsOpen;
+
     /// <summary>Creates the requested resource.</summary>
     public async Task<IRabbitMqChannel> CreateChannelAsync(bool publisherConfirmations = false, CancellationToken cancellationToken = default)
     {
@@ -77,12 +81,14 @@ internal sealed class RabbitMqConnectionAdapter(IConnection inner) : IRabbitMqCo
 
 internal interface IRabbitMqChannel : IAsyncDisposable
 {
+    /// <summary>False once the channel is closed (a 404/406 protocol error closes it without any callback failing).</summary>
+    bool IsOpen { get; }
     Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default);
     Task QueueDeclareAsync(string queue, bool durable, bool exclusive, bool autoDelete, IDictionary<string, object?>? arguments = null, CancellationToken cancellationToken = default);
     Task QueueBindAsync(string queue, string exchange, string routingKey, CancellationToken cancellationToken = default);
     Task BasicQosAsync(ushort prefetchCount, CancellationToken cancellationToken = default);
     ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default);
-    Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default);
+    Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default);
     Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default);
     ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default);
     ValueTask BasicNackAsync(ulong deliveryTag, bool requeue, CancellationToken cancellationToken = default);
@@ -91,6 +97,8 @@ internal interface IRabbitMqChannel : IAsyncDisposable
 
 internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
 {
+    public bool IsOpen => inner.IsOpen;
+
     /// <summary>Runs the ExchangeDeclareAsync operation.</summary>
     public Task ExchangeDeclareAsync(string exchange, string type, bool durable, bool autoDelete, CancellationToken cancellationToken = default)
         => inner.ExchangeDeclareAsync(exchange, type, durable, autoDelete, cancellationToken: cancellationToken);
@@ -112,7 +120,7 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
         => inner.BasicPublishAsync(exchange, routingKey, mandatory: true, properties, body, cancellationToken);
 
     /// <summary>Runs the BasicConsumeAsync operation.</summary>
-    public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
+    public async Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
     {
         var consumer = new AsyncEventingBasicConsumer(inner);
         consumer.ReceivedAsync += (_, args) =>
@@ -129,7 +137,24 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
             return handler(delivery);
         };
 
-        return inner.BasicConsumeAsync(
+        // Deliveries can stop without any exception reaching the subscriber: a broker-side
+        // basic.cancel (queue deleted) only raises UnregisteredAsync and a channel-level protocol
+        // close only raises ChannelShutdownAsync. Fold both into one termination task the subscriber
+        // can await. A client-initiated BasicCancelAsync completes it too (cancel-ok also raises
+        // UnregisteredAsync); the subscriber filters that out with its stopping token.
+        var terminated = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        consumer.UnregisteredAsync += (_, _) =>
+        {
+            terminated.TrySetResult("the broker canceled the consumer (basic.cancel, typically a deleted queue)");
+            return Task.CompletedTask;
+        };
+        inner.ChannelShutdownAsync += (_, args) =>
+        {
+            terminated.TrySetResult($"the channel shut down ({args.ReplyCode} {args.ReplyText})");
+            return Task.CompletedTask;
+        };
+
+        var consumerTag = await inner.BasicConsumeAsync(
             queue,
             autoAck: false,
             consumerTag: string.Empty,
@@ -137,7 +162,8 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
             exclusive: false,
             arguments: null,
             consumer,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        return new RabbitMqConsumer(consumerTag, terminated.Task);
     }
 
     /// <summary>Runs the BasicCancelAsync operation.</summary>
@@ -159,6 +185,13 @@ internal sealed class RabbitMqChannelAdapter(IChannel inner) : IRabbitMqChannel
     /// <summary>Releases resources held by this instance.</summary>
     public ValueTask DisposeAsync() => inner.DisposeAsync();
 }
+
+/// <summary>
+/// An active consumer subscription. <see cref="Terminated"/> completes (with a reason) when the
+/// broker cancels the consumer or the channel shuts down — cases that stop deliveries forever
+/// without failing any pending call.
+/// </summary>
+internal sealed record RabbitMqConsumer(string ConsumerTag, Task<string> Terminated);
 
 internal sealed record RabbitMqDelivery(
     string ConsumerTag,

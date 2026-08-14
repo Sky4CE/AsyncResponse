@@ -55,11 +55,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// <summary>Jobs accepted but not yet finished (queued + executing). Test-harness idle probe.</summary>
     internal int OutstandingJobs => Volatile.Read(ref _outstanding);
 
-    /// <summary>
-    /// The delayed jobs currently waiting on their due-time timers. AsyncResponse.Testing snapshots
-    /// these before a simulated restart and re-publishes them into the next incarnation — modeling
-    /// a broker that retains scheduled messages across a redeploy.
-    /// </summary>
+    /// <summary>The delayed jobs currently waiting on their due-time timers (test inspection).</summary>
     internal IReadOnlyList<WorkerJobEnvelope> SnapshotDelayedJobs()
     {
         lock (_delayedGate)
@@ -76,6 +72,22 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     }
 
     /// <summary>
+    /// AsyncResponse.Testing only. From this call on, the shutdown drain RETAINS delayed jobs in
+    /// the returned list instead of dropping them, and a delayed publish that arrives while the
+    /// transport is draining (a flow suspending mid-drain) is retained instead of rejected —
+    /// modeling the broker that keeps scheduled messages across a redeploy. A snapshot taken
+    /// before the stop cannot do this: it misses both the drain-time publishes and any job armed
+    /// between the snapshot and the drain. Read the list only after the stop has completed.
+    /// </summary>
+    internal List<WorkerJobEnvelope> BeginRetainingDelayedJobs()
+    {
+        lock (_delayedGate)
+            return _drainRetention ??= [];
+    }
+
+    private List<WorkerJobEnvelope>? _drainRetention;
+
+    /// <summary>
     /// Begins the shutdown drain. Called by <see cref="InMemoryWorkerHost"/> when the host starts
     /// stopping. The writer is deliberately NOT completed while anything is queued or running:
     /// accepted jobs were promised in-process execution, and a draining job may legitimately
@@ -87,7 +99,9 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// for them would hang the host. They are dropped with a warning — the in-memory transport is
     /// process-local by contract, so delayed jobs share the process's lifetime. A durable flow
     /// sleeping on such a wake-up must be resumed explicitly after restart (or use a broker
-    /// transport, whose delayed messages survive).
+    /// transport, whose delayed messages survive). The test harness opts out of the drop via
+    /// <see cref="BeginRetainingDelayedJobs"/> and re-publishes the retained jobs into the next
+    /// incarnation.
     /// </para>
     /// </summary>
     internal void BeginShutdownDrain()
@@ -95,15 +109,23 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         _draining = true;
 
         KeyValuePair<DelayedJob, ITimer>[] pending;
+        List<WorkerJobEnvelope>? retention;
         lock (_delayedGate)
         {
             pending = [.. _delayedJobs];
             _delayedJobs.Clear();
+            retention = _drainRetention;
         }
 
         foreach (var (job, timer) in pending)
         {
             timer.Dispose();
+            if (retention is not null)
+            {
+                retention.Add(job.Envelope);
+                continue;
+            }
+
             DrainLogger?.LogWarning(
                 "Dropping delayed in-memory worker job {Target}.{Method} due at {NotBeforeUtc} at shutdown; in-memory delayed jobs do not survive the process. A durable flow waiting on this wake-up must be resumed explicitly after restart.",
                 job.Envelope.Call.ServiceInterfaceFullName, job.Envelope.Call.MethodName, job.Envelope.NotBeforeUtc);
@@ -186,6 +208,15 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         {
             if (_draining)
             {
+                // Harness restart: a flow suspending mid-drain parks its wake-up with "the
+                // broker" instead of faulting the draining job (and stalling the stop on the
+                // redelivery backoff).
+                if (_drainRetention is { } retained)
+                {
+                    retained.Add(job);
+                    return Task.CompletedTask;
+                }
+
                 // Same contract as the shutdown drain below: delayed in-memory jobs share the
                 // process lifetime, and a publish racing shutdown is dropped loudly, not queued
                 // onto a channel that will complete underneath it.

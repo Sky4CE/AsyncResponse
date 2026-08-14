@@ -15,6 +15,22 @@ internal static class NatsTransportOptionsValidator
             throw new InvalidOperationException($"{nameof(NatsAsyncResponseTransportOptions)}.{name} must be positive when set.");
     }
 
+    private static void ValidateSubjectToken(string? value, string name)
+    {
+        if (!string.IsNullOrWhiteSpace(value) && value.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+    }
+
+    private static void EnsureDistinct(string left, string right, string kind, string leftName, string rightName)
+    {
+        if (StringComparer.Ordinal.Equals(left, right))
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{leftName} and " +
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{rightName} must resolve to distinct {kind}s " +
+                $"(both resolve to '{left}') so worker, response, and dead-letter traffic do not consume each other's messages.");
+    }
+
     /// <summary>Validates the supplied options.</summary>
     public static void ValidateCommon(NatsAsyncResponseTransportOptions options)
     {
@@ -29,6 +45,29 @@ internal static class NatsTransportOptionsValidator
         if (options.SubjectPrefix.IndexOfAny([' ', '\t', '*', '>', '\r', '\n']) >= 0)
             throw new InvalidOperationException(
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{nameof(options.SubjectPrefix)} '{options.SubjectPrefix}' must not contain whitespace or the NATS wildcards '*'/'>'.");
+
+        // An explicitly configured subject must satisfy the same token rules as the prefix-derived
+        // defaults: whitespace or a wildcard fails stream/consumer creation at first use — deep
+        // inside the subscriber retry loop as an opaque broker error retried forever — instead of
+        // as a named startup error here.
+        ValidateSubjectToken(options.WorkerSubject, nameof(options.WorkerSubject));
+        ValidateSubjectToken(options.ResponseSubject, nameof(options.ResponseSubject));
+        ValidateSubjectToken(options.DeadLetterSubject, nameof(options.DeadLetterSubject));
+
+        // Worker, response, and dead-letter traffic must never share a subject or a stream: the
+        // durable consumers are unfiltered, so a shared stream feeds every role every message (and
+        // a dead-letter republish landing back in the worker stream loops poison forever). Compare
+        // the RESOLVED names, as the Redis sibling does: stream defaulting sanitizes every
+        // non-[A-Za-z0-9-_] char to '_', so even distinct subjects ('a.b' vs 'a_b') can collide on
+        // one stream — which EnsureStreamAsync would then silently repoint to whichever role ran
+        // last.
+        var schema = new NatsTransportSubjectSchema(options);
+        EnsureDistinct(schema.WorkerSubject, schema.ResponseSubject, "subject", nameof(options.WorkerSubject), nameof(options.ResponseSubject));
+        EnsureDistinct(schema.WorkerSubject, schema.DeadLetterSubject, "subject", nameof(options.WorkerSubject), nameof(options.DeadLetterSubject));
+        EnsureDistinct(schema.ResponseSubject, schema.DeadLetterSubject, "subject", nameof(options.ResponseSubject), nameof(options.DeadLetterSubject));
+        EnsureDistinct(schema.WorkerStream, schema.ResponseStream, "stream", nameof(options.WorkerStream), nameof(options.ResponseStream));
+        EnsureDistinct(schema.WorkerStream, schema.DeadLetterStream, "stream", nameof(options.WorkerStream), nameof(options.DeadLetterStream));
+        EnsureDistinct(schema.ResponseStream, schema.DeadLetterStream, "stream", nameof(options.ResponseStream), nameof(options.DeadLetterStream));
 
         // AckWait is a server-side JetStream consumer deadline carried as nanoseconds on the wire
         // (persistence bound keeps it representable); the retry delays arm in-process Task.Delay

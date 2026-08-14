@@ -264,6 +264,23 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             if (_created)
                 return;
 
+            // Row-count semantics guard: lease renewal and update fencing treat ExecuteNonQuery's
+            // result as ROWS MATCHED, MySqlConnector's default (UseAffectedRows=false). With
+            // UseAffectedRows=true the result becomes rows CHANGED, so an UPDATE that rewrites
+            // identical values (a renewal landing in the same microsecond as the stored expiry, a
+            // stalled clock) reports 0 and a healthy execution aborts as "lease lost" — sporadic
+            // and unattributable from logs. Every other silently-breaking property (charset,
+            // collation, column shape, keys) fails startup in VerifyFlowTableAsync below; the
+            // connection string gets the same treatment.
+            if (new MySqlConnectionStringBuilder(_options.ConnectionString!).UseAffectedRows)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(MySqlDurableFlowOptions)}.{nameof(MySqlDurableFlowOptions.ConnectionString)} sets UseAffectedRows=true, " +
+                    "which switches ExecuteNonQuery from rows-MATCHED to rows-CHANGED semantics and silently breaks this store's " +
+                    "lease renewal and update fencing. Remove UseAffectedRows from the connection string; the MySqlConnector " +
+                    "default (false) is required.");
+            }
+
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             if (_options.AutoCreateSchema)
             {
@@ -572,12 +589,10 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
 
     private async Task<MySqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
-        // Row-count semantics guard: this store's lease renewal (and update fencing) treats
+        // Row-count semantics: this store's lease renewal (and update fencing) treats
         // ExecuteNonQuery's result as ROWS MATCHED, which is MySqlConnector's default
-        // (UseAffectedRows=false). A connection string with UseAffectedRows=true switches the
-        // result to ROWS CHANGED, and a renewal that lands in the same microsecond as the current
-        // lease expiry would report 0 and abort a healthy execution. Do not set
-        // UseAffectedRows=true on this store's connection string.
+        // (UseAffectedRows=false). EnsureCreatedAsync rejects a connection string that sets
+        // UseAffectedRows=true before any of those UPDATEs can run.
         var connection = new MySqlConnection(_options.ConnectionString);
         try
         {

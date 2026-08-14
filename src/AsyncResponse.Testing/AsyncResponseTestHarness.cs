@@ -198,7 +198,10 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var pendingDelayed = Transport.SnapshotDelayedJobs();
+        // Retention, not a snapshot: the drain moves every pending delayed job into this list and
+        // also captures delayed publishes made BY draining jobs (a flow suspending mid-drain), so
+        // nothing falls between a pre-stop snapshot and the drain — a broker would keep all of it.
+        var pendingDelayed = Transport.BeginRetainingDelayedJobs();
         await StopHostedServicesAsync().ConfigureAwait(false);
         await _provider.DisposeAsync().ConfigureAwait(false);
 
@@ -228,7 +231,13 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
                     ? notBefore - now
                     : TimeSpan.Zero;
                 if (remaining > TimeSpan.Zero)
-                    await transport.PublishAsync(job, remaining).ConfigureAwait(false);
+                {
+                    // Per-hop clamp, as every production publisher applies: NotBeforeUtc rides the
+                    // envelope, so the executor re-delays the remainder on delivery. Unclamped, a
+                    // legal 60-day sleep would throw here and silently lose the rest of the list.
+                    var hop = remaining <= transport.MaxPublishDelay ? remaining : transport.MaxPublishDelay;
+                    await transport.PublishAsync(job, hop).ConfigureAwait(false);
+                }
                 else
                     await ((IWorkerTransport)transport).PublishAsync(job).ConfigureAwait(false);
             }

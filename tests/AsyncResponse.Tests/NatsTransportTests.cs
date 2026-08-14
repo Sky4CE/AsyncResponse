@@ -36,6 +36,55 @@ public class NatsTransportOptionsAndSchemaTests
             new NatsAsyncResponseTransportOptions { AckWait = TimeSpan.Zero }));
 
     [Fact]
+    public void ValidateCommon_Throws_WhenWorkerAndResponseSubjectsResolveToTheSameSubject()
+    {
+        // The durable consumers are unfiltered, so a shared subject feeds worker and response
+        // traffic to BOTH roles; the resolved names must stay distinct.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { WorkerSubject = "app.shared", ResponseSubject = "app.shared" }));
+
+        Assert.Contains("distinct subject", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("app.shared", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateCommon_Throws_WhenDistinctSubjectsSanitizeToTheSameStream()
+    {
+        // Stream defaulting sanitizes every non-[A-Za-z0-9-_] character to '_', so 'a.b' and
+        // 'a_b' are DISTINCT subjects that collide on ONE stream — which EnsureStreamAsync would
+        // then silently repoint to whichever role ran last.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { WorkerSubject = "a.b", ResponseSubject = "a_b" }));
+
+        Assert.Contains("distinct stream", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("app.transport.work>")]
+    [InlineData("app transport worker")]
+    public void ValidateCommon_Throws_ForWildcardOrWhitespaceInExplicitWorkerSubject(string subject)
+    {
+        // An explicitly configured subject must satisfy the same token rules as the derived
+        // defaults: a wildcard or whitespace otherwise fails stream creation deep inside the
+        // subscriber retry loop as an opaque broker error retried forever, not as a named
+        // startup error.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { WorkerSubject = subject }));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.WorkerSubject), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateCommon_Throws_WhenDeadLetterSubjectEqualsTheWorkerSubject()
+    {
+        // A dead-letter republish landing back in the worker stream loops poison forever.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { DeadLetterSubject = "asyncresponse.transport.worker" }));
+
+        Assert.Contains("distinct subject", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void ValidateSubscriber_RequiresBackgroundSettingsForEarlyAck()
     {
         var subscriber = new NatsSubscriberOptions { AckMode = NatsAckMode.AckAfterEnqueue };

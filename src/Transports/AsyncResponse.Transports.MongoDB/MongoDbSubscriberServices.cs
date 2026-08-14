@@ -166,9 +166,15 @@ internal abstract class MongoDbSubscriberService : BackgroundService
 
     private async Task WaitForSignalOrDelayAsync(CancellationToken cancellationToken)
     {
-        var delay = Task.Delay(SubscriberOptions.EmptyPollDelay, cancellationToken);
-        var signal = _signals.Reader.WaitToReadAsync(cancellationToken).AsTask();
+        // The WhenAny loser is cancelled via the per-iteration linked source (mirroring the
+        // channel-side CollectDispatchScopeAsync): an abandoned WaitToReadAsync would otherwise
+        // stay parked in the channel's blocked-reader list until the next signal — one per empty
+        // poll, accumulating without bound on an idle queue.
+        using var iteration = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var delay = Task.Delay(SubscriberOptions.EmptyPollDelay, iteration.Token);
+        var signal = _signals.Reader.WaitToReadAsync(iteration.Token).AsTask();
         var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
+        iteration.Cancel();
         if (completed == signal)
         {
             await signal.ConfigureAwait(false);

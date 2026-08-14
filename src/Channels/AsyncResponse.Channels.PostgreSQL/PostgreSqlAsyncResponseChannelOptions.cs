@@ -71,6 +71,16 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
     public TimeSpan ListenerPollInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
+    /// Minimum interval between full safety-net sweeps. A full sweep queries the store once per
+    /// subscribed correlation id, so its idle cost is W queries per <see cref="ListenerPollInterval"/>
+    /// tick with W in-flight waiters. On this provider the sweep only covers wake notifications
+    /// lost in failure windows (NOTIFY carries normal delivery), so raising this bounds idle
+    /// database load without touching normal delivery latency — it stretches only the worst-case
+    /// recovery of a LOST wake. Null (the default) sweeps on every poll tick.
+    /// </summary>
+    public TimeSpan? FullSweepInterval { get; set; }
+
+    /// <summary>
     /// Number of pending response messages loaded per subscribed correlation id per listener pass.
     /// Default: 64.
     /// </summary>
@@ -122,6 +132,8 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ListenerPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(ListenerPollInterval));
+        if (FullSweepInterval is { } fullSweepInterval)
+            EnsureTimerBacked(fullSweepInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(FullSweepInterval));
         EnsureTimerBacked(SubscriberHeartbeatInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(SubscriberHeartbeatInterval));
         EnsurePersistedTtl(SubscriberHeartbeatTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(SubscriberHeartbeatTimeout));
 

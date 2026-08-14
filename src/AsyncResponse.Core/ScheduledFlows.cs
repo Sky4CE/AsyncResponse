@@ -51,8 +51,11 @@ internal sealed class ScheduledFlowService(
 {
     /// <summary>
     /// Longest single sleep between checks. Chunking keeps every armed delay far under the BCL
-    /// timer ceiling and re-evaluates the schedule hourly, so an OS time-zone-rule update (or a
-    /// suspended laptop clock jump) is honored within an hour instead of after a season.
+    /// timer ceiling and re-reads the clock hourly, so a suspended laptop's clock jump is honored
+    /// within an hour instead of after a season. Time-zone RULES are not re-read while waiting:
+    /// occurrences convert through the <see cref="TimeZoneInfo"/> captured at parse, whose
+    /// adjustment rules are immutable (and the BCL caches OS zone data for the process lifetime),
+    /// so an OS tz-database update only takes effect after a process restart.
     /// </summary>
     private static readonly TimeSpan MaxSleepChunk = TimeSpan.FromHours(1);
 

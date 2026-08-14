@@ -412,42 +412,97 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
-    public async Task Queued_WhenBackgroundQueueIsFull_NacksWithRequeue()
+    public async Task Queued_WhenBackgroundQueueIsFull_PausesDeliveryLoopInsteadOfNacking()
     {
         var channel = new FakeDispatcherChannel();
-        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var calls = 0;
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var dispatcher = RabbitMqMessageDispatcher.Create(
-            async (_, _) =>
-            {
-                if (Interlocked.Increment(ref calls) == 1)
-                {
-                    firstStarted.TrySetResult();
-                    await releaseFirst.Task.ConfigureAwait(false);
-                }
-            },
+            async (_, _) => await gate.Task.ConfigureAwait(false),
             new RabbitMqAsyncResponseOptions(),
             EnqueueSubscriber(workers: 1, capacity: 1),
             NullLogger.Instance,
             "worker.q",
             RabbitMqSubscriberRole.Worker);
 
-        // First delivery is dequeued by the single worker and blocks; it gets ACKed.
+        // The gated worker holds m1; m2 fills the capacity-1 queue; m3 overflows.
         await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
-        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-
-        // Second fills the bounded queue (capacity 1) -> ACK.
         await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
-        // Third cannot be written -> NACK/requeue.
-        await dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
 
+        // The overflow delivery must park the handler — RabbitMQ.Client dispatches a channel's
+        // deliveries sequentially, so this pauses the delivery loop — not NACK: the early ACKs
+        // already returned the prefetch credit, so a NACK would redeliver and spin at network rate.
+        // No ACK either until the delivery is actually enqueued.
+        Assert.False(overflow.IsCompleted);
+        Assert.Empty(channel.Nacks);
         Assert.Equal(new[] { 1UL, 2UL }, channel.Acks);
+
+        gate.TrySetResult();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(channel.Nacks);
+        Assert.Equal(new[] { 1UL, 2UL, 3UL }, channel.Acks); // every delivery ACKed exactly once
+    }
+
+    [Fact]
+    public async Task Queued_DisposeWhileParkedOnFullQueue_RequeuesTheParkedDeliveryOnce()
+    {
+        var channel = new FakeDispatcherChannel();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = (QueuedRabbitMqMessageDispatcher)RabbitMqMessageDispatcher.Create(
+            async (_, _) => await gate.Task.ConfigureAwait(false),
+            new RabbitMqAsyncResponseOptions(),
+            EnqueueSubscriber(workers: 1, capacity: 1),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
+        Assert.False(overflow.IsCompleted);
+
+        // Draining completes the queue writer; the parked write must fall back to one NACK-requeue
+        // (the delivery was never enqueued or ACKed) instead of throwing into the delivery callback.
+        var disposing = dispatcher.DisposeAsync().AsTask();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(5));
+        gate.TrySetResult();
+        await disposing.WaitAsync(TimeSpan.FromSeconds(5));
+
         var nack = Assert.Single(channel.Nacks);
         Assert.Equal(3UL, nack.DeliveryTag);
         Assert.True(nack.Requeue);
+        Assert.Equal(new[] { 1UL, 2UL }, channel.Acks);
+        Assert.Equal(0, dispatcher.PendingCount); // the failed write refunded its pending slot
+    }
 
-        releaseFirst.TrySetResult();
+    [Fact]
+    public async Task Queued_DisposeWhileParkedOnFullQueue_ClosedChannel_DoesNotNack()
+    {
+        var channel = new FakeDispatcherChannel();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = (QueuedRabbitMqMessageDispatcher)RabbitMqMessageDispatcher.Create(
+            async (_, _) => await gate.Task.ConfigureAwait(false),
+            new RabbitMqAsyncResponseOptions(),
+            EnqueueSubscriber(workers: 1, capacity: 1),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("m1", deliveryTag: 1), channel, CancellationToken.None);
+        await dispatcher.HandleAsync(Delivery("m2", deliveryTag: 2), channel, CancellationToken.None);
+        var overflow = dispatcher.HandleAsync(Delivery("m3", deliveryTag: 3), channel, CancellationToken.None);
+        Assert.False(overflow.IsCompleted);
+
+        // A closed channel already returned the un-ACKed delivery to the broker; NACKing would throw.
+        channel.IsOpen = false;
+        var disposing = dispatcher.DisposeAsync().AsTask();
+        await overflow.WaitAsync(TimeSpan.FromSeconds(5));
+        gate.TrySetResult();
+        await disposing.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Empty(channel.Nacks);
+        Assert.Equal(0, dispatcher.PendingCount);
     }
 
     [Fact]
@@ -736,6 +791,7 @@ public class RabbitMqDispatcherTests
 
     private sealed class FakeDispatcherChannel : IRabbitMqChannel
     {
+        public bool IsOpen { get; set; } = true;
         public List<ulong> Acks { get; } = [];
         public List<(ulong DeliveryTag, bool Requeue)> Nacks { get; } = [];
         public Exception? ThrowOnAck { get; init; }
@@ -772,8 +828,8 @@ public class RabbitMqDispatcherTests
         public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
             => ValueTask.CompletedTask;
 
-        public Task<string> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
-            => Task.FromResult("consumer-tag");
+        public Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
+            => Task.FromResult(new RabbitMqConsumer("consumer-tag", new TaskCompletionSource<string>().Task));
 
         public Task BasicCancelAsync(string consumerTag, CancellationToken cancellationToken = default)
             => Task.CompletedTask;

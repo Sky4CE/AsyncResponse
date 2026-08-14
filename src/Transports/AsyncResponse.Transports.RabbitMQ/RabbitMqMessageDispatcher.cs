@@ -363,15 +363,30 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         Interlocked.Increment(ref _pendingCount);
         if (!_queue.Writer.TryWrite(delivery))
         {
-            Interlocked.Decrement(ref _pendingCount);
-            Logger.LogWarning(
-                "RabbitMQ background queue rejected delivery {DeliveryTag} for {Queue}; returning NACK. Pending={PendingCount}, Running={RunningCount}.",
-                delivery.DeliveryTag,
+            // Saturated: wait for a worker to free a slot instead of NACKing. The early ACK below has
+            // already released the prefetch credit, so QoS cannot bound a NACK/redeliver cycle — the
+            // broker would redeliver within ~1 RTT and spin at network rate. RabbitMQ.Client dispatches
+            // a channel's deliveries sequentially, so blocking here pauses this channel's delivery
+            // loop, which is the actual backpressure (mirrors the Kafka pause and the NATS wait).
+            Logger.LogDebug(
+                "RabbitMQ background queue for {Queue} is full; pausing the delivery loop until capacity frees. Pending={PendingCount}, Running={RunningCount}.",
                 _queueName,
                 PendingCount,
                 RunningCount);
-            await channel.BasicNackAsync(delivery.DeliveryTag, requeue: true, subscriberCancellationToken).ConfigureAwait(false);
-            return;
+            try
+            {
+                await _queue.Writer.WriteAsync(delivery, subscriberCancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
+            {
+                // Subscriber stopping or dispatcher draining while parked: the delivery was never
+                // enqueued (and never ACKed), so hand it back to the broker — one NACK, not a spin.
+                // A closed channel requeues the un-ACKed delivery on its own; never throw from here,
+                // this runs inside the client's delivery callback.
+                Interlocked.Decrement(ref _pendingCount);
+                await TryRequeueAsync(delivery, channel).ConfigureAwait(false);
+                return;
+            }
         }
 
         // The delivery now belongs to a background worker, which decrements _pendingCount when it dequeues.
@@ -386,6 +401,26 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
             Logger.LogError(
                 ex,
                 "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after enqueue; it is being processed but the broker will redeliver it when the channel closes.",
+                delivery.DeliveryTag,
+                _queueName);
+        }
+    }
+
+    private async ValueTask TryRequeueAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel)
+    {
+        // A closed channel already returned every un-ACKed delivery to the queue; NACKing it would throw.
+        if (!channel.IsOpen)
+            return;
+
+        try
+        {
+            await channel.BasicNackAsync(delivery.DeliveryTag, requeue: true, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(
+                ex,
+                "Failed to NACK delivery {DeliveryTag} for {Queue} during shutdown; the broker requeues it when the channel closes.",
                 delivery.DeliveryTag,
                 _queueName);
         }

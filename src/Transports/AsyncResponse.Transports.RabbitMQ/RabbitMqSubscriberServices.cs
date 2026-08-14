@@ -73,11 +73,12 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             }
             catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
+                // Covers failed startup and a mid-run consumer/channel termination alike.
                 // Strictly positive and timer-bounded by validation — usable directly.
                 var retryDelay = Options.NetworkRecoveryInterval;
                 Logger.LogWarning(
                     ex,
-                    "RabbitMQ subscriber could not start for queue {Queue} ({Role}); retrying in {RetryDelay}.",
+                    "RabbitMQ subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
                     queue,
                     SubscriberRole,
                     retryDelay);
@@ -107,22 +108,37 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             SubscriberRole,
             SubscriberOptions.AckMode);
 
-        var consumerTag = await channel.BasicConsumeAsync(
+        var consumer = await channel.BasicConsumeAsync(
             queue,
             delivery => dispatcher.HandleAsync(delivery, channel, stoppingToken),
             stoppingToken).ConfigureAwait(false);
 
-        try
+        // Park until host shutdown or consumer termination. The termination task is the only signal
+        // that deliveries stopped (broker-side basic.cancel and channel-level closes raise no
+        // exception here), so parking on the stopping token alone would keep a dead subscription
+        // alive forever. A registration-fed TCS instead of an infinite Task.Delay: a faulted
+        // iteration must not leak one timer + token registration per rebuild.
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using (stoppingToken.Register(() => stopped.TrySetResult()))
         {
-            await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken).ConfigureAwait(false);
+            var first = await Task.WhenAny(consumer.Terminated, stopped.Task).ConfigureAwait(false);
+
+            // A client-initiated cancel during shutdown also completes Terminated (cancel-ok raises
+            // UnregisteredAsync), so termination is a failure only while the host is still running.
+            // Throwing hands control to the ExecuteAsync retry loop, which disposes this
+            // connection/channel (via await using) and rebuilds both plus the consumer after backoff.
+            if (first == consumer.Terminated && !stoppingToken.IsCancellationRequested)
+            {
+                var reason = await consumer.Terminated.ConfigureAwait(false);
+                throw new InvalidOperationException(
+                    $"RabbitMQ consumer for queue '{queue}' ({SubscriberRole}) stopped receiving: {reason}.");
+            }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-            using var shutdown = new CancellationTokenSource(Options.ShutdownTimeout);
-            await channel.BasicCancelAsync(consumerTag, shutdown.Token).ConfigureAwait(false);
-            await channel.CloseAsync(shutdown.Token).ConfigureAwait(false);
-            await connection.CloseAsync(Options.ShutdownTimeout, shutdown.Token).ConfigureAwait(false);
-        }
+
+        using var shutdown = new CancellationTokenSource(Options.ShutdownTimeout);
+        await channel.BasicCancelAsync(consumer.ConsumerTag, shutdown.Token).ConfigureAwait(false);
+        await channel.CloseAsync(shutdown.Token).ConfigureAwait(false);
+        await connection.CloseAsync(Options.ShutdownTimeout, shutdown.Token).ConfigureAwait(false);
     }
 }
 

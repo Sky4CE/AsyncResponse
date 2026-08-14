@@ -73,6 +73,29 @@ public sealed class RelationalDurableFlowFailureTests
     }
 
     [Fact]
+    public async Task MySqlStore_RejectsUseAffectedRowsConnectionString_BeforeOpeningAConnection()
+    {
+        // Regression (review fix): UseAffectedRows=true switches ExecuteNonQuery from rows-MATCHED
+        // to rows-CHANGED semantics, silently breaking lease renewal and update fencing. The store
+        // must reject the connection STRING before opening any connection — the old code surfaced
+        // an unrelated connection failure from the unreachable endpoint instead.
+        var store = new MySqlFlowStateStore(Options.Create(new MySqlDurableFlowOptions
+        {
+            ConnectionString = "Server=127.0.0.1;Port=9;Database=x;Uid=u;Pwd=p;UseAffectedRows=true;Connection Timeout=1",
+            AutoCreateSchema = false
+        }));
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("flow"));
+        stopwatch.Stop();
+
+        Assert.Contains("UseAffectedRows", ex.Message, StringComparison.Ordinal);
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(2),
+            $"the guard took {stopwatch.Elapsed}; it must fail from the connection string alone, without a connection attempt");
+    }
+
+    [Fact]
     public async Task OracleStore_RechecksCreatedStateAfterWaitingForSchemaGate()
     {
         var store = new OracleFlowStateStore(Options.Create(new OracleDurableFlowOptions

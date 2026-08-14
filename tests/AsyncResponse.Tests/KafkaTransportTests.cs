@@ -401,8 +401,20 @@ public class KafkaTransportTests
             { options => options.TopicNumPartitions = 0, nameof(KafkaAsyncResponseTransportOptions.TopicNumPartitions) },
             { options => options.TopicNumPartitions = -2, nameof(KafkaAsyncResponseTransportOptions.TopicNumPartitions) },
             { options => options.TopicReplicationFactor = 0, nameof(KafkaAsyncResponseTransportOptions.TopicReplicationFactor) },
-            { options => options.HostShutdownTimeout = TimeSpan.Zero, nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout) }
+            { options => options.HostShutdownTimeout = TimeSpan.Zero, nameof(KafkaAsyncResponseTransportOptions.HostShutdownTimeout) },
+            // Worker and response subscribers run distinct consumer groups, so a shared topic
+            // feeds every message to BOTH roles — explicit collisions and an explicit name that
+            // lands on the OTHER role's derived default must fail on the RESOLVED names.
+            { options => { options.WorkerTopic = "shared-topic"; options.ResponseTopic = "shared-topic"; }, "must resolve to distinct topics" },
+            { options => options.WorkerTopic = "asyncresponse.transport.response", "must resolve to distinct topics" },
+            // A dead-letter topic aimed at a LIVE transport topic re-feeds poison to a subscriber.
+            { options => options.DeadLetterTopic = "asyncresponse.transport.worker", "live transport topic" },
+            { options => options.DeadLetterTopic = "asyncresponse.transport.response", "live transport topic" }
         };
+
+    [Fact]
+    public void ValidateCommon_Passes_ForDefaults()
+        => KafkaTransportOptionsValidator.ValidateCommon(KafkaTestData.NewOptions());
 
     [Fact]
     public void ValidateCommon_DeadLetterDisabled_AllowsEmptySuffix()

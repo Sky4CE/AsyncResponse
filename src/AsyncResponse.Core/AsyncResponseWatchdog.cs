@@ -430,6 +430,14 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         {
             return await _subscriberProbe.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Shutdown must abort the scan here, not degrade to -1: swallowed, a canceled probe
+            // would let the loop grind through every remaining entry (throw/catch per id, delaying
+            // shutdown) and then publish a snapshot attesting a completed scan whose liveness was
+            // never probed. ExecuteAsync catches this as its stop signal.
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Recovery watchdog failed to probe subscribers for correlationId {CorrelationId}.", correlationId);

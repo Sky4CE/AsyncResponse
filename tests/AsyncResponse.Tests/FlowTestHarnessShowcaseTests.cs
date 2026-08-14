@@ -81,6 +81,37 @@ public sealed class TenantOnboardingFlow(IProvisioningClient _client, StepRecord
     }
 }
 
+public sealed record DrainSuspendInput(long Id);
+
+/// <summary>
+/// Gates mid-execution so a test can force its durable-timer suspend to happen while the OLD
+/// harness incarnation is draining: the wake-up is then published into a stopping transport,
+/// exactly the window <c>SimulateRestartAsync</c>'s drain retention exists for.
+/// </summary>
+public sealed class DrainSuspendFlow : IDurableFlow<DrainSuspendInput>
+{
+    public static TaskCompletionSource EnteredExecution = NewSource();
+    public static TaskCompletionSource ReleaseToSuspend = NewSource();
+
+    public static TaskCompletionSource NewSource() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task ExecuteAsync(IDurableFlowContext flow, DrainSuspendInput input)
+    {
+        EnteredExecution.TrySetResult();
+        await ReleaseToSuspend.Task.ConfigureAwait(false);
+        await flow.DelayAsync("two-day-settle", TimeSpan.FromDays(2));
+    }
+}
+
+public sealed record LongSettleInput(long Id);
+
+/// <summary>A flow whose single durable timer exceeds the in-memory transport's ~49.7-day per-hop ceiling.</summary>
+public sealed class SixtyDaySettleFlow : IDurableFlow<LongSettleInput>
+{
+    public async Task ExecuteAsync(IDurableFlowContext flow, LongSettleInput input)
+        => await flow.DelayAsync("sixty-day-settle", TimeSpan.FromDays(60));
+}
+
 public class FlowTestHarnessShowcaseTests
 {
     private static async Task<(FlowTestHarness Harness, RecordingProvisioningClient Client, StepRecorder Recorder)> StartAsync()
@@ -230,6 +261,60 @@ public class FlowTestHarnessShowcaseTests
         Assert.Equal(1, recorder.Entries.Count(e => e.StartsWith("welcome:", StringComparison.Ordinal)));
         Assert.Equal(1, client.Calls.Count(c => c == "migrate:21"));
         Assert.True(client.Calls.Count(c => c == "import:21") >= 1);
+    }
+
+    [Fact]
+    public async Task SimulateRestart_RetainsDelayedWakeUpPublishedWhileTheOldIncarnationDrains()
+    {
+        // Regression (review fix): SimulateRestartAsync used to SNAPSHOT delayed jobs before the
+        // stop, so a flow suspending while the old incarnation drained published its wake-up into
+        // a transport that rejected it — the flow slept forever and the restart lost the timer.
+        // The drain now RETAINS delayed jobs, including delayed publishes made mid-drain.
+        DrainSuspendFlow.EnteredExecution = DrainSuspendFlow.NewSource();
+        DrainSuspendFlow.ReleaseToSuspend = DrainSuspendFlow.NewSource();
+        var harness = await FlowTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<DrainSuspendFlow, DrainSuspendInput>());
+        await using var _ = harness;
+
+        var run = await harness.StartFlowAsync<DrainSuspendFlow, DrainSuspendInput>(new DrainSuspendInput(1));
+        await DrainSuspendFlow.EnteredExecution.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The restart starts draining with the flow still executing; the gate release lands while
+        // the drain waits for it, so the flow's suspend publishes its 2-day wake mid-drain.
+        var restart = harness.Engine.SimulateRestartAsync();
+        var release = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(130));
+            DrainSuspendFlow.ReleaseToSuspend.TrySetResult();
+        });
+        await restart;
+        await release;
+
+        await harness.AdvanceAsync(TimeSpan.FromDays(2) + TimeSpan.FromMinutes(1));
+
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Fact]
+    public async Task SimulateRestart_ClampsRetainedWakeUpsBeyondTheTransportMaxDelay()
+    {
+        // Regression (review fix): a retained wake-up with more than ~49.7 days remaining used to
+        // be republished unclamped, throwing ArgumentOutOfRangeException out of the restart (and
+        // silently losing the rest of the retained list). The republish must clamp each hop to the
+        // transport's MaxPublishDelay — NotBeforeUtc rides the envelope, so the executor re-delays
+        // the remainder on delivery, exactly as every production publisher chains long sleeps.
+        var harness = await FlowTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<SixtyDaySettleFlow, LongSettleInput>());
+        await using var _ = harness;
+
+        var run = await harness.StartFlowAsync<SixtyDaySettleFlow, LongSettleInput>(new LongSettleInput(2));
+        await run.WaitForTimerStepAsync("sixty-day-settle");
+        await harness.Engine.WaitForWorkerIdleAsync();
+
+        await harness.Engine.SimulateRestartAsync();
+
+        await harness.AdvanceAsync(TimeSpan.FromDays(60) + TimeSpan.FromMinutes(1));
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
     }
 
     [Fact]

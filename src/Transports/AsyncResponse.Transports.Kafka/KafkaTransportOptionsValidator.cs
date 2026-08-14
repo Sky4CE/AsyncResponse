@@ -27,6 +27,18 @@ internal static class KafkaTransportOptionsValidator
                 "(the Kafka client passes it to librdkafka as a 32-bit millisecond value).");
     }
 
+    private static void EnsureDeadLetterNotLive(string deadLetterTopic, KafkaTransportTopicSchema topics)
+    {
+        if (StringComparer.Ordinal.Equals(deadLetterTopic, topics.WorkerTopic) ||
+            StringComparer.Ordinal.Equals(deadLetterTopic, topics.ResponseTopic))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(KafkaAsyncResponseTransportOptions.DeadLetterTopic)} resolves to " +
+                $"'{deadLetterTopic}', which is a live transport topic; dead-lettered messages republished into a consumed topic " +
+                "are re-consumed instead of parked.");
+        }
+    }
+
     /// <summary>Validates the supplied options.</summary>
     public static void ValidateCommon(KafkaAsyncResponseTransportOptions options)
     {
@@ -39,6 +51,31 @@ internal static class KafkaTransportOptionsValidator
 
         if (options.DeadLetterEnabled && string.IsNullOrWhiteSpace(options.DeadLetterTopic))
             _ = Required(options.DeadLetterTopicSuffix, nameof(options.DeadLetterTopicSuffix));
+
+        // Worker and response subscribers run distinct consumer groups, so a shared topic feeds
+        // every message to BOTH: job envelopes complete real waiters through the response ingress
+        // (the correlation-id header is stamped and trusted) while responses churn through the
+        // worker dispatcher into the dead-letter topic. Compare the RESOLVED names, as the
+        // queue-based siblings do, so an explicit value colliding with the other role's derived
+        // default is caught too.
+        var topics = new KafkaTransportTopicSchema(options);
+        if (StringComparer.Ordinal.Equals(topics.WorkerTopic, topics.ResponseTopic))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.WorkerTopic)} and " +
+                $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.ResponseTopic)} must resolve to distinct topics " +
+                $"(both resolve to '{topics.WorkerTopic}') so worker and response subscribers do not consume each other's messages.");
+        }
+
+        if (options.DeadLetterEnabled)
+        {
+            // A dead-letter topic aimed at a LIVE transport topic re-feeds poison to a subscriber:
+            // its own source topic loops the message forever, the other role's topic cross-routes
+            // it. Derived names ({source}{suffix}) cannot collide with their source, but an
+            // explicit DeadLetterTopic can.
+            EnsureDeadLetterNotLive(topics.DeadLetterTopicFor(topics.WorkerTopic), topics);
+            EnsureDeadLetterNotLive(topics.DeadLetterTopicFor(topics.ResponseTopic), topics);
+        }
 
         if (options.OffsetCommitInterval <= TimeSpan.Zero || options.OffsetCommitInterval > MaxOffsetCommitInterval)
             throw new InvalidOperationException(

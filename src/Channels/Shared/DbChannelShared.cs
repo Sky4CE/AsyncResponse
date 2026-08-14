@@ -763,6 +763,11 @@ internal abstract class DbAsyncResponseChannelBase :
     /// scans only the signaled correlation ids, so a flood of wake signals never forces a scan of
     /// every waiter.
     /// </summary>
+    /// <summary>Returned for a poll tick whose full sweep is not yet due: scan nothing. Never mutated.</summary>
+    private static readonly HashSet<string> EmptyDispatchScope = [];
+
+    private DateTimeOffset _lastFullSweepUtc;
+
     private protected async Task<HashSet<string>?> CollectDispatchScopeAsync(CancellationToken cancellationToken)
     {
         // The WhenAny loser is cancelled via the per-iteration linked source: an abandoned
@@ -774,7 +779,21 @@ internal abstract class DbAsyncResponseChannelBase :
         var completed = await Task.WhenAny(delay, signal).ConfigureAwait(false);
         iteration.Cancel();
         if (completed == delay)
+        {
+            // The timer sweep costs one store query per subscribed correlation id, so with W
+            // waiters an idle channel pays W queries per poll tick. FullSweepInterval bounds that:
+            // a tick whose sweep is not yet due scans nothing (signaled scans are unaffected —
+            // they arrive through the signal branch below with their own scope).
+            if (_options.FullSweepInterval is { } fullSweepInterval)
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (now - _lastFullSweepUtc < fullSweepInterval)
+                    return EmptyDispatchScope;
+                _lastFullSweepUtc = now;
+            }
+
             return null;
+        }
 
         await signal.ConfigureAwait(false);
 
@@ -788,7 +807,15 @@ internal abstract class DbAsyncResponseChannelBase :
                 scope.Add(correlationId);
         }
 
-        return fullSweep || scope.Count == 0 ? null : scope;
+        if (fullSweep || scope.Count == 0)
+        {
+            // A signal-driven full sweep does the timer sweep's work; stamping it defers the next
+            // timer sweep by a full interval instead of re-scanning everything twice in a row.
+            _lastFullSweepUtc = DateTimeOffset.UtcNow;
+            return null;
+        }
+
+        return scope;
     }
 
     private protected async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)

@@ -133,6 +133,47 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// FullSweepInterval gates the timer-driven safety-net sweep (which costs one store query per
+    /// subscribed correlation id per tick): the first poll tick sweeps and stamps, a second tick
+    /// inside the interval scans NOTHING (a non-null empty scope), and a targeted signal still
+    /// flows during the suppression window.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task CollectDispatchScope_SuppressesPollSweepsInsideFullSweepInterval(Provider provider)
+    {
+        await using var harness = Harness.Create(
+            provider, failing: false, pollInterval: TimeSpan.FromMilliseconds(20), fullSweepInterval: TimeSpan.FromMinutes(10));
+
+        // First delay-win: no sweep has run yet — full sweep (null scope), stamping the interval.
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+
+        // Second delay-win, milliseconds later: the 10-minute sweep is not due — scan nothing.
+        var suppressed = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
+        Assert.Empty(suppressed);
+
+        // Signalled scans are unaffected by the gate: a targeted id still dispatches on its signal.
+        harness.Invoke("SignalDispatcher", "corr-signal");
+        var targeted = Assert.IsType<HashSet<string>>(await harness.CollectDispatchScopeAsync());
+        Assert.Single(targeted, "corr-signal");
+    }
+
+    /// <summary>Null (the default) keeps the pre-option behavior: every poll tick is a full sweep.</summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task CollectDispatchScope_NullFullSweepInterval_SweepsOnEveryPollTick(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: false, pollInterval: TimeSpan.FromMilliseconds(20));
+
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+        Assert.Null(await harness.CollectDispatchScopeAsync());
+    }
+
+    /// <summary>
     /// The heartbeat round's compensation: a registration dropped (or removed) after the round's
     /// snapshot was taken gets a compensating subscriber delete — the round's upsert may have
     /// resurrected the row the cleanup had just deleted, which would count a phantom live waiter
@@ -433,7 +474,7 @@ public sealed class DbChannelSharedCoverageTests
         /// <summary>Mongo harness only: the subscribers-collection mock, for heartbeat fault injection.</summary>
         public Mock<IMongoCollection<MongoChannelSubscriberDocument>>? MongoSubscribers { get; private set; }
 
-        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval)
+        public static Harness Create(Provider provider, bool failing, TimeSpan pollInterval, TimeSpan? fullSweepInterval = null)
         {
             var logger = new CollectingLogger();
             var recoveryState = new Mock<IRecoveryStateStore>();
@@ -461,6 +502,7 @@ public sealed class DbChannelSharedCoverageTests
                         AutoCreateSchema = false,
                         ActivePollInterval = pollInterval,
                         IdlePollInterval = pollInterval,
+                        FullSweepInterval = fullSweepInterval,
                         SubscriberHeartbeatInterval = heartbeat,
                         SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(5),
                         DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
@@ -491,6 +533,7 @@ public sealed class DbChannelSharedCoverageTests
                     {
                         AutoCreateSchema = false,
                         ListenerPollInterval = pollInterval,
+                        FullSweepInterval = fullSweepInterval,
                         SubscriberHeartbeatInterval = heartbeat,
                         SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(5),
                         DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
@@ -524,6 +567,7 @@ public sealed class DbChannelSharedCoverageTests
                         UseOwnershipLedger = false,
                         UseChangeStreams = false,
                         ListenerPollInterval = pollInterval,
+                        FullSweepInterval = fullSweepInterval,
                         SubscriberHeartbeatInterval = heartbeat,
                         SubscriberHeartbeatTimeout = TimeSpan.FromSeconds(5),
                         DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),

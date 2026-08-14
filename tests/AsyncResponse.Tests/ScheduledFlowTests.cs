@@ -170,6 +170,36 @@ public class ScheduledFlowTests
     }
 
     [Fact]
+    public async Task ClockJumpAcrossManySleepChunks_StartsTheJumpedOccurrenceExactlyOnce()
+    {
+        var recorder = new StepRecorder();
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.StartTime = new DateTimeOffset(2030, 1, 1, 0, 30, 0, TimeSpan.Zero);
+            options.ConfigureServices = services => services.AddSingleton(recorder);
+            options.ConfigureAsyncResponse = builder => builder.WithScheduledFlow<NightlyReportFlow, ReportInput>(
+                "nightly-report",
+                "0 6 * * *",
+                occurrence => new ReportInput(occurrence));
+        });
+
+        // The 06:00 occurrence sits ~5.5 hours out — far beyond MaxSleepChunk (1h), so the loop
+        // can only ever arm hourly sleeps toward it. Jump the clock past the occurrence in ONE
+        // advance (the suspended-laptop shape MaxSleepChunk documents: the loop re-reads the
+        // clock per chunk, so a jump is honored within an hour, not after a season). The chunked
+        // timers must cascade to the occurrence within this single advance — a loop that armed
+        // the full 5.5h sleep once, or re-derived it from a stale "now", would still be asleep.
+        await harness.AdvanceAsync(TimeSpan.FromHours(5) + TimeSpan.FromMinutes(31));
+
+        var run = harness.Attach("sched:nightly-report:20300101T060000Z");
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+
+        // Exactly once: the jumped occurrence itself, and no burst of anything else — the
+        // missed-successor skip policy is unchanged by the chunk cascade.
+        Assert.Equal(["report:20300101T0600"], recorder.Entries);
+    }
+
+    [Fact]
     public async Task InputFactoryThrowingInvalidOperation_IsAFailedStart_NotAReportedDuplicate()
     {
         var logger = new CapturingLogger<ScheduledFlowService>();

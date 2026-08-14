@@ -12,7 +12,8 @@ internal sealed class AsyncResponseIngress(
     IAsyncResponsePublisher _publisher,
     WorkerJobExecutor _workerJobExecutor,
     AsyncResponseContextPropagation _propagation,
-    ILogger<AsyncResponseIngress> _logger) : IAsyncResponseIngress
+    ILogger<AsyncResponseIngress> _logger,
+    TimeProvider? _timeProvider = null) : IAsyncResponseIngress
 {
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
@@ -73,7 +74,8 @@ internal sealed class AsyncResponseIngress(
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
-                CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None,
+                _timeProvider).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

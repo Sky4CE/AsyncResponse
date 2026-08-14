@@ -183,6 +183,55 @@ public class AsyncResponseWatchdogLoopTests
 
 
     [Fact]
+    public async Task CanceledProbe_AbortsTheScan_WithoutPublishingASnapshot()
+    {
+        // Regression (review fix): a probe canceled by shutdown used to be swallowed into the
+        // generic -1 (unknown) fallback, so the scan ground through every remaining entry
+        // (throw/catch per id, delaying shutdown) and then published a snapshot attesting a
+        // completed pass whose liveness was never probed. The cancellation must abort the pass.
+        var state = new AsyncResponseWatchdogState();
+        var entries = Enumerable.Range(0, 50).Select(i => StaleEntry($"cid-{i:D2}")).ToArray();
+        var probe = new CancellationObservingProbe();
+        var watchdog = Build(state, Options(enabled: true), new FakeScanner(entries), probe);
+
+        await watchdog.StartAsync(CancellationToken.None);
+        try
+        {
+            await probe.ThirdCallReached.Task.WaitAsync(PublishTimeout);
+        }
+        finally
+        {
+            // Cancels the scan token while the third probe call is parked on it; that call then
+            // surfaces OperationCanceledException exactly as a canceled store client would.
+            await watchdog.StopAsync(CancellationToken.None);
+        }
+
+        Assert.True(probe.Calls <= 5, $"expected the canceled probe to abort the scan, but {probe.Calls} of the 50 entries were probed");
+        Assert.Null(state.Latest);
+    }
+
+    private sealed class CancellationObservingProbe : IActiveSubscriberProbe
+    {
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
+
+        public TaskCompletionSource ThirdCallReached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _calls) < 3)
+                return 0;
+
+            ThirdCallReached.TrySetResult();
+            // Parks until StopAsync cancels the scan token; the resulting TaskCanceledException
+            // is an OperationCanceledException carrying that token.
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+    }
+
+    [Fact]
     public async Task MissingSubscriberProbe_TreatsLivenessAsUnknown()
     {
         var state = new AsyncResponseWatchdogState();

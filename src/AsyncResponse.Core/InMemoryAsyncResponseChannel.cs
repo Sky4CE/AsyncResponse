@@ -45,7 +45,7 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         _propagation = propagation;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
     }
 
     /// <inheritdoc />
