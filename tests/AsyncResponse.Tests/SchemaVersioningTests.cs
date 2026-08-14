@@ -60,6 +60,100 @@ public class SchemaVersioningTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(job));
     }
 
+    [Theory]
+    [InlineData("cid ")]
+    [InlineData(" cid")]
+    [InlineData("looooong")]
+    // "surrogate" is a shape, not a literal: xUnit's theory-argument serialization would replace
+    // an unpaired surrogate with U+FFFD before the test ever saw it.
+    [InlineData("surrogate")]
+    public async Task WorkerJobExecutor_RejectsANonPortableCorrelationId_BeforeRunningTheHandler(string correlationId)
+    {
+        // A correlation id arriving over a broker gets the same contract as one handed to a
+        // publisher, and it has to be checked HERE — before the handler runs. Otherwise the job
+        // executes, its implicit response publish throws on the id, the transport redelivers, and
+        // the handler's side effects happen again on every attempt until the job dead-letters.
+        // Rejecting first turns that into an ordinary poison message.
+        correlationId = correlationId switch
+        {
+            "looooong" => new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength + 1),
+            "surrogate" => "cid-\ud800",
+            _ => correlationId
+        };
+
+        var probe = new HandlerProbe();
+        var services = new ServiceCollection();
+        services.AddSingleton(probe);
+        services.AddSingleton<IProbeService>(probe);
+        await using var provider = services.BuildServiceProvider();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+
+        var job = new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IProbeService).FullName!,
+                MethodName = nameof(IProbeService.RunAsync),
+                Params = []
+            },
+            CorrelationId = correlationId
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(job));
+        Assert.Equal(0, probe.Invocations);
+    }
+
+    [Theory]
+    // null: a fire-and-forget job, which has no response to publish.
+    [InlineData(null)]
+    // ...and an ordinary, perfectly valid id, which is the false-positive guard: the new check must
+    // reject only ids that break the contract, not every job that carries one.
+    [InlineData("cid-ok")]
+    public async Task WorkerJobExecutor_StillRunsAJobWhoseCorrelationIdIsFine(string? correlationId)
+    {
+        var probe = new HandlerProbe();
+        var services = new ServiceCollection();
+        services.AddSingleton(probe);
+        services.AddSingleton<IProbeService>(probe);
+        await using var provider = services.BuildServiceProvider();
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+
+        await executor.ExecuteAsync(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IProbeService).FullName!,
+                MethodName = nameof(IProbeService.RunAsync),
+                Params = []
+            },
+            CorrelationId = correlationId
+        });
+
+        Assert.Equal(1, probe.Invocations);
+    }
+
+    public interface IProbeService
+    {
+        Task RunAsync();
+    }
+
+    private sealed class HandlerProbe : IProbeService
+    {
+        private int _invocations;
+
+        public int Invocations => Volatile.Read(ref _invocations);
+
+        public Task RunAsync()
+        {
+            Interlocked.Increment(ref _invocations);
+            return Task.CompletedTask;
+        }
+    }
+
     [Fact]
     public void Envelope_RoundTrips_SchemaVersion()
     {

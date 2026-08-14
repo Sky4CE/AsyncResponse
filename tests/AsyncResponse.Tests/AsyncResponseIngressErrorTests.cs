@@ -90,7 +90,7 @@ public class AsyncResponseIngressErrorTests
         // The other half of the worker path: a body that never becomes an envelope at all. It takes
         // a different route — the failure is thrown out of deserialization, before any field has
         // been read — so the "log safe metadata once parsed" step never runs and the only thing
-        // standing between the body and the log is the digest line. A malformed body is exactly the
+        // standing between the body and the log is the size line. A malformed body is exactly the
         // one an operator turns Debug on to inspect, which is when it would have leaked.
         var logger = new CapturingLogger<AsyncResponseIngress>();
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
@@ -99,7 +99,8 @@ public class AsyncResponseIngressErrorTests
             () => ingress.HandleWorkerMessageAsync("""{"Call":{"broken":"card 4111-1111-1111-1111"}"""));
 
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
-        Assert.Contains(logger.Entries, entry => entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+        AssertNoContentDigest(logger);
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("code units", StringComparison.Ordinal));
     }
 
     [Theory]
@@ -109,8 +110,9 @@ public class AsyncResponseIngressErrorTests
     public async Task HandleResponseMessageAsync_NonPortableCorrelationId_DropsMessageWithoutLoggingIt(string correlationId)
     {
         // The drop branch logs at ERROR — the loudest level in this file, and the one most likely
-        // to be on — so it is also the branch where a body would be most exposed. Same rule: the
-        // digest, never the payload.
+        // to be on — so it is also the branch where a body would be most exposed. Same rule: a
+        // size, never the payload — and never a hash of it, which is a content oracle for a
+        // low-entropy body and equality-trackable across messages.
         if (correlationId == "looooong")
             correlationId = new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength + 1);
 
@@ -122,8 +124,9 @@ public class AsyncResponseIngressErrorTests
 
         Assert.Equal(0, rawPublisher.RawJsonCalls);
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
+        AssertNoContentDigest(logger);
         Assert.Contains(logger.Entries, entry =>
-            entry.Level == LogLevel.Error && entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+            entry.Level == LogLevel.Error && entry.Message.Contains("code units", StringComparison.Ordinal));
     }
 
     [Theory]
@@ -175,9 +178,10 @@ public class AsyncResponseIngressErrorTests
         await ingress.HandleResponseMessageAsync("""{"Status":2,"Message":"card 4111-1111-1111-1111"}""", "corr-log");
 
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
-        // Still traceable: size and content hash line the entry up with broker-side capture.
+        AssertNoContentDigest(logger);
+        // Still traceable: the correlation id and a size, which is what the digest stood in for.
         Assert.Contains(logger.Entries, entry =>
-            entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase)
+            entry.Message.Contains("code units", StringComparison.Ordinal)
             && entry.Message.Contains("corr-log", StringComparison.Ordinal));
     }
 
@@ -206,9 +210,41 @@ public class AsyncResponseIngressErrorTests
 
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("acme-secret", StringComparison.Ordinal));
+        AssertNoContentDigest(logger);
         // Safe routing metadata is still logged — the service and method are the point of the line.
-        Assert.Contains(logger.Entries, entry => entry.Message.Contains("sha256", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(logger.Entries, entry => entry.Message.Contains("code units", StringComparison.Ordinal));
         Assert.Contains(logger.Entries, entry => entry.Message.Contains("Contoso.IBilling.Charge", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// No hash of the body, at any level. A digest reads like harmless metadata and is not: it is
+    /// deterministic, so two entries showing the same value prove the two payloads were identical
+    /// across messages and hosts, and a payload drawn from a small set (a status enum, an account
+    /// id, a yes/no result) is confirmed outright by hashing the candidates. Asserting only that
+    /// the payload is absent would let a digest come back unnoticed — which is how it got here.
+    /// </summary>
+    private static void AssertNoContentDigest(CapturingLogger<AsyncResponseIngress> logger)
+    {
+        Assert.DoesNotContain(logger.Entries, entry =>
+            entry.Message.Contains("sha", StringComparison.OrdinalIgnoreCase)
+            || entry.Message.Contains("hash", StringComparison.OrdinalIgnoreCase)
+            || entry.Message.Contains("digest", StringComparison.OrdinalIgnoreCase)
+            || entry.Message.Contains("fingerprint", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task HandleResponseMessageAsync_IllFormedCorrelationId_DropsMessage()
+    {
+        // The untrusted edge takes the same ill-formed-UTF-16 rule as the public boundary, with the
+        // opposite answer: dropped, not thrown, because a broker message that throws comes straight
+        // back on redelivery. An unpaired surrogate encodes to the same bytes as a literal U+FFFD,
+        // so routing it would hand this payload to whichever conversation owns that subject.
+        var rawPublisher = new ThrowingRawPublisher();
+        var ingress = CreateIngress(rawPublisher, new RecordingPublisher());
+
+        await ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-\ud800");
+
+        Assert.Equal(0, rawPublisher.RawJsonCalls);
     }
 
     private static AsyncResponseIngress CreateIngress(

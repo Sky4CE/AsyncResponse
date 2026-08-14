@@ -65,6 +65,22 @@ internal sealed class WorkerJobExecutor(
                 $"(current: {WorkerJobEnvelopeSchema.Current}) and cannot be executed safely.");
         }
 
+        // The same portable-id contract the publishers enforce, applied to an id that arrived over
+        // a broker. It has to happen HERE, before the redelay hop and before any handler runs: the
+        // handler's implicit response publish would throw on this id, so the job would fail AFTER
+        // its side effects and be redelivered to run them again. A null or blank id is left alone —
+        // that is a fire-and-forget job, which has no response to publish.
+        if (!string.IsNullOrWhiteSpace(job.CorrelationId)
+            && AsyncResponseChannelOptions.CorrelationIdNotPortable(job.CorrelationId) is { } rejection)
+        {
+            _logger.LogWarning(
+                "Worker job carries a correlation id outside the portable contract; rejecting it before execution. {Rejection}",
+                rejection);
+            AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            throw new InvalidOperationException(
+                $"Worker job cannot be executed: its correlation id is not portable. {rejection}");
+        }
+
         // Due-time guard, the shared half of delayed delivery (see IDelayedWorkerTransport): a job
         // delivered before its stamped due time — a chunked hop on a transport whose per-publish
         // delay is capped, or plain broker imprecision — is re-published for the remainder instead

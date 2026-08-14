@@ -133,6 +133,57 @@ public class DurableChildFlowTests
     }
 
     [Theory]
+    // Shapes, not literals: xUnit serializes theory arguments and that round trip substitutes
+    // U+FFFD for an unpaired surrogate, which would hand the test a well-formed string.
+    [InlineData("high")]
+    [InlineData("low")]
+    [InlineData("high-then-char")]
+    public async Task RootFlowId_ThatIsIllFormedUtf16_IsRejectedAtStart(string shape)
+    {
+        var flowId = "flow-" + shape switch
+        {
+            "high" => "\ud800",
+            "low" => "\udc00",
+            _ => "\ud800x"
+        };
+
+        // The flow-id twin of the correlation-id rule, and it matters here for a second reason:
+        // the UTF-8 BYTE budget this contract enforces is measured with an encoder that substitutes
+        // U+FFFD for an unpaired surrogate, so the count would be taken against a different string
+        // than the caller passed. Rejected before that measurement, not after it.
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(new ChildFlowProbe());
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(
+            new RecursiveChildInput(0),
+            flowId));
+        Assert.Contains("unpaired surrogate", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RootFlowId_WithASupplementaryCharacter_IsAcceptedAndRuns()
+    {
+        // The false-positive guard for the rule above: a real supplementary character IS a surrogate
+        // pair, so a check that rejected surrogates rather than ILL-FORMED ones would refuse every
+        // emoji and most CJK-extension id. It also has to survive the UTF-8 byte budget, which this
+        // contract measures separately — four bytes for this one character, not two.
+        await using var harness = await FlowTestHarness.StartAsync(options =>
+        {
+            options.ConfigureServices = services => services.AddSingleton(new ChildFlowProbe());
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<RecursiveChildFlow, RecursiveChildInput>();
+        });
+
+        var run = await harness.StartFlowAsync<RecursiveChildFlow, RecursiveChildInput>(
+            new RecursiveChildInput(0),
+            "flow-\U0001F600-ok");
+
+        Assert.Equal(FlowRunStatus.Succeeded, await run.WaitForFinishedAsync());
+    }
+
+    [Theory]
     [InlineData("flow-a ")]
     [InlineData(" flow-a")]
     public async Task RootFlowId_WithSurroundingSpaces_IsRejectedAtStart(string flowId)

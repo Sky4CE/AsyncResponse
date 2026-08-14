@@ -916,13 +916,26 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             await delivery.AckAsync();
             Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
 
-            await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, """{"kind":"nak"}""", null, CancellationToken.None);
+            var nakId = Guid.NewGuid();
+            await store.PublishAsync(nakId, options.WorkerQueue, """{"kind":"nak"}""", null, CancellationToken.None);
             var retry = (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None))!;
-            await retry.NakAsync(TimeSpan.FromMilliseconds(30));
+            // Ten minutes, not thirty milliseconds — same reasoning as the SQL Server twin of this
+            // test: the assertion below is that the row is INVISIBLE during its delay, and a delay
+            // that can expire while the next round trip is in flight makes it a race with the
+            // database rather than a statement about the store.
+            await retry.NakAsync(TimeSpan.FromMinutes(10));
             Assert.Null(await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None));
-            await EventuallyAsync(async () =>
-                (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None)) is { } retried
-                && await AckAndMatchAttemptAsync(retried, 2));
+
+            // Bring the row forward by hand so redelivery is a fact rather than a wait.
+            await using (var release = dataSource.CreateCommand(
+                $"UPDATE {store.MessageTable} SET available_at = now() - interval '1 minute' WHERE id = @id;"))
+            {
+                release.Parameters.AddWithValue("@id", nakId);
+                await release.ExecuteNonQueryAsync();
+            }
+
+            var retried = (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None))!;
+            Assert.True(await AckAndMatchAttemptAsync(retried, 2));
 
             await store.PublishAsync(Guid.NewGuid(), options.WorkerQueue, """{"kind":"deadletter"}""", null, CancellationToken.None);
             var poison = (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None))!;

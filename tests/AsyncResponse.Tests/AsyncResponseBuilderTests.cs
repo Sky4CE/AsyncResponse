@@ -55,6 +55,40 @@ public class AsyncResponseBuilderTests
         => new AsyncResponseBuilder(_subscriber.Object)
             .For<OperationResult>(new string('c', AsyncResponseChannelOptions.MaxCorrelationIdLength));
 
+    [Theory]
+    // A lone high surrogate, a lone low surrogate, and a high surrogate followed by an ordinary
+    // character — the three ways a .NET string can hold ill-formed UTF-16. Passed as a SHAPE and
+    // built below, never as inline data: xUnit serializes theory arguments, and that round trip
+    // substitutes U+FFFD for an unpaired surrogate, so the test would silently receive a
+    // well-formed string and prove nothing.
+    [InlineData("high")]
+    [InlineData("low")]
+    [InlineData("high-then-char")]
+    public void For_WithAnIllFormedUtf16CorrelationId_IsRejected(string shape)
+    {
+        var correlationId = "corr-" + shape switch
+        {
+            "high" => "\ud800",
+            "low" => "\udc00",
+            _ => "\ud800x"
+        };
+
+        // Not merely invalid — COLLIDING. Every UTF-8 encoder in the framework substitutes U+FFFD
+        // for an unpaired surrogate instead of failing, so this id and the same id with a literal
+        // U+FFFD encode to identical bytes: one NATS subject, one recovery key, one stored value,
+        // for two conversations the engine treats as different. That is the exact failure mode the
+        // ordinal-identity contract exists to prevent, arriving through the encoder instead of
+        // through a collation.
+        var ex = Assert.Throws<ArgumentException>(
+            () => new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>(correlationId));
+        Assert.Contains("unpaired surrogate", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void For_AcceptsAWellFormedSurrogatePair()
+        // The false-positive guard: a real supplementary character is two code units and must pass.
+        => new AsyncResponseBuilder(_subscriber.Object).For<OperationResult>("corr-\U0001F600-ok");
+
     [Fact]
     public async Task WaitAsync_TriggerRunsAfterSubscription()
     {

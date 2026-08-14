@@ -238,6 +238,12 @@ public abstract class ChannelConformanceSuite
     // compares them ordinally — the wrong waiter can be handed the response.
     [InlineData("trailing-space")]
     [InlineData("leading-space")]
+    // An unpaired surrogate: every UTF-8 encoder substitutes U+FFFD for it rather than failing, so
+    // this id and one carrying a literal U+FFFD produce identical bytes — one NATS subject, one
+    // recovery key, one stored value — for two conversations the engine treats as different.
+    // A SHAPE, not a literal: xUnit serializes theory arguments and that round trip would repair
+    // the string before the test saw it.
+    [InlineData("unpaired-surrogate")]
     public async Task Contract_ANonPortableCorrelationIdIsRefusedWhenSubscribing(string violation)
     {
         // Every channel applies the same contract at the same boundary, whatever its own storage
@@ -251,6 +257,7 @@ public abstract class ChannelConformanceSuite
         {
             "length" => valid + new string('x', AsyncResponseChannelOptions.MaxCorrelationIdLength),
             "trailing-space" => valid + " ",
+            "unpaired-surrogate" => valid + '\ud800',
             _ => " " + valid
         };
 
@@ -272,6 +279,7 @@ public abstract class ChannelConformanceSuite
         var correlationId = NewCorrelationId("padded");
         var padded = correlationId + " ";
         var overlong = correlationId + new string('x', AsyncResponseChannelOptions.MaxCorrelationIdLength);
+        var illFormed = correlationId + '\ud800';
 
         await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
             correlationId, timeout: WaiterTimeout);
@@ -282,6 +290,8 @@ public abstract class ChannelConformanceSuite
             () => harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "too long"), overlong));
         await Assert.ThrowsAnyAsync<ArgumentException>(
             () => harness.Publisher.SetException(new InvalidOperationException("smuggled failure"), padded));
+        await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "ill-formed"), illFormed));
 
         // The raw path takes the ingress's answer: acknowledged, logged, never written.
         await harness.RawPublisher.SetRawResponseJson("""{"Status":2,"Message":"smuggled raw"}""", padded);
@@ -293,6 +303,24 @@ public abstract class ChannelConformanceSuite
         await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "mine"), correlationId);
         var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
         Assert.Equal("mine", result.Message);
+    }
+
+    [Fact]
+    public async Task Contract_ACorrelationIdWithASupplementaryCharacterRoundTrips()
+    {
+        // The false-positive guard for the rule above, and the reason it is worded in terms of
+        // WELL-FORMEDNESS rather than "no surrogates": a real supplementary character — an emoji,
+        // most CJK extension text — IS a surrogate pair, and must survive subscribe, publish, and
+        // whatever subject or key the channel derives from it.
+        await using var harness = await CreateHarnessAsync();
+        var correlationId = NewCorrelationId("astral") + "-\U0001F600";
+
+        await using var waiter = await harness.Subscriber.CreateResponseWaiter<ConformanceResult>(
+            correlationId, timeout: WaiterTimeout);
+        await harness.Publisher.SetResponse(Result(ConformanceStatus.Completed, "astral"), correlationId);
+
+        var result = await waiter.ResponseTask.WaitAsync(WaitBudget);
+        Assert.Equal("astral", result.Message);
     }
 
     [Fact]

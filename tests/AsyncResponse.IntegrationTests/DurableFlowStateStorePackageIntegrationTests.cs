@@ -331,6 +331,221 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Fact]
+    public async Task MySqlPackageStore_RoundTripsAFlowIdWithSupplementaryCharacters()
+    {
+        // The reason the character-set check exists, stated as a fact rather than as a rejection:
+        // an emoji is a four-byte utf8mb4 character, and this store's own DDL has to actually carry
+        // one. On the latin1 table the sibling test refuses, this id would fail or be mangled on
+        // insert — and on MySQL's older three-byte `utf8` it fails too, which is why the check
+        // names utf8mb4 specifically instead of "any Unicode set".
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_astral", 64);
+        try
+        {
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table
+                }));
+
+            var flowId = "flow-\U0001F600-世";
+            Assert.True(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
+
+            var loaded = await store.LoadAsync(flowId);
+            Assert.NotNull(loaded);
+            // And it is still the SAME key: a mangled id would read back as a different flow, so a
+            // second create would succeed instead of reporting the duplicate.
+            Assert.False(await store.TryCreateAsync(flowId, CreateState(flowId), TimeSpan.FromMinutes(5)));
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MySqlPackageStore_RejectsANarrowCharacterSetOnFlowId()
+    {
+        // latin1_bin ends in _bin and passes the collation check, yet the column holds almost
+        // nothing: an emoji, a Han character, most non-Latin text — every one of them a legal flow
+        // id — fails or is mangled on insert. Character set and collation are two questions, and
+        // only asking the second one let this schema through.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_latin1", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("latin", CreateState("latin"), TimeSpan.FromMinutes(5)));
+            Assert.Contains("character set 'latin1'", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("utf8mb4", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Theory]
+    // An extra NOT NULL column with no default: this store never names it, so EVERY create fails —
+    // at the first flow, not at startup, which is the wrong end of the deployment.
+    [InlineData("tenant_id bigint NOT NULL", true)]
+    // The same column the database can fill in for itself is harmless, and refusing it would stop
+    // applications from adding perfectly reasonable bookkeeping to their own table.
+    [InlineData("tenant_id bigint NOT NULL DEFAULT 0", false)]
+    [InlineData("tenant_id bigint NULL", false)]
+    [InlineData("flow_id_len int GENERATED ALWAYS AS (CHAR_LENGTH(flow_id)) STORED NOT NULL", false)]
+    public async Task MySqlPackageStore_RejectsOnlyExtraColumnsItCannotLeaveUnwritten(string extraColumn, bool rejected)
+    {
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_extra", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        {extraColumn}
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            if (rejected)
+            {
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => store.TryCreateAsync("extra", CreateState("extra"), TimeSpan.FromMinutes(5)));
+                Assert.Contains("extra column 'tenant_id'", ex.Message, StringComparison.Ordinal);
+            }
+            else
+            {
+                Assert.True(await store.TryCreateAsync("extra", CreateState("extra"), TimeSpan.FromMinutes(5)));
+            }
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MySqlPackageStore_DoesNotReportADuplicateWhenSomeOtherKeyRaised1062()
+    {
+        // A table with BOTH the required key and a legacy prefix one. Startup verification is happy
+        // — the full key it needs is there — but the prefix key still fires 1062 for a DIFFERENT id
+        // that happens to share the first 100 characters. Reading every 1062 as "this flow already
+        // exists" would report a successful start for a flow with no row and no run: the caller
+        // gets false, believes another replica owns it, and nothing ever executes it.
+        await WaitForMySqlAsync();
+        var table = NewIdentifier("df_mysql_1062", 64);
+        try
+        {
+            await using (var connection = new MySqlConnection(Fixture.MySqlConnectionString))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    CREATE TABLE `{table}` (
+                        flow_id varchar(400) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
+                        state_json longtext NOT NULL,
+                        expires_at_utc datetime(6) NOT NULL,
+                        updated_at_utc datetime(6) NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id varchar(64) NULL,
+                        lease_expires_at_utc datetime(6) NULL,
+                        UNIQUE KEY `{table}_legacy_prefix` (flow_id(100))
+                    );
+                    """;
+                await command.ExecuteNonQueryAsync();
+            }
+
+            var store = new MySqlFlowStateStore(
+                Options.Create(new MySqlDurableFlowOptions
+                {
+                    ConnectionString = Fixture.MySqlConnectionString,
+                    TableName = table,
+                    AutoCreateSchema = false
+                }));
+
+            var shared = new string('p', 100);
+            Assert.True(await store.TryCreateAsync(shared + "-first", CreateState(shared + "-first"), TimeSpan.FromMinutes(5)));
+
+            // Different flow, same first 100 characters. The prefix key rejects it — and the store
+            // must say so rather than claim the ledger already exists.
+            var second = shared + "-second";
+            await Assert.ThrowsAsync<MySqlException>(
+                () => store.TryCreateAsync(second, CreateState(second), TimeSpan.FromMinutes(5)));
+            Assert.Null(await store.LoadAsync(second));
+        }
+        finally
+        {
+            await using var connection = new MySqlConnection(Fixture.MySqlConnectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS `{table}`;";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task MySqlPackageStore_AcceptsAMoreGenerousColumnShape()
     {
         // The false-positive guard for the shape check: widths and precisions are MINIMA, not exact

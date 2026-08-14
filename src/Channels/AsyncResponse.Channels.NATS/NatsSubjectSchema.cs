@@ -25,6 +25,17 @@ internal sealed class NatsSubjectSchema(string _subjectPrefix)
     public static string CorrelationIdFromRecoveryKey(string recoveryKey) => Decode(recoveryKey) ?? recoveryKey;
 
     /// <summary>
+    /// UTF-8 that FAILS on ill-formed input instead of substituting U+FFFD, in both directions.
+    /// The default encoder's substitution is a correctness problem at this particular boundary: the
+    /// bytes it produces are the subject a waiter subscribes to and the key its recovery state is
+    /// stored under, so two ids the engine considers different — an unpaired surrogate and a
+    /// literal U+FFFD — would share one subject and one key, and one conversation's response would
+    /// reach the other's waiter. Validation rejects such ids at the public boundary; this makes the
+    /// collision unreachable from anywhere else, including ids read back from an older store.
+    /// </summary>
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    /// <summary>
     /// Encodes an arbitrary string to a NATS-safe token using URL-safe Base64 without padding.
     /// Implemented over <see cref="Convert.ToBase64String(byte[])"/> so it works identically on every
     /// target framework.
@@ -33,7 +44,7 @@ internal sealed class NatsSubjectSchema(string _subjectPrefix)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(value);
 
-        var base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+        var base64 = Convert.ToBase64String(StrictUtf8.GetBytes(value));
         // '+' and '/' are illegal in NATS subject tokens / KV keys; '=' padding is dropped.
         return base64.Replace('+', '-').Replace('/', '_').TrimEnd('=');
     }
@@ -54,10 +65,12 @@ internal sealed class NatsSubjectSchema(string _subjectPrefix)
 
         try
         {
-            return Encoding.UTF8.GetString(Convert.FromBase64String(base64));
+            return StrictUtf8.GetString(Convert.FromBase64String(base64));
         }
-        catch (FormatException)
+        catch (Exception exception) when (exception is FormatException or DecoderFallbackException)
         {
+            // Not base64, or base64 of something that is not UTF-8 — either way a key this schema
+            // did not write. Callers fall back to treating the key verbatim.
             return null;
         }
     }

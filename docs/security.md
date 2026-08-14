@@ -118,9 +118,15 @@ At every log level, including `Debug`. This matters most at the ingress, where e
 response and every worker job passes through: a worker envelope carries the job's arguments and
 whatever the context propagators captured (tenant, auth, trace baggage), so logging it whole would
 put all of that in the application log the moment someone turned Debug on to diagnose something
-else. What is logged instead is a byte length and a SHA-256 prefix of the body — enough to line the
-entry up with whatever the broker's own capture tooling recorded — plus routing metadata that is
-safe by construction: the correlation id, the reply target, and the target service and method.
+else. What is logged instead is a size, plus routing metadata that is safe by construction: the
+correlation id, the reply target, and the target service and method.
+
+**Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
+deterministic, so two log entries showing the same prefix prove the two payloads were identical —
+across messages, hosts, and days — and a payload drawn from a small set (a status enum, an account
+id, a yes/no result) can be confirmed outright by hashing the candidates until one matches. The
+correlation id and the trace id already tie an entry to its conversation, which is what the digest
+was there for.
 
 ## Explicit correlation id
 

@@ -85,6 +85,15 @@ public abstract class AsyncResponseChannelOptions
                 "while the library compares ids ordinally — a response could reach the wrong waiter. Trim the id.";
         }
 
+        if (PortableText.IndexOfIllFormedUtf16(correlationId) is var illFormed and >= 0)
+        {
+            return PortableText.IllFormedUtf16Rejection(
+                "CorrelationId",
+                correlationId.Length <= 40 ? correlationId : string.Concat(correlationId.AsSpan(0, 40), "…"),
+                correlationId[illFormed],
+                illFormed);
+        }
+
         return null;
     }
 

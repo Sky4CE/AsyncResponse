@@ -51,6 +51,11 @@ internal static class FlowStateConcurrency
                 "column length in the SQL Server, MySQL, Oracle, and EF Core stores). " + BudgetGuidance;
         }
 
+        // Checked BEFORE the byte count, which would otherwise be measured against the U+FFFD an
+        // encoder substitutes rather than against the id the caller passed.
+        if (PortableText.IndexOfIllFormedUtf16(flowId) is var illFormed and >= 0)
+            return PortableText.IllFormedUtf16Rejection("Flow id", Excerpt(flowId), flowId[illFormed], illFormed);
+
         var utf8Bytes = System.Text.Encoding.UTF8.GetByteCount(flowId);
         if (utf8Bytes > DurableFlowOptions.MaxFlowIdBytes)
         {

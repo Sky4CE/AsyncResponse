@@ -132,6 +132,17 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         }
         catch (MySqlException exception) when (exception.Number == 1062)
         {
+            // 1062 says "some unique constraint rejected this row" — NOT "this flow id exists".
+            // The distinction is load-bearing on a table this build did not create: a legacy
+            // PREFIX key alongside the required one (UNIQUE (flow_id(100))) raises 1062 for a
+            // DIFFERENT id that happens to share a prefix, and reading that as "already exists"
+            // would report a successful start for a flow with no row and no run. Startup
+            // verification refuses such tables, but this store also runs against schemas it did not
+            // get to inspect first (AutoCreateSchema off, table created later), so confirm the row
+            // is actually there before believing the error.
+            if (!await ExistsAsync(flowId, cancellationToken).ConfigureAwait(false))
+                throw;
+
             // The id already exists. Only an expired row may be replaced below; do not use
             // INSERT IGNORE here because it also suppresses truncation and other data errors.
         }
@@ -151,6 +162,19 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             WHERE flow_id = @flow_id AND expires_at_utc <= UTC_TIMESTAMP(6);
             """;
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
+    }
+
+    /// <summary>
+    /// Whether a row with EXACTLY this flow id exists, expired or not — the question a 1062 does
+    /// not answer on its own. Opens its own connection so it is safe to call mid-operation.
+    /// </summary>
+    private async Task<bool> ExistsAsync(string flowId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT 1 FROM {Table} WHERE flow_id = @flow_id LIMIT 1;";
+        command.Parameters.AddWithValue("@flow_id", flowId);
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     public async Task<bool> TryUpdateAsync(
@@ -298,7 +322,8 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             command.CommandText =
                 """
                 SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, COLLATION_NAME, IS_NULLABLE,
-                       CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION
+                       CHARACTER_MAXIMUM_LENGTH, DATETIME_PRECISION, CHARACTER_SET_NAME,
+                       COLUMN_DEFAULT, EXTRA
                 FROM information_schema.COLUMNS
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @table;
                 """;
@@ -312,7 +337,10 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                     Collation: reader.IsDBNull(3) ? null : reader.GetString(3),
                     Nullable: string.Equals(reader.GetString(4), "YES", StringComparison.OrdinalIgnoreCase),
                     MaxLength: reader.IsDBNull(5) ? null : reader.GetInt64(5),
-                    DateTimePrecision: reader.IsDBNull(6) ? null : reader.GetInt64(6));
+                    DateTimePrecision: reader.IsDBNull(6) ? null : reader.GetInt64(6),
+                    CharacterSet: reader.IsDBNull(7) ? null : reader.GetString(7),
+                    HasDefault: !reader.IsDBNull(8),
+                    Extra: reader.IsDBNull(9) ? string.Empty : reader.GetString(9));
             }
         }
 
@@ -346,7 +374,42 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
             }
         }
 
-        var collation = columns["flow_id"].Collation;
+        // Columns this store never names in an INSERT. One that the database cannot fill in for
+        // itself makes EVERY create fail — the shape is otherwise perfect, so the failure arrives
+        // at the first flow rather than at startup, which is the wrong end of the deployment.
+        // Generated and auto-increment columns are fine; so is anything nullable or defaulted.
+        foreach (var (name, actual) in columns)
+        {
+            if (ExpectedColumns.Any(expected => string.Equals(expected.Name, name, StringComparison.OrdinalIgnoreCase))
+                || actual.IsWritableWithoutValue)
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"The MySQL durable-flow table '{_options.TableName}' has an extra column '{name}' ({actual.ColumnType} NOT NULL) " +
+                "with no default. This store writes only its own columns, so every flow creation would fail on that column. Give " +
+                "it a default, make it nullable or generated, or move it to a table of your own.");
+        }
+
+        var flowIdColumn = columns["flow_id"];
+        // utf8mb4 or nothing: MySQL's older `utf8` is three bytes and holds no supplementary
+        // character, and a single-byte set like latin1 holds almost nothing. Either one turns a
+        // perfectly legal flow id — an emoji, a Han character, most non-Latin text — into an insert
+        // error or a mangled key, and the collation check above cannot see it because latin1_bin
+        // ends in _bin just like utf8mb4_bin does.
+        if (flowIdColumn.CharacterSet is not { } characterSet
+            || !characterSet.Equals("utf8mb4", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"The MySQL durable-flow table '{_options.TableName}' stores flow_id in the character set " +
+                $"'{flowIdColumn.CharacterSet ?? "(none)"}', which cannot hold every id the engine accepts. Flow ids are arbitrary " +
+                "text — this store's contract bounds their length, not their alphabet — so a narrower set rejects or mangles ids " +
+                $"that are perfectly valid. Fix it with ALTER TABLE `{_options.TableName}` MODIFY flow_id varchar(400) CHARACTER " +
+                "SET utf8mb4 COLLATE utf8mb4_bin NOT NULL; (tables this build creates get that character set automatically).");
+        }
+
+        var collation = flowIdColumn.Collation;
         if (collation is null || !collation.EndsWith("_bin", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
@@ -367,7 +430,21 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         string? Collation,
         bool Nullable,
         long? MaxLength,
-        long? DateTimePrecision);
+        long? DateTimePrecision,
+        string? CharacterSet,
+        bool HasDefault,
+        string Extra)
+    {
+        /// <summary>
+        /// Whether this store could insert a row without naming this column. True when the column
+        /// is nullable, carries a default, auto-increments, or is computed by the database.
+        /// </summary>
+        internal bool IsWritableWithoutValue
+            => Nullable
+                || HasDefault
+                || Extra.Contains("auto_increment", StringComparison.OrdinalIgnoreCase)
+                || Extra.Contains("GENERATED", StringComparison.OrdinalIgnoreCase);
+    }
 
     /// <summary>
     /// What this store needs from one column, and the check that says so. Widths and precisions are

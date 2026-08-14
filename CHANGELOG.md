@@ -281,9 +281,35 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 - **Ingress no longer logs message bodies.** The response path logged the raw JSON and the worker
   path logged the entire envelope — arguments and propagated context included — at Debug, in the
   same file whose comments state that payloads stay out of logs by policy (docs/security.md).
-  Both now log a byte length and a SHA-256 prefix, enough to line an entry up with broker-side
-  capture, plus safe routing metadata: the correlation id, and the target service and method once
-  the envelope has been read.
+  Both now log a size and safe routing metadata — the correlation id, and the target service and
+  method once the envelope has been read — and nothing derived from the content. A hash prefix
+  looks like harmless metadata but is a content oracle: it is deterministic, so equal payloads are
+  visibly equal across messages and hosts, and a low-entropy payload (a status enum, a small id, a
+  boolean) can be confirmed outright by hashing the guesses. Trace and correlation ids already tie
+  an entry to its conversation, and dropping the hash also stops the ingress allocating and
+  digesting every body it handles.
+- **Identifiers must be well-formed UTF-16.** Correlation ids and flow ids alike: an unpaired
+  surrogate is not merely invalid, it *collides*. Every UTF-8 encoder in the framework substitutes
+  U+FFFD for one rather than failing, so an id containing a lone `U+D800` and an id containing a
+  literal `U+FFFD` produce identical bytes — and therefore one NATS subject, one recovery key, and
+  one stored value — for two conversations the engine treats as different. Rejected at every public
+  boundary, and the NATS subject/key schema now encodes and decodes with a strict UTF-8 encoder so
+  the collision is unreachable even for an id read back from an older store.
+- **A worker job's correlation id is validated before its handler runs.** An id arriving over a
+  broker got no portability check, so a padded or over-long one executed the handler and only then
+  failed on the implicit response publish — after the side effects, with the transport redelivering
+  to repeat them. It is now rejected up front, which turns the job into an ordinary poison message.
+  A null or blank id still runs: that is a fire-and-forget job with no response to publish.
+- **MySQL flow-table verification covers the character set and extra columns.** A
+  `latin1 COLLATE latin1_bin` flow_id passed the collation check and then rejected most non-Latin
+  ids; an extra `NOT NULL` column with no default passed everything and made every create fail,
+  because this store names only its own columns. Both are refused now, with generated,
+  auto-increment, defaulted, and nullable extras still allowed.
+- **MySQL no longer reads every duplicate-key error as "this flow exists".** Error 1062 says some
+  unique constraint rejected the row, not which one. On a table carrying a legacy prefix key
+  alongside the required one, a *different* id sharing the first *n* characters raised 1062 and the
+  store returned `false` for a flow that had no row and never ran. The row's existence is now
+  confirmed before the error is believed; otherwise the database error propagates.
 - **Positive sub-second SQS durations no longer truncate to zero.** `VisibilityTimeout`,
   `ReceiveWaitTime`, and the redelivery delay each crossed an `(int)TotalSeconds` conversion, so a
   validated 500 ms visibility timeout became 0 — the message went visible again the instant it was

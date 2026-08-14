@@ -1,4 +1,5 @@
 using AsyncResponse.Channels.NATS;
+using System.Text;
 using Xunit;
 
 namespace AsyncResponse.Tests;
@@ -8,6 +9,40 @@ public class NatsAsyncResponseChannelOptionsTests
     [Fact]
     public void RecoveryKey_InvalidBase64Length_FallsBackToVerbatimKey()
         => Assert.Equal("a", NatsSubjectSchema.CorrelationIdFromRecoveryKey("a"));
+
+    [Fact]
+    public void Encode_RefusesIllFormedUtf16_RatherThanCollidingWithTheReplacementCharacter()
+    {
+        // The mechanism behind the whole ill-formed-UTF-16 rule, shown at the place it does damage.
+        // The default UTF-8 encoder substitutes U+FFFD for an unpaired surrogate instead of
+        // failing, so "corr-\ud800" and "corr-�" encode to the SAME bytes — and therefore the
+        // same Base64 token, which is the response subject a waiter subscribes to AND the key its
+        // recovery state is stored under. Two conversations, one mailbox: whichever waiter is
+        // listening gets the other's response. Validation rejects such ids at the public boundary;
+        // this makes the collision unreachable from anywhere else, including an id read back from
+        // an older store.
+        Assert.Throws<EncoderFallbackException>(() => NatsSubjectSchema.Encode("corr-\ud800"));
+
+        // The literal replacement character is a perfectly ordinary id and still encodes.
+        var replacement = NatsSubjectSchema.Encode("corr-�");
+        Assert.Equal("corr-�", NatsSubjectSchema.Decode(replacement));
+
+        // And a real supplementary character — a well-formed pair — round-trips untouched.
+        var emoji = NatsSubjectSchema.Encode("corr-\U0001F600");
+        Assert.Equal("corr-\U0001F600", NatsSubjectSchema.Decode(emoji));
+        Assert.NotEqual(replacement, emoji);
+    }
+
+    [Fact]
+    public void Decode_OfBytesThatAreNotUtf8_FallsBackToVerbatimKey()
+    {
+        // A key some other producer wrote: strict decoding must report "not mine" rather than
+        // manufacture a U+FFFD-bearing correlation id that could then collide with a real one.
+        var notUtf8 = Convert.ToBase64String([0xC3, 0x28]).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+        Assert.Null(NatsSubjectSchema.Decode(notUtf8));
+        Assert.Equal(notUtf8, NatsSubjectSchema.CorrelationIdFromRecoveryKey(notUtf8));
+    }
 
     [Fact]
     public void Validate_Passes_ForDefaults() => new NatsAsyncResponseChannelOptions().Validate();
