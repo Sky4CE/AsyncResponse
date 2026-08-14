@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786740509502,
+  "lastUpdate": 1786740513368,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -114966,6 +114966,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 42949.632,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "4a1e506adcd497c0b2bd3d2781197894668faa2b",
+          "message": "fix: apply round-23 review — early-ack lease heartbeat, shutdown-vs-failure parity, address-level validators\n- DB transports: the r22 NAK-on-full park now renews the claimed row's lease\n  for the park's duration (early-ack skipped the heartbeat entirely, so a park\n  past LockTimeout ran the job twice); claimed headers copy via indexer,\n  last-wins (case-variant keys threw AFTER the claim committed — an unkillable\n  poison row that never reached dead-lettering) in PG/SqlServer/Mongo.\n- Shutdown cancellation is not a handler failure in the four transports the\n  r22 fix missed: NATS/ASB/SQS rethrow and leave the delivery unsettled\n  (no NAK/abandon/visibility-shorten, no dead-letter/Term at the cap);\n  Pub/Sub documents Nack as its only release primitive in an explicit branch.\n- NATS early-ack: both acks moved out of the NAK try into swallow-and-log\n  blocks (an ack blip tore down the subscriber mid-handler and double-ran the\n  job); the shutdown NAK itself is now guarded.\n- Worker transports (RabbitMQ/SQS/ASB/PubSub): DisposeAsync releases but no\n  longer disposes the connection gate — Dispose left concurrent publishers\n  parked in WaitAsync forever; PubSub publishes now take the caller's token\n  through the adapter seam (pre-check before the SDK hand-off).\n- Core: the awaited-step breadcrumb TTL now covers the step timeout\n  (stepTimeout + StateExpiry, timer-path parity) so a wait longer than\n  StateExpiry can't expire the ledger mid-await and strand the run; the\n  re-attach short-circuit adopts the persisted revision only while the run is\n  still Running (adopting a FailAsync writer's revision resurrected a\n  terminally Failed run); lost-response dispatch no longer rethrows a sibling\n  registration's failure after another callback consumed the response (logged\n  loudly, registration kept for watchdog/redelivery); in-memory transport\n  failure-path decrements complete the drain writer and the delayed-fire\n  count moves inside the gate (drain could stall shutdown or drop a fired\n  wake-up).\n- Validators/stores: RabbitMQ rejects colliding (exchange, routingKey) publish\n  addresses and scopes the DLX guard to live bindings (a distinct\n  DeadLetterRoutingKey on a shared exchange starts again); SQL Server relation\n  verification keys its catalog dictionary case-insensitively (case-variant\n  collisions were misreported as \"does not exist\" with shape checks skipped);\n  MySQL auto-repairs a pre-r22 state_json charset under AutoCreateSchema\n  instead of hard-failing the upgrade, and the docs DDL pins utf8mb4.\n- Testing: FlowProbe replays newest-first and replies target the live or NEXT\n  awaited park under the probe gate — never an answered/abandoned correlation\n  id from a faulted earlier attempt.",
+          "timestamp": "2026-08-14T22:30:04+02:00",
+          "tree_id": "6cf272dd5b2aae4a12a0d8a1f018537a61d40576",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/4a1e506adcd497c0b2bd3d2781197894668faa2b"
+        },
+        "date": 1786740512614,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0552,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1669.22048,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 0.1054,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3374.592,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 2926.1328,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0019,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 464.5408,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0033,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 469.376,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0024,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 522.6912,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0022,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 437.4368,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0047,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 460.0608,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0044,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 454.224,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0041,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 457.3856,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0045,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 603.056,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0029,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 539.8944,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0024,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 294.5696,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0486,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1483.5648,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.0817,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1889.06112,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 3.0964,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4907.77216,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 4.1342,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8553.6576,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 55.768,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3026.816,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0386,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1148.6816,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.0892,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2780.6528,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 10.985,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 42806.9952,
             "unit": "B/flow"
           }
         ]
