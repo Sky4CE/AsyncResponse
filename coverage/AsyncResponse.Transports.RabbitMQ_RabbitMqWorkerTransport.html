@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="93">93</td>
+<td class="limit-width right" title="91">91</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,7 +49,7 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="95">95</td>
+<td class="limit-width right" title="93">93</td>
 </tr>
 <tr>
 <th>Total lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="93 of 95">97.8%</td>
+<td class="limit-width right" title="91 of 93">97.8%</td>
 </tr>
 </table>
 </div>
@@ -66,20 +66,20 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar21">79%</div>
+<div class="large cardpercentagebar cardpercentagebar22">78%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="27">27</td>
+<td class="limit-width right" title="25">25</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="34">34</td>
+<td class="limit-width right" title="32">32</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="27 of 34">79.4%</td>
+<td class="limit-width right" title="25 of 32">78.1%</td>
 </tr>
 </table>
 </div>
@@ -110,7 +110,7 @@
 <tr><td title=".ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions&gt;, AsyncResponse.Transports.RabbitMQ.IRabbitMqConnectionFactory)"><a href="#file0_line22" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title=".ctor(Microsoft.Extensions.Options.IOptions&lt;AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions&gt;)"><a href="#file0_line30" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="ValidatePublishOptions(AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions)"><a href="#file0_line45" class="navigatetohash">ValidatePublishOptions(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="GetChannelAsync()"><a href="#file0_line54" class="navigatetohash">GetChannelAsync()</a></td><td>88.89%</td><td>18</td><td>18</td><td>95.83%</td></tr>
+<tr><td title="GetChannelAsync()"><a href="#file0_line54" class="navigatetohash">GetChannelAsync()</a></td><td>87.5%</td><td>16</td><td>16</td><td>95.45%</td></tr>
 <tr><td title="DisposeQuietlyAsync()"><a href="#file0_line113" class="navigatetohash">DisposeQuietlyAsync()</a></td><td>100%</td><td>1</td><td>1</td><td>60%</td></tr>
 <tr><td title="PublishAsync()"><a href="#file0_line124" class="navigatetohash">PublishAsync()</a></td><td>50%</td><td>10</td><td>10</td><td>100%</td></tr>
 <tr><td title="DisposeAsync()"><a href="#file0_line160" class="navigatetohash">DisposeAsync()</a></td><td>100%</td><td>6</td><td>6</td><td>100%</td></tr>
@@ -189,12 +189,12 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line64"></a><code>64</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line65"></a><code>65</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;A&nbsp;cached-but-closed&nbsp;channel&nbsp;is&nbsp;treated&nbsp;as&nbsp;absent:&nbsp;a&nbsp;protocol&nbsp;error&nbsp;(404/406&nbsp;after&nbsp;an</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line66"></a><code>66</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;exchange&nbsp;delete/redeclare)&nbsp;closes&nbsp;the&nbsp;channel&nbsp;without&nbsp;failing&nbsp;the&nbsp;publish&nbsp;that&nbsp;comes</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line67"></a><code>67</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;next,&nbsp;so&nbsp;keeping&nbsp;it&nbsp;would&nbsp;cache&nbsp;a&nbsp;dead&nbsp;channel&nbsp;forever.&nbsp;Dispose&nbsp;before&nbsp;recreating.</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line68"></a><code>68</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(_channel&nbsp;is&nbsp;not&nbsp;null)</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line69"></a><code>69</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line70"></a><code>70</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;await&nbsp;DisposeQuietlyAsync(_channel).ConfigureAwait(false);</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line71"></a><code>71</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_channel&nbsp;=&nbsp;null;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line72"></a><code>72</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line67"></a><code>67</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;next,&nbsp;so&nbsp;keeping&nbsp;it&nbsp;would&nbsp;cache&nbsp;a&nbsp;dead&nbsp;channel&nbsp;forever.&nbsp;Deliberately&nbsp;dereferenced</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line68"></a><code>68</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;WITHOUT&nbsp;disposing:&nbsp;a&nbsp;concurrent&nbsp;publisher&nbsp;that&nbsp;took&nbsp;the&nbsp;lock-free&nbsp;fast&nbsp;path&nbsp;above&nbsp;may</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line69"></a><code>69</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;still&nbsp;hold&nbsp;this&nbsp;object,&nbsp;and&nbsp;disposing&nbsp;it&nbsp;under&nbsp;that&nbsp;publisher&nbsp;turns&nbsp;its&nbsp;retryable</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line70"></a><code>70</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;AlreadyClosedException&nbsp;into&nbsp;a&nbsp;use-after-dispose.&nbsp;A&nbsp;closed&nbsp;channel&nbsp;holds&nbsp;no&nbsp;broker</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line71"></a><code>71</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;resources;&nbsp;the&nbsp;client&nbsp;releases&nbsp;its&nbsp;state&nbsp;when&nbsp;the&nbsp;owning&nbsp;connection&nbsp;is&nbsp;disposed.</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line72"></a><code>72</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;_channel&nbsp;=&nbsp;null;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line73"></a><code>73</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line74"></a><code>74</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;The&nbsp;connection&nbsp;is&nbsp;replaced&nbsp;only&nbsp;when&nbsp;itself&nbsp;closed:&nbsp;with&nbsp;automatic&nbsp;recovery&nbsp;enabled&nbsp;the</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line75"></a><code>75</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;//&nbsp;client&nbsp;object&nbsp;stays&nbsp;open&nbsp;while&nbsp;it&nbsp;reconnects,&nbsp;so&nbsp;this&nbsp;only&nbsp;fires&nbsp;when&nbsp;it&nbsp;is&nbsp;truly&nbsp;dead</code></td></tr>
@@ -330,7 +330,7 @@
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 12:56:41<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 16:26:30<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
