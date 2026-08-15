@@ -1152,7 +1152,10 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
         await Assert.ThrowsAnyAsync<Exception>(() =>
             badSubscriber.CreateResponseWaiter<OperationResult>(NewId("missing"), timeout: TimeSpan.FromSeconds(5)));
 
-        Assert.Equal(0, await badProbe.CountActiveSubscribersAsync(NewId("missing-count")));
+        // -1, not 0: the subscriber table does not exist under AutoCreateSchema=false, so the probe
+        // could not be run at all. Reporting 0 would assert "definitively no live waiter" and let
+        // the watchdog flag every over-threshold registration stale.
+        Assert.Equal(-1, await badProbe.CountActiveSubscribersAsync(NewId("missing-count")));
         await Assert.ThrowsAnyAsync<Exception>(() =>
             badPublisher.SetResponse(new OperationResult { Status = OperationStatus.Completed }, NewId("missing-response")));
         await Assert.ThrowsAnyAsync<Exception>(() =>

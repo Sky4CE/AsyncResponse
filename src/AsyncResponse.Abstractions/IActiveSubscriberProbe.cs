@@ -18,6 +18,14 @@ public interface IActiveSubscriberProbe
     /// Returns the number of live subscribers awaiting the response channel for
     /// <paramref name="correlationId"/>. <c>0</c> means no waiter is listening (e.g. the owning
     /// process died); a positive value means at least one waiter is still awaiting.
+    /// <para>
+    /// A <b>negative</b> value means liveness could not be determined — the probe itself failed
+    /// (broker unreachable, missing schema, no connected endpoint to ask). Implementations must
+    /// return a negative value rather than <c>0</c> in that case: <c>0</c> asserts there is
+    /// definitively no waiter, which would make the watchdog flag every over-threshold
+    /// registration stale during a transient probe outage. The watchdog treats unknown liveness
+    /// as "not stale".
+    /// </para>
     /// </summary>
     ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default);
 }
