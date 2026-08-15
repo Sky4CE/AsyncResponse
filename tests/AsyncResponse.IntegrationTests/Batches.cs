@@ -1,11 +1,15 @@
 using Microsoft.Data.SqlClient;
 using Npgsql;
 using Xunit;
+using Xunit.Sdk;
+using Xunit.v3;
 
 // Batches must not overlap in time: each one boots its own AppHost, and running two collections
 // concurrently would stand every batch's containers up at once — the opposite of the point. xUnit
 // parallelizes collections by default, so this is what makes batching mean anything.
-[assembly: CollectionBehavior(DisableTestParallelization = true)]
+// (xUnit v3 4.0 moved this off CollectionBehavior.DisableTestParallelization, now obsolete-as-error;
+// ParallelMode.None is that flag's documented replacement — no parallelism anywhere in the assembly.)
+[assembly: Parallelization(Mode = ParallelMode.None)]
 
 namespace AsyncResponse.IntegrationTests;
 
