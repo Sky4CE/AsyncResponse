@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786832866237,
+  "lastUpdate": 1786832870502,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -120342,6 +120342,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 42742.8992,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "06c1c4936eae0aafd966d60ab65e20876a3255ff",
+          "message": "fix: apply round-25 full-codebase review — 79 findings across ~30 packages\n\nCorrectness (silent data loss / duplicate execution):\n- envelope payloads deserialized case-SENSITIVELY on all 5 broker/DB channels:\n  a camelCase producer completed waiters with an all-default payload, no error\n- a JSON-null body completed waiters with null (NRE at the consumer, message\n  already acked); success envelopes with a null payload now fail the delivery\n- OnRecovery override probe ignored return type, so `void OnRecovery()` defeated\n  the recovery guard and flows silently Failed instead of resuming\n- wrong-typed transport header VALUES were unkillable poison rows (x3 stores):\n  header materialization is now lenient, so poison flows to the dead-letter path\n- Redis/NATS worker batches had no lease heartbeat: XCLAIM JUSTID idle refresh\n  and JetStream AckProgress now prevent duplicate execution and false DLQ\n- ThrowIfLost ignored the lease deadline; a stop-the-world pause ran side effects\n  concurrently with the takeover host\n- AOT flow path never compared InputTypeName, misparsing V1 ledgers as V2\n- ingress classified OperationCanceledException as transient, then escalated it\n  through SetException: flow terminally failed AND response acked away\n\nDurable-flow TTL coherence (four faces of one missing concept):\n- awaited steps persist AwaitDeadlineUtc; redeliveries arm the remainder\n- child/descendant parks extend every Running ancestor's ledger\n- StateExpiry is validated against the channel's declared default wait timeout\n  (all six channels now declare EffectiveDefaultWaitTimeout)\n- replayed sleeps are no longer re-validated against current options\n\nSchema verification: datetime2 scale and PG collation are now verified; PG\nidentity columns and covering PRIMARY KEYs no longer block startup; SQLite and\nthe DB transport stores verify operator-provisioned schemas; SQL Server\ndiagnosis no longer masks a permission failure as a phantom collision.\n\nConsolidation: correlation-id JSON walker (8 copies -> 1, JsonDocument +\npre-split paths), subscriber supervisor loop (10 copies -> 1), transient-fault\nclassifiers, FlowState JSON single writer, Mongo cluster-key derivation.\n\nBehavior changes: in-memory worker transport wire-round-trips job envelopes\n([JsonIgnore] state dropped, post-publish mutations invisible, non-serializable\nargs throw at publish); Redis recovery blobs gain per-registration expiry (old\nbuilds cannot read new blobs); health-check data keys renamed.\n\nTests: 2392/2392 on net8.0 and net10.0 (4784 executions, +606 vs baseline);\nevery correctness fix carries a red-on-old regression test. Docs and CHANGELOG\nupdated across 11 files; knowledge graph refreshed.\n\nDeferred: SQL Server flow-store transient retry (needs a retry seam + options);\nancestor TTL extension covers parks, not continuous work; SQS ShutdownTimeout\nis not summed into the validated host shutdown budget.",
+          "timestamp": "2026-08-16T00:15:55+02:00",
+          "tree_id": "ce511cdb5e241cb3b8ed473d5d0ff407d69b661c",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/06c1c4936eae0aafd966d60ab65e20876a3255ff"
+        },
+        "date": 1786832869400,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0484,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1668.51072,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 1.4884,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3377.7856,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4951.3696,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0037,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 462.3008,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0028,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 471.4496,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 489.296,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 442.864,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0043,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 459.168,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0043,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 455.0176,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0048,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 461.616,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0051,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 601.7504,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0034,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 535.7312,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0026,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 290.9376,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0374,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1482.74688,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.0415,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1865.04256,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 7.5455,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4925.39392,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 6.1099,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8540.576,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 54.0592,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3011.6,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0172,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1145.1904,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.0613,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2760.1024,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 6.3709,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 46370.0096,
             "unit": "B/flow"
           }
         ]
