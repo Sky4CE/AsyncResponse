@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786792230142,
+  "lastUpdate": 1786792234081,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -116758,6 +116758,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 42952.5312,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "bff18f416a42304df858dcc1e2528d3488d88fe4",
+          "message": "fix: apply round-24 review — DI store lifetime, settlement parity, probe tri-state, verify-under-operator-schema\n- DI (P1): the IFlowStateStore forward mirrors the concrete registration's\n  lifetime — a scoped factory returning the singleton store let every\n  flow-execution scope capture and dispose it, killing the store (and its\n  owned NpgsqlDataSource/Mongo client) after the FIRST flow on the documented\n  ConnectionString path. Reproduced standalone on MS.DI 8.\n- Settlement parity: Kafka's awaiting dispatcher stores its offset OUTSIDE the\n  handler try (settle failure no longer re-runs/dead-letters a succeeded\n  handler); NATS guards Term/Nak like its acks (a thrown settle tore down the\n  subscriber and dead-lettered the same message forever); RabbitMQ ACKs and\n  Redis's pre-handler dead-letter ignore cancellation; ASB wraps its\n  failure-path DeadLetter/Abandon (a lock-lost settle rebuilt the receiver,\n  dropping the rest of the batch).\n- Probe tri-state: channel probes return -1 for \"could not be probed\" (the\n  watchdog's unknown-liveness contract — 0 falsely flagged every\n  over-threshold registration stale during a probe blip); Redis's probe is\n  async + token-aware; Redis/NATS lost-subscriber re-checks THROW on unknown\n  so the publish retries instead of consuming a live waiter's registration.\n- Stores: MySQL latches _created only on a verified table (Oracle parity);\n  PG/SqlServer verify operator-provisioned schemas under AutoCreateSchema=false\n  (absent table = re-check later, never latch); the SqlServer relation\n  verifier keys columns/PKs OrdinalIgnoreCase in all four methods (the r23 fix\n  had reached only LoadObjectKindsAsync); Mongo's ownership guard\n  pattern-matches BsonString instead of AsString-throwing on foreign writes.\n- Races/leaks: DB channels arm the waiter timeout AFTER AddSubscription\n  (Redis/NATS parity; an early fire pinned a permanently-dropped subscription\n  and locked SQL Server into active-interval polling); NATS recovery-state\n  expiry cleanup deletes revision-conditioned (an unconditional delete could\n  wipe a just-committed registration); Pub/Sub stops its SubscriberClient on\n  the failure path (one leaked client per retry rebuild); Kafka's producer no\n  longer caches a faulted build (Lazy ExecutionAndPublication poisoned every\n  publish until restart) and backpressure re-asserts the pause each saturated\n  tick (a rebalance reset librdkafka's pause state); the watchdog gauges read\n  a re-published current-state holder instead of pinning the first host's.\n- Validation: MessageRetention must exceed DeliveryConfirmationTimeout on the\n  3 DB channels (a pruned row was reported as delivered, silently skipping\n  lost-response recovery); SQS rejects derived dead-letter names colliding\n  with live queues (a \"-dlq\"-named response queue became the worker redrive\n  target, completing waiters with poison job envelopes); named reply targets\n  on PG/SqlServer/Mongo reject worker/dead-letter queue collisions; Redis\n  KeyPrefix is validated at the RedisKeySchema choke point (glob metachars\n  silently blinded the recovery SCAN).\n- Core: lost-EXCEPTION dispatch no longer rethrows a sibling registration's\n  failure after another callback consumed the exception (r23 gave the\n  response path this guard; the redelivery hot-looped under RabbitMQ's\n  attempts=0); awaited-step re-attach re-extends the ledger TTL (timer-path\n  parity — a redelivered 30d wait expired its own 14d ledger mid-wait);\n  FailAsync notifies run-finished observers before the parent wake-up;\n  envelope parsing throws JsonException on wrong-typed Success /\n  ExceptionMessage / ExceptionStackTrace (InvalidOperationException read as\n  transient and burned the ingress retry budget); the remote stack-trace cap\n  backs off a split surrogate pair; RawJsonResponse materializes a private\n  typed payload per subscriber (the memo aliased one mutable object across\n  same-type waiters); ASB LockRenewalInterval defaults to 10s (30s equaled\n  Azure's default LockDuration and the first renew fires after one full\n  interval — it could never win); SQS visibility renewal takes the shutdown\n  token through the seam and checks it per message.\n- Deferred: early-ACK background failures on RabbitMQ/ASB still only log +\n  OnBackgroundFailure — a DLX republish needs channel plumbing and a\n  serialized publish gate on RabbitMQ, and ASB's DLQ sub-queue cannot be\n  published into; needs its own design pass.\n- Tests: fakes/pins updated to the new contracts (async Redis probe mocks,\n  healthy-endpoint fixture, -1 assertions, per-call raw payload identity,\n  Kafka adapter field shape); docs updated for the 10s renewal default.\n  4178/4178 unit tests green (2089 × net8.0 + net10.0).",
+          "timestamp": "2026-08-15T12:51:29+02:00",
+          "tree_id": "636d8cc6eee5329449f4a674de77ebcbd7503cad",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/bff18f416a42304df858dcc1e2528d3488d88fe4"
+        },
+        "date": 1786792233145,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0399,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1669.79232,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 3.0642,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3387.5712,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 2955.09856,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0036,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 469.9968,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0023,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 462.4352,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.004,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 488.9824,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0035,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 438.704,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0052,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 457.4432,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0049,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 460.7584,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 460.6272,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 627.7792,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0044,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 537.9456,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0029,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 291.8432,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0508,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1483.07104,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.1118,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1869.72288,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 8.973,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4912.32256,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 4.0959,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8539.08352,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 56.4251,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3028.836,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0183,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1167.9648,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.149,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2786.1152,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 7.2574,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5648,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 42446.144,
             "unit": "B/flow"
           }
         ]
