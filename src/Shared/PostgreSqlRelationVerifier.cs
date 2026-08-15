@@ -23,8 +23,27 @@ internal static class PostgreSqlRelationVerifier
     /// <c>created_at DEFAULT now() + interval '1 year'</c> silently shifts every timestamp the
     /// watermark and visibility logic compare, and <c>available_at</c> with a future default
     /// would strand transport jobs.
+    /// <para>
+    /// <paramref name="RequiresDeterministicCollation"/> marks the columns that store an identity
+    /// the library compares ORDINALLY — correlation ids, queue names, flow ids. Under a
+    /// non-deterministic ICU collation the database treats strings its own rules call equal as ONE
+    /// key, so two distinct ids collide: lookups cross-match and a primary key rejects the second
+    /// id. A type that carries no collation at all (<c>uuid</c>, <c>bigint</c>) reports none and
+    /// always passes.
+    /// </para>
     /// </summary>
-    internal readonly record struct ExpectedColumn(string Name, string Type, bool Nullable, string? DefaultExpression = null);
+    /// <remarks>
+    /// The check reads the column's OWN collation. A DATABASE whose default collation is itself
+    /// non-deterministic is out of scope: an uncollated declaration records the
+    /// <c>pg_catalog."default"</c> entry, which is always marked deterministic whatever the
+    /// cluster's locale, so the catalog cannot answer that question here.
+    /// </remarks>
+    internal readonly record struct ExpectedColumn(
+        string Name,
+        string Type,
+        bool Nullable,
+        bool RequiresDeterministicCollation = false,
+        string? DefaultExpression = null);
 
     /// <summary>
     /// One expected relation: kind 'r' (table, verified against <paramref name="Columns"/> and
@@ -50,70 +69,156 @@ internal static class PostgreSqlRelationVerifier
         IReadOnlyList<ExpectedRelation> expected,
         CancellationToken cancellationToken)
     {
+        var relations = await LoadRelationsAsync(connection, transaction, schemaName, expected, cancellationToken).ConfigureAwait(false);
+        var columns = await LoadTableColumnsAsync(connection, transaction, schemaName, expected, cancellationToken).ConfigureAwait(false);
+        Evaluate(schemaName, componentName, expected, relations, columns);
+    }
+
+    // Both primary-key columns and index key columns come from indkey sliced to indnkeyatts:
+    // indkey lists key columns FOLLOWED by INCLUDE payload columns, and a covering
+    // PRIMARY KEY (…) INCLUDE (…) enforces exactly the uniqueness the stores rely on — reading
+    // the whole vector would reject it for carrying its payload columns.
+    internal const string RelationQuery =
+        """
+        SELECT c.relname,
+               c.relkind::text,
+               c.relpersistence::text,
+               COALESCE(t.relname, ''),
+               COALESCE(am.amname, ''),
+               COALESCE(i.indisunique, false),
+               i.indpred IS NOT NULL,
+               COALESCE(i.indisvalid AND i.indisready, true),
+               COALESCE((SELECT array_agg(a.attname ORDER BY k.ord)
+                         FROM unnest(i.indkey[0:i.indnkeyatts-1]) WITH ORDINALITY AS k(attnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum), '{}'),
+               COALESCE(s.seqtypid::regtype::text, ''),
+               COALESCE(s.seqincrement, 1),
+               COALESCE(s.seqcache, 1),
+               COALESCE(s.seqcycle, false),
+               COALESCE(s.seqmax, 9223372036854775807),
+               COALESCE((SELECT array_agg(a2.attname ORDER BY k2.ord)
+                         FROM pg_index pi
+                         CROSS JOIN LATERAL unnest(pi.indkey[0:pi.indnkeyatts-1]) WITH ORDINALITY AS k2(attnum, ord)
+                         JOIN pg_attribute a2 ON a2.attrelid = c.oid AND a2.attnum = k2.attnum
+                         WHERE pi.indrelid = c.oid AND pi.indisprimary), '{}')
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_index i ON i.indexrelid = c.oid
+        LEFT JOIN pg_class t ON t.oid = i.indrelid
+        LEFT JOIN pg_am am ON am.oid = c.relam
+        LEFT JOIN pg_sequence s ON s.seqrelid = c.oid
+        WHERE n.nspname = @schema AND c.relname = ANY(@names);
+        """;
+
+    private static async Task<Dictionary<string, ActualRelation>> LoadRelationsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string schemaName,
+        IReadOnlyList<ExpectedRelation> expected,
+        CancellationToken cancellationToken)
+    {
         await using var verify = connection.CreateCommand();
         verify.Transaction = transaction;
-        verify.CommandText =
-            """
-            SELECT c.relname,
-                   c.relkind::text,
-                   c.relpersistence::text,
-                   COALESCE(t.relname, ''),
-                   COALESCE(am.amname, ''),
-                   COALESCE(i.indisunique, false),
-                   i.indpred IS NOT NULL,
-                   COALESCE(i.indisvalid AND i.indisready, true),
-                   COALESCE((SELECT array_agg(a.attname ORDER BY k.ord)
-                             FROM unnest(i.indkey[0:i.indnkeyatts-1]) WITH ORDINALITY AS k(attnum, ord)
-                             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum), '{}'),
-                   COALESCE(s.seqtypid::regtype::text, ''),
-                   COALESCE(s.seqincrement, 1),
-                   COALESCE(s.seqcache, 1),
-                   COALESCE(s.seqcycle, false),
-                   COALESCE(s.seqmax, 9223372036854775807),
-                   COALESCE((SELECT array_agg(a2.attname ORDER BY k2.ord)
-                             FROM pg_index pi
-                             CROSS JOIN LATERAL unnest(pi.indkey) WITH ORDINALITY AS k2(attnum, ord)
-                             JOIN pg_attribute a2 ON a2.attrelid = c.oid AND a2.attnum = k2.attnum
-                             WHERE pi.indrelid = c.oid AND pi.indisprimary), '{}')
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            LEFT JOIN pg_index i ON i.indexrelid = c.oid
-            LEFT JOIN pg_class t ON t.oid = i.indrelid
-            LEFT JOIN pg_am am ON am.oid = c.relam
-            LEFT JOIN pg_sequence s ON s.seqrelid = c.oid
-            WHERE n.nspname = @schema AND c.relname = ANY(@names);
-            """;
+        verify.CommandText = RelationQuery;
         verify.Parameters.AddWithValue("schema", schemaName);
         verify.Parameters.AddWithValue("names", expected.Select(e => e.Name).ToArray());
 
         var actual = new Dictionary<string, ActualRelation>(StringComparer.Ordinal);
-        await using (var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        await using var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-            {
-                actual[reader.GetString(0)] = new ActualRelation(
-                    Kind: reader.GetString(1),
-                    Persistence: reader.GetString(2),
-                    OwningTable: reader.GetString(3),
-                    AccessMethod: reader.GetString(4),
-                    IsUnique: reader.GetBoolean(5),
-                    HasPredicate: reader.GetBoolean(6),
-                    IsValidAndReady: reader.GetBoolean(7),
-                    KeyColumns: reader.GetFieldValue<string[]>(8),
-                    SequenceType: reader.GetString(9),
-                    SequenceIncrement: reader.GetInt64(10),
-                    SequenceCache: reader.GetInt64(11),
-                    SequenceCycles: reader.GetBoolean(12),
-                    SequenceMax: reader.GetInt64(13),
-                    PrimaryKey: reader.GetFieldValue<string[]>(14));
-            }
+            actual[reader.GetString(0)] = new ActualRelation(
+                Kind: reader.GetString(1),
+                Persistence: reader.GetString(2),
+                OwningTable: reader.GetString(3),
+                AccessMethod: reader.GetString(4),
+                IsUnique: reader.GetBoolean(5),
+                HasPredicate: reader.GetBoolean(6),
+                IsValidAndReady: reader.GetBoolean(7),
+                KeyColumns: reader.GetFieldValue<string[]>(8),
+                SequenceType: reader.GetString(9),
+                SequenceIncrement: reader.GetInt64(10),
+                SequenceCache: reader.GetInt64(11),
+                SequenceCycles: reader.GetBoolean(12),
+                SequenceMax: reader.GetInt64(13),
+                PrimaryKey: reader.GetFieldValue<string[]>(14));
         }
 
+        return actual;
+    }
+
+    // The writable column is "writable without being named": a default (pg_attrdef also carries
+    // stored generation expressions), an identity, or a generated column. Identity columns have
+    // NO pg_attrdef row, so testing the rendered default alone would misread
+    // GENERATED ... AS IDENTITY — which PostgreSQL populates on every insert — as unwritable.
+    // format_type renders no collation, so the last two columns join it in separately;
+    // attcollation is 0 for a type that cannot carry one, which the LEFT JOIN resolves to the
+    // deterministic default rather than a missing row that would fail every flagged column.
+    internal const string TableColumnQuery =
+        """
+        SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
+               COALESCE(pg_get_expr(ad.adbin, ad.adrelid), ''),
+               ad.adrelid IS NOT NULL OR a.attidentity <> '' OR a.attgenerated <> '',
+               COALESCE(co.collname, ''),
+               COALESCE(co.collisdeterministic, true)
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+        LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+        LEFT JOIN pg_collation co ON co.oid = a.attcollation
+        WHERE n.nspname = @schema AND c.relname = ANY(@names);
+        """;
+
+    private static async Task<Dictionary<(string Table, string Column), ActualColumn>> LoadTableColumnsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string schemaName,
+        IReadOnlyList<ExpectedRelation> expected,
+        CancellationToken cancellationToken)
+    {
+        var actual = new Dictionary<(string Table, string Column), ActualColumn>();
+        var tables = expected.Where(e => e.Kind == 'r' && e.Columns is not null).ToArray();
+        if (tables.Length == 0)
+            return actual;
+
+        await using var verify = connection.CreateCommand();
+        verify.Transaction = transaction;
+        verify.CommandText = TableColumnQuery;
+        verify.Parameters.AddWithValue("schema", schemaName);
+        verify.Parameters.AddWithValue("names", tables.Select(t => t.Name).ToArray());
+
+        await using var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            actual[(reader.GetString(0), reader.GetString(1))] = new ActualColumn(
+                Type: reader.GetString(2),
+                NotNull: reader.GetBoolean(3),
+                Default: reader.GetString(4),
+                Writable: reader.GetBoolean(5),
+                Collation: reader.GetString(6),
+                DeterministicCollation: reader.GetBoolean(7));
+        }
+
+        return actual;
+    }
+
+    internal static void Evaluate(
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedRelation> expected,
+        Dictionary<string, ActualRelation> relations,
+        Dictionary<(string Table, string Column), ActualColumn> columns)
+    {
+        // Diagnose in CAUSE order, not declaration order. A misprovisioned or colliding schema is
+        // usually wrong in several ways at once — a foreign relation occupying one name is WHY a
+        // dependent object was never created, and an operator who mis-shaped a table has typically
+        // also forgotten an index — so reporting "does not exist" first would name a victim and
+        // hide the culprit. Anything that is present and wrong is checked first; absence is only
+        // reported once nothing present explains it.
         foreach (var relation in expected)
         {
-            if (!actual.TryGetValue(relation.Name, out var found))
-                throw new InvalidOperationException(
-                    $"The PostgreSQL {componentName} store expected '{schemaName}.{relation.Name}' to exist after schema creation, but it does not.");
+            if (!relations.TryGetValue(relation.Name, out var found))
+                continue;
 
             if (found.Kind != relation.Kind.ToString()
                 || (relation.OwningTable is not null && !string.Equals(found.OwningTable, relation.OwningTable, StringComparison.Ordinal)))
@@ -160,7 +265,15 @@ internal static class PostgreSqlRelationVerifier
                     $"({string.Join(", ", found.PrimaryKey)}) instead of ({string.Join(", ", primaryKey)}). " + CollisionGuidance);
         }
 
-        await VerifyTableColumnsAsync(connection, transaction, schemaName, componentName, expected, cancellationToken).ConfigureAwait(false);
+        EvaluateTableColumns(schemaName, componentName, expected, relations, columns);
+
+        foreach (var relation in expected)
+        {
+            if (!relations.ContainsKey(relation.Name))
+                throw new InvalidOperationException(
+                    $"The PostgreSQL {componentName} store expected '{schemaName}.{relation.Name}' to exist after schema creation, " +
+                    "but it does not. " + CollisionGuidance);
+        }
     }
 
     /// <summary>
@@ -170,49 +283,27 @@ internal static class PostgreSqlRelationVerifier
     /// behavior. Every DDL-declared column must exist with the declared type and nullability;
     /// columns the DDL gives runtime-relied defaults must carry EXACTLY that default expression
     /// (a same-named default computing something else shifts every timestamp the store
-    /// compares); and extra columns are allowed only when they are writable without being named
-    /// (nullable, or defaulted) — an extra NOT NULL column without a default fails every normal
-    /// insert with 23502.
+    /// compares); identity columns must carry a deterministic collation (the SQL Server sibling's
+    /// binary-collation rule, in the form PostgreSQL expresses it); and extra columns are allowed
+    /// only when they are writable without being named
+    /// (nullable, defaulted, identity, or generated) — an extra NOT NULL column the database
+    /// cannot fill in itself fails every normal insert with 23502.
     /// </summary>
-    private static async Task VerifyTableColumnsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
+    private static void EvaluateTableColumns(
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedRelation> expected,
-        CancellationToken cancellationToken)
+        Dictionary<string, ActualRelation> relations,
+        Dictionary<(string Table, string Column), ActualColumn> columns)
     {
-        var tables = expected.Where(e => e.Kind == 'r' && e.Columns is not null).ToArray();
-        if (tables.Length == 0)
-            return;
-
-        await using var verify = connection.CreateCommand();
-        verify.Transaction = transaction;
-        verify.CommandText =
-            """
-            SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
-                   COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '')
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
-            LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-            WHERE n.nspname = @schema AND c.relname = ANY(@names);
-            """;
-        verify.Parameters.AddWithValue("schema", schemaName);
-        verify.Parameters.AddWithValue("names", tables.Select(t => t.Name).ToArray());
-
-        var actual = new Dictionary<(string Table, string Column), (string Type, bool NotNull, string Default)>();
-        await using (var reader = await verify.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        foreach (var table in expected)
         {
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                actual[(reader.GetString(0), reader.GetString(1))] = (reader.GetString(2), reader.GetBoolean(3), reader.GetString(4));
-        }
+            if (table.Kind != 'r' || table.Columns is null || !relations.ContainsKey(table.Name))
+                continue;
 
-        foreach (var table in tables)
-        {
-            foreach (var column in table.Columns!)
+            foreach (var column in table.Columns)
             {
-                if (!actual.TryGetValue((table.Name, column.Name), out var found))
+                if (!columns.TryGetValue((table.Name, column.Name), out var found))
                     throw new InvalidOperationException(
                         $"The PostgreSQL {componentName} store's table '{schemaName}.{table.Name}' exists but is missing the column " +
                         $"'{column.Name}' ({column.Type}); a same-name table from another component or a partial manual creation " +
@@ -229,16 +320,26 @@ internal static class PostgreSqlRelationVerifier
                         $"{(found.NotNull ? " NOT NULL" : " NULL")}{(found.Default.Length == 0 ? " without a default" : $" DEFAULT {found.Default}")}. " +
                         CollisionGuidance);
                 }
+
+                if (column.RequiresDeterministicCollation && !found.DeterministicCollation)
+                    throw new InvalidOperationException(
+                        $"The PostgreSQL {componentName} store's column '{schemaName}.{table.Name}.{column.Name}' uses the " +
+                        $"collation '{found.Collation}', which is non-deterministic (collisdeterministic = false). That column " +
+                        "stores an identity the library compares ORDINALLY, and a non-deterministic collation folds whatever its " +
+                        "rules call equal — case, accents, or full-width forms, depending on the ICU rule — into one key. Distinct " +
+                        "ids would then collide: lookups cross-match and the second id is rejected on insert. ALTER the column to " +
+                        "a deterministic collation (\"C\" compares by code point) after dropping the keys and indexes that " +
+                        "reference it.");
             }
 
             // Extra columns are fine only when inserts that do not name them can still succeed.
-            var expectedNames = table.Columns!.Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
-            foreach (var ((tableName, columnName), found) in actual)
+            var expectedNames = table.Columns.Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+            foreach (var ((tableName, columnName), found) in columns)
             {
                 if (!string.Equals(tableName, table.Name, StringComparison.Ordinal) || expectedNames.Contains(columnName))
                     continue;
 
-                if (found.NotNull && found.Default.Length == 0)
+                if (found.NotNull && !found.Writable)
                     throw new InvalidOperationException(
                         $"The PostgreSQL {componentName} store's table '{schemaName}.{table.Name}' has an extra column " +
                         $"'{columnName}' that is NOT NULL without a default: every insert the store issues would fail with " +
@@ -296,7 +397,7 @@ internal static class PostgreSqlRelationVerifier
         _ => $"a relation of kind '{kind}'",
     };
 
-    private readonly record struct ActualRelation(
+    internal readonly record struct ActualRelation(
         string Kind,
         string Persistence,
         string OwningTable,
@@ -311,4 +412,12 @@ internal static class PostgreSqlRelationVerifier
         bool SequenceCycles,
         long SequenceMax,
         string[] PrimaryKey);
+
+    internal readonly record struct ActualColumn(
+        string Type,
+        bool NotNull,
+        string Default,
+        bool Writable,
+        string Collation,
+        bool DeterministicCollation);
 }

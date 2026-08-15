@@ -134,6 +134,38 @@ public sealed class RelationalTransportCoverageTests
         await Assert.ThrowsAnyAsync<Exception>(() => pgStore.EnsureCreatedAsync());
     }
 
+    /// <summary>
+    /// AutoCreateSchema=false is a managed-schema contract, not a no-op: the store must verify the
+    /// operator-provisioned queue table (its channel siblings always did) instead of trusting it
+    /// blind. Against an unreachable server that verification now surfaces the connection failure —
+    /// previously EnsureCreated returned silently having checked nothing — and it must NOT latch,
+    /// so the next call re-verifies once the server (or the migration) is there.
+    /// </summary>
+    [Fact]
+    public async Task ManagedSchema_TransportStores_VerifyInsteadOfSilentlySkipping()
+    {
+        var sqlOptions = Options.Create(new SqlServerAsyncResponseTransportOptions
+        {
+            ConnectionString = "Server=tcp:127.0.0.1,1;Database=none;User ID=sa;Password=unused;Encrypt=False;Connect Timeout=1",
+            AutoCreateSchema = false
+        });
+        var sqlStore = new SqlServerTransportStore(sqlOptions);
+        await Assert.ThrowsAnyAsync<Exception>(() => sqlStore.EnsureCreatedAsync());
+        Assert.False(Created(sqlStore));
+        await Assert.ThrowsAnyAsync<Exception>(() => sqlStore.EnsureCreatedAsync());
+
+        await using var dataSource = NpgsqlDataSource.Create(
+            "Host=127.0.0.1;Port=1;Username=unused;Password=unused;Database=none;Timeout=1;Pooling=false");
+        var pgOptions = Options.Create(new PostgreSqlAsyncResponseTransportOptions { AutoCreateSchema = false });
+        var pgStore = new PostgreSqlTransportStore(dataSource, pgOptions);
+        await Assert.ThrowsAnyAsync<Exception>(() => pgStore.EnsureCreatedAsync());
+        Assert.False(Created(pgStore));
+        await Assert.ThrowsAnyAsync<Exception>(() => pgStore.EnsureCreatedAsync());
+    }
+
+    private static bool Created(object store)
+        => (bool)store.GetType().GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(store)!;
+
     [Fact]
     public async Task PostgreSqlWorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
     {

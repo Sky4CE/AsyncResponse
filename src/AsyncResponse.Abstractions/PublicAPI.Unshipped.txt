@@ -111,6 +111,8 @@ AsyncResponse.FlowState.Values.get -> System.Collections.Generic.Dictionary<stri
 AsyncResponse.FlowState.Values.set -> void
 AsyncResponse.FlowStateSchema
 AsyncResponse.FlowStepState
+AsyncResponse.FlowStepState.AwaitDeadlineUtc.get -> System.DateTime?
+AsyncResponse.FlowStepState.AwaitDeadlineUtc.set -> void
 AsyncResponse.FlowStepState.ChildFlowId.get -> string?
 AsyncResponse.FlowStepState.ChildFlowId.set -> void
 AsyncResponse.FlowStepState.Completed.get -> bool

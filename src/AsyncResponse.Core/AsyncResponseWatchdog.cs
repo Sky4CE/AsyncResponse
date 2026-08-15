@@ -38,7 +38,15 @@ public sealed class AsyncResponseWatchdogOptions
     /// </summary>
     public int MaxScanEntries { get; set; } = 100_000;
 
-    /// <summary>Validates the timer-armed knobs so a bad value fails at startup, not mid-scan.</summary>
+    /// <summary>
+    /// Upper bound on liveness probes one scan runs concurrently. Each probe is its own round
+    /// trip to the channel (a store query or broker request) and a scan issues one per buffered
+    /// entry, so probing strictly sequentially would serialize up to <see cref="MaxScanEntries"/>
+    /// round trips per scan. Must be at least 1 (strictly sequential). Default: 8.
+    /// </summary>
+    public int ProbeConcurrency { get; set; } = 8;
+
+    /// <summary>Validates the scan-loop knobs so a bad value fails at startup, not mid-scan.</summary>
     internal void Validate()
     {
         // Interval and StartupDelay arm Task.Delay in the scan loop; an out-of-range value there
@@ -47,6 +55,12 @@ public sealed class AsyncResponseWatchdogOptions
         // failing fast where the misconfiguration is visible.
         AsyncResponseChannelOptions.EnsureTimerBacked(Interval, nameof(AsyncResponseWatchdogOptions), nameof(Interval));
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(StartupDelay, nameof(AsyncResponseWatchdogOptions), nameof(StartupDelay));
+
+        // The probe fan-out degree feeds Parallel.ForEachAsync mid-scan, which rejects values
+        // below 1 with the same delayed, host-stopping failure mode.
+        if (ProbeConcurrency < 1)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseWatchdogOptions)}.{nameof(ProbeConcurrency)} must be at least 1.");
     }
 }
 
@@ -88,12 +102,47 @@ public sealed record AsyncResponseWatchdogSnapshot(
 public sealed class AsyncResponseWatchdogState
 {
     private volatile AsyncResponseWatchdogSnapshot? _latest;
+    private volatile WatchdogActivation? _activation;
 
     /// <summary>The most recent scan outcome, or <c>null</c> when no scan has completed yet.</summary>
     public AsyncResponseWatchdogSnapshot? Latest => _latest;
 
+    /// <summary>
+    /// Whether this host's watchdog scans: <c>true</c> once its scan loop is armed, <c>false</c>
+    /// when it declined to run (disabled via options, or the channel registers no scanner), and
+    /// <c>null</c> while unknown (the watchdog has not started, or none is registered).
+    /// </summary>
+    public bool? Scanning => _activation?.Scanning;
+
+    /// <summary>Why this host's watchdog does not scan, when <see cref="Scanning"/> is <c>false</c>.</summary>
+    public string? IdleReason => _activation is { Scanning: false } activation ? activation.IdleReason : null;
+
+    internal WatchdogActivation? Activation => _activation;
+
     /// <summary>Publishes the latest watchdog snapshot for health checks and metrics.</summary>
     public void Publish(AsyncResponseWatchdogSnapshot snapshot) => _latest = snapshot;
+
+    /// <summary>
+    /// Marks this host's watchdog as armed, so the health check can hold it to a first-scan
+    /// deadline instead of attesting "no scan yet" for a loop that died before ever publishing.
+    /// </summary>
+    internal void MarkScanning(DateTime startedUtc, TimeSpan startupDelay, TimeSpan interval)
+        => _activation = new WatchdogActivation(Scanning: true, IdleReason: null, startedUtc, startupDelay, interval);
+
+    /// <summary>
+    /// Marks this host's watchdog as deliberately idle, so the health check can attest "this host
+    /// does not scan" (the documented multi-host pattern) instead of "no scan yet".
+    /// </summary>
+    internal void MarkIdle(string reason)
+        => _activation = new WatchdogActivation(Scanning: false, reason, StartedUtc: null, default, default);
+
+    /// <summary>How the watchdog resolved its startup guards. Single writer: the watchdog.</summary>
+    internal sealed record WatchdogActivation(
+        bool Scanning,
+        string? IdleReason,
+        DateTime? StartedUtc,
+        TimeSpan StartupDelay,
+        TimeSpan Interval);
 }
 
 /// <summary>Result of evaluating a snapshot of the persisted recovery state.</summary>
@@ -101,6 +150,13 @@ public sealed class AsyncResponseWatchdogState
 /// <param name="EntriesWithActiveWaiter">Observed entries with at least one live subscriber.</param>
 /// <param name="StaleEntries">Entries with no live waiter registered longer ago than the staleness threshold.</param>
 /// <param name="UnknownAgeEntries">Entries with no live waiter and no registration timestamp — reported separately, never flagged stale.</param>
+/// <param name="UnprobeableEntries">
+/// Entries whose waiter liveness could not be probed (negative
+/// <see cref="RecoveryStateObservation.ActiveSubscribers"/>: the probe failed, or no
+/// <see cref="IActiveSubscriberProbe"/> is registered). Their staleness is unknown and they are
+/// never flagged stale, so the health check degrades rather than letting a probe outage read as
+/// a clean pass with zeroed counters.
+/// </param>
 /// <param name="Truncated">
 /// Whether the scan stopped at <see cref="AsyncResponseWatchdogOptions.MaxScanEntries"/> before
 /// exhausting the store — the counts and stale list then describe the buffered subset only, and
@@ -111,6 +167,7 @@ public sealed record AsyncResponseWatchdogReport(
     int EntriesWithActiveWaiter,
     IReadOnlyList<RecoveryStateObservation> StaleEntries,
     int UnknownAgeEntries,
+    int UnprobeableEntries = 0,
     bool Truncated = false)
 {
     /// <summary>
@@ -151,25 +208,27 @@ public sealed record AsyncResponseWatchdogReport(
         var totalEntries = 0;
         var entriesWithActiveWaiter = 0;
         var unknownAgeEntries = 0;
+        var unprobeableEntries = 0;
         List<RecoveryStateObservation>? staleEntries = null;
 
         if (byCorrelationId is not null)
         {
             foreach (var entry in byCorrelationId.Values)
-                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref staleEntries);
+                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref unprobeableEntries, ref staleEntries);
         }
 
         if (ungrouped is not null)
         {
             foreach (var entry in ungrouped)
-                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref staleEntries);
+                Classify(entry, utcNow, staleAfter, ref totalEntries, ref entriesWithActiveWaiter, ref unknownAgeEntries, ref unprobeableEntries, ref staleEntries);
         }
 
         return new AsyncResponseWatchdogReport(
             totalEntries,
             entriesWithActiveWaiter,
             staleEntries ?? [],
-            unknownAgeEntries);
+            unknownAgeEntries,
+            unprobeableEntries);
     }
 
     /// <summary>Prefers the entry with the oldest known registration; a known age beats an unknown one.</summary>
@@ -184,6 +243,7 @@ public sealed record AsyncResponseWatchdogReport(
         ref int totalEntries,
         ref int entriesWithActiveWaiter,
         ref int unknownAgeEntries,
+        ref int unprobeableEntries,
         ref List<RecoveryStateObservation>? staleEntries)
     {
         totalEntries++;
@@ -194,9 +254,13 @@ public sealed record AsyncResponseWatchdogReport(
             return;
         }
 
-        // Negative liveness means it could not be probed; never flag those as stale.
+        // Negative liveness means it could not be probed; never flag those as stale, but count
+        // them — dropped from every bucket, a probe outage would read as a clean pass.
         if (activeSubscribers != 0)
+        {
+            unprobeableEntries++;
             return;
+        }
 
         if (entry.RegisteredAtUtc is not { } registeredAtUtc)
         {
@@ -249,8 +313,6 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         _options.Validate();
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logger = logger;
-
-        AsyncResponseDiagnostics.EnsureWatchdogGauges(state);
     }
 
     /// <inheritdoc />
@@ -258,15 +320,23 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
     {
         if (!_options.Enabled)
         {
+            _state.MarkIdle($"disabled via {nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}.{nameof(AsyncResponseWatchdogOptions.Enabled)}");
             _logger.LogInformation("Recovery watchdog disabled via options; not scanning.");
             return;
         }
 
         if (_scanner is null)
         {
+            _state.MarkIdle($"no {nameof(IRecoveryStateScanner)} registered (the configured channel does not support scanning)");
             _logger.LogInformation("Recovery watchdog idle: no IRecoveryStateScanner registered (the configured channel does not support scanning).");
             return;
         }
+
+        // Only a watchdog that actually scans may take over the process-wide gauge holder: a
+        // disabled or scanner-less host (the documented multi-host pattern) would otherwise
+        // permanently zero the gauges for the host that does scan.
+        _state.MarkScanning(_timeProvider.GetUtcNow().UtcDateTime, _options.StartupDelay, _options.Interval);
+        AsyncResponseDiagnostics.EnsureWatchdogGauges(_state);
 
         _logger.LogInformation("Recovery watchdog started. Interval: {Interval}, stale threshold: {StaleAfter}.", _options.Interval, _options.StaleAfter);
 
@@ -298,6 +368,28 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         {
             // Host shutdown.
         }
+    }
+
+    /// <inheritdoc />
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            AsyncResponseDiagnostics.ReleaseWatchdogGauges(_state);
+        }
+    }
+
+    /// <inheritdoc />
+    public override void Dispose()
+    {
+        // Covers hosts torn down without a graceful StopAsync. The release is identity-conditional
+        // and idempotent, so the double call on the graceful path is harmless.
+        AsyncResponseDiagnostics.ReleaseWatchdogGauges(_state);
+        base.Dispose();
     }
 
     private async Task<AsyncResponseWatchdogReport> ScanOnceAsync(CancellationToken cancellationToken)
@@ -353,34 +445,38 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                 }
             }
 
-            // Phase 2 — one liveness probe per unique correlation id, then the same pure
+            // Phase 2 — one liveness probe per unique correlation id, fanned out with bounded
+            // concurrency (each probe is its own channel round trip; strictly sequential awaits
+            // would serialize up to MaxScanEntries of them per scan), then the same pure
             // classifier the report type exposes publicly, so this scan and Evaluate (the tested
             // and benchmarked surface) can never drift apart again.
-            var observations = new List<RecoveryStateObservation>((byCorrelationId?.Count ?? 0) + (ungrouped?.Count ?? 0));
+            var pending = new List<(string? CorrelationId, DateTime? RegisteredAtUtc, string? PayloadTypeFullName)>(BufferedCount());
 
             if (byCorrelationId is not null)
             {
                 foreach (var (correlationId, entry) in byCorrelationId)
-                {
-                    observations.Add(new RecoveryStateObservation(
-                        correlationId,
-                        entry.RegisteredAtUtc,
-                        await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false),
-                        entry.PayloadTypeFullName));
-                }
+                    pending.Add((correlationId, entry.RegisteredAtUtc, entry.PayloadTypeFullName));
             }
 
             if (ungrouped is not null)
-            {
-                foreach (var entry in ungrouped)
+                pending.AddRange(ungrouped);
+
+            // Per-slot writes keep the result independent of probe completion order. A probe
+            // canceled by shutdown still aborts the whole fan-out: CountActiveSubscribersAsync
+            // rethrows, and ForEachAsync cancels its siblings and surfaces the cancellation.
+            var observations = new RecoveryStateObservation[pending.Count];
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, pending.Count),
+                new ParallelOptions { MaxDegreeOfParallelism = _options.ProbeConcurrency, CancellationToken = cancellationToken },
+                async (index, ct) =>
                 {
-                    observations.Add(new RecoveryStateObservation(
-                        entry.CorrelationId,
-                        entry.RegisteredAtUtc,
-                        await CountActiveSubscribersAsync(entry.CorrelationId, cancellationToken).ConfigureAwait(false),
-                        entry.PayloadTypeFullName));
-                }
-            }
+                    var (correlationId, registeredAtUtc, payloadTypeFullName) = pending[index];
+                    observations[index] = new RecoveryStateObservation(
+                        correlationId,
+                        registeredAtUtc,
+                        await CountActiveSubscribersAsync(correlationId, ct).ConfigureAwait(false),
+                        payloadTypeFullName);
+                }).ConfigureAwait(false);
 
             var report = AsyncResponseWatchdogReport.Evaluate(observations, _timeProvider.GetUtcNow().UtcDateTime, _options.StaleAfter);
 
@@ -400,8 +496,9 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
             activity?.SetTag("asyncresponse.watchdog.active_waiters", report.EntriesWithActiveWaiter);
             activity?.SetTag("asyncresponse.watchdog.stale_entries", report.StaleEntries.Count);
             activity?.SetTag("asyncresponse.watchdog.unknown_age_entries", report.UnknownAgeEntries);
+            activity?.SetTag("asyncresponse.watchdog.unprobeable_entries", report.UnprobeableEntries);
 
-            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries);
+            _logger.LogInformation("Recovery watchdog scan complete. Outstanding registrations: {Total}, with live waiter: {Active}, stale (no waiter, older than {StaleAfter}): {Stale}, unknown age: {UnknownAge}, liveness unprobeable: {Unprobeable}.", report.TotalEntries, report.EntriesWithActiveWaiter, _options.StaleAfter, report.StaleEntries.Count, report.UnknownAgeEntries, report.UnprobeableEntries);
 
             foreach (var stale in report.StaleEntries)
             {

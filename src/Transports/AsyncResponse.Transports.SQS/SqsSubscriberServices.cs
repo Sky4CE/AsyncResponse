@@ -43,38 +43,22 @@ internal abstract class SqsSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
-        var failures = 0;
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(queue, stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = AsyncResponseRetry.Backoff(
-                    failures,
-                    Options.SubscriberRetryBaseDelay,
-                    Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(
-                    ex,
-                    "SQS subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
-                    queue,
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
+        return SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(queue, ct),
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(
+                failures,
+                Options.SubscriberRetryBaseDelay,
+                Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "SQS subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
+                queue,
+                SubscriberRole,
+                retryDelay));
     }
 
     private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
@@ -182,7 +166,23 @@ internal abstract class SqsSubscriberService : BackgroundService
         finally
         {
             renewalCancellation.Cancel();
-            await renewalTask.ConfigureAwait(false);
+            try
+            {
+                // Cancellation exits the sweep between messages and reaches the in-flight
+                // ChangeVisibility call through its token, so this join normally completes at
+                // once. The bound covers the one case the token cannot end promptly — an SDK call
+                // mid-retry against a degraded endpoint — which would otherwise stall the receive
+                // loop (and, at shutdown, the host's stop budget) for the SDK retry budget.
+                await renewalTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                Logger.LogWarning(
+                    "SQS visibility renewal for {Queue} ({Role}) did not stop within the shutdown budget ({ShutdownTimeout}); abandoning the renewal task.",
+                    queue,
+                    SubscriberRole,
+                    Options.ShutdownTimeout);
+            }
         }
     }
 

@@ -106,10 +106,21 @@ public sealed class KafkaSubscriberOptions
 
     /// <summary>
     /// Maximum delay between in-process handler retry attempts. Keep the total retry budget well
-    /// below the consumer's <c>max.poll.interval.ms</c> (default 5 minutes) or the broker will
-    /// evict the consumer from its group mid-retry. Default: <c>5s</c>.
+    /// below <see cref="MaxPollInterval"/> or the broker will evict the consumer from its group
+    /// mid-retry. Default: <c>5s</c>.
     /// </summary>
     public TimeSpan HandlerRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Maximum gap between consumer polls before the broker evicts this consumer from its group
+    /// and rebalances its partitions (the librdkafka <c>max.poll.interval.ms</c>). The in-process
+    /// handler retry delays run on the poll thread, so validation requires the worst-case retry
+    /// delay budget plus <see cref="PollTimeout"/> to fit within half this interval; handler
+    /// execution time itself is not bounded by the library and remains the operator's
+    /// responsibility, as does the unlimited-retry mode (<see cref="MaxDeliveryAttempts"/> =
+    /// <c>0</c>). Default: <c>5 minutes</c> (the librdkafka default).
+    /// </summary>
+    public TimeSpan MaxPollInterval { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// Number of background workers used by <see cref="KafkaAckMode.AckAfterEnqueue"/>.

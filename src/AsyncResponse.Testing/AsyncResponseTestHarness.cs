@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -249,7 +250,6 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     private void BuildProvider()
     {
         var services = new ServiceCollection();
-        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
 
         // The engine clock, the shared durable state, and the harness observers go in FIRST so the
         // TryAdd registrations inside AddAsyncResponse()/With*() adopt them.
@@ -261,6 +261,25 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
             services.AddSingleton<IDurableFlowExecutionObserver>(observer);
 
         _options.ConfigureServices?.Invoke(services);
+
+        // The engine resolves the LAST TimeProvider registration, so a clock registered in
+        // ConfigureServices would silently displace the virtual one: no engine timer ever arms,
+        // AdvanceAsync advances a clock nothing reads, and every wait dies as an unexplained
+        // RealTimeGuard timeout. Fail construction instead, naming the fix.
+        var lastClock = services.LastOrDefault(d => !d.IsKeyedService && d.ServiceType == typeof(TimeProvider));
+        if (lastClock is null || !ReferenceEquals(lastClock.ImplementationInstance, Clock))
+        {
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseTestHarness)} drives the whole engine on its own virtual clock; a TimeProvider " +
+                "registered via ConfigureServices would displace it and no timer, timeout, lease, or backoff would " +
+                "ever elapse. Use harness.Clock / AdvanceAsync instead of registering your own TimeProvider.");
+        }
+
+        // Fallback only, and only AFTER the user's registrations: AddLogging registers ILogger<>
+        // with TryAdd semantics, so a non-Try registration made before ConfigureServices would
+        // silently pin NullLogger and swallow the very diagnostics the harness's failure messages
+        // tell users to check.
+        services.TryAddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
 
         var builder = services.AddAsyncResponse()
             .WithInMemoryChannel(channel =>

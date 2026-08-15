@@ -7,6 +7,7 @@ using Moq;
 using StackExchange.Redis;
 using System.Net;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using Xunit;
 
@@ -385,6 +386,51 @@ public class RedisAsyncResponseChannelWaiterTests
         await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
         await Eventually(() => _channelSubscriber.UnsubscribeCount == 1);
         _store.Verify(s => s.TryDeleteAsync("corr-timeout", It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
+    {
+        // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
+        // logger provider that throws on the timeout warning) must be caught and logged through
+        // the error path, not die as an unobserved task fault.
+        var logger = new RecordingThrowingLogger<RedisAsyncResponseChannel> { ThrowOnMessageContaining = "Timed out waiting" };
+        var channel = CreateChannel(new RedisAsyncResponseOptions
+        {
+            DefaultTimeout = TimeSpan.FromSeconds(5),
+            RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+        }, logger);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-timeout-throws",
+            timeout: TimeSpan.FromMilliseconds(5));
+
+        await Eventually(() => logger.HasEntry(LogLevel.Error, "Error handling waiter timeout"));
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_NonAsciiPayload_RoundTripsThroughTheUtf8BytePath()
+    {
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-utf8",
+            timeout: TimeSpan.FromSeconds(5));
+
+        // Delivered as raw UTF-8 bytes, exactly how StackExchange.Redis hands pub/sub values
+        // over; the message covers 2-, 3-, and 4-byte UTF-8 sequences.
+        var message = "Grüße 数据 🚀";
+        var json = JsonSerializer.Serialize(new AsyncResponseEnvelope<OperationResult>
+        {
+            Success = true,
+            Payload = new OperationResult { Status = OperationStatus.Completed, Message = message }
+        }, AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+        await _channelSubscriber.Handler!.Invoke(
+            _channelSubscriber.SubscribedChannel,
+            Encoding.UTF8.GetBytes(json));
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(message, result.Message);
     }
 
     [Fact]

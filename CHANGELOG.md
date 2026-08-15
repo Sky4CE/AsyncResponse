@@ -11,6 +11,49 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
 
 ## [Unreleased]
 
+### Changed
+
+- **The in-memory worker transport now wire round-trips every published job**, matching every
+  broker-backed transport: each publish serializes the job envelope to its wire JSON, and the
+  worker receives an instance materialized back from those bytes rather than the caller's live
+  object.
+  > **In-process production behavior change.** `[JsonIgnore]`-annotated argument state is now
+  > excluded from what the handler sees (it was visible before); mutating an argument object after
+  > `PublishAsync` returns no longer reaches the handler; and a non-serializable argument now
+  > throws at publish instead of silently working — exactly the failure mode every broker-backed
+  > transport already had. Tests and single-node deployments that relied on the old
+  > pass-by-reference behavior will see it change. The enqueuer's captured `ExecutionContext`
+  > (trace id, principal, logging scope) still flows unchanged — that was never envelope state.
+- **Recovery health-check data keys renamed and added.** `scanIntervalMinutes` is replaced by
+  `scanInterval` (human-readable) and `scanIntervalSeconds` (a lossless numeric — the old
+  whole-minutes value read `0` for any sub-minute `Watchdog.Interval`). New keys: `scanning` and
+  `reason` (why a deliberately idle host isn't scanning), `firstScanDueByUtc` (an armed watchdog's
+  first-scan deadline), and `stats.unprobeable` (entries whose liveness couldn't be probed on the
+  last scan). See [recovery.md](docs/recovery.md#the-recovery-watchdog--health-check).
+- A **Success envelope with a JSON-null payload now faults the delivery** instead of completing
+  the waiter with `null`. The shared envelope converter rejects it (`JsonException`) on every
+  broker-backed channel, and the in-memory channel's own raw-dispatch and per-waiter
+  materialization paths apply the equivalent guard. Previously a producer publishing a literal
+  `null` body — or a raw ingress wrapping one through verbatim — completed a non-nullable `T`
+  waiter with `null`, so the first `NullReferenceException` surfaced at the consumer, far from the
+  message that caused it.
+- **Redis recovery-state blob format changed.** Registrations sharing one correlation id's key now
+  each carry their own expiry inside an enveloped blob, instead of one bare JSON array sharing the
+  key's TTL — a stream of fresh registrations for one id can no longer keep a dead sibling
+  recoverable, nor truncate a longer-lived one. New builds still read old (bare-array) blobs.
+  **Rolling-deploy caveat: an OLD build cannot read a blob a NEW build has written** — sequence the
+  Redis channel package upgrade accordingly, or accept that recovery registrations saved mid-rollout
+  by an upgraded host are invisible to not-yet-upgraded hosts until they too upgrade.
+- NATS worker/response consumption switched from an open-ended prefetch stream to bounded
+  batch-fetch dispatch, with an in-progress (`AckProgress`) heartbeat covering the whole in-flight
+  batch so `AckWait` no longer has to exceed the slowest handler. Redis Streams batches get the
+  equivalent: a periodic `XCLAIM ... JUSTID` idle-time refresh for entries still queued behind a
+  slow handler, which resets idle time without bumping the PEL delivery count.
+- New options: `SqsAsyncResponseOptions.ShutdownTimeout` (5 s),
+  `RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay` / `SubscriberRetryMaxDelay` (250 ms /
+  5 s), `AsyncResponseWatchdogOptions.ProbeConcurrency` (8), `KafkaSubscriberOptions.MaxPollInterval`
+  (5 minutes), and the additive `FlowStepState.AwaitDeadlineUtc` wire property.
+
 ### Added
 
 - **Durable timers inside flows** — `IDurableFlowContext.DelayAsync(name, delay)` and
@@ -183,7 +226,7 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   broker transports that already had it, so early-ACK drain budgets can be validated against host
   shutdown on every transport.
 - Lock/visibility renewal: the Azure Service Bus subscriber renews the peek-lock of unsettled
-  batch messages (`LockRenewalInterval`, default 30 s), SQS gains an opt-in visibility heartbeat
+  batch messages (`LockRenewalInterval`, default 10 s), SQS gains an opt-in visibility heartbeat
   (`VisibilityRenewalInterval`), and the PostgreSQL, SQL Server, and MongoDB transports renew a
   claimed row's lease automatically (fenced by `lock_id`) while its handler runs.
 - `MaxStateBytes` flow-store option — an explicit cap on persisted flow-state size, replacing

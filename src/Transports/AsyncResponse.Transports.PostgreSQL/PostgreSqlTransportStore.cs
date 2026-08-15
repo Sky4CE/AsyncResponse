@@ -4,7 +4,6 @@ using Npgsql;
 using NpgsqlTypes;
 using System.Runtime.CompilerServices;
 using System.Text;
-using System.Text.Json;
 
 using AsyncResponse.Internal;
 
@@ -63,7 +62,7 @@ internal sealed class PostgreSqlTransportStore
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -75,60 +74,74 @@ internal sealed class PostgreSqlTransportStore
             await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
-            // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
-            // concurrent create of the same object: two instances starting together both pass the existence
-            // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
-            // transaction-scoped advisory lock (keyed by schema, shared with the channel store) lets one
-            // instance build the schema while the rest wait and then find it already present.
-            await using (var lockCommand = connection.CreateCommand())
+            if (_options.AutoCreateSchema)
             {
-                lockCommand.Transaction = transaction;
-                lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
-                lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
-                await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
+                // Serialize schema creation across processes. CREATE ... IF NOT EXISTS is not atomic against a
+                // concurrent create of the same object: two instances starting together both pass the existence
+                // check and collide on the system catalog ("duplicate key ... pg_type_typname_nsp_index"). A
+                // transaction-scoped advisory lock (keyed by schema, shared with the channel store) lets one
+                // instance build the schema while the rest wait and then find it already present.
+                await using (var lockCommand = connection.CreateCommand())
+                {
+                    lockCommand.Transaction = transaction;
+                    lockCommand.CommandText = "SELECT pg_advisory_xact_lock(@lock_key);";
+                    lockCommand.Parameters.AddWithValue("lock_key", _schemaLockKey);
+                    await lockCommand.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
 
-            await using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText =
-                $"""
-                CREATE SCHEMA IF NOT EXISTS {Schema};
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS {Schema};
 
-                CREATE TABLE IF NOT EXISTS {MessageTable} (
-                    id uuid PRIMARY KEY,
-                    queue text NOT NULL,
-                    payload_json jsonb NOT NULL,
-                    headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
-                    created_at timestamptz NOT NULL DEFAULT now(),
-                    available_at timestamptz NOT NULL DEFAULT now(),
-                    locked_until timestamptz NULL,
-                    lock_id uuid NULL,
-                    attempts integer NOT NULL DEFAULT 0,
-                    dead_letter_reason text NULL
-                );
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "claim"))}
-                    ON {MessageTable} (queue, available_at, locked_until, created_at);
-                CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "created"))}
-                    ON {MessageTable} (created_at);
-                """;
-            try
-            {
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                    CREATE TABLE IF NOT EXISTS {MessageTable} (
+                        id uuid PRIMARY KEY,
+                        queue text NOT NULL,
+                        payload_json jsonb NOT NULL,
+                        headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        available_at timestamptz NOT NULL DEFAULT now(),
+                        locked_until timestamptz NULL,
+                        lock_id uuid NULL,
+                        attempts integer NOT NULL DEFAULT 0,
+                        dead_letter_reason text NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "claim"))}
+                        ON {MessageTable} (queue, available_at, locked_until, created_at);
+                    CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "created"))}
+                        ON {MessageTable} (created_at);
+                    """;
+                try
+                {
+                    await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+                {
+                    // E.g. CREATE INDEX ... ON a name that is really another component's index:
+                    // IF NOT EXISTS skipped the table create, and the dependent statement then hits
+                    // the wrong relation kind mid-batch — surface the namespace collision instead of
+                    // the raw "cannot open relation".
+                    throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
+                }
             }
-            catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.WrongObjectType or PostgresErrorCodes.UndefinedColumn)
+            else if (!await TableExistsAsync(connection, transaction, cancellationToken).ConfigureAwait(false))
             {
-                // E.g. CREATE INDEX ... ON a name that is really another component's index:
-                // IF NOT EXISTS skipped the table create, and the dependent statement then hits
-                // the wrong relation kind mid-batch — surface the namespace collision instead of
-                // the raw "cannot open relation".
-                throw new InvalidOperationException(PostgreSqlRelationVerifier.DdlCollisionMessage("transport", _options.SchemaName), ex);
+                // Operator-managed schema and the migration has not run yet: the first query
+                // surfaces a clear PostgreSQL error (the documented "create it yourself, later"
+                // workflow), and _created stays unlatched so a later operation re-verifies once
+                // the migration lands. When the relation DOES exist it flows into the same catalog
+                // verification the DDL path uses — operator-provisioned schemas are exactly what
+                // that check exists for.
+                return;
             }
 
             // The transport can share a schema with the channel and durable-flow stores (and
             // unrelated objects), whose derived names its own validation cannot see — and
-            // IF NOT EXISTS also accepts a same-name index with the WRONG definition. Verify
-            // against the catalog, in-transaction under the shared DDL lock, that every relation
-            // actually IS what the DDL above intended, definitions included.
+            // IF NOT EXISTS also accepts a same-name index with the WRONG definition, exactly as
+            // an operator-provisioned table can carry the wrong shape. Verify against the catalog
+            // that every relation actually IS what this store reads and writes, definitions
+            // included (in-transaction, under the shared DDL lock when this build just ran the DDL).
             await PostgreSqlRelationVerifier.VerifyAsync(
                 connection,
                 transaction,
@@ -138,7 +151,7 @@ internal sealed class PostgreSqlTransportStore
                     new(_options.MessageTable, 'r', Columns:
                         [
                             new("id", "uuid", Nullable: false),
-                            new("queue", "text", Nullable: false),
+                            new("queue", "text", Nullable: false, RequiresDeterministicCollation: true),
                             new("payload_json", "jsonb", Nullable: false),
                             new("headers_json", "jsonb", Nullable: false, DefaultExpression: "jsonb_build_object()"),
                             new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
@@ -162,6 +175,27 @@ internal sealed class PostgreSqlTransportStore
         }
     }
 
+    /// <summary>
+    /// Reports whether ANY relation occupies the configured queue-table name (any relkind: a view
+    /// or foreign component's object must reach verification, which names the precise wrong-kind
+    /// reason instead of skipping the checks).
+    /// </summary>
+    private async Task<bool> TableExistsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = @schema AND c.relname = @table);
+            """;
+        command.Parameters.AddWithValue("schema", _options.SchemaName);
+        command.Parameters.AddWithValue("table", _options.MessageTable);
+        return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+    }
 
     /// <summary>
     /// Publishes a queue row. The caller supplies the id so a retried publish is idempotent
@@ -453,23 +487,11 @@ internal sealed class PostgreSqlTransportStore
             && Interlocked.CompareExchange(ref _lastDeadLetterPruneTicks, now, last) == last;
     }
 
+    // Lenient by contract (see DbTransportHeaders): this runs after the claim already committed
+    // attempts+1/lock_id, so rejecting any JSON the column legally holds would create an
+    // unkillable poison row.
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
-    {
-        var parsed = AsyncResponseJson.Deserialize<Dictionary<string, string>>(json);
-        if (parsed is null)
-            return EmptyHeaders;
-
-        // Indexer, not the copying constructor: rows can be written by foreign producers, and JSON
-        // legally carries keys differing only in case — the constructor's internal Add would throw
-        // AFTER the claim already committed attempts+1/lock_id, before any delivery exists, so the
-        // row could never reach HandleFailureAsync or dead-letter: an unkillable poison row that
-        // tears down the subscriber on every re-claim. Last-wins, matching the ASB/SQS receive
-        // adapters.
-        var headers = new Dictionary<string, string>(parsed.Count, StringComparer.OrdinalIgnoreCase);
-        foreach (var pair in parsed)
-            headers[pair.Key] = pair.Value;
-        return headers;
-    }
+        => DbTransportHeaders.Materialize(json);
 
     private static string Sanitize(string value) => value.Replace('\r', ' ').Replace('\n', ' ');
 

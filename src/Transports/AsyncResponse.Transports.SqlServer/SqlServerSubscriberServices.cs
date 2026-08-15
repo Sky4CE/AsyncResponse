@@ -52,29 +52,12 @@ internal abstract class SqlServerSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay);
-                await Task.Delay(delay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, delay) => Logger.LogWarning(ex, "SQL Server subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
@@ -88,23 +71,28 @@ internal abstract class SqlServerSubscriberService : BackgroundService
             if (queue is null || string.Equals(queue, Queue, StringComparison.Ordinal))
                 _signals.Writer.TryWrite(true);
         };
-        _store.MessagePublished += onPublished;
 
-        await using var dispatcher = new SqlServerMessageDispatcher(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            Role);
-
-        Logger.LogInformation(
-            "SQL Server subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
-            Queue,
-            Role,
-            SubscriberOptions.AckMode);
-
+        // The subscription happens inside the try so ANY escape — the dispatcher's constructor
+        // included — runs the unsubscribing finally: the store is a singleton, so a handler leaked
+        // by one failed run survives every retry and every later publish invokes it. A -= that the
+        // += never preceded is a harmless no-op.
         try
         {
+            _store.MessagePublished += onPublished;
+
+            await using var dispatcher = new SqlServerMessageDispatcher(
+                HandleMessageAsync,
+                Options,
+                SubscriberOptions,
+                Logger,
+                Role);
+
+            Logger.LogInformation(
+                "SQL Server subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
+                Queue,
+                Role,
+                SubscriberOptions.AckMode);
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 var claimed = 0;

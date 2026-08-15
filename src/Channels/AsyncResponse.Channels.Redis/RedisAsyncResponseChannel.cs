@@ -126,7 +126,6 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         // on some channels entirely, insta-timing-out a fully registered waiter.
         AsyncResponseChannelOptions.EnsureWaiterTimeoutSupported(timeout.Value);
 
-        var storedCorrelationId = correlationId;
         // Capture the subscribe-time ExecutionContext so app AsyncLocals (trace, principal, logging
         // scope) flow into the message handler, which runs on a foreign Redis subscriber thread.
         var capturedContext = ExecutionContext.Capture();
@@ -140,309 +139,20 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         if (_logger.IsEnabled(LogLevel.Debug))
             _logger.LogDebug("Waiting for response on correlationId {CorrelationId} with timeout {Timeout}.", correlationId, timeout.Value);
 
-        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var registrationId = Guid.NewGuid();
+        var subscription = new RedisSubscription<T>(
+            this,
+            correlationId,
+            channel,
+            registrationId: Guid.NewGuid(),
+            completionPredicate,
+            capturedContext,
+            activity);
+        var channelName = subscription.ChannelName;
 
         // Single-use cancellation token implementing the timeout. The timer is armed only
         // after subscribe + recovery-state save succeeds, but the callback is registered before
         // subscribing so a very fast terminal message can still clean up safely.
-        var cancellationTokenSource = new CancellationTokenSource();
-        CancellationTokenRegistration timeoutRegistration = default;
-        IRedisChannelSubscription? subscription = null;
-        var executorRegistered = false;
-
-        // -------------------------------------------------------------------------
-        // Local: CleanupOnceAsync
-        // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
-        // happen once no matter whether completion, timeout, or waiter disposal got there first.
-        int cleanupStarted = 0;
-        var cleanupGate = new object();
-        Task? cleanupTask = null;
-
-        // Task-latched so EVERY caller completes only when the one real cleanup has finished —
-        // the previous fire-once int latch let a second caller (a disposing waiter racing the
-        // timeout) return before the task was settled.
-        ValueTask CleanupOnceAsync()
-        {
-            Task task;
-            lock (cleanupGate)
-            {
-                task = cleanupTask ??= CleanupCoreAsync();
-            }
-
-            return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
-        }
-
-        // Dispose-path cleanup: DRAINS the per-channel serial executor before settling. A delivery
-        // may be mid Until-predicate holding a claimed terminal message; the marker work item
-        // completes only after that in-flight item finished, so by the time cleanup cancels, the
-        // task is either settled by the delivery or genuinely undelivered — never a cancellation
-        // stealing a consumed response. Must NOT be called from dispatch code (which runs ON the
-        // executor): the dispatch-triggered cleanup uses CleanupOnceAsync directly, its task
-        // already settled.
-        //
-        // The drain is bounded by DisposalDrainTimeout — one budget covering marker ADMISSION too
-        // (a full bounded queue behind a wedged item blocks the enqueue itself). A lapsed budget
-        // must not fall back to the cleanup's cancel: the wedged delivery holds a message already
-        // consumed from the stream, and "canceled" would tell a re-attaching caller nothing was
-        // delivered. It faults the task with the explicit indeterminate contract instead, routing
-        // durable flows to a fresh idempotent restart. A tombstone-suppressed enqueue is the
-        // opposite case — the retired executor finished everything it ever admitted, so nothing
-        // is in flight and the plain cancel is truthful.
-        async ValueTask DrainThenCleanupAsync()
-        {
-            if (Volatile.Read(ref cleanupStarted) == 0 && executorRegistered)
-            {
-                var drainTimeout = _options.DisposalDrainTimeout;
-                var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                try
-                {
-                    using var budget = new CancellationTokenSource(drainTimeout);
-                    var accepted = await _executors.EnqueueAsync(channel.ToString()!, () =>
-                    {
-                        drained.TrySetResult();
-                        return Task.CompletedTask;
-                    }, budget.Token).ConfigureAwait(false);
-                    if (accepted)
-                        await drained.Task.WaitAsync(budget.Token).ConfigureAwait(false);
-                }
-                catch (Exception drainEx)
-                {
-                    // Budget lapse — or an unforeseen drain failure: either way the marker never
-                    // ran, so an in-flight delivery cannot be ruled out (only accepted=false
-                    // proves the executor finished everything). Settlement unproven means the
-                    // cleanup's cancel below would be a false "nothing was delivered" — fault
-                    // with the explicit indeterminate contract instead. A TrySetResult from the
-                    // late-finishing dispatch loses against this and is dropped; its cleanup
-                    // call is a no-op behind the latch.
-                    _logger.LogWarning(
-                        "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
-                        correlationId, drainTimeout);
-                    AsyncResponseDiagnostics.SetError(activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
-                    if (drainEx is not OperationCanceledException)
-                        _logger.LogDebug(drainEx, "Dispatch drain failed for channel {Channel}.", channel.ToString()!);
-                    tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(correlationId, drainTimeout));
-                }
-            }
-
-            await CleanupOnceAsync().ConfigureAwait(false);
-        }
-
-        async Task CleanupCoreAsync()
-        {
-            Interlocked.Exchange(ref cleanupStarted, 1);
-
-            // A waiter disposed before any terminal signal must not leave ResponseTask pending
-            // forever for callers that hold it directly — the timeout dies with this cleanup, so
-            // nothing else could ever complete the task. Cancellation is a no-op after a normal
-            // completion, timeout, or fault (and after a delivery drained by DrainThenCleanupAsync).
-            tcs.TrySetCanceled();
-
-            try
-            {
-                try
-                {
-                    // Delete the recovery state BEFORE unsubscribing. In the reverse order a publish
-                    // landing in the window sees "no subscriber, state present" and fires a spurious
-                    // recovery callback for a wait that already reached a terminal state. In this
-                    // order the window shows a subscriber that drops the message — a late or duplicate
-                    // terminal message is droppable; a resurrected recovery callback is not.
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    // Best-effort: the state expires on its own, and a transient store failure must
-                    // not skip the unsubscribe and executor teardown below.
-                    _logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", correlationId);
-                }
-
-                try
-                {
-                    // Bounded like the drain: this latched core is what a disposing waiter awaits
-                    // when terminal delivery started cleanup first, so an unbudgeted unsubscribe
-                    // would let a wedged client library hold DisposeAsync hostage past
-                    // DisposalDrainTimeout. The quiet wrapper logs its own failure — including
-                    // one that completes AFTER this wait was abandoned, which previously died as
-                    // a TaskScheduler.UnobservedTaskException nobody logged.
-                    if (subscription is not null)
-                        await UnsubscribeQuietlyAsync(subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
-                }
-                catch (TimeoutException)
-                {
-                    _logger.LogError(
-                        "Unsubscribe for channel {Channel} did not finish within {DisposalDrainTimeout}; abandoning the wait (its outcome is logged when it completes).",
-                        channel.ToString()!, _options.DisposalDrainTimeout);
-                }
-            }
-            finally
-            {
-                // Purely local teardown runs no matter which network call above failed — the
-                // cleanup latch is already set, so anything skipped here would leak until process
-                // exit.
-                if (executorRegistered)
-                    _executors.OnSubscriptionRetired(channel.ToString()!);
-
-                // Schedule the disposal on the thread pool; do not await directly to prevent
-                // deadlocks with work currently running on the executor.
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await _executors.RemoveAsync(channel.ToString()!).ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", channel.ToString()!);
-                    }
-                });
-
-                await timeoutRegistration.DisposeAsync().ConfigureAwait(false);
-                cancellationTokenSource.Dispose();
-                activity?.Dispose();
-            }
-        }
-
-        // Never faults: the unsubscribe outcome is logged HERE, so a teardown outliving the
-        // bounded wait above still records its failure instead of surfacing as an unobserved
-        // task exception.
-        async Task UnsubscribeQuietlyAsync(IRedisChannelSubscription liveSubscription)
-        {
-            try
-            {
-                await liveSubscription.DisposeAsync().ConfigureAwait(false);
-                _logger.LogDebug("Unsubscribed from channel {Channel}.", channel.ToString()!);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", channel.ToString()!);
-            }
-        }
-
-        // -------------------------------------------------------------------------
-        // Local: ProcessRedisMessageAsync
-        // Deserializes and handles a single incoming envelope, completes the TCS when terminal.
-        async Task ProcessRedisMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
-        {
-            _logger.LogDebug("Received message on channel {Channel}.", messageChannel.ToString()!);
-
-            bool finished = false;
-            try
-            {
-                var envelope = JsonSerializer.Deserialize(messageValue.ToString(), AsyncResponseEnvelopeJson.TypeInfo<T>());
-
-                if (envelope == null)
-                {
-                    _logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", correlationId);
-
-                    finished = true;
-                    var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {correlationId}.");
-                    AsyncResponseDiagnostics.SetError(activity, "deserialize_failure", deserializationError.Message);
-                    if (!tcs.TrySetException(deserializationError))
-                        _logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
-                }
-                else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
-                {
-                    finished = true;
-                    var schemaError = new InvalidOperationException(
-                        $"Response envelope for correlationId {correlationId} has schema version {envelope.SchemaVersion}, " +
-                        $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
-                    AsyncResponseDiagnostics.SetError(activity, "schema_mismatch", schemaError.Message);
-                    if (!tcs.TrySetException(schemaError))
-                        _logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
-                }
-                else if (!envelope.Success)
-                {
-                    finished = true;
-                    var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
-                    if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
-                    {
-                        // Cap on receive too: the publish-side cap only bounds traces we emit, not what
-                        // a remote we do not control can push at us.
-                        remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _options.MaxRemoteStackTraceLength);
-                    }
-
-                    _logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", correlationId, envelope.ExceptionMessage);
-                    AsyncResponseDiagnostics.SetError(activity, "remote_failure", remoteFailure.Message);
-                    if (!tcs.TrySetException(remoteFailure))
-                        _logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
-                }
-                else
-                {
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug("Received response for correlationId {CorrelationId}.", correlationId);
-
-                    finished = await completionPredicate(envelope.Payload!).ConfigureAwait(false);
-
-                    if (finished && !tcs.TrySetResult(envelope.Payload!))
-                        _logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error processing message on channel {Channel} for correlationId {CorrelationId}.", messageChannel.ToString()!, correlationId);
-
-                finished = true;
-                AsyncResponseDiagnostics.SetError(activity, ex);
-                if (!tcs.TrySetException(ex))
-                    _logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", correlationId);
-            }
-            finally
-            {
-                // Unsubscription also happens on dispose, but doing it immediately after the
-                // terminal message releases resources sooner.
-                if (finished)
-                    await CleanupOnceAsync().ConfigureAwait(false);
-            }
-        }
-
-        // -------------------------------------------------------------------------
-        // Local: HandleMessageAsync
-        // Receives pub/sub messages from the async subscription and enqueues them on the
-        // per-channel executor, awaiting admission so executor backpressure reaches the
-        // subscription's message loop instead of blocking a Redis reader thread.
-        Task HandleMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
-        {
-            // The registry coordinates create/enqueue/retire under one lock, so the message is never
-            // enqueued onto an executor that is concurrently being torn down (no lost messages) and a
-            // correlation-id reused mid-drain never produces two live executors for one channel.
-            var enqueue = _executors.EnqueueAsync(
-                messageChannel.ToString()!,
-                () => ProcessUnderCapturedContextAsync(messageChannel, messageValue));
-            return enqueue.IsCompletedSuccessfully ? Task.CompletedTask : enqueue.AsTask();
-        }
-
-        // -------------------------------------------------------------------------
-        // Local: ProcessUnderCapturedContextAsync
-        // Restores the waiter's subscribe-time ExecutionContext (app AsyncLocals: trace, principal,
-        // logging scope) plus the correlation id before processing — the Redis subscriber callback
-        // runs on a foreign thread-pool thread that never had them.
-        Task ProcessUnderCapturedContextAsync(RedisChannel messageChannel, RedisValue messageValue)
-        {
-            async Task ProcessAsync()
-            {
-                using var correlationScope = AsyncResponseContext.PushCorrelationId(storedCorrelationId);
-                await ProcessRedisMessageAsync(messageChannel, messageValue).ConfigureAwait(false);
-            }
-
-            if (capturedContext is null)
-                return ProcessAsync();
-
-            Task? task = null;
-            ExecutionContext.Run(capturedContext, _ => task = ProcessAsync(), null);
-            return task!;
-        }
-
-        timeoutRegistration = cancellationTokenSource.Token.Register(() =>
-        {
-            _ = Task.Run(async () =>
-            {
-                _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
-                AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
-                AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
-                tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                await DrainThenCleanupAsync().ConfigureAwait(false);
-            });
-        });
+        subscription.RegisterTimeoutCallback();
 
         try
         {
@@ -451,10 +161,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             // before it returns, and on a correlation id reused within the tombstone lifetime the
             // registry would silently drop them as retirement stragglers until this registration
             // is visible. The subscribe-failure path below retires it again.
-            _executors.OnSubscriptionRegistered(channel.ToString()!);
-            executorRegistered = true;
-            subscription = await _channelSubscriber.SubscribeAsync(channel, HandleMessageAsync).ConfigureAwait(false);
-            if (Volatile.Read(ref cleanupStarted) != 0)
+            _executors.OnSubscriptionRegistered(channelName);
+            subscription.ExecutorRegistered = true;
+            subscription.Subscription = await _channelSubscriber.SubscribeAsync(channel, subscription.HandleMessageAsync).ConfigureAwait(false);
+            if (subscription.CleanupStarted)
             {
                 // A message pumped inside SubscribeAsync completed the waiter and ran cleanup to
                 // the end before this assignment existed — its unsubscribe saw a null
@@ -465,17 +175,17 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // teardown fault must not fail the create.
                 try
                 {
-                    await UnsubscribeQuietlyAsync(subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
+                    await subscription.UnsubscribeQuietlyAsync(subscription.Subscription).WaitAsync(_options.DisposalDrainTimeout).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", channel.ToString()!);
+                    _logger.LogError(ex, "Post-registration unsubscribe for channel {Channel} failed; the subscription may linger until process exit.", channelName);
                 }
             }
 
             var recoveryState = new RecoveryState
             {
-                RegistrationId = registrationId,
+                RegistrationId = subscription.Id,
                 ResumeCallback = resumeCallback,
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
@@ -484,7 +194,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
-            if (Volatile.Read(ref cleanupStarted) != 0)
+            if (subscription.CleanupStarted)
             {
                 // A terminal delivery started cleanup while this registration was still being
                 // written: cleanup's delete ran before the save committed, so the save just
@@ -494,7 +204,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 // watchdog back a failed delete.
                 try
                 {
-                    await _recoveryStateStore.TryDeleteAsync(correlationId, registrationId).ConfigureAwait(false);
+                    await _recoveryStateStore.TryDeleteAsync(correlationId, subscription.Id).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -502,9 +212,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 }
             }
 
-            _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
+            _logger.LogDebug("Subscribed to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId);
         }
-        catch (Exception ex) when (tcs.Task.IsCompletedSuccessfully || tcs.Task.IsFaulted)
+        catch (Exception ex) when (subscription.ResponseTask.IsCompletedSuccessfully || subscription.ResponseTask.IsFaulted)
         {
             // The wait already settled: a delivery completed the waiter while this registration
             // step was still in flight (cleanup marks cleanupStarted just after setting the task,
@@ -524,9 +234,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channel.ToString()!, correlationId);
+            _logger.LogError(ex, "Failed to subscribe to channel {Channel} for correlationId {CorrelationId}.", channelName, correlationId);
             AsyncResponseDiagnostics.SetError(activity, "subscribe_failure", ex.Message);
-            await DrainThenCleanupAsync().ConfigureAwait(false);
+            await subscription.DrainThenCleanupAsync().ConfigureAwait(false);
 
             // Rethrow instead of returning a pre-faulted waiter: the builder's contract is that
             // the trigger runs only once the subscription AND recovery state exist. A returned
@@ -536,17 +246,384 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             throw;
         }
 
-        try
+        subscription.ArmTimeout(timeout.Value);
+
+        return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.DrainThenCleanupAsync);
+    }
+
+    /// <summary>
+    /// Per-waiter subscription state and lifecycle. A concrete class rather than closures over the
+    /// creating method: the message handler and timeout callback live for the whole wait — days
+    /// for a durable-flow await — and must retain only these fields, not a display class holding
+    /// every local of the registration scope. The channel-name string is rendered once here;
+    /// dispatch and cleanup key the executor registry with it instead of re-rendering the
+    /// <see cref="RedisChannel"/> per message.
+    /// </summary>
+    private sealed class RedisSubscription<T> where T : IAsyncResponsePayload
+    {
+        private readonly RedisAsyncResponseChannel _owner;
+        private readonly string _correlationId;
+        private readonly Func<T, ValueTask<bool>> _completionPredicate;
+        private readonly ExecutionContext? _capturedContext;
+        private readonly Activity? _activity;
+        private readonly TaskCompletionSource<T> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Single-use cancellation token implementing the waiter timeout.
+        private readonly CancellationTokenSource _cancellationTokenSource = new();
+        private CancellationTokenRegistration _timeoutRegistration;
+
+        // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
+        // happen once no matter whether completion, timeout, or waiter disposal got there first.
+        private int _cleanupStarted;
+        private readonly object _cleanupGate = new();
+        private Task? _cleanupTask;
+
+        public RedisSubscription(
+            RedisAsyncResponseChannel owner,
+            string correlationId,
+            RedisChannel channel,
+            Guid registrationId,
+            Func<T, ValueTask<bool>> completionPredicate,
+            ExecutionContext? capturedContext,
+            Activity? activity)
         {
-            if (Volatile.Read(ref cleanupStarted) == 0)
-                cancellationTokenSource.CancelAfter(timeout.Value);
-        }
-        catch (ObjectDisposedException)
-        {
-            // A response completed and cleaned up between the check and CancelAfter.
+            _owner = owner;
+            _correlationId = correlationId;
+            ChannelName = channel.ToString()!;
+            Id = registrationId;
+            _completionPredicate = completionPredicate;
+            _capturedContext = capturedContext;
+            _activity = activity;
         }
 
-        return new RedisAsyncResponseWaiter<T>(tcs.Task, DrainThenCleanupAsync);
+        /// <summary>Per-waiter registration id used for recovery-state cleanup.</summary>
+        public Guid Id { get; }
+        public string ChannelName { get; }
+        public Task<T> ResponseTask => _tcs.Task;
+        public bool CleanupStarted => Volatile.Read(ref _cleanupStarted) != 0;
+        public IRedisChannelSubscription? Subscription { get; set; }
+        public bool ExecutorRegistered { get; set; }
+
+        /// <summary>
+        /// Registers the timeout callback on the (not yet armed) token; the creator registers it
+        /// before subscribing so a very fast terminal message can still clean up safely.
+        /// </summary>
+        public void RegisterTimeoutCallback()
+            => _timeoutRegistration = _cancellationTokenSource.Token.Register(
+                static state => ((RedisSubscription<T>)state!).OnTimeout(), this);
+
+        /// <summary>Arms the timeout once registration has succeeded; a no-op after cleanup started.</summary>
+        public void ArmTimeout(TimeSpan timeout)
+        {
+            try
+            {
+                if (Volatile.Read(ref _cleanupStarted) == 0)
+                    _cancellationTokenSource.CancelAfter(timeout);
+            }
+            catch (ObjectDisposedException)
+            {
+                // A response completed and cleaned up between the check and CancelAfter.
+            }
+        }
+
+        private void OnTimeout()
+            => _ = Task.Run(async () =>
+            {
+                try
+                {
+                    _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId);
+                    AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}.");
+                    AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
+                    _tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."));
+                    await DrainThenCleanupAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
+                    _owner._logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", _correlationId);
+                }
+            });
+
+        /// <summary>
+        /// Receives pub/sub messages from the async subscription and enqueues them on the
+        /// per-channel executor, awaiting admission so executor backpressure reaches the
+        /// subscription's message loop instead of blocking a Redis reader thread.
+        /// </summary>
+        public Task HandleMessageAsync(RedisChannel messageChannel, RedisValue messageValue)
+        {
+            // The registry coordinates create/enqueue/retire under one lock, so the message is never
+            // enqueued onto an executor that is concurrently being torn down (no lost messages) and a
+            // correlation-id reused mid-drain never produces two live executors for one channel.
+            var enqueue = _owner._executors.EnqueueAsync(
+                ChannelName,
+                () => ProcessUnderCapturedContextAsync(messageValue));
+            return enqueue.IsCompletedSuccessfully ? Task.CompletedTask : enqueue.AsTask();
+        }
+
+        /// <summary>
+        /// Restores the waiter's subscribe-time ExecutionContext (app AsyncLocals: trace, principal,
+        /// logging scope) plus the correlation id before processing — the Redis subscriber callback
+        /// runs on a foreign thread-pool thread that never had them.
+        /// </summary>
+        private Task ProcessUnderCapturedContextAsync(RedisValue messageValue)
+        {
+            async Task ProcessAsync()
+            {
+                using var correlationScope = AsyncResponseContext.PushCorrelationId(_correlationId);
+                await ProcessMessageAsync(messageValue).ConfigureAwait(false);
+            }
+
+            if (_capturedContext is null)
+                return ProcessAsync();
+
+            Task? task = null;
+            ExecutionContext.Run(_capturedContext, _ => task = ProcessAsync(), null);
+            return task!;
+        }
+
+        /// <summary>Deserializes and handles a single incoming envelope, completes the TCS when terminal.</summary>
+        private async Task ProcessMessageAsync(RedisValue messageValue)
+        {
+            _owner._logger.LogDebug("Received message on channel {Channel}.", ChannelName);
+
+            bool finished = false;
+            try
+            {
+                // The delivered value is UTF-8 bytes; deserializing them directly avoids the
+                // ToString() detour, which paid a payload-sized UTF-16 allocation plus a
+                // transcode both ways on every message.
+                var envelope = JsonSerializer.Deserialize((ReadOnlySpan<byte>)(byte[]?)messageValue, AsyncResponseEnvelopeJson.TypeInfo<T>());
+
+                if (envelope == null)
+                {
+                    _owner._logger.LogError("Failed to deserialize envelope for correlationId {CorrelationId}.", _correlationId);
+
+                    finished = true;
+                    var deserializationError = new JsonException($"Failed to deserialize envelope for correlationId {_correlationId}.");
+                    AsyncResponseDiagnostics.SetError(_activity, "deserialize_failure", deserializationError.Message);
+                    if (!_tcs.TrySetException(deserializationError))
+                        _owner._logger.LogWarning(deserializationError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                }
+                else if (!AsyncResponseEnvelopeSchema.IsReadable(envelope.SchemaVersion))
+                {
+                    finished = true;
+                    var schemaError = new InvalidOperationException(
+                        $"Response envelope for correlationId {_correlationId} has schema version {envelope.SchemaVersion}, " +
+                        $"which this build does not support (current: {AsyncResponseEnvelopeSchema.Current}).");
+                    AsyncResponseDiagnostics.SetError(_activity, "schema_mismatch", schemaError.Message);
+                    if (!_tcs.TrySetException(schemaError))
+                        _owner._logger.LogWarning(schemaError, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                }
+                else if (!envelope.Success)
+                {
+                    finished = true;
+                    var remoteFailure = new Exception(envelope.ExceptionMessage ?? "Unknown error during asynchronous processing.");
+                    if (!string.IsNullOrEmpty(envelope.ExceptionStackTrace))
+                    {
+                        // Cap on receive too: the publish-side cap only bounds traces we emit, not what
+                        // a remote we do not control can push at us.
+                        remoteFailure.Data["RemoteStackTrace"] = RemoteStackTrace.Cap(envelope.ExceptionStackTrace, _owner._options.MaxRemoteStackTraceLength);
+                    }
+
+                    _owner._logger.LogWarning("Received error response for correlationId {CorrelationId}: {ErrorMessage}", _correlationId, envelope.ExceptionMessage);
+                    AsyncResponseDiagnostics.SetError(_activity, "remote_failure", remoteFailure.Message);
+                    if (!_tcs.TrySetException(remoteFailure))
+                        _owner._logger.LogWarning(remoteFailure, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                }
+                else
+                {
+                    if (_owner._logger.IsEnabled(LogLevel.Debug))
+                        _owner._logger.LogDebug("Received response for correlationId {CorrelationId}.", _correlationId);
+
+                    finished = await _completionPredicate(envelope.Payload!).ConfigureAwait(false);
+
+                    if (finished && !_tcs.TrySetResult(envelope.Payload!))
+                        _owner._logger.LogWarning("TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+                }
+            }
+            catch (Exception ex)
+            {
+                _owner._logger.LogError(ex, "Error processing message on channel {Channel} for correlationId {CorrelationId}.", ChannelName, _correlationId);
+
+                finished = true;
+                AsyncResponseDiagnostics.SetError(_activity, ex);
+                if (!_tcs.TrySetException(ex))
+                    _owner._logger.LogWarning(ex, "TaskCompletionSource already completed for correlationId {CorrelationId}.", _correlationId);
+            }
+            finally
+            {
+                // Unsubscription also happens on dispose, but doing it immediately after the
+                // terminal message releases resources sooner.
+                if (finished)
+                    await CleanupOnceAsync().ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Task-latched so EVERY caller completes only when the one real cleanup has finished —
+        /// a fire-once flag alone would let a second caller (a disposing waiter racing the
+        /// timeout) return before the task was settled.
+        /// </summary>
+        public ValueTask CleanupOnceAsync()
+        {
+            Task task;
+            lock (_cleanupGate)
+            {
+                task = _cleanupTask ??= CleanupCoreAsync();
+            }
+
+            return task.IsCompletedSuccessfully ? ValueTask.CompletedTask : new ValueTask(task);
+        }
+
+        /// <summary>
+        /// Dispose-path cleanup: DRAINS the per-channel serial executor before settling. A delivery
+        /// may be mid <c>Until</c>-predicate holding a claimed terminal message; the marker work
+        /// item completes only after that in-flight item finished, so by the time cleanup cancels,
+        /// the task is either settled by the delivery or genuinely undelivered — never a
+        /// cancellation stealing a consumed response. Must NOT be called from dispatch code (which
+        /// runs ON the executor): the dispatch-triggered cleanup uses <see cref="CleanupOnceAsync"/>
+        /// directly, its task already settled.
+        /// <para>
+        /// The drain is bounded by <c>DisposalDrainTimeout</c> — one budget covering marker
+        /// ADMISSION too (a full bounded queue behind a wedged item blocks the enqueue itself). A
+        /// lapsed budget must not fall back to the cleanup's cancel: the wedged delivery holds a
+        /// message already consumed from the stream, and "canceled" would tell a re-attaching
+        /// caller nothing was delivered. It faults the task with the explicit indeterminate
+        /// contract instead, routing durable flows to a fresh idempotent restart. A
+        /// tombstone-suppressed enqueue is the opposite case — the retired executor finished
+        /// everything it ever admitted, so nothing is in flight and the plain cancel is truthful.
+        /// </para>
+        /// </summary>
+        public async ValueTask DrainThenCleanupAsync()
+        {
+            if (Volatile.Read(ref _cleanupStarted) == 0 && ExecutorRegistered)
+            {
+                var drainTimeout = _owner._options.DisposalDrainTimeout;
+                var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                try
+                {
+                    using var budget = new CancellationTokenSource(drainTimeout);
+                    var accepted = await _owner._executors.EnqueueAsync(ChannelName, () =>
+                    {
+                        drained.TrySetResult();
+                        return Task.CompletedTask;
+                    }, budget.Token).ConfigureAwait(false);
+                    if (accepted)
+                        await drained.Task.WaitAsync(budget.Token).ConfigureAwait(false);
+                }
+                catch (Exception drainEx)
+                {
+                    // Budget lapse — or an unforeseen drain failure: either way the marker never
+                    // ran, so an in-flight delivery cannot be ruled out (only accepted=false
+                    // proves the executor finished everything). Settlement unproven means the
+                    // cleanup's cancel below would be a false "nothing was delivered" — fault
+                    // with the explicit indeterminate contract instead. A TrySetResult from the
+                    // late-finishing dispatch loses against this and is dropped; its cleanup
+                    // call is a no-op behind the latch.
+                    _owner._logger.LogWarning(
+                        "Disposal drain for correlationId {CorrelationId} did not prove settlement within {DrainTimeout}; faulting the waiter as indeterminate.",
+                        _correlationId, drainTimeout);
+                    AsyncResponseDiagnostics.SetError(_activity, "indeterminate_delivery", "Disposal drain did not prove settlement.");
+                    if (drainEx is not OperationCanceledException)
+                        _owner._logger.LogDebug(drainEx, "Dispatch drain failed for channel {Channel}.", ChannelName);
+                    _tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout));
+                }
+            }
+
+            await CleanupOnceAsync().ConfigureAwait(false);
+        }
+
+        private async Task CleanupCoreAsync()
+        {
+            Interlocked.Exchange(ref _cleanupStarted, 1);
+
+            // A waiter disposed before any terminal signal must not leave ResponseTask pending
+            // forever for callers that hold it directly — the timeout dies with this cleanup, so
+            // nothing else could ever complete the task. Cancellation is a no-op after a normal
+            // completion, timeout, or fault (and after a delivery drained by DrainThenCleanupAsync).
+            _tcs.TrySetCanceled();
+
+            try
+            {
+                try
+                {
+                    // Delete the recovery state BEFORE unsubscribing. In the reverse order a publish
+                    // landing in the window sees "no subscriber, state present" and fires a spurious
+                    // recovery callback for a wait that already reached a terminal state. In this
+                    // order the window shows a subscriber that drops the message — a late or duplicate
+                    // terminal message is droppable; a resurrected recovery callback is not.
+                    await _owner._recoveryStateStore.TryDeleteAsync(_correlationId, Id).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Best-effort: the state expires on its own, and a transient store failure must
+                    // not skip the unsubscribe and executor teardown below.
+                    _owner._logger.LogError(ex, "Failed to delete recovery state for correlationId {CorrelationId}.", _correlationId);
+                }
+
+                try
+                {
+                    // Bounded like the drain: this latched core is what a disposing waiter awaits
+                    // when terminal delivery started cleanup first, so an unbudgeted unsubscribe
+                    // would let a wedged client library hold DisposeAsync hostage past
+                    // DisposalDrainTimeout. The quiet wrapper logs its own failure — including
+                    // one that completes AFTER this wait was abandoned, which previously died as
+                    // a TaskScheduler.UnobservedTaskException nobody logged.
+                    if (Subscription is not null)
+                        await UnsubscribeQuietlyAsync(Subscription).WaitAsync(_owner._options.DisposalDrainTimeout).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    _owner._logger.LogError(
+                        "Unsubscribe for channel {Channel} did not finish within {DisposalDrainTimeout}; abandoning the wait (its outcome is logged when it completes).",
+                        ChannelName, _owner._options.DisposalDrainTimeout);
+                }
+            }
+            finally
+            {
+                // Purely local teardown runs no matter which network call above failed — the
+                // cleanup latch is already set, so anything skipped here would leak until process
+                // exit.
+                if (ExecutorRegistered)
+                    _owner._executors.OnSubscriptionRetired(ChannelName);
+
+                // Schedule the disposal on the thread pool; do not await directly to prevent
+                // deadlocks with work currently running on the executor.
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _owner._executors.RemoveAsync(ChannelName).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _owner._logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", ChannelName);
+                    }
+                });
+
+                await _timeoutRegistration.DisposeAsync().ConfigureAwait(false);
+                _cancellationTokenSource.Dispose();
+                _activity?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Never faults: the unsubscribe outcome is logged HERE, so a teardown outliving the
+        /// bounded wait above still records its failure instead of surfacing as an unobserved
+        /// task exception.
+        /// </summary>
+        public async Task UnsubscribeQuietlyAsync(IRedisChannelSubscription liveSubscription)
+        {
+            try
+            {
+                await liveSubscription.DisposeAsync().ConfigureAwait(false);
+                _owner._logger.LogDebug("Unsubscribed from channel {Channel}.", ChannelName);
+            }
+            catch (Exception ex)
+            {
+                _owner._logger.LogError(ex, "Error during unsubscribe-once for channel {Channel}.", ChannelName);
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------------------

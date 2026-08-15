@@ -14,6 +14,13 @@ internal sealed class DurableFlowRegistration
     /// <summary>The flow class full name as persisted in <see cref="FlowState.FlowTypeName"/>.</summary>
     public required string FlowTypeFullName { get; init; }
 
+    /// <summary>
+    /// The TInput full name, formatted exactly as <see cref="FlowState.InputTypeName"/> is stamped
+    /// at start (<c>typeof(TInput).FullName</c>), so the executor can reject a persisted run whose
+    /// input type no longer matches this registration instead of silently deserializing it.
+    /// </summary>
+    public required string InputTypeFullName { get; init; }
+
     /// <summary>The flow class, resolved from DI per execution.</summary>
     public required Type FlowType { get; init; }
 

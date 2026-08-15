@@ -26,11 +26,14 @@ internal static class SqlServerRelationVerifier
 {
     /// <summary>
     /// One expected column: name, rendered type (<c>nvarchar(400)</c>, <c>nvarchar(max)</c>,
-    /// <c>datetime2</c>, …), and nullability. <paramref name="RequiresBinaryCollation"/> marks the
-    /// columns that store an identity the library compares ORDINALLY — correlation ids, flow ids,
-    /// queue names. Under a case-insensitive column collation (the default in a great many SQL
-    /// Server deployments) the database treats <c>foo</c> and <c>FOO</c> as the same key, so two
-    /// distinct ids collide: lookups cross-match and primary keys reject the second id.
+    /// <c>datetime2(7)</c>, …), and nullability. The fractional-seconds types state their scale:
+    /// SQL Server ROUNDS on store, so a reduced-scale column is not a narrower clock but a
+    /// different one — a stored timestamp can round BELOW an already-observed full-precision
+    /// watermark and reorder the events the stores compare. <paramref name="RequiresBinaryCollation"/>
+    /// marks the columns that store an identity the library compares ORDINALLY — correlation ids,
+    /// flow ids, queue names. Under a case-insensitive column collation (the default in a great
+    /// many SQL Server deployments) the database treats <c>foo</c> and <c>FOO</c> as the same key,
+    /// so two distinct ids collide: lookups cross-match and primary keys reject the second id.
     /// </summary>
     /// <remarks>
     /// <c>DefaultExpression</c> is the exact <c>sys.default_constraints.definition</c> rendering,
@@ -61,16 +64,27 @@ internal static class SqlServerRelationVerifier
         string[]? PrimaryKey = null);
 
     /// <summary>
-    /// Verifies every expected object. Pass the DDL transaction so the checks see uncommitted
-    /// work; pass <c>null</c> when diagnosing a FAILED batch on a fresh connection, where the
-    /// objects of interest are somebody else's and already committed.
+    /// Verifies every expected object, reporting missing ones as errors. Pass the DDL transaction
+    /// so the checks see uncommitted work; pass <c>null</c> when the objects of interest are
+    /// already committed. <see cref="ThrowDiagnosedCollisionAsync"/> runs the same checks after a
+    /// FAILED batch, where absence is the failure's consequence rather than reportable evidence.
     /// </summary>
-    public static async Task VerifyAsync(
+    public static Task VerifyAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
         string schemaName,
         string componentName,
         IReadOnlyList<ExpectedObject> expected,
+        CancellationToken cancellationToken)
+        => VerifyCoreAsync(connection, transaction, schemaName, componentName, expected, reportAbsence: true, cancellationToken);
+
+    private static async Task VerifyCoreAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> expected,
+        bool reportAbsence,
         CancellationToken cancellationToken)
     {
         var actual = await LoadObjectKindsAsync(connection, transaction, schemaName, expected, cancellationToken).ConfigureAwait(false);
@@ -99,6 +113,13 @@ internal static class SqlServerRelationVerifier
         await VerifySequencesAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyTableColumnsAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyPrimaryKeysAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
+
+        // In diagnosis mode absence proves nothing: the failed batch rolled back whatever it did
+        // create, so the expected objects are missing BECAUSE the batch failed — reporting one
+        // would bury the real error (permissions, a full disk, a killed session) under a phantom
+        // collision. Reaching this point there, the caller rethrows the original failure.
+        if (!reportAbsence)
+            return;
 
         foreach (var expectedObject in expected)
         {
@@ -139,7 +160,10 @@ internal static class SqlServerRelationVerifier
         {
             try
             {
-                await VerifyAsync(diagnosis, transaction: null, schemaName, componentName, expected, cancellationToken).ConfigureAwait(false);
+                // reportAbsence: false — the failed batch's own objects were rolled back, so on
+                // this fresh connection every expected object may legitimately be missing; only
+                // something PRESENT and wrong is evidence of a collision.
+                await VerifyCoreAsync(diagnosis, transaction: null, schemaName, componentName, expected, reportAbsence: false, cancellationToken).ConfigureAwait(false);
             }
             catch (InvalidOperationException diagnosed)
             {
@@ -248,7 +272,7 @@ internal static class SqlServerRelationVerifier
         command.Transaction = transaction;
         command.CommandText =
             $"""
-            SELECT o.name, c.name, t.name, c.max_length, c.is_nullable, ISNULL(c.collation_name, N''),
+            SELECT o.name, c.name, t.name, c.max_length, c.scale, c.is_nullable, ISNULL(c.collation_name, N''),
                    CASE WHEN c.default_object_id <> 0 OR c.is_identity = 1 OR c.is_computed = 1 THEN 1 ELSE 0 END,
                    ISNULL(dc.definition, N'')
             FROM sys.columns c
@@ -272,14 +296,27 @@ internal static class SqlServerRelationVerifier
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 actual[(reader.GetString(0), reader.GetString(1))] = new ActualColumn(
-                    Type: RenderType(reader.GetString(2), reader.GetInt16(3)),
-                    Nullable: reader.GetBoolean(4),
-                    Collation: reader.GetString(5),
-                    Writable: reader.GetInt32(6) == 1,
-                    Default: reader.GetString(7));
+                    Type: RenderType(reader.GetString(2), reader.GetInt16(3), reader.GetByte(4)),
+                    Nullable: reader.GetBoolean(5),
+                    Collation: reader.GetString(6),
+                    Writable: reader.GetInt32(7) == 1,
+                    Default: reader.GetString(8));
             }
         }
 
+        EvaluateTableColumns(schemaName, componentName, tables, actual);
+    }
+
+    /// <summary>
+    /// The pure column decision, over catalog rows already loaded. Split out so the accept/reject
+    /// table is exercised without a server, the way the PostgreSQL sibling's <c>Evaluate</c> is.
+    /// </summary>
+    internal static void EvaluateTableColumns(
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> tables,
+        Dictionary<(string Table, string Column), ActualColumn> actual)
+    {
         foreach (var table in tables)
         {
             foreach (var column in table.Columns!)
@@ -407,12 +444,17 @@ internal static class SqlServerRelationVerifier
 
     /// <summary>
     /// Renders a <c>sys.types</c> row the way the DDL declares it. <c>max_length</c> is in bytes,
-    /// so the Unicode types halve it, and -1 is the <c>(max)</c> sentinel.
+    /// so the Unicode types halve it, and -1 is the <c>(max)</c> sentinel. The fractional-seconds
+    /// types render their SCALE instead: a bare <c>datetime2</c> is <c>datetime2(7)</c>, and
+    /// dropping the digits made a reduced-scale column indistinguishable from a full-precision one
+    /// — SQL Server ROUNDS on store, so <c>datetime2(0)</c> is not a coarser view of the same
+    /// instant but a different one, which reorders the timestamps the stores compare.
     /// </summary>
-    private static string RenderType(string typeName, short maxLength) => typeName switch
+    internal static string RenderType(string typeName, short maxLength, byte scale) => typeName switch
     {
         "nvarchar" or "nchar" => maxLength < 0 ? $"{typeName}(max)" : $"{typeName}({maxLength / 2})",
         "varchar" or "char" or "varbinary" or "binary" => maxLength < 0 ? $"{typeName}(max)" : $"{typeName}({maxLength})",
+        "datetime2" or "datetimeoffset" or "time" => $"{typeName}({scale})",
         _ => typeName
     };
 
@@ -458,11 +500,11 @@ internal static class SqlServerRelationVerifier
     private const string CollisionGuidance =
         "Give this component its own object names (or its own schema) so two AsyncResponse components cannot share one name.";
 
-    private readonly record struct ActualColumn(string Type, bool Nullable, string Collation, bool Writable, string Default);
+    internal readonly record struct ActualColumn(string Type, bool Nullable, string Collation, bool Writable, string Default);
 
     /// <summary>Case-insensitive (table, column) tuple comparer — catalog name matching is
     /// case-insensitive under the common catalog collations, so the keys must be too.</summary>
-    private sealed class TableColumnComparer : IEqualityComparer<(string Table, string Column)>
+    internal sealed class TableColumnComparer : IEqualityComparer<(string Table, string Column)>
     {
         public static readonly TableColumnComparer Instance = new();
 

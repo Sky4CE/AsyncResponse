@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Threading.Channels;
 
 namespace AsyncResponse.Transports;
@@ -356,7 +355,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
             if (!deadLettered)
             {
                 _logger.LogWarning(exception, "{Provider} dead-letter publish failed for queue {Queue} ({Role}); releasing for retry.", _providerName, delivery.Queue, _role);
-                await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+                await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
             }
         }
         else
@@ -368,7 +367,31 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 delivery.Queue,
                 _role,
                 delivery.Attempt);
+            await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
+        }
+    }
+
+    // Same rule as the post-handler ACK above: the handler's outcome is already decided, so a
+    // transient NAK failure must not escape HandleAsync and tear down the subscriber — that would
+    // dispose the dispatcher mid-flight and dead-letter unrelated already-ACKed background work on
+    // the way down. Swallow and log; the claim's lease lapses on its own and at-least-once
+    // redelivery applies either way.
+    private async Task NakSwallowingFailureAsync(DbTransportDelivery delivery)
+    {
+        try
+        {
             await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to NAK {Provider} message {MessageId} on queue {Queue} ({Role}) after a failed handler; the lease will lapse and the {Unit} will be redelivered.",
+                _providerName,
+                delivery.Id,
+                delivery.Queue,
+                _role,
+                _unitNoun);
         }
     }
 
@@ -426,8 +449,9 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
 
 /// <summary>
 /// Extracts the AsyncResponse correlation id from the queue item's metadata first, then from the
-/// JSON response body via configured paths. Shared verbatim by the three database transports —
-/// the header name and JSON paths both come from the aliased options type.
+/// JSON response body via configured paths (walked by the shared <see cref="CorrelationIdJsonPaths"/>,
+/// same as the broker transports). Shared verbatim by the three database transports — the header
+/// name and JSON paths both come from the aliased options type.
 /// </summary>
 internal static class DbCorrelationIdExtractor
 {
@@ -440,89 +464,59 @@ internal static class DbCorrelationIdExtractor
         if (headers is not null && headers.TryGetValue(headerName, out var headerValue) && !string.IsNullOrWhiteSpace(headerValue))
             return headerValue;
 
-        var jsonPaths = options.CorrelationIdJsonPaths;
-        if (jsonPaths is null || jsonPaths.Length == 0 || string.IsNullOrWhiteSpace(messageJson))
-            return null;
+        return CorrelationIdJsonPaths.Extract(messageJson, options.CorrelationIdJsonPaths);
+    }
+}
 
-        JsonNode? root;
+/// <summary>
+/// Materializes a claimed queue item's <c>headers_json</c> without rejecting ANY content the
+/// column can legally hold. This runs after the claim already committed <c>attempts+1</c>/<c>lock_id</c>
+/// and before any delivery object exists, so a throw here (a wrong-typed value, a non-object root,
+/// malformed text in an unchecked column) could never reach the failure handler or dead-letter:
+/// an unkillable poison row that tears down the subscriber on every re-claim. Instead, string
+/// values are taken as-is, scalars keep their raw JSON text (culture-free by construction),
+/// object/array values keep their raw JSON so correlation extraction still sees a usable string,
+/// nulls are skipped, and anything unusable degrades to no headers — a genuinely poison message
+/// then fails in the handler and flows through the NORMAL dead-letter path. Keys differing only
+/// in case (legal JSON from foreign producers) are last-wins, matching the ASB/SQS receive
+/// adapters.
+/// </summary>
+internal static class DbTransportHeaders
+{
+    public static IReadOnlyDictionary<string, string> Materialize(string json)
+    {
+        JsonDocument document;
         try
         {
-            root = JsonNode.Parse(messageJson);
+            document = JsonDocument.Parse(json);
         }
         catch (JsonException)
         {
-            return null;
+            return Empty;
         }
 
-        if (root is null)
-            return null;
-
-        foreach (var path in jsonPaths)
+        using (document)
         {
-            var value = TryReadPath(root, path);
-            if (!string.IsNullOrWhiteSpace(value))
-                return value;
-        }
+            if (document.RootElement.ValueKind is not JsonValueKind.Object)
+                return Empty;
 
-        return null;
-    }
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                var value = property.Value.ValueKind switch
+                {
+                    JsonValueKind.String => property.Value.GetString(),
+                    JsonValueKind.Null or JsonValueKind.Undefined => null,
+                    _ => property.Value.GetRawText()
+                };
+                if (value is not null)
+                    headers[property.Name] = value;
+            }
 
-    private static string? TryReadPath(JsonNode root, string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            return null;
-
-        var current = root;
-        foreach (var segment in path.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            current = UnwrapJsonString(current);
-            if (current is not JsonObject obj)
-                return null;
-
-            current = TryGetProperty(obj, segment);
-            if (current is null)
-                return null;
-        }
-
-        current = UnwrapJsonString(current);
-        return current switch
-        {
-            JsonValue value when value.TryGetValue<string>(out var s) => s,
-            JsonValue value => value.ToString(),
-            _ => null
-        };
-    }
-
-    private static JsonNode? TryGetProperty(JsonObject obj, string name)
-    {
-        if (obj.TryGetPropertyValue(name, out var exact))
-            return exact;
-
-        foreach (var property in obj)
-        {
-            if (string.Equals(property.Key, name, StringComparison.OrdinalIgnoreCase))
-                return property.Value;
-        }
-
-        return null;
-    }
-
-    private static JsonNode? UnwrapJsonString(JsonNode? node)
-    {
-        if (node is not JsonValue value || !value.TryGetValue<string>(out var text))
-            return node;
-
-        var trimmed = text.AsSpan().TrimStart();
-        if (trimmed.Length == 0 || (trimmed[0] != '{' && trimmed[0] != '['))
-            return node;
-
-        try
-        {
-            return JsonNode.Parse(text);
-        }
-        catch (JsonException)
-        {
-            return node;
+            return headers;
         }
     }
+
+    private static readonly IReadOnlyDictionary<string, string> Empty =
+        new Dictionary<string, string>(0, StringComparer.OrdinalIgnoreCase);
 }

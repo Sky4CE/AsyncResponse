@@ -368,6 +368,51 @@ public class InMemoryAsyncResponseTests
     }
 
     [Fact]
+    public async Task RawJsonResponse_LiteralNullBody_FaultsWaiterInsteadOfCompletingWithNull()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-null-body";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(5));
+
+        // A literal-null body passes the not-JSON guard and deserializes without error; it must
+        // fault the waiter, never complete it with a null payload that surfaces as an NRE at the
+        // consumer's first member access.
+        await rawPublisher.SetRawResponseJson("null", correlationId);
+
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Contains("deserialized to null", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
+    public async Task RawObjectResponse_Null_FaultsWaiterInsteadOfCompletingWithNull()
+    {
+        var provider = CreateProvider();
+        var subscriber = provider.GetRequiredService<IAsyncResponseSubscriber>();
+        var rawPublisher = provider.GetRequiredService<IRawAsyncResponsePublisher>();
+        var probe = provider.GetRequiredService<IActiveSubscriberProbe>();
+        var correlationId = $"{CorrelationId}-raw-null-object";
+
+        await using var waiter = await subscriber.CreateResponseWaiter<OperationResult>(
+            correlationId,
+            timeout: TimeSpan.FromSeconds(5));
+
+        // The typed conversion path has the same hazard as the raw body: a published null must
+        // fault the waiter — the broker channels reject the equivalent envelope shape.
+        await rawPublisher.SetRawResponse(null, correlationId);
+
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Contains("materialized to null", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, await probe.CountActiveSubscribersAsync(correlationId));
+    }
+
+    [Fact]
     public async Task RawJsonResponse_AsyncCompletionPredicate_CompletesFromRawPublisher()
     {
         var provider = CreateProvider();

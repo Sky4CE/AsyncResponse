@@ -135,6 +135,60 @@ public sealed class DbTransportSharedCoverageTests
         Assert.Equal(1, calls.DeadLetter);
     }
 
+    /// <summary>
+    /// A failed handler is released for redelivery with a NAK; a NAK that itself fails (connection
+    /// blip during the release) must be swallowed like the guarded ACK — an escape would tear the
+    /// whole subscriber down over one poison message, and the drain on the way out dead-letters
+    /// unrelated already-ACKed in-flight work. The lease lapses on its own either way.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task FailedHandler_WhoseReleaseNakThrows_DoesNotTearDownTheSubscriber(Provider provider)
+    {
+        var calls = new Calls { NakThrows = true };
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: static () => throw new InvalidOperationException("handler blew up"));
+
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(0, calls.Ack);
+        Assert.Contains(logger.Messages, message => message.StartsWith("Failed to NAK", StringComparison.Ordinal)
+            && message.Contains("after a failed handler", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Same guard on the second bare release: when the attempt cap is reached but the dead-letter
+    /// publish fails, the fallback NAK's own failure must not escape either.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task FailedDeadLetter_WhoseFallbackNakThrows_DoesNotTearDownTheSubscriber(Provider provider)
+    {
+        var calls = new Calls { NakThrows = true, DeadLetterResult = false };
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: static () => throw new InvalidOperationException("handler blew up"),
+            maxDeliveryAttempts: 1);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(1, calls.Nak);
+        Assert.Contains(logger.Messages, message => message.StartsWith("Failed to NAK", StringComparison.Ordinal));
+    }
+
     public enum Provider
     {
         SqlServer,
@@ -153,7 +207,8 @@ public sealed class DbTransportSharedCoverageTests
         Calls calls,
         Func<Task> handler,
         bool earlyAck = false,
-        Action? onBackgroundFailure = null)
+        Action? onBackgroundFailure = null,
+        int? maxDeliveryAttempts = null)
     {
         switch (provider)
         {
@@ -165,6 +220,8 @@ public sealed class DbTransportSharedCoverageTests
                     LockTimeout = lockTimeout
                 };
                 var subscriber = new SqlServerSubscriberOptions();
+                if (maxDeliveryAttempts is { } sqlCap)
+                    subscriber.MaxDeliveryAttempts = sqlCap;
                 if (onBackgroundFailure is not null)
                     subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
                 if (earlyAck)
@@ -184,6 +241,8 @@ public sealed class DbTransportSharedCoverageTests
             {
                 var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = lockTimeout };
                 var subscriber = new PostgreSqlSubscriberOptions();
+                if (maxDeliveryAttempts is { } pgCap)
+                    subscriber.MaxDeliveryAttempts = pgCap;
                 if (onBackgroundFailure is not null)
                     subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
                 if (earlyAck)
@@ -203,6 +262,8 @@ public sealed class DbTransportSharedCoverageTests
             {
                 var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = lockTimeout };
                 var subscriber = new MongoDbSubscriberOptions();
+                if (maxDeliveryAttempts is { } mongoCap)
+                    subscriber.MaxDeliveryAttempts = mongoCap;
                 if (onBackgroundFailure is not null)
                     subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
                 if (earlyAck)
@@ -233,10 +294,12 @@ public sealed class DbTransportSharedCoverageTests
     private sealed class Calls
     {
         public int Ack;
+        public int Nak;
         public int Renew;
         public int DeadLetter;
         public bool DeadLetterResult = true;
         public bool RenewThrows;
+        public bool NakThrows;
 
         public ValueTask AckAsync()
         {
@@ -244,7 +307,14 @@ public sealed class DbTransportSharedCoverageTests
             return ValueTask.CompletedTask;
         }
 
-        public ValueTask NakAsync(TimeSpan delay) => ValueTask.CompletedTask;
+        public ValueTask NakAsync(TimeSpan delay)
+        {
+            Interlocked.Increment(ref Nak);
+            if (NakThrows)
+                throw new InvalidOperationException("release store unavailable");
+
+            return ValueTask.CompletedTask;
+        }
 
         public ValueTask<bool> DeadLetterAsync(Exception exception, bool deleteOriginal, CancellationToken cancellationToken)
         {

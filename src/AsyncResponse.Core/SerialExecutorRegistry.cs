@@ -19,7 +19,7 @@ namespace AsyncResponse;
 /// for the same channel, briefly violating the per-channel ordering guarantee.
 /// </para>
 /// </summary>
-internal sealed class SerialExecutorRegistry(ILogger _logger)
+internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeDrainLimit = null)
 {
     // How long a retired channel's tombstone blocks executor re-creation. Long enough to outlive
     // any enqueue that was already in flight when cleanup retired the executor, short enough that
@@ -30,6 +30,15 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
     // parked indefinitely awaiting queue capacity with a token that never fires, and teardown
     // paths await RemoveAsync directly — they must not inherit that hang.
     internal static readonly TimeSpan EnqueueDrainLimit = TimeSpan.FromSeconds(30);
+
+    // Upper bound on how long retirement waits for the executor's dispatched work to finish. A
+    // dispatched item runs arbitrary user code (a completion predicate that never finishes), and
+    // an unbounded wait here would wedge the channel key permanently — every later enqueue for
+    // the correlation id parks on the never-completed retirement, including a NEW waiter that
+    // legitimately re-registered the id.
+    internal static readonly TimeSpan DisposeDrainLimit = TimeSpan.FromSeconds(30);
+
+    private readonly TimeSpan _disposeDrainLimit = disposeDrainLimit ?? DisposeDrainLimit;
 
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime> _tombstones = new(StringComparer.Ordinal);
@@ -209,7 +218,22 @@ internal sealed class SerialExecutorRegistry(ILogger _logger)
                     channel);
             }
 
-            await entry.Executor.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                // Bounded for the same reason: disposal waits for the reader loop, which can be
+                // parked in a dispatched item's arbitrary user code. The writer is completed
+                // before disposal first awaits, so the abandoned loop drains and exits on its own
+                // if the wedged item ever finishes; retiring the entry regardless (the finally
+                // below) keeps the channel key usable for future waiters.
+                await entry.Executor.DisposeAsync().AsTask().WaitAsync(_disposeDrainLimit).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "Timed out after {DrainLimit} waiting for in-flight work on channel {Channel} to finish; abandoning the hung work item and retiring the executor.",
+                    _disposeDrainLimit,
+                    channel);
+            }
         }
         finally
         {

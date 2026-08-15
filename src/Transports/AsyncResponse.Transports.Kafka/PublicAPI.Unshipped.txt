@@ -95,6 +95,8 @@ AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.HandlerRetryMaxDelay.set -
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.KafkaSubscriberOptions() -> void
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxDeliveryAttempts.get -> int
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxDeliveryAttempts.set -> void
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxPollInterval.get -> System.TimeSpan
+AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.MaxPollInterval.set -> void
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.OnBackgroundFailure.get -> System.Func<AsyncResponse.Transports.Kafka.KafkaBackgroundFailureContext!, System.Threading.Tasks.ValueTask>?
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.OnBackgroundFailure.set -> void
 AsyncResponse.Transports.Kafka.KafkaSubscriberOptions.PollTimeout.get -> System.TimeSpan

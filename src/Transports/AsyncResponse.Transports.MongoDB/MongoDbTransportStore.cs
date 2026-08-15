@@ -1,8 +1,9 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Bson.Serialization.Attributes;
-using MongoDB.Bson.Serialization.Options;
+using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
@@ -51,7 +52,7 @@ internal sealed class MongoDbTransportStore : IDisposable
         IOptions<MongoDbAsyncResponseTransportOptions> options,
         IMongoClient? ownedClient = null,
         ILogger<MongoDbTransportStore>? logger = null,
-        MongoNamespaceRegistry? namespaceRegistry = null)
+        IMongoNamespaceRegistry? namespaceRegistry = null)
     {
         _options = options.Value;
         _logger = logger;
@@ -59,7 +60,7 @@ internal sealed class MongoDbTransportStore : IDisposable
 
         // Cross-component collection ownership (DI-hosted stores only): see MongoNamespaceRegistry.
         namespaceRegistry?.Claim(
-            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            MongoNamespaceRegistry.ClusterKey(database),
             database.DatabaseNamespace.DatabaseName,
             "MongoDB transport",
             [(_options.MessageCollection, nameof(_options.MessageCollection))]);
@@ -67,13 +68,7 @@ internal sealed class MongoDbTransportStore : IDisposable
         // The namespace BYTE limit can only be checked here, where the actual database name is
         // first known; a near-limit configuration otherwise passes every static check and fails
         // at the first server operation.
-        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.MessageCollection}";
-        var byteLength = Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 235)
-            throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({nameof(_options.MessageCollection)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
-                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
-                "Shorten the database or collection name.");
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
 
         _database = database;
         _messages = database.GetCollection<MongoTransportMessageDocument>(_options.MessageCollection);
@@ -254,37 +249,76 @@ internal sealed class MongoDbTransportStore : IDisposable
         TimeSpan? delay = null)
     {
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
-        var document = new MongoTransportMessageDocument
-        {
-            Id = id,
-            Queue = queue,
-            Payload = payload,
-            Headers = headers is null
-                ? new Dictionary<string, string>(0, StringComparer.OrdinalIgnoreCase)
-                : new Dictionary<string, string>(headers, StringComparer.OrdinalIgnoreCase),
-            CreatedAtUtc = now,
-            // "Available immediately on arrival": InsertOne cannot evaluate $$NOW, and stamping the
-            // client clock here would let client-ahead-of-server skew hide a fresh message from the
-            // server-clock claim filter until the skew elapsed. Epoch expresses what the SQL stores'
-            // "available_at DEFAULT now()" expresses; a NAK re-stamps a real server-relative time.
-            // A DELAYED publish is the exception: InsertOne still cannot evaluate $$NOW, so the due
-            // time is client-computed (now + delay) in one atomic insert — skew shifts it by the
-            // skew only, and an early delivery is corrected by the envelope's NotBeforeUtc guard in
-            // the worker-job executor. (The insert-then-$$NOW-update alternative had a crash window
-            // that left a never-claimable document.)
-            AvailableAtUtc = delay is { } pending ? now.Add(pending) : DateTime.UnixEpoch,
-            Attempts = 0,
-            DeadLetterReason = deadLetterReason
-        };
         try
         {
-            await _messages.InsertOneAsync(document, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await _messages.UpdateOneAsync(
+                Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id),
+                BuildInsertPipeline(queue, payload, headers, deadLetterReason, delay),
+                new UpdateOptions { IsUpsert = true },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (MongoWriteException ex) when (ex.WriteError?.Category == ServerErrorCategory.DuplicateKey)
         {
-            // A retried publish found the document already inserted: idempotent success.
+            // Two concurrent upserts of one id can both attempt the insert; the loser's
+            // duplicate-key error is the outcome the caller asked for (a retried publish found the
+            // document already present): idempotent success.
         }
+    }
+
+    /// <summary>
+    /// Upsert pipeline for a queue document. <c>created_at</c> — the claim <c>Sort</c> key and the
+    /// dead-letter prune cutoff — is stamped from the SERVER clock (<c>$$NOW</c>), matching the
+    /// claim/renew/NAK updates: a behind-clock publisher's client stamp would otherwise sort its
+    /// rows permanently to the queue head and shift them across the prune boundary. <c>$ifNull</c>
+    /// keeps the first (server-stamped) values when a publish retry finds the document already
+    /// present, and a retry must not reset a claimed document's attempts or lease either — those
+    /// fields are left alone entirely.
+    /// </summary>
+    /// <remarks>
+    /// "Available immediately on arrival" still stamps epoch: it expresses what the SQL stores'
+    /// <c>available_at DEFAULT now()</c> expresses without even a same-millisecond tie against the
+    /// claim filter's <c>$$NOW</c>. A DELAYED publish computes its due time server-relative
+    /// (<c>$$NOW + delay</c>), mirroring the NAK update, so client clock skew cannot shift it.
+    /// User-supplied strings ride inside <c>$literal</c>: in a pipeline expression a plain string
+    /// beginning with <c>$</c> would otherwise be read as a field path or variable.
+    /// </remarks>
+    internal static UpdateDefinition<MongoTransportMessageDocument> BuildInsertPipeline(
+        string queue,
+        string payload,
+        IReadOnlyDictionary<string, string>? headers,
+        string? deadLetterReason,
+        TimeSpan? delay)
+    {
+        var headerArray = new BsonArray();
+        if (headers is not null)
+        {
+            foreach (var pair in headers)
+                headerArray.Add(new BsonDocument { ["k"] = pair.Key, ["v"] = pair.Value });
+        }
+
+        return Builders<MongoTransportMessageDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["queue"] = new BsonDocument("$literal", queue),
+                ["payload"] = new BsonDocument("$literal", payload),
+                ["headers"] = new BsonDocument("$ifNull", new BsonArray { "$headers", new BsonDocument("$literal", headerArray) }),
+                ["created_at"] = new BsonDocument("$ifNull", new BsonArray { "$created_at", "$$NOW" }),
+                ["available_at"] = new BsonDocument("$ifNull", new BsonArray
+                {
+                    "$available_at",
+                    delay is { } pending
+                        ? new BsonDocument("$add", new BsonArray { "$$NOW", pending.TotalMilliseconds })
+                        : (BsonValue)new BsonDateTime(DateTime.UnixEpoch)
+                }),
+                ["attempts"] = new BsonDocument("$ifNull", new BsonArray { "$attempts", 0 }),
+                ["dead_letter_reason"] = new BsonDocument("$ifNull", new BsonArray
+                {
+                    "$dead_letter_reason",
+                    deadLetterReason is null ? BsonNull.Value : new BsonDocument("$literal", deadLetterReason)
+                })
+            })
+        });
     }
 
     private async ValueTask AckAsync(Guid id, Guid lockId)
@@ -438,10 +472,26 @@ internal sealed class MongoDbTransportStore : IDisposable
             return;
 
         await _messages.DeleteManyAsync(
-            Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Queue, _options.DeadLetterQueue)
-            & Builders<MongoTransportMessageDocument>.Filter.Lt(item => item.CreatedAtUtc, DateTime.UtcNow.Subtract(retention)),
+            BuildDeadLetterPruneFilter(_options.DeadLetterQueue, retention),
             cancellationToken).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Prune filter: age is evaluated ENTIRELY on the server clock — <c>$$NOW</c> against the
+    /// server-stamped <c>created_at</c> — mirroring the claim filter. Comparing an app-clock
+    /// cutoff against another instance's stamp mixes two clocks: a pruner running behind the
+    /// publisher deletes fresh dead letters on arrival, destroying the forensic record of a
+    /// poison message, and one running ahead keeps them past retention.
+    /// </summary>
+    internal static FilterDefinition<MongoTransportMessageDocument> BuildDeadLetterPruneFilter(string deadLetterQueue, TimeSpan retention)
+        => Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Queue, deadLetterQueue)
+           & new BsonDocumentFilterDefinition<MongoTransportMessageDocument>(new BsonDocument(
+               "$expr",
+               new BsonDocument("$lt", new BsonArray
+               {
+                   "$created_at",
+                   new BsonDocument("$subtract", new BsonArray { "$$NOW", retention.TotalMilliseconds })
+               })));
 
     private bool ShouldPruneDeadLetters()
     {
@@ -489,10 +539,11 @@ internal sealed class MongoTransportMessageDocument
     [BsonElement("payload")]
     public string Payload { get; set; } = "";
 
-    // Array-of-documents representation keeps arbitrary header names (dots, dollars) legal as values
-    // rather than as BSON field names.
+    // Array-of-documents representation keeps arbitrary header names (dots, dollars) legal as
+    // values rather than as BSON field names; the lenient serializer keeps that wire shape while
+    // never rejecting a foreign producer's value types.
     [BsonElement("headers")]
-    [BsonDictionaryOptions(DictionaryRepresentation.ArrayOfDocuments)]
+    [BsonSerializer(typeof(LenientTransportHeaderSerializer))]
     public Dictionary<string, string>? Headers { get; set; }
 
     [BsonElement("created_at")]
@@ -513,4 +564,83 @@ internal sealed class MongoTransportMessageDocument
 
     [BsonElement("dead_letter_reason")]
     public string? DeadLetterReason { get; set; }
+}
+
+/// <summary>
+/// Serializes headers in the driver's array-of-documents shape (<c>[{ "k": …, "v": … }, …]</c>)
+/// and deserializes them without rejecting ANY BSON a foreign producer can legally store there.
+/// The default dictionary serializer throws on a wrong-typed value ("Cannot deserialize a
+/// 'String' from BsonType 'Int32'") — and header materialization runs inside the claim's
+/// <c>findOneAndUpdate</c>, AFTER the server already stamped <c>attempts+1</c>/<c>lock_id</c> and
+/// before any delivery object exists, so that throw could never reach the failure handler or
+/// dead-letter: an unkillable poison document that tears down the subscriber on every re-claim.
+/// Instead, string values are taken as-is, other scalars keep their canonical (culture-free)
+/// string form, document/array values keep their JSON text so correlation extraction still sees a
+/// usable string, nulls are skipped, and unusable shapes degrade to no headers — a genuinely
+/// poison message then fails in the handler and flows through the NORMAL dead-letter path.
+/// </summary>
+internal sealed class LenientTransportHeaderSerializer : SerializerBase<Dictionary<string, string>?>
+{
+    public override Dictionary<string, string>? Deserialize(BsonDeserializationContext context, BsonDeserializationArgs args)
+        => Materialize(BsonValueSerializer.Instance.Deserialize(context));
+
+    internal static Dictionary<string, string>? Materialize(BsonValue value)
+    {
+        if (value is not BsonArray entries)
+            return null;
+
+        // Default (ordinal) comparer, matching the driver's own dictionary: the claim-side copy is
+        // the case-folding point. Indexer writes, so duplicate keys — case-variant or exact, both
+        // legal BSON — are last-wins instead of a throw.
+        var headers = new Dictionary<string, string>(entries.Count);
+        foreach (var entry in entries)
+        {
+            if (entry is not BsonDocument pair
+                || !pair.TryGetValue("k", out var key)
+                || !pair.TryGetValue("v", out var rawValue))
+            {
+                continue;
+            }
+
+            var name = Coerce(key);
+            var text = Coerce(rawValue);
+            if (name is not null && text is not null)
+                headers[name] = text;
+        }
+
+        return headers;
+    }
+
+    private static string? Coerce(BsonValue value) => value.BsonType switch
+    {
+        BsonType.String => value.AsString,
+        BsonType.Null or BsonType.Undefined => null,
+        BsonType.Document or BsonType.Array => value.ToJson(),
+        // The scalar ToString overrides are JSON-flavored and culture-free ("1.5", "123", "true",
+        // ISO-8601 dates — raw epoch millis when out of DateTime range), and none of them throws.
+        _ => value.ToString() ?? ""
+    };
+
+    public override void Serialize(BsonSerializationContext context, BsonSerializationArgs args, Dictionary<string, string>? value)
+    {
+        var writer = context.Writer;
+        if (value is null)
+        {
+            writer.WriteNull();
+            return;
+        }
+
+        writer.WriteStartArray();
+        foreach (var pair in value)
+        {
+            writer.WriteStartDocument();
+            writer.WriteName("k");
+            writer.WriteString(pair.Key);
+            writer.WriteName("v");
+            writer.WriteString(pair.Value);
+            writer.WriteEndDocument();
+        }
+
+        writer.WriteEndArray();
+    }
 }

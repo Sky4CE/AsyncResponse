@@ -52,53 +52,42 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "MongoDB subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay);
-                await Task.Delay(delay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, delay) => Logger.LogWarning(ex, "MongoDB subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
         using var signalCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        var listenTask = Options.UseChangeStreamWake
-            ? Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token)
-            : Task.CompletedTask;
 
-        await using var dispatcher = new MongoDbMessageDispatcher(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            Role);
-
-        Logger.LogInformation(
-            "MongoDB subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
-            Queue,
-            Role,
-            SubscriberOptions.AckMode);
-
+        // The wake task starts inside the try so ANY escape — the dispatcher's constructor
+        // included — runs the cancelling finally. Disposing signalCts does NOT cancel it, so an
+        // escape before the finally would otherwise leave ListenLoopAsync parked on the change
+        // stream, leaking a cursor per retry.
+        Task? listenTask = null;
         try
         {
+            listenTask = Options.UseChangeStreamWake
+                ? Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token)
+                : Task.CompletedTask;
+
+            await using var dispatcher = new MongoDbMessageDispatcher(
+                HandleMessageAsync,
+                Options,
+                SubscriberOptions,
+                Logger,
+                Role);
+
+            Logger.LogInformation(
+                "MongoDB subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
+                Queue,
+                Role,
+                SubscriberOptions.AckMode);
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 var claimed = 0;
@@ -117,12 +106,15 @@ internal abstract class MongoDbSubscriberService : BackgroundService
         finally
         {
             await signalCts.CancelAsync().ConfigureAwait(false);
-            try
+            if (listenTask is not null)
             {
-                await listenTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
-            {
+                try
+                {
+                    await listenTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+                {
+                }
             }
         }
     }

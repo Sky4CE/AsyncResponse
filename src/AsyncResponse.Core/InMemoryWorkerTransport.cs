@@ -12,6 +12,13 @@ namespace AsyncResponse;
 /// Jobs run in the current process and survive only as long as it does — use a broker-backed
 /// transport for durability. Intended for development, tests, and single-node deployments.
 /// <para>
+/// Envelopes have broker wire parity: each publish serializes the job to its wire JSON and the
+/// worker receives an instance materialized from it — <c>[JsonIgnore]</c> argument state is
+/// excluded, post-publish mutations are invisible, and a non-serializable argument throws at
+/// <see cref="PublishAsync(WorkerJobEnvelope, CancellationToken)"/> — so behavior observed here
+/// carries over unchanged to every broker-backed transport.
+/// </para>
+/// <para>
 /// Because the job stays in-process, the enqueuer's <see cref="ExecutionContext"/> is captured and
 /// the job runs under it (see <see cref="InMemoryWorkerHost"/>), so ambient <see cref="AsyncLocal{T}"/>
 /// state — trace id, principal, logging scope — flows automatically without any serializable
@@ -160,6 +167,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     public async Task PublishAsync(WorkerJobEnvelope job, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(job);
+        job = MaterializeFromWire(job);
 
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
@@ -203,6 +211,7 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
             throw new ArgumentOutOfRangeException(nameof(delay), delay, $"Delay must be at most {MaxPublishDelay.TotalDays:0.#} days (the .NET timer ceiling).");
 
         cancellationToken.ThrowIfCancellationRequested();
+        job = MaterializeFromWire(job);
 
         using var activity = AsyncResponseDiagnostics.StartActivity(
             "asyncresponse.worker.publish",
@@ -288,6 +297,18 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
                 queued.Job.Call.ServiceInterfaceFullName, queued.Job.Call.MethodName);
         }
     }
+
+    // Wire parity for EVERY job, in-process included: the envelope the worker receives is
+    // re-materialized from the publisher's wire JSON — the same representation a broker delivery
+    // carries, [JsonIgnore] argument state excluded, post-publish mutations invisible, and a
+    // non-serializable argument failing HERE, at the publish, exactly where every broker transport
+    // fails it. Handing the caller's live envelope through (the old path) let tests and single-node
+    // deployments run on state no broker-backed transport can deliver. The publish serializes with
+    // the transports' wire options and re-binds with the broker ingress's case-insensitive options.
+    // The enqueuer's captured ExecutionContext still flows: ambient AsyncLocal state is this
+    // transport's documented in-process feature, not envelope state.
+    private static WorkerJobEnvelope MaterializeFromWire(WorkerJobEnvelope job)
+        => AsyncResponseJson.DeserializeCaseInsensitive<WorkerJobEnvelope>(AsyncResponseJson.SerializeToUtf8Bytes(job))!;
 
     /// <summary>Identity handle for one scheduled delayed job (reference equality keys the timer map).</summary>
     private sealed class DelayedJob(InMemoryWorkerTransport owner, QueuedJob queued)

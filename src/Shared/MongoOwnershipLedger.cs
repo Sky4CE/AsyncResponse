@@ -40,19 +40,34 @@ internal static class MongoOwnershipLedger
             // stored an enum) — are foreign writes: tolerated rather than guessed about, and the
             // BsonString pattern matches below keep the guard itself from throwing
             // InvalidCastException while evaluating them.
-            var existing = await ledger.FindOneAndUpdateAsync<BsonDocument>(
+            Task<BsonDocument?> UpsertClaimAsync() => ledger.FindOneAndUpdateAsync<BsonDocument?>(
                 new BsonDocument("_id", collection),
                 new BsonDocument("$setOnInsert", new BsonDocument
                 {
                     { "component", componentName },
                     { "purpose", purpose }
                 }),
-                new FindOneAndUpdateOptions<BsonDocument, BsonDocument>
+                new FindOneAndUpdateOptions<BsonDocument, BsonDocument?>
                 {
                     IsUpsert = true,
                     ReturnDocument = ReturnDocument.Before
                 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken);
+
+            BsonDocument? existing;
+            try
+            {
+                existing = await UpsertClaimAsync().ConfigureAwait(false);
+            }
+            catch (MongoException ex) when (IsDuplicateKey(ex))
+            {
+                // The upsert's no-match-then-insert is not atomic against a concurrent FIRST
+                // claim on the same _id: the loser of that race gets E11000 instead of the
+                // winner's document. One identical retry now matches the winner's document and
+                // resolves through the ownership check below — idempotent success for the same
+                // component, the actionable conflict error for a different one.
+                existing = await UpsertClaimAsync().ConfigureAwait(false);
+            }
 
             if (existing is not null
                 && existing.TryGetValue("component", out var owner)
@@ -72,4 +87,14 @@ internal static class MongoOwnershipLedger
             }
         }
     }
+
+    /// <summary>
+    /// The server's duplicate-key rejection (the E11000 family), on either surface it reaches the
+    /// driver through: findAndModify reports it as a command error, write commands as a
+    /// categorized write error. The code set matches the driver's own
+    /// <see cref="ServerErrorCategory.DuplicateKey"/> mapping.
+    /// </summary>
+    private static bool IsDuplicateKey(MongoException exception)
+        => exception is MongoWriteException { WriteError.Category: ServerErrorCategory.DuplicateKey }
+           || exception is MongoCommandException { Code: 11000 or 11001 or 12582 };
 }

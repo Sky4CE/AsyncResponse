@@ -3,7 +3,6 @@ using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Runtime.CompilerServices;
-using System.Text.Json;
 
 namespace AsyncResponse.Transports.SqlServer;
 
@@ -106,7 +105,7 @@ internal sealed class SqlServerTransportStore
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -116,6 +115,25 @@ internal sealed class SqlServerTransportStore
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!_options.AutoCreateSchema)
+            {
+                // Operator-managed schema: no DDL and no DDL lock, but the SAME catalog
+                // verification the DDL path runs — an operator-provisioned queue table with the
+                // wrong shape (the queue column's binary collation above all, which ExactQueueMatch
+                // and the claim index depend on) fails silently at runtime, which is exactly what
+                // verification exists to catch. An absent object is fine: the migration has not run
+                // yet, the first query surfaces a clear SQL Server error (the documented "create it
+                // yourself, later" workflow), and _created stays unlatched so a later operation
+                // re-verifies once the migration lands.
+                if (!await ObjectExistsAsync(connection, cancellationToken).ConfigureAwait(false))
+                    return;
+
+                await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
+                _created = true;
+                return;
+            }
+
             await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
             // Serialize schema creation across processes. The IF-NOT-EXISTS guards are not atomic
@@ -221,8 +239,33 @@ internal sealed class SqlServerTransportStore
             ExpectedObjects(),
             cancellationToken);
 
+    /// <summary>
+    /// Reports whether ANY object occupies the configured queue-table name (any kind: a view or
+    /// foreign component's object must reach verification, which names the precise wrong-kind
+    /// reason instead of skipping the checks). The catalog's own collation decides case matching,
+    /// exactly as the server resolves the runtime identifier.
+    /// </summary>
+    private async Task<bool> ObjectExistsAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT CASE WHEN EXISTS (
+                SELECT 1
+                FROM sys.objects o
+                JOIN sys.schemas s ON s.schema_id = o.schema_id
+                WHERE s.name = @schema AND o.name = @table) THEN 1 ELSE 0 END;
+            """;
+        command.Parameters.AddWithValue("@schema", _options.SchemaName);
+        command.Parameters.AddWithValue("@table", _options.MessageTable);
+        return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! == 1;
+    }
+
     /// <summary>The catalog shape this store's DDL intends — the single source for both the
     /// post-DDL verification and the failed-batch diagnosis.</summary>
+    /// <remarks>A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types
+    /// state the scale, because a reduced-scale column rounds <c>available_at</c>/<c>locked_until</c>
+    /// on store — a claim lease that rounds backwards is already expired when it is written.</remarks>
     private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.MessageTable, SqlServerObjectKind.Table,
@@ -231,9 +274,9 @@ internal sealed class SqlServerTransportStore
                     new("queue", "nvarchar(200)", Nullable: false, RequiresBinaryCollation: true),
                     new("payload_json", "nvarchar(max)", Nullable: false),
                     new("headers_json", "nvarchar(max)", Nullable: false, DefaultExpression: "(N'{}')"),
-                    new("created_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
-                    new("available_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
-                    new("locked_until", "datetime2", Nullable: true),
+                    new("created_at", "datetime2(7)", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
+                    new("available_at", "datetime2(7)", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
+                    new("locked_until", "datetime2(7)", Nullable: true),
                     new("lock_id", "uniqueidentifier", Nullable: true),
                     new("attempts", "int", Nullable: false, DefaultExpression: "((0))"),
                     new("dead_letter_reason", "nvarchar(max)", Nullable: true)
@@ -531,23 +574,11 @@ internal sealed class SqlServerTransportStore
         }
     }
 
+    // Lenient by contract (see DbTransportHeaders): this runs after the claim already committed
+    // attempts+1/lock_id, so rejecting any content the nvarchar column legally holds would create
+    // an unkillable poison row.
     private static IReadOnlyDictionary<string, string> DeserializeHeaders(string json)
-    {
-        var parsed = AsyncResponseJson.Deserialize<Dictionary<string, string>>(json);
-        if (parsed is null)
-            return EmptyHeaders;
-
-        // Indexer, not the copying constructor: rows can be written by foreign producers, and JSON
-        // legally carries keys differing only in case — the constructor's internal Add would throw
-        // AFTER the claim already committed attempts+1/lock_id, before any delivery exists, so the
-        // row could never reach HandleFailureAsync or dead-letter: an unkillable poison row that
-        // tears down the subscriber on every re-claim. Last-wins, matching the ASB/SQS receive
-        // adapters.
-        var headers = new Dictionary<string, string>(parsed.Count, StringComparer.OrdinalIgnoreCase);
-        foreach (var pair in parsed)
-            headers[pair.Key] = pair.Value;
-        return headers;
-    }
+        => DbTransportHeaders.Materialize(json);
 
     private static string Sanitize(string value) => value.Replace('\r', ' ').Replace('\n', ' ');
 

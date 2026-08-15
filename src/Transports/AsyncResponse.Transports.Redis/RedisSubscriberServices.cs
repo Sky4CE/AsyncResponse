@@ -59,37 +59,20 @@ internal abstract class RedisSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = AsyncResponseRetry.Backoff(
-                    failures,
-                    Options.SubscriberRetryBaseDelay,
-                    Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(
-                    ex,
-                    "Redis subscriber failed for stream {Stream} ({Role}); retrying in {RetryDelay}.",
-                    Stream.ToString(),
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(
+                failures,
+                Options.SubscriberRetryBaseDelay,
+                Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "Redis subscriber failed for stream {Stream} ({Role}); retrying in {RetryDelay}.",
+                Stream.ToString(),
+                SubscriberRole,
+                retryDelay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
@@ -139,14 +122,12 @@ internal abstract class RedisSubscriberService : BackgroundService
                     SubscriberOptions.BatchSize,
                     stoppingToken).ConfigureAwait(false);
 
-                foreach (var entry in entries)
-                {
-                    if (await DispatchEntryAsync(dispatcher, entry, attempt: 1, stoppingToken).ConfigureAwait(false)
-                        == RedisDispatchOutcome.Processed)
-                    {
-                        processed++;
-                    }
-                }
+                processed += await DispatchBatchAsync(
+                    dispatcher,
+                    entries,
+                    consumerName,
+                    static _ => 1,
+                    stoppingToken).ConfigureAwait(false);
             }
 
             // Throttle when nothing advanced — an empty stream, or every entry deferred under backpressure.
@@ -224,20 +205,135 @@ internal abstract class RedisSubscriberService : BackgroundService
             pending.Select(item => item.MessageId).ToArray(),
             cancellationToken).ConfigureAwait(false);
 
-        var processed = 0;
-        foreach (var entry in claimed)
-        {
-            var priorDeliveries = pendingById.TryGetValue(entry.Id.ToString(), out var info)
-                ? info.DeliveryCount
-                : 1;
-            if (await DispatchEntryAsync(dispatcher, entry, Math.Max(1, priorDeliveries + 1), cancellationToken).ConfigureAwait(false)
-                == RedisDispatchOutcome.Processed)
+        return await DispatchBatchAsync(
+            dispatcher,
+            claimed,
+            consumerName,
+            entry =>
             {
-                processed++;
+                var priorDeliveries = pendingById.TryGetValue(entry.Id.ToString(), out var info)
+                    ? info.DeliveryCount
+                    : 1;
+                return Math.Max(1, priorDeliveries + 1);
+            },
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<int> DispatchBatchAsync(
+        RedisMessageDispatcher dispatcher,
+        StreamEntry[] entries,
+        RedisValue consumerName,
+        Func<StreamEntry, int> attemptFor,
+        CancellationToken stoppingToken)
+    {
+        if (entries.Length == 0)
+            return 0;
+
+        // The batch is dispatched serially, and XREADGROUP/XCLAIM stamped every entry's idle
+        // clock at read time — so a slow handler lets the idle time of the later (still
+        // unprocessed) entries cross PendingMessageMinIdleTime, where a sibling's pending-claim
+        // scan steals and re-runs them concurrently, bumping their PEL delivery count toward the
+        // dead-letter cap on work that never once failed. While the batch is in flight, a
+        // heartbeat claims the unprocessed entries back to this consumer with XCLAIM JUSTID,
+        // which resets idle WITHOUT bumping the delivery count.
+        var progress = new BatchProgress();
+        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var renewalTask = RenewClaimLoopAsync(entries, consumerName, progress, renewalCancellation.Token);
+        var processed = 0;
+        try
+        {
+            foreach (var entry in entries)
+            {
+                try
+                {
+                    if (await DispatchEntryAsync(dispatcher, entry, attemptFor(entry), stoppingToken).ConfigureAwait(false)
+                        == RedisDispatchOutcome.Processed)
+                    {
+                        processed++;
+                    }
+                }
+                finally
+                {
+                    // Also counts Deferred entries: they were left pending ON PURPOSE, so the
+                    // heartbeat must stop touching them and let their idle accrue toward reclaim.
+                    progress.MarkSettled();
+                }
             }
+        }
+        finally
+        {
+            renewalCancellation.Cancel();
+            await renewalTask.ConfigureAwait(false);
         }
 
         return processed;
+    }
+
+    private async Task RenewClaimLoopAsync(
+        StreamEntry[] entries,
+        RedisValue consumerName,
+        BatchProgress progress,
+        CancellationToken cancellationToken)
+    {
+        // ~PendingMessageMinIdleTime/3: two chances to land an idle reset inside every reclaim
+        // window even when one sweep is delayed by a slow round trip.
+        var interval = TimeSpan.FromMilliseconds(Math.Max(1, SubscriberOptions.PendingMessageMinIdleTime.TotalMilliseconds / 3));
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+
+                // Claim from the first unsettled entry onward: that covers the entry currently in
+                // the handler plus everything still waiting its turn. minIdle 0 resets the idle
+                // clock unconditionally, and the races are harmless — an entry ACKed while this
+                // sweep is in flight has left the PEL (the claim simply skips it), and a failed
+                // entry is settled before MarkSettled runs, so its post-failure idle countdown is
+                // never stretched.
+                var settled = progress.SettledCount;
+                if (settled >= entries.Length)
+                    return;
+
+                var remaining = new RedisValue[entries.Length - settled];
+                for (var i = settled; i < entries.Length; i++)
+                    remaining[i - settled] = entries[i].Id;
+
+                try
+                {
+                    await _database.StreamClaimIdsOnlyAsync(
+                        Stream,
+                        ConsumerGroup,
+                        consumerName,
+                        minIdleTimeInMilliseconds: 0,
+                        remaining,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Logger.LogWarning(
+                        ex,
+                        "Failed to refresh the pending idle time of {EntryCount} Redis entries on {Stream}; a sibling may reclaim them while they are still queued here (at-least-once preserved).",
+                        remaining.Length,
+                        Stream.ToString());
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The batch finished or the subscriber is stopping.
+        }
+    }
+
+    private sealed class BatchProgress
+    {
+        // Settled only ever increments, so a monotonic volatile read is enough — no lock, and a
+        // stale read only claims an already-settled entry once more (an ACKed id is simply
+        // absent from the PEL, and a failed one gets its reclaim delayed by one sweep).
+        private int _settledCount;
+
+        public int SettledCount => Volatile.Read(ref _settledCount);
+
+        public void MarkSettled() => Interlocked.Increment(ref _settledCount);
     }
 
     private RedisStreamDelivery CreateDelivery(StreamEntry entry, int attempt)

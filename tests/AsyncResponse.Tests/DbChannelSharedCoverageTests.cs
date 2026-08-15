@@ -174,6 +174,38 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// A targeted dispatch scan touches exactly the signaled correlation ids — a publish signals
+    /// one id, so the scan must cost O(scope), not O(live waiters). Ids outside the scope, ids
+    /// with no live subscription, and the not-yet-due poll tick's empty scope never reach the
+    /// store; a signaled id with a live waiter and the null-scope full sweep still do. The
+    /// failing store makes "reached the store" observable as the arranged fault.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task DispatchPendingMessages_ScansOnlyTheSignaledScope(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        harness.AddSubscription("corr-live", harness.Subscription("corr-live").Instance);
+
+        // Out-of-scope subscription, unknown signaled id, and the empty (suppressed-tick) scope:
+        // no store read, so the arranged fault never surfaces.
+        await harness.InvokeAsync(
+            "DispatchPendingMessagesAsync", new HashSet<string>(StringComparer.Ordinal) { "corr-other" }, CancellationToken.None);
+        await harness.InvokeAsync(
+            "DispatchPendingMessagesAsync", new HashSet<string>(StringComparer.Ordinal), CancellationToken.None);
+
+        // The signaled id has a live waiter: the scan loads its messages and hits the fault.
+        await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
+            "DispatchPendingMessagesAsync", new HashSet<string>(StringComparer.Ordinal) { "corr-live" }, CancellationToken.None));
+
+        // The full sweep (null scope) still scans every subscribed id.
+        await Assert.ThrowsAnyAsync<Exception>(() => harness.InvokeAsync(
+            "DispatchPendingMessagesAsync", null, CancellationToken.None));
+    }
+
+    /// <summary>
     /// The heartbeat round's compensation: a registration dropped (or removed) after the round's
     /// snapshot was taken gets a compensating subscriber delete — the round's upsert may have
     /// resurrected the row the cleanup had just deleted, which would count a phantom live waiter
@@ -561,9 +593,11 @@ public sealed class DbChannelSharedCoverageTests
                     var options = Options.Create(new MongoDbAsyncResponseChannelOptions
                     {
                         AutoCreateIndexes = false,
-                        // Keep EnsureCreatedAsync a no-op: the ledger's collection is not mocked,
-                        // and a store call routed through it would fault on the loose mock instead
-                        // of the fault (or success) the test actually arranged.
+                        // Keep EnsureCreatedAsync off the ledger: the ledger's collection is not
+                        // mocked, and a store call routed through it would fault on the loose mock
+                        // instead of the fault (or success) the test actually arranged. (The
+                        // read-only index check on this path swallows the loose mocks' faults, so
+                        // it cannot interfere.)
                         UseOwnershipLedger = false,
                         UseChangeStreams = false,
                         ListenerPollInterval = pollInterval,
@@ -583,9 +617,6 @@ public sealed class DbChannelSharedCoverageTests
                         .Setup(db => db.GetCollection<MongoChannelSubscriberDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
                         .Returns(subscribers.Object);
                     database.WithCounters();
-                    database
-                        .Setup(db => db.RunCommandAsync(It.IsAny<Command<BsonDocument>>(), It.IsAny<ReadPreference>(), It.IsAny<CancellationToken>()))
-                        .ReturnsAsync(new BsonDocument("localTime", new BsonDateTime(DateTime.UtcNow)));
 
                     if (failing)
                     {

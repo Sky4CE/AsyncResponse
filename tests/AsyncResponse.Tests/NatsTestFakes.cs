@@ -17,6 +17,38 @@ internal class TestLogger : ILogger
 
 internal sealed class TestLogger<T> : TestLogger, ILogger<T>;
 
+/// <summary>
+/// A recording logger that can be told to throw on messages containing a fragment — for pinning
+/// fire-and-forget paths that must catch and log a failure escaping their own body (a throwing
+/// logger provider is the realistic escape).
+/// </summary>
+internal sealed class RecordingThrowingLogger<T> : ILogger<T>
+{
+    private readonly object _gate = new();
+    private readonly List<(LogLevel Level, string Message, Exception? Exception)> _entries = [];
+
+    public string? ThrowOnMessageContaining { get; set; }
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        var message = formatter(state, exception);
+        if (ThrowOnMessageContaining is { } fragment && message.Contains(fragment, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Logger provider failed while logging: {message}");
+
+        lock (_gate)
+            _entries.Add((logLevel, message, exception));
+    }
+
+    public bool HasEntry(LogLevel level, string messageFragment)
+    {
+        lock (_gate)
+            return _entries.Any(entry => entry.Level == level && entry.Message.Contains(messageFragment, StringComparison.Ordinal));
+    }
+}
+
 /// <summary>A controllable <see cref="TimeProvider"/> for deterministic expiry tests.</summary>
 internal sealed class TestTimeProvider : TimeProvider
 {
@@ -296,12 +328,17 @@ internal sealed class FakeNatsResponseChannelClient : INatsResponseChannelClient
     }
 }
 
-/// <summary>Records the ack/nak/term verbs invoked on a single JetStream delivery.</summary>
+/// <summary>Records the ack/nak/term/in-progress verbs invoked on a single JetStream delivery.</summary>
 internal sealed class RecordingDelivery
 {
+    private int _progresses;
+
     public int Acks { get; private set; }
     public int Terms { get; private set; }
     public readonly List<TimeSpan> Naks = new();
+
+    /// <summary>In-progress (AckWait renewal) signals. Interlocked: the heartbeat runs on a background task.</summary>
+    public int Progresses => Volatile.Read(ref _progresses);
 
     /// <summary>When set, every ACK attempt is recorded and then fails with this exception.</summary>
     public Exception? AckException { get; set; }
@@ -311,6 +348,9 @@ internal sealed class RecordingDelivery
 
     /// <summary>When set, every TERM attempt is recorded and then fails with this exception.</summary>
     public Exception? TermException { get; set; }
+
+    /// <summary>When set, every in-progress attempt is recorded and then fails with this exception.</summary>
+    public Exception? ProgressException { get; set; }
 
     public NatsJobDelivery Create(string payload, long numDelivered, string subject = "asyncresponse.transport.worker", IReadOnlyDictionary<string, string>? headers = null)
         => new(
@@ -332,7 +372,14 @@ internal sealed class RecordingDelivery
             {
                 Terms++;
                 return TermException is null ? ValueTask.CompletedTask : ValueTask.FromException(TermException);
-            });
+            })
+        {
+            ProgressAsync = () =>
+            {
+                Interlocked.Increment(ref _progresses);
+                return ProgressException is null ? ValueTask.CompletedTask : ValueTask.FromException(ProgressException);
+            }
+        };
 }
 
 /// <summary>Fake <see cref="INatsJetStreamTransport"/> recording topology/publish calls and yielding queued deliveries.</summary>
@@ -389,10 +436,40 @@ internal sealed class FakeNatsJetStreamTransport : INatsJetStreamTransport
         return Task.FromResult(_publishAttempts.ToString());
     }
 
-    public async IAsyncEnumerable<NatsJobDelivery> ConsumeAsync(string stream, string durable, int batchSize, [EnumeratorCancellation] CancellationToken cancellationToken)
+    /// <summary>Immediate drain: yields only what is already queued, like a JetStream no-wait fetch.</summary>
+    public async IAsyncEnumerable<NatsJobDelivery> FetchNoWaitAsync(string stream, string durable, int maxMessages, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await foreach (var delivery in _deliveries.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        for (var i = 0; i < maxMessages && _deliveries.Reader.TryRead(out var delivery); i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Yield();
             yield return delivery;
+        }
+    }
+
+    /// <summary>Long poll: waits for the first delivery (or expiry/completion), then drains up to the batch.</summary>
+    public async IAsyncEnumerable<NatsJobDelivery> FetchAsync(string stream, string durable, int maxMessages, TimeSpan expires, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var expiry = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        expiry.CancelAfter(expires);
+        for (var i = 0; i < maxMessages; i++)
+        {
+            NatsJobDelivery delivery;
+            try
+            {
+                delivery = await _deliveries.Reader.ReadAsync(expiry.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                yield break; // the fetch expired empty — a real fetch completes without error
+            }
+            catch (ChannelClosedException)
+            {
+                yield break; // CompleteDeliveries()
+            }
+
+            yield return delivery;
+        }
     }
 
     public void EnqueueDelivery(NatsJobDelivery delivery) => _deliveries.Writer.TryWrite(delivery);

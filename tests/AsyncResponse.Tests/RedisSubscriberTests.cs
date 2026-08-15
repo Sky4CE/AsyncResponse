@@ -359,6 +359,152 @@ public class RedisSubscriberTests
         Assert.Equal(64, RedisSubscriberService.TrimConsumerName(new string('x', 65)).Length);
     }
 
+    [Fact]
+    public async Task WorkerSubscriber_SlowBatch_RefreshesPendingIdleOfUnprocessedEntries_ThenStops()
+    {
+        // Red-on-old: XREADGROUP stamps every batch entry as delivered at read time and nothing
+        // refreshed the idle clock while the batch dispatched serially — a handler slower than
+        // PendingMessageMinIdleTime / BatchSize let a sibling's pending-claim scan steal the
+        // batch tail, re-run it concurrently, and bump its PEL delivery count toward the
+        // dead-letter cap on work that never once failed.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        database.ReadBatches.Enqueue(
+        [
+            RedisTransportTests.Entry("1-0", ("payload", "p1"), ("correlationId", "c1")),
+            RedisTransportTests.Entry("2-0", ("payload", "p2"), ("correlationId", "c2"))
+        ]);
+        var ingress = new GatedIngress();
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress,
+            options =>
+            {
+                // Cadence is PendingMessageMinIdleTime / 3 = 30ms; the pending-claim scan is
+                // parked so only the heartbeat touches the claim APIs.
+                options.WorkerSubscriber.PendingMessageMinIdleTime = TimeSpan.FromMilliseconds(90);
+                options.WorkerSubscriber.PendingClaimInterval = TimeSpan.FromSeconds(30);
+            });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started("p1").WaitAsync(TimeSpan.FromSeconds(5)); // 1-0 is wedged in the handler
+
+            // While 1-0 sits in the handler and 2-0 waits its turn, the heartbeat JUSTID-claims
+            // BOTH back to this consumer with minIdle 0 (reset idle, never bump delivery count).
+            await WaitUntilAsync(() => ClaimedIdSets(database).Any(ids => ids.SequenceEqual(["1-0", "2-0"])));
+            lock (database.ClaimIdsOnlyCalls)
+            {
+                var call = database.ClaimIdsOnlyCalls[0];
+                Assert.Equal(0, call.MinIdleTimeInMilliseconds);
+                Assert.Equal(database.ReadGroupCalls[0].Consumer, call.Consumer);
+            }
+
+            ingress.Release("p1");
+            await ingress.Started("p2").WaitAsync(TimeSpan.FromSeconds(5)); // 2-0 is now in the handler
+
+            // 1-0 settled: the sweep shrinks to exactly the unprocessed suffix.
+            await WaitUntilAsync(() => ClaimedIdSets(database).Any(ids => ids.SequenceEqual(["2-0"])));
+
+            ingress.Release("p2");
+            await WaitUntilAsync(() => database.Acks.Count(ack => ack.MessageId is "1-0" or "2-0") == 2);
+
+            // The heartbeat dies with the batch: no further claims after everything settled.
+            int claimsAfterBatch;
+            lock (database.ClaimIdsOnlyCalls)
+            {
+                claimsAfterBatch = database.ClaimIdsOnlyCalls.Count;
+            }
+
+            await Task.Delay(150);
+            lock (database.ClaimIdsOnlyCalls)
+            {
+                Assert.Equal(claimsAfterBatch, database.ClaimIdsOnlyCalls.Count);
+            }
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_FastBatch_DoesNotTouchTheClaimHeartbeat()
+    {
+        // Default PendingMessageMinIdleTime (30s) puts the first sweep at ~10s: a batch settled
+        // quickly must never pay a claim round trip.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        database.ReadBatches.Enqueue(
+        [
+            RedisTransportTests.Entry("1-0", ("payload", "fast"), ("correlationId", "c1"))
+        ]);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        var handled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("fast"))
+            .Returns(() =>
+            {
+                handled.TrySetResult();
+                return Task.CompletedTask;
+            });
+        var subscriber = WorkerSubscriber(
+            database,
+            ingress.Object,
+            options => options.WorkerSubscriber.PendingMessageMinIdleTime = TimeSpan.FromSeconds(30));
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await handled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => database.Acks.Any(ack => ack.MessageId == "1-0"));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        lock (database.ClaimIdsOnlyCalls)
+        {
+            Assert.Empty(database.ClaimIdsOnlyCalls);
+        }
+    }
+
+    private static List<string[]> ClaimedIdSets(RedisTransportTests.FakeRedisStreamDatabase database)
+    {
+        lock (database.ClaimIdsOnlyCalls)
+        {
+            return database.ClaimIdsOnlyCalls.Select(call => call.MessageIds).ToList();
+        }
+    }
+
+    /// <summary>Wedges each worker message in the handler until its payload is released.</summary>
+    private sealed class GatedIngress : IAsyncResponseIngress
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, TaskCompletionSource> _started = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, TaskCompletionSource> _release = new(StringComparer.Ordinal);
+
+        public Task Started(string payload) => Gate(_started, payload).Task;
+
+        public void Release(string payload) => Gate(_release, payload).TrySetResult();
+
+        public async Task HandleWorkerMessageAsync(string messageJson)
+        {
+            Gate(_started, messageJson).TrySetResult();
+            await Gate(_release, messageJson).Task;
+        }
+
+        public Task HandleResponseMessageAsync(string messageJson, string? correlationId = null)
+            => Task.CompletedTask;
+
+        private TaskCompletionSource Gate(Dictionary<string, TaskCompletionSource> gates, string payload)
+        {
+            lock (_gate)
+            {
+                if (!gates.TryGetValue(payload, out var source))
+                {
+                    source = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    gates[payload] = source;
+                }
+
+                return source;
+            }
+        }
+    }
+
     private static RedisWorkerSubscriber WorkerSubscriber(
         RedisTransportTests.FakeRedisStreamDatabase database,
         IAsyncResponseIngress ingress,

@@ -55,12 +55,18 @@ public sealed class OracleDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(ConnectionString))
-            throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
-
+        DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(OracleDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)}", "Oracle", identifierCap: 128);
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(OracleDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+
+        // Indexes share Oracle's schema-object namespace with tables: a table whose name ends
+        // exactly where the reserved "_EXPIRES_IDX" stem truncates derives its own name, and the
+        // CREATE INDEX then raises ORA-00955 — indistinguishable from the benign already-exists
+        // race the DDL path deliberately swallows — so the expiry index would silently never
+        // exist and every prune would full-scan. Unquoted identifiers are case-insensitive.
+        if (string.Equals(DurableFlowStoreShared.DerivedName(TableName, "_EXPIRES_IDX", 128), TableName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"{nameof(OracleDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(OracleDurableFlowOptions));
     }
 }
 
@@ -86,7 +92,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
     private readonly OracleDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
-    private bool _created;
+    private volatile bool _created;
 
     public OracleFlowStateStore(IOptions<OracleDurableFlowOptions> options)
     {
@@ -754,10 +760,7 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -780,20 +783,8 @@ public sealed class OracleFlowStateStore : IFlowStateStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task<OracleConnection> OpenConnectionAsync(CancellationToken cancellationToken)
-    {
-        var connection = new OracleConnection(_options.ConnectionString);
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            return connection;
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
+    private Task<OracleConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+        => DurableFlowStoreShared.OpenConnectionAsync<OracleConnection>(_options.ConnectionString, cancellationToken);
 
     private string Table => _options.TableName;
     private string IndexName => DurableFlowStoreShared.DerivedName(_options.TableName, "_EXPIRES_IDX", 128);

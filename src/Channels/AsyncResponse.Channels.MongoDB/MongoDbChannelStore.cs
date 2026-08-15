@@ -1,9 +1,10 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using MongoDB.Driver;
 using System.Runtime.CompilerServices;
-using System.Text;
 using AsyncResponse.Internal;
 
 namespace AsyncResponse.Channels.MongoDB;
@@ -27,23 +28,26 @@ internal sealed class MongoDbChannelStore : IDisposable
     private readonly MongoDbAsyncResponseChannelOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly IMongoClient? _ownedClient;
+    private readonly ILogger _logger;
     private bool _created;
 
     public MongoDbChannelStore(
         IMongoDatabase database,
         IOptions<MongoDbAsyncResponseChannelOptions> options,
         IMongoClient? ownedClient = null,
-        MongoNamespaceRegistry? namespaceRegistry = null)
+        IMongoNamespaceRegistry? namespaceRegistry = null,
+        ILogger? logger = null)
     {
         _options = options.Value;
         _options.Validate();
         _database = database;
+        _logger = logger ?? NullLogger.Instance;
 
         // Cross-component collection ownership (DI-hosted stores only): another AsyncResponse
         // component configured onto one of these collections — the derived counters collection
         // included — must fail startup in either construction order.
         namespaceRegistry?.Claim(
-            ClusterKey(database),
+            MongoNamespaceRegistry.ClusterKey(database),
             database.DatabaseNamespace.DatabaseName,
             "MongoDB channel",
             [
@@ -57,10 +61,10 @@ internal sealed class MongoDbChannelStore : IDisposable
         // first known — and the derived counters namespace is 9 bytes longer than the configured
         // message collection, so a near-limit configuration passed every static check and failed
         // at the first ack-sequence draw.
-        ValidateEffectiveNamespace(database, _options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection));
-        ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
-        ValidateEffectiveNamespace(database, _options.SubscriberCollection, nameof(_options.SubscriberCollection));
-        ValidateEffectiveNamespace(database, CountersCollectionName(_options.MessageCollection), "the derived ack-counter collection");
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.RecoveryStateCollection, nameof(_options.RecoveryStateCollection));
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.MessageCollection, nameof(_options.MessageCollection));
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.SubscriberCollection, nameof(_options.SubscriberCollection));
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, CountersCollectionName(_options.MessageCollection), "the derived ack-counter collection");
 
         _recovery = database.GetCollection<MongoRecoveryStateDocument>(_options.RecoveryStateCollection);
         _messages = database.GetCollection<MongoChannelMessageDocument>(_options.MessageCollection);
@@ -74,7 +78,7 @@ internal sealed class MongoDbChannelStore : IDisposable
 
     public async Task EnsureCreatedAsync(CancellationToken cancellationToken = default)
     {
-        if (_created || (!_options.AutoCreateIndexes && !_options.UseOwnershipLedger))
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -104,6 +108,13 @@ internal sealed class MongoDbChannelStore : IDisposable
 
             if (!_options.AutoCreateIndexes)
             {
+                // Manually managed indexes get a one-time read-only check instead of DDL. There
+                // is no collection shape to verify (documents are schemaless), so the silent
+                // failure modes are all indexes — above all a missing TTL index, which means
+                // nothing ever reaps expired documents. Absence is a warning, never a startup
+                // failure: indexes degrade retention and performance, not correctness, and a
+                // least-privilege operator may provision them out of band.
+                await WarnIfManagedIndexesMissingAsync(cancellationToken).ConfigureAwait(false);
                 _created = true;
                 return;
             }
@@ -177,6 +188,71 @@ internal sealed class MongoDbChannelStore : IDisposable
             await collection.Indexes.CreateOneAsync(model, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private async Task WarnIfManagedIndexesMissingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await WarnIfCollectionIndexesMissingAsync(_recovery, _options.RecoveryStateCollection, cancellationToken).ConfigureAwait(false);
+            await WarnIfCollectionIndexesMissingAsync(_messages, _options.MessageCollection, cancellationToken).ConfigureAwait(false);
+            await WarnIfCollectionIndexesMissingAsync(_subscribers, _options.SubscriberCollection, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A deployment that cannot even list indexes (no listIndexes privilege, server
+            // unreachable at first use) must not lose the actual operation to the check: the
+            // caller's own store call surfaces any real connectivity failure.
+            _logger.LogDebug(ex, "Skipping index verification for the manually managed MongoDB channel collections; listIndexes was not available.");
+        }
+    }
+
+    private async Task WarnIfCollectionIndexesMissingAsync<TDocument>(
+        IMongoCollection<TDocument> collection,
+        string collectionName,
+        CancellationToken cancellationToken)
+    {
+        List<BsonDocument> indexes;
+        try
+        {
+            using var cursor = await collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
+            indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (MongoCommandException ex) when (ex.Code == 26)
+        {
+            // NamespaceNotFound: the collection does not exist yet. MongoDB creates it bare on
+            // the first write — which, with index DDL disabled, is exactly a collection with no
+            // TTL index.
+            indexes = [];
+        }
+
+        // Matched by KEY, not by name: operators own the naming of manually provisioned indexes.
+        if (!indexes.Any(index => IndexLeadsOn(index, "expires_at") && index.Contains("expireAfterSeconds")))
+        {
+            _logger.LogWarning(
+                "MongoDB collection {Database}.{Collection} has no TTL index on 'expires_at' and AutoCreateIndexes is disabled. " +
+                "Expired documents are never reaped, so the collection grows without bound. " +
+                "Create a TTL index (expireAfterSeconds: 0 on 'expires_at') or enable AutoCreateIndexes.",
+                _database.DatabaseNamespace.DatabaseName, collectionName);
+        }
+
+        if (!indexes.Any(index => IndexLeadsOn(index, "correlation_id")))
+        {
+            _logger.LogWarning(
+                "MongoDB collection {Database}.{Collection} has no index leading on 'correlation_id' and AutoCreateIndexes is disabled. " +
+                "Correlation-id lookups scan the whole collection — performance only; create the index to restore indexed dispatch.",
+                _database.DatabaseNamespace.DatabaseName, collectionName);
+        }
+    }
+
+    /// <summary>
+    /// Whether the listed index's FIRST key field is <paramref name="field"/> — what a prefix
+    /// lookup uses, and (TTL indexes being single-field) what identifies the TTL index.
+    /// </summary>
+    private static bool IndexLeadsOn(BsonDocument index, string field)
+        => index.TryGetValue("key", out var key)
+           && key is BsonDocument keyDocument
+           && keyDocument.ElementCount > 0
+           && keyDocument.GetElement(0).Name == field;
 
     public async Task SaveRecoveryStateAsync(string correlationId, RecoveryState state, TimeSpan ttl, CancellationToken cancellationToken)
     {
@@ -257,7 +333,7 @@ internal sealed class MongoDbChannelStore : IDisposable
     public Task<DateTimeOffset> InsertMessageAsync(Guid id, string correlationId, string envelopeJson, TimeSpan retention, CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(
             token => InsertMessageOnceAsync(id, correlationId, envelopeJson, retention, token),
-            IsTransient,
+            MongoTransientFaults.IsTransient,
             _options.PublishMaxAttempts,
             _options.PublishRetryBaseDelay,
             _options.PublishRetryMaxDelay,
@@ -451,14 +527,48 @@ internal sealed class MongoDbChannelStore : IDisposable
     /// <summary>
     /// A subscription's registration watermark: the server's UTC clock (for the created-at bound)
     /// and a fresh position in the monotonic ack sequence (for the exact acked-history bound —
-    /// see the watermark in the shared channel base).
+    /// see the watermark in the shared channel base). Drawn by ONE atomic counter update whose
+    /// pipeline advances the sequence and stamps <c>$$NOW</c> in the same document write
+    /// (PG/SqlServer single-statement parity): with separate clock and sequence round trips, a
+    /// delivery claim landing between them pairs a same-millisecond <c>acked_at</c> with a lower
+    /// sequence, and the same-tick tie-breaker then files a legitimate fan-out delivery as
+    /// history.
     /// </summary>
     public async Task<(DateTimeOffset ServerTimeUtc, long StartSeq)> GetSubscriptionStartAsync(CancellationToken cancellationToken)
     {
-        var serverTimeUtc = await GetServerTimeUtcAsync(cancellationToken).ConfigureAwait(false);
-        var startSeq = await DrawAckSequenceAsync(cancellationToken).ConfigureAwait(false);
-        return (serverTimeUtc, startSeq);
+        var counter = await _counters.FindOneAndUpdateAsync<BsonDocument>(
+            new BsonDocument("_id", "ack_seq"),
+            BuildSubscriptionStartPipeline(),
+            new FindOneAndUpdateOptions<BsonDocument, BsonDocument> { IsUpsert = true, ReturnDocument = ReturnDocument.After },
+            cancellationToken).ConfigureAwait(false);
+
+        // The pipeline stamps drawn_at from $$NOW unconditionally, so anything else is a driver
+        // anomaly. Failing beats an app-clock fallback, which would silently feed a client clock
+        // into the server-clock watermark this draw exists to protect.
+        return counter is not null
+               && counter.TryGetValue("drawn_at", out var drawnAt)
+               && drawnAt is BsonDateTime serverTime
+            ? (new DateTimeOffset(serverTime.ToUniversalTime(), TimeSpan.Zero), counter["seq"].ToInt64())
+            : throw new InvalidOperationException(
+                "MongoDB subscription-start draw returned no server-stamped counter document despite IsUpsert + ReturnDocument.After; the registration watermark is unknown.");
     }
+
+    /// <summary>
+    /// Counter-update pipeline for a subscription registration: advances the monotonic ack
+    /// sequence AND stamps the draw with the server clock in one atomic document update, so no
+    /// delivery claim can interleave between the sequence draw and the clock read.
+    /// <c>$ifNull</c> seeds a fresh counter document at 1, matching the delivery claim's
+    /// <c>$inc</c> upsert.
+    /// </summary>
+    internal static UpdateDefinition<BsonDocument> BuildSubscriptionStartPipeline()
+        => Builders<BsonDocument>.Update.Pipeline(new[]
+        {
+            new BsonDocument("$set", new BsonDocument
+            {
+                ["seq"] = new BsonDocument("$add", new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$seq", 0L }), 1L }),
+                ["drawn_at"] = "$$NOW"
+            })
+        });
 
     public async Task<bool> IsMessageAcknowledgedAsync(Guid messageId, CancellationToken cancellationToken)
     {
@@ -601,22 +711,6 @@ internal sealed class MongoDbChannelStore : IDisposable
     internal static string RegistrationKey(string correlationId, Guid registrationId)
         => $"{correlationId}:{registrationId:N}";
 
-    internal static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is MongoConnectionException
-               or MongoNotPrimaryException
-               or MongoNodeIsRecoveringException
-               or MongoExecutionTimeoutException
-               or TimeoutException
-               || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
-
-    /// <summary>
-    /// Stable identity of the cluster a database handle points at, for cross-component
-    /// collection-ownership claims: same servers + same database name = same namespace space.
-    /// </summary>
-    internal static string ClusterKey(IMongoDatabase database)
-        => string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal));
-
     /// <summary>
     /// Name of the derived ack-counter collection. Part of the effective collection-name plan:
     /// options validation must keep the configured collections distinct from this derived name,
@@ -637,22 +731,6 @@ internal sealed class MongoDbChannelStore : IDisposable
         if (string.Equals(value, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"{nameof(MongoDbAsyncResponseChannelOptions)}.{name} '{value}' is reserved for the cross-component ownership ledger.");
-    }
-
-    /// <summary>
-    /// Validates an effective namespace ("database.collection") against MongoDB's 255-byte UTF-8
-    /// limit. Only the store constructor knows the actual database name, so this cannot live in
-    /// options validation.
-    /// </summary>
-    internal static void ValidateEffectiveNamespace(IMongoDatabase database, string collectionName, string description)
-    {
-        var ns = $"{database.DatabaseNamespace.DatabaseName}.{collectionName}";
-        var byteLength = Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 235)
-            throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({description}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
-                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
-                "Shorten the database or collection name.");
     }
 
     /// <summary>Disposes the Mongo client when the store created (and therefore owns) it.</summary>

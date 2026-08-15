@@ -651,8 +651,12 @@ code pushes to `main`; per-commit trends with regression alerting are published 
 
 ## How it's tested
 
-**6,800+ test executions per CI run, none skipped** — 4,300+ unit
-and 2,500+ integration cases against real servers. The unit suite dogfoods the shipped
+**7,300+ test executions per CI run** — 4,800+ unit and 2,500+ integration cases against real
+servers. The only skips are declared ones: capability-gated conformance facts (the delayed-delivery
+timing contract skips on the five transports without native scheduling — Redis, NATS, Kafka,
+RabbitMQ, and Google Pub/Sub) and two explicit opt-out switches (`ASYNCRESPONSE_SKIP_AOT_GATE` for
+the Native AOT gate, `ASYNCRESPONSE_ITEST_SKIP_ORACLE_COSMOS` for the Oracle/Cosmos shards). The
+unit suite dogfoods the shipped
 [`AsyncResponse.Testing`](docs/testing.md) harness: durable timers, cron schedules,
 production-sized timeouts, crash-at-every-checkpoint matrices, and restart-recovery scenarios all
 run on its virtual clock — multi-day sleeps and seven-day timeouts elapse in microseconds, so the
@@ -707,8 +711,11 @@ and the subscription's `DeadLetterPolicy` on Google Pub/Sub. Two constrain the b
 cannot count past two without an application-owned TTL-retry cycle (a plain `basic.nack` requeue does
 not increment `x-death`), and a Pub/Sub dead-letter policy rejects anything under five. Payload
 ceilings differ by two orders of magnitude — SQS and Service Bus standard tier both reject messages
-over 256 KiB — so the payload fact is sized per transport. Where a capability is genuinely absent, the
-contract asserts the absence instead of skipping, so adding it later fails the test.
+over 256 KiB — so the payload fact is sized per transport. Where a capability is genuinely absent, a
+dedicated fact asserts the absence — every transport is pinned for or against native delayed
+delivery, so gaining or losing `IDelayedWorkerTransport` later fails the test — while the
+delayed-delivery *timing* facts skip, capability-gated, on the five transports that lack it (there,
+durable-flow timers wait in process on the engine's timer path instead).
 
 ### Real servers, and the shipped app
 

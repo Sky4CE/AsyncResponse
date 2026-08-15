@@ -22,6 +22,7 @@ public class WatchdogReportTests
         Assert.Equal(0, report.EntriesWithActiveWaiter);
         Assert.Same(entry, Assert.Single(report.StaleEntries));
         Assert.Equal(0, report.UnknownAgeEntries);
+        Assert.Equal(0, report.UnprobeableEntries);
     }
 
     [Fact]
@@ -61,7 +62,7 @@ public class WatchdogReportTests
     }
 
     [Fact]
-    public void UnknownLiveness_IsNotStaleOrUnknownAge()
+    public void UnknownLiveness_IsNotStaleOrUnknownAge_ButIsCountedUnprobeable()
     {
         var entry = Entry(registeredAgo: TimeSpan.FromDays(3), activeSubscribers: -1);
 
@@ -70,6 +71,9 @@ public class WatchdogReportTests
         Assert.Equal(1, report.TotalEntries);
         Assert.Empty(report.StaleEntries);
         Assert.Equal(0, report.UnknownAgeEntries);
+        // Never flagged stale (no false alarms) — but never silently dropped either: dropped
+        // from every bucket, a probe outage would read as a clean pass.
+        Assert.Equal(1, report.UnprobeableEntries);
     }
 
     [Fact]
@@ -79,12 +83,14 @@ public class WatchdogReportTests
         var healthyActive = Entry(TimeSpan.FromDays(3), activeSubscribers: 2, correlationId: "active");
         var armedYoung = Entry(TimeSpan.FromMinutes(10), activeSubscribers: 0, correlationId: "young");
         var legacy = new RecoveryStateObservation("legacy", null, 0, null);
+        var unprobeable = Entry(TimeSpan.FromDays(3), activeSubscribers: -1, correlationId: "unprobeable");
 
-        var report = AsyncResponseWatchdogReport.Evaluate([stale, healthyActive, armedYoung, legacy], Now, StaleAfter);
+        var report = AsyncResponseWatchdogReport.Evaluate([stale, healthyActive, armedYoung, legacy, unprobeable], Now, StaleAfter);
 
-        Assert.Equal(4, report.TotalEntries);
+        Assert.Equal(5, report.TotalEntries);
         Assert.Equal(1, report.EntriesWithActiveWaiter);
         Assert.Equal(1, report.UnknownAgeEntries);
+        Assert.Equal(1, report.UnprobeableEntries);
         Assert.Equal("stale", report.StaleEntries.Single().CorrelationId);
     }
 

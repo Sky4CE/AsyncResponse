@@ -500,11 +500,19 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         {
             _ = Task.Run(async () =>
             {
-                _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
-                AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
-                AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
-                tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                await DrainThenCleanupAsync().ConfigureAwait(false);
+                try
+                {
+                    _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
+                    AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
+                    AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
+                    tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
+                    await DrainThenCleanupAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Fire-and-forget: nothing awaits this task, so an escaped fault would vanish.
+                    _logger.LogError(ex, "Error handling waiter timeout for correlationId {CorrelationId}.", correlationId);
+                }
             });
         });
 

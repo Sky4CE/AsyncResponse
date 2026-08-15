@@ -1,5 +1,6 @@
 using AsyncResponse.Channels.MongoDB;
 using AsyncResponse.DurableFlows.MongoDB;
+using AsyncResponse.Internal;
 using AsyncResponse.Transports.MongoDB;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -101,6 +102,37 @@ public sealed class MongoDbOptionsTests
     }
 
     [Fact]
+    public void SharedDatabase_TransportJoinsTheSameOwnershipRegistryAsChannel()
+    {
+        // Each MongoDB package's own ServiceCollectionExtensions calls
+        // TryAddSingleton<IMongoNamespaceRegistry, MongoNamespaceRegistry>() independently — three
+        // separate call sites (channel, transport, durable-flow), each compiling its OWN copy of
+        // the link-shared MongoNamespaceRegistry concrete type. If those calls resolved three
+        // independent instances instead of one shared singleton, this collision would go
+        // undetected exactly as a ClusterKey derivation drift would: silently, fail-open. The
+        // sibling collision test above pairs channel + durable-flow; this pairs channel +
+        // transport, the one MongoDB package that test does not exercise.
+        var client = new Mock<IMongoClient>();
+        client.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        database.SetupGet(d => d.Client).Returns(client.Object);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton(database.Object);
+        services.AddAsyncResponse()
+            .WithMongoDbChannel(options => options.MessageCollection = "jobs")
+            .WithMongoDbTransport(options => options.MessageCollection = "jobs_counters");
+        using var provider = services.BuildServiceProvider();
+
+        _ = provider.GetRequiredService<MongoDbChannelStore>();
+        var ex = Assert.Throws<InvalidOperationException>(provider.GetRequiredService<MongoDbTransportStore>);
+        Assert.Contains("MongoDB channel", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MongoDB transport", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("jobs_counters", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Stores_RejectEffectiveNamespacesOverTheByteLimit_AtConstruction()
     {
         // The namespace limit spans "database.collection", so only the store — which knows the
@@ -141,6 +173,29 @@ public sealed class MongoDbOptionsTests
         using var flowAtLimit = new MongoDbFlowStateStore(
             database,
             Options.Create(new MongoDbDurableFlowOptions { CollectionName = new string('m', 229) }));
+    }
+
+    [Fact]
+    public void Stores_RejectEffectiveNamespacesOverTheByteLimit_WithMultiByteUtf8Collection()
+    {
+        // Encoding.UTF8.GetByteCount, not string.Length, must gate the limit: 'é' costs 2 UTF-8
+        // bytes but 1 char, so a char-count check would pass a namespace the byte count rejects.
+        // db "tests" (5 bytes) + "." + N-byte collection = N + 6.
+        var database = new MongoClient("mongodb://localhost:27017").GetDatabase("tests");
+
+        // 115 copies of 'é': 115 CHARACTERS (nowhere near a 235-character limit) but 230 UTF-8
+        // bytes — one byte over the 235-byte sharded limit once the "tests." prefix is counted.
+        var overLimit = Assert.Throws<InvalidOperationException>(() => new MongoDbTransportStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('é', 115) })));
+        Assert.Contains("236 UTF-8 bytes", overLimit.Message, StringComparison.Ordinal);
+        Assert.Contains("235 bytes", overLimit.Message, StringComparison.Ordinal);
+
+        // 114 copies of 'é' plus one single-byte character: 229 UTF-8 bytes of collection name —
+        // exactly 235 for the full namespace. Constructs without throwing.
+        using var atLimit = new MongoDbTransportStore(
+            database,
+            Options.Create(new MongoDbAsyncResponseTransportOptions { MessageCollection = new string('é', 114) + "m" }));
     }
 
     [Fact]
@@ -465,18 +520,28 @@ public sealed class MongoDbOptionsTests
     }
 
     [Fact]
-    public void MongoDbRetry_ClassifiesTransientExceptions()
+    public void CorrelationExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(() => MongoDbCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"1","CorrelationId":"2"}""",
+            new MongoDbAsyncResponseTransportOptions()));
+
+    [Fact]
+    public void MongoTransientFaults_ClassifiesTransientExceptions()
     {
-        Assert.True(MongoDbTransportRetry.IsTransient(new TimeoutException()));
-        Assert.True(MongoDbChannelStore.IsTransient(new TimeoutException()));
-        Assert.False(MongoDbTransportRetry.IsTransient(new OperationCanceledException()));
-        Assert.False(MongoDbChannelStore.IsTransient(new OperationCanceledException()));
-        Assert.False(MongoDbTransportRetry.IsTransient(new InvalidOperationException()));
-        Assert.False(MongoDbChannelStore.IsTransient(new InvalidOperationException()));
+        // MongoDbTransportRetry (worker publish) and MongoDbChannelStore (response insert) both
+        // route their retry loops through this one classifier now — asserting it here is what
+        // keeps their verdicts from drifting apart again.
+        Assert.True(MongoTransientFaultsIsTransient(new TimeoutException()));
+        Assert.False(MongoTransientFaultsIsTransient(new OperationCanceledException()));
+        Assert.False(MongoTransientFaultsIsTransient(new InvalidOperationException()));
     }
 
     [Fact]
-    public void MongoDbRetry_ClassifiesDriverExceptionsAndRetryableLabels()
+    public void MongoTransientFaults_ClassifiesDriverExceptionsAndRetryableLabels()
     {
         var connectionId = new ConnectionId(
             new ServerId(new ClusterId(), new DnsEndPoint("localhost", 27017)));
@@ -492,13 +557,9 @@ public sealed class MongoDbOptionsTests
         ];
 
         foreach (var exception in transient)
-        {
-            Assert.True(MongoDbTransportRetry.IsTransient(exception));
-            Assert.True(MongoDbChannelStore.IsTransient(exception));
-        }
+            Assert.True(MongoTransientFaultsIsTransient(exception));
 
-        Assert.False(MongoDbTransportRetry.IsTransient(new MongoException("permanent")));
-        Assert.False(MongoDbChannelStore.IsTransient(new MongoException("permanent")));
+        Assert.False(MongoTransientFaultsIsTransient(new MongoException("permanent")));
     }
 
     [Fact]
@@ -695,4 +756,16 @@ public sealed class MongoDbOptionsTests
         => (RecoveryState?)typeof(MongoDbRecoveryStateStore)
             .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(store, [json, correlationId]);
+
+    /// <summary>
+    /// MongoTransientFaults is source-linked into both the channel and transport packages, so an
+    /// unqualified reference from a test that references both assemblies is a CS0433 ambiguity
+    /// (matching MongoOwnershipLedgerTests' reflection binding to one assembly's copy — every
+    /// copy is behaviorally identical, so which one answers is immaterial).
+    /// </summary>
+    private static bool MongoTransientFaultsIsTransient(Exception exception)
+        => (bool)typeof(MongoDbAsyncResponseChannelOptions).Assembly
+            .GetType("AsyncResponse.Internal.MongoTransientFaults", throwOnError: true)!
+            .GetMethod("IsTransient", BindingFlags.Public | BindingFlags.Static)!
+            .Invoke(null, [exception])!;
 }

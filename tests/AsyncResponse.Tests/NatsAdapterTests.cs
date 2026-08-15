@@ -446,7 +446,7 @@ public class NatsJetStreamTransportAdapterTests
     }
 
     [Fact]
-    public async Task ConsumeAsync_MapsMessages_AndAckNakTermDelegatesForward()
+    public async Task FetchNoWaitAsync_MapsMessages_AndSettlementDelegatesForward()
     {
         var message = new Mock<INatsJSMsg<string>>();
         message.SetupGet(m => m.Subject).Returns("subj");
@@ -455,17 +455,21 @@ public class NatsJetStreamTransportAdapterTests
         message.SetupGet(m => m.Metadata).Returns((NatsJSMsgMetadata?)null);
         message.Setup(m => m.AckAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>())).Returns(ValueTask.CompletedTask);
         message.Setup(m => m.AckTerminateAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>())).Returns(ValueTask.CompletedTask);
+        message.Setup(m => m.AckProgressAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>())).Returns(ValueTask.CompletedTask);
 
+        NatsJSFetchOpts? capturedOpts = null;
         var consumer = new Mock<INatsJSConsumer>();
-        consumer.Setup(c => c.ConsumeAsync<string>(It.IsAny<INatsDeserialize<string>>(), It.IsAny<NatsJSConsumeOpts>(), It.IsAny<CancellationToken>()))
+        consumer.Setup(c => c.FetchNoWaitAsync<string>(It.IsAny<NatsJSFetchOpts>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .Callback<NatsJSFetchOpts, INatsDeserialize<string>?, CancellationToken>((opts, _, _) => capturedOpts = opts)
             .Returns(AsyncEnum(message.Object));
         _jetStream.Setup(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>())).ReturnsAsync(consumer.Object);
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         var deliveries = new List<NatsJobDelivery>();
-        await foreach (var delivery in adapter.ConsumeAsync("stream", "durable", 16, CancellationToken.None))
+        await foreach (var delivery in adapter.FetchNoWaitAsync("stream", "durable", 16, CancellationToken.None))
             deliveries.Add(delivery);
 
+        Assert.Equal(16, capturedOpts!.MaxMsgs);
         var single = Assert.Single(deliveries);
         Assert.Equal("subj", single.Subject);
         Assert.Equal("payload", single.Payload);
@@ -473,16 +477,18 @@ public class NatsJetStreamTransportAdapterTests
 
         await single.AckAsync();
         await single.TermAsync();
+        await single.ProgressAsync();
         // NakAsync(delay) is a NATS.Net extension over the message (not a mockable member), so it
         // cannot be Moq-verified; invoking the delegate still exercises the adapter's nak path, and the
         // extension's internal member call on the loose mock is tolerated.
         try { await single.NakAsync(TimeSpan.FromSeconds(2)); } catch (Exception) { /* extension-over-mock */ }
         message.Verify(m => m.AckAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
         message.Verify(m => m.AckTerminateAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
+        message.Verify(m => m.AckProgressAsync(It.IsAny<AckOpts?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
-    public async Task ConsumeAsync_MapsHeadersAndMetadata()
+    public async Task FetchAsync_MapsHeadersAndMetadata_AndCarriesExpires()
     {
         var headers = new NatsHeaders
         {
@@ -502,21 +508,44 @@ public class NatsJetStreamTransportAdapterTests
             "durable",
             "domain"));
 
+        NatsJSFetchOpts? capturedOpts = null;
         var consumer = new Mock<INatsJSConsumer>();
-        consumer.Setup(c => c.ConsumeAsync<string>(It.IsAny<INatsDeserialize<string>>(), It.IsAny<NatsJSConsumeOpts>(), It.IsAny<CancellationToken>()))
+        consumer.Setup(c => c.FetchAsync<string>(It.IsAny<NatsJSFetchOpts>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .Callback<NatsJSFetchOpts, INatsDeserialize<string>?, CancellationToken>((opts, _, _) => capturedOpts = opts)
             .Returns(AsyncEnum(message.Object));
         _jetStream.Setup(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>())).ReturnsAsync(consumer.Object);
         var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
 
         var deliveries = new List<NatsJobDelivery>();
-        await foreach (var delivery in adapter.ConsumeAsync("stream", "durable", 16, CancellationToken.None))
+        await foreach (var delivery in adapter.FetchAsync("stream", "durable", 1, TimeSpan.FromSeconds(30), CancellationToken.None))
             deliveries.Add(delivery);
 
+        Assert.Equal(1, capturedOpts!.MaxMsgs);
+        Assert.Equal(TimeSpan.FromSeconds(30), capturedOpts.Expires);
         var single = Assert.Single(deliveries);
         Assert.Equal(string.Empty, single.Payload);
         Assert.Equal(4, single.NumDelivered);
         Assert.Equal("corr-1", single.Headers["AR-Correlation-Id"]);
         Assert.Equal("yes", single.Headers["Retry"]);
+    }
+
+    [Fact]
+    public async Task FetchAsync_ReusesTheConsumerLookupAcrossFetches()
+    {
+        // One consumer-INFO round trip per (stream, durable), not per fetch: the wrapper only
+        // carries names for building pull requests, so it stays valid across batches.
+        var consumer = new Mock<INatsJSConsumer>();
+        consumer.Setup(c => c.FetchNoWaitAsync<string>(It.IsAny<NatsJSFetchOpts>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .Returns(AsyncEnum());
+        consumer.Setup(c => c.FetchAsync<string>(It.IsAny<NatsJSFetchOpts>(), It.IsAny<INatsDeserialize<string>>(), It.IsAny<CancellationToken>()))
+            .Returns(AsyncEnum());
+        _jetStream.Setup(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>())).ReturnsAsync(consumer.Object);
+        var adapter = new NatsJetStreamTransportAdapter(_jetStream.Object);
+
+        await foreach (var _ in adapter.FetchNoWaitAsync("stream", "durable", 16, CancellationToken.None)) { }
+        await foreach (var _ in adapter.FetchAsync("stream", "durable", 1, TimeSpan.FromSeconds(1), CancellationToken.None)) { }
+
+        _jetStream.Verify(c => c.GetConsumerAsync("stream", "durable", It.IsAny<CancellationToken>()), Times.Once);
     }
 
     private static async IAsyncEnumerable<INatsJSMsg<string>> AsyncEnum(params INatsJSMsg<string>[] items)

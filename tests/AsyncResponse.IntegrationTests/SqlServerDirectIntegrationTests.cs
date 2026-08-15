@@ -137,6 +137,105 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task PreDdlFailure_SurfacesTheOriginalError_NotAPhantomAbsenceCollision()
+    {
+        // A DDL batch that dies before creating anything (here: CREATE SCHEMA/TABLE permission
+        // denied) used to be re-diagnosed against an EMPTY catalog, where the unconditional
+        // absence check reported "expected ... to exist after schema creation" — wrapping the
+        // real SqlException in a phantom collision about a table nobody expected to be there. A
+        // diagnosis that finds nothing present and wrong must let the original error stand.
+        await WithSchemaAsync("sql_pre_ddl", async schema =>
+        {
+            var login = $"{schema}_login";
+            const string password = "Pre-Ddl-Failure-1!";
+            await ExecuteAsync($"CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF;");
+            await ExecuteAsync($"CREATE USER [{login}] FOR LOGIN [{login}];");
+            try
+            {
+                // CONNECT only: the login can open connections and read what little metadata it
+                // owns (nothing), but every CREATE in the DDL batch is denied.
+                var options = ChannelOptions(schema);
+                options.ConnectionString = new SqlConnectionStringBuilder(Fixture.SqlServerConnectionString)
+                {
+                    UserID = login,
+                    Password = password,
+                    Pooling = false
+                }.ConnectionString;
+                var channel = new SqlServerChannelSql(Options.Create(options));
+
+                var ex = await Assert.ThrowsAsync<SqlException>(() => channel.EnsureCreatedAsync());
+                Assert.Contains("permission denied", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                await ExecuteAsync($"DROP USER IF EXISTS [{login}];");
+                await ExecuteAsync($"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];");
+            }
+        });
+    }
+
+    [Fact]
+    public async Task ManagedTransportSchema_VerifiesProvisionedTables_AndDefersWhileAbsent()
+    {
+        // AutoCreateSchema=false used to return before ANY network call: an operator-provisioned
+        // queue table's shape was never checked — the transport ran the verifier only on the DDL
+        // path, i.e. only where it was least needed. Managed mode now runs the same catalog
+        // verification with the flow store's semantics: absent object = silent, re-check later
+        // (never latch); present = verify (wrong shape fails actionably) and latch.
+        await WithSchemaAsync("sql_managed_transport", async schema =>
+        {
+            var managedOptions = TransportOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new SqlServerTransportStore(Options.Create(managedOptions));
+
+            await managed.EnsureCreatedAsync();
+            Assert.False(CreatedLatch(managed));
+
+            await new SqlServerTransportStore(Options.Create(TransportOptions(schema))).EnsureCreatedAsync();
+            await managed.EnsureCreatedAsync();
+            Assert.True(CreatedLatch(managed));
+        });
+
+        // The queue column's binary collation is part of the verified shape: three logical queues
+        // share one table told apart by nothing but that column, and a case-folding collation on
+        // an operator-provisioned table previously went completely undetected.
+        await WithSchemaAsync("sql_managed_collation", async schema =>
+        {
+            await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
+            await ExecuteAsync(
+                $"""
+                CREATE TABLE [{schema}].[jobs] (
+                    id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+                    queue nvarchar(200) COLLATE Latin1_General_100_CI_AS NOT NULL,
+                    payload_json nvarchar(max) NOT NULL,
+                    headers_json nvarchar(max) NOT NULL DEFAULT N'{EmptyJsonObject}',
+                    created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    locked_until datetime2 NULL,
+                    lock_id uniqueidentifier NULL,
+                    attempts int NOT NULL DEFAULT 0,
+                    dead_letter_reason nvarchar(max) NULL
+                );
+                """);
+
+            var options = TransportOptions(schema);
+            options.AutoCreateSchema = false;
+            options.MessageTable = "jobs";
+            var store = new SqlServerTransportStore(Options.Create(options));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Contains("not binary", ex.Message, StringComparison.Ordinal);
+            Assert.False(CreatedLatch(store));
+        });
+    }
+
+    // Interpolated into crafted DDL: literal braces cannot appear directly inside the
+    // interpolated raw string.
+    private const string EmptyJsonObject = "{}";
+
+    private static bool CreatedLatch(object store)
+        => (bool)store.GetType().GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(store)!;
+
+    [Fact]
     public async Task NameHeldByAnotherObjectKind_FailsVerificationInsteadOfRawError2714()
     {
         // A view (or synonym, or procedure) occupying the name slips past an existence guard that
@@ -529,6 +628,58 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
             Assert.Contains("is not binary", ex.Message, StringComparison.Ordinal);
             Assert.Contains("Latin1_General_100_CS_AS", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task ReducedScaleTimestampColumns_AreRejected_AndFullScaleOnesAccepted()
+    {
+        // datetime2(0) is not a coarser VIEW of the same instant: SQL Server ROUNDS on store, so a
+        // lease or ack timestamp can land BELOW an already-observed full-precision watermark and
+        // reorder the events the stores compare. The catalog query read only max_length, so the
+        // reduced-scale column rendered as a bare "datetime2" and matched the expectation exactly.
+        await WithSchemaAsync("sql_scale", async schema =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            options.AutoCreateSchema = false;
+            var emptyJsonDefault = "{}";
+            await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
+            await ExecuteAsync(
+                $"""
+                CREATE TABLE [{schema}].[jobs] (
+                    id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
+                    queue nvarchar(200) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    payload_json nvarchar(max) NOT NULL,
+                    headers_json nvarchar(max) NOT NULL DEFAULT N'{emptyJsonDefault}',
+                    created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                    available_at datetime2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
+                    locked_until datetime2 NULL,
+                    lock_id uniqueidentifier NULL,
+                    attempts int NOT NULL DEFAULT 0,
+                    dead_letter_reason nvarchar(max) NULL
+                );
+                """);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync());
+            Assert.Contains("available_at", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("expected datetime2(7)", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("found datetime2(0)", ex.Message, StringComparison.Ordinal);
+        });
+
+        await WithSchemaAsync("sql_full_scale", async schema =>
+        {
+            // A bare datetime2 declaration IS datetime2(7): the operator-provisioned twin of the
+            // DDL path's own table must keep passing.
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            await new SqlServerTransportStore(Options.Create(options)).EnsureCreatedAsync();
+
+            var managed = TransportOptions(schema);
+            managed.MessageTable = "jobs";
+            managed.AutoCreateSchema = false;
+            await new SqlServerTransportStore(Options.Create(managed)).EnsureCreatedAsync();
         });
     }
 

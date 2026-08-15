@@ -73,6 +73,16 @@ public class RedisStreamDatabaseAdapterTests
                 It.Is<RedisValue[]>(ids => ids.SequenceEqual(new RedisValue[] { "1-0" })),
                 CommandFlags.None))
             .ReturnsAsync(claimed);
+        var claimedIds = new RedisValue[] { "1-0" };
+        database
+            .Setup(db => db.StreamClaimIdsOnlyAsync(
+                "stream",
+                "group",
+                "consumer",
+                0L,
+                It.Is<RedisValue[]>(ids => ids.SequenceEqual(new RedisValue[] { "1-0" })),
+                CommandFlags.None))
+            .ReturnsAsync(claimedIds);
         var adapter = new RedisStreamDatabaseAdapter(database.Object, TimeSpan.FromSeconds(5));
 
         Assert.Equal("42-0", await adapter.StreamAddAsync("stream", values, 123, true, CancellationToken.None));
@@ -81,6 +91,7 @@ public class RedisStreamDatabaseAdapterTests
         Assert.Equal(1, await adapter.StreamAcknowledgeAsync("stream", "group", "1-0", CancellationToken.None));
         Assert.Same(pending, await adapter.StreamPendingMessagesAsync("stream", "group", 11, "consumer", "0-0", "9-0", 250, CancellationToken.None));
         Assert.Same(claimed, await adapter.StreamClaimAsync("stream", "group", "consumer", 250, ["1-0"], CancellationToken.None));
+        Assert.Same(claimedIds, await adapter.StreamClaimIdsOnlyAsync("stream", "group", "consumer", 0, ["1-0"], CancellationToken.None));
         database.VerifyAll();
     }
 

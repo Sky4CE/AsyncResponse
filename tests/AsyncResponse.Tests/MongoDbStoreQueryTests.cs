@@ -100,6 +100,71 @@ public sealed class MongoDbStoreQueryTests
         Assert.Equal(BsonNull.Value, set["lock_id"]);
     }
 
+    /// <summary>
+    /// created_at — the claim Sort key and the dead-letter prune cutoff — is stamped from the
+    /// server clock ($ifNull → $$NOW, kept on retry), so a skewed publisher cannot sort its rows
+    /// to the queue head; user strings ride inside $literal so a value starting with '$' is never
+    /// read as a field path; and attempts/lease fields of an already-claimed document are never
+    /// reset by a publish retry.
+    /// </summary>
+    [Fact]
+    public void TransportInsertPipeline_StampsServerClockAndPreservesExistingStateOnRetry()
+    {
+        var rendered = MongoDbTransportStore.BuildInsertPipeline(
+                "worker",
+                """{"job":1}""",
+                new Dictionary<string, string> { ["AR-CorrelationId"] = "corr" },
+                deadLetterReason: null,
+                delay: null)
+            .Render(TransportRenderArgs());
+
+        var set = rendered.AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal("worker", set["queue"]["$literal"].AsString);
+        Assert.Equal("""{"job":1}""", set["payload"]["$literal"].AsString);
+        Assert.Equal(new BsonArray { "$created_at", "$$NOW" }, set["created_at"]["$ifNull"].AsBsonArray);
+        Assert.Equal(
+            new BsonArray { "$available_at", new BsonDateTime(DateTime.UnixEpoch) },
+            set["available_at"]["$ifNull"].AsBsonArray);
+        Assert.Equal(new BsonArray { "$attempts", 0 }, set["attempts"]["$ifNull"].AsBsonArray);
+        Assert.Equal("$headers", set["headers"]["$ifNull"].AsBsonArray[0]);
+        Assert.Equal(
+            new BsonArray { new BsonDocument { ["k"] = "AR-CorrelationId", ["v"] = "corr" } },
+            set["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray);
+        Assert.Equal(new BsonArray { "$dead_letter_reason", BsonNull.Value }, set["dead_letter_reason"]["$ifNull"].AsBsonArray);
+        // Never touched by a publish: a retry must not reset a claimed document's lease or count.
+        Assert.False(set.Contains("locked_until"));
+        Assert.False(set.Contains("lock_id"));
+    }
+
+    /// <summary>A delayed publish computes its due time server-relative, mirroring the NAK update.</summary>
+    [Fact]
+    public void TransportInsertPipeline_DelayedPublish_ComputesDueTimeOnTheServerClock()
+    {
+        var rendered = MongoDbTransportStore.BuildInsertPipeline("worker", "{}", headers: null, deadLetterReason: null, delay: TimeSpan.FromSeconds(30))
+            .Render(TransportRenderArgs());
+
+        var availableAt = rendered.AsBsonArray[0]["$set"]["available_at"]["$ifNull"].AsBsonArray;
+        Assert.Equal("$available_at", availableAt[0]);
+        Assert.Equal(new BsonArray { "$$NOW", 30_000d }, availableAt[1]["$add"].AsBsonArray);
+    }
+
+    /// <summary>
+    /// The dead-letter prune cutoff is evaluated ENTIRELY on the server clock ($$NOW against the
+    /// server-stamped created_at), like the claim filter — an app-clock cutoff mixed two
+    /// instances' clocks, so a behind-clock pruner deleted fresh dead letters on arrival.
+    /// </summary>
+    [Fact]
+    public void TransportDeadLetterPruneFilter_EvaluatesAgeOnTheServerClock()
+    {
+        var rendered = MongoDbTransportStore.BuildDeadLetterPruneFilter("dead", TimeSpan.FromMinutes(30))
+            .Render(TransportRenderArgs());
+
+        Assert.Equal("dead", rendered["queue"].AsString);
+        var age = rendered["$expr"]["$lt"].AsBsonArray;
+        Assert.Equal("$created_at", age[0]);
+        Assert.Equal(new BsonArray { "$$NOW", 1_800_000d }, age[1]["$subtract"].AsBsonArray);
+    }
+
     [Fact]
     public void ChannelInsertPipeline_PreservesOriginalTimestampsAndClaimFlagsOnRetry()
     {
@@ -145,6 +210,22 @@ public sealed class MongoDbStoreQueryTests
             condition[0].AsBsonDocument);
         Assert.Equal(42L, condition[1].AsInt64);
         Assert.Equal("$acked_seq", condition[2].AsString);
+    }
+
+    [Fact]
+    public void ChannelSubscriptionStartPipeline_DrawsSequenceAndServerClockInOneUpdate()
+    {
+        var rendered = MongoDbChannelStore.BuildSubscriptionStartPipeline()
+            .Render(RenderArgsFor<BsonDocument>());
+
+        // One $set stage advances the sequence AND stamps the server clock — the atomicity the
+        // same-tick tie-breaker relies on (a claim landing between a separate clock read and
+        // sequence draw would resolve a legitimate fan-out delivery as history).
+        var set = rendered.AsBsonArray[0]["$set"].AsBsonDocument;
+        Assert.Equal(
+            new BsonArray { new BsonDocument("$ifNull", new BsonArray { "$seq", 0L }), 1L },
+            set["seq"]["$add"].AsBsonArray);
+        Assert.Equal("$$NOW", set["drawn_at"].AsString);
     }
 
     [Fact]

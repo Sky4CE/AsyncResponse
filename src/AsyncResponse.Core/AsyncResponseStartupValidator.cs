@@ -13,6 +13,16 @@ namespace AsyncResponse;
 internal sealed class AsyncResponseChannelMarker(string name)
 {
     public string Name { get; } = name;
+
+    /// <summary>
+    /// The channel's RESOLVED default waiter timeout (<c>DefaultTimeout ?? RecoveryStateExpiry</c>),
+    /// declared by the channel registration from its bound options — the window a timeout-less
+    /// wait actually runs for. The startup validator requires the durable-flow ledger TTL to
+    /// out-live it, and the flow engine extends a parked ledger by it, without either referencing
+    /// channel option types. <c>null</c> when the registration declares nothing; both consumers
+    /// then skip their checks.
+    /// </summary>
+    public TimeSpan? EffectiveDefaultWaitTimeout { get; init; }
 }
 
 /// <summary>
@@ -42,10 +52,45 @@ internal sealed class AsyncResponseTransportMarker(string name)
 }
 
 /// <summary>Internal marker registered by each durable-flow state-store registration.</summary>
-internal sealed class AsyncResponseDurableFlowStoreMarker(Type storeType)
+internal sealed class AsyncResponseDurableFlowStoreMarker(
+    Type storeType,
+    ServiceLifetime? forwardLifetime = null,
+    IServiceCollection? services = null)
 {
+    private IServiceCollection? _services = services;
+
     public Type StoreType { get; } = storeType;
     public string Name { get; } = storeType.FullName ?? storeType.Name;
+
+    /// <summary>
+    /// The <see cref="IFlowStateStore"/> forward mirrors the concrete registration's lifetime as
+    /// seen WHEN <c>WithDurableFlows</c> ran. A concrete registration added after the fluent chain
+    /// with a different lifetime leaves that snapshot stale — the worst shape being a Scoped
+    /// forward to a root singleton, which every flow-execution scope captures as its own
+    /// disposable: the first scope's disposal kills the store (and any connection it owns) for
+    /// the whole process. MS.DI resolves the concrete last-wins, so the mismatch is re-checked
+    /// here against the FINAL collection and fails startup with the ordering fix instead. Holds
+    /// the service collection only until the check runs, then releases it.
+    /// </summary>
+    public void ValidateForwardLifetime()
+    {
+        var services = Interlocked.Exchange(ref _services, null);
+        if (services is null || forwardLifetime is null)
+            return;
+
+        var finalLifetime = services.LastOrDefault(descriptor => descriptor.ServiceType == StoreType)?.Lifetime;
+        if (finalLifetime is null || finalLifetime == forwardLifetime)
+            return;
+
+        throw new InvalidOperationException(
+            $"The durable-flow store '{Name}' is registered as {finalLifetime}, but the IFlowStateStore forward mirrored " +
+            $"{forwardLifetime} when WithDurableFlows<{StoreType.Name}>() ran — the store registration was added or changed " +
+            "after the fluent chain. " +
+            (forwardLifetime == ServiceLifetime.Scoped && finalLifetime == ServiceLifetime.Singleton
+                ? "A Scoped forward to a Singleton store lets the first flow-execution scope dispose the store (and any connection it owns) for the whole process. "
+                : "The forward and the store must share one lifetime, or resolutions through the interface and the concrete type diverge. ") +
+            $"Register the store (e.g. services.Add{finalLifetime}<{StoreType.Name}>()) BEFORE the WithDurableFlows call.");
+    }
 }
 
 /// <summary>
@@ -145,9 +190,44 @@ internal sealed class AsyncResponseStartupValidator(
                 "Register exactly one durable-flow store.");
         }
 
+        foreach (var storeMarker in _flowStores)
+            storeMarker.ValidateForwardLifetime();
+
         ValidateEarlyAckDeclarations();
+        ValidateAwaitedStepLedgerCoverage();
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// An awaited step with no explicit timeout and no <see cref="DurableFlowOptions.DefaultStepTimeout"/>
+    /// waits out the CHANNEL's default timeout, so the ledger's idle TTL must out-live that window:
+    /// with <see cref="DurableFlowOptions.StateExpiry"/> at or below it, the row (and the lease
+    /// renewal anchored on it) is pruned mid-wait — the run becomes unrecoverable and no
+    /// step-timeout fault ever fires. Channels declare their resolved default through the marker;
+    /// a channel that declares nothing skips the check, and a configured
+    /// <c>DefaultStepTimeout</c> makes the channel default unreachable, so the check does not apply.
+    /// </summary>
+    private void ValidateAwaitedStepLedgerCoverage()
+    {
+        var flowOptions = _flowOptions?.FirstOrDefault();
+        if (flowOptions is null || flowOptions.DefaultStepTimeout is not null)
+            return;
+
+        foreach (var channel in _channels)
+        {
+            if (channel.EffectiveDefaultWaitTimeout is not { } effectiveDefault
+                || flowOptions.StateExpiry > effectiveDefault)
+                continue;
+
+            throw new InvalidOperationException(
+                $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.StateExpiry)} ({flowOptions.StateExpiry}) does not exceed the " +
+                $"{channel.Name} channel's effective default waiter timeout ({effectiveDefault} — DefaultTimeout, or RecoveryStateExpiry " +
+                "when DefaultTimeout is null). An awaited step without an explicit timeout waits out that default, and a ledger whose TTL " +
+                "does not out-live the wait is pruned mid-wait: the run becomes unrecoverable and no step-timeout fault ever fires. " +
+                $"Raise StateExpiry above the channel default, shorten the channel default, or set " +
+                $"{nameof(DurableFlowOptions)}.{nameof(DurableFlowOptions.DefaultStepTimeout)}.");
+        }
     }
 
     /// <summary>

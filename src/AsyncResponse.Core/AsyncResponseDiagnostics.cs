@@ -189,11 +189,12 @@ public static class AsyncResponseDiagnostics
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     internal static void EnsureWatchdogGauges(AsyncResponseWatchdogState state)
     {
-        // The NEWEST watchdog's state wins: the gauges are registered once process-wide on the
-        // static meter, so capturing the first state instance in the gauge callbacks would pin a
-        // disposed host's last snapshot forever in any process that builds more than one host
-        // (test harnesses, WebApplicationFactory, host-per-tenant workers). The callbacks read
-        // this holder instead, which every newly constructed watchdog state re-publishes.
+        // The NEWEST scanning watchdog's state wins: the gauges are registered once process-wide
+        // on the static meter, so capturing the first state instance in the gauge callbacks would
+        // pin a disposed host's last snapshot forever in any process that builds more than one
+        // host (test harnesses, WebApplicationFactory, host-per-tenant workers). The callbacks
+        // read this holder instead, which every watchdog that begins scanning re-publishes and
+        // ReleaseWatchdogGauges conditionally clears on stop.
         Volatile.Write(ref _watchdogState, state);
 
         if (Interlocked.Exchange(ref _watchdogGaugesRegistered, 1) != 0)
@@ -211,5 +212,17 @@ public static class AsyncResponseDiagnostics
         Meter.CreateObservableGauge("asyncresponse.recovery.scan_truncated",
             static () => Volatile.Read(ref _watchdogState)?.Latest?.Report?.Truncated == true ? 1L : 0L, unit: "{scan}",
             description: "1 when the last watchdog scan stopped at the MaxScanEntries buffer cap — outstanding/stale then describe the buffered subset only.");
+        Meter.CreateObservableGauge("asyncresponse.recovery.unprobeable",
+            static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.UnprobeableEntries ?? 0), unit: "{entry}",
+            description: "Recovery registrations whose waiter liveness could not be probed at the last watchdog scan — staleness is unknown for these.");
     }
+
+    /// <summary>
+    /// Clears the gauge holder when a stopping watchdog still owns it. Identity-conditional: a
+    /// host stopping after a successor took over must not clear the successor's state, and once
+    /// the last host stops the still-registered gauges must read zero instead of pinning the
+    /// disposed host's final snapshot (and its stale-entry list) for process lifetime.
+    /// </summary>
+    internal static void ReleaseWatchdogGauges(AsyncResponseWatchdogState state)
+        => Interlocked.CompareExchange(ref _watchdogState, null, state);
 }

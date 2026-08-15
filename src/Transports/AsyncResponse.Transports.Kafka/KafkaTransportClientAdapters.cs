@@ -93,6 +93,7 @@ internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
     private readonly KafkaAsyncResponseTransportOptions _options;
     private readonly object _producerGate = new();
     private IProducer<string?, byte[]>? _producer;
+    private bool _disposed;
 
     /// <summary>Runs the KafkaProducerClientAdapter operation.</summary>
     public KafkaProducerClientAdapter(KafkaAsyncResponseTransportOptions options)
@@ -114,6 +115,11 @@ internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
 
             lock (_producerGate)
             {
+                // Checked under the same gate Dispose latches under: a build racing Dispose must
+                // either be flushed and disposed by Dispose (build won the gate) or never happen
+                // (Dispose won) — a producer built after the latch would leak its librdkafka
+                // threads and silently drop its buffered jobs at shutdown.
+                ObjectDisposedException.ThrowIf(_disposed, this);
                 return _producer ??= CreateProducer();
             }
         }
@@ -150,20 +156,32 @@ internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
     /// <summary>Releases resources held by this instance.</summary>
     public void Dispose()
     {
-        var producer = Volatile.Read(ref _producer);
-        if (producer is null)
-            return;
-
-        try
+        // The whole read/flush/dispose runs under the build gate: reading the field outside it
+        // raced a concurrent build — whichever the read missed was never flushed (dropping its
+        // buffered jobs and leaking librdkafka threads), and the reverse order left later
+        // publishes producing onto a disposed handle.
+        lock (_producerGate)
         {
-            producer.Flush(_options.OperationTimeout);
-        }
-        catch (KafkaException)
-        {
-            // Best-effort drain of in-flight messages on shutdown; Dispose below always runs.
-        }
+            if (_disposed)
+                return;
 
-        producer.Dispose();
+            _disposed = true;
+            var producer = _producer;
+            _producer = null;
+            if (producer is null)
+                return;
+
+            try
+            {
+                producer.Flush(_options.OperationTimeout);
+            }
+            catch (KafkaException)
+            {
+                // Best-effort drain of in-flight messages on shutdown; Dispose below always runs.
+            }
+
+            producer.Dispose();
+        }
     }
 
     private IProducer<string?, byte[]> CreateProducer()
@@ -243,6 +261,9 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
     /// <summary>Creates one consumer for the given subscriber role.</summary>
     public IKafkaConsumerClient Create(KafkaSubscriberRole role)
     {
+        var subscriberOptions = role is KafkaSubscriberRole.Worker
+            ? _options.WorkerSubscriber
+            : _options.ResponseSubscriber;
         var config = new ConsumerConfig
         {
             BootstrapServers = KafkaTransportOptionsValidator.Required(
@@ -257,6 +278,10 @@ internal sealed class KafkaConsumerClientFactory(KafkaAsyncResponseTransportOpti
             EnableAutoCommit = true,
             EnableAutoOffsetStore = false,
             AutoCommitIntervalMs = (int)Math.Max(1, _options.OffsetCommitInterval.TotalMilliseconds),
+            // The dispatcher's in-process retry delays run on the poll thread, so the eviction
+            // deadline they must fit within is set explicitly and validated against the retry
+            // budget instead of trusting the librdkafka default to line up.
+            MaxPollIntervalMs = (int)Math.Max(1, subscriberOptions.MaxPollInterval.TotalMilliseconds),
             // Start new consumer groups at the beginning of the topic so messages published before
             // the first subscriber starts are not skipped (mirrors the other transports).
             AutoOffsetReset = AutoOffsetReset.Earliest,

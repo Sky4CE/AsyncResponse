@@ -14,6 +14,12 @@ namespace AsyncResponse.Transports.NATS;
 /// </summary>
 internal abstract class NatsSubscriberService : BackgroundService
 {
+    /// <summary>
+    /// Re-arm period of the idle long-poll fetch (the NATS.Net default fetch period). Purely how
+    /// often an empty wait returns to re-check cancellation — not a delivery deadline.
+    /// </summary>
+    private static readonly TimeSpan LongPollExpires = TimeSpan.FromSeconds(30);
+
     private readonly INatsJetStreamTransport _jetStream;
 
     /// <summary>Runs the NatsSubscriberService operation.</summary>
@@ -64,29 +70,12 @@ internal abstract class NatsSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(ex, "NATS subscriber failed for subject {Subject} ({Role}); retrying in {RetryDelay}.", Subject, Role, retryDelay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
@@ -113,10 +102,130 @@ internal abstract class NatsSubscriberService : BackgroundService
             "NATS subscriber started. Subject: {Subject}. Stream: {Stream}. Consumer: {Consumer}. Role: {Role}. AckMode: {AckMode}.",
             Subject, Stream, Consumer, Role, SubscriberOptions.AckMode);
 
-        await foreach (var delivery in _jetStream.ConsumeAsync(Stream, Consumer, SubscriberOptions.BatchSize, stoppingToken).ConfigureAwait(false))
+        var batch = new List<NatsJobDelivery>(SubscriberOptions.BatchSize);
+        while (!stoppingToken.IsCancellationRequested)
         {
-            await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+            batch.Clear();
+
+            // Drain whatever is already available, up to the batch size. The batch is
+            // materialized out of the client buffer BEFORE dispatch so the in-progress heartbeat
+            // below can reach every waiting message: the server starts each message's AckWait
+            // clock at delivery, and an open-ended consume buffered the whole prefetch
+            // client-side — a serial batch whose handlers together outlast AckWait had its tail
+            // redelivered to a competing consumer (and NumDelivered climbed toward the Term cap)
+            // while it was still queued here.
+            await foreach (var delivery in _jetStream.FetchNoWaitAsync(Stream, Consumer, SubscriberOptions.BatchSize, stoppingToken).ConfigureAwait(false))
+                batch.Add(delivery);
+
+            if (batch.Count == 0)
+            {
+                // Nothing waiting: long-poll for a single message so idle delivery latency stays
+                // push-like. Siblings arriving behind the long-polled message stay ON the stream
+                // — where AckWait has not started — until the next no-wait drain.
+                await foreach (var delivery in _jetStream.FetchAsync(Stream, Consumer, maxMessages: 1, LongPollExpires, stoppingToken).ConfigureAwait(false))
+                    batch.Add(delivery);
+
+                if (batch.Count == 0)
+                    continue; // the long poll expired empty; re-arm
+            }
+
+            await DispatchBatchAsync(dispatcher, batch, stoppingToken).ConfigureAwait(false);
         }
+    }
+
+    private async Task DispatchBatchAsync(
+        NatsMessageDispatcher dispatcher,
+        List<NatsJobDelivery> batch,
+        CancellationToken stoppingToken)
+    {
+        // The batch is dispatched serially, so a slow handler lets the server-side AckWait of the
+        // later (still unsettled) messages lapse into redelivery. While the batch is in flight, a
+        // heartbeat signals in-progress for every unsettled message to reset its AckWait window.
+        var progress = new BatchProgress();
+        using var renewalCancellation = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var renewalTask = RenewInProgressLoopAsync(batch, progress, renewalCancellation.Token);
+        try
+        {
+            foreach (var delivery in batch)
+            {
+                try
+                {
+                    await dispatcher.HandleAsync(delivery, stoppingToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    progress.MarkSettled();
+                }
+            }
+        }
+        finally
+        {
+            renewalCancellation.Cancel();
+            await renewalTask.ConfigureAwait(false);
+        }
+    }
+
+    private async Task RenewInProgressLoopAsync(
+        List<NatsJobDelivery> batch,
+        BatchProgress progress,
+        CancellationToken cancellationToken)
+    {
+        // ~AckWait/3: two chances to land a renewal inside every AckWait window even when one
+        // sweep is delayed by a slow round trip.
+        var interval = TimeSpan.FromMilliseconds(Math.Max(1, Options.AckWait.TotalMilliseconds / 3));
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(interval, cancellationToken).ConfigureAwait(false);
+
+                // Renew from the first unsettled message onward: that covers the message
+                // currently in the handler plus everything still waiting its turn. A settle
+                // racing this sweep is harmless — Ack/Nak/Term has already consumed the delivery
+                // server-side, and a late in-progress signal for it is ignored rather than
+                // un-settling anything, so no suppression mark is needed (unlike the SQS twin,
+                // whose failure path re-arms a visibility a late renewal could stretch).
+                for (var i = progress.SettledCount; i < batch.Count; i++)
+                {
+                    // The batch finished or the subscriber is stopping: exit quietly between
+                    // messages instead of spending a round trip on each remaining renewal.
+                    if (cancellationToken.IsCancellationRequested)
+                        return;
+
+                    if (i < progress.SettledCount)
+                        continue;
+
+                    var delivery = batch[i];
+                    try
+                    {
+                        await delivery.ProgressAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        Logger.LogWarning(
+                            ex,
+                            "Failed to signal in-progress for NATS message on subject {Subject} ({Role}); its AckWait may lapse and it may redeliver while still queued (at-least-once preserved).",
+                            delivery.Subject,
+                            Role);
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The batch finished or the subscriber is stopping.
+        }
+    }
+
+    private sealed class BatchProgress
+    {
+        // Settled only ever increments, so a monotonic volatile read is enough — no lock, and a
+        // stale read only renews an already-settled message once more (which the server ignores).
+        private int _settledCount;
+
+        public int SettledCount => Volatile.Read(ref _settledCount);
+
+        public void MarkSettled() => Interlocked.Increment(ref _settledCount);
     }
 }
 

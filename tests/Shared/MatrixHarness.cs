@@ -674,8 +674,12 @@ public sealed class MatrixHarness : IAsyncDisposable
                 // no management API, so per-cell queues are impossible. Cells lease a pair from the
                 // pool the emulator config declares (see servicebus-emulator-config.json) and rely on
                 // per-cell correlation ids plus the drain in teardown for isolation.
-                var lease = AzureServiceBusQueuePool.Lease();
+                // Resolve the backend BEFORE leasing, and register the release IMMEDIATELY after:
+                // Require throws on a wrong-shard cell, and a lease taken with no release
+                // registered would pin the pool's semaphore at 0 for the process lifetime — every
+                // later ASB cell then blocks forever in the untimed Lease() wait.
                 var serviceBusConnection = backends.Require(backends.AzureServiceBus, "servicebus");
+                var lease = AzureServiceBusQueuePool.Lease();
                 _always.Add(async () =>
                 {
                     // Drain worker/response queues AND their dead-letter sub-queues before the

@@ -217,6 +217,9 @@ internal sealed class SqlServerChannelSql
 
     /// <summary>The catalog shape this store's DDL intends — the single source for both the
     /// post-DDL verification and the failed-batch diagnosis.</summary>
+    /// <remarks>A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types
+    /// state the scale, because a reduced-scale column rounds the timestamps on store rather than
+    /// merely displaying them coarsely.</remarks>
     private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.RecoveryStateTable, SqlServerObjectKind.Table,
@@ -224,8 +227,8 @@ internal sealed class SqlServerChannelSql
                     new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("registration_id", "uniqueidentifier", Nullable: false),
                     new("state_json", "nvarchar(max)", Nullable: false),
-                    new("expires_at", "datetime2", Nullable: false),
-                    new("registered_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())")
+                    new("expires_at", "datetime2(7)", Nullable: false),
+                    new("registered_at", "datetime2(7)", Nullable: false, DefaultExpression: "(sysutcdatetime())")
                 ],
                 PrimaryKey: ["correlation_id", "registration_id"]),
                 new(_options.MessageTable, SqlServerObjectKind.Table,
@@ -233,9 +236,9 @@ internal sealed class SqlServerChannelSql
                     new("id", "uniqueidentifier", Nullable: false),
                     new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("envelope_json", "nvarchar(max)", Nullable: false),
-                    new("created_at", "datetime2", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
-                    new("expires_at", "datetime2", Nullable: false),
-                    new("acked_at", "datetime2", Nullable: true),
+                    new("created_at", "datetime2(7)", Nullable: false, DefaultExpression: "(sysutcdatetime())"),
+                    new("expires_at", "datetime2(7)", Nullable: false),
+                    new("acked_at", "datetime2(7)", Nullable: true),
                     new("acked_seq", "bigint", Nullable: true),
                     new("recovery_claimed", "bit", Nullable: false, DefaultExpression: "((0))")
                 ],
@@ -245,7 +248,7 @@ internal sealed class SqlServerChannelSql
                     new("correlation_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("registration_id", "uniqueidentifier", Nullable: false),
                     new("instance_id", "nvarchar(200)", Nullable: false),
-                    new("expires_at", "datetime2", Nullable: false)
+                    new("expires_at", "datetime2(7)", Nullable: false)
                 ],
                 PrimaryKey: ["correlation_id", "registration_id"]),
                 new(AckSequenceName, SqlServerObjectKind.Sequence)
@@ -817,19 +820,11 @@ internal sealed class SqlServerChannelSql
             ($"{nameof(options.SubscriberTable)} table", options.SubscriberTable),
             ("ack sequence (derived from MessageTable)", SequenceName(options.MessageTable)),
         ];
-        for (var i = 0; i < plan.Length; i++)
-        {
-            for (var j = i + 1; j < plan.Length; j++)
-            {
-                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException(
-                        $"{nameof(SqlServerAsyncResponseChannelOptions)}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
-                        "Tables and the sequence derived from MessageTable share one schema-object namespace and must be distinct " +
-                        "(long names reserve suffix space by truncating the table stem). Shorten or de-overlap the configured table names.");
-                }
-            }
-        }
+        RelationalNamePlan.RequireDistinct(
+            plan,
+            nameof(SqlServerAsyncResponseChannelOptions),
+            ". Tables and the sequence derived from MessageTable share one schema-object namespace and must be distinct " +
+            "(long names reserve suffix space by truncating the table stem). Shorten or de-overlap the configured table names.");
     }
 
     /// <summary>
@@ -841,10 +836,7 @@ internal sealed class SqlServerChannelSql
     internal static string AddMilliseconds(string parameterName)
         => $"DATEADD(SECOND, CAST({parameterName} / 1000 AS int), DATEADD(MILLISECOND, CAST({parameterName} % 1000 AS int), SYSUTCDATETIME()))";
 
-    internal static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is SqlException sqlException && SqlServerTransientFaults.IsTransient(sqlException)
-               || exception is TimeoutException);
+    internal static bool IsTransient(Exception exception) => SqlServerTransientFaults.IsTransient(exception);
 
     /// <summary>
     /// Stable application-lock resource for serializing schema creation. It must be deterministic
@@ -869,55 +861,5 @@ internal sealed class SqlServerChannelSql
         var last = Interlocked.Read(ref lastTicks);
         return now - last >= interval.Ticks
             && Interlocked.CompareExchange(ref lastTicks, now, last) == last;
-    }
-}
-
-/// <summary>
-/// Classifies SQL Server errors worth retrying. <see cref="SqlException"/> exposes no public
-/// transient flag, so this mirrors the error numbers Microsoft's own retry guidance and the
-/// SqlClient configurable-retry defaults treat as transient, plus severity ≥ 20 (broken connection).
-/// </summary>
-internal static class SqlServerTransientFaults
-{
-    private static readonly HashSet<int> TransientErrorNumbers =
-    [
-        -2,    // client-side command timeout
-        20,    // instance does not support encryption
-        64,    // connection lost during login
-        121,   // transport semaphore timeout
-        233,   // no process on the other end of the pipe
-        997,   // overlapped I/O in progress
-        1204,  // lock resources exhausted
-        1205,  // deadlock victim
-        1222,  // lock request timeout
-        4060,  // database unavailable
-        4221,  // readable secondary timeout
-        10053, // transport-level connection abort
-        10054, // transport-level connection reset
-        10060, // network unreachable / connect timeout
-        10928, // Azure SQL resource limit reached
-        10929, // Azure SQL minimum guarantee exceeded
-        40143, // Azure SQL connection failure
-        40197, // Azure SQL service processing error
-        40501, // Azure SQL service busy
-        40540, // Azure SQL service unavailable
-        40613, // Azure SQL database unavailable
-        49918, // cannot process request, not enough resources
-        49919, // cannot process create/update request
-        49920  // cannot process request, too many operations
-    ];
-
-    public static bool IsTransient(SqlException exception)
-    {
-        if (exception.Class >= 20)
-            return true;
-
-        foreach (SqlError error in exception.Errors)
-        {
-            if (TransientErrorNumbers.Contains(error.Number))
-                return true;
-        }
-
-        return TransientErrorNumbers.Contains(exception.Number);
     }
 }

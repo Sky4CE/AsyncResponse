@@ -204,6 +204,34 @@ public sealed class DurableFlowStoreSharedTests
     }
 
     [Fact]
+    public void OracleTableName_CannotDeriveItsOwnExpiryIndexName()
+    {
+        // Oracle tables and indexes share one schema-object namespace, and a 128-character table
+        // name ending exactly where the reserved "_EXPIRES_IDX" stem truncates derives its own
+        // name: CREATE INDEX raises ORA-00955, which the DDL path must swallow as the benign
+        // already-exists race — the expiry index would silently never exist and every prune
+        // would full-scan. Unquoted Oracle identifiers are case-insensitive, so the check is too.
+        var selfDerived = Assert.Throws<InvalidOperationException>(() => new OracleDurableFlowOptions
+        {
+            ConnectionString = "Data Source=db",
+            TableName = new string('T', 116) + "_EXPIRES_IDX"
+        }.Validate());
+        Assert.Contains("expiry-index", selfDerived.Message);
+
+        var caseFolded = Assert.Throws<InvalidOperationException>(() => new OracleDurableFlowOptions
+        {
+            ConnectionString = "Data Source=db",
+            TableName = new string('t', 116) + "_expires_idx"
+        }.Validate());
+        Assert.Contains("expiry-index", caseFolded.Message);
+
+        // A maximum-length name that does not collide, and a short name carrying the suffix
+        // (its derived name is longer, not itself), both stay valid.
+        new OracleDurableFlowOptions { ConnectionString = "Data Source=db", TableName = new string('T', 128) }.Validate();
+        new OracleDurableFlowOptions { ConnectionString = "Data Source=db", TableName = "T_EXPIRES_IDX" }.Validate();
+    }
+
+    [Fact]
     public void CosmosRegistration_RequiresOrOwnsClient()
     {
         using var missing = BuildProvider((_, builder) => builder.WithCosmosDurableFlows(options =>

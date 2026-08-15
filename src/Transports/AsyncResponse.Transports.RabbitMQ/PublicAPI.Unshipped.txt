@@ -47,6 +47,10 @@ AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseRoutingKe
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ResponseSubscriber.get -> AsyncResponse.Transports.RabbitMQ.RabbitMqSubscriberOptions!
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.ShutdownTimeout.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay.set -> void
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.SubscriberRetryMaxDelay.get -> System.TimeSpan
+AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.SubscriberRetryMaxDelay.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TopologyRecoveryEnabled.get -> bool
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.TopologyRecoveryEnabled.set -> void
 AsyncResponse.Transports.RabbitMQ.RabbitMqAsyncResponseOptions.UserName.get -> string!

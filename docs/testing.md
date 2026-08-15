@@ -175,3 +175,10 @@ restart never complete (their process is gone); assert through the recovery side
 - Keep flow dependencies as ordinary DI fakes via `options.ConfigureServices` — the harness
   re-applies registrations on every simulated restart, so keep instances you assert on in test
   locals (registered as singletons), like the recorders in the library's suites.
+- Don't register your own `TimeProvider` in `ConfigureServices` — the harness runs the whole engine
+  on its own virtual clock, and construction now fails fast naming the fix instead of letting a
+  registered clock silently displace it (no timer, timeout, lease, or backoff would ever elapse).
+  Drive time through `harness.Clock` / `AdvanceAsync` instead.
+- Call `services.AddLogging(...)` in `ConfigureServices` to see the engine's own diagnostics — it
+  now wins over the harness's `NullLogger<>` fallback, which previously always registered first and
+  swallowed them regardless of what the test configured.

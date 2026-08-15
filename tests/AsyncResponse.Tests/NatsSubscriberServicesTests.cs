@@ -94,6 +94,95 @@ public class NatsSubscriberServicesTests
     }
 
     [Fact]
+    public async Task WorkerSubscriber_SlowBatch_SignalsInProgressForEveryUnsettledMessage_ThenStops()
+    {
+        // Red-on-old: the open-ended consume loop buffered the whole prefetched batch client-side
+        // with no AckWait heartbeat anywhere in the package — a serial batch whose handlers
+        // together outlasted AckWait had its tail redelivered to a competing consumer while it
+        // was still queued here, and NumDelivered climbed toward the Term cap on healthy work.
+        var ingress = new GatedIngress();
+        var first = new RecordingDelivery();
+        var second = new RecordingDelivery();
+        _jetStream.EnqueueDelivery(first.Create("p1", numDelivered: 1));
+        _jetStream.EnqueueDelivery(second.Create("p2", numDelivered: 1));
+        var subscriber = new NatsWorkerSubscriber(
+            Options(o => o.AckWait = TimeSpan.FromMilliseconds(300)),
+            _jetStream,
+            ingress,
+            new TestLogger<NatsWorkerSubscriber>());
+
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            await ingress.Started.Task.WaitAsync(TimeSpan.FromSeconds(5)); // p1 is wedged in the handler
+
+            // While p1 sits in the handler and p2 waits its turn, the ~AckWait/3 heartbeat
+            // signals in-progress for BOTH unsettled messages.
+            await Eventually(() => first.Progresses >= 1 && second.Progresses >= 1);
+            Assert.Equal(0, first.Acks);
+            Assert.Equal(0, second.Acks);
+
+            ingress.Release.TrySetResult();
+            await Eventually(() => first.Acks == 1 && second.Acks == 1);
+
+            // The heartbeat dies with the batch: no further renewals after both settled.
+            var firstProgresses = first.Progresses;
+            var secondProgresses = second.Progresses;
+            await Task.Delay(400);
+            Assert.Equal(firstProgresses, first.Progresses);
+            Assert.Equal(secondProgresses, second.Progresses);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task WorkerSubscriber_FastBatch_SignalsNoInProgress()
+    {
+        // Default AckWait (30s) puts the first heartbeat sweep at ~10s: a batch settled quickly
+        // must never pay a renewal round trip.
+        var subscriber = new NatsWorkerSubscriber(Options(), _jetStream, _ingress, new TestLogger<NatsWorkerSubscriber>());
+        await subscriber.StartAsync(CancellationToken.None);
+        try
+        {
+            var delivery = new RecordingDelivery();
+            _jetStream.EnqueueDelivery(delivery.Create("fast", numDelivered: 1));
+
+            await Eventually(() => delivery.Acks == 1);
+            Assert.Equal(0, delivery.Progresses);
+        }
+        finally
+        {
+            await subscriber.StopAsync(CancellationToken.None);
+            subscriber.Dispose();
+        }
+    }
+
+    /// <summary>Wedges the FIRST worker message in the handler until released; later ones pass through.</summary>
+    private sealed class GatedIngress : IAsyncResponseIngress
+    {
+        private int _calls;
+
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task HandleWorkerMessageAsync(string messageJson)
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                Started.TrySetResult();
+                await Release.Task;
+            }
+        }
+
+        public Task HandleResponseMessageAsync(string messageJson, string? correlationId = null)
+            => Task.CompletedTask;
+    }
+
+    [Fact]
     public async Task WorkerSubscriber_InvalidOptions_FailHostStartupSynchronously()
     {
         // Red-on-old (Hosting 10.0.10+): validation used to sit at the top of ExecuteAsync, which

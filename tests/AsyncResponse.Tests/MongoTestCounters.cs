@@ -6,10 +6,11 @@ namespace AsyncResponse.Tests;
 
 /// <summary>
 /// Counters-collection mock for Mongo store fixtures: the channel store draws its monotonic ack
-/// sequence from <c>{messages}_counters</c> via <c>findOneAndUpdate($inc)</c>, so any fixture
-/// whose database mock leaves that collection unset NREs on the first delivery claim or waiter
-/// registration. The mock hands out a process-local increasing sequence, which is exactly the
-/// contract the store needs.
+/// sequence from <c>{messages}_counters</c> via <c>findOneAndUpdate</c> (the delivery claim's
+/// <c>$inc</c>, the registration's stamping pipeline), so any fixture whose database mock leaves
+/// that collection unset NREs on the first delivery claim or waiter registration. The mock hands
+/// out a process-local increasing sequence plus the <c>drawn_at</c> server stamp the registration
+/// draw reads, which is exactly the contract the store needs.
 /// </summary>
 internal static class MongoTestCounters
 {
@@ -26,7 +27,8 @@ internal static class MongoTestCounters
             .ReturnsAsync(() => new BsonDocument
             {
                 ["_id"] = "ack_seq",
-                ["seq"] = Interlocked.Increment(ref seq)
+                ["seq"] = Interlocked.Increment(ref seq),
+                ["drawn_at"] = new BsonDateTime(DateTime.UtcNow)
             });
         return counters.Object;
     }

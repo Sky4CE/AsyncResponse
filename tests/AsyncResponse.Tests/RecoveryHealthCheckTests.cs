@@ -118,6 +118,67 @@ public class RecoveryHealthCheckTests
         Assert.Contains("truncated", result.Description!, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task UnprobeableEntriesWithZeroStale_ReportDegradedWithCount()
+    {
+        // Unknown liveness is never flagged stale, so a probe outage zeroes the stale counter;
+        // the check must surface "could not assess" instead of attesting a clean pass.
+        var result = await CheckAsync(state => state.Publish(Snapshot(
+            CleanReport(totalEntries: 3, withWaiter: 0) with { UnprobeableEntries = 3 })));
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("could not probe waiter liveness for 3 of 3", result.Description!, StringComparison.Ordinal);
+        var stats = Assert.IsType<AsyncResponseRecoveryStats>(result.Data["stats"]);
+        Assert.Equal(3, stats.Unprobeable);
+    }
+
+    [Fact]
+    public async Task IdleWatchdog_ReportsHealthy_WithExplicitNotScanningData()
+    {
+        // The documented multi-host pattern disables the watchdog on all but one host; that host's
+        // check must stay alert-quiet while honestly attesting that it does not scan.
+        var result = await CheckAsync(state => state.MarkIdle("disabled via options"));
+
+        Assert.Equal(HealthStatus.Healthy, result.Status);
+        Assert.Contains("does not scan", result.Description!, StringComparison.Ordinal);
+        Assert.Equal(false, result.Data["scanning"]);
+        Assert.Equal("disabled via options", result.Data["reason"]);
+    }
+
+    [Fact]
+    public void ArmedWatchdogWithinFirstScanBudget_ReportsHealthy()
+    {
+        var startedUtc = new DateTime(2026, 6, 11, 12, 0, 0, DateTimeKind.Utc);
+        var state = new AsyncResponseWatchdogState();
+        state.MarkScanning(startedUtc, startupDelay: TimeSpan.FromMinutes(5), interval: Interval);
+
+        var result = AsyncResponseRecoveryHealthCheck.Evaluate(
+            snapshot: null, state.Activation, utcNow: startedUtc + TimeSpan.FromMinutes(5) + Interval);
+
+        Assert.Equal(HealthStatus.Healthy, result.Status);
+        Assert.Contains("not completed a scan", result.Description, StringComparison.Ordinal);
+        Assert.Equal(false, result.Data["scanned"]);
+        Assert.Equal(true, result.Data["scanning"]);
+    }
+
+    [Fact]
+    public void ArmedWatchdogPastFirstScanBudget_ReportsDegraded()
+    {
+        // A scan loop that never produces its first snapshot (scanner hangs, loop died before
+        // publishing) is as dead as one that stopped; "no scan yet" must not mask it forever.
+        var startedUtc = new DateTime(2026, 6, 11, 12, 0, 0, DateTimeKind.Utc);
+        var state = new AsyncResponseWatchdogState();
+        state.MarkScanning(startedUtc, startupDelay: TimeSpan.FromMinutes(5), interval: Interval);
+
+        var result = AsyncResponseRecoveryHealthCheck.Evaluate(
+            snapshot: null, state.Activation, utcNow: startedUtc + TimeSpan.FromMinutes(6) + Interval * 2);
+
+        Assert.Equal(HealthStatus.Degraded, result.Status);
+        Assert.Contains("never completed its first scan", result.Description!, StringComparison.Ordinal);
+        Assert.Equal(false, result.Data["scanned"]);
+        Assert.Equal(true, result.Data["scanning"]);
+    }
+
     private static async Task<HealthCheckResult> CheckAsync(Action<AsyncResponseWatchdogState> arrange)
     {
         var state = new AsyncResponseWatchdogState();

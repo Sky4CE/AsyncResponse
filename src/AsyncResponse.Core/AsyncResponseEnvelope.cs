@@ -48,10 +48,21 @@ internal static class AsyncResponseEnvelopeSchema
 /// (de)serialization go through <see cref="AsyncResponseEnvelopeJson"/> rather than the
 /// reflection-based <see cref="JsonSerializer"/> overloads.
 /// </para>
+/// <para>
+/// Property matching is case-insensitive for the PAYLOAD, matching every other broker-ingress
+/// read (<see cref="AsyncResponseJson.CaseInsensitive"/>): external producers publish payload
+/// JSON in their own casing, and binding it case-sensitively silently completed waiters with
+/// all-default payloads. The envelope's own fields are unaffected — its converter matches them
+/// byte-exact regardless of this flag. Writes are unaffected too (the flag is read-only).
+/// </para>
 /// </summary>
 internal static class AsyncResponseEnvelopeOptions<T>
 {
-    public static readonly JsonSerializerOptions Instance = new() { TypeInfoResolver = new EnvelopeResolver() };
+    public static readonly JsonSerializerOptions Instance = new()
+    {
+        TypeInfoResolver = new EnvelopeResolver(),
+        PropertyNameCaseInsensitive = true
+    };
 
     private sealed class EnvelopeResolver : IJsonTypeInfoResolver
     {
@@ -72,7 +83,21 @@ internal static class AsyncResponseEnvelopeJson
 {
     /// <summary>Typed metadata for <see cref="AsyncResponseEnvelope{T}"/> bound to its pre-configured options.</summary>
     public static JsonTypeInfo<AsyncResponseEnvelope<T>> TypeInfo<T>()
-        => AsyncResponseJson.GetTypeInfo<AsyncResponseEnvelope<T>>(AsyncResponseEnvelopeOptions<T>.Instance);
+        => Cache<T>.Value ??= AsyncResponseJson.GetTypeInfo<AsyncResponseEnvelope<T>>(AsyncResponseEnvelopeOptions<T>.Instance);
+
+    /// <summary>
+    /// Per-<typeparamref name="T"/> memo of the resolved metadata, saving the options' dictionary
+    /// lookup + cast + catch frame on every publish and dispatch. A plain field with a
+    /// success-only latch, deliberately NOT a <c>static readonly</c> initializer: resolution can
+    /// fail with the actionable register-a-context error (trimmed/AOT app, payload context
+    /// registered later at startup), and an initializer would poison the type — every later call
+    /// would surface a <see cref="TypeInitializationException"/> instead of retrying. The benign
+    /// latch race resolves to the same instance either way (the serializer caches per options).
+    /// </summary>
+    private static class Cache<T>
+    {
+        public static JsonTypeInfo<AsyncResponseEnvelope<T>>? Value;
+    }
 
     /// <summary>Serializes an envelope for publishing.</summary>
     public static string Serialize<T>(AsyncResponseEnvelope<T> envelope)
@@ -84,8 +109,12 @@ internal static class AsyncResponseEnvelopeJson
 }
 
 /// <summary>
-/// Custom converter that tolerates a JSON <c>null</c> payload even when <typeparamref name="T"/>
-/// is a non-nullable value type, assigning <c>default(T)</c> instead of throwing.
+/// Custom converter that tolerates a JSON <c>null</c> payload on failure envelopes — their
+/// routine shape — even when <typeparamref name="T"/> is a non-nullable value type, assigning
+/// <c>default(T)</c> instead of throwing. On a success envelope a <c>null</c> payload is
+/// rejected as malformed: no publisher ever writes one, and accepting it would complete the
+/// waiter with a payload that surfaces as a <see cref="NullReferenceException"/> at the
+/// consumer, far from the message that caused it.
 /// </summary>
 internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncResponseEnvelope<T>>
 {
@@ -106,6 +135,7 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
         int schemaVersion = default;
         bool hasSchemaVersion = false;
         bool success = false;
+        bool payloadIsNull = false;
         T? payload = default;
         string? exceptionMessage = null;
         string? exceptionStackTrace = null;
@@ -137,10 +167,17 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 }
                 else if (property == EnvelopeProperty.Payload)
                 {
-                    // Instead of throwing, assign default(T)
-                    payload = reader.TokenType == JsonTokenType.Null
-                        ? default
-                        : JsonSerializer.Deserialize(ref reader, AsyncResponseJson.GetTypeInfo<T>(options));
+                    if (reader.TokenType == JsonTokenType.Null)
+                    {
+                        // Instead of throwing, assign default(T); whether null was legal here is
+                        // judged against Success AFTER the loop — property order is not fixed.
+                        payloadIsNull = true;
+                        payload = default;
+                    }
+                    else
+                    {
+                        payload = JsonSerializer.Deserialize(ref reader, AsyncResponseJson.GetTypeInfo<T>(options));
+                    }
                 }
                 else if (property == EnvelopeProperty.ExceptionMessage)
                 {
@@ -163,6 +200,14 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
 
         if (!hasSchemaVersion)
             throw new JsonException("SchemaVersion is required.");
+
+        // Every publisher serializes the non-null payload it was handed, so Success=true with a
+        // null Payload only arises from a producer-side contract violation — typically a raw
+        // ingress body of literal `null` wrapped verbatim into the envelope. JsonException makes
+        // it fail fast: the ingress classifies it as permanent (no retry burn) and the waiter
+        // faults with the reason instead of completing with a null payload.
+        if (success && payloadIsNull)
+            throw new JsonException("Payload is null on a Success envelope; a successful response must carry a non-null payload.");
 
         return new AsyncResponseEnvelope<T>
         {

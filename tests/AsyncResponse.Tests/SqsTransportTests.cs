@@ -69,6 +69,9 @@ public sealed class SqsTransportTests
             options => options.SubscriberRetryBaseDelay = TimeSpan.FromSeconds(2),
             nameof(SqsAsyncResponseOptions.SubscriberRetryBaseDelay));
         AssertInvalidCommon(
+            options => options.ShutdownTimeout = TimeSpan.Zero,
+            nameof(SqsAsyncResponseOptions.ShutdownTimeout));
+        AssertInvalidCommon(
             options =>
             {
                 options.CreateQueues = true;
@@ -496,6 +499,16 @@ public sealed class SqsTransportTests
             """{"CorrelationId":42}""",
             new SqsAsyncResponseOptions { CorrelationIdJsonPaths = ["CorrelationId"] }));
     }
+
+    [Fact]
+    public void CorrelationIdExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(() => SqsCorrelationIdExtractor.Extract(
+            Delivery(),
+            """{"CorrelationId":"1","CorrelationId":"2"}""",
+            new SqsAsyncResponseOptions { CorrelationIdJsonPaths = ["CorrelationId"] }));
 
     [Fact]
     public void QueueAddress_ClassifiesUrlsFifoQueuesAndNames()

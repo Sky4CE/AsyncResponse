@@ -72,6 +72,7 @@ internal static class SqsOptionsValidator
         AsyncResponseChannelOptions.EnsureTimerBacked(options.PublishRetryMaxDelay, nameof(SqsAsyncResponseOptions), nameof(options.PublishRetryMaxDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryBaseDelay, nameof(SqsAsyncResponseOptions), nameof(options.SubscriberRetryBaseDelay));
         AsyncResponseChannelOptions.EnsureTimerBacked(options.SubscriberRetryMaxDelay, nameof(SqsAsyncResponseOptions), nameof(options.SubscriberRetryMaxDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(options.ShutdownTimeout, nameof(SqsAsyncResponseOptions), nameof(options.ShutdownTimeout));
 
         if (options.PublishRetryBaseDelay > options.PublishRetryMaxDelay)
             throw new InvalidOperationException($"{nameof(SqsAsyncResponseOptions)}.{nameof(options.PublishRetryBaseDelay)} cannot exceed {nameof(options.PublishRetryMaxDelay)}.");

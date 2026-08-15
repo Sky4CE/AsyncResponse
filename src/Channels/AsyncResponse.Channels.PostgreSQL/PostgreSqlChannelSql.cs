@@ -171,8 +171,8 @@ internal sealed class PostgreSqlChannelSql
                 [
                     new(_options.RecoveryStateTable, 'r', Columns:
                         [
-                            new("correlation_id", "text", Nullable: false),
-                            new("registration_id", "uuid", Nullable: false),
+                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                            new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
                             new("state_json", "jsonb", Nullable: false),
                             new("expires_at", "timestamp with time zone", Nullable: false),
                             new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
@@ -180,7 +180,7 @@ internal sealed class PostgreSqlChannelSql
                     new(_options.MessageTable, 'r', Columns:
                         [
                             new("id", "uuid", Nullable: false),
-                            new("correlation_id", "text", Nullable: false),
+                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
                             new("envelope_json", "jsonb", Nullable: false),
                             new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
                             new("expires_at", "timestamp with time zone", Nullable: false),
@@ -190,8 +190,8 @@ internal sealed class PostgreSqlChannelSql
                         ], PrimaryKey: ["id"]),
                     new(_options.SubscriberTable, 'r', Columns:
                         [
-                            new("correlation_id", "text", Nullable: false),
-                            new("registration_id", "uuid", Nullable: false),
+                            new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
+                            new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
                             new("instance_id", "text", Nullable: false),
                             new("expires_at", "timestamp with time zone", Nullable: false),
                         ], PrimaryKey: ["correlation_id", "registration_id"]),
@@ -774,34 +774,19 @@ internal sealed class PostgreSqlChannelSql
             ("MessageTable expiry index", IndexName(options.MessageTable, "expires")),
             ("SubscriberTable expiry index", IndexName(options.SubscriberTable, "expires")),
         ];
-        RequireDistinctNamePlan(plan, nameof(PostgreSqlAsyncResponseChannelOptions));
-    }
-
-    internal static void RequireDistinctNamePlan((string Role, string Name)[] plan, string optionsName)
-    {
-        for (var i = 0; i < plan.Length; i++)
-        {
-            for (var j = i + 1; j < plan.Length; j++)
-            {
-                if (string.Equals(plan[i].Name, plan[j].Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException(
-                        $"{optionsName}: the {plan[i].Role} and the {plan[j].Role} both resolve to '{plan[j].Name}'. " +
-                        "All tables and the index/sequence names derived from them share one namespace and must be distinct " +
-                        "(long names reserve suffix space by truncating the table stem, which can make distinct tables derive " +
-                        "the same name). Shorten or de-overlap the configured table names.");
-                }
-            }
-        }
+        RelationalNamePlan.RequireDistinct(
+            plan,
+            nameof(PostgreSqlAsyncResponseChannelOptions),
+            ". All tables and the index/sequence names derived from them share one namespace and must be distinct " +
+            "(long names reserve suffix space by truncating the table stem, which can make distinct tables derive " +
+            "the same name). Shorten or de-overlap the configured table names.");
     }
 
     /// <summary>NOTIFY payload for a publish: the correlation id, or empty when it is too long to carry.</summary>
     private static string NotifyPayload(string correlationId)
         => Encoding.UTF8.GetByteCount(correlationId) <= MaxNotifyPayloadBytes ? correlationId : string.Empty;
 
-    internal static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is NpgsqlException { IsTransient: true } || exception is TimeoutException);
+    internal static bool IsTransient(Exception exception) => PostgreSqlTransientFaults.IsTransient(exception);
 
     /// <summary>
     /// Stable 64-bit advisory-lock key for serializing schema creation. Uses FNV-1a over a

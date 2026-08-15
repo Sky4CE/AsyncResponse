@@ -125,6 +125,16 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
 
         RabbitMqOptionsValidator.ValidateConnection(transportOptions);
 
+        // Both arm Task.Delay timers in the subscriber restart loop.
+        AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.SubscriberRetryBaseDelay, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay));
+        AsyncResponseChannelOptions.EnsureTimerBacked(transportOptions.SubscriberRetryMaxDelay, nameof(RabbitMqAsyncResponseOptions), nameof(RabbitMqAsyncResponseOptions.SubscriberRetryMaxDelay));
+        if (transportOptions.SubscriberRetryBaseDelay > transportOptions.SubscriberRetryMaxDelay)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(RabbitMqAsyncResponseOptions)}.{nameof(RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay)} cannot exceed " +
+                $"{nameof(RabbitMqAsyncResponseOptions.SubscriberRetryMaxDelay)}.");
+        }
+
         if (StringComparer.Ordinal.Equals(transportOptions.WorkerQueue, transportOptions.ResponseQueue))
         {
             throw new InvalidOperationException(
@@ -338,7 +348,7 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             // then reject without requeue so the broker dead-letters (or drops) it instead of hot-looping.
             var requeue = MaxDeliveryAttempts <= 0
                 || ResolveDeliveryAttempt(delivery) < MaxDeliveryAttempts;
-            await channel.BasicNackAsync(delivery.DeliveryTag, requeue, CancellationToken.None).ConfigureAwait(false);
+            await TryNackAsync(delivery, channel, requeue).ConfigureAwait(false);
             return;
         }
 
@@ -357,6 +367,37 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             Logger.LogError(
                 ex,
                 "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after a successful handler; the broker will redeliver it when the channel closes.",
+                delivery.DeliveryTag,
+                QueueName);
+        }
+    }
+
+    private async ValueTask TryNackAsync(RabbitMqDelivery delivery, IRabbitMqChannel channel, bool requeue)
+    {
+        // Never throw from here: this runs inside the client's delivery callback, and an escaped
+        // exception would leave the delivery neither ACKed nor NACKed — a prefetch credit pinned
+        // with no app-visible trace and the requeue/reject decision silently lost.
+        // A closed channel already returned every un-ACKed delivery to the queue; NACKing it would throw.
+        if (!channel.IsOpen)
+        {
+            Logger.LogWarning(
+                "Skipping NACK ({NackDecision}) of RabbitMQ delivery {DeliveryTag} for {Queue}: the channel is closed, so the broker has already requeued it.",
+                requeue ? "requeue" : "reject",
+                delivery.DeliveryTag,
+                QueueName);
+            return;
+        }
+
+        try
+        {
+            await channel.BasicNackAsync(delivery.DeliveryTag, requeue, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(
+                ex,
+                "Failed to NACK ({NackDecision}) RabbitMQ delivery {DeliveryTag} for {Queue}; the broker redelivers it when the channel closes.",
+                requeue ? "requeue" : "reject",
                 delivery.DeliveryTag,
                 QueueName);
         }

@@ -542,10 +542,24 @@ asyncResponse
 
 // Exactly one durable-flow store (enforced at host startup), independent from waiter recovery
 // state. The sample defaults to process-local state; choose SQLite or MongoDB for restart durability.
-// AllowEarlyAckWorkerSubscriber acknowledges the early-ACK trade-off for the sample's opt-in
-// early-ACK modes: durable-flow wake-ups ride the worker queue, and a crash after an early ACK
-// strands the run until an operator resumes it — startup refuses the combination without this
-// explicit acceptance (see docs/transport-semantics.md).
+// AllowEarlyAckWorkerSubscriber pairs 1:1 with an actual early-ACK opt-in (the active transport's
+// "<Transport>:Worker:AckMode" = AckAfterEnqueue handled above): durable-flow wake-ups ride the
+// worker queue, and a crash after an early ACK strands the run until an operator resumes it —
+// startup refuses the combination unless it is explicitly accepted (see docs/transport-semantics.md).
+// Pre-setting the flag when nothing opted into early ACK would silently disable that startup veto.
+var workerAckModePrefix = useAzureServiceBus ? "AzureServiceBus"
+    : useGooglePubSub ? "PubSub"
+    : useKafka ? "Kafka"
+    : useRabbitMq ? "RabbitMQ"
+    : useRedisTransport ? "Redis"
+    : useNatsTransport ? "Nats"
+    : usePostgreSqlTransport ? "PostgreSQL"
+    : useSqlServerTransport ? "SqlServer"
+    : useSqs ? "SQS"
+    : useMongoDbTransport ? "MongoDB"
+    : null;
+var workerEarlyAckOptedIn = workerAckModePrefix is not null && string.Equals(
+    builder.Configuration[$"{workerAckModePrefix}:Worker:AckMode"], "AckAfterEnqueue", StringComparison.OrdinalIgnoreCase);
 var durableFlowStore = builder.Configuration["AsyncResponse:DurableFlowStore"]
     ?? Environment.GetEnvironmentVariable("ASYNCRESPONSE_SAMPLE_DURABLE_STORE");
 if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase))
@@ -554,7 +568,7 @@ if (string.Equals(durableFlowStore, "sqlite", StringComparison.OrdinalIgnoreCase
     asyncResponse.WithSqliteDurableFlows(options =>
     {
         options.ConnectionString = $"Data Source={flowDatabasePath}";
-        options.AllowEarlyAckWorkerSubscriber = true;
+        options.AllowEarlyAckWorkerSubscriber = workerEarlyAckOptedIn; // paired with the worker AckAfterEnqueue opt-in
     });
 }
 else if (string.Equals(durableFlowStore, "mongodb", StringComparison.OrdinalIgnoreCase))
@@ -564,12 +578,13 @@ else if (string.Equals(durableFlowStore, "mongodb", StringComparison.OrdinalIgno
     asyncResponse.WithMongoDbDurableFlows(options =>
     {
         options.CollectionName = builder.Configuration["MongoDB:FlowStateCollection"] ?? options.CollectionName;
-        options.AllowEarlyAckWorkerSubscriber = true;
+        options.AllowEarlyAckWorkerSubscriber = workerEarlyAckOptedIn; // paired with the worker AckAfterEnqueue opt-in
     });
 }
 else
 {
-    asyncResponse.WithInMemoryDurableFlows(options => options.AllowEarlyAckWorkerSubscriber = true);
+    // paired with the worker AckAfterEnqueue opt-in
+    asyncResponse.WithInMemoryDurableFlows(options => options.AllowEarlyAckWorkerSubscriber = workerEarlyAckOptedIn);
 }
 
 builder.Services.AddHealthChecks().AddAsyncResponseRecoveryCheck();

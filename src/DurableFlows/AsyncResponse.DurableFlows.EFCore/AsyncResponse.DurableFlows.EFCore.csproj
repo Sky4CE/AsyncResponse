@@ -3,8 +3,9 @@
   <PropertyGroup>
     <PackageId>AsyncResponse.DurableFlows.EFCore</PackageId>
     <Description>Entity Framework Core durable-flow state store for AsyncResponse. Maps the durable-flow ledger into an application-owned DbContext so any EF Core relational provider can host it and the table rides the application's own migration pipeline.</Description>
-    <!-- FlowState (the only JSON this package writes) uses source-generated metadata
-         (DurableFlowStoreJsonContext); no reflection-based serialization remains. -->
+    <!-- FlowState (the only JSON this package writes) goes through Core's FlowStateJson
+         (source-generated metadata + the AsyncResponseJsonSerialization resolver seam); no
+         reflection-based serialization remains. -->
     <IsAotCompatible>true</IsAotCompatible>
     <PackageTags>$(PackageTags);efcore;entityframework;durable;workflow;orchestration</PackageTags>
   </PropertyGroup>

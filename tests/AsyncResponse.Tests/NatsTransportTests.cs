@@ -85,6 +85,64 @@ public class NatsTransportOptionsAndSchemaTests
     }
 
     [Fact]
+    public void ValidateCommon_Throws_ForOverlongSubjectPrefix()
+    {
+        // Red-on-old: no length cap existed, and stream defaulting sizes a stackalloc from the
+        // subject — an unbounded prefix reached it from binding, and even a merely long one
+        // yields names the JetStream API rejects at first use inside the subscriber retry loop.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { SubjectPrefix = new string('p', 300) }));
+
+        Assert.Contains(nameof(NatsAsyncResponseTransportOptions.SubjectPrefix), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("255", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateCommon_Throws_WhenPrefixDerivedSubjectCrossesTheLengthCap()
+    {
+        // A prefix inside the cap can still derive an over-cap subject once the role suffix is
+        // appended; the RESOLVED names are re-checked.
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(
+            new NatsAsyncResponseTransportOptions { SubjectPrefix = new string('p', 250) }));
+
+        Assert.Contains("255", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("WorkerSubject")]
+    [InlineData("WorkerStream")]
+    [InlineData("WorkerConsumer")]
+    public void ValidateCommon_Throws_ForOverlongExplicitNames(string property)
+    {
+        var options = new NatsAsyncResponseTransportOptions();
+        var value = new string('n', 256);
+        switch (property)
+        {
+            case "WorkerSubject": options.WorkerSubject = value; break;
+            case "WorkerStream": options.WorkerStream = value; break;
+            default: options.WorkerConsumer = value; break;
+        }
+
+        var ex = Assert.Throws<InvalidOperationException>(() => NatsTransportOptionsValidator.ValidateCommon(options));
+
+        Assert.Contains(property, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("255", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SanitizeStreamName_LongInput_TakesTheHeapPathAndStillSanitizes()
+    {
+        // Behavior pin for the stackalloc guard: a future unvalidated caller with an over-cap
+        // subject must land on the heap path, never on an uncatchable stack overflow.
+        var input = string.Concat(Enumerable.Repeat("a.b", 40_000));
+
+        var sanitized = NatsTransportSubjectSchema.SanitizeStreamName(input);
+
+        Assert.Equal(input.Length, sanitized.Length);
+        Assert.Equal(string.Concat(Enumerable.Repeat("a_b", 40_000)), sanitized);
+    }
+
+    [Fact]
     public void ValidateSubscriber_RequiresBackgroundSettingsForEarlyAck()
     {
         var subscriber = new NatsSubscriberOptions { AckMode = NatsAckMode.AckAfterEnqueue };
@@ -362,6 +420,69 @@ public class NatsCorrelationIdExtractorTests
     [Fact]
     public void Extract_ReturnsRawString_WhenSegmentValueIsInvalidJson()
         => Assert.Equal("{not valid", NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"{not valid"}""", _options));
+
+    // The shared CorrelationIdJsonPaths walker replaced a mutable JsonNode DOM (whose JsonObject
+    // throws ArgumentException the instant a touched object contains an exact-duplicate key, even
+    // one unrelated to the property being read) with a JsonElement walk. Both cases below pin that
+    // this runtime's throwing behavior is preserved rather than silently resolving to one of the
+    // duplicates, on both net8.0 and net10.0.
+    [Fact]
+    public void Extract_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        => Assert.Throws<ArgumentException>(
+            () => NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"1","CorrelationId":"2"}""", _options));
+
+    [Fact]
+    public void Extract_Throws_WhenTouchedObjectHasAnUnrelatedDuplicateKey()
+        => Assert.Throws<ArgumentException>(
+            () => NatsCorrelationIdExtractor.Extract(null, """{"Other":"1","Other":"2","CorrelationId":"x"}""", _options));
+
+    [Fact]
+    public void Extract_DoesNotThrow_WhenDuplicateKeyIsInAnUntouchedSibling()
+    {
+        // "CustomParameters" is never visited while resolving "CorrelationId" at the root, so its
+        // duplicate key must never be touched (mirrors JsonObject's per-node lazy materialization).
+        var options = new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+        Assert.Equal(
+            "root",
+            NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"root","CustomParameters":{"a":"1","a":"2"}}""", options));
+    }
+
+    [Fact]
+    public void Extract_ReadsMessageRoot_ForANonBlankZeroSegmentPath()
+    {
+        // "." is not blank (unlike "" or whitespace) so it is not skipped, but it splits to zero
+        // segments — the walk reads the message root itself rather than descending anywhere.
+        var options = new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["."] };
+        Assert.Equal("42", NatsCorrelationIdExtractor.Extract(null, "42", options));
+        Assert.Equal("hello", NatsCorrelationIdExtractor.Extract(null, "\"hello\"", options));
+        Assert.Null(NatsCorrelationIdExtractor.Extract(null, """{"a":"1"}""", options));
+    }
+
+    [Fact]
+    public void Extract_IsConsistentAcrossRepeatedCalls_WithTheSameOptionsInstance()
+    {
+        // Configured paths are pre-split and cached once per options-held array; repeated calls
+        // against the same options instance must still produce the same correct result every time.
+        var options = new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["A.B", "CorrelationId"] };
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.Equal("nested", NatsCorrelationIdExtractor.Extract(null, """{"A":{"B":"nested"}}""", options));
+            Assert.Equal("flat", NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"flat"}""", options));
+        }
+    }
+
+    [Fact]
+    public void Extract_DoesNotCrossContaminate_AcrossDifferentOptionsInstancesWithEqualPaths()
+    {
+        // Two distinct options instances whose CorrelationIdJsonPaths arrays have equal content but
+        // different identity must be cached (and read) independently.
+        var first = new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+        var second = new NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+
+        Assert.Equal("one", NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"one"}""", first));
+        Assert.Equal("two", NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"two"}""", second));
+        Assert.Equal("one-again", NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"one-again"}""", first));
+    }
 }
 
 public class NatsWorkerTransportTests

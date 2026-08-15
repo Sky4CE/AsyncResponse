@@ -3,8 +3,9 @@
   <PropertyGroup>
     <PackageId>AsyncResponse.DurableFlows.MySql</PackageId>
     <Description>MySQL and MariaDB durable-flow state store for AsyncResponse. Persists durable-flow ledgers in an application-owned table instead of the response-channel recovery cache.</Description>
-    <!-- FlowState (the only JSON this package writes) uses source-generated metadata
-         (DurableFlowStoreJsonContext); no reflection-based serialization remains. -->
+    <!-- FlowState (the only JSON this package writes) goes through Core's FlowStateJson
+         (source-generated metadata + the AsyncResponseJsonSerialization resolver seam); no
+         reflection-based serialization remains. -->
     <IsAotCompatible>true</IsAotCompatible>
     <PackageTags>$(PackageTags);mysql;mariadb;durable;workflow;orchestration</PackageTags>
   </PropertyGroup>

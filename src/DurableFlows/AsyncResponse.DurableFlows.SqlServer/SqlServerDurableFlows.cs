@@ -59,13 +59,10 @@ public sealed class SqlServerDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(ConnectionString))
-            throw new InvalidOperationException($"{nameof(SqlServerDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
-
+        DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(SqlServerDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(SchemaName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(SchemaName)}", "SQL Server", identifierCap: 128);
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqlServerDurableFlowOptions)}.{nameof(TableName)}", "SQL Server", identifierCap: 128);
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(SqlServerDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(SqlServerDurableFlowOptions));
     }
 }
 
@@ -77,7 +74,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
     private readonly SqlServerDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
-    private bool _created;
+    private volatile bool _created;
 
     public SqlServerFlowStateStore(IOptions<SqlServerDurableFlowOptions> options)
     {
@@ -370,17 +367,20 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
     /// <summary>The catalog shape this store's DDL intends — the single source for both the
     /// post-DDL verification and the failed-batch diagnosis.</summary>
+    /// <remarks>A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types
+    /// state the scale, because a reduced-scale <c>lease_expires_at_utc</c> rounds the fence on
+    /// store — two nodes can then both read the lease as expired and run one flow at once.</remarks>
     private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
             [
                 new(_options.TableName, SqlServerObjectKind.Table,
                 [
                     new("flow_id", "nvarchar(400)", Nullable: false, RequiresBinaryCollation: true),
                     new("state_json", "nvarchar(max)", Nullable: false),
-                    new("expires_at_utc", "datetime2", Nullable: false),
-                    new("updated_at_utc", "datetime2", Nullable: false),
+                    new("expires_at_utc", "datetime2(7)", Nullable: false),
+                    new("updated_at_utc", "datetime2(7)", Nullable: false),
                     new("revision", "bigint", Nullable: false),
                     new("lease_id", "nvarchar(64)", Nullable: true),
-                    new("lease_expires_at_utc", "datetime2", Nullable: true)
+                    new("lease_expires_at_utc", "datetime2(7)", Nullable: true)
                 ],
                 PrimaryKey: ["flow_id"])
             ];
@@ -393,10 +393,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -418,20 +415,8 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
-    {
-        var connection = new SqlConnection(_options.ConnectionString);
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            return connection;
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
+    private Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+        => DurableFlowStoreShared.OpenConnectionAsync<SqlConnection>(_options.ConnectionString, cancellationToken);
 
     /// <summary>
     /// SQL expression adding a millisecond bigint parameter to the database clock (the same

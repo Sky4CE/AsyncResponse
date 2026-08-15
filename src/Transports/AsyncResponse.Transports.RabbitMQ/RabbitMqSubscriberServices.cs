@@ -54,7 +54,7 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
 
@@ -73,31 +73,20 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
                 SubscriberRole);
         }
 
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(queue, stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                // Covers failed startup and a mid-run consumer/channel termination alike.
-                // Strictly positive and timer-bounded by validation — usable directly.
-                var retryDelay = Options.NetworkRecoveryInterval;
-                Logger.LogWarning(
-                    ex,
-                    "RabbitMQ subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
-                    queue,
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
+        return SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(queue, ct),
+            stoppingToken,
+            // Covers failed startup and a mid-run consumer/channel termination alike. Jittered
+            // backoff, not NetworkRecoveryInterval (which paces the CLIENT's automatic recovery
+            // of an existing connection): a broker restart drops every consumer on every
+            // replica at once, and a flat shared delay reconnects them all on the same tick.
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "RabbitMQ subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
+                queue,
+                SubscriberRole,
+                retryDelay));
     }
 
     private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)

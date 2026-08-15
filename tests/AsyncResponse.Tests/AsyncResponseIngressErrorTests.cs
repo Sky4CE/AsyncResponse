@@ -55,6 +55,27 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
+    public async Task HandleResponseMessageAsync_Cancellation_Propagates_WithoutRetryOrSetException()
+    {
+        // Cancellation is not a handler failure: a durable flow losing its execution lease
+        // mid-dispatch surfaces here as an OperationCanceledException. Retrying it burned the
+        // in-process budget, and escalating it through SetException terminally failed a waiter
+        // whose response was never lost — then the successful publish acked the message away.
+        // It must propagate so the transport treats the delivery as canceled (NAK/redeliver).
+        var cancellation = new OperationCanceledException("execution lease lost");
+        var rawPublisher = new ThrowingRawPublisher(cancellation);
+        var publisher = new RecordingPublisher();
+        var ingress = CreateIngress(rawPublisher, publisher);
+
+        var thrown = await Assert.ThrowsAsync<OperationCanceledException>(
+            () => ingress.HandleResponseMessageAsync("""{"Status":2}""", "corr-oce"));
+
+        Assert.Same(cancellation, thrown);
+        Assert.Equal(1, rawPublisher.RawJsonCalls);
+        Assert.Null(publisher.Exception);
+    }
+
+    [Fact]
     public async Task HandleResponseMessageAsync_WhenEscalationAlsoFails_Propagates_SoTransportRedelivers()
     {
         var original = new InvalidDataException("bad payload");

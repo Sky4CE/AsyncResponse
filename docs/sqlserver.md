@@ -127,6 +127,16 @@ CREATE INDEX asyncresponse_transport_messages_created_idx
     ON dbo.asyncresponse_transport_messages (created_at);
 ```
 
+The store verifies this shape against the catalog the first time it's used — under
+`AutoCreateSchema = false` just as under `AutoCreateSchema = true` (after its own DDL): an absent
+table is assumed not yet migrated and re-checked on the next operation, while a present table with
+the wrong shape throws with the fix instead of failing silently at the first claim. Verification
+now also checks scale on every fractional-seconds column: a bare `datetime2` above is already
+`datetime2(7)`, so the shape needs no change, but a manually reduced scale (`datetime2(3)`,
+`datetime2(0)`) is rejected — SQL Server rounds on store, so a lower-scale column is a different
+clock, not a coarser view of the same one, and could round a timestamp below an already-observed
+watermark.
+
 The three logical queues share this one table and are told apart by the `queue` column alone, so
 the claim query matches it exactly — `queue = @queue AND queue + N'.' = @queue + N'.' COLLATE
 Latin1_General_100_BIN2`. The sentinel is there because SQL Server pads the shorter operand of an

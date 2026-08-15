@@ -210,6 +210,18 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             {
                 await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
             }
+            catch (OperationCanceledException ex) when (_backgroundCts!.IsCancellationRequested)
+            {
+                // The drain budget lapsed with this already-ACKed message still unprocessed:
+                // JetStream will not redeliver it, so surface the drop through OnBackgroundFailure
+                // instead of dead-lettering a never-run job as a handler failure (Kafka/Redis
+                // dispatcher parity).
+                _logger.LogWarning(
+                    "NATS background handler for already-ACKed message on subject {Subject} ({Role}) was canceled during dispatcher shutdown; surfacing via OnBackgroundFailure.",
+                    delivery.Subject,
+                    _role);
+                await InvokeBackgroundFailureAsync(delivery, ex).ConfigureAwait(false);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Background handler failed for {Role} on subject {Subject} after early ACK.", _role, delivery.Subject);

@@ -44,7 +44,18 @@ public static class PostgreSqlAsyncResponseChannelServiceCollectionExtensions
             provider.GetService<TimeProvider>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
-        services.AddSingleton(new AsyncResponseChannelMarker(PostgreSqlAsyncResponseChannelOptions.ChannelName));
+        // The resolved default waiter timeout is declared through the marker so the startup
+        // validator can require the durable-flow ledger TTL to out-live a timeout-less awaited
+        // step, and the flow engine can extend a parked ledger by it — without either referencing
+        // channel option types.
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<PostgreSqlAsyncResponseChannelOptions>>().Value;
+            return new AsyncResponseChannelMarker(PostgreSqlAsyncResponseChannelOptions.ChannelName)
+            {
+                EffectiveDefaultWaitTimeout = options.DefaultTimeout ?? options.RecoveryStateExpiry
+            };
+        });
         return builder;
     }
 }

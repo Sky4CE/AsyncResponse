@@ -22,6 +22,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\CorrelationIdJsonPaths.cs" Link="CorrelationIdJsonPaths.cs" />
+    <Compile Include="..\Shared\SubscriberSupervisor.cs" Link="SubscriberSupervisor.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
     <PackageReference Include="NATS.Net" />

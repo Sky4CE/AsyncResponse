@@ -1,3 +1,4 @@
+using AsyncResponse.Internal;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 using System.Diagnostics;
@@ -99,14 +100,5 @@ internal static class MongoDbTransportRetry
         TimeSpan baseDelay,
         TimeSpan maxDelay,
         CancellationToken cancellationToken)
-        => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
-
-    public static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is MongoConnectionException
-               or MongoNotPrimaryException
-               or MongoNodeIsRecoveringException
-               or MongoExecutionTimeoutException
-               or TimeoutException
-               || (exception is MongoException mongoException && mongoException.HasErrorLabel("RetryableWriteError")));
+        => AsyncResponseRetry.ExecuteAsync(action, MongoTransientFaults.IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 }

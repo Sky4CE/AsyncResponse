@@ -9,10 +9,20 @@ internal static class KafkaTransportOptionsValidator
             : throw new InvalidOperationException($"{nameof(KafkaAsyncResponseTransportOptions)}.{name} must be configured.");
 
     /// <summary>
-    /// librdkafka's allowed range for <c>auto.commit.interval.ms</c> tops out at 86,400,000 ms;
-    /// a larger value fails consumer CONSTRUCTION inside the subscriber loop, not validation.
+    /// librdkafka's allowed range for its interval settings (<c>auto.commit.interval.ms</c>,
+    /// <c>max.poll.interval.ms</c>) tops out at 86,400,000 ms; a larger value fails consumer
+    /// CONSTRUCTION inside the subscriber loop, not validation.
     /// </summary>
-    private static readonly TimeSpan MaxOffsetCommitInterval = TimeSpan.FromDays(1);
+    private static readonly TimeSpan MaxLibrdkafkaInterval = TimeSpan.FromDays(1);
+
+    /// <summary>Validates a subscriber's <c>max.poll.interval.ms</c> against the librdkafka range.</summary>
+    internal static void EnsureMaxPollInterval(TimeSpan value, string optionsName, string name)
+    {
+        if (value <= TimeSpan.Zero || value > MaxLibrdkafkaInterval)
+            throw new InvalidOperationException(
+                $"{optionsName}.{name} must be positive and at most 1 day " +
+                "(the librdkafka max.poll.interval.ms range; larger values fail consumer construction).");
+    }
 
     /// <summary>
     /// The Kafka client passes timeouts to librdkafka as 32-bit millisecond values
@@ -77,7 +87,7 @@ internal static class KafkaTransportOptionsValidator
             EnsureDeadLetterNotLive(topics.DeadLetterTopicFor(topics.ResponseTopic), topics);
         }
 
-        if (options.OffsetCommitInterval <= TimeSpan.Zero || options.OffsetCommitInterval > MaxOffsetCommitInterval)
+        if (options.OffsetCommitInterval <= TimeSpan.Zero || options.OffsetCommitInterval > MaxLibrdkafkaInterval)
             throw new InvalidOperationException(
                 $"{nameof(KafkaAsyncResponseTransportOptions)}.{nameof(options.OffsetCommitInterval)} must be positive and at most 1 day " +
                 "(the librdkafka auto.commit.interval.ms range; larger values fail consumer construction).");

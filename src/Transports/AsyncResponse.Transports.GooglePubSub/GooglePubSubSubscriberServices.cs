@@ -85,7 +85,7 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var projectId = GooglePubSubOptionsValidator.Required(Options.ProjectId, nameof(Options.ProjectId));
         var subscriptionId = SubscriptionId;
@@ -101,34 +101,19 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
             subscriptionName.ToString(),
             SubscriberRole);
 
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(subscriptionName, subscriptionId, stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = AsyncResponseRetry.Backoff(
-                    failures,
-                    Options.SubscriberRetryBaseDelay,
-                    Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(
-                    ex,
-                    "Pub/Sub subscriber failed for subscription {Subscription} ({Role}); retrying in {RetryDelay}.",
-                    subscriptionName.ToString(),
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
+        return SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(subscriptionName, subscriptionId, ct),
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(
+                failures,
+                Options.SubscriberRetryBaseDelay,
+                Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "Pub/Sub subscriber failed for subscription {Subscription} ({Role}); retrying in {RetryDelay}.",
+                subscriptionName.ToString(),
+                SubscriberRole,
+                retryDelay));
     }
 
     private async Task RunSubscriberAsync(

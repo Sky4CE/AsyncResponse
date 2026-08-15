@@ -133,6 +133,14 @@ public sealed class SqsAsyncResponseOptions
     public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Bounds the visibility-renewal task join after each batch (including the final batch while a
+    /// hosted subscriber stops). The join completes immediately when healthy; when it does not, the
+    /// renewal task is abandoned anyway, so keep this short — at shutdown it counts against the
+    /// host's budget. Default: <c>5s</c>.
+    /// </summary>
+    public TimeSpan ShutdownTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// The hosting shutdown budget that must contain
     /// <see cref="SqsSubscriberOptions.BackgroundDrainTimeout"/> when a subscriber uses
     /// <see cref="SqsAckMode.AckAfterEnqueue"/>. Defaults to the Generic Host default of 30 seconds.

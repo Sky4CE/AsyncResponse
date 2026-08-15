@@ -3,11 +3,19 @@ using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AsyncResponse.Channels.Redis;
 
 /// <summary>
 /// Redis-backed implementation of <see cref="IRecoveryStateStore"/>.
+/// <para>
+/// Every registration for a correlation id shares one key, but Redis applies a single TTL per key,
+/// so each entry also carries an absolute <see cref="StoredRegistration.ExpiresAtUtc"/>: reads and
+/// scans treat an entry past its expiry as absent, saves prune expired entries, and the key TTL is
+/// always the longest remaining entry lifetime — a stream of fresh registrations can therefore
+/// never keep a dead sibling registration recoverable (nor truncate a longer-lived one).
+/// </para>
 /// </summary>
 internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
 {
@@ -15,17 +23,20 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     private readonly IDatabase _database;
     private readonly RedisKeySchema _keys;
     private readonly ILogger<RedisRecoveryStateStore> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>Creates a Redis-backed recovery state store.</summary>
     public RedisRecoveryStateStore(
         IConnectionMultiplexer multiplexer,
         IOptions<RedisAsyncResponseOptions> options,
-        ILogger<RedisRecoveryStateStore> logger)
+        ILogger<RedisRecoveryStateStore> logger,
+        TimeProvider? timeProvider = null)
     {
         _multiplexer = multiplexer;
         _database = multiplexer.GetDatabase();
         _keys = new RedisKeySchema(options.Value.KeyPrefix);
         _logger = logger;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <inheritdoc />
@@ -57,18 +68,31 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            var nowUtc = _timeProvider.GetUtcNow();
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
-            var states = previous.IsNullOrEmpty
-                ? []
-                : DeserializeStates(previous, recoveryKey, correlationId, logAsError: true);
-            states.RemoveAll(existing => existing.RegistrationId == state.RegistrationId);
-            states.Add(state);
+            var (entries, legacy) = previous.IsNullOrEmpty
+                ? (new List<StoredRegistration>(), false)
+                : DeserializeEntries(previous, recoveryKey, correlationId, logAsError: true, nowUtc);
+            if (legacy)
+            {
+                // Legacy blobs (a bare state list) carry no per-entry expiry — under that format
+                // every save re-armed the whole key with a full TTL anyway, so re-stamping each
+                // entry with this save's full TTL preserves that ceiling exactly once; from here
+                // on the blob is enveloped and expiry is per entry.
+                foreach (var entry in entries)
+                    entry.ExpiresAtUtc = nowUtc + ttl;
+            }
+
+            entries.RemoveAll(existing => existing.State!.RegistrationId == state.RegistrationId);
+            entries.Add(new StoredRegistration { State = state, ExpiresAtUtc = nowUtc + ttl });
 
             var transaction = _database.CreateTransaction();
             transaction.AddCondition(previous.IsNull
                 ? Condition.KeyNotExists(recoveryKey)
                 : Condition.StringEqual(recoveryKey, previous));
-            _ = transaction.StringSetAsync(recoveryKey, AsyncResponseJson.Serialize(states), ttl);
+            // The key must outlive its longest-lived entry and no more: a fresh full TTL here
+            // would re-extend every co-located registration's physical lifetime on each save.
+            _ = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
                 return;
         }
@@ -103,21 +127,39 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            var nowUtc = _timeProvider.GetUtcNow();
             var previous = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
             if (previous.IsNullOrEmpty)
                 return false;
 
-            var states = DeserializeStates(previous, recoveryKey, correlationId, logAsError: true);
-            var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
+            var (entries, legacy) = DeserializeEntries(previous, recoveryKey, correlationId, logAsError: true, nowUtc);
+            var removed = entries.RemoveAll(entry => entry.State!.RegistrationId == registrationId) > 0;
             if (!removed)
                 return false;
 
             var transaction = _database.CreateTransaction();
             transaction.AddCondition(Condition.StringEqual(recoveryKey, previous));
-            if (states.Count == 0)
+            if (entries.Count == 0)
+            {
                 _ = transaction.KeyDeleteAsync(recoveryKey);
+            }
+            else if (legacy)
+            {
+                // Legacy blobs keep their shape and key TTL here: only SaveAsync migrates to the
+                // enveloped shape, because it alone has a TTL to stamp the survivors with.
+                _ = transaction.StringSetAsync(
+                    recoveryKey,
+                    AsyncResponseJson.Serialize(entries.ConvertAll(entry => entry.State!)),
+                    Expiration.KeepTtl,
+                    ValueCondition.Always);
+            }
             else
-                _ = transaction.StringSetAsync(recoveryKey, AsyncResponseJson.Serialize(states), Expiration.KeepTtl, ValueCondition.Always);
+            {
+                // Shrink the key to its longest surviving entry: keeping the previous TTL would
+                // hold the key alive long after the removed registration — possibly the only
+                // long-lived one — is gone.
+                _ = transaction.StringSetAsync(recoveryKey, SerializeEntries(entries), MaxRemaining(entries, nowUtc));
+            }
             if (await transaction.ExecuteAsync().ConfigureAwait(false))
                 return true;
         }
@@ -155,8 +197,9 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                     continue;
 
                 var correlationId = _keys.CorrelationIdFromRecoveryKey(recoveryKey);
-                foreach (var state in DeserializeStates(value, recoveryKey, correlationId, logAsError: false))
-                    yield return state;
+                var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: false, _timeProvider.GetUtcNow());
+                foreach (var entry in entries)
+                    yield return entry.State!;
             }
         }
     }
@@ -166,48 +209,65 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     private async Task<List<RecoveryState>> LoadStatesAsync(string recoveryKey, string correlationId)
     {
         var value = await _database.StringGetAsync(recoveryKey).ConfigureAwait(false);
-        return value.IsNullOrEmpty
-            ? []
-            : DeserializeStates(value, recoveryKey, correlationId, logAsError: true);
+        if (value.IsNullOrEmpty)
+            return [];
+
+        var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: true, _timeProvider.GetUtcNow());
+        return entries.ConvertAll(entry => entry.State!);
     }
 
-    private List<RecoveryState> DeserializeStates(RedisValue value, string recoveryKey, string correlationId, bool logAsError)
+    private static RedisValue SerializeEntries(List<StoredRegistration> entries)
+        => JsonSerializer.Serialize(
+            new StoredRecoveryState { Registrations = entries },
+            RedisChannelJsonContext.Default.StoredRecoveryState);
+
+    private static TimeSpan MaxRemaining(List<StoredRegistration> entries, DateTimeOffset nowUtc)
     {
+        var maxExpiresAtUtc = DateTimeOffset.MinValue;
+        foreach (var entry in entries)
+        {
+            if (entry.ExpiresAtUtc > maxExpiresAtUtc)
+                maxExpiresAtUtc = entry.ExpiresAtUtc;
+        }
+
+        return maxExpiresAtUtc - nowUtc;
+    }
+
+    private (List<StoredRegistration> Entries, bool Legacy) DeserializeEntries(
+        RedisValue value,
+        string recoveryKey,
+        string correlationId,
+        bool logAsError,
+        DateTimeOffset nowUtc)
+    {
+        var json = value.ToString();
         try
         {
-            var states = AsyncResponseJson.Deserialize<List<RecoveryState>>(value.ToString()) ?? [];
-
-            for (var i = states.Count - 1; i >= 0; i--)
+            // Legacy blobs are a bare JSON array of states; enveloped blobs are an object. The
+            // first significant character tells the shapes apart without a speculative parse.
+            if (IsLegacyShape(json))
             {
-                var state = states[i];
-                if (state is null || state.RegistrationId == Guid.Empty)
+                var states = AsyncResponseJson.Deserialize<List<RecoveryState>>(json) ?? [];
+                var legacyEntries = new List<StoredRegistration>(states.Count);
+                foreach (var state in states)
                 {
-                    _logger.LogWarning(
-                        "Recovery state at {RecoveryKey} has no registration id; rejecting it because it cannot be deleted safely.",
-                        recoveryKey);
-                    states.RemoveAt(i);
-                    continue;
+                    // A legacy entry has no expiry of its own; it lives until the key's TTL, as it
+                    // always did (SaveAsync stamps one when it rewrites the blob enveloped).
+                    if (IsStateReadable(state, recoveryKey, correlationId))
+                        legacyEntries.Add(new StoredRegistration { State = state });
                 }
 
-                if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
-                {
-                    _logger.LogWarning(
-                        "Recovery state at {RecoveryKey} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
-                        recoveryKey, state.SchemaVersion, RecoveryStateSchema.Current);
-                    states.RemoveAt(i);
-                    continue;
-                }
-
-                if (!string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
-                {
-                    _logger.LogWarning(
-                        "Recovery state at {RecoveryKey} has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
-                        recoveryKey, state.CorrelationId, correlationId);
-                    states.RemoveAt(i);
-                }
+                return (legacyEntries, true);
             }
 
-            return states;
+            var stored = JsonSerializer.Deserialize(json, RedisChannelJsonContext.Default.StoredRecoveryState);
+            var entries = stored?.Registrations ?? [];
+            entries.RemoveAll(entry => entry is null || !IsStateReadable(entry.State, recoveryKey, correlationId));
+            // An entry past its per-entry expiry is logically gone even while a longer-lived
+            // sibling keeps the key alive; surfacing it would fire recovery callbacks for a
+            // registration that lapsed long ago.
+            entries.RemoveAll(entry => entry.ExpiresAtUtc <= nowUtc);
+            return (entries, false);
         }
         catch (JsonException ex)
         {
@@ -215,8 +275,71 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
                 _logger.LogError(ex, "Failed to deserialize recovery state at {RecoveryKey}.", recoveryKey);
             else
                 _logger.LogWarning(ex, "Unreadable recovery state at {RecoveryKey}; skipping.", recoveryKey);
-            return [];
+            return ([], false);
         }
     }
 
+    private static bool IsLegacyShape(string json)
+    {
+        foreach (var ch in json)
+        {
+            if (char.IsWhiteSpace(ch))
+                continue;
+            return ch == '[';
+        }
+
+        return false;
+    }
+
+    private bool IsStateReadable(RecoveryState? state, string recoveryKey, string correlationId)
+    {
+        if (state is null || state.RegistrationId == Guid.Empty)
+        {
+            _logger.LogWarning(
+                "Recovery state at {RecoveryKey} has no registration id; rejecting it because it cannot be deleted safely.",
+                recoveryKey);
+            return false;
+        }
+
+        if (!RecoveryStateSchema.IsReadable(state.SchemaVersion))
+        {
+            _logger.LogWarning(
+                "Recovery state at {RecoveryKey} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
+                recoveryKey, state.SchemaVersion, RecoveryStateSchema.Current);
+            return false;
+        }
+
+        if (string.Equals(state.CorrelationId, correlationId, StringComparison.Ordinal))
+            return true;
+
+        _logger.LogWarning(
+            "Recovery state at {RecoveryKey} has correlationId {StoredCorrelationId}, expected {CorrelationId}; rejecting it.",
+            recoveryKey, state.CorrelationId, correlationId);
+        return false;
+    }
+
+    /// <summary>
+    /// The stored envelope: an object (legacy blobs were a bare array, which is how the two
+    /// shapes are told apart) holding every registration with its own absolute expiry.
+    /// </summary>
+    internal sealed class StoredRecoveryState
+    {
+        public List<StoredRegistration>? Registrations { get; set; }
+    }
+
+    /// <summary>One registration and the absolute expiry of the save that wrote it.</summary>
+    internal sealed class StoredRegistration
+    {
+        public RecoveryState? State { get; set; }
+        public DateTimeOffset ExpiresAtUtc { get; set; }
+    }
 }
+
+/// <summary>
+/// Source-generated metadata for the package-local recovery envelope (trim/AOT-safe; Metadata-mode
+/// generation with default options serializes the nested <see cref="RecoveryState"/> exactly like
+/// the reflection-based path did).
+/// </summary>
+[JsonSourceGenerationOptions(GenerationMode = JsonSourceGenerationMode.Metadata)]
+[JsonSerializable(typeof(RedisRecoveryStateStore.StoredRecoveryState))]
+internal sealed partial class RedisChannelJsonContext : JsonSerializerContext;

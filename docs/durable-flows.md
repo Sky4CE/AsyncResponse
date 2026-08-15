@@ -266,6 +266,7 @@ property makes every failure mode collapse into "run it again":
 | Process crashes **before** a step | Worker redelivery re-runs the flow; completed steps skip; the step runs normally. This relies on the worker subscriber's default `AckAfterHandlerCompletes` — the wake job must stay unacknowledged until the handler finishes |
 | The worker subscriber uses **early ACK** (`UseAckAfterEnqueue`) | Vetoed at startup: a crash after the ACK but before execution would strand the run as `Running` with no lease, no queued job, and no discovery API. `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` accepts the risk — a stranded run then waits for an operator `ResumeAsync(flowId)` (a run already awaiting a step also self-heals when its response arrives and recovery re-enqueues it) |
 | Process crashes **while awaiting** a remote step | The re-run **re-attaches** to the in-flight wait via the persisted correlation-id breadcrumb — the request is *not* re-sent; progress keeps streaming. (One unavoidable sliver: if the response had already been claimed for delivery at the instant of the crash — or its recovery registration was deleted by a cancelled execution's teardown just as it arrived — nothing can replay it; the re-attached wait then ends at the step timeout and the idempotent step restarts fresh. Disposal drains an in-flight delivery first — bounded by `DisposalDrainTimeout` — so a response mid-processing settles as delivered rather than falling into this sliver; if that drain budget lapses with the delivery still running, the wait faults as *indeterminate* instead of cancelling, and the step restarts fresh immediately rather than re-attaching to a possibly-consumed correlation id) |
+| A **redelivery repeats faster than an awaited step's timeout** | The step's fault deadline is persisted at first arm, not recomputed per attempt, so each re-attach arms only the REMAINDER of the original window — the fault clock and the ledger TTL survive crashes and redeliveries instead of restarting from zero every time. A deadline already elapsed by the time execution resumes faults the step immediately (after checking whether recovery already completed it in the gap) rather than arming a fresh full wait indefinitely |
 | Process is **down** when a progress/success response arrives | The payload's `OnRecovery() == Resume` routes to the auto-registered recovery callback with the materialized payload. It finds the step by correlation id, checkpoints the actual payload, clears the pending wait, and re-enqueues the run. A payload that classifies a progress message as `KeepWaiting` skips all of that: nothing fires, the registration stays armed, and only the terminal response resumes — one recovery per step instead of one per checkpoint |
 | Process is down when a **failed** response arrives | `OnRecovery() == Fail` routes to the auto-registered **failure** callback: the run is marked `Failed` — a failure is never resumed as a success |
 | The **terminal** response itself was the lost message | Its payload is already the step result. The resumed run skips that completed await and continues; it does not wait for a consumed correlation id or re-send the remote request |
@@ -275,7 +276,7 @@ property makes every failure mode collapse into "run it again":
 | A **child run dead-letters** (a retriable failure exhausts the transport's delivery attempts) | The child stays `Running` and the parent stays suspended — **the child's DLQ entry is the alarm**. Replay the DLQ entry or call `ResumeAsync(childFlowId)`; re-enqueueing the parent (`ResumeAsync(parentFlowId)`) also works — it re-enqueues the child. The parent resumes automatically once the child reaches a terminal state |
 | You want a dead-lettered run to **wait for you** | A `Running` run can be resurrected at any time by a late response or recovery — by design. To take manual control first, set the run's status to `FlowRunStatus.Suspended` in the flow store: wake-ups, resumes, and failure signals are ignored while suspended (a parent awaiting a suspended child keeps waiting). A recovered **terminal** response is not discarded: it is checkpointed into the suspended run's ledger *without waking it*, so un-parking replays from that preserved result; non-terminal checkpoints keep the recovery registration armed. When ready, set it back to `Running` and call `ResumeAsync(flowId)` to replay from checkpoints. **Park only runs that are not mid-execution**: the store write bumps the ledger revision, so a worker actively executing that flow fails its next checkpoint (logged as a lost execution lease) and everything after its last checkpoint replays on un-park — the normal at-least-once replay, but with side effects that already ran once |
 | The **child's ledger expired** while the parent was suspended | The parent step fails terminally with `DurableFlowFailedException` (`"has no state (expired or deleted)"`) instead of silently re-running the child's side effects — the child's outcome is unknowable. Size `DurableFlowOptions.StateExpiry` beyond the longest child idle time; the TTL refreshes on every checkpoint |
-| The **parent's ledger expired** while suspended | Same sizing rule — `StateExpiry` bounds the idle time of a suspended parent too. An expired run cannot be resumed: the executor logs a warning and no-ops |
+| The **parent's ledger expired** while suspended | A descendant's long park (a timer sleep, or an awaited step whose wait window exceeds `StateExpiry`) auto-extends every `Running` ancestor up the chain to cover it, so a parent suspended only because a child is parked no longer needs separate sizing for that case. This propagation fires on parking only: a child that keeps running and checkpointing without ever parking longer than its own `StateExpiry` does not extend the parent, so size `StateExpiry` above that child's total wall-clock duration too. Either way, an expired run cannot be resumed: the executor logs a warning and no-ops |
 | A step keeps failing | The exception propagates; the worker transport redelivers the run with bounded attempts, then **dead-letters it — that's your "run is stuck" alarm** |
 | The flow decides it's hopeless | Throw `DurableFlowFailedException`: the run is marked `Failed` terminally, with no redelivery |
 | The **parent fails (or is failed) while a child still runs** | The child is deliberately independent: it keeps running to completion — its side effects happen — and its terminal notification to the already-terminal parent is a no-op. There is no cascade-cancel. If the child's work must not continue, act on the child explicitly: park it (`FlowRunStatus.Suspended`) or fail it (`IDurableFlowExecutor.FailAsync`). Policy modes (cascade cancel/park on parent failure) are on the roadmap |
@@ -469,6 +470,15 @@ builder.Services
     .WithDurableFlows<MyDatabaseFlowStateStore>();
 ```
 
+> Register (or set the lifetime of) `MyDatabaseFlowStateStore` **before** calling
+> `WithDurableFlows<TFlowStateStore>()`. The call forwards `IFlowStateStore` to your concrete
+> registration and mirrors its lifetime *as seen at that point in the chain* (`TryAddScoped` if you
+> have not registered it yet). A concrete registration added, or re-lifetimed, after the call
+> leaves that mirror stale — worst case, a Scoped forward to a root Singleton, which the first
+> flow-execution scope then disposes along with any connection it owns, for the whole process.
+> Startup re-checks the mirror against your final service collection and fails fast with the fix if
+> they disagree.
+
 There is no weaker three-method or local-lock compatibility mode. Every store must atomically
 create a run, compare-and-swap revisions, and fence execution with renewable leases. Built-in
 providers implement the full contract; the in-memory store implements it within one process.
@@ -482,9 +492,12 @@ registers *your* store as **scoped**, so EF Core `DbContext`-style dependencies 
 gap between checkpoints rather than total run duration. The default is deliberately double the
 7-day default step-timeout chain (`DefaultStepTimeout` → channel `DefaultTimeout` →
 `RecoveryStateExpiry`): a step that silently waits out the full default timeout still faults and
-checkpoints before its ledger can expire, instead of racing it. Expired, malformed,
-identity-mismatched, revision-mismatched, or unsupported-schema ledgers load as absent instead of
-entering execution.
+checkpoints before its ledger can expire, instead of racing it. When `DefaultStepTimeout` is unset,
+startup enforces that margin for you: `StateExpiry` must exceed the registered channel's effective
+default wait timeout (`DefaultTimeout ?? RecoveryStateExpiry` — the window a timeout-less awaited
+step actually waits out) or it throws with the fix; set `DefaultStepTimeout` explicitly to opt out
+of the check. Expired, malformed, identity-mismatched, revision-mismatched, or unsupported-schema
+ledgers load as absent instead of entering execution.
 
 Full contract, package lifetimes, schema requirements, and expired-state cleanup:
 [durable-flow-state-stores.md](durable-flow-state-stores.md). `StateExpiry` and

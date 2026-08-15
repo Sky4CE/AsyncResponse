@@ -1,7 +1,5 @@
+using System.Data.Common;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse.DurableFlows.Internal;
 
@@ -16,15 +14,6 @@ internal static class DurableFlowStoreShared
     /// to "effectively never" instead of failing every write.
     /// </summary>
     private static readonly TimeSpan MaxServerClockTtl = TimeSpan.FromSeconds(int.MaxValue);
-
-    private static readonly JsonSerializerOptions Options = new()
-    {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        TypeInfoResolver = DurableFlowStoreJsonContext.Default
-    };
-
-    private static JsonTypeInfo<FlowState> FlowStateTypeInfo
-        => (JsonTypeInfo<FlowState>)Options.GetTypeInfo(typeof(FlowState));
 
     public static void ValidateCreate(string flowId, FlowState state, TimeSpan ttl)
     {
@@ -42,7 +31,27 @@ internal static class DurableFlowStoreShared
             throw new ArgumentException("The new flow-state revision must increment the expected revision by one.", nameof(state));
     }
 
-    public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, FlowStateTypeInfo);
+    /// <summary>
+    /// Argument preamble shared by every store's lease acquire/renew path. The stores pass their
+    /// own parameters straight through, so the thrown <c>ParamName</c>s ("flowId", "leaseId",
+    /// "leaseDuration") match the public <c>IFlowStateStore</c> signatures exactly.
+    /// </summary>
+    public static void ValidateLeaseArgs(string flowId, string leaseId, TimeSpan leaseDuration)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
+        if (leaseDuration <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+    }
+
+    /// <summary>
+    /// The ledger has exactly ONE wire format: Core's <c>FlowStateJson</c> (source-generated
+    /// metadata, nulls omitted on write, resolved through the <c>AsyncResponseJson</c> chain so
+    /// <c>AsyncResponseJsonSerialization.RegisterResolver</c> — the documented trim/AOT seam —
+    /// reaches every store). Serialize and Deserialize both delegate there, so a ledger written
+    /// through any provider store always loads through any other, byte for byte.
+    /// </summary>
+    public static string Serialize(FlowState state) => FlowStateJson.Serialize(state);
 
     /// <summary>
     /// Serializes a ledger for a full-state write and enforces the store's <c>MaxStateBytes</c>
@@ -103,18 +112,8 @@ internal static class DurableFlowStoreShared
     public static long ServerClockTtlMilliseconds(TimeSpan ttl)
         => (long)ServerClockTtl(ttl).TotalMilliseconds;
 
-    public static FlowState? Deserialize(string json)
-    {
-        try
-        {
-            var state = JsonSerializer.Deserialize(json, DurableFlowStoreJsonContext.Default.FlowState);
-            return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
+    /// <inheritdoc cref="Serialize"/>
+    public static FlowState? Deserialize(string json) => FlowStateJson.Deserialize(json);
 
     /// <summary>
     /// Throttles opportunistic expired-state pruning: returns <c>true</c> at most once per
@@ -154,6 +153,43 @@ internal static class DurableFlowStoreShared
     /// <summary>SQL Server <c>sp_getapplock</c> resource name for schema DDL (shared with the channel/transport packages).</summary>
     public static string SchemaLockResource(string schemaName)
         => $"asyncresponse:ddl:{schemaName}";
+
+    /// <summary>Connection-string guard shared by the stores that own their connections.</summary>
+    public static void ValidateConnectionString(string? connectionString, string optionsTypeName)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException($"{optionsTypeName}.ConnectionString must be configured.");
+    }
+
+    /// <summary><c>MaxStateBytes</c> guard shared by all nine stores (null disables the budget).</summary>
+    public static void ValidateMaxStateBytes(long? maxStateBytes, string optionsTypeName)
+    {
+        if (maxStateBytes is <= 0)
+            throw new InvalidOperationException($"{optionsTypeName}.MaxStateBytes must be positive when configured.");
+    }
+
+    /// <summary>
+    /// Opens a fresh provider connection, disposing it when open fails — an ADO.NET connection
+    /// that failed to open still holds its allocation until disposed, and the caller never
+    /// receives it.
+    /// </summary>
+    public static async Task<TConnection> OpenConnectionAsync<TConnection>(
+        string? connectionString,
+        CancellationToken cancellationToken)
+        where TConnection : DbConnection, new()
+    {
+        var connection = new TConnection { ConnectionString = connectionString };
+        try
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
 
     public static void ValidateIdentifier(string? value, string optionName, string providerName, int identifierCap = 0)
     {
@@ -222,15 +258,3 @@ internal sealed class FlowStateTooLargeException(string flowId, long serializedS
     /// <summary>The configured budget the write exceeded.</summary>
     public long MaxStateBytes { get; } = maxStateBytes;
 }
-
-/// <summary>
-/// Source-generated JSON metadata for <see cref="FlowState"/> so the store packages never fall back
-/// to reflection-based serialization (trim/AOT-safe). Compiled into each store package alongside
-/// <see cref="DurableFlowStoreShared"/>, so every assembly gets its own generated context. Metadata
-/// mode (no fast-path writer) so writes honor <see cref="DurableFlowStoreShared"/>'s options
-/// (WhenWritingNull) and the persisted bytes are unchanged; reads use the context's bare default
-/// options, matching the previous options-less <c>Deserialize&lt;FlowState&gt;(json)</c> call.
-/// </summary>
-[JsonSourceGenerationOptions(GenerationMode = JsonSourceGenerationMode.Metadata)]
-[JsonSerializable(typeof(FlowState))]
-internal sealed partial class DurableFlowStoreJsonContext : JsonSerializerContext;

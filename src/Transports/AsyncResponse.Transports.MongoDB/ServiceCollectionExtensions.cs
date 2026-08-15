@@ -1,4 +1,5 @@
 using AsyncResponse;
+using AsyncResponse.Internal;
 using AsyncResponse.Transports.MongoDB;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
@@ -33,12 +34,12 @@ public static class MongoDbAsyncResponseTransportServiceCollectionExtensions
         // creates and owns a client from the options. Nothing is registered as a bare
         // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are never
         // answered — or broken — by this package.
-        services.TryAddSingleton<MongoNamespaceRegistry>();
+        services.TryAddSingleton<IMongoNamespaceRegistry, MongoNamespaceRegistry>();
         services.TryAddSingleton(provider =>
         {
             var options = provider.GetRequiredService<IOptions<MongoDbAsyncResponseTransportOptions>>();
             var logger = provider.GetService<ILogger<MongoDbTransportStore>>();
-            var registry = provider.GetRequiredService<MongoNamespaceRegistry>();
+            var registry = provider.GetRequiredService<IMongoNamespaceRegistry>();
 
             var database = provider.GetService<IMongoDatabase>();
             if (database is not null)

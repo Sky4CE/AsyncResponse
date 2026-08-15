@@ -524,23 +524,34 @@ public class NatsMessageDispatcherTests
 
         await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
 
-        // The drain CTS must stay alive until the worker actually finishes: after the timed-out dispose the
-        // cancelled handler still dead-letters and reports through the failure callback (no ObjectDisposedException).
+        // The drain CTS must stay alive until the worker actually finishes: after the timed-out
+        // dispose the cancelled handler still reports through the failure callback (no
+        // ObjectDisposedException) — but the drain cancellation is a shutdown, not a handler
+        // failure, so nothing is dead-lettered (Kafka/Redis dispatcher parity).
         var context = await failure.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.IsAssignableFrom<OperationCanceledException>(context.Exception);
-        Assert.Contains(_jetStream.Published, p => p.Subject == DeadLetterSubject);
+        Assert.DoesNotContain(_jetStream.Published, p => p.Subject == DeadLetterSubject);
     }
 
     [Fact]
-    public async Task DisposeAsync_QueuedButUnstartedMessages_AreAttemptedAndSurfacedInsteadOfDropped()
+    public async Task DisposeAsync_QueuedButUnstartedMessages_AreSurfacedViaOnBackgroundFailure_NotDeadLettered()
     {
+        // Regression (r25): the drain-cancellation OperationCanceledException fell into the
+        // generic background catch, which wrote never-completed jobs to the dead-letter subject
+        // with reason "A task was canceled" — misfiling a shutdown as a handler failure. Kafka
+        // and Redis both carve the drain cancellation out; NATS now does too: the drop is
+        // surfaced via OnBackgroundFailure only.
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var failures = 0;
+        var failures = new List<NatsBackgroundFailureContext>();
         var subscriber = new NatsSubscriberOptions
         {
-            OnBackgroundFailure = _ =>
+            OnBackgroundFailure = context =>
             {
-                Interlocked.Increment(ref failures);
+                lock (failures)
+                {
+                    failures.Add(context);
+                }
+
                 return ValueTask.CompletedTask;
             }
         }.UseAckAfterEnqueue(
@@ -563,11 +574,22 @@ public class NatsMessageDispatcherTests
 
         await dispatcher.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
 
-        // The hard stop must not silently drop the already-ACKed queued message: it is attempted
-        // with the cancelled drain token, dead-lettered, and surfaced via OnBackgroundFailure —
-        // same as the one that was mid-handler.
-        await WaitUntilAsync(() => Volatile.Read(ref failures) == 2);
-        Assert.Equal(2, _jetStream.Published.Count(p => p.Subject == DeadLetterSubject));
+        // Both the mid-handler message and the still-queued one were already ACKed: the shutdown
+        // interruption is surfaced through OnBackgroundFailure for each, and neither is written
+        // to the dead-letter subject as a phantom handler failure.
+        await WaitUntilAsync(() =>
+        {
+            lock (failures)
+            {
+                return failures.Count == 2;
+            }
+        });
+        lock (failures)
+        {
+            Assert.All(failures, context => Assert.IsAssignableFrom<OperationCanceledException>(context.Exception));
+        }
+
+        Assert.Empty(_jetStream.Published);
     }
 
     [Fact]

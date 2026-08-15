@@ -589,10 +589,14 @@ public sealed class RemainingCoverageTests
         }
         var sqlExHighClass = (SqlException)exceptionConstructor.Invoke(exceptionArgs);
 
-        // Call SqlServerTransientFaults.IsTransient
-        Assert.True(SqlServerTransientFaults.IsTransient(sqlExTransient));
-        Assert.False(SqlServerTransientFaults.IsTransient(sqlExNonTransient));
-        Assert.True(SqlServerTransientFaults.IsTransient(sqlExHighClass));
+        // Call SqlServerTransientFaults.IsTransient. The classifier is source-linked into every
+        // SQL Server package, so the C# name is ambiguous and it is reached through one anchor.
+        var transientFaults = typeof(SqlServerChannelSql).Assembly
+            .GetType("AsyncResponse.Internal.SqlServerTransientFaults", throwOnError: true)!
+            .GetMethod("IsTransient", BindingFlags.Static | BindingFlags.Public, null, [typeof(SqlException)], null)!;
+        Assert.True((bool)transientFaults.Invoke(null, [sqlExTransient])!);
+        Assert.False((bool)transientFaults.Invoke(null, [sqlExNonTransient])!);
+        Assert.True((bool)transientFaults.Invoke(null, [sqlExHighClass])!);
 
         // Call SqlServerChannelSql.IsTransient via reflection
         var isTransientMethod = typeof(SqlServerChannelSql).GetMethod("IsTransient", BindingFlags.Static | BindingFlags.NonPublic)!;

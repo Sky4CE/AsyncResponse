@@ -221,14 +221,28 @@ default). Alert on its warnings or the `Degraded` status: stale recovery state i
 signal of stuck flows. The watchdog also feeds the `asyncresponse.recovery.*` gauges (see
 [observability.md](observability.md)).
 
+Before the first scan completes, the check reports one of three states: **idle** — this host's
+watchdog deliberately does not scan (`Watchdog.Enabled = false`, or the channel registers no
+`IRecoveryStateScanner`) — stays `Healthy` with `scanning: false` and a `reason` in its data, since
+staleness is attested by whichever host does scan; **armed** — the scan loop is running but still
+inside its first-scan budget (`StartupDelay` plus twice `Interval`) — stays `Healthy` with
+`scanning: true` and a `firstScanDueByUtc`; and **overdue** — armed but past that budget with
+nothing published — reports `Degraded`, the same as a scan loop that stopped publishing after its
+first scan. Once scanning, `Degraded` also fires when a scan could not probe waiter liveness for
+some entries (a probe outage, or no `IActiveSubscriberProbe` registered): those entries' staleness
+is unknown and never flagged stale by themselves, so without this the check would attest a clean
+pass it never actually computed.
+
 ## Recovery-state durability
 
 Recovery state lives in the durable channel's store and survives a redeploy:
 
-- **Redis** — recovery state is stored in Redis keys under `KeyPrefix`, expiring after
-  `RecoveryStateExpiry` (7 days default). Registration-list updates are optimistic
-  (transaction-conditioned compare-and-set with retries), so concurrent registrations for one
-  correlation id all survive.
+- **Redis** — recovery state is stored in Redis keys under `KeyPrefix`, with a per-registration
+  expiry layered inside the shared per-correlation key: every registration carries its own
+  `RecoveryStateExpiry` (7 days default) stamped at save time, and the key's own TTL tracks the
+  longest-remaining registration — a fresh registration cannot keep a dead sibling recoverable, nor
+  truncate a longer-lived one. Registration-list updates are optimistic (transaction-conditioned
+  compare-and-set with retries), so concurrent registrations for one correlation id all survive.
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
   per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
   revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one

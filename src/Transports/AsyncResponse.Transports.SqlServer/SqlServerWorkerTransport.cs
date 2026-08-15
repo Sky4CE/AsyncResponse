@@ -1,4 +1,4 @@
-using Microsoft.Data.SqlClient;
+using AsyncResponse.Internal;
 using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Text.Json;
@@ -99,58 +99,5 @@ internal static class SqlServerTransportRetry
         CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
-    public static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is SqlException sqlException && SqlServerTransientFaults.IsTransient(sqlException)
-               || exception is TimeoutException);
-}
-
-/// <summary>
-/// Classifies SQL Server errors worth retrying. <see cref="SqlException"/> exposes no public
-/// transient flag, so this mirrors the error numbers Microsoft's own retry guidance and the
-/// SqlClient configurable-retry defaults treat as transient, plus severity ≥ 20 (broken connection).
-/// </summary>
-internal static class SqlServerTransientFaults
-{
-    private static readonly HashSet<int> TransientErrorNumbers =
-    [
-        -2,    // client-side command timeout
-        20,    // instance does not support encryption
-        64,    // connection lost during login
-        121,   // transport semaphore timeout
-        233,   // no process on the other end of the pipe
-        997,   // overlapped I/O in progress
-        1204,  // lock resources exhausted
-        1205,  // deadlock victim
-        1222,  // lock request timeout
-        4060,  // database unavailable
-        4221,  // readable secondary timeout
-        10053, // transport-level connection abort
-        10054, // transport-level connection reset
-        10060, // network unreachable / connect timeout
-        10928, // Azure SQL resource limit reached
-        10929, // Azure SQL minimum guarantee exceeded
-        40143, // Azure SQL connection failure
-        40197, // Azure SQL service processing error
-        40501, // Azure SQL service busy
-        40540, // Azure SQL service unavailable
-        40613, // Azure SQL database unavailable
-        49918, // cannot process request, not enough resources
-        49919, // cannot process create/update request
-        49920  // cannot process request, too many operations
-    ];
-
-    public static bool IsTransient(SqlException exception)
-    {
-        if (exception.Class >= 20)
-            return true;
-
-        foreach (SqlError error in exception.Errors)
-        {
-            if (TransientErrorNumbers.Contains(error.Number))
-                return true;
-        }
-
-        return TransientErrorNumbers.Contains(exception.Number);
-    }
+    public static bool IsTransient(Exception exception) => SqlServerTransientFaults.IsTransient(exception);
 }

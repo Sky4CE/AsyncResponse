@@ -55,12 +55,9 @@ public sealed class SqliteDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(ConnectionString))
-            throw new InvalidOperationException($"{nameof(SqliteDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
-
+        DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(SqliteDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(SqliteDurableFlowOptions)}.{nameof(TableName)}", "SQLite");
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(SqliteDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(SqliteDurableFlowOptions));
     }
 }
 
@@ -85,7 +82,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     // concurrent (WAL).
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private long _lastPruneTicks;
-    private bool _created;
+    private volatile bool _created;
 
     public SqliteFlowStateStore(IOptions<SqliteDurableFlowOptions> options)
     {
@@ -189,10 +186,10 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     }
 
     public Task<bool> TryAcquireLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
-        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, renew: false, cancellationToken);
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: true, cancellationToken);
 
     public Task<bool> TryRenewLeaseAsync(string flowId, string leaseId, TimeSpan leaseDuration, CancellationToken cancellationToken = default)
-        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, renew: true, cancellationToken);
+        => UpdateLeaseAsync(flowId, leaseId, leaseDuration, acquire: false, cancellationToken);
 
     public async Task ReleaseLeaseAsync(string flowId, string leaseId, CancellationToken cancellationToken = default)
     {
@@ -238,7 +235,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -248,30 +245,41 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            command.CommandText =
-                $"""
-                -- WAL is the right journal mode for this store's use case (concurrent flow
-                -- executors on one node): readers never block behind a writer, which rollback
-                -- journal mode does not guarantee — concurrent load/save storms on slow disks
-                -- surface as SQLITE_BUSY 'database is locked' there. The mode is persistent in
-                -- the database file, so setting it alongside the schema costs nothing per
-                -- operation. Manually-provisioned databases (AutoCreateSchema=false) should set
-                -- it themselves — see docs/durable-flow-state-stores.md.
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS {Table} (
-                    flow_id TEXT NOT NULL PRIMARY KEY,
-                    state_json TEXT NOT NULL,
-                    expires_at_utc TEXT NOT NULL,
-                    updated_at_utc TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 0,
-                    lease_id TEXT NULL,
-                    lease_expires_at_utc TEXT NULL
-                );
-                CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
-                """;
-            await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
-            _created = true;
+            if (_options.AutoCreateSchema)
+            {
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    $"""
+                    -- WAL is the right journal mode for this store's use case (concurrent flow
+                    -- executors on one node): readers never block behind a writer, which rollback
+                    -- journal mode does not guarantee — concurrent load/save storms on slow disks
+                    -- surface as SQLITE_BUSY 'database is locked' there. The mode is persistent in
+                    -- the database file, so setting it alongside the schema costs nothing per
+                    -- operation. Manually-provisioned databases (AutoCreateSchema=false) should set
+                    -- it themselves — see docs/durable-flow-state-stores.md.
+                    PRAGMA journal_mode=WAL;
+                    CREATE TABLE IF NOT EXISTS {Table} (
+                        flow_id TEXT NOT NULL PRIMARY KEY,
+                        state_json TEXT NOT NULL,
+                        expires_at_utc TEXT NOT NULL,
+                        updated_at_utc TEXT NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 0,
+                        lease_id TEXT NULL,
+                        lease_expires_at_utc TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
+                    """;
+                await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
+                _created = true;
+                return;
+            }
+
+            // Operator-provisioned schema: nothing on this path issues DDL (not even the WAL
+            // pragma — see the note above), but the table's shape is still verified before the
+            // store trusts it. Latch only when the table was actually verified (MySQL/Oracle
+            // parity): an absent table must keep re-verifying, or a migration that lands AFTER
+            // the first operation would never have its shape checked for the process lifetime.
+            _created = await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -279,17 +287,168 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         }
     }
 
+    /// <summary>
+    /// Checks the operator-provisioned table against the shape this store reads and writes.
+    /// Declared types are compared by SQLite AFFINITY, not spelling, so any declaration that
+    /// behaves like the documented DDL passes. Two properties are load-bearing and misfire
+    /// SILENTLY or at the first flow — the wrong end of the deployment — when absent:
+    /// <list type="bullet">
+    /// <item><description>
+    /// A single-column PRIMARY KEY on flow_id. <see cref="TryCreateAsync"/>'s upsert targets
+    /// <c>ON CONFLICT(flow_id)</c>, which requires a uniqueness constraint on exactly that
+    /// column; and SQLite's historical quirk admits NULL keys when the PRIMARY KEY column is
+    /// not also declared NOT NULL.
+    /// </description></item>
+    /// <item><description>
+    /// TEXT affinity on the timestamp columns. Expiry and lease fencing compare ISO-8601
+    /// strings lexicographically; a numeric affinity coerces digit-only values and breaks that
+    /// ordering.
+    /// </description></item>
+    /// </list>
+    /// </summary>
+    private async Task<bool> VerifyFlowTableAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var columns = new Dictionary<string, ActualColumn>(StringComparer.OrdinalIgnoreCase);
+        await using (var command = connection.CreateCommand())
+        {
+            // Read-only: table_info reports name, declared type, NOT NULL, default, and the
+            // primary-key ordinal. Generated columns are not listed — exactly right for the
+            // extra-column check below, because they fill themselves in on insert.
+            command.CommandText = $"PRAGMA table_info({Table});";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                columns[reader.GetString(1)] = new ActualColumn(
+                    DeclaredType: reader.GetString(2),
+                    NotNull: reader.GetInt64(3) != 0,
+                    HasDefault: !reader.IsDBNull(4),
+                    PrimaryKeyOrdinal: reader.GetInt64(5));
+            }
+        }
+
+        if (columns.Count == 0)
+        {
+            // The table does not exist: AutoCreateSchema = false and the migration has not run
+            // yet. That surfaces at the first query with a clear SQLite error, and failing here
+            // would break the documented "create it yourself, later" workflow. Returning false
+            // keeps _created unlatched so the next operation re-verifies once the migration has
+            // run.
+            return false;
+        }
+
+        foreach (var expected in ExpectedColumns)
+        {
+            if (!columns.TryGetValue(expected.Name, out var actual))
+            {
+                throw new InvalidOperationException(
+                    $"The SQLite durable-flow table '{_options.TableName}' has no '{expected.Name}' column. It was created by an " +
+                    "earlier build or by hand and does not match the shape this store reads and writes " +
+                    $"({string.Join(", ", ExpectedColumns.Select(column => $"{column.Name} {column.Declaration}"))}). Re-create it " +
+                    "with the DDL in docs/durable-flow-state-stores.md (tables this build creates get that shape automatically).");
+            }
+
+            if (expected.Mismatch(actual) is { } mismatch)
+            {
+                throw new InvalidOperationException(
+                    $"The SQLite durable-flow table '{_options.TableName}' declares {expected.Name} as " +
+                    $"'{(actual.DeclaredType.Length == 0 ? "(no type)" : actual.DeclaredType)}{(actual.NotNull ? " NOT NULL" : " NULL")}', " +
+                    $"which {mismatch}. This store needs {expected.Name} {expected.Declaration}. SQLite cannot alter a column in " +
+                    "place — re-create the table with the DDL in docs/durable-flow-state-stores.md (tables this build creates get " +
+                    "that shape automatically).");
+            }
+        }
+
+        // Exactly PRIMARY KEY (flow_id): the create upsert's ON CONFLICT(flow_id) needs a
+        // uniqueness constraint on that column alone — a composite key constrains a different
+        // tuple, so SQLite rejects the upsert at the first flow rather than at startup.
+        if (columns["flow_id"].PrimaryKeyOrdinal != 1 || columns.Values.Count(column => column.PrimaryKeyOrdinal != 0) != 1)
+        {
+            throw new InvalidOperationException(
+                $"The SQLite durable-flow table '{_options.TableName}' does not declare PRIMARY KEY (flow_id) on that column alone. " +
+                "Starting a flow is an insert-if-absent targeting ON CONFLICT(flow_id), which requires a uniqueness constraint on " +
+                "exactly flow_id — without it every flow creation fails, and a composite key admits duplicate ids. Re-create the " +
+                "table with the DDL in docs/durable-flow-state-stores.md (tables this build creates declare it automatically).");
+        }
+
+        // Columns this store never names in an INSERT. One that the database cannot fill in for
+        // itself makes EVERY create fail — the shape is otherwise perfect, so the failure arrives
+        // at the first flow rather than at startup. Generated columns never reach this loop; so
+        // is anything nullable or defaulted.
+        foreach (var (name, actual) in columns)
+        {
+            if (ExpectedColumns.Any(expected => string.Equals(expected.Name, name, StringComparison.OrdinalIgnoreCase))
+                || !actual.NotNull
+                || actual.HasDefault)
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(
+                $"The SQLite durable-flow table '{_options.TableName}' has an extra column '{name}' ({actual.DeclaredType} NOT NULL) " +
+                "with no default. This store writes only its own columns, so every flow creation would fail on that column. Give " +
+                "it a default, make it nullable or generated, or move it to a table of your own.");
+        }
+
+        return true;
+    }
+
+    /// <summary>SQLite column-affinity rules (in the documented precedence order).</summary>
+    private static string Affinity(string declaredType)
+    {
+        if (declaredType.Contains("INT", StringComparison.OrdinalIgnoreCase))
+            return "INTEGER";
+        if (declaredType.Contains("CHAR", StringComparison.OrdinalIgnoreCase)
+            || declaredType.Contains("CLOB", StringComparison.OrdinalIgnoreCase)
+            || declaredType.Contains("TEXT", StringComparison.OrdinalIgnoreCase))
+        {
+            return "TEXT";
+        }
+
+        if (declaredType.Length == 0 || declaredType.Contains("BLOB", StringComparison.OrdinalIgnoreCase))
+            return "BLOB";
+        if (declaredType.Contains("REAL", StringComparison.OrdinalIgnoreCase)
+            || declaredType.Contains("FLOA", StringComparison.OrdinalIgnoreCase)
+            || declaredType.Contains("DOUB", StringComparison.OrdinalIgnoreCase))
+        {
+            return "REAL";
+        }
+
+        return "NUMERIC";
+    }
+
+    private sealed record ActualColumn(string DeclaredType, bool NotNull, bool HasDefault, long PrimaryKeyOrdinal);
+
+    private sealed record ExpectedColumn(string Name, string Declaration, string RequiredAffinity, bool NotNull)
+    {
+        public string? Mismatch(ActualColumn actual)
+        {
+            if (!string.Equals(Affinity(actual.DeclaredType), RequiredAffinity, StringComparison.Ordinal))
+                return $"resolves to {Affinity(actual.DeclaredType)} affinity where {RequiredAffinity} is required";
+            if (actual.NotNull != NotNull)
+                return NotNull ? "must be NOT NULL" : "must be nullable (this store writes and clears NULL there)";
+            return null;
+        }
+    }
+
+    private static readonly ExpectedColumn[] ExpectedColumns =
+    [
+        new("flow_id", "TEXT NOT NULL PRIMARY KEY", "TEXT", NotNull: true),
+        new("state_json", "TEXT NOT NULL", "TEXT", NotNull: true),
+        new("expires_at_utc", "TEXT NOT NULL", "TEXT", NotNull: true),
+        new("updated_at_utc", "TEXT NOT NULL", "TEXT", NotNull: true),
+        new("revision", "INTEGER NOT NULL DEFAULT 0", "INTEGER", NotNull: true),
+        new("lease_id", "TEXT NULL", "TEXT", NotNull: false),
+        new("lease_expires_at_utc", "TEXT NULL", "TEXT", NotNull: false)
+    ];
+
     private async Task<bool> UpdateLeaseAsync(
         string flowId,
         string leaseId,
         TimeSpan leaseDuration,
-        bool renew,
+        bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -301,7 +460,7 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
             SET lease_id = $lease_id, lease_expires_at_utc = $lease_expires_at_utc
             WHERE flow_id = $flow_id
               AND expires_at_utc > $now_utc
-              AND {(renew ? "lease_id = $lease_id AND lease_expires_at_utc > $now_utc" : "(lease_id IS NULL OR lease_expires_at_utc <= $now_utc OR lease_id = $lease_id)")};
+              AND {(acquire ? "(lease_id IS NULL OR lease_expires_at_utc <= $now_utc OR lease_id = $lease_id)" : "lease_id = $lease_id AND lease_expires_at_utc > $now_utc")};
             """;
         command.Parameters.AddWithValue("$flow_id", flowId);
         command.Parameters.AddWithValue("$lease_id", leaseId);
@@ -323,20 +482,8 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
         }
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
-    {
-        var connection = new SqliteConnection(_options.ConnectionString);
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            return connection;
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
+    private Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+        => DurableFlowStoreShared.OpenConnectionAsync<SqliteConnection>(_options.ConnectionString, cancellationToken);
 
     private string Table => Quote(_options.TableName);
     private string IndexName => Quote($"{_options.TableName}_expires_idx");

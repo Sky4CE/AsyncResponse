@@ -1,5 +1,6 @@
 using System.Reflection;
 using AsyncResponse.Channels.PostgreSQL;
+using AsyncResponse.DurableFlows.PostgreSQL;
 using AsyncResponse.Sample;
 using AsyncResponse.Transports.PostgreSQL;
 using Microsoft.Extensions.DependencyInjection;
@@ -249,6 +250,246 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             var channel = new PostgreSqlChannelSql(dataSource, Options.Create(channelOptions));
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => channel.EnsureCreatedAsync());
             Assert.Contains("occupied by an object of a different kind or shape", ex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task ExtraSelfPopulatingColumns_PassVerification_AndInsertsStillSucceed()
+    {
+        // Identity columns carry no pg_attrdef row, so the extra-column writability check used to
+        // read GENERATED ALWAYS AS IDENTITY as "NOT NULL without a default" and fail startup —
+        // for a column PostgreSQL populates on every insert. Stored generated columns are the
+        // same self-populating class.
+        await WithDataSourceAsync("extra_identity", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            await new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions)).EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    ALTER TABLE "{schema}"."jobs" ADD COLUMN audit_seq bigint GENERATED ALWAYS AS IDENTITY;
+                    ALTER TABLE "{schema}"."jobs" ADD COLUMN attempts_snapshot integer GENERATED ALWAYS AS (attempts) STORED NOT NULL;
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions));
+            await store.EnsureCreatedAsync();
+
+            // The columns really are self-populating: a publish that names neither succeeds.
+            await store.PublishAsync(Guid.NewGuid(), transportOptions.WorkerQueue, SuccessEnvelope("extra"), headers: null, CancellationToken.None);
+        });
+    }
+
+    [Fact]
+    public async Task CoveringPrimaryKey_WithIncludePayloadColumns_PassesVerification()
+    {
+        // PostgreSQL 11+ covering keys: PRIMARY KEY (id) INCLUDE (queue) enforces exactly the
+        // uniqueness the store relies on, with the INCLUDE columns riding along in the index
+        // without being key columns. The verifier used to read the WHOLE indkey — key and
+        // payload alike — and reject the table with "primary key is (id, queue) instead of (id)".
+        await WithDataSourceAsync("covering_pk", async (schema, dataSource) =>
+        {
+            var transportOptions = TransportOptions(schema);
+            transportOptions.MessageTable = "jobs";
+            await new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions)).EnsureCreatedAsync();
+
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var reshape = connection.CreateCommand())
+            {
+                reshape.CommandText =
+                    $"""
+                    ALTER TABLE "{schema}"."jobs" DROP CONSTRAINT "jobs_pkey";
+                    ALTER TABLE "{schema}"."jobs" ADD PRIMARY KEY (id) INCLUDE (queue);
+                    """;
+                await reshape.ExecuteNonQueryAsync();
+            }
+
+            await new PostgreSqlTransportStore(dataSource, Options.Create(transportOptions)).EnsureCreatedAsync();
+        });
+    }
+
+    [Fact]
+    public async Task OperatorProvisionedFlowSchema_WrongColumnShape_IsReportedBeforeAMissingIndex()
+    {
+        // A misprovisioned schema is usually wrong in several ways at once. The verifier used to
+        // report the index the operator forgot ("does not exist") while the wrong column type on
+        // the table they DID provide — the actionable finding — went unreported; and the absence
+        // error carried no shared-namespace guidance at all.
+        await WithDataSourceAsync("flow_cause_order", async (schema, dataSource) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var provision = connection.CreateCommand())
+            {
+                provision.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS "{schema}";
+                    CREATE TABLE "{schema}"."flow_state" (
+                        flow_id text NOT NULL PRIMARY KEY,
+                        state_json text NOT NULL,
+                        expires_at_utc timestamptz NOT NULL,
+                        updated_at_utc timestamptz NOT NULL,
+                        revision bigint NOT NULL DEFAULT 0,
+                        lease_id text NULL,
+                        lease_expires_at_utc timestamptz NULL
+                    );
+                    """;
+                await provision.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions
+                {
+                    SchemaName = schema,
+                    TableName = "flow_state",
+                    AutoCreateSchema = false
+                }));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.LoadAsync("missing"));
+            Assert.Contains("column 'state_json'", ex.Message, StringComparison.Ordinal);
+            Assert.DoesNotContain("to exist after schema creation", ex.Message, StringComparison.Ordinal);
+
+            // With the shape fixed, the forgotten index is reported — as the absence it is, now
+            // carrying the shared-namespace guidance like every other verifier error.
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var repair = connection.CreateCommand())
+            {
+                repair.CommandText =
+                    $"""ALTER TABLE "{schema}"."flow_state" ALTER COLUMN state_json TYPE jsonb USING state_json::jsonb;""";
+                await repair.ExecuteNonQueryAsync();
+            }
+
+            var repaired = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions
+                {
+                    SchemaName = schema,
+                    TableName = "flow_state",
+                    AutoCreateSchema = false
+                }));
+            var missingIndex = await Assert.ThrowsAsync<InvalidOperationException>(() => repaired.LoadAsync("missing"));
+            Assert.Contains("_expires_idx", missingIndex.Message, StringComparison.Ordinal);
+            Assert.Contains("to exist after schema creation", missingIndex.Message, StringComparison.Ordinal);
+            Assert.Contains("share one namespace", missingIndex.Message, StringComparison.Ordinal);
+        });
+    }
+
+    [Fact]
+    public async Task ManagedTransportSchema_VerifiesProvisionedTables_AndDefersWhileAbsent()
+    {
+        // AutoCreateSchema=false used to return before ANY network call: an operator-provisioned
+        // queue table's shape was never checked — the transport ran the full verifier only on the
+        // DDL path, i.e. only where it was least needed. Managed mode now runs the same catalog
+        // verification with the flow stores' semantics: absent table = silent, re-check later
+        // (never latch); present = verify (wrong shape fails actionably) and latch.
+        await WithDataSourceAsync("managed_transport", async (schema, dataSource) =>
+        {
+            var managedOptions = TransportOptions(schema);
+            managedOptions.AutoCreateSchema = false;
+            var managed = new PostgreSqlTransportStore(dataSource, Options.Create(managedOptions));
+
+            await managed.EnsureCreatedAsync();
+            Assert.False(CreatedLatch(managed));
+
+            // Provision through the DDL path (the exact expected shape, indexes included); the
+            // managed store then verifies against the catalog and latches.
+            await new PostgreSqlTransportStore(dataSource, Options.Create(TransportOptions(schema))).EnsureCreatedAsync();
+            await managed.EnsureCreatedAsync();
+            Assert.True(CreatedLatch(managed));
+        });
+
+        await WithDataSourceAsync("managed_transport_wrong", async (schema, dataSource) =>
+        {
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var craft = connection.CreateCommand())
+            {
+                craft.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS "{schema}";
+                    CREATE TABLE "{schema}"."jobs" (
+                        id uuid PRIMARY KEY,
+                        queue text NOT NULL,
+                        available_at timestamptz NOT NULL DEFAULT now(),
+                        locked_until timestamptz NULL,
+                        created_at timestamptz NOT NULL DEFAULT now()
+                    );
+                    """;
+                await craft.ExecuteNonQueryAsync();
+            }
+
+            var options = TransportOptions(schema);
+            options.AutoCreateSchema = false;
+            options.MessageTable = "jobs";
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Contains("missing the column 'payload_json'", ex.Message, StringComparison.Ordinal);
+            Assert.False(CreatedLatch(store));
+        });
+    }
+
+    private static bool CreatedLatch(object store)
+        => (bool)store.GetType().GetField("_created", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(store)!;
+
+    [Fact]
+    public async Task NonDeterministicCollationOnAnIdentityColumn_IsRejected()
+    {
+        // PostgreSQL's own DDL emits no COLLATE, so this needs an operator-provisioned table — but
+        // a non-deterministic ICU collation is exactly what the SQL Server sibling has always
+        // rejected on the same columns: the database folds strings its rules call equal into ONE
+        // key, so two distinct queue names collide and the second is rejected on insert. Nothing
+        // downstream re-checks the queue column's storage, and the verifier checked no collation.
+        await WithDataSourceAsync("pg_nondeterministic", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            options.MessageTable = "jobs";
+            options.AutoCreateSchema = false;
+
+            var claimIndex = PostgreSqlTransportStore.IndexName("jobs", "claim");
+            var createdIndex = PostgreSqlTransportStore.IndexName("jobs", "created");
+            await using (var connection = await dataSource.OpenConnectionAsync())
+            await using (var craft = connection.CreateCommand())
+            {
+                craft.CommandText =
+                    $"""
+                    CREATE SCHEMA IF NOT EXISTS "{schema}";
+                    CREATE COLLATION "{schema}".case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                    CREATE TABLE "{schema}"."jobs" (
+                        id uuid PRIMARY KEY,
+                        queue text COLLATE "{schema}".case_insensitive NOT NULL,
+                        payload_json jsonb NOT NULL,
+                        headers_json jsonb NOT NULL DEFAULT jsonb_build_object(),
+                        created_at timestamptz NOT NULL DEFAULT now(),
+                        available_at timestamptz NOT NULL DEFAULT now(),
+                        locked_until timestamptz NULL,
+                        lock_id uuid NULL,
+                        attempts integer NOT NULL DEFAULT 0,
+                        dead_letter_reason text NULL
+                    );
+                    CREATE INDEX "{claimIndex}" ON "{schema}"."jobs" (queue, available_at, locked_until, created_at);
+                    CREATE INDEX "{createdIndex}" ON "{schema}"."jobs" (created_at);
+                    """;
+                await craft.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
+            Assert.Contains("jobs.queue", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("case_insensitive", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("non-deterministic", ex.Message, StringComparison.Ordinal);
+            Assert.False(CreatedLatch(store));
+        });
+
+        await WithDataSourceAsync("pg_default_collation", async (schema, dataSource) =>
+        {
+            // The default collation reports collisdeterministic = true, and uuid/jsonb columns
+            // carry no collation at all (attcollation 0, no joined row) — both must pass.
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(TransportOptions(schema)));
+            await store.EnsureCreatedAsync();
+            Assert.True(CreatedLatch(store));
         });
     }
 

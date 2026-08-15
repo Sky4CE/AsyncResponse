@@ -1,6 +1,8 @@
 using AsyncResponse;
 using AsyncResponse.Channels.MongoDB;
+using AsyncResponse.Internal;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MongoDB.Driver;
 
@@ -34,28 +36,29 @@ public static class MongoDbAsyncResponseChannelServiceCollectionExtensions
         // One registry per container: DI-hosted Mongo components claim their effective
         // collections so a cross-component collision (e.g. a durable-flow store on the channel's
         // derived counters collection) fails startup in either construction order.
-        services.TryAddSingleton<MongoNamespaceRegistry>();
+        services.TryAddSingleton<IMongoNamespaceRegistry, MongoNamespaceRegistry>();
         services.TryAddSingleton(provider =>
         {
             var options = provider.GetRequiredService<IOptions<MongoDbAsyncResponseChannelOptions>>();
-            var registry = provider.GetRequiredService<MongoNamespaceRegistry>();
+            var registry = provider.GetRequiredService<IMongoNamespaceRegistry>();
+            var logger = provider.GetService<ILogger<MongoDbChannelStore>>();
 
             var database = provider.GetService<IMongoDatabase>();
             if (database is not null)
-                return new MongoDbChannelStore(database, options, namespaceRegistry: registry);
+                return new MongoDbChannelStore(database, options, namespaceRegistry: registry, logger: logger);
 
             if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MongoDbAsyncResponseChannelOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
             var sharedClient = provider.GetService<IMongoClient>();
             if (sharedClient is not null)
-                return new MongoDbChannelStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, namespaceRegistry: registry);
+                return new MongoDbChannelStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, namespaceRegistry: registry, logger: logger);
 
             if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                 throw new InvalidOperationException($"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MongoDbAsyncResponseChannelOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
             var ownedClient = new MongoClient(options.Value.ConnectionString);
-            return new MongoDbChannelStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, namespaceRegistry: registry);
+            return new MongoDbChannelStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, namespaceRegistry: registry, logger: logger);
         });
 
         services.TryAddSingleton<MongoDbRecoveryStateStore>();
@@ -77,7 +80,18 @@ public static class MongoDbAsyncResponseChannelServiceCollectionExtensions
             provider.GetService<TimeProvider>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
-        services.AddSingleton(new AsyncResponseChannelMarker(MongoDbAsyncResponseChannelOptions.ChannelName));
+        // The resolved default waiter timeout is declared through the marker so the startup
+        // validator can require the durable-flow ledger TTL to out-live a timeout-less awaited
+        // step, and the flow engine can extend a parked ledger by it — without either referencing
+        // channel option types.
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<MongoDbAsyncResponseChannelOptions>>().Value;
+            return new AsyncResponseChannelMarker(MongoDbAsyncResponseChannelOptions.ChannelName)
+            {
+                EffectiveDefaultWaitTimeout = options.DefaultTimeout ?? options.RecoveryStateExpiry
+            };
+        });
         return builder;
     }
 }

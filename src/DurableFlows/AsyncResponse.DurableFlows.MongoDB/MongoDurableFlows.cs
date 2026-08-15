@@ -27,27 +27,27 @@ namespace Microsoft.Extensions.DependencyInjection
             // creates and owns a client from the options. Nothing is registered as a bare
             // IMongoClient/IMongoDatabase service, so unrelated resolutions of those types are
             // never answered — or broken — by this package.
-            builder.Services.TryAddSingleton<MongoNamespaceRegistry>();
+            builder.Services.TryAddSingleton<IMongoNamespaceRegistry, MongoNamespaceRegistry>();
             builder.Services.TryAddSingleton(provider =>
             {
                 var options = provider.GetRequiredService<IOptions<MongoDbDurableFlowOptions>>();
 
                 var database = provider.GetService<IMongoDatabase>();
                 if (database is not null)
-                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
+                    return new MongoDbFlowStateStore(database, options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.DatabaseName))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.DatabaseName)} must be configured when no IMongoDatabase is registered.");
 
                 var sharedClient = provider.GetService<IMongoClient>();
                 if (sharedClient is not null)
-                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<MongoNamespaceRegistry>());
+                    return new MongoDbFlowStateStore(sharedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient: null, provider.GetRequiredService<IMongoNamespaceRegistry>());
 
                 if (string.IsNullOrWhiteSpace(options.Value.ConnectionString))
                     throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.ConnectionString)} must be configured when no IMongoDatabase or IMongoClient is registered.");
 
                 var ownedClient = new MongoClient(options.Value.ConnectionString);
-                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<MongoNamespaceRegistry>());
+                return new MongoDbFlowStateStore(ownedClient.GetDatabase(options.Value.DatabaseName), options, ownedClient, provider.GetRequiredService<IMongoNamespaceRegistry>());
             });
             return builder.WithDurableFlows<MongoDbFlowStateStore, MongoDbDurableFlowOptions>(configure);
         }
@@ -102,8 +102,7 @@ public sealed class MongoDbDurableFlowOptions : DurableFlowOptions
         if (string.Equals(CollectionName, MongoOwnershipLedger.CollectionName, StringComparison.Ordinal))
             throw new InvalidOperationException(
                 $"{nameof(MongoDbDurableFlowOptions)}.{nameof(CollectionName)} '{CollectionName}' is reserved for the cross-component ownership ledger.");
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(MongoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(MongoDbDurableFlowOptions));
     }
 }
 
@@ -115,7 +114,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     private readonly MongoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly IMongoClient? _ownedClient;
-    private bool _created;
+    private volatile bool _created;
 
     /// <summary>
     /// DI construction path: also claims the collection in the container's cross-component
@@ -126,11 +125,11 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         IMongoDatabase database,
         IOptions<MongoDbDurableFlowOptions> options,
         IMongoClient? ownedClient,
-        MongoNamespaceRegistry? namespaceRegistry)
+        IMongoNamespaceRegistry? namespaceRegistry)
         : this(database, options, ownedClient)
     {
         namespaceRegistry?.Claim(
-            string.Join(",", database.Client.Settings.Servers.Select(static s => s.ToString()).OrderBy(static s => s, StringComparer.Ordinal)),
+            MongoNamespaceRegistry.ClusterKey(database),
             database.DatabaseNamespace.DatabaseName,
             "MongoDB durable-flow store",
             [(_options.CollectionName, nameof(_options.CollectionName))]);
@@ -148,13 +147,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // The namespace BYTE limit can only be checked here, where the actual database name is
         // first known; a near-limit configuration otherwise passes every static check and fails
         // at the first server operation.
-        var ns = $"{database.DatabaseNamespace.DatabaseName}.{_options.CollectionName}";
-        var byteLength = System.Text.Encoding.UTF8.GetByteCount(ns);
-        if (byteLength > 235)
-            throw new InvalidOperationException(
-                $"The MongoDB namespace '{ns}' ({nameof(_options.CollectionName)}) is {byteLength} UTF-8 bytes; the store enforces MongoDB's SHARDED " +
-                "namespace limit of 235 bytes (unsharded allows 255) so a later shard-enable cannot strand the collection. " +
-                "Shorten the database or collection name.");
+        MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.CollectionName, nameof(_options.CollectionName));
 
         _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
         _ownedClient = ownedClient;
@@ -335,10 +328,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
             new BsonDocument("hello", 1),
             ReadPreference.Primary,
             cancellationToken).ConfigureAwait(false);
-        // Defensive: a mongo-compatible endpoint omitting localTime falls back to the app clock —
-        // the pre-server-clock behavior — instead of failing every create.
-        return reply.TryGetValue("localTime", out var localTime)
-            ? localTime.ToUniversalTime()
+        // Defensive: a mongo-compatible endpoint omitting localTime — or answering with a
+        // non-date value (only BsonDateTime implements ToUniversalTime; every other BsonValue
+        // throws) — falls back to the app clock, the pre-server-clock behavior, instead of
+        // failing every create.
+        return reply.TryGetValue("localTime", out var localTime) && localTime is BsonDateTime serverTime
+            ? serverTime.ToUniversalTime()
             : DateTime.UtcNow;
     }
 
@@ -349,10 +344,7 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var result = await _collection.UpdateOneAsync(

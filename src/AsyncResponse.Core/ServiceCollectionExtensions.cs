@@ -102,13 +102,16 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         // concrete registration's lifetime: a scoped factory that returns a root-owned singleton
         // would be captured into every flow-execution scope's disposable list, so the first scope's
         // disposal would dispose the store (and any connections it owns) for the whole process.
+        // The mirror is a REGISTRATION-TIME snapshot — a concrete registration added after this
+        // call with a different lifetime silently re-opens that hazard, so the marker carries the
+        // snapshot and the startup validator re-checks it against the final collection.
         builder.Services.TryAddScoped<TFlowStateStore>();
         var storeLifetime = builder.Services.Last(d => d.ServiceType == typeof(TFlowStateStore)).Lifetime;
         builder.Services.Add(ServiceDescriptor.Describe(
             typeof(IFlowStateStore),
             static provider => provider.GetRequiredService<TFlowStateStore>(),
             storeLifetime));
-        builder.Services.AddSingleton(new AsyncResponseDurableFlowStoreMarker(typeof(TFlowStateStore)));
+        builder.Services.AddSingleton(new AsyncResponseDurableFlowStoreMarker(typeof(TFlowStateStore), storeLifetime, builder.Services));
         AddDurableFlowEngine(builder.Services);
         return builder;
     }
@@ -131,6 +134,8 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         {
             FlowTypeFullName = typeof(TFlow).FullName
                 ?? throw new InvalidOperationException("Durable flow classes must have a FullName."),
+            InputTypeFullName = typeof(TInput).FullName
+                ?? throw new InvalidOperationException("Durable flow input types must have a FullName."),
             FlowType = typeof(TFlow),
             DeserializeInput = static json => JsonSafety.SafeDeserialize<TInput>(json),
             ExecuteAsync = static (flow, context, input) =>
@@ -274,7 +279,12 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>(),
             provider.GetService<TimeProvider>(),
             provider.GetServices<IDurableFlowExecutionObserver>(),
-            provider.GetService<IWorkerTransport>()));
+            provider.GetService<IWorkerTransport>(),
+            // The registered channel's declared default waiter timeout (the startup validator
+            // enforces exactly one channel); null when the channel does not declare one.
+            provider.GetServices<AsyncResponseChannelMarker>()
+                .Select(marker => marker.EffectiveDefaultWaitTimeout)
+                .LastOrDefault(timeout => timeout is not null)));
         services.TryAddSingleton<IDurableFlows>(provider => new DurableFlowService(
             provider.GetRequiredService<IServiceScopeFactory>(),
             provider.GetRequiredService<IAsyncResponseBuilder>(),
@@ -340,7 +350,18 @@ public static class AsyncResponseCoreServiceCollectionExtensions
             provider.GetService<TimeProvider>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
-        services.AddSingleton(new AsyncResponseChannelMarker("InMemory"));
+        // The resolved default waiter timeout is declared through the marker so the startup
+        // validator can require the durable-flow ledger TTL to out-live a timeout-less awaited
+        // step, and the flow engine can extend a parked ledger by it — without either referencing
+        // channel option types.
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<InMemoryAsyncResponseOptions>>().Value;
+            return new AsyncResponseChannelMarker("InMemory")
+            {
+                EffectiveDefaultWaitTimeout = options.DefaultTimeout ?? options.RecoveryStateExpiry
+            };
+        });
         return builder;
     }
 

@@ -130,7 +130,9 @@ usable on its own):
 - Day-of-month and day-of-week combine with classic Vixie-cron semantics: **OR** when both are
   explicitly restricted, **AND** when either is star-shaped (`*`, `*/2`, `?`) — a star-step field
   stays out of the either/or rule while its step mask still applies, exactly as Vixie's
-  `DOM_STAR`/`DOW_STAR` flags do. `0` and `7` are both Sunday.
+  `DOM_STAR`/`DOW_STAR` flags do. `0` and `7` are both Sunday, and a stepped day-of-week range that
+  wraps past Saturday strides on the real 7-day week — `SAT-MON/2` fires Saturday and Monday, not
+  Saturday and the Sunday duplicate.
 - Expressions are validated at registration — a typo fails the `WithScheduledFlow` call, not
   silently at 3 a.m.
 

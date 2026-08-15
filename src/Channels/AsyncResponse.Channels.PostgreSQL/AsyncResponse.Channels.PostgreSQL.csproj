@@ -34,6 +34,8 @@
 
   <ItemGroup>
     <Compile Include="..\..\Shared\PostgreSqlRelationVerifier.cs" Link="PostgreSqlRelationVerifier.cs" />
+    <Compile Include="..\..\Shared\PostgreSqlTransientFaults.cs" Link="PostgreSqlTransientFaults.cs" />
+    <Compile Include="..\..\Shared\RelationalNamePlan.cs" Link="RelationalNamePlan.cs" />
   </ItemGroup>
 
 </Project>

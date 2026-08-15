@@ -1,6 +1,7 @@
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using AsyncResponse.Transports.SQS;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -335,6 +336,76 @@ public sealed class SqsSubscriberTests
         await stopping.WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.Empty(secondCalls.VisibilityChanges);
+    }
+
+    [Fact]
+    public async Task RenewalJoin_IsBounded_WhenAnInFlightRenewIgnoresCancellation()
+    {
+        // Red-on-old: the batch finally awaited the renewal task unbounded. The sweep is well
+        // token-plumbed, but one in-flight SDK call that fails to honor the token promptly parked
+        // that await forever — the receive loop never asked for another batch and, at shutdown,
+        // held the host budget hostage. The join is now bounded by ShutdownTimeout (ASB parity):
+        // the wedged renewal task is abandoned with a warning and the loop keeps receiving.
+        var client = new FakeSqsClient();
+        var logger = new CollectingLogger<SqsWorkerSubscriber>();
+        var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () => await releaseFirstHandler.Task);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m2-body")).Returns(Task.CompletedTask);
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+            ShutdownTimeout = TimeSpan.FromMilliseconds(250)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            logger);
+
+        // m1's handler blocks while the sweep parks inside m1's renew — which never returns and
+        // never observes its token, like an SDK call wedged past cancellation.
+        client.Enqueue(new SqsTransportDelivery(
+            FakeSqsClient.UrlFor("workers"),
+            "m1-body",
+            "m1",
+            "m1-receipt",
+            1,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            () =>
+            {
+                firstCalls.Delete++;
+                firstCalls.Deleted.TrySetResult();
+                return ValueTask.CompletedTask;
+            },
+            async (delay, _) =>
+            {
+                firstCalls.RecordVisibilityChange(delay);
+                sweepBlocked.TrySetResult();
+                await new TaskCompletionSource().Task;
+            }));
+        await subscriber.StartAsync(CancellationToken.None);
+        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The batch finishes; the finally must give up on the wedged renewal task within the
+        // bound and keep receiving — a follow-up batch's message still gets processed.
+        releaseFirstHandler.TrySetResult();
+        await firstCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(
+            logger.Snapshot(),
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("did not stop within the shutdown budget", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -858,6 +929,44 @@ public sealed class SqsSubscriberTests
             lock (_visibilityChanges)
             {
                 _visibilityChanges.Add(delay);
+            }
+        }
+    }
+
+    private sealed class CollectingLogger<T> : ILogger<T>
+    {
+        private readonly object _gate = new();
+        private readonly List<(LogLevel Level, string Message, Exception? Exception)> _entries = [];
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NoopScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_gate)
+                _entries.Add((logLevel, formatter(state, exception), exception));
+        }
+
+        public IReadOnlyList<(LogLevel Level, string Message, Exception? Exception)> Snapshot()
+        {
+            lock (_gate)
+                return _entries.ToArray();
+        }
+
+        private sealed class NoopScope : IDisposable
+        {
+            public static readonly NoopScope Instance = new();
+
+            public void Dispose()
+            {
             }
         }
     }

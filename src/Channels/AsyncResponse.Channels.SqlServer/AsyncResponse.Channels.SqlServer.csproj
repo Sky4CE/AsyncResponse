@@ -17,6 +17,8 @@
   <ItemGroup>
     <Compile Include="..\Shared\DbChannelShared.cs" Link="DbChannelShared.cs" />
     <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
+    <Compile Include="..\..\Shared\SqlServerTransientFaults.cs" Link="SqlServerTransientFaults.cs" />
+    <Compile Include="..\..\Shared\RelationalNamePlan.cs" Link="RelationalNamePlan.cs" />
   </ItemGroup>
 
   <ItemGroup>

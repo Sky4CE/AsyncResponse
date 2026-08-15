@@ -450,6 +450,20 @@ public class RedisTransportTests
         Assert.Null(correlationId);
     }
 
+    [Fact]
+    public void CorrelationExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+    {
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        const string json = """{"CorrelationId":"1","CorrelationId":"2"}""";
+
+        Assert.Throws<ArgumentException>(() => RedisCorrelationIdExtractor.Extract(
+            Entry("1-0", ("payload", json)),
+            json,
+            new RedisAsyncResponseTransportOptions()));
+    }
+
     public static TheoryData<Action<RedisAsyncResponseTransportOptions>, string> InvalidCommonOptions()
         => new()
         {
@@ -655,6 +669,36 @@ public class RedisTransportTests
                 messageIds.Select(id => id.ToString()).ToArray()));
             return Task.FromResult(ClaimedMessages);
         }
+
+        public Task<RedisValue[]> StreamClaimIdsOnlyAsync(
+            RedisKey stream,
+            RedisValue groupName,
+            RedisValue consumerName,
+            long minIdleTimeInMilliseconds,
+            RedisValue[] messageIds,
+            CancellationToken cancellationToken)
+        {
+            if (ClaimIdsOnlyException is not null)
+                throw ClaimIdsOnlyException;
+
+            lock (ClaimIdsOnlyCalls)
+            {
+                ClaimIdsOnlyCalls.Add(new ClaimCall(
+                    stream.ToString(),
+                    groupName.ToString(),
+                    consumerName.ToString(),
+                    minIdleTimeInMilliseconds,
+                    messageIds.Select(id => id.ToString()).ToArray()));
+            }
+
+            return Task.FromResult(messageIds);
+        }
+
+        /// <summary>JUSTID heartbeat claims. Locked: the renewal loop runs on a background task.</summary>
+        public List<ClaimCall> ClaimIdsOnlyCalls { get; } = [];
+
+        /// <summary>When set, every JUSTID heartbeat claim throws this exception.</summary>
+        public Exception? ClaimIdsOnlyException { get; set; }
 
         internal sealed record AddCall(string Stream, NameValueEntry[] Values, long? MaxLength, bool Approximate);
         internal sealed record AckCall(string Stream, string Group, string MessageId);

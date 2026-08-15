@@ -781,13 +781,10 @@ public sealed class MongoDbChannelCoverageTests
                     It.IsAny<string>(),
                     It.IsAny<MongoCollectionSettings>()))
                 .Returns(Subscribers.Object);
+            // No hello/localTime fake: the subscription watermark is drawn atomically from the
+            // counters collection alone, so a registration that reaches RunCommandAsync again
+            // (the old two-round-trip draw) fails loudly on the unmocked call.
             Database.WithCounters();
-            Database
-                .Setup(d => d.RunCommandAsync(
-                    It.IsAny<Command<BsonDocument>>(),
-                    It.IsAny<ReadPreference>(),
-                    It.IsAny<CancellationToken>()))
-                .ReturnsAsync(new BsonDocument("localTime", new BsonDateTime(DateTime.UtcNow)));
             Subscribers
                 .Setup(c => c.CountDocumentsAsync(
                     It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
@@ -1006,6 +1003,46 @@ public sealed class MongoDbChannelCoverageTests
 
         var scope = new HashSet<string> { "other-corr" };
         await (Task)dispatchMethod.Invoke(channel, [scope, CancellationToken.None])!;
+    }
+
+    [Fact]
+    public async Task DispatchPendingMessagesAsync_ScopedScanDeliversThroughTheQueuedWorkItem()
+    {
+        // End-to-end through the sweep path: the targeted scan finds the signaled id's live
+        // waiter, queues the dispatch on the per-correlation serial executor, and the queued work
+        // item claims and delivers the message to the waiter.
+        var fixture = new ChannelFixture();
+        var channel = fixture.Channel;
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true), "sweep-corr");
+        AddSubscription(channel, "sweep-corr", subscription.Instance);
+
+        var document = new MongoChannelMessageDocument
+        {
+            Id = Guid.NewGuid(),
+            CorrelationId = "sweep-corr",
+            EnvelopeJson = """{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"swept"}}""",
+            CreatedAtUtc = DateTime.UtcNow
+        };
+        fixture.Messages
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new DummyCursor<MongoChannelMessageDocument>([document]));
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(document);
+
+        var dispatchMethod = typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await (Task)dispatchMethod.Invoke(channel, [new HashSet<string> { "sweep-corr" }, CancellationToken.None])!;
+
+        var delivered = await subscription.Completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("swept", delivered.Message);
     }
 
     [Fact]

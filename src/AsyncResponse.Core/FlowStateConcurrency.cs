@@ -193,7 +193,9 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _lost = new();
     private readonly Task _renewal;
-    private DateTime _validUntilUtc;
+    // DateTime ticks so the renewal loop's writes and the execution path's reads tear-free on
+    // 32-bit runtimes and order via Volatile.
+    private long _validUntilUtcTicks;
     private int _disposed;
 
     public FlowExecutionLease(
@@ -210,7 +212,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         _options = options;
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _validUntilUtc = _timeProvider.GetUtcNow().UtcDateTime.Add(options.ExecutionLeaseDuration);
+        Volatile.Write(ref _validUntilUtcTicks, _timeProvider.GetUtcNow().UtcDateTime.Add(options.ExecutionLeaseDuration).Ticks);
         _renewal = RenewLoopAsync();
     }
 
@@ -219,11 +221,23 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// <summary>
     /// Throws when the lease is lost. <paramref name="cause"/> (e.g. the exception that made the
     /// caller check) is attached as the inner exception so the real failure is not discarded.
+    /// <para>
+    /// A passed deadline counts as lost even before any renewal fails: the renewal loop only
+    /// observes loss on a store round-trip, so a stop-the-world pause (GC, VM freeze, debugger)
+    /// longer than the lease lets another worker take over while this side has seen nothing —
+    /// its next step body would then run concurrently with the new holder's. Checkpoints are
+    /// lease-fenced; side effects are fenced only by this guard, so it is conservative near the
+    /// boundary by design: retrying from the checkpoint is always safe, a concurrent step is not.
+    /// </para>
     /// </summary>
     public void ThrowIfLost(Exception? cause = null)
     {
-        if (_lost.IsCancellationRequested)
-            throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
+        if (!_lost.IsCancellationRequested
+            && _timeProvider.GetUtcNow().UtcDateTime.Ticks < Volatile.Read(ref _validUntilUtcTicks))
+            return;
+
+        MarkLost();
+        throw new InvalidOperationException($"Durable flow '{_flowId}' lost its execution lease; the worker will retry from the last checkpoint.", cause);
     }
 
     public async Task SaveAsync(FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default, Exception? cause = null)
@@ -312,7 +326,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     return;
                 }
 
-                _validUntilUtc = _timeProvider.GetUtcNow().UtcDateTime.Add(_options.ExecutionLeaseDuration);
+                Volatile.Write(ref _validUntilUtcTicks, _timeProvider.GetUtcNow().UtcDateTime.Add(_options.ExecutionLeaseDuration).Ticks);
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {
@@ -321,7 +335,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to renew durable flow {FlowId} execution lease; retrying before expiry.", _flowId);
-                if (_timeProvider.GetUtcNow().UtcDateTime >= _validUntilUtc)
+                if (_timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks))
                 {
                     MarkLost();
                     return;

@@ -254,6 +254,49 @@ public class KafkaTransportTests
     }
 
     [Fact]
+    public async Task ProducerAdapter_PublishAfterDispose_ThrowsObjectDisposedException()
+    {
+        // Red-on-old: Dispose read the producer field outside the build gate and set no latch, so
+        // a publish AFTER dispose lazily built a fresh producer and produced onto it — a
+        // never-flushed handle whose buffered jobs vanished and whose librdkafka threads leaked.
+        var options = KafkaTestData.NewOptions();
+        options.OperationTimeout = TimeSpan.FromMilliseconds(100);
+        // Bound the old code's broker-less produce so the wrong behavior fails fast instead of
+        // waiting out librdkafka's 300s default message timeout.
+        options.ConfigureProducer = config => config.MessageTimeoutMs = 100;
+        var adapter = new KafkaProducerClientAdapter(options);
+
+        adapter.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            adapter.PublishAsync(
+                "jobs",
+                "corr",
+                Encoding.UTF8.GetBytes("payload"),
+                [],
+                CancellationToken.None));
+    }
+
+    [Fact]
+    public void ProducerAdapter_DisposeAfterBuild_FlushesOnceAndLatches()
+    {
+        // A producer built before Dispose is flushed and disposed under the same gate the getter
+        // builds under; a second Dispose is a no-op and later builds are refused.
+        var options = KafkaTestData.NewOptions();
+        options.OperationTimeout = TimeSpan.FromMilliseconds(100);
+        var adapter = new KafkaProducerClientAdapter(options);
+        var producerProperty = typeof(KafkaProducerClientAdapter)
+            .GetProperty("Producer", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        Assert.NotNull(producerProperty.GetValue(adapter)); // materialize the native producer
+
+        adapter.Dispose();
+        adapter.Dispose(); // idempotent
+
+        var ex = Assert.Throws<TargetInvocationException>(() => producerProperty.GetValue(adapter));
+        Assert.IsType<ObjectDisposedException>(ex.InnerException);
+    }
+
+    [Fact]
     public void ProducerAdapter_DoesNotCacheAFaultedBuild_RetriesOnNextAccess()
     {
         // Regression (r24): the producer was cached behind Lazy<T>(ExecutionAndPublication), which
@@ -289,6 +332,8 @@ public class KafkaTransportTests
         options.WorkerConsumerGroup = "worker-group";
         options.ResponseConsumerGroup = "response-group";
         options.OffsetCommitInterval = TimeSpan.FromMilliseconds(123);
+        options.WorkerSubscriber.MaxPollInterval = TimeSpan.FromMinutes(7);
+        options.ResponseSubscriber.MaxPollInterval = TimeSpan.FromMinutes(9);
         var groups = new List<string?>();
         options.ConfigureConsumer = config =>
         {
@@ -298,6 +343,8 @@ public class KafkaTransportTests
             Assert.True(config.EnableAutoCommit);
             Assert.False(config.EnableAutoOffsetStore);
             Assert.Equal(123, config.AutoCommitIntervalMs);
+            // Each role's consumer carries its own subscriber's poll-interval ceiling.
+            Assert.Equal((int)TimeSpan.FromMinutes(groups.Count == 1 ? 7 : 9).TotalMilliseconds, config.MaxPollIntervalMs);
             Assert.Equal(AutoOffsetReset.Earliest, config.AutoOffsetReset);
             Assert.False(config.EnablePartitionEof);
             throw new InvalidOperationException("stop before broker build");
@@ -553,6 +600,14 @@ public class KafkaTransportTests
     [Fact]
     public void Extract_WhenNoConfiguredPathMatches_ReturnsNull()
         => Assert.Null(KafkaCorrelationIdExtractor.Extract([], """{"Other":"corr"}""", KafkaTestData.NewOptions()));
+
+    [Fact]
+    public void Extract_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(
+            () => KafkaCorrelationIdExtractor.Extract([], """{"CorrelationId":"1","CorrelationId":"2"}""", KafkaTestData.NewOptions()));
 
     // ---------- Reply targets ----------
 

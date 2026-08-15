@@ -13,6 +13,7 @@ public class RedisRecoveryStateStoreTests
 {
     private readonly Mock<IConnectionMultiplexer> _multiplexer = new();
     private readonly Mock<IDatabase> _database = new();
+    private readonly TestTimeProvider _time = new();
     private readonly RedisRecoveryStateStore _store;
     private readonly List<Mock<ITransaction>> _transactions = new();
 
@@ -25,8 +26,24 @@ public class RedisRecoveryStateStoreTests
         _store = new RedisRecoveryStateStore(
             _multiplexer.Object,
             Options.Create(new RedisAsyncResponseOptions { KeyPrefix = "ar" }),
-            NullLogger<RedisRecoveryStateStore>.Instance);
+            NullLogger<RedisRecoveryStateStore>.Instance,
+            _time);
     }
+
+    /// <summary>
+    /// Builds the enveloped blob shape the store writes: each registration paired with its own
+    /// absolute expiry. Raw JSON (rather than the store's internal types) so shape drift fails
+    /// loudly here.
+    /// </summary>
+    private static string EnvelopeBlob(params (RecoveryState State, DateTimeOffset ExpiresAtUtc)[] registrations)
+        => "{\"Registrations\":["
+           + string.Join(",", registrations.Select(registration =>
+               $"{{\"State\":{JsonSerializer.Serialize(registration.State)},\"ExpiresAtUtc\":\"{registration.ExpiresAtUtc:O}\"}}"))
+           + "]}";
+
+    private static JsonElement WrittenRegistration(JsonElement envelope, Guid registrationId)
+        => envelope.GetProperty("Registrations").EnumerateArray()
+            .Single(entry => entry.GetProperty("State").GetProperty("RegistrationId").GetGuid() == registrationId);
 
     /// <summary>
     /// Wires <see cref="IDatabase.CreateTransaction"/> to hand out one recording transaction per
@@ -87,10 +104,11 @@ public class RedisRecoveryStateStoreTests
         var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
         Assert.Equal("ar:recovery:corr-a", stringSet.Arguments[0]!.ToString());
         Assert.Equal("EX 180", stringSet.Arguments[2]!.ToString());
-        var savedStates = JsonSerializer.Deserialize<List<RecoveryState>>(((RedisValue)stringSet.Arguments[1]!).ToString());
-        var savedState = Assert.Single(savedStates!);
-        Assert.Equal("corr-a", savedState!.CorrelationId);
-        Assert.NotEqual(Guid.Empty, savedState.RegistrationId);
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+        var registration = Assert.Single(written.RootElement.GetProperty("Registrations").EnumerateArray());
+        Assert.Equal("corr-a", registration.GetProperty("State").GetProperty("CorrelationId").GetString());
+        Assert.NotEqual(Guid.Empty, registration.GetProperty("State").GetProperty("RegistrationId").GetGuid());
+        Assert.Equal(_time.Now + TimeSpan.FromMinutes(3), registration.GetProperty("ExpiresAtUtc").GetDateTimeOffset());
 
         await Assert.ThrowsAsync<ArgumentException>(() => _store.SaveAsync(" ", state, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<ArgumentNullException>(() => _store.SaveAsync("corr-a", null!, TimeSpan.FromSeconds(1)));
@@ -340,11 +358,14 @@ public class RedisRecoveryStateStoreTests
         await _store.SaveAsync("corr-a", second, TimeSpan.FromMinutes(3));
 
         Assert.Equal(2, _transactions.Count);
-        var written = JsonSerializer.Deserialize<List<RecoveryState>>(WrittenValue(_transactions[1]).ToString())!;
-        Assert.Equal(3, written.Count);
-        Assert.Contains(written, s => s.RegistrationId == first.RegistrationId);
-        Assert.Contains(written, s => s.RegistrationId == competing.RegistrationId);
-        Assert.Contains(written, s => s.RegistrationId == second.RegistrationId);
+        using var written = JsonDocument.Parse(WrittenValue(_transactions[1]).ToString());
+        var writtenIds = written.RootElement.GetProperty("Registrations").EnumerateArray()
+            .Select(entry => entry.GetProperty("State").GetProperty("RegistrationId").GetGuid())
+            .ToList();
+        Assert.Equal(3, writtenIds.Count);
+        Assert.Contains(first.RegistrationId, writtenIds);
+        Assert.Contains(competing.RegistrationId, writtenIds);
+        Assert.Contains(second.RegistrationId, writtenIds);
     }
 
     [Fact]
@@ -371,9 +392,194 @@ public class RedisRecoveryStateStoreTests
             PayloadTypeFullName = typeof(OperationResult).FullName
         }, TimeSpan.FromMinutes(3));
 
-        var state = Assert.Single(JsonSerializer.Deserialize<List<RecoveryState>>(WrittenValue(Assert.Single(_transactions)).ToString())!);
-        Assert.Equal(registrationId, state.RegistrationId);
-        Assert.Equal(typeof(OperationResult).FullName, state.PayloadTypeFullName);
+        using var written = JsonDocument.Parse(WrittenValue(Assert.Single(_transactions)).ToString());
+        var registration = Assert.Single(written.RootElement.GetProperty("Registrations").EnumerateArray());
+        Assert.Equal(registrationId, registration.GetProperty("State").GetProperty("RegistrationId").GetGuid());
+        Assert.Equal(typeof(OperationResult).FullName, registration.GetProperty("State").GetProperty("PayloadTypeFullName").GetString());
+    }
+
+    [Fact]
+    public async Task SaveAsync_KeyTtlIsMaxRemainingAcrossEntries_NotAFreshFullTtl()
+    {
+        // Registrations for one correlation id share one key, so the key TTL must be the longest
+        // remaining ENTRY lifetime. A save that stamped its own full TTL onto the key would
+        // truncate a longer-lived sibling here — and the pre-envelope behavior re-extended every
+        // sibling on each save, keeping dead registrations recoverable indefinitely.
+        var longLived = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((longLived, _time.Now + TimeSpan.FromMinutes(10))));
+        SetupTransactions(true);
+
+        var second = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", second, TimeSpan.FromMinutes(5));
+
+        var transaction = Assert.Single(_transactions);
+        var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal("EX 600", stringSet.Arguments[2]!.ToString());
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+        Assert.Equal(2, written.RootElement.GetProperty("Registrations").GetArrayLength());
+        Assert.Equal(
+            _time.Now + TimeSpan.FromMinutes(10),
+            WrittenRegistration(written.RootElement, longLived.RegistrationId).GetProperty("ExpiresAtUtc").GetDateTimeOffset());
+        Assert.Equal(
+            _time.Now + TimeSpan.FromMinutes(5),
+            WrittenRegistration(written.RootElement, second.RegistrationId).GetProperty("ExpiresAtUtc").GetDateTimeOffset());
+    }
+
+    [Fact]
+    public async Task SaveAsync_PrunesEntriesPastTheirExpiry()
+    {
+        var expired = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var live = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (expired, _time.Now - TimeSpan.FromMinutes(1)),
+                (live, _time.Now + TimeSpan.FromMinutes(10))));
+        SetupTransactions(true);
+
+        var fresh = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", fresh, TimeSpan.FromMinutes(5));
+
+        var transaction = Assert.Single(_transactions);
+        var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal("EX 600", stringSet.Arguments[2]!.ToString());
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+        var writtenIds = written.RootElement.GetProperty("Registrations").EnumerateArray()
+            .Select(entry => entry.GetProperty("State").GetProperty("RegistrationId").GetGuid())
+            .ToList();
+        Assert.Equal(2, writtenIds.Count);
+        Assert.Contains(live.RegistrationId, writtenIds);
+        Assert.Contains(fresh.RegistrationId, writtenIds);
+        Assert.DoesNotContain(expired.RegistrationId, writtenIds);
+    }
+
+    [Fact]
+    public async Task GetAllAsync_FiltersEntriesPastTheirExpiry()
+    {
+        // A sibling's later save keeps the KEY alive past this entry's own lifetime; the entry
+        // must still read as absent, or a late response fires recovery callbacks for a
+        // registration that lapsed long ago.
+        var expired = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var live = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (expired, _time.Now - TimeSpan.FromSeconds(1)),
+                (live, _time.Now + TimeSpan.FromMinutes(10))));
+
+        var state = Assert.Single(await _store.GetAllAsync("corr-a"));
+
+        Assert.Equal(live.RegistrationId, state.RegistrationId);
+    }
+
+    [Fact]
+    public async Task SaveAsync_ReStampsLegacyEntriesWithAFullExpiry()
+    {
+        // Legacy blobs (a bare state list) carry no per-entry expiry. The first post-upgrade save
+        // converts them to the enveloped shape, stamping each with the save's full TTL — the same
+        // ceiling every legacy save applied to the whole key.
+        var legacy = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { legacy }));
+        SetupTransactions(true);
+
+        var fresh = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", fresh, TimeSpan.FromMinutes(3));
+
+        var transaction = Assert.Single(_transactions);
+        var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal("EX 180", stringSet.Arguments[2]!.ToString());
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+        Assert.Equal(2, written.RootElement.GetProperty("Registrations").GetArrayLength());
+        Assert.Equal(
+            _time.Now + TimeSpan.FromMinutes(3),
+            WrittenRegistration(written.RootElement, legacy.RegistrationId).GetProperty("ExpiresAtUtc").GetDateTimeOffset());
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_ShrinksKeyTtlToLongestSurvivingEntry()
+    {
+        var longLived = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var shortLived = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (longLived, _time.Now + TimeSpan.FromMinutes(10)),
+                (shortLived, _time.Now + TimeSpan.FromMinutes(4))));
+        SetupTransactions(true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", longLived.RegistrationId));
+
+        var transaction = Assert.Single(_transactions);
+        var stringSet = Assert.Single(transaction.Invocations, invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Equal("EX 240", stringSet.Arguments[2]!.ToString());
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+        var survivor = Assert.Single(written.RootElement.GetProperty("Registrations").EnumerateArray());
+        Assert.Equal(shortLived.RegistrationId, survivor.GetProperty("State").GetProperty("RegistrationId").GetGuid());
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_ExpiredRegistration_ReportsNothingDeleted()
+    {
+        var expired = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob((expired, _time.Now - TimeSpan.FromMinutes(1))));
+
+        Assert.False(await _store.TryDeleteAsync("corr-a", expired.RegistrationId));
+
+        _database.Verify(d => d.CreateTransaction(It.IsAny<object?>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ScanAsync_SkipsEntriesPastTheirExpiry_AndStillYieldsLegacyEntries()
+    {
+        var endpoint = new DnsEndPoint("redis-a", 6379);
+        var server = new Mock<IServer>();
+        server.SetupGet(s => s.IsConnected).Returns(true);
+        RedisKey[] keys = [(RedisKey)"ar:recovery:corr-a", (RedisKey)"ar:recovery:corr-legacy"];
+        server
+            .Setup(s => s.Keys(
+                It.IsAny<int>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<int>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(keys);
+        server
+            .Setup(s => s.Keys(
+                It.IsAny<int>(),
+                It.IsAny<RedisValue>(),
+                It.IsAny<int>(),
+                It.IsAny<long>(),
+                It.IsAny<int>(),
+                It.IsAny<CommandFlags>()))
+            .Returns(keys);
+        _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endpoint]);
+        _multiplexer.Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>())).Returns(server.Object);
+
+        var expired = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var live = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        var legacy = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-legacy" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (expired, _time.Now - TimeSpan.FromMinutes(1)),
+                (live, _time.Now + TimeSpan.FromMinutes(10))));
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-legacy", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(JsonSerializer.Serialize(new[] { legacy }));
+
+        var states = new List<RecoveryState>();
+        await foreach (var state in _store.ScanAsync())
+            states.Add(state);
+
+        Assert.Equal(2, states.Count);
+        Assert.Contains(states, state => state.RegistrationId == live.RegistrationId);
+        Assert.Contains(states, state => state.RegistrationId == legacy.RegistrationId);
+        Assert.DoesNotContain(states, state => state.RegistrationId == expired.RegistrationId);
     }
 
     [Fact]

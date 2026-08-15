@@ -133,6 +133,30 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
                 $"{optionPath}.{nameof(KafkaSubscriberOptions.HandlerRetryMaxDelay)}.");
         }
 
+        KafkaTransportOptionsValidator.EnsureMaxPollInterval(subscriberOptions.MaxPollInterval, optionPath, nameof(KafkaSubscriberOptions.MaxPollInterval));
+
+        // The in-process retry loop runs on the poll thread, so its delays suspend Consume();
+        // a poll gap reaching max.poll.interval.ms gets the consumer evicted from its group
+        // mid-retry and its partitions redelivered elsewhere. The retry DELAY budget (handler
+        // execution time is the operator's responsibility) plus one poll must fit within half
+        // the interval so real handler time has the other half. Unlimited retries
+        // (MaxDeliveryAttempts = 0) have no finite budget and stay the operator's call.
+        if (subscriberOptions.MaxDeliveryAttempts > 0)
+        {
+            var retryDelayBudgetMs = WorstCaseRetryDelayBudgetMs(subscriberOptions);
+            var pollGapMs = retryDelayBudgetMs + subscriberOptions.PollTimeout.TotalMilliseconds;
+            if (pollGapMs * 2 > subscriberOptions.MaxPollInterval.TotalMilliseconds)
+            {
+                throw new InvalidOperationException(
+                    $"{optionPath}: the worst-case in-process handler retry delay budget plus one poll " +
+                    $"({DescribeMilliseconds(pollGapMs)} across {subscriberOptions.MaxDeliveryAttempts} delivery attempts) must fit within half of " +
+                    $"{nameof(KafkaSubscriberOptions.MaxPollInterval)} ({subscriberOptions.MaxPollInterval}) — these delays run on the poll thread, and a " +
+                    "poll gap reaching max.poll.interval.ms gets the consumer evicted from its group mid-retry. Reduce " +
+                    $"{nameof(KafkaSubscriberOptions.MaxDeliveryAttempts)}, {nameof(KafkaSubscriberOptions.HandlerRetryBaseDelay)}, or " +
+                    $"{nameof(KafkaSubscriberOptions.HandlerRetryMaxDelay)}, or raise {nameof(KafkaSubscriberOptions.MaxPollInterval)}.");
+            }
+        }
+
         switch (subscriberOptions.AckMode)
         {
             case KafkaAckMode.AckAfterHandlerCompletes:
@@ -170,6 +194,35 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
                     $"{optionPath}.{nameof(KafkaSubscriberOptions.AckMode)} has unsupported value '{subscriberOptions.AckMode}'.");
         }
     }
+
+    /// <summary>
+    /// Ceiling of the retry delays a failing message can spend on the poll thread: one backoff per
+    /// completed attempt except the last. Mirrors <see cref="AsyncResponseRetry.Backoff"/>'s
+    /// pre-jitter shape — <c>min(max, base * 2^min(attempt-1, 10))</c>; jitter only ever shrinks a
+    /// step — and is computed in milliseconds because a large attempt count times the capped step
+    /// overflows <see cref="TimeSpan"/>.
+    /// </summary>
+    private static double WorstCaseRetryDelayBudgetMs(KafkaSubscriberOptions subscriberOptions)
+    {
+        var baseMs = subscriberOptions.HandlerRetryBaseDelay.TotalMilliseconds;
+        var maxMs = subscriberOptions.HandlerRetryMaxDelay.TotalMilliseconds;
+        var delays = subscriberOptions.MaxDeliveryAttempts - 1;
+
+        var totalMs = 0d;
+        for (var attempt = 1; attempt <= Math.Min(delays, 11); attempt++)
+            totalMs += Math.Min(maxMs, baseMs * (1 << (attempt - 1)));
+
+        // The multiplier saturates at 2^10, so every later delay is the same capped step.
+        if (delays > 11)
+            totalMs += (delays - 11) * Math.Min(maxMs, baseMs * 1024);
+
+        return totalMs;
+    }
+
+    private static string DescribeMilliseconds(double milliseconds)
+        => milliseconds <= TimeSpan.MaxValue.TotalMilliseconds
+            ? TimeSpan.FromMilliseconds(milliseconds).ToString()
+            : $"more than {TimeSpan.MaxValue}";
 
     /// <summary>Handles the delivered message.</summary>
     public abstract Task HandleAsync(KafkaDelivery delivery, CancellationToken subscriberCancellationToken);

@@ -48,7 +48,22 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
-    public async Task Disabled_DoesNotScanOrPublish()
+    public void Construction_NonPositiveProbeConcurrency_FailsFastAtStartup()
+    {
+        // ProbeConcurrency feeds Parallel.ForEachAsync mid-scan, which rejects values below 1
+        // with the same delayed, host-stopping failure mode as an out-of-range delay.
+        var options = Microsoft.Extensions.Options.Options.Create(new AsyncResponseOptions
+        {
+            Watchdog = new AsyncResponseWatchdogOptions { ProbeConcurrency = 0 }
+        });
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            Build(new AsyncResponseWatchdogState(), options, new FakeScanner(), new FakeProbe(0)));
+        Assert.Contains(nameof(AsyncResponseWatchdogOptions.ProbeConcurrency), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Disabled_DoesNotScanOrPublish_AndMarksItsStateIdle()
     {
         var state = new AsyncResponseWatchdogState();
         var watchdog = Build(state, Options(enabled: false), new FakeScanner(StaleEntry()), new FakeProbe(0));
@@ -56,8 +71,11 @@ public class AsyncResponseWatchdogLoopTests
         await watchdog.StartAsync(CancellationToken.None);
         try
         {
+            // The idle marker doubles as "ExecuteAsync has run" (hosting may defer it past StartAsync).
+            await WaitUntilAsync(() => state.Scanning is false);
             await Task.Delay(200); // give a (disabled) loop ample time to misbehave
             Assert.Null(state.Latest);
+            Assert.Contains(nameof(AsyncResponseWatchdogOptions.Enabled), state.IdleReason!, StringComparison.Ordinal);
         }
         finally
         {
@@ -66,7 +84,7 @@ public class AsyncResponseWatchdogLoopTests
     }
 
     [Fact]
-    public async Task NoScanner_StaysIdle()
+    public async Task NoScanner_StaysIdle_AndMarksItsStateIdle()
     {
         var state = new AsyncResponseWatchdogState();
         var watchdog = Build(state, Options(enabled: true), scanner: null, new FakeProbe(0));
@@ -74,13 +92,27 @@ public class AsyncResponseWatchdogLoopTests
         await watchdog.StartAsync(CancellationToken.None);
         try
         {
+            await WaitUntilAsync(() => state.Scanning is false);
             await Task.Delay(200);
             Assert.Null(state.Latest);
+            Assert.Contains(nameof(IRecoveryStateScanner), state.IdleReason!, StringComparison.Ordinal);
         }
         finally
         {
             await watchdog.StopAsync(CancellationToken.None);
         }
+    }
+
+    [Fact]
+    public async Task ScanningWatchdog_MarksItsStateScanning()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var watchdog = Build(state, Options(enabled: true), new FakeScanner(StaleEntry()), new FakeProbe(0));
+
+        await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.True(state.Scanning);
+        Assert.Null(state.IdleReason);
     }
 
     [Fact]
@@ -192,7 +224,9 @@ public class AsyncResponseWatchdogLoopTests
         var state = new AsyncResponseWatchdogState();
         var entries = Enumerable.Range(0, 50).Select(i => StaleEntry($"cid-{i:D2}")).ToArray();
         var probe = new CancellationObservingProbe();
-        var watchdog = Build(state, Options(enabled: true), new FakeScanner(entries), probe);
+        // Strictly sequential probing keeps "the third call parks" deterministic; the parallel
+        // fan-out's cancellation propagation has its own coverage.
+        var watchdog = Build(state, Options(enabled: true, probeConcurrency: 1), new FakeScanner(entries), probe);
 
         await watchdog.StartAsync(CancellationToken.None);
         try
@@ -243,6 +277,7 @@ public class AsyncResponseWatchdogLoopTests
         Assert.Equal(1, snapshot.Report!.TotalEntries);
         Assert.Empty(snapshot.Report.StaleEntries);
         Assert.Equal(0, snapshot.Report.EntriesWithActiveWaiter);
+        Assert.Equal(1, snapshot.Report.UnprobeableEntries);
     }
 
     [Fact]
@@ -257,6 +292,50 @@ public class AsyncResponseWatchdogLoopTests
         Assert.Equal(1, snapshot.Report!.TotalEntries);
         Assert.Empty(snapshot.Report.StaleEntries);
         Assert.Equal(0, snapshot.Report.EntriesWithActiveWaiter);
+        Assert.Equal(1, snapshot.Report.UnprobeableEntries);
+    }
+
+    [Fact]
+    public async Task ProbeConcurrencyOne_ProbesStrictlySequentially()
+    {
+        var state = new AsyncResponseWatchdogState();
+        var probe = new OverlapObservingProbe();
+        var entries = Enumerable.Range(0, 4).Select(i => StaleEntry($"seq-{i}")).ToArray();
+        var watchdog = Build(state, Options(enabled: true, probeConcurrency: 1), new FakeScanner(entries), probe);
+
+        var snapshot = await RunUntilPublishedAsync(watchdog, state);
+
+        Assert.Equal(4, snapshot.Report!.TotalEntries);
+        Assert.Equal(1, probe.MaxInFlight);
+    }
+
+    /// <summary>Tracks how many probe calls overlap; each call lingers long enough to be seen.</summary>
+    private sealed class OverlapObservingProbe : IActiveSubscriberProbe
+    {
+        private int _inFlight;
+        private int _maxInFlight;
+
+        public int MaxInFlight => Volatile.Read(ref _maxInFlight);
+
+        public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+        {
+            var inFlight = Interlocked.Increment(ref _inFlight);
+            int seen;
+            while (inFlight > (seen = Volatile.Read(ref _maxInFlight))
+                   && Interlocked.CompareExchange(ref _maxInFlight, inFlight, seen) != seen)
+            {
+            }
+
+            try
+            {
+                await Task.Delay(50, cancellationToken);
+                return 1;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
     }
 
     [Fact]
@@ -315,7 +394,7 @@ public class AsyncResponseWatchdogLoopTests
             options,
             NullLogger<AsyncResponseWatchdog>.Instance);
 
-    private static IOptions<AsyncResponseOptions> Options(bool enabled) => Microsoft.Extensions.Options.Options.Create(
+    private static IOptions<AsyncResponseOptions> Options(bool enabled, int probeConcurrency = 8) => Microsoft.Extensions.Options.Options.Create(
         new AsyncResponseOptions
         {
             Watchdog = new AsyncResponseWatchdogOptions
@@ -324,9 +403,21 @@ public class AsyncResponseWatchdogLoopTests
                 StartupDelay = TimeSpan.Zero,
                 // These tests inspect the first publication; keep the next scan outside that window.
                 Interval = PublishTimeout + PublishTimeout,
-                StaleAfter = TimeSpan.FromMinutes(1)
+                StaleAfter = TimeSpan.FromMinutes(1),
+                ProbeConcurrency = probeConcurrency
             }
         });
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + PublishTimeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+                throw new TimeoutException("Condition not reached in time.");
+            await Task.Delay(20);
+        }
+    }
 
     private static RecoveryState StaleEntry(string correlationId = "cid") => new()
     {

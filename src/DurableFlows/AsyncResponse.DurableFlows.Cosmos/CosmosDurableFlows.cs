@@ -97,8 +97,7 @@ public sealed class CosmosDurableFlowOptions : DurableFlowOptions
         }
         if (Throughput is <= 0)
             throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(Throughput)} must be positive when configured.");
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(CosmosDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(CosmosDurableFlowOptions));
     }
 }
 
@@ -115,7 +114,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
     private readonly CosmosDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly bool _ownsClient;
-    private bool _created;
+    private volatile bool _created;
 
     public CosmosFlowStateStore(CosmosClient client, IOptions<CosmosDurableFlowOptions> options, bool ownsClient = false)
     {
@@ -442,10 +441,7 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         var container = await GetContainerAsync(cancellationToken).ConfigureAwait(false);
         for (var attempt = 0; attempt < 4; attempt++)

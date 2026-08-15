@@ -33,6 +33,8 @@
 
   <ItemGroup>
     <Compile Include="..\..\Shared\MongoOwnershipLedger.cs" Link="MongoOwnershipLedger.cs" />
+    <Compile Include="..\..\Shared\MongoNamespaceRegistry.cs" Link="MongoNamespaceRegistry.cs" />
+    <Compile Include="..\..\Shared\MongoTransientFaults.cs" Link="MongoTransientFaults.cs" />
   </ItemGroup>
 
 </Project>

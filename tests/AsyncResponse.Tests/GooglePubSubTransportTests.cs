@@ -459,6 +459,23 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
+    public void CorrelationIdExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+    {
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        var message = new PubsubMessage
+        {
+            Data = ByteString.CopyFromUtf8("""{"CorrelationId":"1","CorrelationId":"2"}""")
+        };
+
+        Assert.Throws<ArgumentException>(() => GooglePubSubCorrelationIdExtractor.Extract(
+            message,
+            message.Data.ToStringUtf8(),
+            new GooglePubSubAsyncResponseOptions()));
+    }
+
+    [Fact]
     public async Task WorkerTransport_PublishAfterDispose_ThrowsTransportNamedDisposedException()
     {
         // Regression (r23): DisposeAsync used to Release then Dispose the publisher gate.

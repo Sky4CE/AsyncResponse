@@ -38,9 +38,10 @@ public sealed class RabbitMqAsyncResponseOptions
     public bool TopologyRecoveryEnabled { get; set; } = true;
 
     /// <summary>
-    /// How long the client waits between automatic recovery attempts (also the delay between
-    /// subscriber start retries). Must be strictly positive: the RabbitMQ client uses the value
-    /// directly in its recovery loop. Default: 5 seconds.
+    /// How long the client waits between automatic recovery attempts. Must be strictly positive:
+    /// the RabbitMQ client uses the value directly in its recovery loop. Default: 5 seconds. The
+    /// hosted subscribers' own restart retries back off separately, governed by
+    /// <see cref="SubscriberRetryBaseDelay"/>/<see cref="SubscriberRetryMaxDelay"/>.
     /// </summary>
     public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
 
@@ -121,6 +122,12 @@ public sealed class RabbitMqAsyncResponseOptions
         "PubSubParams.CustomParameters.CorrelationId",
         "DagJsonParameters.CorrelationId"
     ];
+
+    /// <summary>Initial delay after a subscriber loop failure.</summary>
+    public TimeSpan SubscriberRetryBaseDelay { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Maximum delay after repeated subscriber loop failures.</summary>
+    public TimeSpan SubscriberRetryMaxDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Bounds the connection close while hosted consumers/publishers stop. The close completes in

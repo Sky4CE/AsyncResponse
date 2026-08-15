@@ -42,9 +42,17 @@ public static class AsyncResponsePayloadReflection
             return false;
 
         // Implicit implementations (the overwhelmingly common shape) declare a public
-        // OnRecovery on the class itself — detectable without the interface map.
-        if (type.GetMethod(nameof(IAsyncResponsePayload.OnRecovery), BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes) is not null)
+        // OnRecovery on the class itself — detectable without the interface map. The return type
+        // must match too: GetMethod ignores it, but a same-name method returning anything else
+        // (void, Task, …) cannot implicitly implement the interface member — the interface
+        // default still applies, so reporting true here would wave through exactly the payload
+        // this guard exists to reject. A wrong-return match falls through to the interface map,
+        // which answers authoritatively (an explicit implementation may still exist alongside).
+        if (type.GetMethod(nameof(IAsyncResponsePayload.OnRecovery), BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes) is { } declared
+            && declared.ReturnType == typeof(RecoveryAction))
+        {
             return true;
+        }
 
         try
         {

@@ -2,6 +2,7 @@ using AsyncResponse.Transports.RabbitMQ;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
@@ -326,6 +327,63 @@ public class RabbitMqDispatcherTests
         var nack = Assert.Single(channel.Nacks);
         Assert.Equal(12UL, nack.DeliveryTag);
         Assert.True(nack.Requeue);
+    }
+
+    [Fact]
+    public async Task Awaiting_HandlerThrows_ChannelAlreadyClosed_SkipsNackAndLogsWarning()
+    {
+        // Red-on-old: the failure-path NACK was the one unguarded settle. A closed channel has
+        // already returned every un-ACKed delivery to the queue, so NACKing it throws into the
+        // client's delivery callback — the requeue/reject decision silently lost, with no log.
+        var logger = new ListLogger();
+        var channel = new FakeDispatcherChannel { IsOpen = false };
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { AckMode = RabbitMqAckMode.AckAfterHandlerCompletes },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 41), channel, CancellationToken.None);
+
+        Assert.Empty(channel.Acks);
+        Assert.Empty(channel.Nacks);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("41", StringComparison.Ordinal)
+                && entry.Message.Contains("requeue", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Awaiting_HandlerThrows_NackFailure_DoesNotEscapeTheDeliveryCallbackAndLogsWarning()
+    {
+        // Red-on-old: a throwing NACK (stale delivery tag after automatic recovery, channel torn
+        // down between handler failure and settle) escaped HandleAsync — which runs inside the
+        // client's delivery callback — leaving the delivery neither ACKed nor NACKed.
+        var logger = new ListLogger();
+        var channel = new FakeDispatcherChannel
+        {
+            ThrowOnNack = new global::RabbitMQ.Client.Exceptions.AlreadyClosedException(
+                new ShutdownEventArgs(ShutdownInitiator.Peer, 406, "channel closed"))
+        };
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { AckMode = RabbitMqAckMode.AckAfterHandlerCompletes },
+            logger,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 42), channel, CancellationToken.None);
+
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Warning
+                && entry.Exception is global::RabbitMQ.Client.Exceptions.AlreadyClosedException
+                && entry.Message.Contains("42", StringComparison.Ordinal)
+                && entry.Message.Contains("requeue", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -884,6 +942,7 @@ public class RabbitMqDispatcherTests
         public List<CancellationToken> AckTokens { get; } = [];
         public List<(ulong DeliveryTag, bool Requeue)> Nacks { get; } = [];
         public Exception? ThrowOnAck { get; init; }
+        public Exception? ThrowOnNack { get; init; }
 
         public ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default)
         {
@@ -904,6 +963,9 @@ public class RabbitMqDispatcherTests
 
         public ValueTask BasicNackAsync(ulong deliveryTag, bool requeue, CancellationToken cancellationToken = default)
         {
+            if (ThrowOnNack is not null)
+                throw ThrowOnNack;
+
             lock (Nacks)
                 Nacks.Add((deliveryTag, requeue));
             return ValueTask.CompletedTask;

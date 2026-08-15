@@ -143,7 +143,7 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedW
             }
             catch (Exception ex) when (IsTransient(ex) && attempt < _options.PublishMaxAttempts && !cancellationToken.IsCancellationRequested)
             {
-                var delay = RetryDelay(attempt);
+                var delay = AsyncResponseRetry.Backoff(attempt, _options.PublishRetryBaseDelay, _options.PublishRetryMaxDelay);
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -152,12 +152,6 @@ public sealed class AzureServiceBusWorkerTransport : IWorkerTransport, IDelayedW
     /// <summary>Runs the IsTransient operation.</summary>
     internal static bool IsTransient(Exception exception)
         => exception is ServiceBusException { IsTransient: true };
-
-    private TimeSpan RetryDelay(int failedAttempt)
-    {
-        var milliseconds = _options.PublishRetryBaseDelay.TotalMilliseconds * Math.Pow(2, failedAttempt - 1);
-        return TimeSpan.FromMilliseconds(Math.Min(milliseconds, _options.PublishRetryMaxDelay.TotalMilliseconds));
-    }
 
     /// <summary>Releases resources held by this instance.</summary>
     public async ValueTask DisposeAsync()

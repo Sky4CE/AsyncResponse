@@ -79,6 +79,11 @@ processes start together.
 Set `AutoCreateSchema = false` when migrations own the schema. Keep channel and transport table names
 distinct even when they share the same schema.
 
+With `AutoCreateSchema = false`, the transport now verifies its operator-provisioned queue table
+against the catalog too, at first use — matching the channel's existing behavior: an absent table
+is assumed not yet migrated and re-checked on the next operation, while a present table with the
+wrong shape throws with the fix instead of failing silently at the first publish or claim.
+
 ### Upgrading a manually managed schema
 
 1.0.0 added a monotonic ack sequence to the channel message table. With `AutoCreateSchema = false`
@@ -147,6 +152,13 @@ Recommended Npgsql connection-string settings:
   its relations against the catalog after schema creation (kind and, for indexes, owning table)
   — a name occupied by another component's object fails startup with a rename error instead of
   `CREATE ... IF NOT EXISTS` silently skipping the DDL.
+- **Identity columns need a deterministic collation.** `correlation_id`/`registration_id`
+  (channel), `queue` (transport), and `flow_id` (durable-flow store) are compared ordinally, so a
+  non-deterministic ICU collation folds distinct ids onto one key — lookups cross-match and the
+  second id is rejected on insert. Startup verification reads each column's collation from the
+  catalog and fails actionably if it is not deterministic (`"C"` always qualifies). This check
+  needs **PostgreSQL 12+** (`pg_collation.collisdeterministic`), on top of the covering-index
+  support (`pg_index.indnkeyatts`) catalog verification has required since PostgreSQL 11.
 - Keep `SubscriberHeartbeatInterval` lower than `SubscriberHeartbeatTimeout`; publishers use these
   rows to decide whether to wait for live delivery. Registration writes one row, then each interval
   performs one update for the process's current active-registration snapshot. Rows no longer in that

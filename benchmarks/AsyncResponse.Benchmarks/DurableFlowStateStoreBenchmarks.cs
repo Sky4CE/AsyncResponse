@@ -17,7 +17,7 @@ public class DurableFlowStateStoreBenchmarks
     private SqliteFlowStateStore _store = null!;
     private ServiceProvider _serviceProvider = null!;
     private IFlowStateStore _memoryStore = null!;
-    private FlowState _state = null!;
+    private readonly List<string> _createdIds = [];
     private int _sequence;
 
     [GlobalSetup]
@@ -36,9 +36,9 @@ public class DurableFlowStateStoreBenchmarks
             .WithInMemoryDurableFlows();
         _serviceProvider = services.BuildServiceProvider();
         _memoryStore = _serviceProvider.GetRequiredService<IFlowStateStore>();
-        _state = CreateState("bench-load");
-        await _store.TryCreateAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
-        await _memoryStore.TryCreateAsync(_state.FlowId!, _state, TimeSpan.FromMinutes(30));
+        var seed = CreateState("bench-load");
+        await _store.TryCreateAsync(seed.FlowId!, seed, TimeSpan.FromMinutes(30));
+        await _memoryStore.TryCreateAsync(seed.FlowId!, seed, TimeSpan.FromMinutes(30));
     }
 
     [GlobalCleanup]
@@ -48,13 +48,24 @@ public class DurableFlowStateStoreBenchmarks
         File.Delete(_databasePath);
     }
 
+    // Each create gets a fresh per-op state: a shared mutated instance would alias every stored
+    // entry (including the "bench-load" row the load benchmarks read), and the rows are deleted
+    // OUTSIDE the measured op in [IterationCleanup] — left in place, later iterations run against
+    // an ever-larger store, so the ns/op trend and the MemoryDiagnoser numbers drift with
+    // iteration count instead of measuring the operation.
     [Benchmark]
     public Task<bool> CreateAsync()
     {
-        var id = "bench-save-" + Interlocked.Increment(ref _sequence).ToString("D8");
-        _state.FlowId = id;
-        _state.Revision = 0;
-        return _store.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
+        var id = NextCreatedId();
+        return _store.TryCreateAsync(id, CreateState(id), TimeSpan.FromMinutes(30));
+    }
+
+    [IterationCleanup(Target = nameof(CreateAsync))]
+    public void CleanupCreated()
+    {
+        foreach (var id in _createdIds)
+            _store.TryDeleteAsync(id).GetAwaiter().GetResult();
+        _createdIds.Clear();
     }
 
     [Benchmark]
@@ -64,9 +75,7 @@ public class DurableFlowStateStoreBenchmarks
     public async Task SaveLoadDeleteAsync()
     {
         var id = "bench-roundtrip-" + Interlocked.Increment(ref _sequence).ToString("D8");
-        _state.FlowId = id;
-        _state.Revision = 0;
-        await _store.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
+        await _store.TryCreateAsync(id, CreateState(id), TimeSpan.FromMinutes(30));
         _ = await _store.LoadAsync(id);
         await _store.TryDeleteAsync(id);
     }
@@ -74,10 +83,16 @@ public class DurableFlowStateStoreBenchmarks
     [Benchmark]
     public Task<bool> InMemoryCreateAsync()
     {
-        var id = "bench-save-" + Interlocked.Increment(ref _sequence).ToString("D8");
-        _state.FlowId = id;
-        _state.Revision = 0;
-        return _memoryStore.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
+        var id = NextCreatedId();
+        return _memoryStore.TryCreateAsync(id, CreateState(id), TimeSpan.FromMinutes(30));
+    }
+
+    [IterationCleanup(Target = nameof(InMemoryCreateAsync))]
+    public void CleanupInMemoryCreated()
+    {
+        foreach (var id in _createdIds)
+            _memoryStore.TryDeleteAsync(id).GetAwaiter().GetResult();
+        _createdIds.Clear();
     }
 
     [Benchmark]
@@ -87,11 +102,16 @@ public class DurableFlowStateStoreBenchmarks
     public async Task InMemoryCreateLoadDeleteAsync()
     {
         var id = "bench-roundtrip-" + Interlocked.Increment(ref _sequence).ToString("D8");
-        _state.FlowId = id;
-        _state.Revision = 0;
-        await _memoryStore.TryCreateAsync(id, _state, TimeSpan.FromMinutes(30));
+        await _memoryStore.TryCreateAsync(id, CreateState(id), TimeSpan.FromMinutes(30));
         _ = await _memoryStore.LoadAsync(id);
         await _memoryStore.TryDeleteAsync(id);
+    }
+
+    private string NextCreatedId()
+    {
+        var id = "bench-save-" + Interlocked.Increment(ref _sequence).ToString("D8");
+        _createdIds.Add(id);
+        return id;
     }
 
     private static FlowState CreateState(string flowId)

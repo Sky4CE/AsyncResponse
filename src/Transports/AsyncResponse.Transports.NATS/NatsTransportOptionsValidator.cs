@@ -22,6 +22,24 @@ internal static class NatsTransportOptionsValidator
                 $"{nameof(NatsAsyncResponseTransportOptions)}.{name} '{value}' must not contain whitespace or the NATS wildcards '*'/'>'.");
     }
 
+    /// <summary>
+    /// nats-server caps JetStream stream/consumer names at 255 characters (its subject-length
+    /// default is far larger, but names derived from subjects share the cap). A longer value fails
+    /// stream/consumer creation at first use — deep inside the subscriber retry loop as an opaque
+    /// broker error retried forever — and derived stream names size a stack buffer from the
+    /// subject, so the bound is enforced here as a named startup error.
+    /// </summary>
+    private const int NameLengthCap = 255;
+
+    private static void EnsureNameLength(string? value, string name)
+    {
+        if (value is not null && value.Length > NameLengthCap)
+            throw new InvalidOperationException(
+                $"{nameof(NatsAsyncResponseTransportOptions)}.{name} resolves to {value.Length} characters; " +
+                $"NATS limits subjects and JetStream stream/consumer names to {NameLengthCap} characters, " +
+                "so longer values fail stream/consumer creation at first use instead of at startup.");
+    }
+
     private static void EnsureDistinct(string left, string right, string kind, string leftName, string rightName)
     {
         if (StringComparer.Ordinal.Equals(left, right))
@@ -54,6 +72,19 @@ internal static class NatsTransportOptionsValidator
         ValidateSubjectToken(options.ResponseSubject, nameof(options.ResponseSubject));
         ValidateSubjectToken(options.DeadLetterSubject, nameof(options.DeadLetterSubject));
 
+        // Length caps must run BEFORE the schema below resolves anything: stream defaulting sizes
+        // a stack buffer from the subject, so the raw inputs are bounded before code derives from
+        // them.
+        EnsureNameLength(options.SubjectPrefix, nameof(options.SubjectPrefix));
+        EnsureNameLength(options.WorkerSubject, nameof(options.WorkerSubject));
+        EnsureNameLength(options.ResponseSubject, nameof(options.ResponseSubject));
+        EnsureNameLength(options.DeadLetterSubject, nameof(options.DeadLetterSubject));
+        EnsureNameLength(options.WorkerStream, nameof(options.WorkerStream));
+        EnsureNameLength(options.ResponseStream, nameof(options.ResponseStream));
+        EnsureNameLength(options.DeadLetterStream, nameof(options.DeadLetterStream));
+        EnsureNameLength(options.WorkerConsumer, nameof(options.WorkerConsumer));
+        EnsureNameLength(options.ResponseConsumer, nameof(options.ResponseConsumer));
+
         // Worker, response, and dead-letter traffic must never share a subject or a stream: the
         // durable consumers are unfiltered, so a shared stream feeds every role every message (and
         // a dead-letter republish landing back in the worker stream loops poison forever). Compare
@@ -62,6 +93,16 @@ internal static class NatsTransportOptionsValidator
         // one stream — which EnsureStreamAsync would then silently repoint to whichever role ran
         // last.
         var schema = new NatsTransportSubjectSchema(options);
+
+        // Re-check the RESOLVED names: a prefix inside the cap can still derive an over-cap
+        // subject/stream once the role suffix is appended.
+        EnsureNameLength(schema.WorkerSubject, nameof(options.WorkerSubject));
+        EnsureNameLength(schema.ResponseSubject, nameof(options.ResponseSubject));
+        EnsureNameLength(schema.DeadLetterSubject, nameof(options.DeadLetterSubject));
+        EnsureNameLength(schema.WorkerStream, nameof(options.WorkerStream));
+        EnsureNameLength(schema.ResponseStream, nameof(options.ResponseStream));
+        EnsureNameLength(schema.DeadLetterStream, nameof(options.DeadLetterStream));
+
         EnsureDistinct(schema.WorkerSubject, schema.ResponseSubject, "subject", nameof(options.WorkerSubject), nameof(options.ResponseSubject));
         EnsureDistinct(schema.WorkerSubject, schema.DeadLetterSubject, "subject", nameof(options.WorkerSubject), nameof(options.DeadLetterSubject));
         EnsureDistinct(schema.ResponseSubject, schema.DeadLetterSubject, "subject", nameof(options.ResponseSubject), nameof(options.DeadLetterSubject));

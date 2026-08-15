@@ -64,6 +64,88 @@ public class KafkaDispatcherTests
             }
         };
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ValidateOptions_RejectsNonPositiveMaxPollInterval(int seconds)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                KafkaTestData.NewOptions(),
+                new KafkaSubscriberOptions { MaxPollInterval = TimeSpan.FromSeconds(seconds) },
+                KafkaSubscriberRole.Worker));
+
+        Assert.Contains(nameof(KafkaSubscriberOptions.MaxPollInterval), ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_RejectsMaxPollIntervalAboveTheLibrdkafkaRange()
+    {
+        // > 86,400,000 ms fails consumer CONSTRUCTION inside the subscriber loop, not validation.
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                KafkaTestData.NewOptions(),
+                new KafkaSubscriberOptions { MaxPollInterval = TimeSpan.FromDays(2) },
+                KafkaSubscriberRole.Worker));
+
+        Assert.Contains("max.poll.interval.ms", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_RejectsRetryDelayBudgetThatCannotFitTheMaxPollInterval()
+    {
+        // The in-process retry delays run on the poll thread: 4 completed attempts back off
+        // 20+40+80+160 = 300s of pure delay, which cannot fit within half of a 5-minute
+        // max.poll.interval.ms — the broker would evict the consumer mid-retry.
+        var subscriberOptions = new KafkaSubscriberOptions
+        {
+            MaxDeliveryAttempts = 5,
+            HandlerRetryBaseDelay = TimeSpan.FromSeconds(20),
+            HandlerRetryMaxDelay = TimeSpan.FromSeconds(160)
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            KafkaMessageDispatcher.ValidateOptions(
+                KafkaTestData.NewOptions(),
+                subscriberOptions,
+                KafkaSubscriberRole.Worker));
+
+        Assert.Contains(nameof(KafkaSubscriberOptions.MaxPollInterval), ex.Message, StringComparison.Ordinal);
+        Assert.Contains("evicted", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ValidateOptions_AcceptsRetryBudgetOnceMaxPollIntervalIsRaised()
+    {
+        // The same budget passes when the operator raises the poll interval to hold it.
+        KafkaMessageDispatcher.ValidateOptions(
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions
+            {
+                MaxDeliveryAttempts = 5,
+                HandlerRetryBaseDelay = TimeSpan.FromSeconds(20),
+                HandlerRetryMaxDelay = TimeSpan.FromSeconds(160),
+                MaxPollInterval = TimeSpan.FromMinutes(15)
+            },
+            KafkaSubscriberRole.Worker);
+    }
+
+    [Fact]
+    public void ValidateOptions_UnlimitedRetries_SkipTheRetryBudgetCheck()
+    {
+        // MaxDeliveryAttempts = 0 has no finite delay budget; the option's doc pins staying
+        // under the ceiling as the operator's responsibility.
+        KafkaMessageDispatcher.ValidateOptions(
+            KafkaTestData.NewOptions(),
+            new KafkaSubscriberOptions
+            {
+                MaxDeliveryAttempts = 0,
+                HandlerRetryBaseDelay = TimeSpan.FromMinutes(2),
+                HandlerRetryMaxDelay = TimeSpan.FromMinutes(10)
+            },
+            KafkaSubscriberRole.Worker);
+    }
+
     [Fact]
     public void ValidateOptions_AckAfterEnqueue_RequiresBackgroundWorkerCount()
     {

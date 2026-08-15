@@ -24,6 +24,8 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DbTransportShared.cs" Link="DbTransportShared.cs" />
+    <Compile Include="..\Shared\CorrelationIdJsonPaths.cs" Link="CorrelationIdJsonPaths.cs" />
+    <Compile Include="..\Shared\SubscriberSupervisor.cs" Link="SubscriberSupervisor.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -34,6 +36,8 @@
 
   <ItemGroup>
     <Compile Include="..\..\Shared\MongoOwnershipLedger.cs" Link="MongoOwnershipLedger.cs" />
+    <Compile Include="..\..\Shared\MongoNamespaceRegistry.cs" Link="MongoNamespaceRegistry.cs" />
+    <Compile Include="..\..\Shared\MongoTransientFaults.cs" Link="MongoTransientFaults.cs" />
   </ItemGroup>
 
 </Project>

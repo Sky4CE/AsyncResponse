@@ -50,6 +50,30 @@ public sealed class MongoDbFlowStateStoreTests
         Assert.InRange(harness.Inserted!.UpdatedAtUtc, before, DateTime.UtcNow);
     }
 
+    [Theory]
+    [MemberData(nameof(NonDateLocalTimes))]
+    public async Task TryCreate_NonDateLocalTime_FallsBackToAppClock(BsonValue localTime)
+    {
+        // Only BsonDateTime implements ToUniversalTime — every other BsonValue throws
+        // NotSupportedException. A mongo-compatible endpoint (Cosmos Mongo API, DocumentDB,
+        // FerretDB) answering hello with a PRESENT non-date localTime must fall back exactly
+        // like an absent one, not fail every create.
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1, ["localTime"] = localTime });
+        var before = DateTime.UtcNow;
+
+        Assert.True(await harness.Store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)));
+
+        Assert.NotNull(harness.Inserted);
+        Assert.InRange(harness.Inserted!.UpdatedAtUtc, before, DateTime.UtcNow);
+    }
+
+    public static TheoryData<BsonValue> NonDateLocalTimes =>
+    [
+        BsonNull.Value,
+        new BsonString("2031-03-14T09:26:53.589Z"),
+        new BsonInt64(1_900_000_000_000)
+    ];
+
     private static FlowState CreateState(string flowId) => new()
     {
         FlowId = flowId,

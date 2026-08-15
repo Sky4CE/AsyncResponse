@@ -51,37 +51,20 @@ internal abstract class KafkaSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = AsyncResponseRetry.Backoff(
-                    failures,
-                    Options.SubscriberRetryBaseDelay,
-                    Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(
-                    ex,
-                    "Kafka subscriber failed for topic {Topic} ({Role}); retrying in {RetryDelay}.",
-                    Topic,
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(
+                failures,
+                Options.SubscriberRetryBaseDelay,
+                Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "Kafka subscriber failed for topic {Topic} ({Role}); retrying in {RetryDelay}.",
+                Topic,
+                SubscriberRole,
+                retryDelay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {

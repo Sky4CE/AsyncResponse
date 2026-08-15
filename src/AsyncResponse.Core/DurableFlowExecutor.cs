@@ -52,6 +52,7 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     private readonly TimeProvider _timeProvider;
     private readonly IDurableFlowExecutionObserver[] _observers;
     private readonly IWorkerTransport? _workerTransport;
+    private readonly TimeSpan? _channelDefaultWaitTimeout;
     private readonly Dictionary<string, DurableFlowRegistration> _registrations;
     private readonly CancellationToken _hostStopping;
 
@@ -68,9 +69,11 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         Microsoft.Extensions.Hosting.IHostApplicationLifetime? hostLifetime = null,
         TimeProvider? timeProvider = null,
         IEnumerable<IDurableFlowExecutionObserver>? observers = null,
-        IWorkerTransport? workerTransport = null)
+        IWorkerTransport? workerTransport = null,
+        TimeSpan? channelDefaultWaitTimeout = null)
     {
         _workerTransport = workerTransport;
+        _channelDefaultWaitTimeout = channelDefaultWaitTimeout;
         _scopeFactory = scopeFactory;
         _builder = builder;
         _subscriber = subscriber;
@@ -512,13 +515,28 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             lease,
             _timeProvider,
             _observers,
-            _workerTransport);
+            _workerTransport,
+            _channelDefaultWaitTimeout);
 
         // Statically-typed path for flows registered via WithDurableFlow<TFlow, TInput>(): no
         // type-name resolution, no MakeGenericType, no MethodInfo.Invoke — the path trimmed and
         // Native AOT apps rely on.
         if (state.FlowTypeName is not null && _registrations.TryGetValue(state.FlowTypeName, out var registration))
         {
+            // Fail closed exactly like the reflection fallback: a run persisted with a different
+            // input type than the registration's TInput would otherwise silently parse the old
+            // payload as the new type — renamed or added members become defaults — and execute
+            // the remaining steps against wrong input. Null tolerated: ledgers written before the
+            // stamp existed carry no input type name.
+            if (state.InputTypeName is not null
+                && !string.Equals(state.InputTypeName, registration.InputTypeFullName, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Durable flow type '{state.FlowTypeName}' is registered with input type '{registration.InputTypeFullName}', " +
+                    $"but the persisted run carries input type '{state.InputTypeName}'; the flow state was written by an " +
+                    "incompatible flow definition.");
+            }
+
             var flow = ResolveFlowFromDi(serviceProvider, registration.FlowType);
             var input = state.InputJson is null ? null : registration.DeserializeInput(state.InputJson);
             await registration.ExecuteAsync(flow, context, input).ConfigureAwait(false);

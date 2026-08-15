@@ -42,6 +42,8 @@ AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SecretKey.get -> string?
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SecretKey.set -> void
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ServiceUrl.get -> string?
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ServiceUrl.set -> void
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ShutdownTimeout.get -> System.TimeSpan
+AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.ShutdownTimeout.set -> void
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SqsAsyncResponseOptions() -> void
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryBaseDelay.get -> System.TimeSpan
 AsyncResponse.Transports.SQS.SqsAsyncResponseOptions.SubscriberRetryBaseDelay.set -> void

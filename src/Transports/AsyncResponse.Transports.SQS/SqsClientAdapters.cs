@@ -133,6 +133,10 @@ internal sealed class SqsClientAdapter(
             receiveCount = parsedReceiveCount;
         }
 
+        // Ordinal on purpose, unlike the sibling transports' OrdinalIgnoreCase inbound header maps:
+        // SQS treats attribute names case-sensitively, so "CorrelationId" and "correlationId" can
+        // coexist as two distinct real attributes on one message — a case-folding map would alias
+        // them and let one silently shadow the other. The outbound publish path is Ordinal too.
         var messageAttributes = new Dictionary<string, string>(StringComparer.Ordinal);
         if (message.MessageAttributes is { } attributes)
         {

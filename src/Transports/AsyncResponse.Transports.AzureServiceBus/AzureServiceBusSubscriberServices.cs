@@ -43,35 +43,19 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var queue = QueueName;
-        var failures = 0;
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(queue, stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var retryDelay = RetryDelay(failures);
-                Logger.LogWarning(
-                    ex,
-                    "Azure Service Bus subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
-                    queue,
-                    SubscriberRole,
-                    retryDelay);
-                await Task.Delay(retryDelay, stoppingToken).ConfigureAwait(false);
-            }
-        }
+        return SubscriberSupervisor.RunAsync(
+            ct => RunSubscriberAsync(queue, ct),
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, retryDelay) => Logger.LogWarning(
+                ex,
+                "Azure Service Bus subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.",
+                queue,
+                SubscriberRole,
+                retryDelay));
     }
 
     private async Task RunSubscriberAsync(string queue, CancellationToken stoppingToken)
@@ -233,13 +217,6 @@ internal abstract class AzureServiceBusSubscriberService : BackgroundService
         public int SettledCount => Volatile.Read(ref _settledCount);
 
         public void MarkSettled() => Interlocked.Increment(ref _settledCount);
-    }
-
-    private TimeSpan RetryDelay(int failures)
-    {
-        var exponent = Math.Max(0, failures - 1);
-        var milliseconds = Options.SubscriberRetryBaseDelay.TotalMilliseconds * Math.Pow(2, exponent);
-        return TimeSpan.FromMilliseconds(Math.Min(milliseconds, Options.SubscriberRetryMaxDelay.TotalMilliseconds));
     }
 }
 

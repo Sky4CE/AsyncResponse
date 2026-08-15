@@ -1,3 +1,5 @@
+using AsyncResponse.Internal;
+
 namespace AsyncResponse.Transports.PostgreSQL;
 
 internal static class PostgreSqlTransportOptionsValidator
@@ -33,18 +35,10 @@ internal static class PostgreSqlTransportOptionsValidator
             ("claim index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "claim")),
             ("created index (derived from MessageTable)", PostgreSqlTransportStore.IndexName(options.MessageTable, "created")),
         ];
-        for (var i = 0; i < namePlan.Length; i++)
-        {
-            for (var j = i + 1; j < namePlan.Length; j++)
-            {
-                if (string.Equals(namePlan[i].Name, namePlan[j].Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException(
-                        $"{nameof(PostgreSqlAsyncResponseTransportOptions)}: the {namePlan[i].Role} and the {namePlan[j].Role} both resolve to " +
-                        $"'{namePlan[j].Name}'; rename {nameof(options.MessageTable)} so the derived index names stay distinct.");
-                }
-            }
-        }
+        RelationalNamePlan.RequireDistinct(
+            namePlan,
+            nameof(PostgreSqlAsyncResponseTransportOptions),
+            $"; rename {nameof(options.MessageTable)} so the derived index names stay distinct.");
 
         // Timer-armed knobs get the .NET timer ceiling (LockTimeout also drives the in-process
         // lease-renewal Task.Delay at half its value); DeadLetterRetention and RedeliveryDelay are

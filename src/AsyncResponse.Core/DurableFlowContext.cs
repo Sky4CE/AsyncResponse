@@ -28,9 +28,16 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     private readonly TimeProvider _timeProvider;
     private readonly IDurableFlowExecutionObserver[] _observers;
     private readonly IWorkerTransport? _workerTransport;
+    private readonly TimeSpan? _channelDefaultWaitTimeout;
     private bool _suspended;
     private bool _progressDirty;
     private DateTime _lastPersistenceUtc;
+
+    /// <summary>
+    /// How many ancestors a long park refreshes (see <see cref="ExtendAncestorLedgersAsync"/>);
+    /// far beyond any sane child-flow nesting, small enough to bound a corrupted parent cycle.
+    /// </summary>
+    private const int MaxAncestorLedgerDepth = 16;
 
     /// <summary>Creates the context for one execution of the given run.</summary>
     public DurableFlowContext(
@@ -45,7 +52,8 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         FlowExecutionLease lease,
         TimeProvider? timeProvider = null,
         IDurableFlowExecutionObserver[]? observers = null,
-        IWorkerTransport? workerTransport = null)
+        IWorkerTransport? workerTransport = null,
+        TimeSpan? channelDefaultWaitTimeout = null)
     {
         _state = state;
         _store = store;
@@ -59,6 +67,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         _timeProvider = timeProvider ?? TimeProvider.System;
         _observers = observers ?? [];
         _workerTransport = workerTransport;
+        _channelDefaultWaitTimeout = channelDefaultWaitTimeout;
     }
 
     private DateTime UtcNow => _timeProvider.GetUtcNow().UtcDateTime;
@@ -173,9 +182,24 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Timer, wakeAtUtc: wakeAtUtc).ConfigureAwait(false);
 
         var remaining = wakeAtUtc - UtcNow;
-        ThrowIfSleepBeyondLedger(name, remaining);
-
         var firstPass = checkpoint.WakeAtUtc is null;
+
+        // The ledger bound is settled at the FIRST arm, against the options in force then; a
+        // replay never re-litigates the checkpointed sleep against the CURRENT options — raising
+        // StateExpiry mid-sleep shrinks the recomputed bound and would terminally fail a parked
+        // timer that was valid when it was armed, exactly the class of failure the
+        // argument-ignoring contract above rules out.
+        if (firstPass)
+            ThrowIfSleepBeyondLedger(name, remaining);
+
+        // The skew proof rides the wake-up that carried it, and that wake-up targets the ONE step
+        // whose due time is already persisted — the parked timer this delivery re-executes.
+        // Claiming it here (one-shot) scopes the forced-early fallback to that step alone: an
+        // unrelated later timer in the same replay suspends normally instead of inheriting an
+        // exemption that would pin it in process for its full remainder, or fail it on the
+        // 49.7-day ceiling below.
+        var forcedEarly = !firstPass && WorkerJobSkewScope.TryConsumeForcedEarlyExecution();
+
         if (firstPass)
         {
             // Persist the breadcrumb BEFORE any wake-up can exist, with a TTL that covers the whole
@@ -202,7 +226,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             // time. That fallback needs no new envelope and is the same one non-delayed transports
             // always take.
             if (remaining > _options.TimerInProcessThreshold
-                && !WorkerJobSkewScope.IsForcedEarlyExecution
+                && !forcedEarly
                 && _workerTransport is IDelayedWorkerTransport delayedTransport
                 && delayedTransport.MaxPublishDelay > TimeSpan.Zero)
             {
@@ -220,7 +244,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 throw new DurableFlowFailedException(
                     $"Timer step '{name}' of flow '{FlowId}' sleeps for {remaining.TotalDays:0.#} days, which exceeds the " +
                     $"{AsyncResponseChannelOptions.MaxTimerBackedTimeout.TotalDays:0.#}-day .NET timer ceiling, and " +
-                    (WorkerJobSkewScope.IsForcedEarlyExecution
+                    (forcedEarly
                         ? "this wake-up was released early because the transport's delay gate and the publishing clock disagree, so " +
                           "re-suspending would loop instead of sleeping. Fix the clock skew between the application and the broker/database."
                         : $"the registered worker transport has no native delayed delivery ({nameof(IDelayedWorkerTransport)}) to suspend on. " +
@@ -309,7 +333,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// timeouts are timer-bounded far below it), the sum here always carries the full StateExpiry
     /// margin past the due instant.
     /// </summary>
-    private Task SaveForSleepAsync(TimeSpan remaining, CancellationToken cancellationToken)
+    private async Task SaveForSleepAsync(TimeSpan remaining, CancellationToken cancellationToken)
     {
         var margin = AsyncResponseChannelOptions.MaxPersistenceTtl - _options.StateExpiry;
         var ttl = remaining <= TimeSpan.Zero
@@ -317,7 +341,72 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             : remaining >= margin
                 ? AsyncResponseChannelOptions.MaxPersistenceTtl
                 : remaining + _options.StateExpiry;
-        return SaveAsync(cancellationToken, ttl: ttl);
+        await SaveAsync(cancellationToken, ttl: ttl).ConfigureAwait(false);
+
+        // A parked ancestor's row must survive this run's whole wait, not just its own idle
+        // margin: nothing refreshes an ancestor while it waits on this chain (lease renewal only
+        // stamps the lease columns), so a descendant parking beyond the ancestor's StateExpiry
+        // silently expired the ancestor and the eventual completion wake-up found no state.
+        if (ttl > _options.StateExpiry && _state.ParentFlowId is not null)
+            await ExtendAncestorLedgersAsync(ttl, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Best-effort TTL refresh of the ancestor chain when this run parks for a window its own
+    /// plain <see cref="DurableFlowOptions.StateExpiry"/> would not cover. Only
+    /// <see cref="FlowRunStatus.Running"/> ancestors are stamped — a terminal or
+    /// operator-suspended run is not waiting on this chain, and an absent row is never
+    /// resurrected (the walk stops there and the expired-ancestor failure surfaces on wake-up,
+    /// as before). Failures log and return: this run's own checkpoint already latched, and
+    /// faulting the park over ancestor insurance would re-run the step for a write the next long
+    /// park retries anyway.
+    /// </summary>
+    private async Task ExtendAncestorLedgersAsync(TimeSpan ttl, CancellationToken cancellationToken)
+    {
+        var ancestorId = _state.ParentFlowId;
+        for (var depth = 0; ancestorId is not null && depth < MaxAncestorLedgerDepth; depth++)
+        {
+            string? next = null;
+            var running = false;
+            try
+            {
+                var found = await FlowStateConcurrency.MutateAsync(
+                    _store,
+                    ancestorId,
+                    ttl,
+                    _timeProvider,
+                    state =>
+                    {
+                        next = state.ParentFlowId;
+                        running = state.Status == FlowRunStatus.Running;
+                        return running;
+                    },
+                    cancellationToken).ConfigureAwait(false);
+                if (!found)
+                {
+                    _logger.LogWarning(
+                        "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
+                        FlowId, ttl, ancestorId);
+                    return;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Flow {FlowId} could not extend ancestor flow {AncestorFlowId}'s ledger TTL for its {Ttl} park; the ancestor keeps its current expiry.",
+                    FlowId, ancestorId, ttl);
+                return;
+            }
+
+            if (!running)
+                return;
+            ancestorId = next;
+        }
     }
 
     /// <inheritdoc />
@@ -524,8 +613,45 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             ? checkpoint.PendingCorrelationId!
             : AsyncResponseContext.GenerateCorrelationId();
         var stepTimeout = timeout ?? _options.DefaultStepTimeout;
+        // The window the ledger must outlive: the resolved step timeout, or — for a timeout-less
+        // wait — the channel's declared default waiter timeout, which the channel arms on the
+        // waiter below anyway. Null only when the channel declares nothing; such waits keep the
+        // historical plain-TTL stamp and re-arm-in-full replays.
+        var waitWindow = stepTimeout ?? _channelDefaultWaitTimeout;
 
         await NotifyStepAsync(static (o, e) => o.OnStepStartingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);
+
+        if (reattach && checkpoint.AwaitDeadlineUtc is { } awaitDeadline)
+        {
+            // The deadline persisted at the FIRST arm is the step's fault clock across
+            // executions: a replay arms the REMAINDER, never a fresh full window. Recomputing the
+            // window per attempt let every redelivery inside the timeout restart both the fault
+            // clock and the ledger TTL from zero — a remote system that never answers produced a
+            // run that neither completed nor alarmed, kept alive indefinitely.
+            var remainingWindow = awaitDeadline - UtcNow;
+            if (remainingWindow <= TimeSpan.Zero)
+            {
+                // The window elapsed while no execution was live. Recovery may have consumed the
+                // response and completed the step in that gap — prefer its checkpoint over a
+                // fault (same authority argument as the post-registration short-circuit below).
+                if (await TryShortCircuitRecoveredCheckpointAsync(name, checkpoint).ConfigureAwait(false))
+                    return DeserializeResult<TResponse>(checkpoint.ResultJson);
+
+                // Settle exactly like the live timeout the waiter would have produced: the fault
+                // is recorded so the next execution restarts the step fresh, and the exception
+                // propagates as retriable for the transport's bounded redelivery.
+                var timedOut = new TimeoutException(
+                    $"Timed out waiting for response for correlationId {correlationId}: the await deadline {awaitDeadline:O} " +
+                    "elapsed while no execution was live.");
+                checkpoint.Faulted = true;
+                checkpoint.Message = timedOut.Message;
+                await SaveAsync(CancellationToken.None, cause: timedOut).ConfigureAwait(false);
+                throw timedOut;
+            }
+
+            stepTimeout = remainingWindow;
+            waitWindow = remainingWindow;
+        }
 
         var waiter = await CreateWaiterAsync(correlationId, until, stepTimeout, name).ConfigureAwait(false);
         var triggerCompleted = reattach;
@@ -552,14 +678,18 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 checkpoint.PendingPayloadTypeFullName = typeof(TResponse).FullName;
                 checkpoint.Faulted = false;
                 checkpoint.Message = null;
+                // The fault clock survives crashes and redeliveries only through this stamp (see
+                // the re-attach deadline branch above); null when the effective window is unknown,
+                // and such waits keep the recompute-per-attempt behavior.
+                checkpoint.AwaitDeadlineUtc = waitWindow is { } window ? UtcNow.Add(window) : null;
                 // The ledger must outlive the wait it records, exactly as SaveForSleepAsync covers
-                // a timer's sleep: with a step timeout longer than StateExpiry, a plain-TTL stamp
+                // a timer's sleep: with a wait window longer than StateExpiry, a plain-TTL stamp
                 // expires the row (and with it the lease renewal's anchor) mid-wait — the lease is
                 // marked lost against a row that no longer exists and the run is unrecoverable. A
-                // timeout-less wait keeps the plain stamp: bounding open-ended idleness is what
-                // StateExpiry is documented to do.
-                if (stepTimeout is { } waitWindow)
-                    await SaveForSleepAsync(waitWindow, cancellationToken).ConfigureAwait(false);
+                // wait whose window is unknown keeps the plain stamp: bounding open-ended idleness
+                // is what StateExpiry is documented to do.
+                if (waitWindow is { } armWindow)
+                    await SaveForSleepAsync(armWindow, cancellationToken).ConfigureAwait(false);
                 else
                     await SaveAsync(cancellationToken).ConfigureAwait(false);
 
@@ -569,12 +699,14 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             else
             {
                 // Replayed execution re-attaching to an in-flight wait: the executor's
-                // unconditional per-attempt save reset the ledger TTL to StateExpiry, so a step
-                // timeout longer than StateExpiry would out-live its own ledger and strand the
+                // unconditional per-attempt save reset the ledger TTL to StateExpiry, so a wait
+                // window longer than StateExpiry would out-live its own ledger and strand the
                 // run mid-wait — re-extend to cover the wait, exactly as the fresh path above
-                // and the timer path's replay branch do. A timeout-less re-attach keeps the
-                // plain stamp the executor already wrote this attempt.
-                if (stepTimeout is { } replayWindow)
+                // and the timer path's replay branch do. With a persisted deadline the window is
+                // the REMAINDER (shrunk above); a legacy ledger without one re-extends (and
+                // re-arms) the full window — its fault clock restarts, the pre-deadline behavior.
+                // A window-less re-attach keeps the plain stamp the executor already wrote.
+                if (waitWindow is { } replayWindow)
                     await SaveForSleepAsync(replayWindow, cancellationToken).ConfigureAwait(false);
 
                 if (_logger.IsEnabled(LogLevel.Debug))

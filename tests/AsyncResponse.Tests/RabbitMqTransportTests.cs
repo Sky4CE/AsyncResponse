@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using RabbitMQ.Client;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -144,6 +145,41 @@ public class RabbitMqTransportTests
             Delivery("""{"CustomParameters":{"CorrelationId":"from-json"}}"""),
             """{"CustomParameters":{"CorrelationId":"from-json"}}""",
             options));
+    }
+
+    [Fact]
+    public void CorrelationExtractor_FormatsNumericAndTimestampHeadersCultureInvariantly()
+    {
+        // Red-on-old: the header-conversion catch-all rendered values under CurrentCulture, so a
+        // producer stamping the correlation id as an AMQP double read "1.5" on an en-US consumer
+        // and "1,5" on de-DE — the waiter registered on one host was never matched by the ingress
+        // on the other, and the wait ran to timeout.
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdHeader = "cid" };
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            Assert.Equal("1.5", RabbitMqCorrelationIdExtractor.Extract(
+                Delivery("{}", new BasicProperties { Headers = new Dictionary<string, object?> { ["cid"] = 1.5d } }),
+                "{}",
+                options));
+            Assert.Equal("2.25", RabbitMqCorrelationIdExtractor.Extract(
+                Delivery("{}", new BasicProperties { Headers = new Dictionary<string, object?> { ["cid"] = 2.25m } }),
+                "{}",
+                options));
+            Assert.Equal("08/15/2026 10:30:00 +00:00", RabbitMqCorrelationIdExtractor.Extract(
+                Delivery("{}", new BasicProperties
+                {
+                    Headers = new Dictionary<string, object?> { ["cid"] = new DateTimeOffset(2026, 8, 15, 10, 30, 0, TimeSpan.Zero) }
+                }),
+                "{}",
+                options));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 
     [Fact]
@@ -618,6 +654,18 @@ public class RabbitMqTransportTests
         Assert.Null(RabbitMqCorrelationIdExtractor.Extract(Delivery("{}"), "{}", options));
     }
 
+    [Fact]
+    public void CorrelationExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+    {
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        var options = new RabbitMqAsyncResponseOptions { CorrelationIdJsonPaths = ["CorrelationId"] };
+        const string json = """{"CorrelationId":"1","CorrelationId":"2"}""";
+
+        Assert.Throws<ArgumentException>(() => RabbitMqCorrelationIdExtractor.Extract(Delivery(json), json, options));
+    }
+
     // ---------- Topology declaration + message properties ----------
 
     [Fact]
@@ -786,7 +834,13 @@ public class RabbitMqTransportTests
         var subscriber = new RabbitMqWorkerSubscriber(
             Options.Create(new RabbitMqAsyncResponseOptions
             {
-                NetworkRecoveryInterval = TimeSpan.FromMilliseconds(20)
+                // A deliberately huge client-recovery interval: reaching a second attempt within
+                // the wait budget proves the restart delay derives from the subscriber retry
+                // knobs (jittered backoff), not from NetworkRecoveryInterval, which keeps its
+                // separate client-automatic-recovery meaning.
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(30),
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(1)
             }),
             Mock.Of<IAsyncResponseIngress>(),
             logger,
@@ -798,6 +852,30 @@ public class RabbitMqTransportTests
         await subscriber.StopAsync(CancellationToken.None);
 
         Assert.Contains(logger.Snapshot(), entry => entry.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public void Subscriber_RejectsInvalidSubscriberRetryDelays()
+    {
+        Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { SubscriberRetryBaseDelay = TimeSpan.Zero },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+        Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions { SubscriberRetryMaxDelay = TimeSpan.FromSeconds(-1) },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+
+        var ex = Assert.Throws<InvalidOperationException>(() => RabbitMqMessageDispatcher.ValidateOptions(
+            new RabbitMqAsyncResponseOptions
+            {
+                SubscriberRetryBaseDelay = TimeSpan.FromSeconds(10),
+                SubscriberRetryMaxDelay = TimeSpan.FromSeconds(5)
+            },
+            new RabbitMqSubscriberOptions(),
+            RabbitMqSubscriberRole.Worker));
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.SubscriberRetryBaseDelay), ex.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(RabbitMqAsyncResponseOptions.SubscriberRetryMaxDelay), ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -14,7 +14,8 @@ public sealed record AsyncResponseRecoveryStats(
     [property: JsonPropertyName("outstandingRegistrations")] int OutstandingRegistrations,
     [property: JsonPropertyName("withLiveWaiter")] int WithLiveWaiter,
     [property: JsonPropertyName("stale")] int Stale,
-    [property: JsonPropertyName("unknownAge")] int UnknownAge);
+    [property: JsonPropertyName("unknownAge")] int UnknownAge,
+    [property: JsonPropertyName("unprobeable")] int Unprobeable = 0);
 
 /// <summary>
 /// One stale recovery registration listed under the <c>staleEntries</c> key of the recovery
@@ -37,11 +38,15 @@ public sealed record AsyncResponseStaleRecoveryEntry(
 /// health-endpoint options, which is the ASP.NET Core default).
 /// </para>
 /// <list type="bullet">
-/// <item><description><b>Healthy</b> — last scan found no stale entries (or no scan has run yet:
-/// the watchdog starts with a delay, and readiness must not block on it).</description></item>
+/// <item><description><b>Healthy</b> — last scan found no stale entries; no scan has run yet but
+/// the watchdog is inside its first-scan budget (it starts with a delay, and readiness must not
+/// block on it); or this host's watchdog is deliberately idle (disabled, or the channel has no
+/// scanner — the multi-host pattern), reported as explicit data rather than an alert.</description></item>
 /// <item><description><b>Degraded</b> — stale entries exist, the last scan failed, the last scan
-/// was truncated at the buffer cap (its verdict covers a subset only), or the watchdog stopped
-/// publishing (snapshot older than twice the scan interval).</description></item>
+/// was truncated at the buffer cap (its verdict covers a subset only), waiter liveness could not
+/// be probed for some entries (their staleness is unknown), or the watchdog stopped publishing
+/// (snapshot older than twice the scan interval, or no first snapshot after the startup delay
+/// plus twice the interval).</description></item>
 /// </list>
 /// </summary>
 public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState _state, TimeProvider? _timeProvider = null) : IHealthCheck
@@ -51,16 +56,15 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
 
     /// <summary>Runs the CheckHealthAsync operation.</summary>
     public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
-        => Task.FromResult(Evaluate(_state.Latest, (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
+        => Task.FromResult(Evaluate(_state.Latest, _state.Activation, (_timeProvider ?? TimeProvider.System).GetUtcNow().UtcDateTime));
 
-    internal static HealthCheckResult Evaluate(AsyncResponseWatchdogSnapshot? snapshot, DateTime utcNow)
+    internal static HealthCheckResult Evaluate(
+        AsyncResponseWatchdogSnapshot? snapshot,
+        AsyncResponseWatchdogState.WatchdogActivation? activation,
+        DateTime utcNow)
     {
         if (snapshot is null)
-        {
-            return HealthCheckResult.Healthy(
-                "Async-response watchdog has not completed a scan yet.",
-                new Dictionary<string, object> { ["scanned"] = false });
-        }
+            return EvaluateBeforeFirstScan(activation, utcNow);
 
         var snapshotAge = utcNow - snapshot.ScanCompletedUtc;
         if (snapshotAge > snapshot.ScanInterval * 2)
@@ -94,9 +98,66 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
                 data: BuildData(snapshot));
         }
 
+        if (report.UnprobeableEntries > 0)
+        {
+            // Unknown liveness is never flagged stale (no false alarms), so without this a probe
+            // outage would zero every counter and read as a clean pass the scan never computed.
+            return HealthCheckResult.Degraded(
+                $"Async-response watchdog could not probe waiter liveness for {report.UnprobeableEntries} of {report.TotalEntries} recovery registration(s) (probe outage, or no IActiveSubscriberProbe registered); their staleness is unknown.",
+                data: BuildData(snapshot));
+        }
+
         return HealthCheckResult.Healthy(
             "No stale async-response recovery state.",
             BuildData(snapshot));
+    }
+
+    /// <summary>
+    /// Attestation before any snapshot exists. Three honest answers instead of a blanket Healthy:
+    /// a deliberately idle watchdog (disabled, or no scanner — the documented multi-host pattern)
+    /// stays alert-quiet but says so in data; an armed scan loop is Healthy only inside its
+    /// first-scan budget (startup delay plus two intervals) — past it the loop is as dead as one
+    /// that stopped publishing, and "no scan yet" must not mask that forever; with no activation
+    /// marker (watchdog not started, or none registered) there is no deadline to hold it to.
+    /// </summary>
+    private static HealthCheckResult EvaluateBeforeFirstScan(
+        AsyncResponseWatchdogState.WatchdogActivation? activation,
+        DateTime utcNow)
+    {
+        if (activation is { Scanning: false })
+        {
+            return HealthCheckResult.Healthy(
+                $"Async-response watchdog on this host does not scan ({activation.IdleReason}); recovery staleness is attested by the scanning host.",
+                new Dictionary<string, object>
+                {
+                    ["scanning"] = false,
+                    ["reason"] = activation.IdleReason ?? "unknown"
+                });
+        }
+
+        if (activation is { Scanning: true, StartedUtc: { } startedUtc })
+        {
+            var firstScanDueByUtc = startedUtc + activation.StartupDelay + 2 * activation.Interval;
+            var data = new Dictionary<string, object>
+            {
+                ["scanned"] = false,
+                ["scanning"] = true,
+                ["firstScanDueByUtc"] = firstScanDueByUtc
+            };
+
+            if (utcNow > firstScanDueByUtc)
+            {
+                return HealthCheckResult.Degraded(
+                    $"Async-response watchdog never completed its first scan: it started {startedUtc:u} and published nothing within the startup delay ({activation.StartupDelay}) plus twice the scan interval ({activation.Interval}).",
+                    data: data);
+            }
+
+            return HealthCheckResult.Healthy("Async-response watchdog has not completed a scan yet.", data);
+        }
+
+        return HealthCheckResult.Healthy(
+            "Async-response watchdog has not completed a scan yet.",
+            new Dictionary<string, object> { ["scanned"] = false });
     }
 
     private static Dictionary<string, object> BuildData(AsyncResponseWatchdogSnapshot snapshot)
@@ -104,7 +165,10 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
         var data = new Dictionary<string, object>
         {
             ["lastScanUtc"] = snapshot.ScanCompletedUtc,
-            ["scanIntervalMinutes"] = (int)snapshot.ScanInterval.TotalMinutes
+            // Human-readable text plus a lossless numeric — alert math derived from a
+            // whole-minutes value reads 0 for any sub-minute interval.
+            ["scanInterval"] = snapshot.ScanInterval.ToString(),
+            ["scanIntervalSeconds"] = snapshot.ScanInterval.TotalSeconds
         };
 
         if (snapshot.Report is not { } report)
@@ -116,7 +180,8 @@ public sealed class AsyncResponseRecoveryHealthCheck(AsyncResponseWatchdogState 
             report.TotalEntries,
             report.EntriesWithActiveWaiter,
             report.StaleEntries.Count,
-            report.UnknownAgeEntries);
+            report.UnknownAgeEntries,
+            report.UnprobeableEntries);
 
         if (report.StaleEntries.Count > 0)
         {

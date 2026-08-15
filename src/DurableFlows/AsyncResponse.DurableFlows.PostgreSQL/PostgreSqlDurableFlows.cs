@@ -88,8 +88,7 @@ public sealed class PostgreSqlDurableFlowOptions : DurableFlowOptions
         if (string.Equals(DurableFlowStoreShared.DerivedName(TableName, "_expires_idx", 63), TableName, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException(
                 $"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(TableName)} '{TableName}' collides with its derived expiry-index name; rename the table.");
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(PostgreSqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(PostgreSqlDurableFlowOptions));
     }
 }
 
@@ -104,7 +103,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
     private readonly bool _ownsDataSource;
     private readonly long _schemaLockKey;
     private long _lastPruneTicks;
-    private bool _created;
+    private volatile bool _created;
 
     public PostgreSqlFlowStateStore(NpgsqlDataSource dataSource, IOptions<PostgreSqlDurableFlowOptions> options, bool ownsDataSource = false)
     {
@@ -329,7 +328,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                 [
                     new(_options.TableName, 'r', Columns:
                         [
-                            new("flow_id", "text", Nullable: false),
+                            new("flow_id", "text", Nullable: false, RequiresDeterministicCollation: true),
                             new("state_json", "jsonb", Nullable: false),
                             new("expires_at_utc", "timestamp with time zone", Nullable: false),
                             new("updated_at_utc", "timestamp with time zone", Nullable: false),
@@ -380,10 +379,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);

@@ -57,11 +57,12 @@ public sealed class NativeAotPublishGateTests
                 repoRoot,
                 PublishTimeout);
 
-            if (publish.ExitCode != 0 && LooksLikeMissingNativeToolchain(publish.Output))
+            if (MissingNativeToolchainProbe(publish.ExitCode, publish.Output) is { } missingToolchain)
             {
                 Assert.Skip(
-                    "Native AOT publish needs the platform native toolchain (Windows: 'Desktop development with C++'; " +
-                    "Linux: clang + zlib1g-dev). Install it to run the AOT gate locally. Publish output tail: " +
+                    $"Native AOT publish needs the platform native toolchain (matched probe: \"{missingToolchain}\"; " +
+                    "Windows: 'Desktop development with C++'; Linux: clang + zlib1g-dev). Install it to run the " +
+                    "AOT gate locally. Publish output tail: " +
                     Tail(publish.Output, 500));
             }
 
@@ -235,10 +236,41 @@ public sealed class NativeAotPublishGateTests
         return (process.ExitCode, output.ToString());
     }
 
-    private static bool LooksLikeMissingNativeToolchain(string output)
-        => output.Contains("Platform linker not found", StringComparison.OrdinalIgnoreCase)
-           || output.Contains("Platform linker ('", StringComparison.OrdinalIgnoreCase)
-           || output.Contains("Microsoft.DotNet.ILCompiler is not supported", StringComparison.OrdinalIgnoreCase);
+    private static readonly string[] MissingNativeToolchainProbes =
+    [
+        "Platform linker not found",
+        "Platform linker ('",
+        "Microsoft.DotNet.ILCompiler is not supported",
+    ];
+
+    /// <summary>
+    /// Returns the matched missing-toolchain probe when — and only when — skipping is legitimate:
+    /// the publish failed, its output matches a known toolchain-absence diagnostic, and it carries
+    /// no trim/AOT analysis finding. A failure WITH an ILC finding must fail the gate even if
+    /// toolchain-probe text also appears in the output: with <c>-warnaserror</c> those findings are
+    /// the exact defect class this gate exists to catch, and a skip would green-light them.
+    /// </summary>
+    internal static string? MissingNativeToolchainProbe(int exitCode, string output)
+    {
+        if (exitCode == 0 || ContainsTrimOrAotAnalysisFinding(output))
+            return null;
+
+        foreach (var probe in MissingNativeToolchainProbes)
+        {
+            if (output.Contains(probe, StringComparison.OrdinalIgnoreCase))
+                return probe;
+        }
+
+        return null;
+    }
+
+    // "warning ILxxxx" counts too: -warnaserror fails the publish on the warning even when a
+    // component prints it un-promoted, so its presence in a failing publish is a real finding.
+    internal static bool ContainsTrimOrAotAnalysisFinding(string output)
+        => output.Contains("error IL2", StringComparison.OrdinalIgnoreCase)
+           || output.Contains("error IL3", StringComparison.OrdinalIgnoreCase)
+           || output.Contains("warning IL2", StringComparison.OrdinalIgnoreCase)
+           || output.Contains("warning IL3", StringComparison.OrdinalIgnoreCase);
 
     private static string FindRepoRoot()
     {

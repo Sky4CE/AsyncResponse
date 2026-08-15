@@ -55,12 +55,9 @@ public sealed class MySqlDurableFlowOptions : DurableFlowOptions
     /// <summary>Validates option values and throws on misconfiguration.</summary>
     public void Validate()
     {
-        if (string.IsNullOrWhiteSpace(ConnectionString))
-            throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(ConnectionString)} must be configured.");
-
+        DurableFlowStoreShared.ValidateConnectionString(ConnectionString, nameof(MySqlDurableFlowOptions));
         DurableFlowStoreShared.ValidateIdentifier(TableName, $"{nameof(MySqlDurableFlowOptions)}.{nameof(TableName)}", "MySQL", identifierCap: 64);
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(MySqlDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(MySqlDurableFlowOptions));
     }
 }
 
@@ -81,7 +78,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     private readonly MySqlDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private long _lastPruneTicks;
-    private bool _created;
+    private volatile bool _created;
 
     public MySqlFlowStateStore(IOptions<MySqlDurableFlowOptions> options)
     {
@@ -600,10 +597,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
@@ -625,24 +619,12 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
     }
 
-    private async Task<MySqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
-    {
-        // Row-count semantics: this store's lease renewal (and update fencing) treats
-        // ExecuteNonQuery's result as ROWS MATCHED, which is MySqlConnector's default
-        // (UseAffectedRows=false). EnsureCreatedAsync rejects a connection string that sets
-        // UseAffectedRows=true before any of those UPDATEs can run.
-        var connection = new MySqlConnection(_options.ConnectionString);
-        try
-        {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            return connection;
-        }
-        catch
-        {
-            await connection.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
-    }
+    // Row-count semantics: this store's lease renewal (and update fencing) treats
+    // ExecuteNonQuery's result as ROWS MATCHED, which is MySqlConnector's default
+    // (UseAffectedRows=false). EnsureCreatedAsync rejects a connection string that sets
+    // UseAffectedRows=true before any of those UPDATEs can run.
+    private Task<MySqlConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+        => DurableFlowStoreShared.OpenConnectionAsync<MySqlConnection>(_options.ConnectionString, cancellationToken);
 
     private string Table => Quote(_options.TableName);
     private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 64));

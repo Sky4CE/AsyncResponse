@@ -25,6 +25,8 @@
 
   <ItemGroup>
     <Compile Include="..\Shared\DbTransportShared.cs" Link="DbTransportShared.cs" />
+    <Compile Include="..\Shared\CorrelationIdJsonPaths.cs" Link="CorrelationIdJsonPaths.cs" />
+    <Compile Include="..\Shared\SubscriberSupervisor.cs" Link="SubscriberSupervisor.cs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -35,6 +37,8 @@
 
   <ItemGroup>
     <Compile Include="..\..\Shared\PostgreSqlRelationVerifier.cs" Link="PostgreSqlRelationVerifier.cs" />
+    <Compile Include="..\..\Shared\PostgreSqlTransientFaults.cs" Link="PostgreSqlTransientFaults.cs" />
+    <Compile Include="..\..\Shared\RelationalNamePlan.cs" Link="RelationalNamePlan.cs" />
   </ItemGroup>
 
 </Project>

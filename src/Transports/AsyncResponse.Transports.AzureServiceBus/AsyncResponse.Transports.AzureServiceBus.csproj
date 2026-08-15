@@ -23,6 +23,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Include="..\Shared\CorrelationIdJsonPaths.cs" Link="CorrelationIdJsonPaths.cs" />
+    <Compile Include="..\Shared\SubscriberSupervisor.cs" Link="SubscriberSupervisor.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Azure.Messaging.ServiceBus" />
   </ItemGroup>
 

@@ -47,7 +47,18 @@ public static class SqlServerAsyncResponseChannelServiceCollectionExtensions
             provider.GetService<TimeProvider>())));
         services.Replace(ServiceDescriptor.Singleton<IAsyncResponseBuilder>(provider => provider.GetRequiredService<IRecoverableAsyncResponseBuilder>()));
 
-        services.AddSingleton(new AsyncResponseChannelMarker(SqlServerAsyncResponseChannelOptions.ChannelName));
+        // The resolved default waiter timeout is declared through the marker so the startup
+        // validator can require the durable-flow ledger TTL to out-live a timeout-less awaited
+        // step, and the flow engine can extend a parked ledger by it — without either referencing
+        // channel option types.
+        services.AddSingleton(provider =>
+        {
+            var options = provider.GetRequiredService<Microsoft.Extensions.Options.IOptions<SqlServerAsyncResponseChannelOptions>>().Value;
+            return new AsyncResponseChannelMarker(SqlServerAsyncResponseChannelOptions.ChannelName)
+            {
+                EffectiveDefaultWaitTimeout = options.DefaultTimeout ?? options.RecoveryStateExpiry
+            };
+        });
         return builder;
     }
 }

@@ -113,6 +113,7 @@ public class MetricsTests
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.outstanding");
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.stale");
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.active_waiters");
+        Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.unprobeable");
     }
 
     [Fact]

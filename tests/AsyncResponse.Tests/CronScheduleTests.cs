@@ -110,6 +110,49 @@ public class CronScheduleTests
     }
 
     [Fact]
+    public void SteppedDayOfWeekWrapAround_StridesOnTheRealSevenDayWeek()
+    {
+        // "SAT-MON/2": Saturday, then +2 REAL days = Monday. Day-of-week has 8 slots for 7 values
+        // (0 and 7 are both Sunday); folding the stride by the 8-slot span credited the duplicate
+        // Sunday slot as a day, so this fired Saturday+Sunday. Jan 2030: Sat 5th, Sun 6th, Mon 7th.
+        Assert.Equal(Utc(2030, 1, 5, 0, 0), Next("0 0 * * SAT-MON/2", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 7, 0, 0), Next("0 0 * * SAT-MON/2", Utc(2030, 1, 5, 0, 0)));
+
+        // "FRI-MON/2": Friday, Sunday — Monday is out of stride (Fri 4th, Sun 6th, next Fri 11th).
+        Assert.Equal(Utc(2030, 1, 4, 0, 0), Next("0 0 * * FRI-MON/2", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 6, 0, 0), Next("0 0 * * FRI-MON/2", Utc(2030, 1, 4, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 11, 0, 0), Next("0 0 * * FRI-MON/2", Utc(2030, 1, 6, 0, 0)));
+
+        // "7-1/2" (Sunday spelled as 7, through Monday): Sunday only — Monday is one real day on.
+        Assert.Equal(Utc(2030, 1, 6, 0, 0), Next("0 0 * * 7-1/2", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 13, 0, 0), Next("0 0 * * 7-1/2", Utc(2030, 1, 6, 0, 0)));
+
+        // "6-0/2" (SAT-SUN): Saturday only — Sunday is adjacent, not two days on.
+        Assert.Equal(Utc(2030, 1, 5, 0, 0), Next("0 0 * * 6-0/2", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 12, 0, 0), Next("0 0 * * 6-0/2", Utc(2030, 1, 5, 0, 0)));
+    }
+
+    [Fact]
+    public void UnsteppedDayOfWeekWrapAround_StillCoversEveryDayInTheRange()
+    {
+        // Step 1 hits every slot, duplicate Sunday included, so the cycle fix leaves it as it was:
+        // SAT-MON = Saturday, Sunday, Monday (Jan 2030: 5th, 6th, 7th; then Sat 12th).
+        Assert.Equal(Utc(2030, 1, 5, 0, 0), Next("0 0 * * SAT-MON", Utc(2030, 1, 1, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 6, 0, 0), Next("0 0 * * SAT-MON", Utc(2030, 1, 5, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 7, 0, 0), Next("0 0 * * SAT-MON", Utc(2030, 1, 6, 0, 0)));
+        Assert.Equal(Utc(2030, 1, 12, 0, 0), Next("0 0 * * SAT-MON", Utc(2030, 1, 7, 0, 0)));
+    }
+
+    [Fact]
+    public void SteppedHourWrapAround_KeepsItsCadence()
+    {
+        // Hours have no duplicate slot: 22-2/2 = 22, 0, 2 — untouched by the day-of-week cycle fix.
+        Assert.Equal(Utc(2030, 1, 1, 22, 0), Next("0 22-2/2 * * *", Utc(2030, 1, 1, 21, 0)));
+        Assert.Equal(Utc(2030, 1, 2, 0, 0), Next("0 22-2/2 * * *", Utc(2030, 1, 1, 22, 0)));
+        Assert.Equal(Utc(2030, 1, 2, 2, 0), Next("0 22-2/2 * * *", Utc(2030, 1, 2, 0, 0)));
+    }
+
+    [Fact]
     public void StarStepInDayOfMonth_AndsWithRestrictedDayOfWeek()
     {
         // Vixie's star rule: "*/2" starts with '*', so it stays OUT of the dom/dow either-or and

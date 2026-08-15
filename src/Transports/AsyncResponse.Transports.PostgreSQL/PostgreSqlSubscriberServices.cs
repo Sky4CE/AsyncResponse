@@ -52,51 +52,40 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var failures = 0;
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                await RunSubscriberAsync(stoppingToken).ConfigureAwait(false);
-                return;
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                return;
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                failures++;
-                var delay = AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay);
-                Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay);
-                await Task.Delay(delay, stoppingToken).ConfigureAwait(false);
-            }
-        }
-    }
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        => SubscriberSupervisor.RunAsync(
+            RunSubscriberAsync,
+            stoppingToken,
+            failures => AsyncResponseRetry.Backoff(failures, Options.SubscriberRetryBaseDelay, Options.SubscriberRetryMaxDelay),
+            (ex, delay) => Logger.LogWarning(ex, "PostgreSQL subscriber failed for queue {Queue} ({Role}); retrying in {RetryDelay}.", Queue, Role, delay));
 
     private async Task RunSubscriberAsync(CancellationToken stoppingToken)
     {
         await _store.EnsureCreatedAsync(stoppingToken).ConfigureAwait(false);
         using var signalCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        var listenTask = Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token);
 
-        await using var dispatcher = new PostgreSqlMessageDispatcher(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            Role);
-
-        Logger.LogInformation(
-            "PostgreSQL subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
-            Queue,
-            Role,
-            SubscriberOptions.AckMode);
-
+        // The LISTEN task starts inside the try so ANY escape — the dispatcher's constructor
+        // included — runs the cancelling finally. Disposing signalCts does NOT cancel it, so an
+        // escape before the finally would otherwise leave ListenLoopAsync parked in
+        // connection.WaitAsync holding a pooled connection, one per retry until pool exhaustion.
+        Task? listenTask = null;
         try
         {
+            listenTask = Task.Run(() => ListenLoopAsync(signalCts.Token), signalCts.Token);
+
+            await using var dispatcher = new PostgreSqlMessageDispatcher(
+                HandleMessageAsync,
+                Options,
+                SubscriberOptions,
+                Logger,
+                Role);
+
+            Logger.LogInformation(
+                "PostgreSQL subscriber started. Queue: {Queue}. Role: {Role}. AckMode: {AckMode}.",
+                Queue,
+                Role,
+                SubscriberOptions.AckMode);
+
             while (!stoppingToken.IsCancellationRequested)
             {
                 var claimed = 0;
@@ -115,12 +104,15 @@ internal abstract class PostgreSqlSubscriberService : BackgroundService
         finally
         {
             await signalCts.CancelAsync().ConfigureAwait(false);
-            try
+            if (listenTask is not null)
             {
-                await listenTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
-            {
+                try
+                {
+                    await listenTask.WaitAsync(Options.ShutdownTimeout).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+                {
+                }
             }
         }
     }

@@ -1,3 +1,4 @@
+using AsyncResponse.Internal;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using System.Diagnostics;
@@ -101,7 +102,5 @@ internal static class PostgreSqlTransportRetry
         CancellationToken cancellationToken)
         => AsyncResponseRetry.ExecuteAsync(action, IsTransient, maxAttempts, baseDelay, maxDelay, cancellationToken);
 
-    public static bool IsTransient(Exception exception)
-        => exception is not OperationCanceledException
-           && (exception is NpgsqlException { IsTransient: true } || exception is TimeoutException);
+    public static bool IsTransient(Exception exception) => PostgreSqlTransientFaults.IsTransient(exception);
 }

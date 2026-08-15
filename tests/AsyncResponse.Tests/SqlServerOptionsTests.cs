@@ -528,6 +528,16 @@ public sealed class SqlServerOptionsTests
     }
 
     [Fact]
+    public void CorrelationExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(() => SqlServerCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"1","CorrelationId":"2"}""",
+            TransportOptions()));
+
+    [Fact]
     public void SqlServerRetry_ClassifiesTransientExceptions()
     {
         Assert.True(SqlServerTransportRetry.IsTransient(new TimeoutException()));

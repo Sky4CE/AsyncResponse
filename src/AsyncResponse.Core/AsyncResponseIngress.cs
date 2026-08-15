@@ -62,6 +62,10 @@ internal sealed class AsyncResponseIngress(
             // first attempt — that would convert a recoverable response into a permanent business
             // failure. Retry briefly in-process before escalating. Parse failures are excluded:
             // an unparseable message never becomes parseable, so it escalates immediately.
+            // Cancellation is excluded from BOTH the retry and the escalation below: it is not a
+            // handler failure (a durable flow losing its execution lease mid-dispatch surfaces
+            // here as an OperationCanceledException), so it propagates for the transport to
+            // NAK/redeliver instead of terminally failing a waiter whose response was never lost.
             // Recovery resume callbacks may be re-invoked by these retries, which matches their
             // contract — broker redelivery re-invokes them the same way.
             await AsyncResponseRetry.ExecuteAsync(
@@ -70,14 +74,14 @@ internal sealed class AsyncResponseIngress(
                     await _rawPublisher.SetRawResponseJson(messageJson, correlationId).ConfigureAwait(false);
                     return true;
                 },
-                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException),
+                isTransient: static ex => ex is not (System.Text.Json.JsonException or InvalidDataException or OperationCanceledException),
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
                 CancellationToken.None,
                 _timeProvider).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Ingress failed to process the inbound response message.");
             AsyncResponseDiagnostics.SetError(activity, ex);

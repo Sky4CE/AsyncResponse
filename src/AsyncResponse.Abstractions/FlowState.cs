@@ -126,6 +126,17 @@ public sealed class FlowStepState
     public string? PendingPayloadTypeFullName { get; set; }
 
     /// <summary>
+    /// The awaited step's fault deadline — the first arm's instant plus its resolved wait window —
+    /// persisted alongside <see cref="PendingCorrelationId"/> so a re-attaching execution arms the
+    /// REMAINDER of the window instead of a fresh full one: the fault clock survives crashes,
+    /// redeliveries, and lease losses, and a deadline found already elapsed faults the step exactly
+    /// like a live timeout. Additive wire property: absent on ledgers written before it existed,
+    /// and for waits whose effective window is unknown — such re-attaches arm the full window
+    /// again. Stays set after completion as the historical deadline.
+    /// </summary>
+    public DateTime? AwaitDeadlineUtc { get; set; }
+
+    /// <summary>
     /// Whether the last attempt of this step faulted (timeout or exception); a faulted awaited
     /// step is restarted fresh instead of re-attached.
     /// </summary>

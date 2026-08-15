@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -539,6 +540,16 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Fact]
+    public void CorrelationIdExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(() => AzureServiceBusCorrelationIdExtractor.Extract(
+            Delivery(body: """{"CorrelationId":"1","CorrelationId":"2"}"""),
+            """{"CorrelationId":"1","CorrelationId":"2"}""",
+            new AzureServiceBusAsyncResponseOptions()));
+
+    [Fact]
     public void CorrelationIdExtractor_HandlesApplicationPropertyTypes()
     {
         var options = new AzureServiceBusAsyncResponseOptions { CorrelationIdProperty = "cid" };
@@ -559,6 +570,41 @@ public sealed class AzureServiceBusTransportTests
             Delivery(properties: new Dictionary<string, object?> { ["cid"] = 42 }),
             "{}",
             options));
+    }
+
+    [Fact]
+    public void CorrelationIdExtractor_FormatsNumericAndTimestampPropertiesCultureInvariantly()
+    {
+        // Red-on-old: the property-conversion catch-all rendered values under CurrentCulture, so a
+        // producer stamping the correlation id as an AMQP double read "1.5" on an en-US consumer
+        // and "1,5" on de-DE — the waiter registered on one host was never matched by the ingress
+        // on the other, and the wait ran to timeout.
+        var options = new AzureServiceBusAsyncResponseOptions { CorrelationIdProperty = "cid" };
+        var original = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            Assert.Equal("1.5", AzureServiceBusCorrelationIdExtractor.Extract(
+                Delivery(properties: new Dictionary<string, object?> { ["cid"] = 1.5d }),
+                "{}",
+                options));
+            Assert.Equal("2.25", AzureServiceBusCorrelationIdExtractor.Extract(
+                Delivery(properties: new Dictionary<string, object?> { ["cid"] = 2.25m }),
+                "{}",
+                options));
+            Assert.Equal("08/15/2026 10:30:00 +00:00", AzureServiceBusCorrelationIdExtractor.Extract(
+                Delivery(properties: new Dictionary<string, object?>
+                {
+                    ["cid"] = new DateTimeOffset(2026, 8, 15, 10, 30, 0, TimeSpan.Zero)
+                }),
+                "{}",
+                options));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
     }
 
     [Fact]
@@ -692,6 +738,46 @@ public sealed class AzureServiceBusTransportTests
         Assert.True(receiver.ReceiveAttempts >= 2);
         ingress.Verify(i => i.HandleWorkerMessageAsync("worker-json"), Times.Once);
         Assert.Equal(1, calls.Complete);
+    }
+
+    [Fact]
+    public async Task Subscriber_RetryDelays_RouteThroughSharedJitteredBackoff()
+    {
+        // Red-on-old: the subscriber supervised its restarts through a private un-jittered
+        // base*2^n helper instead of AsyncResponseRetry.Backoff. Backoff floors every delay at
+        // 1 ms after half-jitter, so a sub-millisecond base yields exactly 1 ms; the old helper
+        // rendered the same base as a 0 ms (or sub-ms) delay — the first logged retry delays pin
+        // which computation the loop routes through.
+        var receiver = new FakeReceiver { FailuresBeforeReceive = 2 };
+        var client = new FakeServiceBusClient { Receiver = receiver };
+        var logger = new RetryDelayCapturingLogger<AzureServiceBusWorkerSubscriber>();
+        var calls = new SettlementCalls();
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>())).Returns(Task.CompletedTask);
+        var subscriber = new AzureServiceBusWorkerSubscriber(
+            Options.Create(new AzureServiceBusAsyncResponseOptions
+            {
+                WorkerQueue = "workers",
+                ResponseQueue = "responses",
+                ReceiveWaitTime = TimeSpan.FromMilliseconds(10),
+                SubscriberRetryBaseDelay = TimeSpan.FromTicks(4000), // 0.4 ms
+                SubscriberRetryMaxDelay = TimeSpan.FromSeconds(5)
+            }),
+            client,
+            ingress.Object,
+            logger);
+
+        await subscriber.StartAsync(CancellationToken.None);
+        receiver.Enqueue(Delivery(calls, queue: "workers"));
+        await calls.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        var delays = logger.RetryDelays;
+        Assert.True(delays.Count >= 2);
+        // Half a 0.4 ms (and 0.8 ms) exponential step sits under the 1 ms floor either way.
+        Assert.Equal(TimeSpan.FromMilliseconds(1), delays[0]);
+        Assert.Equal(TimeSpan.FromMilliseconds(1), delays[1]);
+        Assert.All(delays, delay => Assert.InRange(delay, TimeSpan.FromMilliseconds(1), TimeSpan.FromSeconds(5)));
     }
 
     [Fact]
@@ -1119,6 +1205,56 @@ public sealed class AzureServiceBusTransportTests
         {
             DisposeCalls++;
             return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class RetryDelayCapturingLogger<T> : ILogger<T>
+    {
+        private readonly object _gate = new();
+        private readonly List<TimeSpan> _retryDelays = [];
+
+        public IReadOnlyList<TimeSpan> RetryDelays
+        {
+            get
+            {
+                lock (_gate)
+                    return _retryDelays.ToArray();
+            }
+        }
+
+        public IDisposable BeginScope<TState>(TState state)
+            where TState : notnull
+            => NoopScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (state is not IReadOnlyList<KeyValuePair<string, object?>> values)
+                return;
+
+            foreach (var pair in values)
+            {
+                if (pair.Key == "RetryDelay" && pair.Value is TimeSpan delay)
+                {
+                    lock (_gate)
+                        _retryDelays.Add(delay);
+                }
+            }
+        }
+
+        private sealed class NoopScope : IDisposable
+        {
+            public static readonly NoopScope Instance = new();
+
+            public void Dispose()
+            {
+            }
         }
     }
 

@@ -243,8 +243,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
     {
         _scopeFactory = scopeFactory;
         _options = options.Value;
-        if (_options.MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(EFCoreDurableFlowOptions)}.{nameof(EFCoreDurableFlowOptions.MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(_options.MaxStateBytes, nameof(EFCoreDurableFlowOptions));
     }
 
     public async Task<FlowState?> LoadAsync(string flowId, CancellationToken cancellationToken = default)
@@ -395,10 +394,7 @@ public sealed class EFCoreFlowStateStore<[DynamicallyAccessedMembers(Dynamically
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await using var contextLease = await LeaseContextAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTime.UtcNow;

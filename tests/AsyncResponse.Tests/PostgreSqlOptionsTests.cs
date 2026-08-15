@@ -420,6 +420,16 @@ public sealed class PostgreSqlOptionsTests
     }
 
     [Fact]
+    public void CorrelationExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
+        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
+        // of the duplicates.
+        => Assert.Throws<ArgumentException>(() => PostgreSqlCorrelationIdExtractor.Extract(
+            headers: null,
+            """{"CorrelationId":"1","CorrelationId":"2"}""",
+            new PostgreSqlAsyncResponseTransportOptions()));
+
+    [Fact]
     public void PostgreSqlRetry_ClassifiesTransientExceptions()
     {
         var transientDriverFailure = new NpgsqlException("network", new TimeoutException());

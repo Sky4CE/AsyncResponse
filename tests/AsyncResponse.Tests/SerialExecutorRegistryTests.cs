@@ -298,6 +298,43 @@ public class SerialExecutorRegistryTests
         Assert.Contains("cid", warning.Message);
     }
 
+    [Fact]
+    public async Task RemoveAsync_WithAHungWorkItem_StillRetiresTheChannel_SoLaterEnqueuesRun()
+    {
+        // A dispatched work item runs arbitrary user code — an Until predicate that never
+        // completes. Retirement's dispose used to await the reader loop unbounded, so one hung
+        // item left Retiring set forever and every later enqueue for the correlation id (including
+        // a NEW waiter's) parked on the never-completed retirement. The bounded dispose abandons
+        // the hung item, logs it, and still retires the entry.
+        var logger = new CapturingLogger();
+        var registry = new SerialExecutorRegistry(logger, disposeDrainLimit: TimeSpan.FromMilliseconds(200));
+        registry.OnSubscriptionRegistered("cid");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", async () =>
+        {
+            started.TrySetResult();
+            await release.Task;
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await registry.RemoveAsync("cid").AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        var warning = Assert.Single(logger.Entries, entry => entry.Level == LogLevel.Warning);
+        Assert.Contains("cid", warning.Message);
+
+        // The channel key is usable again: a re-registered waiter's delivery must run, not park.
+        var ranAgain = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await registry.EnqueueAsync("cid", () => { ranAgain.TrySetResult(); return Task.CompletedTask; })
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await ranAgain.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Unwedge the abandoned item; its loop drains against the already-completed writer and exits.
+        release.TrySetResult();
+        registry.OnSubscriptionRetired("cid");
+        await registry.RemoveAsync("cid");
+    }
+
     /// <summary>Captures log entries so a test can assert a drop was reported rather than silent.</summary>
     private sealed class CapturingLogger : ILogger
     {

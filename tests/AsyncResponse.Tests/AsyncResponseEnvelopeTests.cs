@@ -8,8 +8,10 @@ namespace AsyncResponse.Tests;
 /// <summary>
 /// The wire envelope every published response travels in. Its custom converter is a persisted
 /// contract: it must round-trip payload and failure envelopes, tolerate a JSON <c>null</c> payload
-/// even for a non-nullable value type (assigning <c>default(T)</c> rather than throwing), and skip
-/// unknown properties so additive schema changes stay compatible.
+/// on failure envelopes even for a non-nullable value type (assigning <c>default(T)</c> rather
+/// than throwing) while rejecting one on success envelopes, bind payload properties
+/// case-insensitively like every other broker-ingress read, and skip unknown properties so
+/// additive schema changes stay compatible.
 /// </summary>
 public class AsyncResponseEnvelopeTests
 {
@@ -76,16 +78,69 @@ public class AsyncResponseEnvelopeTests
             json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
 
     [Fact]
-    public void NullPayload_ForNonNullableValueType_BecomesDefault()
+    public void NullPayload_OnAFailureEnvelope_BecomesDefault()
     {
-        // The converter assigns default(int) instead of throwing on a JSON null payload.
+        // The failure envelope's routine shape: the converter assigns default(int) instead of
+        // throwing on its JSON null payload, even for a non-nullable value type.
         var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
-            """{"SchemaVersion":1,"Success":true,"Payload":null}""",
+            """{"SchemaVersion":1,"Success":false,"Payload":null,"ExceptionMessage":"boom"}""",
             AsyncResponseEnvelopeOptions<int>.Instance);
 
         Assert.NotNull(restored);
-        Assert.True(restored!.Success);
+        Assert.False(restored!.Success);
         Assert.Equal(0, restored.Payload);
+        Assert.Equal("boom", restored.ExceptionMessage);
+    }
+
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Success":true,"Payload":null}""")]
+    [InlineData("""{"SchemaVersion":1,"Payload":null,"Success":true}""")]
+    public void NullPayload_OnASuccessEnvelope_ThrowsJsonException(string json)
+    {
+        // No publisher ever writes Success=true with a null Payload — the shape only arises from
+        // producer-side garbage (typically a raw ingress body of literal `null` wrapped verbatim).
+        // Accepting it completed the waiter with a null payload that surfaced as an NRE at the
+        // consumer, far from the message; it must fail fast instead, in either property order.
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<int>>(
+            json, AsyncResponseEnvelopeOptions<int>.Instance));
+    }
+
+    [Fact]
+    public void PayloadProperties_BindCaseInsensitively()
+    {
+        // External producers publish payload JSON in their own casing; the raw ingress wraps those
+        // bytes verbatim into the envelope. Binding them case-sensitively silently completed the
+        // waiter with an all-default payload — the envelope's own fields matched, so nothing
+        // signaled the loss. The payload must bind like every other broker-ingress read.
+        var restored = JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            """{"SchemaVersion":1,"Success":true,"Payload":{"status":2,"message":"done"}}""",
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance);
+
+        Assert.NotNull(restored);
+        Assert.Equal(OperationStatus.Completed, restored!.Payload!.Status);
+        Assert.Equal("done", restored.Payload.Message);
+    }
+
+    [Fact]
+    public void EnvelopeFields_StayByteExact_DespiteCaseInsensitivePayloadBinding()
+    {
+        // The converter matches the envelope's OWN properties byte-exact regardless of the
+        // options flag: a case-variant SchemaVersion is an unknown property, and its absence is
+        // rejected — the envelope contract does not loosen with the payload binding.
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            """{"schemaVersion":1,"Success":true,"Payload":{"Status":2}}""",
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+    }
+
+    [Fact]
+    public void TypeInfo_ReturnsTheSameInstanceAcrossCalls()
+    {
+        // The per-T memo on the publish/dispatch hot path: same metadata instance every call.
+        Assert.Same(
+            AsyncResponseEnvelopeJson.TypeInfo<OperationResult>(),
+            AsyncResponseEnvelopeJson.TypeInfo<OperationResult>());
     }
 
     [Fact]

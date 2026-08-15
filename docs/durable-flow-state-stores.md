@@ -298,6 +298,38 @@ builder.Services.AddAsyncResponse()
     });
 ```
 
+With `AutoCreateSchema = false` the table is yours to provision. Two properties of it are
+load-bearing, and the store verifies both — by SQLite **affinity**, not exact spelling, so any
+declaration that behaves like this passes — rather than letting them fail silently later:
+
+```sql
+CREATE TABLE asyncresponse_flow_state (
+    flow_id TEXT NOT NULL PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    expires_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    lease_id TEXT NULL,
+    lease_expires_at_utc TEXT NULL
+);
+CREATE INDEX asyncresponse_flow_state_expires_idx ON asyncresponse_flow_state (expires_at_utc);
+```
+
+The **primary key on `flow_id` alone** is the one to keep if you change anything: starting a flow
+targets `ON CONFLICT(flow_id)`, which needs a uniqueness constraint on exactly that column — a
+composite key constrains a different tuple, so the upsert fails at the first flow instead of at
+startup. **`TEXT` affinity on `expires_at_utc` and `lease_expires_at_utc`** matters just as much:
+expiry and lease fencing compare the stored ISO-8601 strings lexicographically, and a numeric
+affinity silently coerces digit-only values and breaks that ordering. (Every declared column's
+affinity and nullability is verified, not just these two — they are the ones a subtly wrong type
+breaks silently instead of loudly.)
+
+Verification runs the first time the store opens a connection: an absent table is assumed not yet
+migrated and is re-checked on the next operation rather than failing startup, while a present table
+with the wrong shape — a missing column, a mismatched affinity or nullability, no single-column
+primary key, or an extra `NOT NULL` column with no default — throws with the fix instead of failing
+silently at the first flow.
+
 ### Oracle
 
 ```csharp
@@ -316,7 +348,10 @@ builder.Services.AddAsyncResponse()
 ```
 
 Oracle 12.1 and earlier have a 30-character identifier limit. If the generated expiry-index name
-would exceed it, shorten `TableName`.
+would exceed it, shorten `TableName`. Startup also rejects a `TableName` that collides with its own
+derived index name — e.g. one already ending `_EXPIRES_IDX` — since Oracle shares one namespace for
+tables and indexes and the index create would otherwise fail with an error indistinguishable from a
+benign already-exists race, silently leaving the expiry index never created.
 
 ### MongoDB
 

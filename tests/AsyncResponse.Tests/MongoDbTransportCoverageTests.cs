@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using Moq;
 using System.Reflection;
@@ -16,15 +17,16 @@ public sealed class MongoDbTransportCoverageTests
     [Fact]
     public async Task WorkerTransport_PublishesCorrelatedAndUncorrelatedJobs_AndReportsFailures()
     {
-        var documents = new List<MongoTransportMessageDocument>();
+        var upserts = new List<(UpdateDefinition<MongoTransportMessageDocument> Update, UpdateOptions Options)>();
         var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
         collection
-            .Setup(c => c.InsertOneAsync(
-                It.IsAny<MongoTransportMessageDocument>(),
-                It.IsAny<InsertOneOptions>(),
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
                 It.IsAny<CancellationToken>()))
-            .Callback((MongoTransportMessageDocument document, InsertOneOptions _, CancellationToken _) => documents.Add(document))
-            .Returns(Task.CompletedTask);
+            .Callback((FilterDefinition<MongoTransportMessageDocument> _, UpdateDefinition<MongoTransportMessageDocument> update, UpdateOptions updateOptions, CancellationToken _) => upserts.Add((update, updateOptions)))
+            .ReturnsAsync(new UpdateResult.Acknowledged(0, 0, BsonNull.Value));
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions
         {
             AutoCreateIndexes = false,
@@ -37,19 +39,28 @@ public sealed class MongoDbTransportCoverageTests
         await transport.PublishAsync(Job("corr-mongo"));
         await transport.PublishAsync(Job(null));
 
-        Assert.Equal(2, documents.Count);
-        Assert.NotNull(documents[0].Headers);
-        Assert.NotNull(documents[1].Headers);
-        Assert.Equal("corr-mongo", documents[0].Headers![options.Value.CorrelationIdHeader]);
-        Assert.Empty(documents[1].Headers!);
+        // A publish is an insert-if-absent upsert whose pipeline stamps created_at on the SERVER
+        // clock; the rendered $set carries the headers as the {k,v} array-of-documents shape.
+        Assert.Equal(2, upserts.Count);
+        Assert.All(upserts, upsert => Assert.True(upsert.Options.IsUpsert));
+        var sets = upserts
+            .Select(upsert => upsert.Update.Render(TransportRenderArgs()).AsBsonArray[0]["$set"].AsBsonDocument)
+            .ToArray();
+        Assert.Equal(
+            new BsonArray { new BsonDocument { ["k"] = options.Value.CorrelationIdHeader, ["v"] = "corr-mongo" } },
+            sets[0]["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray);
+        Assert.Empty(sets[1]["headers"]["$ifNull"].AsBsonArray[1]["$literal"].AsBsonArray);
         // Fresh publishes must be claimable regardless of client/server clock skew: the claim
         // filter compares available_at against the server's $$NOW, so inserts stamp epoch.
-        Assert.All(documents, d => Assert.Equal(DateTime.UnixEpoch, d.AvailableAtUtc));
+        Assert.All(sets, set => Assert.Equal(
+            new BsonArray { "$available_at", new BsonDateTime(DateTime.UnixEpoch) },
+            set["available_at"]["$ifNull"].AsBsonArray));
 
         collection
-            .Setup(c => c.InsertOneAsync(
-                It.IsAny<MongoTransportMessageDocument>(),
-                It.IsAny<InsertOneOptions>(),
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("publish failed"));
 
@@ -57,6 +68,44 @@ public sealed class MongoDbTransportCoverageTests
         Assert.Equal("publish failed", error.Message);
         await Assert.ThrowsAsync<ArgumentNullException>(() => transport.PublishAsync(null!));
     }
+
+    /// <summary>
+    /// The dead-letter prune must age rows on the SERVER clock ($$NOW), not this instance's: the
+    /// dead letters it deletes were stamped by OTHER instances' publishes, and an app-clock cutoff
+    /// let a behind-clock pruner destroy fresh dead letters the moment they arrived.
+    /// </summary>
+    [Fact]
+    public async Task Publish_PrunesDeadLettersWithAServerClockCutoff()
+    {
+        FilterDefinition<MongoTransportMessageDocument>? pruneFilter = null;
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.DeleteManyAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, CancellationToken _) => pruneFilter = filter)
+            .ReturnsAsync(new DeleteResult.Acknowledged(0));
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions
+        {
+            AutoCreateIndexes = false,
+            DeadLetterRetention = TimeSpan.FromMinutes(30)
+        });
+        using var store = CreateStore(collection.Object, options);
+
+        await store.PublishAsync(Guid.NewGuid(), "worker", "{}", headers: null, CancellationToken.None);
+
+        Assert.NotNull(pruneFilter);
+        var rendered = pruneFilter!.Render(TransportRenderArgs());
+        Assert.Equal(options.Value.DeadLetterQueue, rendered["queue"].AsString);
+        Assert.True(rendered.Contains("$expr"), $"prune cutoff is not server-clock based: {rendered}");
+        Assert.Equal("$created_at", rendered["$expr"]["$lt"].AsBsonArray[0]);
+        Assert.Equal(
+            new BsonArray { "$$NOW", 1_800_000d },
+            rendered["$expr"]["$lt"].AsBsonArray[1]["$subtract"].AsBsonArray);
+    }
+
+    private static RenderArgs<MongoTransportMessageDocument> TransportRenderArgs()
+        => new(BsonSerializer.LookupSerializer<MongoTransportMessageDocument>(), BsonSerializer.SerializerRegistry);
 
     [Fact]
     public void WorkerTransport_PublicConstructor_UsesTheProvidedDatabase()
@@ -106,9 +155,10 @@ public sealed class MongoDbTransportCoverageTests
             Times.Once);
 
         collection
-            .Setup(c => c.InsertOneAsync(
-                It.IsAny<MongoTransportMessageDocument>(),
-                It.IsAny<InsertOneOptions>(),
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new InvalidOperationException("dlq unavailable"));
         var enabledOptions = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });

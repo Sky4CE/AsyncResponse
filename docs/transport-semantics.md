@@ -77,7 +77,7 @@ These hold for every transport in the matrix, verified per package:
 | **GooglePubSub** | streaming pull: ACK on success, NACK on failure | native — subscription retry policy + `DeadLetterPolicy` `maxDeliveryAttempts`; no app counter by design | subscription `DeadLetterPolicy` (delegated to infra) | log + `OnBackgroundFailure`; already ACKed, no DLQ write possible | drain + close 5 s (subscriber-client stop) | — (the Pub/Sub client manages the ack deadline) |
 | **Kafka** | manual offset store, auto-committed every `OffsetCommitInterval` 5 s; offsets cannot NACK one message | in-process retries with backoff (100 ms → 5 s); counted per process delivery — a restart before the commit resets the count | `{topic}.deadletter` (or one `DeadLetterTopic`); declared by `CreateTopics` (default on) | retried in-process, then log + `OnBackgroundFailure` + produced to the DLQ topic | drain only | — (stay under `max.poll.interval.ms` instead) |
 | **MongoDB** | claimed document: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `findOneAndUpdate` claim increments the attempt | `deadletter` logical queue in the same collection; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ document | drain + close 5 s (change-stream listen join) | automatic fenced renewal at `LockTimeout`/2 (server-clock `$$NOW`, `lock_id` fence) |
-| **NATS** | JetStream explicit ack: ACK on success, NAK + `RedeliveryDelay` 5 s on failure | broker `NumDelivered`; at `MaxDeliveryAttempts` the message is ACKed + dead-lettered | `{prefix}.transport.deadletter` subject/stream; declared by `CreateStreams` (default on) | log + `OnBackgroundFailure` + published to the DLQ subject | drain only | — (`AckWait` 30 s must cover the handler) |
+| **NATS** | JetStream explicit ack: ACK on success, NAK + `RedeliveryDelay` 5 s on failure | broker `NumDelivered`; at `MaxDeliveryAttempts` the message is ACKed + dead-lettered | `{prefix}.transport.deadletter` subject/stream; declared by `CreateStreams` (default on) | log + `OnBackgroundFailure` + published to the DLQ subject | drain only | automatic in-progress heartbeat every `AckWait`/3 across the in-flight batch (not configurable) |
 | **PostgreSQL** | claimed row: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `FOR UPDATE SKIP LOCKED` claim increments `attempts` | `deadletter` logical queue in the same table; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ row | drain + close 5 s (LISTEN task join) | automatic fenced renewal at `LockTimeout`/2 (`lock_id` fence) |
 | **RabbitMQ** | per-delivery `basic.ack`; `basic.nack` + requeue on failure | broker `x-death` header + `redelivered` flag; **`MaxDeliveryAttempts` default `0` = unlimited**; values > 2 need a TTL-retry DLX cycle (see notes) | optional `DeadLetterExchange` (default `null` → exhausted messages are **dropped**); declared when set and `DeclareTopology` is on | log + `OnBackgroundFailure`; the package writes no DLX message | drain + close 5 s (connection close) | — (unacked deliveries hold no expiring lock) |
 | **Redis** | consumer group: `XACK` on success; a failed entry stays in the PEL and is reclaimed after `PendingMessageMinIdleTime` 30 s | broker — PEL delivery count (`XPENDING`) + 1 at claim; at `MaxDeliveryAttempts` the entry is dead-lettered + `XACK`ed | `{prefix}:transport:deadletter` stream (`XADD` auto-creates it); `DeadLetterEnabled` default on | log + `OnBackgroundFailure` + `XADD` to the DLQ stream | drain only | — (`PendingMessageMinIdleTime` must exceed the slowest handler) |
@@ -98,7 +98,7 @@ remainder, which is how capped transports chunk long delays with no transport-sp
 | **SQS** | ✅ | 15 min (chunked) | `DelaySeconds`; standard queues only — a FIFO worker queue advertises no delay capability (`MaxPublishDelay` = zero), so flow timers fall back in process and a delayed enqueue fails fast at publish |
 | **PostgreSQL** | ✅ | — | insert with `available_at = now() + delay` (database clock); pickup latency ≤ `EmptyPollDelay` |
 | **SqlServer** | ✅ | — | insert with `available_at = SYSUTCDATETIME() + delay`; pickup latency ≤ `EmptyPollDelay` |
-| **MongoDB** | ✅ | — | insert stamps a client-computed `available_at` atomically; skew-early deliveries corrected by the `NotBeforeUtc` guard |
+| **MongoDB** | ✅ | — | insert stamps `available_at` server-relative (`$$NOW + delay`) via an atomic upsert pipeline, so client clock skew cannot shift it |
 | **Kafka, RabbitMQ, GooglePubSub, Redis, NATS** | — | — | no native mechanism; flow timers wait in process under the lease, bare delayed enqueue throws with guidance |
 
 ## What `OnBackgroundFailure` receives
@@ -196,8 +196,13 @@ Only cells that need more than a phrase.
 - In early ACK, a full background queue pauses pulling; a message still waiting in the queue
   when the subscriber stops is NAKed so JetStream redelivers it — backpressure itself never
   churns redeliveries.
-- There is no in-progress ack extension: `AckWait` (30 s) must exceed the slowest handler or
-  the server redelivers mid-handling.
+- Consumption fetches a bounded batch (`FetchNoWaitAsync`, draining whatever is already buffered,
+  or a single-message long-poll `FetchAsync` when idle) and dispatches it serially. While a batch
+  is in flight, a background heartbeat signals in-progress (`ProgressAsync`) for every still-
+  unsettled message roughly every `AckWait`/3 (two chances to land a renewal inside every `AckWait`
+  window even when one sweep is delayed), so `AckWait` (30 s) only has to survive one heartbeat
+  round-trip — it no longer needs to exceed the slowest handler, and before batching this was
+  effectively the slowest handler **× `BatchSize`** (16 by default).
 
 ### SQS
 
@@ -216,6 +221,10 @@ Only cells that need more than a phrase.
   cannot overwrite the shortened redelivery. Ignored in early ACK.
 - `CreateQueues` is the only provisioning default that is **off** — production queues (and
   their redrive policies) are usually owned by infrastructure code.
+- `CorrelationIdAttribute` resolution is case-**sensitive**, unlike every other transport's
+  case-insensitive inbound header lookup — AWS message attribute names are themselves
+  case-sensitive, so `CorrelationId` and `correlationId` can coexist as two distinct attributes on
+  one message; a case-folding lookup would alias them. The outbound publish path is also ordinal.
 
 ### PostgreSQL, SQL Server, MongoDB
 

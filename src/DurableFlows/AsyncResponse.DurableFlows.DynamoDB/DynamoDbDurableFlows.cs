@@ -87,8 +87,7 @@ public sealed class DynamoDbDurableFlowOptions : DurableFlowOptions
                 $"'{DynamoDbFlowStateStore.UpdatedAtAttribute}', '{DynamoDbFlowStateStore.RevisionAttribute}', " +
                 $"'{DynamoDbFlowStateStore.LeaseIdAttribute}', '{DynamoDbFlowStateStore.LeaseExpiresAtAttribute}').");
         }
-        if (MaxStateBytes is <= 0)
-            throw new InvalidOperationException($"{nameof(DynamoDbDurableFlowOptions)}.{nameof(MaxStateBytes)} must be positive when configured.");
+        DurableFlowStoreShared.ValidateMaxStateBytes(MaxStateBytes, nameof(DynamoDbDurableFlowOptions));
     }
 }
 
@@ -112,7 +111,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
     private readonly DynamoDbDurableFlowOptions _options;
     private readonly SemaphoreSlim _ensureGate = new(1, 1);
     private readonly bool _ownsClient;
-    private bool _created;
+    private volatile bool _created;
 
     public DynamoDbFlowStateStore(IAmazonDynamoDB client, IOptions<DynamoDbDurableFlowOptions> options, bool ownsClient = false)
     {
@@ -448,10 +447,7 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
         bool acquire,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(flowId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(leaseId);
-        if (leaseDuration <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(leaseDuration));
+        DurableFlowStoreShared.ValidateLeaseArgs(flowId, leaseId, leaseDuration);
 
         await EnsureCreatedAsync(cancellationToken).ConfigureAwait(false);
         var now = DateTimeOffset.UtcNow;

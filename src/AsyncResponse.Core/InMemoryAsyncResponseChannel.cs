@@ -698,7 +698,13 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             {
                 _ = ((SubscriptionBase)state!).TimeoutAsync();
             }, this, Timeout, System.Threading.Timeout.InfiniteTimeSpan);
-            Volatile.Write(ref _timeoutTimer, timer);
+
+            // Full fence, not Volatile.Write: this store and the CleanupStarted re-check below are
+            // one half of a Dekker pair with StartCleanupAsync (store _cleanupStarted, then read
+            // _timeoutTimer). Release-store/acquire-load does not order StoreLoad, so both sides
+            // could read the other's pre-store value and neither would dispose the timer — leaving
+            // it armed in the timer queue, rooting the subscription graph until it fires.
+            Interlocked.Exchange(ref _timeoutTimer, timer);
 
             // A response or explicit disposal can clean up between the guard and timer arming;
             // cleanup then missed the timer, so the armer disposes it (firing is still harmless —
@@ -880,7 +886,9 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
         private async Task StartCleanupAsync()
         {
-            Volatile.Write(ref _cleanupStarted, 1);
+            // Full fence, not Volatile.Write: the other half of the Dekker pair with ArmTimeout
+            // (store _timeoutTimer, then read _cleanupStarted) — see the comment there.
+            Interlocked.Exchange(ref _cleanupStarted, 1);
 
             // A waiter disposed before any terminal signal must not leave ResponseTask pending
             // forever for callers that hold it directly. Cancellation is a no-op after a normal
@@ -1046,7 +1054,12 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         {
             try
             {
-                return DispatchPayloadAsync(response.Deserialize<T>()!);
+                // A literal-null body passes ThrowIfClearlyNotJson and deserializes without error
+                // (for reference-type payloads); it must fault the waiter, never complete it with
+                // a null payload — the same guard the ingress applies to worker messages.
+                var payload = response.Deserialize<T>()
+                    ?? throw new InvalidDataException("Response message deserialized to null.");
+                return DispatchPayloadAsync(payload);
             }
             catch (Exception ex)
             {
@@ -1084,12 +1097,19 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
         // object across all same-type waiters and exposed in-process-only state no broker-backed
         // channel can deliver. The publish serializes once (UTF-8 bytes); each waiter
         // deserializes its own instance case-insensitively — the same property matching the
-        // string conversion path used, and the same options every broker ingress applies.
-        // JsonElement/string/null payloads keep the existing conversion path.
+        // string conversion path and every broker ingress apply. JsonElement/string/null payloads
+        // keep the existing conversion path.
         private static T MaterializeAs(object? response, byte[]? wireBytes)
-            => wireBytes is null
+        {
+            var payload = wireBytes is null
                 ? response.As<T>()
-                : AsyncResponseJson.DeserializeCaseInsensitive<T>(wireBytes)!;
+                : AsyncResponseJson.DeserializeCaseInsensitive<T>(wireBytes);
+
+            // A null (a published null object, a JSON-null JsonElement, a "null" string body)
+            // must fault the waiter, never complete it — the broker channels reject the same
+            // shape at the envelope, and the raw ingress path applies the equivalent guard.
+            return payload ?? throw new InvalidDataException("Response payload materialized to null.");
+        }
 
         private Task FaultAsync(Exception exception)
         {

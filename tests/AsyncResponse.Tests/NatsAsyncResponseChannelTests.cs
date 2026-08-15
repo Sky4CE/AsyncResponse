@@ -428,6 +428,33 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
+    {
+        // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
+        // logger provider that throws on the timeout warning) must be caught and logged through
+        // the error path, not die as an unobserved task fault.
+        var logger = new RecordingThrowingLogger<NatsAsyncResponseChannel> { ThrowOnMessageContaining = "Timed out waiting" };
+        var channel = new NatsAsyncResponseChannel(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            _client,
+            _store.Object,
+            Options.Create(new NatsAsyncResponseChannelOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5),
+                DisposalDrainTimeout = TimeSpan.FromSeconds(30)
+            }),
+            new AsyncResponseContextPropagation([]),
+            logger);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-timeout-throws",
+            timeout: TimeSpan.FromMilliseconds(5));
+
+        await Eventually(() => logger.HasEntry(LogLevel.Error, "Error handling waiter timeout"));
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_SubscribeOrSaveFailureThrowsAndDeletesRecoveryState()
     {
         var failure = new InvalidOperationException("save failed");

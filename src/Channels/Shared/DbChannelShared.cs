@@ -835,68 +835,89 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private protected async Task DispatchPendingMessagesAsync(HashSet<string>? scope, CancellationToken cancellationToken)
     {
-        foreach (var (correlationId, group) in _subscriptions)
+        if (scope is not null)
         {
-            if (scope is not null && !scope.Contains(correlationId))
-                continue;
-
-            var subscriptions = new List<IDbSubscription>(group.Count);
-            foreach (var subscription in group.Values)
+            // A publish signals exactly one correlation id, so a targeted scan must cost
+            // O(scope), not O(live waiters): enumerating the whole registry made every publish
+            // quadratic under load, and the not-yet-due poll tick (an empty scope) paid the same
+            // walk to match nothing.
+            foreach (var correlationId in scope)
             {
-                if (!subscription.Dropped)
-                    subscriptions.Add(subscription);
+                if (_subscriptions.TryGetValue(correlationId, out var group))
+                    await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
             }
-            if (subscriptions.Count == 0)
-                continue;
 
-            var since = subscriptions.Min(static s => s.StartedAtUtc).AddSeconds(-1);
-            var seenCutoff = DateTimeOffset.UtcNow - _options.MessageRetention - TimeSpan.FromMinutes(1);
-            foreach (var subscription in subscriptions)
-                subscription.PruneSeen(seenCutoff);
+            return;
+        }
 
-            DateTimeOffset? afterCreatedAtUtc = null;
-            Guid? afterId = null;
-            while (true)
+        foreach (var (correlationId, group) in _subscriptions)
+            await DispatchPendingCorrelationAsync(correlationId, group, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task DispatchPendingCorrelationAsync(
+        string correlationId,
+        ConcurrentDictionary<Guid, IDbSubscription> group,
+        CancellationToken cancellationToken)
+    {
+        var subscriptions = new List<IDbSubscription>(group.Count);
+        foreach (var subscription in group.Values)
+        {
+            if (!subscription.Dropped)
+                subscriptions.Add(subscription);
+        }
+        if (subscriptions.Count == 0)
+            return;
+
+        var since = subscriptions.Min(static s => s.StartedAtUtc).AddSeconds(-1);
+        var seenCutoff = DateTimeOffset.UtcNow - _options.MessageRetention - TimeSpan.FromMinutes(1);
+        foreach (var subscription in subscriptions)
+            subscription.PruneSeen(seenCutoff);
+
+        DateTimeOffset? afterCreatedAtUtc = null;
+        Guid? afterId = null;
+        while (true)
+        {
+            var messages = await _store.LoadMessagesAsync(
+                correlationId,
+                since,
+                _options.PendingMessageBatchSize,
+                afterCreatedAtUtc,
+                afterId,
+                cancellationToken).ConfigureAwait(false);
+            foreach (var message in messages)
             {
-                var messages = await _store.LoadMessagesAsync(
-                    correlationId,
-                    since,
-                    _options.PendingMessageBatchSize,
-                    afterCreatedAtUtc,
-                    afterId,
-                    cancellationToken).ConfigureAwait(false);
-                foreach (var message in messages)
+                // The store was asked for ONE exact correlation id, but "exact" is the
+                // database's opinion: a case-insensitive (or accent-insensitive) column
+                // collation — the SQL Server default in most deployments — answers a query for
+                // "FOO" with the rows of "foo". Delivering those would hand one waiter another
+                // waiter's response, so the id is re-checked ordinally here, where the
+                // library's own comparison rules apply. This also covers pre-existing tables
+                // created before the collation was pinned in the DDL.
+                if (!string.Equals(message.CorrelationId, correlationId, StringComparison.Ordinal))
                 {
-                    // The store was asked for ONE exact correlation id, but "exact" is the
-                    // database's opinion: a case-insensitive (or accent-insensitive) column
-                    // collation — the SQL Server default in most deployments — answers a query for
-                    // "FOO" with the rows of "foo". Delivering those would hand one waiter another
-                    // waiter's response, so the id is re-checked ordinally here, where the
-                    // library's own comparison rules apply. This also covers pre-existing tables
-                    // created before the collation was pinned in the DDL.
-                    if (!string.Equals(message.CorrelationId, correlationId, StringComparison.Ordinal))
-                    {
-                        _logger.LogError(
-                            "The {Provider} channel store returned a message for correlationId '{ReturnedCorrelationId}' when asked for '{RequestedCorrelationId}'. " +
-                            "The correlation-id column is not using a case-sensitive/binary collation, so distinct correlation ids collide in the database. " +
-                            "The message was NOT delivered to the wrong waiter. Re-create the AsyncResponse tables (or ALTER the correlation_id columns) with a binary collation.",
-                            _providerName, message.CorrelationId, correlationId);
-                        continue;
-                    }
-
-                    await _executors.EnqueueAsync(
-                        ChannelName(correlationId),
-                        () => DispatchMessageToSubscribersAsync(message, subscriptions, cancellationToken),
-                        cancellationToken).ConfigureAwait(false);
+                    _logger.LogError(
+                        "The {Provider} channel store returned a message for correlationId '{ReturnedCorrelationId}' when asked for '{RequestedCorrelationId}'. " +
+                        "The correlation-id column is not using a case-sensitive/binary collation, so distinct correlation ids collide in the database. " +
+                        "The message was NOT delivered to the wrong waiter. Re-create the AsyncResponse tables (or ALTER the correlation_id columns) with a binary collation.",
+                        _providerName, message.CorrelationId, correlationId);
+                    continue;
                 }
 
-                if (messages.Count < _options.PendingMessageBatchSize)
-                    break;
-
-                var last = messages[^1];
-                afterCreatedAtUtc = last.CreatedAtUtc;
-                afterId = last.Id;
+                // Work-item class, not a lambda: a queued closure would chain display classes
+                // pinning this paging frame (batch list, cursors, watermark) for as long as the
+                // item sits in the executor's bounded queue.
+                await _executors.EnqueueAsync(
+                    ChannelName(correlationId),
+                    new LocalDispatchWorkItem(this, message, subscriptions, cancellationToken).InvokeAsync,
+                    cancellationToken).ConfigureAwait(false);
             }
+
+            if (messages.Count < _options.PendingMessageBatchSize)
+                break;
+
+            var last = messages[^1];
+            afterCreatedAtUtc = last.CreatedAtUtc;
+            afterId = last.Id;
         }
     }
 

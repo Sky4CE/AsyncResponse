@@ -48,6 +48,22 @@ internal interface IRedisStreamDatabase
         long minIdleTimeInMilliseconds,
         RedisValue[] messageIds,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// XCLAIM JUSTID: transfers ownership of <paramref name="messageIds"/> to
+    /// <paramref name="consumerName"/> and resets their idle time WITHOUT bumping the PEL
+    /// delivery count, returning the ids actually claimed (already-ACKed ids are absent). Used
+    /// as the in-flight batch heartbeat. Carries a claim-nothing default implementation so
+    /// out-of-package fakes that never run the subscriber read loop keep compiling.
+    /// </summary>
+    Task<RedisValue[]> StreamClaimIdsOnlyAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue consumerName,
+        long minIdleTimeInMilliseconds,
+        RedisValue[] messageIds,
+        CancellationToken cancellationToken)
+        => Task.FromResult(Array.Empty<RedisValue>());
 }
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
@@ -150,6 +166,23 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
         CancellationToken cancellationToken)
         => WithCancellation(
             _database.StreamClaimAsync(
+                stream,
+                groupName,
+                consumerName,
+                minIdleTimeInMilliseconds,
+                messageIds),
+            cancellationToken);
+
+    /// <summary>Runs the StreamClaimIdsOnlyAsync operation.</summary>
+    public Task<RedisValue[]> StreamClaimIdsOnlyAsync(
+        RedisKey stream,
+        RedisValue groupName,
+        RedisValue consumerName,
+        long minIdleTimeInMilliseconds,
+        RedisValue[] messageIds,
+        CancellationToken cancellationToken)
+        => WithCancellation(
+            _database.StreamClaimIdsOnlyAsync(
                 stream,
                 groupName,
                 consumerName,

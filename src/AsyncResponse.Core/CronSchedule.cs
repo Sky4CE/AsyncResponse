@@ -73,7 +73,9 @@ public sealed class CronSchedule
         var hours = ParseField(expression, fields[1], 0, 23, names: null, allowQuestionMark: false);
         var daysOfMonth = ParseField(expression, fields[2], 1, 31, names: null, allowQuestionMark: true);
         var months = ParseField(expression, fields[3], 1, 12, MonthNames, allowQuestionMark: false);
-        var daysOfWeek = ParseField(expression, fields[4], 0, 7, DayNames, allowQuestionMark: true);
+        // wrapCycle 7, not the 8-slot 0..7 span: slots 0 and 7 are both Sunday, so a stride that
+        // wraps past Saturday must fold back by one real week or it lands a day early.
+        var daysOfWeek = ParseField(expression, fields[4], 0, 7, DayNames, allowQuestionMark: true, wrapCycle: 7);
 
         // 7 is Sunday too; fold it onto bit 0 so matching only ever looks at bits 0..6.
         if ((daysOfWeek & (1UL << 7)) != 0)
@@ -259,10 +261,11 @@ public sealed class CronSchedule
     private static readonly DateTime LastRepresentableMinute =
         new(9999, 12, 31, 23, 59, 0, DateTimeKind.Unspecified);
 
-    private static ulong ParseField(string expression, string field, int min, int max, string[]? names, bool allowQuestionMark)
+    private static ulong ParseField(string expression, string field, int min, int max, string[]? names, bool allowQuestionMark, int? wrapCycle = null)
     {
+        var cycle = wrapCycle ?? (max - min + 1);
         if (field == "*" || (allowQuestionMark && field == "?"))
-            return RangeMask(min, max, min, max, 1);
+            return RangeMask(min, max, min, max, 1, cycle);
 
         ulong mask = 0;
         foreach (var part in field.Split(','))
@@ -310,7 +313,7 @@ public sealed class CronSchedule
                 }
             }
 
-            mask |= RangeMask(min, max, low, high, step);
+            mask |= RangeMask(min, max, low, high, step, cycle);
         }
 
         return mask;
@@ -337,7 +340,7 @@ public sealed class CronSchedule
         return value;
     }
 
-    private static ulong RangeMask(int min, int max, int low, int high, int step)
+    private static ulong RangeMask(int min, int max, int low, int high, int step, int cycle)
     {
         // The accumulators are long: with an int, a step near int.MaxValue overflows `value += step`
         // to a negative, and the (six-bit-masked) shift then sets phantom low bits — "1/2147483647"
@@ -359,8 +362,12 @@ public sealed class CronSchedule
             position += step;
         }
 
-        // Continue the stride into the wrapped segment so 50-10/4 keeps its cadence across the wrap.
-        position = min + (position - max - 1);
+        // Continue the stride into the wrapped segment so 50-10/4 keeps its cadence across the
+        // wrap: fold back by one full cycle of the field's VALUES. For every field but
+        // day-of-week that equals the slot span; day-of-week has 8 slots for 7 values (0 and 7
+        // are both Sunday), and folding by the span would credit the duplicate slot as a real
+        // day — "SAT-MON/2" fired Saturday+Sunday instead of Saturday+Monday.
+        position -= cycle;
         while (position <= high)
         {
             mask |= 1UL << (int)position;

@@ -29,7 +29,12 @@ internal sealed class NatsTransportSubjectSchema(NatsAsyncResponseTransportOptio
     /// <summary>Turns a subject into a valid JetStream stream name (NATS stream names forbid dots and wildcards).</summary>
     internal static string SanitizeStreamName(string subject)
     {
-        Span<char> buffer = stackalloc char[subject.Length];
+        // Options validation caps subjects at 255 chars, but this must stay safe for any caller:
+        // a stackalloc sized by an unbounded input is a stack overflow — an uncatchable process
+        // kill — so longer inputs take the heap path.
+        Span<char> buffer = subject.Length <= 256
+            ? stackalloc char[subject.Length]
+            : new char[subject.Length];
         for (var i = 0; i < subject.Length; i++)
         {
             var c = subject[i];

@@ -1,6 +1,7 @@
 using NATS.Client.Core;
 using NATS.Client.JetStream;
 using NATS.Client.JetStream.Models;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace AsyncResponse.Transports.NATS;
@@ -20,7 +21,16 @@ internal sealed record NatsJobDelivery(
     long NumDelivered,
     Func<ValueTask> AckAsync,
     Func<TimeSpan, ValueTask> NakAsync,
-    Func<ValueTask> TermAsync);
+    Func<ValueTask> TermAsync)
+{
+    /// <summary>
+    /// Signals "working on it" (JetStream in-progress) so the server resets this delivery's
+    /// AckWait window without settling it or bumping its delivery count. An init property with a
+    /// no-op default rather than a positional parameter so out-of-package constructions stay
+    /// source-compatible.
+    /// </summary>
+    public Func<ValueTask> ProgressAsync { get; init; } = static () => ValueTask.CompletedTask;
+}
 
 /// <summary>
 /// Thin abstraction over the NATS JetStream operations the transport needs, confining the NATS.Net
@@ -38,8 +48,25 @@ internal interface INatsJetStreamTransport
     /// <summary>Publishes <paramref name="payload"/> to <paramref name="subject"/> via JetStream and returns the assigned sequence.</summary>
     Task<string> PublishAsync(string subject, string payload, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
 
-    /// <summary>Continuously consumes messages from the durable consumer on <paramref name="stream"/>.</summary>
-    IAsyncEnumerable<NatsJobDelivery> ConsumeAsync(string stream, string durable, int batchSize, CancellationToken cancellationToken);
+    // The two fetch members carry throwing default implementations so out-of-package fakes that
+    // never drive the subscriber read loop keep compiling; every implementation the subscribers
+    // actually consume overrides them.
+
+    /// <summary>
+    /// Fetches up to <paramref name="maxMessages"/> already-available messages from the durable
+    /// consumer and completes immediately (JetStream no-wait fetch) — the batch-drain half of the
+    /// subscriber loop.
+    /// </summary>
+    IAsyncEnumerable<NatsJobDelivery> FetchNoWaitAsync(string stream, string durable, int maxMessages, CancellationToken cancellationToken)
+        => throw new NotSupportedException($"{GetType()} does not implement {nameof(FetchNoWaitAsync)}.");
+
+    /// <summary>
+    /// Fetches up to <paramref name="maxMessages"/> messages, waiting up to
+    /// <paramref name="expires"/> for them to arrive — the idle long-poll half of the subscriber
+    /// loop. Completes without error when the wait expires with fewer messages.
+    /// </summary>
+    IAsyncEnumerable<NatsJobDelivery> FetchAsync(string stream, string durable, int maxMessages, TimeSpan expires, CancellationToken cancellationToken)
+        => throw new NotSupportedException($"{GetType()} does not implement {nameof(FetchAsync)}.");
 }
 
 /// <summary>Production <see cref="INatsJetStreamTransport"/> over a NATS <see cref="INatsJSContext"/>.</summary>
@@ -91,30 +118,66 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
         return ack.Seq.ToString();
     }
 
-    /// <summary>Runs the ConsumeAsync operation.</summary>
-    public async IAsyncEnumerable<NatsJobDelivery> ConsumeAsync(
+    /// <summary>Runs the FetchNoWaitAsync operation.</summary>
+    public async IAsyncEnumerable<NatsJobDelivery> FetchNoWaitAsync(
         string stream,
         string durable,
-        int batchSize,
+        int maxMessages,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var consumer = await GetConsumerAsync(stream, durable, cancellationToken).ConfigureAwait(false);
+        var fetchOpts = new NatsJSFetchOpts { MaxMsgs = maxMessages };
+
+        await foreach (var message in consumer.FetchNoWaitAsync<string>(opts: fetchOpts, cancellationToken: cancellationToken).ConfigureAwait(false))
+            yield return ToDelivery(message);
+    }
+
+    /// <summary>Runs the FetchAsync operation.</summary>
+    public async IAsyncEnumerable<NatsJobDelivery> FetchAsync(
+        string stream,
+        string durable,
+        int maxMessages,
+        TimeSpan expires,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var consumer = await GetConsumerAsync(stream, durable, cancellationToken).ConfigureAwait(false);
+        var fetchOpts = new NatsJSFetchOpts { MaxMsgs = maxMessages, Expires = expires };
+
+        await foreach (var message in consumer.FetchAsync<string>(opts: fetchOpts, cancellationToken: cancellationToken).ConfigureAwait(false))
+            yield return ToDelivery(message);
+    }
+
+    // The consumer wrapper only carries names for building pull requests, so it stays valid across
+    // subscriber rebuilds (EnsureConsumerAsync recreates the durable if it was deleted server-side)
+    // and is cached to avoid a consumer-INFO round trip per fetch. Only a SUCCESSFUL lookup is
+    // cached, so a transient failure is not replayed forever.
+    private readonly ConcurrentDictionary<(string Stream, string Durable), INatsJSConsumer> _consumers = new();
+
+    private async ValueTask<INatsJSConsumer> GetConsumerAsync(string stream, string durable, CancellationToken cancellationToken)
+    {
+        if (_consumers.TryGetValue((stream, durable), out var cached))
+            return cached;
+
         var consumer = await _jetStream.GetConsumerAsync(stream, durable, cancellationToken).ConfigureAwait(false);
-        var consumeOpts = new NatsJSConsumeOpts { MaxMsgs = batchSize };
+        return _consumers.GetOrAdd((stream, durable), consumer);
+    }
 
-        await foreach (var message in consumer.ConsumeAsync<string>(opts: consumeOpts, cancellationToken: cancellationToken).ConfigureAwait(false))
+    private static NatsJobDelivery ToDelivery(INatsJSMsg<string> message)
+    {
+        var numDelivered = (long)(message.Metadata?.NumDelivered ?? 1);
+        var captured = message;
+
+        return new NatsJobDelivery(
+            captured.Subject,
+            captured.Data ?? string.Empty,
+            FromHeaders(captured.Headers),
+            numDelivered,
+            () => captured.AckAsync(cancellationToken: CancellationToken.None),
+            delay => captured.NakAsync(delay: delay, cancellationToken: CancellationToken.None),
+            () => captured.AckTerminateAsync(cancellationToken: CancellationToken.None))
         {
-            var numDelivered = (long)(message.Metadata?.NumDelivered ?? 1);
-            var captured = message;
-
-            yield return new NatsJobDelivery(
-                captured.Subject,
-                captured.Data ?? string.Empty,
-                FromHeaders(captured.Headers),
-                numDelivered,
-                () => captured.AckAsync(cancellationToken: CancellationToken.None),
-                delay => captured.NakAsync(delay: delay, cancellationToken: CancellationToken.None),
-                () => captured.AckTerminateAsync(cancellationToken: CancellationToken.None));
-        }
+            ProgressAsync = () => captured.AckProgressAsync(cancellationToken: CancellationToken.None)
+        };
     }
 
     private static NatsHeaders? ToHeaders(IReadOnlyDictionary<string, string>? headers)

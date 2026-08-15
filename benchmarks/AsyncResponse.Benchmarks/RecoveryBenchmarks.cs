@@ -91,11 +91,11 @@ public class RecoveryBenchmarks
 
     [Benchmark]
     public string HealthCheck_Evaluate_Healthy()
-        => AsyncResponseRecoveryHealthCheck.Evaluate(_healthySnapshot, DateTime.UtcNow).Status.ToString();
+        => AsyncResponseRecoveryHealthCheck.Evaluate(_healthySnapshot, activation: null, DateTime.UtcNow).Status.ToString();
 
     [Benchmark]
     public string HealthCheck_Evaluate_Degraded()
-        => AsyncResponseRecoveryHealthCheck.Evaluate(_degradedSnapshot, DateTime.UtcNow).Status.ToString();
+        => AsyncResponseRecoveryHealthCheck.Evaluate(_degradedSnapshot, activation: null, DateTime.UtcNow).Status.ToString();
 
     private static RecoveryState NewRecoveryState(string correlationId)
         => new()
