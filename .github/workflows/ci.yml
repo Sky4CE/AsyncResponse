@@ -42,27 +42,38 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
+      # Coverage runs through `dotnet-coverage` static instrumentation (instrument-on-disk, then
+      # collect via a session) instead of MTP's `--coverage` flag: on linux-x64 that flag prefers
+      # dynamic CLR-profiler IL rewriting at JIT time, whose rewriter corrupted one Redis async
+      # state machine after an innocent refactor (InvalidProgramException on every publish — the
+      # 23 red RedisChannelConformanceTests). Static managed instrumentation is what every arm64
+      # run already used, is deterministic, and is validated by the JitProbeTests force-JIT
+      # sweep. Details in scripts/coverage-instrument.sh.
+      - name: Install dotnet-coverage
+        # Keep in lockstep with the Microsoft.Testing.Extensions.CodeCoverage version in
+        # Directory.Packages.props — same engine, same probe/report semantics.
+        run: dotnet tool install --global dotnet-coverage --version 18.10.0
+
+      - name: Instrument for coverage
+        run: |
+          ./scripts/coverage-instrument.sh unit-net8 tests/AsyncResponse.Tests/bin/Release/net8.0
+          ./scripts/coverage-instrument.sh unit-net10 tests/AsyncResponse.Tests/bin/Release/net10.0
+
       # MTP otherwise executes both target frameworks concurrently. On the 2-core hosted runner that
       # has repeatedly starved real-time durable-flow tests; keep the same coverage, one TFM at a time.
       - name: Test (unit, net8.0)
         run: |
-          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
-            --configuration Release --framework net8.0 --no-build \
-            --report-trx \
-            --coverage \
-            --coverage-output-format cobertura \
-            --coverage-output unit-net8.0.cobertura.xml \
-            --results-directory "${{ github.workspace }}/TestResults"
+          dotnet-coverage collect --session-id unit-net8 \
+            --output-format cobertura \
+            --output "${{ github.workspace }}/TestResults/unit-net8.0.cobertura.xml" \
+            "dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net8.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults"
 
       - name: Test (unit, net10.0)
         run: |
-          dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
-            --configuration Release --framework net10.0 --no-build \
-            --report-trx \
-            --coverage \
-            --coverage-output-format cobertura \
-            --coverage-output unit-net10.0.cobertura.xml \
-            --results-directory "${{ github.workspace }}/TestResults"
+          dotnet-coverage collect --session-id unit-net10 \
+            --output-format cobertura \
+            --output "${{ github.workspace }}/TestResults/unit-net10.0.cobertura.xml" \
+            "dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net10.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults"
 
       - name: Upload test results
         if: always()
@@ -323,6 +334,22 @@ jobs:
       - name: Build
         run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
 
+      # Same static-instrumentation coverage flow as build-and-test (see the comment there and
+      # scripts/coverage-instrument.sh): the dynamic-profiler mode that MTP's --coverage flag
+      # picks on linux-x64 corrupted RedisAsyncResponseChannel.SetResponseCore<T> at JIT time,
+      # failing all 23 Redis conformance tests in this very leg. The AppHost and SUT sample bins
+      # are instrumented too: they run as child processes, inherit the collect session through
+      # the environment, and contribute most of AsyncResponse.Sample's coverage.
+      - name: Install dotnet-coverage
+        run: dotnet tool install --global dotnet-coverage --version 18.10.0
+
+      - name: Instrument for coverage
+        run: |
+          ./scripts/coverage-instrument.sh "itest-${{ matrix.batch }}" \
+            tests/AsyncResponse.IntegrationTests/bin/Release/net10.0 \
+            tests/AsyncResponse.IntegrationTests.AppHost/bin/Release/net10.0 \
+            samples/AsyncResponse.Sample/bin/Release/net10.0
+
       - name: Test (integration, ${{ matrix.batch }})
         # This leg boots only its own batch's containers and sample apps; the inventory per batch is
         # in docs/operations.md. "none" boots nothing at all — it is the in-memory suite, the Native
@@ -330,15 +357,13 @@ jobs:
         run: |
           # Same targeted boot-flake retry as the AOT integration job: rerun once only when the
           # failure signature is a batch fixture failing to initialize, never for test failures.
+          # dotnet-coverage returns non-zero when the wrapped command fails, so the retry logic
+          # keys off the same exit code as before; a second attempt overwrites the same output.
           run_integration_tests() {
-            dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
-              --configuration Release --no-build \
-              --filter-trait "batch=${{ matrix.batch }}" \
-              --report-trx \
-              --coverage \
-              --coverage-output-format cobertura \
-              --coverage-output integration.${{ matrix.batch }}.cobertura.xml \
-              --results-directory "${{ github.workspace }}/TestResults/Integration" \
+            dotnet-coverage collect --session-id "itest-${{ matrix.batch }}" \
+              --output-format cobertura \
+              --output "${{ github.workspace }}/TestResults/Integration/integration.${{ matrix.batch }}.cobertura.xml" \
+              "dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-build --filter-trait batch=${{ matrix.batch }} --report-trx --results-directory ${{ github.workspace }}/TestResults/Integration" \
               2>&1 | tee itest-console.log
             return "${PIPESTATUS[0]}"
           }

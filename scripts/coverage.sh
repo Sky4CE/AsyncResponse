@@ -72,6 +72,14 @@ run_with_coverage() {
   echo "==> Testing $label"
   # MTP surfaces failures via exit code; keep going so a red test still produces a report. The TRX
   # is the durable record of pass/fail — console output is easy to lose to a pipe.
+  #
+  # NOTE: CI does NOT use MTP's --coverage flag anymore — it pre-instruments with dotnet-coverage
+  # and collects via a session (see scripts/coverage-instrument.sh) because on linux-x64 the flag
+  # picks dynamic CLR-profiler instrumentation, whose JIT-time rewriter corrupted IL in CI. On
+  # macOS/arm64 no dynamic engine ships, so this flag already uses the same static managed
+  # pipeline CI now pins — the MEASUREMENT is identical, only the orchestration differs. Do not
+  # "simplify" ci.yml back to --coverage. If you run this script on a linux-x64 workstation, be
+  # aware it takes the dynamic path there.
   if ! dotnet test --project "$project" \
     --configuration "$CONFIGURATION" --framework "$framework" --no-build \
     --coverage \

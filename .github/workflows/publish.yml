@@ -55,12 +55,14 @@ jobs:
       # Unit suite only, one TFM at a time — same invocation shape as ci.yml (MTP otherwise runs
       # both TFMs concurrently, which starves real-time tests on the 2-core hosted runner).
       # The Docker/Aspire integration suite is omitted here because it already gates every merge to main.
+      # No --coverage: nothing consumed the output here, and the flag's dynamic-profiler mode on
+      # linux-x64 is the engine that corrupted IL in CI (see scripts/coverage-instrument.sh);
+      # this job is a release gate, not a coverage source.
       - name: Test (unit, net8.0)
         run: |
           dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
             --configuration Release --framework net8.0 --no-build \
             --report-trx \
-            --coverage \
             --results-directory "${{ github.workspace }}/TestResults"
 
       - name: Test (unit, net10.0)
@@ -68,7 +70,6 @@ jobs:
           dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
             --configuration Release --framework net10.0 --no-build \
             --report-trx \
-            --coverage \
             --results-directory "${{ github.workspace }}/TestResults"
 
       - name: Pack
