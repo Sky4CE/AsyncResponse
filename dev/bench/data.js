@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786792204054,
+  "lastUpdate": 1786792230142,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -86266,6 +86266,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1342.2353243479447,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "bff18f416a42304df858dcc1e2528d3488d88fe4",
+          "message": "fix: apply round-24 review — DI store lifetime, settlement parity, probe tri-state, verify-under-operator-schema\n- DI (P1): the IFlowStateStore forward mirrors the concrete registration's\n  lifetime — a scoped factory returning the singleton store let every\n  flow-execution scope capture and dispose it, killing the store (and its\n  owned NpgsqlDataSource/Mongo client) after the FIRST flow on the documented\n  ConnectionString path. Reproduced standalone on MS.DI 8.\n- Settlement parity: Kafka's awaiting dispatcher stores its offset OUTSIDE the\n  handler try (settle failure no longer re-runs/dead-letters a succeeded\n  handler); NATS guards Term/Nak like its acks (a thrown settle tore down the\n  subscriber and dead-lettered the same message forever); RabbitMQ ACKs and\n  Redis's pre-handler dead-letter ignore cancellation; ASB wraps its\n  failure-path DeadLetter/Abandon (a lock-lost settle rebuilt the receiver,\n  dropping the rest of the batch).\n- Probe tri-state: channel probes return -1 for \"could not be probed\" (the\n  watchdog's unknown-liveness contract — 0 falsely flagged every\n  over-threshold registration stale during a probe blip); Redis's probe is\n  async + token-aware; Redis/NATS lost-subscriber re-checks THROW on unknown\n  so the publish retries instead of consuming a live waiter's registration.\n- Stores: MySQL latches _created only on a verified table (Oracle parity);\n  PG/SqlServer verify operator-provisioned schemas under AutoCreateSchema=false\n  (absent table = re-check later, never latch); the SqlServer relation\n  verifier keys columns/PKs OrdinalIgnoreCase in all four methods (the r23 fix\n  had reached only LoadObjectKindsAsync); Mongo's ownership guard\n  pattern-matches BsonString instead of AsString-throwing on foreign writes.\n- Races/leaks: DB channels arm the waiter timeout AFTER AddSubscription\n  (Redis/NATS parity; an early fire pinned a permanently-dropped subscription\n  and locked SQL Server into active-interval polling); NATS recovery-state\n  expiry cleanup deletes revision-conditioned (an unconditional delete could\n  wipe a just-committed registration); Pub/Sub stops its SubscriberClient on\n  the failure path (one leaked client per retry rebuild); Kafka's producer no\n  longer caches a faulted build (Lazy ExecutionAndPublication poisoned every\n  publish until restart) and backpressure re-asserts the pause each saturated\n  tick (a rebalance reset librdkafka's pause state); the watchdog gauges read\n  a re-published current-state holder instead of pinning the first host's.\n- Validation: MessageRetention must exceed DeliveryConfirmationTimeout on the\n  3 DB channels (a pruned row was reported as delivered, silently skipping\n  lost-response recovery); SQS rejects derived dead-letter names colliding\n  with live queues (a \"-dlq\"-named response queue became the worker redrive\n  target, completing waiters with poison job envelopes); named reply targets\n  on PG/SqlServer/Mongo reject worker/dead-letter queue collisions; Redis\n  KeyPrefix is validated at the RedisKeySchema choke point (glob metachars\n  silently blinded the recovery SCAN).\n- Core: lost-EXCEPTION dispatch no longer rethrows a sibling registration's\n  failure after another callback consumed the exception (r23 gave the\n  response path this guard; the redelivery hot-looped under RabbitMQ's\n  attempts=0); awaited-step re-attach re-extends the ledger TTL (timer-path\n  parity — a redelivered 30d wait expired its own 14d ledger mid-wait);\n  FailAsync notifies run-finished observers before the parent wake-up;\n  envelope parsing throws JsonException on wrong-typed Success /\n  ExceptionMessage / ExceptionStackTrace (InvalidOperationException read as\n  transient and burned the ingress retry budget); the remote stack-trace cap\n  backs off a split surrogate pair; RawJsonResponse materializes a private\n  typed payload per subscriber (the memo aliased one mutable object across\n  same-type waiters); ASB LockRenewalInterval defaults to 10s (30s equaled\n  Azure's default LockDuration and the first renew fires after one full\n  interval — it could never win); SQS visibility renewal takes the shutdown\n  token through the seam and checks it per message.\n- Deferred: early-ACK background failures on RabbitMQ/ASB still only log +\n  OnBackgroundFailure — a DLX republish needs channel plumbing and a\n  serialized publish gate on RabbitMQ, and ASB's DLQ sub-queue cannot be\n  published into; needs its own design pass.\n- Tests: fakes/pins updated to the new contracts (async Redis probe mocks,\n  healthy-endpoint fixture, -1 assertions, per-call raw payload identity,\n  Kafka adapter field shape); docs updated for the 10s renewal default.\n  4178/4178 unit tests green (2089 × net8.0 + net10.0).",
+          "timestamp": "2026-08-15T12:51:29+02:00",
+          "tree_id": "636d8cc6eee5329449f4a674de77ebcbd7503cad",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/bff18f416a42304df858dcc1e2528d3488d88fe4"
+        },
+        "date": 1786792229239,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 87351.01411033342,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 52389.264810969056,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 78991.66195613056,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 219502.344285037,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 303703.9736627914,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 274933.74096842663,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 291283.6286949328,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 255911.55696591258,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 260807.87848439327,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 214509.41696340468,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 239056.01560557671,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 383353.2677032539,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 385570.4128687981,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 90355.78493877493,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 104565.49689942389,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 40961.87661758451,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 20702.157562299413,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4797.113289107147,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 246742.99249901302,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 76010.02116118988,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1377903.9325378234,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1664.4279001790658,
             "unit": "flows/s"
           }
         ]
