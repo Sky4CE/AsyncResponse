@@ -309,6 +309,9 @@ internal sealed class RecordingDelivery
     /// <summary>When set, every NAK attempt is recorded and then fails with this exception.</summary>
     public Exception? NakException { get; set; }
 
+    /// <summary>When set, every TERM attempt is recorded and then fails with this exception.</summary>
+    public Exception? TermException { get; set; }
+
     public NatsJobDelivery Create(string payload, long numDelivered, string subject = "asyncresponse.transport.worker", IReadOnlyDictionary<string, string>? headers = null)
         => new(
             subject,
@@ -325,7 +328,11 @@ internal sealed class RecordingDelivery
                 Naks.Add(delay);
                 return NakException is null ? ValueTask.CompletedTask : ValueTask.FromException(NakException);
             },
-            () => { Terms++; return ValueTask.CompletedTask; });
+            () =>
+            {
+                Terms++;
+                return TermException is null ? ValueTask.CompletedTask : ValueTask.FromException(TermException);
+            });
 }
 
 /// <summary>Fake <see cref="INatsJetStreamTransport"/> recording topology/publish calls and yielding queued deliveries.</summary>

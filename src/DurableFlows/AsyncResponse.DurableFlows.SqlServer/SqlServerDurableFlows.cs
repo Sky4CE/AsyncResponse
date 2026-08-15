@@ -215,7 +215,7 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
 
     private async Task EnsureCreatedAsync(CancellationToken cancellationToken)
     {
-        if (_created || !_options.AutoCreateSchema)
+        if (_created)
             return;
 
         await _ensureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -225,6 +225,24 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
                 return;
 
             await using var connection = await OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+            if (!_options.AutoCreateSchema)
+            {
+                // Operator-managed schema: no DDL and no DDL lock, but the SAME catalog
+                // verification the DDL path runs — an operator-provisioned table with the wrong
+                // shape (a case-insensitive flow_id collation above all) fails silently at
+                // runtime, which is exactly what verification exists to catch. An absent object is
+                // fine: the migration has not run yet, the first query surfaces a clear SQL Server
+                // error (the documented "create it yourself, later" workflow), and _created stays
+                // unlatched so a later operation re-verifies once the migration lands.
+                if (!await ObjectExistsAsync(connection, cancellationToken).ConfigureAwait(false))
+                    return;
+
+                await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
+                _created = true;
+                return;
+            }
+
             await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
             // Serialize schema creation across processes. The IF-NOT-EXISTS guards are not atomic
@@ -327,6 +345,28 @@ public sealed class SqlServerFlowStateStore : IFlowStateStore
             "durable-flow",
             ExpectedObjects(),
             cancellationToken);
+
+    /// <summary>
+    /// Reports whether ANY object occupies the configured name (any kind: a view or foreign
+    /// component's object must reach verification, which names the precise wrong-kind reason
+    /// instead of skipping the checks). The catalog's own collation decides case matching, exactly
+    /// as the server resolves the runtime identifier.
+    /// </summary>
+    private async Task<bool> ObjectExistsAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT CASE WHEN EXISTS (
+                SELECT 1
+                FROM sys.objects o
+                JOIN sys.schemas s ON s.schema_id = o.schema_id
+                WHERE s.name = @schema AND o.name = @table) THEN 1 ELSE 0 END;
+            """;
+        command.Parameters.AddWithValue("@schema", _options.SchemaName);
+        command.Parameters.AddWithValue("@table", _options.TableName);
+        return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! == 1;
+    }
 
     /// <summary>The catalog shape this store's DDL intends — the single source for both the
     /// post-DDL verification and the failed-batch diagnosis.</summary>

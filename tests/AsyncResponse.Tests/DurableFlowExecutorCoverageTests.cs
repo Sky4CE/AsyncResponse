@@ -153,6 +153,49 @@ public sealed class DurableFlowExecutorCoverageTests
         public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run) => default;
     }
 
+    [Fact]
+    public async Task FailAsync_NotifiesRunFinishedObservers_BeforeTheParentWakeUp()
+    {
+        // Regression (r24): FailAsync's success branch enqueued the parent's wake-up BEFORE
+        // raising run-finished to observers — the opposite order from ExecuteAsync and from its
+        // own already-terminal branch. An observer throw after the parent was already notified
+        // (the documented crash-injection contract) made the redelivered FailAsync take the
+        // already-terminal branch and enqueue the parent a SECOND time; and even without a throw
+        // the parent could resume, memoize the failed child step and finish before the child's
+        // terminal event was recorded.
+        var store = new InMemoryFlowStateStore();
+        var state = State("fail-order");
+        state.ParentFlowId = "parent-1";
+        state.ParentStepName = "child-step";
+        await CreateAsync(store, state);
+        await using var harness = CreateHarness(store, observers: [new ThrowingRunObserver()]);
+
+        // The observer throws out of the run-finished notification, so FailAsync faults...
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Executor.FailAsync("fail-order", new InvalidOperationException("child failed")));
+
+        // ...and because run-finished now precedes the parent notification, the parent wake-up
+        // was NOT yet enqueued — the redelivered FailAsync notifies it via the terminal branch,
+        // exactly once, instead of twice.
+        harness.Builder.Verify(
+            builder => builder.EnqueueWorkerAsync(
+                It.IsAny<Expression<Func<IDurableFlowExecutor, Task>>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    private sealed class ThrowingRunObserver : IDurableFlowExecutionObserver
+    {
+        public ValueTask OnStepStartingAsync(DurableFlowStepEvent step) => default;
+
+        public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step) => default;
+
+        public ValueTask OnStepCompletedAsync(DurableFlowStepEvent step) => default;
+
+        public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run)
+            => throw new InvalidOperationException("observer boom");
+    }
+
     [Theory]
     [InlineData(InvalidFlowDefinition.MissingFlowType, "no flow type name")]
     [InlineData(InvalidFlowDefinition.UnresolvableFlowType, "Cannot resolve flow type")]

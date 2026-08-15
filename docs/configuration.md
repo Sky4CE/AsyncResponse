@@ -214,7 +214,7 @@ The in-memory transport is configured directly on registration:
 | `NotificationChannel` | PostgreSQL | `LISTEN/NOTIFY` channel that wakes PostgreSQL subscribers after publishes or retries. SQL Server has no equivalent: same-process publishes wake subscribers through an in-process signal, and cross-process rows are picked up within `EmptyPollDelay`. |
 | `UseChangeStreamWake` | MongoDB | Wake idle subscribers with a change stream on the queue collection (requires a replica set). When disabled — or when the server is standalone — subscribers fall back to `EmptyPollDelay` polling. |
 | `LockTimeout` | PostgreSQL, SQL Server, MongoDB | How long a claimed row/document stays locked (leased) before another subscriber may retry it. While a handler runs, the subscriber renews the claim automatically at half this cadence (fenced by `lock_id`), so one slow handler is not redelivered mid-execution. |
-| `WorkerSubscriber.LockRenewalInterval` | Azure Service Bus | Peek-lock renewal cadence for received-but-unsettled messages while a batch is processed (default 30 s; `null` disables). Keeps slow handlers from losing their lock mid-batch — see the lock-budget note below. |
+| `WorkerSubscriber.LockRenewalInterval` | Azure Service Bus | Peek-lock renewal cadence for received-but-unsettled messages while a batch is processed (default 10 s; `null` disables). Keeps slow handlers from losing their lock mid-batch — see the lock-budget note below. |
 | `WorkerSubscriber.VisibilityRenewalInterval` | SQS | Opt-in visibility heartbeat for received-but-unprocessed batch messages (default `null` = off; requires `VisibilityTimeout` set and a shorter interval). Off by default because extending visibility overrides queue-tuned redrive timing, and on FIFO queues an extended message keeps its whole message group blocked if the consumer wedges. |
 | `MaxMessagesPerReceive` / `ReceiveWaitTime` | Azure Service Bus, SQS | Receive-loop batch size and long-poll timeout for queue subscribers. SQS caps them at 10 messages and 20 seconds (the defaults). |
 | `WorkerSubscriber.UseAckAfterEnqueue(...)` | all broker transports | Opt-in early-ACK dispatch for long-running workers: bounded in-process queue, configurable worker count, capacity, and drain timeout. Every broker transport exposes the same method name; the message is ACKed once it is accepted into the bounded in-process queue, before the handler runs. Durable-flow wake-ups ride this queue and lose broker redelivery under early ACK, so startup throws unless `DurableFlowOptions.AllowEarlyAckWorkerSubscriber = true` explicitly accepts the risk (see [transport-semantics.md](transport-semantics.md)). |
@@ -241,7 +241,7 @@ background queue; later handler failures cannot be broker-dead-lettered because 
 use `OnBackgroundFailure` for metrics, alerts, or a custom durable failure path. Mind the peek-lock
 budget: a receive batch is processed sequentially, so the last message in a batch waits up to
 `MaxMessagesPerReceive × handler latency` before settlement. By default the subscriber renews the
-peek-lock of every unsettled batch message every `WorkerSubscriber.LockRenewalInterval` (30 s), so
+peek-lock of every unsettled batch message every `WorkerSubscriber.LockRenewalInterval` (10 s), so
 slow handlers no longer hit `MessageLockLostException` redeliveries of already-processed messages;
 if you disable renewal (`LockRenewalInterval = null`), keep that product well under the queue's
 lock duration (or lower `MaxMessagesPerReceive`).

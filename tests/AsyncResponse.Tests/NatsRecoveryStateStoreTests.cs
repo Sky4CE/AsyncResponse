@@ -148,6 +148,36 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task ExpiredCleanup_IsRevisionConditioned_AndSparesAConcurrentFreshRegistration()
+    {
+        // Regression (r24): the expired-entry cleanup called the UNCONDITIONAL DeleteAsync, so a
+        // reader that had just seen the entry expired could wipe a FRESH registration a
+        // concurrent SaveAsync committed between the read and the delete — stranding that waiter
+        // with a live subscription and no recovery arm. The cleanup now uses the
+        // revision-conditioned delete and simply loses on conflict: the new writer owns the key.
+        var key = NatsSubjectSchema.RecoveryKey("corr-expired-race");
+        await _store.SaveAsync(
+            "corr-expired-race",
+            new RecoveryState { CorrelationId = "corr-expired-race", RegisteredAtUtc = DateTime.UtcNow },
+            TimeSpan.FromMinutes(1));
+        _time.Advance(TimeSpan.FromMinutes(2)); // logically expired, physically still present
+
+        // Between GetAllAsync's read (which sees the EXPIRED envelope at revision N) and its
+        // best-effort cleanup, a waiter re-registers and CAS-commits a fresh envelope (N+1).
+        _kv.AfterGet = async _ => await _store.SaveAsync(
+            "corr-expired-race",
+            new RecoveryState { CorrelationId = "corr-expired-race", RegisteredAtUtc = DateTime.UtcNow },
+            TimeSpan.FromMinutes(30));
+
+        // The reader saw the expired envelope, so it reports nothing — but its cleanup must lose.
+        Assert.Empty(await _store.GetAllAsync("corr-expired-race"));
+
+        // The fresh registration survived the racing cleanup and is fully readable.
+        Assert.True(_kv.Entries.ContainsKey(key));
+        Assert.Single(await _store.GetAllAsync("corr-expired-race"));
+    }
+
+    [Fact]
     public async Task GetAllAsync_ReturnsAllRegistrations()
     {
         var first = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };

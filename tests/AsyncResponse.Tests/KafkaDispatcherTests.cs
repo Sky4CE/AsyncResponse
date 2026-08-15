@@ -602,6 +602,34 @@ public class KafkaDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_StoreOffsetFailureAfterSuccessfulHandler_DoesNotRerunOrDeadLetter()
+    {
+        // Regression (r24): the awaiting dispatcher stored its offset INSIDE the handler try, so a
+        // StoreOffset throw after a successful handler (routine when a rebalance revoked the
+        // partition mid-handler) was misread as a handler failure — the already-succeeded handler
+        // re-ran up to MaxDeliveryAttempts and the message was then produced to the dead-letter
+        // topic. Settlement now sits outside the try, parity with the queued dispatcher.
+        var consumer = new FakeKafkaConsumerClient { StoreOffsetException = new InvalidOperationException("rebalanced") };
+        var producer = new FakeKafkaProducerClient();
+        var executions = 0;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                Interlocked.Increment(ref executions);
+                return Task.CompletedTask;
+            },
+            FastRetries(new KafkaSubscriberOptions { MaxDeliveryAttempts = 3 }),
+            consumer: consumer,
+            producer: producer);
+
+        await dispatcher.HandleAsync(KafkaTestData.Delivery(Topic, offset: 1), CancellationToken.None);
+
+        Assert.Equal(1, executions);          // the handler ran exactly once
+        Assert.Empty(producer.Publishes);     // nothing was dead-lettered
+        Assert.Empty(consumer.StoredOffsets); // the store failed; redelivery owns the retry
+    }
+
+    [Fact]
     public async Task Queued_SaturatedQueue_ReportsCannotAcceptMore_UntilDrained()
     {
         var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

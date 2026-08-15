@@ -142,9 +142,15 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 // Backpressure: stop fetching from the assigned partitions while the bounded
                 // in-process queue is saturated. Keep calling Consume so the broker still sees the
                 // consumer polling (max.poll.interval.ms) and rebalance callbacks keep firing.
+                // Re-assert the pause on EVERY saturated tick, not only on the edge: Pause()
+                // snapshots the CURRENT assignment, and a rebalance during backpressure hands this
+                // member partitions with their pause state reset — an edge-triggered pause would
+                // leave those fetching into the full queue and park the poll thread on the bounded
+                // write. Pause is a local librdkafka call (no broker round trip), so the per-tick
+                // re-assert is cheap.
+                consumer.PauseAssignment();
                 if (!paused)
                 {
-                    consumer.PauseAssignment();
                     paused = true;
                     Logger.LogDebug(
                         "Kafka subscriber for {Topic} paused its assignment: the in-process queue is full.",

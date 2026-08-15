@@ -484,8 +484,12 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
             return;
         }
 
-        await NotifyParentAsync(updated).ConfigureAwait(false);
+        // Run-finished observers BEFORE the parent wake-up, matching ExecuteAsync and the
+        // already-terminal branch above: enqueueing the parent first would let it resume and
+        // finish before this run's terminal event is recorded, and an observer throw after the
+        // parent was already notified would re-enqueue the parent a second time on redelivery.
         await NotifyRunFinishedAsync(updated).ConfigureAwait(false);
+        await NotifyParentAsync(updated).ConfigureAwait(false);
 
         _logger.LogWarning(exception, "Durable flow {FlowId} failed via lost-subscriber routing: {Message}", flowId, exception.Message);
     }

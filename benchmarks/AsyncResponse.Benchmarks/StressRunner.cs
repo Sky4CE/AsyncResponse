@@ -1583,7 +1583,7 @@ internal static class StressRunner
                     [options.CorrelationIdAttribute] = $"stress-{i}"
                 },
                 () => { Interlocked.Increment(ref deletes); return ValueTask.CompletedTask; },
-                _ => { Interlocked.Increment(ref visibilityReleases); return ValueTask.CompletedTask; }),
+                (_, _) => { Interlocked.Increment(ref visibilityReleases); return ValueTask.CompletedTask; }),
                 CancellationToken.None).ConfigureAwait(false);
         });
 

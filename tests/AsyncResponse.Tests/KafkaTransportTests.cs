@@ -241,14 +241,44 @@ public class KafkaTransportTests
         options.OperationTimeout = TimeSpan.FromMilliseconds(100);
         options.ConfigureProducer = _ => configured = true;
         var adapter = new KafkaProducerClientAdapter(options);
-        var lazy = (Lazy<IProducer<string?, byte[]>>)typeof(KafkaProducerClientAdapter)
-            .GetField("_producer", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .GetValue(adapter)!;
+        // Materialize through the private Producer property — the lazily-built,
+        // no-faulted-build-cached seam the publish path uses.
+        var producer = typeof(KafkaProducerClientAdapter)
+            .GetProperty("Producer", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(adapter);
 
-        _ = lazy.Value;
+        Assert.NotNull(producer);
         adapter.Dispose();
 
         Assert.True(configured);
+    }
+
+    [Fact]
+    public void ProducerAdapter_DoesNotCacheAFaultedBuild_RetriesOnNextAccess()
+    {
+        // Regression (r24): the producer was cached behind Lazy<T>(ExecutionAndPublication), which
+        // permanently caches a construction exception — one transient ConfigureProducer throw (a
+        // secret-store blip, fd exhaustion during a startup burst) poisoned every later publish
+        // and dead-letter produce until process restart. A faulted build is no longer cached,
+        // parity with the RabbitMQ/Pub-Sub/SQS worker transports.
+        var options = KafkaTestData.NewOptions();
+        var attempts = 0;
+        options.ConfigureProducer = _ =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1)
+                throw new InvalidOperationException("transient secret-store blip");
+        };
+        var adapter = new KafkaProducerClientAdapter(options);
+        var producerProperty = typeof(KafkaProducerClientAdapter)
+            .GetProperty("Producer", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var first = Assert.Throws<TargetInvocationException>(() => producerProperty.GetValue(adapter));
+        Assert.IsType<InvalidOperationException>(first.InnerException);
+
+        // The faulted attempt was NOT cached: the next access rebuilds and succeeds.
+        Assert.NotNull(producerProperty.GetValue(adapter));
+        Assert.Equal(2, attempts);
+        adapter.Dispose();
     }
 
     [Fact]

@@ -345,10 +345,12 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
         // The ACK sits outside the handler's try/catch: a transient BasicAck failure after a
         // successful handler must not be NACKed — the broker would redeliver and re-run side
         // effects that already completed. The un-ACKed delivery is redelivered anyway when the
-        // channel closes, which is the unavoidable at-least-once floor.
+        // channel closes, which is the unavoidable at-least-once floor. Settlement deliberately
+        // ignores cancellation (as every sibling transport does): a shutdown racing the ACK would
+        // abort the settle and redeliver work whose handler already ran.
         try
         {
-            await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
+            await channel.BasicAckAsync(delivery.DeliveryTag, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -453,10 +455,12 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
 
         // The delivery now belongs to a background worker, which decrements _pendingCount when it dequeues.
         // Do not touch the counter or NACK here, even if the ACK below fails — the message is already
-        // executing in-process and a NACK would trigger a duplicate execution via requeue.
+        // executing in-process and a NACK would trigger a duplicate execution via requeue. Settlement
+        // deliberately ignores cancellation (as every sibling transport does): a shutdown racing the
+        // ACK would abort the settle and redeliver a job the background worker is still running.
         try
         {
-            await channel.BasicAckAsync(delivery.DeliveryTag, subscriberCancellationToken).ConfigureAwait(false);
+            await channel.BasicAckAsync(delivery.DeliveryTag, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

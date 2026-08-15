@@ -130,6 +130,12 @@ public sealed class PostgreSqlAsyncResponseChannelOptions : DurableAsyncResponse
 
         EnsurePersistedTtl(MessageRetention, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        if (MessageRetention <= DeliveryConfirmationTimeout)
+            throw new InvalidOperationException(
+                $"{nameof(PostgreSqlAsyncResponseChannelOptions)}.{nameof(MessageRetention)} must exceed " +
+                $"{nameof(DeliveryConfirmationTimeout)}: a message row pruned inside the confirmation window is " +
+                "indistinguishable from an acknowledged one, so the response would be reported delivered and " +
+                "lost-response recovery silently skipped.");
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ListenerPollInterval, nameof(PostgreSqlAsyncResponseChannelOptions), nameof(ListenerPollInterval));
         if (FullSweepInterval is { } fullSweepInterval)

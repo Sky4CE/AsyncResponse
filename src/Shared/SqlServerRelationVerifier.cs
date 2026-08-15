@@ -260,7 +260,13 @@ internal static class SqlServerRelationVerifier
             """;
         command.Parameters.AddWithValue("@schema", schemaName);
 
-        var actual = new Dictionary<(string Table, string Column), ActualColumn>();
+        // OrdinalIgnoreCase throughout, matching how the server itself matched (see the note on
+        // LoadObjectKindsAsync): under a case-insensitive catalog collation the IN list above
+        // returns rows whose table/column names may differ from the configured spelling only in
+        // case — keyed ordinally, every lookup by the configured spelling missed them, so a
+        // correctly-shaped case-variant table was rejected as "missing the column" while the
+        // real shape checks were silently skipped.
+        var actual = new Dictionary<(string Table, string Column), ActualColumn>(TableColumnComparer.Instance);
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -319,10 +325,10 @@ internal static class SqlServerRelationVerifier
             }
 
             // Extra columns are fine only when inserts that do not name them can still succeed.
-            var expectedNames = table.Columns!.Select(c => c.Name).ToHashSet(StringComparer.Ordinal);
+            var expectedNames = table.Columns!.Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var ((tableName, columnName), found) in actual)
             {
-                if (!string.Equals(tableName, table.Name, StringComparison.Ordinal) || expectedNames.Contains(columnName))
+                if (!string.Equals(tableName, table.Name, StringComparison.OrdinalIgnoreCase) || expectedNames.Contains(columnName))
                     continue;
 
                 if (!found.Nullable && !found.Writable)
@@ -367,7 +373,10 @@ internal static class SqlServerRelationVerifier
             """;
         command.Parameters.AddWithValue("@schema", schemaName);
 
-        var actual = new Dictionary<string, List<(byte Ordinal, string Column)>>(StringComparer.Ordinal);
+        // OrdinalIgnoreCase for the same reason as the column dictionary above: the IN list
+        // matched case-insensitively, so an ordinal key would misreport a case-variant table as
+        // "has no primary key" regardless of its real key.
+        var actual = new Dictionary<string, List<(byte Ordinal, string Column)>>(StringComparer.OrdinalIgnoreCase);
         await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
         {
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
@@ -384,7 +393,7 @@ internal static class SqlServerRelationVerifier
                 ? columns.OrderBy(c => c.Ordinal).Select(c => c.Column).ToArray()
                 : [];
 
-            if (!found.AsSpan().SequenceEqual(table.PrimaryKey!))
+            if (!found.AsSpan().SequenceEqual(table.PrimaryKey!, StringComparer.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException(
                     $"The SQL Server {componentName} store's table '{schemaName}.{table.Name}' " +
@@ -450,6 +459,22 @@ internal static class SqlServerRelationVerifier
         "Give this component its own object names (or its own schema) so two AsyncResponse components cannot share one name.";
 
     private readonly record struct ActualColumn(string Type, bool Nullable, string Collation, bool Writable, string Default);
+
+    /// <summary>Case-insensitive (table, column) tuple comparer — catalog name matching is
+    /// case-insensitive under the common catalog collations, so the keys must be too.</summary>
+    private sealed class TableColumnComparer : IEqualityComparer<(string Table, string Column)>
+    {
+        public static readonly TableColumnComparer Instance = new();
+
+        public bool Equals((string Table, string Column) x, (string Table, string Column) y)
+            => string.Equals(x.Table, y.Table, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(x.Column, y.Column, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string Table, string Column) value)
+            => HashCode.Combine(
+                StringComparer.OrdinalIgnoreCase.GetHashCode(value.Table),
+                StringComparer.OrdinalIgnoreCase.GetHashCode(value.Column));
+    }
 }
 
 /// <summary>The SQL Server object kinds an AsyncResponse store creates.</summary>

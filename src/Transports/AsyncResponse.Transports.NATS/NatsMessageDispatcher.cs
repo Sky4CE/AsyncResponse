@@ -234,7 +234,23 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             var shouldTerminate = await DeadLetterAsync(delivery, exception, cancellationToken).ConfigureAwait(false);
             if (shouldTerminate)
             {
-                await delivery.TermAsync().ConfigureAwait(false);
+                // Guarded like both ack sites: TermAsync is the same JetStream request/reply as
+                // Ack/Nak and can throw, and a thrown settlement would unwind the consume loop and
+                // rebuild the whole subscriber — while the un-termed message redelivers after
+                // AckWait and dead-letters AGAIN, forever. Swallow and log; the duplicate
+                // dead-letter on redelivery is the bounded at-least-once outcome.
+                try
+                {
+                    await delivery.TermAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to TERM NATS message on subject {Subject} ({Role}) after dead-lettering; it may redeliver and be dead-lettered again.",
+                        delivery.Subject,
+                        _role);
+                }
             }
             else
             {
@@ -243,7 +259,7 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                     "Dead-letter publish failed for subject {Subject} ({Role}); NAKing so the message can be retried.",
                     delivery.Subject,
                     _role);
-                await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+                await NakQuietlyAsync(delivery).ConfigureAwait(false);
             }
         }
         else
@@ -254,7 +270,28 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
                 delivery.Subject,
                 _role,
                 delivery.NumDelivered);
+            await NakQuietlyAsync(delivery).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// NAKs with the configured redelivery delay, swallowing settlement failures like the ack
+    /// sites: a thrown NAK would unwind the consume loop and rebuild the subscriber, and the only
+    /// consequence of a lost NAK is that redelivery waits for AckWait instead of the delay.
+    /// </summary>
+    private async Task NakQuietlyAsync(NatsJobDelivery delivery)
+    {
+        try
+        {
             await delivery.NakAsync(_subscriberOptions.RedeliveryDelay).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to NAK NATS message on subject {Subject} ({Role}); redelivery falls back to AckWait.",
+                delivery.Subject,
+                _role);
         }
     }
 

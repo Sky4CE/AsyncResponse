@@ -98,9 +98,16 @@ public static class AsyncResponseCoreServiceCollectionExtensions
         // Forward the interface to the concrete registration so resolving either yields the same
         // instance within a scope. TryAdd lets callers (and the DurableFlows.* packages) pre-register
         // the concrete type with a different lifetime — e.g. singleton for stores whose dependencies
-        // are all singletons — without this scoped default overriding it.
+        // are all singletons — without this scoped default overriding it. The forward MIRRORS the
+        // concrete registration's lifetime: a scoped factory that returns a root-owned singleton
+        // would be captured into every flow-execution scope's disposable list, so the first scope's
+        // disposal would dispose the store (and any connections it owns) for the whole process.
         builder.Services.TryAddScoped<TFlowStateStore>();
-        builder.Services.AddScoped<IFlowStateStore>(provider => provider.GetRequiredService<TFlowStateStore>());
+        var storeLifetime = builder.Services.Last(d => d.ServiceType == typeof(TFlowStateStore)).Lifetime;
+        builder.Services.Add(ServiceDescriptor.Describe(
+            typeof(IFlowStateStore),
+            static provider => provider.GetRequiredService<TFlowStateStore>(),
+            storeLifetime));
         builder.Services.AddSingleton(new AsyncResponseDurableFlowStoreMarker(typeof(TFlowStateStore)));
         AddDurableFlowEngine(builder.Services);
         return builder;

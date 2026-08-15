@@ -162,6 +162,12 @@ public sealed class MongoDbAsyncResponseChannelOptions : DurableAsyncResponseCha
 
         EnsurePersistedTtl(MessageRetention, nameof(MongoDbAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        if (MessageRetention <= DeliveryConfirmationTimeout)
+            throw new InvalidOperationException(
+                $"{nameof(MongoDbAsyncResponseChannelOptions)}.{nameof(MessageRetention)} must exceed " +
+                $"{nameof(DeliveryConfirmationTimeout)}: a message document pruned inside the confirmation window is " +
+                "indistinguishable from an acknowledged one, so the response would be reported delivered and " +
+                "lost-response recovery silently skipped.");
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ListenerPollInterval, nameof(MongoDbAsyncResponseChannelOptions), nameof(ListenerPollInterval));
         if (FullSweepInterval is { } fullSweepInterval)

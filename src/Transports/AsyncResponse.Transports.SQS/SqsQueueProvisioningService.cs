@@ -51,9 +51,7 @@ internal sealed class SqsQueueProvisioningService(
     {
         var fifo = SqsQueueAddress.IsFifo(queueName);
         // A FIFO queue's dead-letter queue must itself be FIFO, and FIFO names must end in ".fifo".
-        var deadLetterQueueName = fifo
-            ? $"{queueName[..^".fifo".Length]}{o.DeadLetterQueueSuffix}.fifo"
-            : $"{queueName}{o.DeadLetterQueueSuffix}";
+        var deadLetterQueueName = SqsQueueAddress.DeriveDeadLetterQueueName(queueName, o.DeadLetterQueueSuffix);
 
         var fifoAttributes = fifo
             ? new Dictionary<string, string>(StringComparer.Ordinal) { [QueueAttributeName.FifoQueue] = "true" }

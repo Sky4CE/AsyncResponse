@@ -73,7 +73,7 @@ These hold for every transport in the matrix, verified per package:
 
 | Transport | Ack semantics (default mode) | Attempt counting | Dead-letter destination | After a failure post-early-ACK | Shutdown drain budget | Lock/lease renewal |
 |---|---|---|---|---|---|---|
-| **AzureServiceBus** | peek-lock: complete on success, abandon on failure | broker `DeliveryCount`; dead-letter at `MaxDeliveryAttempts` (`0` = defer to the entity's `MaxDeliveryCount`) | native dead-letter subqueue (broker built-in, nothing to declare) | log + `OnBackgroundFailure`; the lock is settled, no DLQ write possible | drain + close 5 s (receiver/sender close, renewal-task join) | `LockRenewalInterval` 30 s, on by default; `null` disables |
+| **AzureServiceBus** | peek-lock: complete on success, abandon on failure | broker `DeliveryCount`; dead-letter at `MaxDeliveryAttempts` (`0` = defer to the entity's `MaxDeliveryCount`) | native dead-letter subqueue (broker built-in, nothing to declare) | log + `OnBackgroundFailure`; the lock is settled, no DLQ write possible | drain + close 5 s (receiver/sender close, renewal-task join) | `LockRenewalInterval` 10 s, on by default; `null` disables |
 | **GooglePubSub** | streaming pull: ACK on success, NACK on failure | native — subscription retry policy + `DeadLetterPolicy` `maxDeliveryAttempts`; no app counter by design | subscription `DeadLetterPolicy` (delegated to infra) | log + `OnBackgroundFailure`; already ACKed, no DLQ write possible | drain + close 5 s (subscriber-client stop) | — (the Pub/Sub client manages the ack deadline) |
 | **Kafka** | manual offset store, auto-committed every `OffsetCommitInterval` 5 s; offsets cannot NACK one message | in-process retries with backoff (100 ms → 5 s); counted per process delivery — a restart before the commit resets the count | `{topic}.deadletter` (or one `DeadLetterTopic`); declared by `CreateTopics` (default on) | retried in-process, then log + `OnBackgroundFailure` + produced to the DLQ topic | drain only | — (stay under `max.poll.interval.ms` instead) |
 | **MongoDB** | claimed document: delete on success, reschedule after `RedeliveryDelay` 5 s on failure | store — the `findOneAndUpdate` claim increments the attempt | `deadletter` logical queue in the same collection; `DeadLetterEnabled` default on, optional `DeadLetterRetention` | log + `OnBackgroundFailure` + DLQ document | drain + close 5 s (change-stream listen join) | automatic fenced renewal at `LockTimeout`/2 (server-clock `$$NOW`, `lock_id` fence) |
@@ -126,7 +126,7 @@ Only cells that need more than a phrase.
 ### Azure Service Bus
 
 - A receive batch is processed sequentially, so the last message in a batch waits up to
-  `MaxMessagesPerReceive × handler latency` before settlement. `LockRenewalInterval` (30 s,
+  `MaxMessagesPerReceive × handler latency` before settlement. `LockRenewalInterval` (10 s,
   cancellable per beat) renews the peek-lock of every unsettled batch message — including the
   one in the handler — so slow handlers do not hit `MessageLockLostException` redeliveries of
   already-processed messages

@@ -535,6 +535,7 @@ public class RedisTransportTests
     internal sealed class FakeRedisStreamDatabase : IRedisStreamDatabase
     {
         public List<AddCall> Adds { get; } = [];
+        public List<CancellationToken> AddTokens { get; } = [];
         public List<AckCall> Acks { get; } = [];
         public List<CancellationToken> AckTokens { get; } = [];
         public Queue<StreamEntry[]> ReadBatches { get; } = new();
@@ -560,6 +561,7 @@ public class RedisTransportTests
             CancellationToken cancellationToken)
         {
             AddAttempts++;
+            AddTokens.Add(cancellationToken);
             if (AddAttempts <= TransientAddFailuresBeforeSuccess)
                 throw new RedisConnectionException(
                     ConnectionFailureType.UnableToConnect, CommandFlags.None, "transient", null, CommandStatus.Unknown);

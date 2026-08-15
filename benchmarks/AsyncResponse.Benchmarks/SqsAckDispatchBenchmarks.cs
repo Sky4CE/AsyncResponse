@@ -72,5 +72,5 @@ public class SqsAckDispatchBenchmarks
             ReceiveCount: 1,
             Attributes,
             () => ValueTask.CompletedTask,
-            _ => ValueTask.CompletedTask);
+            (_, _) => ValueTask.CompletedTask);
 }

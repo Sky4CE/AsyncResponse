@@ -566,11 +566,23 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 await trigger(correlationId).ConfigureAwait(false);
                 triggerCompleted = true;
             }
-            else if (_logger.IsEnabled(LogLevel.Debug))
+            else
             {
-                _logger.LogDebug(
-                    "Flow {FlowId} step '{Step}' re-attaching to in-flight correlationId {CorrelationId}.",
-                    FlowId, name, correlationId);
+                // Replayed execution re-attaching to an in-flight wait: the executor's
+                // unconditional per-attempt save reset the ledger TTL to StateExpiry, so a step
+                // timeout longer than StateExpiry would out-live its own ledger and strand the
+                // run mid-wait — re-extend to cover the wait, exactly as the fresh path above
+                // and the timer path's replay branch do. A timeout-less re-attach keeps the
+                // plain stamp the executor already wrote this attempt.
+                if (stepTimeout is { } replayWindow)
+                    await SaveForSleepAsync(replayWindow, cancellationToken).ConfigureAwait(false);
+
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    _logger.LogDebug(
+                        "Flow {FlowId} step '{Step}' re-attaching to in-flight correlationId {CorrelationId}.",
+                        FlowId, name, correlationId);
+                }
             }
 
             await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.Awaited, correlationId).ConfigureAwait(false);

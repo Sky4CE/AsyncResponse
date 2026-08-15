@@ -204,15 +204,42 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
         }
         catch (Exception ex)
         {
+            // Failure-path settlement is guarded like the Complete below: a slow handler that
+            // outlived its peek lock makes DeadLetter/Abandon throw MessageLockLost, and an
+            // escaping settlement would tear down the whole receiver — dropping the rest of the
+            // already-received batch un-settled. On a lost settle the lock lapses on its own and
+            // at-least-once redelivery applies (DeliveryCount still advances broker-side).
             if (MaxDeliveryAttempts > 0 && delivery.DeliveryCount >= MaxDeliveryAttempts)
             {
-                await delivery.DeadLetterAsync(
-                    "AsyncResponseHandlerFailed",
-                    ex.Message).ConfigureAwait(false);
+                try
+                {
+                    await delivery.DeadLetterAsync(
+                        "AsyncResponseHandlerFailed",
+                        ex.Message).ConfigureAwait(false);
+                }
+                catch (Exception settleEx)
+                {
+                    Logger.LogWarning(
+                        settleEx,
+                        "Failed to dead-letter Azure Service Bus message {MessageId} after a failed handler; the lock will lapse and the message will be redelivered.",
+                        delivery.MessageId);
+                }
+
                 return;
             }
 
-            await delivery.AbandonAsync().ConfigureAwait(false);
+            try
+            {
+                await delivery.AbandonAsync().ConfigureAwait(false);
+            }
+            catch (Exception settleEx)
+            {
+                Logger.LogWarning(
+                    settleEx,
+                    "Failed to abandon Azure Service Bus message {MessageId} after a failed handler; the lock will lapse and the message will be redelivered.",
+                    delivery.MessageId);
+            }
+
             return;
         }
 
@@ -319,7 +346,21 @@ internal sealed class QueuedAzureServiceBusMessageDispatcher : AzureServiceBusMe
                 _queueName,
                 PendingCount,
                 RunningCount);
-            await delivery.AbandonAsync().ConfigureAwait(false);
+            try
+            {
+                await delivery.AbandonAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // Guarded like every other settlement: an escaping MessageLockLost would tear down
+                // the receiver, and the lock lapsing redelivers the message on its own anyway.
+                Logger.LogWarning(
+                    ex,
+                    "Failed to abandon Azure Service Bus message {MessageId} for {Queue}; the lock will lapse and the message will be redelivered.",
+                    delivery.MessageId,
+                    _queueName);
+            }
+
             return;
         }
 

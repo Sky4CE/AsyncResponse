@@ -857,41 +857,62 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     // IActiveSubscriberProbe
 
     /// <inheritdoc/>
-    public ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
+    public async ValueTask<long> CountActiveSubscribersAsync(string correlationId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(correlationId))
-            return new ValueTask<long>(0L);
+            return 0L;
 
         var channel = _keys.Channel(correlationId);
 
         // Subscriptions live on whichever node the client subscribed through, so the live count is
-        // the maximum reported across all connected endpoints.
+        // the maximum reported across all connected endpoints. The async server call keeps large
+        // watchdog probe sweeps off blocking thread-pool waits, and the per-endpoint token check
+        // lets a shutdown abort the sweep between probes.
         long subscribers = 0;
+        var probed = false;
         foreach (var endPoint in _multiplexer.GetEndPoints())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var server = _multiplexer.GetServer(endPoint);
             if (!server.IsConnected)
                 continue;
 
             try
             {
-                subscribers = Math.Max(subscribers, server.SubscriptionSubscriberCount(channel));
+                subscribers = Math.Max(subscribers, await server.SubscriptionSubscriberCountAsync(channel).ConfigureAwait(false));
+                probed = true;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogDebug(ex, "Failed to read subscriber count for channel {Channel}.", channel.ToString()!);
             }
         }
 
-        return new ValueTask<long>(subscribers);
+        // Negative = "could not be probed" (the watchdog's unknown-liveness contract): when no
+        // endpoint answered, 0 would assert there is definitively no live waiter and flag every
+        // over-threshold registration stale during a transient probe outage.
+        return probed ? subscribers : -1L;
     }
 
     /// <summary>
     /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
-    /// using the same PUBSUB NUMSUB-based probe the watchdog uses.
+    /// using the same PUBSUB NUMSUB-based probe the watchdog uses. An unprobeable result THROWS
+    /// instead of reading as "no live waiter", so the failure propagates to the publisher's catch
+    /// and the publish retries rather than consuming a live waiter's recovery registration
+    /// (parity with the DB channels, whose re-check calls the store directly).
     /// </summary>
     private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
-        => await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+    {
+        var subscribers = await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (subscribers < 0)
+        {
+            throw new InvalidOperationException(
+                $"Redis subscriber liveness for correlationId '{correlationId}' could not be probed on any connected endpoint.");
+        }
+
+        return subscribers > 0;
+    }
 
     private static string SerializeRawSuccessEnvelope(string payloadJson)
     {

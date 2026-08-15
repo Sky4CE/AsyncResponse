@@ -9,14 +9,13 @@ internal sealed class RawJsonResponse
     private readonly string _json;
 
     // One instance is shared across every subscriber of a correlation id, and fan-out dispatch can
-    // materialize payloads from multiple threads. All memoization state below is guarded by _gate:
-    // an unsynchronized publication could hand one waiter a torn (type set, payload null) pair, and
-    // a plain Dictionary corrupts under concurrent writes. The uncontended lock is cheap next to
-    // the deserialization it guards, and allocation behavior is unchanged.
+    // materialize payloads from multiple threads. TYPED payloads are deliberately NOT memoized:
+    // handing one mutable payload instance to multiple same-type waiters would alias user state
+    // across concurrently-running predicates and handlers — every durable channel deserializes a
+    // private instance per waiter, and the in-memory raw path must match (wire parity, same rule
+    // as the typed path's MaterializeAs). The untyped memo below stays: it materializes an
+    // immutable JsonElement, so sharing it is safe; _gate guards its torn-publication hazard.
     private readonly object _gate = new();
-    private Dictionary<Type, object?>? _typedPayloads;
-    private Type? _singlePayloadType;
-    private object? _singlePayload;
     private object? _untypedPayload;
     private bool _hasUntypedPayload;
 
@@ -46,35 +45,7 @@ internal sealed class RawJsonResponse
     /// <summary>Runs the Deserialize operation.</summary>
     public T? Deserialize<T>() => (T?)Deserialize(typeof(T));
 
-    /// <summary>Runs the Deserialize operation.</summary>
+    /// <summary>Materializes a private payload instance per call — see the aliasing note above.</summary>
     public object? Deserialize(Type payloadType)
-    {
-        lock (_gate)
-        {
-            if (_singlePayloadType == payloadType)
-                return _singlePayload;
-
-            if (_typedPayloads?.TryGetValue(payloadType, out var cached) == true)
-                return cached;
-
-            var payload = JsonSafety.SafeDeserialize(_json, payloadType);
-            if (_singlePayloadType is null)
-            {
-                _singlePayloadType = payloadType;
-                _singlePayload = payload;
-                return payload;
-            }
-
-            if (_typedPayloads is null)
-            {
-                _typedPayloads = new Dictionary<Type, object?>
-                {
-                    [_singlePayloadType] = _singlePayload
-                };
-            }
-
-            _typedPayloads.Add(payloadType, payload);
-            return payload;
-        }
-    }
+        => JsonSafety.SafeDeserialize(_json, payloadType);
 }

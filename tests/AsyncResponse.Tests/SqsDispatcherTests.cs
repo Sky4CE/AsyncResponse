@@ -639,7 +639,7 @@ public sealed class SqsDispatcherTests
 
                 return ValueTask.CompletedTask;
             },
-            delay =>
+            (delay, _) =>
             {
                 calls.VisibilityChanges.Add(delay);
                 if (calls.ChangeVisibilityException is not null)

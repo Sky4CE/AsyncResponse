@@ -27,6 +27,12 @@ internal static class RemoteStackTrace
         if (string.IsNullOrEmpty(stackTrace) || maxLength <= 0 || stackTrace.Length <= maxLength)
             return stackTrace;
 
+        // Never split a surrogate pair at the cap: an unpaired high surrogate is ill-formed UTF-16,
+        // which every framework UTF-8 encoder silently replaces with U+FFFD on the wire instead of
+        // failing — back off to the last whole code point.
+        if (char.IsHighSurrogate(stackTrace[maxLength - 1]))
+            maxLength--;
+
         return string.Concat(stackTrace.AsSpan(0, maxLength), TruncationMarker);
     }
 }

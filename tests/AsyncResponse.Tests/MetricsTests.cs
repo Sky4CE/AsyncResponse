@@ -108,11 +108,46 @@ public class MetricsTests
 
         var measurements = await CollectAsync(() => Task.CompletedTask);
 
-        // The gauges are registered process-wide (bound to whichever watchdog state registered first),
-        // so assert presence rather than exact values to stay order-independent across the suite.
+        // The gauges are registered process-wide (reading whichever watchdog state registered most
+        // recently), so assert presence rather than exact values to stay order-independent.
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.outstanding");
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.stale");
         Assert.Contains(measurements, m => m.Instrument == "asyncresponse.recovery.active_waiters");
+    }
+
+    [Fact]
+    public async Task WatchdogGauges_TrackTheNewestRegisteredState()
+    {
+        // Regression (r24): the gauge callbacks captured the FIRST state instance ever registered
+        // process-wide, so any process that builds a second host (test harness, per-tenant hosts,
+        // WebApplicationFactory) kept reporting the dead first host's last snapshot forever. The
+        // callbacks now read a holder the newest registrant re-publishes.
+        var first = new AsyncResponseWatchdogState();
+        AsyncResponseDiagnostics.EnsureWatchdogGauges(first);
+        first.Publish(new AsyncResponseWatchdogSnapshot(
+            DateTime.UtcNow, TimeSpan.FromHours(6),
+            new AsyncResponseWatchdogReport(1, 1, [], 0), Error: null));
+
+        var newest = new AsyncResponseWatchdogState();
+        newest.Publish(new AsyncResponseWatchdogSnapshot(
+            DateTime.UtcNow, TimeSpan.FromHours(6),
+            new AsyncResponseWatchdogReport(42, 7, [], 0), Error: null));
+
+        // Parallel test classes may register their own state concurrently, so re-assert with a
+        // bounded retry: after EnsureWatchdogGauges(newest), the gauges must read 42.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (true)
+        {
+            AsyncResponseDiagnostics.EnsureWatchdogGauges(newest);
+            var measurements = await CollectAsync(() => Task.CompletedTask);
+            if (measurements.Any(m => m.Instrument == "asyncresponse.recovery.outstanding" && m.Value == 42))
+                break;
+
+            Assert.True(
+                DateTime.UtcNow < deadline,
+                "the outstanding gauge never reported the newest registrant's snapshot (42)");
+            await Task.Delay(20);
+        }
     }
 
     private static ServiceProvider CreateInMemoryProvider()

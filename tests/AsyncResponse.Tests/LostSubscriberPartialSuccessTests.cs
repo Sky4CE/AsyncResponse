@@ -94,4 +94,84 @@ public sealed class LostSubscriberPartialSuccessTests
                 Params = [CallbackParam.ForPlaceholder(PlaceholderType.Payload)]
             }
         };
+
+    public interface IPartialFailSpy
+    {
+        Task FailOk(Exception exception);
+        Task FailBoom(Exception exception);
+    }
+
+    private sealed class PartialFailSpy : IPartialFailSpy
+    {
+        private int _ok;
+        private int _boom;
+
+        public int Ok => Volatile.Read(ref _ok);
+        public int Boom => Volatile.Read(ref _boom);
+
+        public Task FailOk(Exception exception)
+        {
+            Interlocked.Increment(ref _ok);
+            return Task.CompletedTask;
+        }
+
+        public Task FailBoom(Exception exception)
+        {
+            Interlocked.Increment(ref _boom);
+            throw new InvalidOperationException("failure callback hit an unregistered service");
+        }
+    }
+
+    [Fact]
+    public async Task DispatchLostExceptions_SiblingFailureAfterASuccessfulCallback_DoesNotEscalate()
+    {
+        // Regression (r24): DispatchLostResponses received this partial-failure guard in r23, but
+        // its exception-path twin still rethrew unconditionally — a SetException whose FIRST
+        // registration's failure callback succeeded (and was consumed) faulted on the SECOND
+        // registration's throw, so the ingress redelivered the whole message forever (the consumed
+        // registration is gone, the failing one keeps failing; the delivery never settles).
+        const string correlationId = "partial-failure-correlation-id";
+        var spy = new PartialFailSpy();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IPartialFailSpy>(spy);
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+
+        var recoveryStateStore = provider.GetRequiredService<IRecoveryStateStore>();
+        var okRegistration = Guid.NewGuid();
+        var boomRegistration = Guid.NewGuid();
+        await recoveryStateStore.SaveAsync(correlationId, FailureRegistration(correlationId, okRegistration, nameof(IPartialFailSpy.FailOk)), TimeSpan.FromMinutes(5));
+        await recoveryStateStore.SaveAsync(correlationId, FailureRegistration(correlationId, boomRegistration, nameof(IPartialFailSpy.FailBoom)), TimeSpan.FromMinutes(5));
+
+        var publisher = provider.GetRequiredService<IAsyncResponsePublisher>();
+
+        // On the old code this faulted with the sibling's InvalidOperationException even though
+        // the exception WAS delivered to (and consumed by) the first registration.
+        await publisher.SetException(new InvalidOperationException("remote boom"), correlationId);
+
+        Assert.Equal(1, spy.Ok);
+        Assert.Equal(1, spy.Boom);
+
+        // The successful registration was consumed; the failed one stays registered so a later
+        // redelivery can retry it and the watchdog can surface it.
+        var remaining = await recoveryStateStore.GetAllAsync(correlationId);
+        var leftover = Assert.Single(remaining);
+        Assert.Equal(boomRegistration, leftover.RegistrationId);
+    }
+
+    private static RecoveryState FailureRegistration(string correlationId, Guid registrationId, string methodName)
+        => new()
+        {
+            RegistrationId = registrationId,
+            CorrelationId = correlationId,
+            PayloadTypeFullName = typeof(OperationResult).FullName,
+            RegisteredAtUtc = DateTime.UtcNow,
+            FailureCallback = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IPartialFailSpy).FullName!,
+                MethodName = methodName,
+                Params = [CallbackParam.ForPlaceholder(PlaceholderType.Exception)]
+            }
+        };
 }

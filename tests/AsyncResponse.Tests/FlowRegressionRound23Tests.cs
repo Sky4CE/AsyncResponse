@@ -59,6 +59,25 @@ public sealed class LongWaitFlow : IDurableFlow<R23Input>
 }
 
 /// <summary>
+/// <see cref="LongWaitFlow"/> with an entered-execution latch, so a test can tell exactly when a
+/// REDELIVERED execution is past the executor's per-attempt save (which resets the ledger TTL to
+/// the plain StateExpiry) and is about to re-attach to the 30-day wait.
+/// </summary>
+public sealed class LongWaitReattachFlow : IDurableFlow<R23Input>
+{
+    public static TaskCompletionSource EnteredExecution = ReattachRaceFlow.NewSource();
+
+    public async Task ExecuteAsync(IDurableFlowContext flow, R23Input input)
+    {
+        EnteredExecution.TrySetResult();
+        await flow.AwaitStepAsync<OperationResult>(
+            "slow",
+            trigger: _ => Task.CompletedTask,
+            timeout: TimeSpan.FromDays(30));
+    }
+}
+
+/// <summary>
 /// Gates mid-execution (before its awaited step) so a test can land concurrent lease-bypassing
 /// writes — RecoverAsync completing the step, FailAsync terminally failing the run — between the
 /// execution's state load and its re-attach to the awaited step.
@@ -156,6 +175,58 @@ public sealed class FlowRegressionRound23Tests
         Assert.True(
             expires > now + TimeSpan.FromDays(30),
             $"the parked ledger expires in {expires - now}; it must outlive the 30-day step timeout.");
+    }
+
+    [Fact]
+    public async Task ReattachedAwaitedStep_ReextendsTheLedgerTtl_AfterRedelivery()
+    {
+        // Regression (r24): the FRESH awaited-step path stamps timeout + StateExpiry (r23 above),
+        // but a REDELIVERED execution re-attaching to the in-flight wait only logged — and the
+        // executor's unconditional per-attempt save had just reset the row's TTL to the plain
+        // StateExpiry, so a step timeout longer than StateExpiry out-lived its own ledger: at
+        // expiry the lease renewal failed against the vanished row and the run was silently lost.
+        // The re-attach branch now re-extends exactly like the timer path's replay branch.
+        LongWaitReattachFlow.EnteredExecution = ReattachRaceFlow.NewSource();
+        var harness = await FlowTestHarness.StartAsync(options =>
+            options.ConfigureAsyncResponse = builder => builder.WithDurableFlow<LongWaitReattachFlow, R23Input>());
+        await using var _ = harness;
+
+        var run = await harness.StartFlowAsync<LongWaitReattachFlow, R23Input>(new R23Input(4));
+        await LongWaitReattachFlow.EnteredExecution.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await run.WaitForAwaitingStepAsync("slow");
+
+        // Kill the parked execution without faulting the breadcrumb; the redelivered execution's
+        // per-attempt save resets the ledger TTL to the plain StateExpiry BEFORE the flow body
+        // runs, so once the latch fires again the old 30d+StateExpiry stamp is gone and only the
+        // re-attach branch can re-extend it.
+        await harness.Engine.SimulateRestartAsync();
+        LongWaitReattachFlow.EnteredExecution = ReattachRaceFlow.NewSource();
+        await run.ResumeAsync();
+        await LongWaitReattachFlow.EnteredExecution.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        using var scope = harness.Engine.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IFlowStateStore>();
+        var entriesField = store.GetType().GetField("_entries", BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(entriesField);
+        var entries = (IDictionary)entriesField!.GetValue(store)!;
+
+        // The re-attach save races this read, so poll until the redelivered execution has
+        // re-extended the TTL past the 30-day wait — on the old code it never does.
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            var entry = entries[run.FlowId];
+            Assert.NotNull(entry);
+            var expires = (DateTime)entry!.GetType().GetProperty("ExpiresAtUtc")!.GetValue(entry)!;
+            var now = harness.Clock.GetUtcNow().UtcDateTime;
+            if (expires > now + TimeSpan.FromDays(30))
+                break;
+
+            Assert.True(
+                TimeProvider.System.GetUtcNow() < guard,
+                $"the re-attached ledger still expires in {expires - now}; it must outlive the 30-day step timeout.");
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
     }
 
     [Fact]

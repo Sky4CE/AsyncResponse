@@ -314,10 +314,9 @@ public sealed class TransportSubscriberCoverageTests
         var adapter = new KafkaProducerClientAdapter(options);
 
         var mockProducer = new Mock<IProducer<string?, byte[]>>();
-        var lazyProducer = new Lazy<IProducer<string?, byte[]>>(() => mockProducer.Object);
 
         var field = typeof(KafkaProducerClientAdapter).GetField("_producer", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        field.SetValue(adapter, lazyProducer);
+        field.SetValue(adapter, mockProducer.Object);
 
         var mockResult = new DeliveryResult<string?, byte[]>
         {

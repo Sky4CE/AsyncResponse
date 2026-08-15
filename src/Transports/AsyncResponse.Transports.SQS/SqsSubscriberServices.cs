@@ -163,10 +163,10 @@ internal abstract class SqsSubscriberService : BackgroundService
                 // stretching that fast retry back out to the full visibility timeout.
                 var tracked = delivery with
                 {
-                    ChangeVisibilityAsync = timeout =>
+                    ChangeVisibilityAsync = (timeout, token) =>
                     {
                         progress.SuppressRenewal(batchIndex);
-                        return delivery.ChangeVisibilityAsync(timeout);
+                        return delivery.ChangeVisibilityAsync(timeout, token);
                     }
                 };
                 try
@@ -211,15 +211,21 @@ internal abstract class SqsSubscriberService : BackgroundService
                 // away from it.
                 for (var i = progress.SettledCount; i < deliveries.Count; i++)
                 {
+                    // The batch finished or the subscriber is stopping: exit quietly between
+                    // messages instead of spending up to a full SDK retry budget on each remaining
+                    // renew (ASB-twin parity).
+                    if (cancellationToken.IsCancellationRequested)
+                        return;
+
                     if (i < progress.SettledCount || progress.IsRenewalSuppressed(i))
                         continue;
 
                     var delivery = deliveries[i];
                     try
                     {
-                        await delivery.ChangeVisibilityAsync(visibilityTimeout).ConfigureAwait(false);
+                        await delivery.ChangeVisibilityAsync(visibilityTimeout, cancellationToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex)
+                    catch (Exception ex) when (ex is not OperationCanceledException)
                     {
                         Logger.LogWarning(
                             ex,

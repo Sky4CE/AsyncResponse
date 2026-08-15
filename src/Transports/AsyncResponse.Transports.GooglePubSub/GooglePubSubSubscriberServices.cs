@@ -137,27 +137,61 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
         CancellationToken stoppingToken)
     {
         var subscriber = await _subscriberFactory(subscriptionName, SubscriberOptions).ConfigureAwait(false);
-        await using var dispatcher = GooglePubSubMessageDispatcher.Create(
-            HandleMessageAsync,
-            Options,
-            SubscriberOptions,
-            Logger,
-            subscriptionId,
-            SubscriberRole);
-
-        Logger.LogInformation(
-            "Pub/Sub subscriber started. Subscription: {Subscription}. Role: {Role}. AckMode: {AckMode}.",
-            subscriptionName.ToString(),
-            SubscriberRole,
-            SubscriberOptions.AckMode);
-
-        var runTask = subscriber.StartAsync(dispatcher.HandleAsync);
-
         try
         {
-            await runTask.WaitAsync(stoppingToken).ConfigureAwait(false);
+            await using var dispatcher = GooglePubSubMessageDispatcher.Create(
+                HandleMessageAsync,
+                Options,
+                SubscriberOptions,
+                Logger,
+                subscriptionId,
+                SubscriberRole);
+
+            Logger.LogInformation(
+                "Pub/Sub subscriber started. Subscription: {Subscription}. Role: {Role}. AckMode: {AckMode}.",
+                subscriptionName.ToString(),
+                SubscriberRole,
+                SubscriberOptions.AckMode);
+
+            var runTask = subscriber.StartAsync(dispatcher.HandleAsync);
+
+            try
+            {
+                await runTask.WaitAsync(stoppingToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                await subscriber.StopAsync(
+                    new SubscriberClient.ShutdownOptions
+                    {
+                        Timeout = Options.ShutdownTimeout
+                    },
+                    CancellationToken.None).ConfigureAwait(false);
+                await runTask.ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            // Graceful shutdown: the cancellation branch above already stopped the client.
+            throw;
+        }
+        catch
+        {
+            // A non-shutdown failure abandons the streaming pull: release the client BEFORE the
+            // retry loop builds a replacement, or its gRPC channels, pull connection and
+            // ack-extension timers stay alive — one leaked client per rebuild.
+            await StopSubscriberQuietlyAsync(subscriber).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort stop of a failed subscriber client, swallowing stop errors: StopAsync is the
+    /// seam's only release primitive, and the caller is already propagating the original failure.
+    /// </summary>
+    private async Task StopSubscriberQuietlyAsync(IGooglePubSubSubscriberClient subscriber)
+    {
+        try
         {
             await subscriber.StopAsync(
                 new SubscriberClient.ShutdownOptions
@@ -165,7 +199,10 @@ internal abstract class GooglePubSubSubscriberService : BackgroundService
                     Timeout = Options.ShutdownTimeout
                 },
                 CancellationToken.None).ConfigureAwait(false);
-            await runTask.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug(ex, "Best-effort stop of a failed Pub/Sub subscriber client did not complete cleanly.");
         }
     }
 

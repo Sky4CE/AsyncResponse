@@ -273,6 +273,57 @@ public class KafkaSubscriberTests
     }
 
     [Fact]
+    public async Task Subscriber_ReassertsThePauseEverySaturatedTick_SoARebalanceCannotUnpauseIt()
+    {
+        // Regression (r24): the poll loop paused only on the !paused edge, but Pause() snapshots
+        // the CURRENT assignment and a rebalance during backpressure hands this member partitions
+        // with their pause state reset — the edge-triggered pause left them fetching into the full
+        // queue and parked the poll thread. The loop now re-asserts the pause on every saturated
+        // tick, so PauseAssignment keeps being called while the queue stays full.
+        var consumer = new FakeKafkaConsumerClient();
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 1, payload: "job-1"));
+        consumer.Enqueue(KafkaTestData.Message("workers", offset: 2, payload: "job-2"));
+
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync(It.IsAny<string>()))
+            .Returns(async (string _) =>
+            {
+                if (Interlocked.Increment(ref calls) == 1)
+                {
+                    handlerStarted.TrySetResult();
+                    await releaseHandler.Task.ConfigureAwait(false);
+                }
+            });
+
+        var subscriber = CreateWorkerSubscriber(consumer, ingress.Object, options =>
+        {
+            options.WorkerTopic = "workers";
+            options.WorkerSubscriber.UseAckAfterEnqueue(
+                backgroundWorkerCount: 1,
+                backgroundQueueCapacity: 1,
+                TimeSpan.FromSeconds(5));
+        });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Reach a steady saturated state (paused, handler parked, queue full)...
+        await KafkaTestData.WaitUntilAsync(() => consumer.Paused);
+        var pausesAtSteadyState = consumer.PauseCount;
+
+        // ...then, with NOTHING changing (the handler stays parked, so no resume can intervene),
+        // the count must keep growing: every backpressure tick re-asserts the pause. The old
+        // edge-triggered pause froze the count here, because `paused` never flipped back.
+        await KafkaTestData.WaitUntilAsync(() => consumer.PauseCount >= pausesAtSteadyState + 2);
+
+        releaseHandler.TrySetResult();
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Subscriber_InvalidEarlyAckOptions_FailFastOnStart()
     {
         var subscriber = CreateWorkerSubscriber(

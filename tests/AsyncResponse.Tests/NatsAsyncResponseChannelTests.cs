@@ -589,12 +589,37 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
-    public async Task CountActiveSubscribers_ReturnsZeroWhenProbeFails()
+    public async Task SetRawResponseJson_ThrowsAndKeepsRegistration_WhenLivenessCannotBeProbed()
+    {
+        // Regression (r24): the lost-subscriber re-check routed through the public probe, which
+        // swallowed every failure into 0 — an UNPROBEABLE server read as "no live waiter", so a
+        // live waiter's recovery registration was consumed (and its callback fired) during a
+        // request blip while the waiter was still awaiting. An unprobeable result now propagates:
+        // the publish throws, the registration stays intact, and the caller's retry machinery
+        // re-attempts (DB-channel parity).
+        _client.NextOutcome = NatsDeliveryOutcome.NoResponders;
+        _client.OutcomeForProbe = _ => throw new InvalidOperationException("probe request failed");
+        _store.Setup(s => s.GetAllAsync("corr-unprobeable", It.IsAny<CancellationToken>()))
+            .ReturnsAsync([new RecoveryState { CorrelationId = "corr-unprobeable", RegistrationId = Guid.NewGuid() }]);
+        var channel = CreateChannel();
+        var raw = (IRawAsyncResponsePublisher)channel;
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => raw.SetRawResponseJson("""{"Status":2,"Message":"late"}""", "corr-unprobeable"));
+        Assert.Contains("could not be probed", exception.Message);
+
+        _store.Verify(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CountActiveSubscribers_ReturnsNegativeWhenProbeFails()
     {
         _client.OutcomeForProbe = _ => throw new InvalidOperationException("probe failed");
         var channel = CreateChannel();
 
-        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr-a"));
+        // Negative = "could not be probed" (the watchdog's unknown-liveness contract): 0 would
+        // assert there is definitively no live waiter.
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr-a"));
     }
 
     [Fact]

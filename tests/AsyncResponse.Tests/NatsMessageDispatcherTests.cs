@@ -286,6 +286,43 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task TermFailureAfterDeadLetterPublish_DoesNotUnwindTheConsumeLoop()
+    {
+        // Regression (r24): TermAsync at the attempt cap ran bare while both ack sites were
+        // guarded — it is the same JetStream request/reply and can throw, and the escaping
+        // settlement unwound the consume loop and rebuilt the whole subscriber. The un-termed
+        // message then redelivered after AckWait still over the cap, so it was dead-lettered
+        // AGAIN, forever. Term is now swallow-and-log like the acks.
+        var rec = new RecordingDelivery { TermException = new InvalidOperationException("ack subject no responders") };
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("boom"), subscriber);
+
+        // Must NOT throw: a thrown Term would tear down the subscriber mid-batch.
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5), CancellationToken.None);
+
+        Assert.Equal(1, rec.Terms);
+        Assert.Single(_jetStream.Published); // the dead-letter publish itself succeeded, once
+    }
+
+    [Fact]
+    public async Task NakFailure_DoesNotUnwindTheConsumeLoop()
+    {
+        // Regression (r24): both NakAsync sites ran bare; a thrown NAK unwound the consume loop
+        // and rebuilt the subscriber. A lost NAK merely means redelivery waits for AckWait
+        // instead of the configured delay, so it is swallow-and-log like the acks.
+        var rec = new RecordingDelivery { NakException = new InvalidOperationException("nak failed") };
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5, RedeliveryDelay = TimeSpan.FromSeconds(7) };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("boom"), subscriber);
+
+        // Below the cap: the failure path NAKs, and the NAK failure must NOT escape.
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 2), CancellationToken.None);
+
+        Assert.Equal([TimeSpan.FromSeconds(7)], rec.Naks);
+        Assert.Equal(0, rec.Terms);
+        Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
     public async Task HandlerFailureAtMaxAttempts_WithDeadLetterDisabled_TerminatesWithoutPublishing()
     {
         var rec = new RecordingDelivery();

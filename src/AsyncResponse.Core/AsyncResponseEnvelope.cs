@@ -128,6 +128,11 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 }
                 else if (property == EnvelopeProperty.Success)
                 {
+                    // Guarded token check: GetBoolean on a non-boolean token throws
+                    // InvalidOperationException, which the ingress would misread as a TRANSIENT
+                    // fault and retry — a malformed envelope must fail fast as a JsonException.
+                    if (reader.TokenType is not (JsonTokenType.True or JsonTokenType.False))
+                        throw new JsonException("Success must be a boolean.");
                     success = reader.GetBoolean();
                 }
                 else if (property == EnvelopeProperty.Payload)
@@ -139,10 +144,14 @@ internal sealed class AsyncResponseEnvelopeConverter<T> : JsonConverter<AsyncRes
                 }
                 else if (property == EnvelopeProperty.ExceptionMessage)
                 {
+                    if (reader.TokenType is not (JsonTokenType.Null or JsonTokenType.String))
+                        throw new JsonException("ExceptionMessage must be a string or null.");
                     exceptionMessage = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
                 else if (property == EnvelopeProperty.ExceptionStackTrace)
                 {
+                    if (reader.TokenType is not (JsonTokenType.Null or JsonTokenType.String))
+                        throw new JsonException("ExceptionStackTrace must be a string or null.");
                     exceptionStackTrace = reader.TokenType == JsonTokenType.Null ? null : reader.GetString();
                 }
                 else

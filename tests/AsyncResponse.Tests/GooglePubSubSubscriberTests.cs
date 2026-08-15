@@ -96,6 +96,47 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task WorkerSubscriberService_StopsAFaultedClient_BeforeTheRetryBuildsAReplacement()
+    {
+        // Regression (r24): a NON-cancellation streaming-pull failure escaped past the
+        // cancellation-only catch (where StopAsync lived), so the retry loop built a replacement
+        // client while the failed one — with its gRPC channels, pull connection and ack-extension
+        // timers — was never released: one leaked client per rebuild, and the seam has no other
+        // disposal member. The failure path now stops the client best-effort before rethrowing.
+        var stops = 0;
+        var clientsBuilt = 0;
+        var secondBuild = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = new GooglePubSubWorkerSubscriber(
+            Options.Create(new GooglePubSubAsyncResponseOptions
+            {
+                ProjectId = "project-a",
+                WorkerSubscriptionId = "workers",
+                SubscriberRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                SubscriberRetryMaxDelay = TimeSpan.FromMilliseconds(5)
+            }),
+            new Mock<IAsyncResponseIngress>().Object,
+            NullLogger<GooglePubSubWorkerSubscriber>.Instance,
+            (_, _) =>
+            {
+                if (Interlocked.Increment(ref clientsBuilt) >= 2)
+                {
+                    secondBuild.TrySetResult();
+                    return Task.FromResult<IGooglePubSubSubscriberClient>(new FakeSubscriberClient());
+                }
+
+                return Task.FromResult<IGooglePubSubSubscriberClient>(
+                    new CountingFaultingClient(() => Interlocked.Increment(ref stops)));
+            });
+
+        await subscriber.StartAsync(CancellationToken.None);
+        await secondBuild.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The faulted first client was stopped before its replacement went live.
+        Assert.True(Volatile.Read(ref stops) >= 1, "the faulted subscriber client was never stopped");
+        await subscriber.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task WorkerSubscriberService_WhenHandlerFails_NacksMessage()
     {
         var client = new FakeSubscriberClient();
@@ -1167,6 +1208,18 @@ public class GooglePubSubSubscriberTests
 
         public Task StopAsync(SubscriberClient.ShutdownOptions options, CancellationToken cancellationToken)
             => Task.CompletedTask;
+    }
+
+    private sealed class CountingFaultingClient(Action _onStop) : IGooglePubSubSubscriberClient
+    {
+        public Task StartAsync(Func<PubsubMessage, CancellationToken, Task<SubscriberClient.Reply>> handler)
+            => Task.FromException(new InvalidOperationException("streaming pull faulted"));
+
+        public Task StopAsync(SubscriberClient.ShutdownOptions options, CancellationToken cancellationToken)
+        {
+            _onStop();
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class ListLogger : ILogger

@@ -356,11 +356,14 @@ internal sealed class AwaitingRedisMessageDispatcher(
     {
         if (AlreadyExceededDeliveryAttempts(delivery))
         {
+            // Settlement deliberately ignores cancellation (parity with the post-handler over-cap
+            // path below): a shutdown landing between the dead-letter XADD and the XACK would
+            // leave the entry in the PEL to be reclaimed and dead-lettered a SECOND time.
             await DeadLetterAndAckAsync(
                 delivery,
                 new InvalidOperationException($"Redis message exceeded {MaxDeliveryAttempts} delivery attempts."),
                 "max_delivery_attempts_exceeded",
-                subscriberCancellationToken).ConfigureAwait(false);
+                CancellationToken.None).ConfigureAwait(false);
             return RedisDispatchOutcome.Processed;
         }
 

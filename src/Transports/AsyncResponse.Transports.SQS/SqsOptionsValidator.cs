@@ -42,6 +42,27 @@ internal static class SqsOptionsValidator
                 throw new InvalidOperationException(
                     $"{nameof(SqsAsyncResponseOptions)}.{nameof(options.MaxReceiveCount)} must be between 1 and 1000 (the SQS redrive policy limit).");
             }
+
+            // The derived dead-letter names must not collide with a LIVE queue (the guard every
+            // sibling transport applies to its dead-letter destination): a redrive policy aimed at
+            // the live response queue moves poison worker jobs into the ingress, where any
+            // parseable JSON completes a real waiter — and provisioning would also silently
+            // reconfigure the live queue's attributes.
+            foreach (var queue in new[] { options.WorkerQueue!, options.ResponseQueue! })
+            {
+                if (SqsQueueAddress.IsUrl(queue))
+                    continue;
+
+                var deadLetterQueue = SqsQueueAddress.DeriveDeadLetterQueueName(queue, options.DeadLetterQueueSuffix!);
+                if (StringComparer.Ordinal.Equals(deadLetterQueue, options.WorkerQueue)
+                    || StringComparer.Ordinal.Equals(deadLetterQueue, options.ResponseQueue))
+                {
+                    throw new InvalidOperationException(
+                        $"{nameof(SqsAsyncResponseOptions)}: the dead-letter queue derived for '{queue}' with " +
+                        $"{nameof(options.DeadLetterQueueSuffix)} '{options.DeadLetterQueueSuffix}' is '{deadLetterQueue}', " +
+                        "which collides with a live worker/response queue. Rename the queues or change the suffix.");
+                }
+            }
         }
 
         if (SqsQueueAddress.IsFifo(options.WorkerQueue))

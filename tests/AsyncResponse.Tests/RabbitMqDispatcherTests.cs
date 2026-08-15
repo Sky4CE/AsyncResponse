@@ -246,6 +246,69 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_AckIgnoresCancellation_SoAShutdownRacingTheAckStillSettles()
+    {
+        // Regression (r24): both BasicAckAsync sites passed subscriberCancellationToken (the NACK
+        // sites already used None), so a shutdown racing the ACK aborted the settle — the broker
+        // requeued and redelivered work whose handler had already completed, running it twice.
+        // Settlement now deliberately ignores cancellation, like every sibling transport.
+        var channel = new FakeDispatcherChannel();
+        using var cts = new CancellationTokenSource();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) =>
+            {
+                cts.Cancel(); // shutdown lands while the handler is finishing
+                return Task.CompletedTask;
+            },
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { AckMode = RabbitMqAckMode.AckAfterHandlerCompletes },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(
+            Delivery("payload", new BasicProperties { CorrelationId = "cid-settle" }, deliveryTag: 61),
+            channel,
+            cts.Token);
+
+        Assert.Equal(61UL, Assert.Single(channel.Acks));
+        Assert.All(channel.AckTokens, token => Assert.Equal(CancellationToken.None, token));
+        Assert.Empty(channel.Nacks);
+    }
+
+    [Fact]
+    public async Task Queued_AckIgnoresCancellation_SoAShutdownRacingTheAckStillSettles()
+    {
+        // Same regression as the awaiting variant, for the early-ACK path: the delivery already
+        // belongs to a background worker when the ACK runs, so an aborted settle redelivered a
+        // job that was still executing in-process — two concurrent executions of one job.
+        var channel = new FakeDispatcherChannel();
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync(); // shutdown already in progress when the delivery lands
+        var dispatcher = (QueuedRabbitMqMessageDispatcher)RabbitMqMessageDispatcher.Create(
+            async (_, _) => await releaseHandler.Task.ConfigureAwait(false),
+            new RabbitMqAsyncResponseOptions(),
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 62), channel, cts.Token);
+
+            Assert.Equal(62UL, Assert.Single(channel.Acks));
+            Assert.All(channel.AckTokens, token => Assert.Equal(CancellationToken.None, token));
+        }
+        finally
+        {
+            releaseHandler.TrySetResult();
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task Awaiting_HandlerThrows_NacksWithRequeue()
     {
         var channel = new FakeDispatcherChannel();
@@ -818,11 +881,19 @@ public class RabbitMqDispatcherTests
     {
         public bool IsOpen { get; set; } = true;
         public List<ulong> Acks { get; } = [];
+        public List<CancellationToken> AckTokens { get; } = [];
         public List<(ulong DeliveryTag, bool Requeue)> Nacks { get; } = [];
         public Exception? ThrowOnAck { get; init; }
 
         public ValueTask BasicAckAsync(ulong deliveryTag, CancellationToken cancellationToken = default)
         {
+            lock (AckTokens)
+                AckTokens.Add(cancellationToken);
+
+            // Mirrors the real adapter, which forwards the token verbatim to the SDK: a cancelled
+            // token aborts the settle instead of acking.
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (ThrowOnAck is not null)
                 throw ThrowOnAck;
 

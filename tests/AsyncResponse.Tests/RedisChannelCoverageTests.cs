@@ -33,8 +33,8 @@ public sealed class RedisChannelCoverageTests
         _multiplexer.Setup(instance => instance.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>()))
             .Returns(_server.Object);
         _server.Setup(instance => instance.IsConnected).Returns(true);
-        _server.Setup(instance => instance.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Returns(() => _liveSubscribers);
+        _server.Setup(instance => instance.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(() => _liveSubscribers);
 
         _store.Setup(store => store.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
@@ -87,8 +87,8 @@ public sealed class RedisChannelCoverageTests
             .ReturnsAsync(0L);
         // The probe sees a waiter once — enough to force the re-publish — then agrees it is gone.
         var probes = 0;
-        _server.Setup(instance => instance.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Returns(() => probes++ == 0 ? 1L : 0L);
+        _server.Setup(instance => instance.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(() => probes++ == 0 ? 1L : 0L);
 
         await PublishAsync(CreateChannel(), kind, "corr-republish-misses");
 
@@ -133,6 +133,65 @@ public sealed class RedisChannelCoverageTests
             instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()),
             Times.Exactly(2));
         _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(PublishKind.Response)]
+    [InlineData(PublishKind.RawJson)]
+    [InlineData(PublishKind.Exception)]
+    public async Task Publish_ThrowsAndKeepsRegistration_WhenLivenessCannotBeProbed(PublishKind kind)
+    {
+        // Regression (r24): the lost-subscriber re-check routed through the public probe, which
+        // swallowed every failure into 0 — an UNPROBEABLE endpoint read as "no live waiter", so a
+        // live waiter's recovery registration was consumed (and its resume/failure callback
+        // fired) during a PUBSUB blip while the waiter was still awaiting. An unprobeable result
+        // now propagates: the publish throws, the registration stays intact, and the caller's
+        // retry/redelivery machinery re-attempts (DB-channel parity).
+        using var activities = new AsyncResponseActivityCollector();
+        _subscriber
+            .Setup(instance => instance.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        _server.Setup(instance => instance.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException(CommandFlags.None, "probe timed out", CommandStatus.Unknown));
+        _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync([NewRecoveryState("corr-unprobeable")]);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishAsync(CreateChannel(), kind, "corr-unprobeable"));
+        Assert.Contains("could not be probed", exception.Message);
+
+        _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task CountActiveSubscribers_ObservesItsCancellationToken()
+    {
+        // Regression (r24): the probe was fully synchronous and never observed its token, so a
+        // watchdog scan over up to MaxScanEntries ids could not be interrupted at shutdown and
+        // each probe blocked a thread-pool thread. The async probe checks the token per endpoint.
+        var channel = CreateChannel();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => channel.CountActiveSubscribersAsync("corr-cancelled", cts.Token).AsTask());
+    }
+
+    [Theory]
+    [InlineData("app[prod]")]
+    [InlineData("app*")]
+    [InlineData("app?x")]
+    [InlineData("app prefix")]
+    [InlineData(" ")]
+    public void KeyPrefix_WithGlobMetacharactersOrWhitespace_IsRejectedAtConstruction(string prefix)
+    {
+        // Regression (r24): KeyPrefix was never validated — keys are written literally, but the
+        // recovery scan uses the prefix inside SCAN MATCH, where * ? [ ] \ are glob
+        // metacharacters: a prefix like app[prod] made the watchdog silently find nothing forever
+        // (and a '*' swept a foreign deployment's keys). The RedisKeySchema choke point — which
+        // both the channel and the recovery store construct through — now rejects it.
+        var exception = Assert.Throws<InvalidOperationException>(() => new RedisKeySchema(prefix));
+        Assert.Contains("KeyPrefix", exception.Message);
     }
 
     private static RecoveryState NewRecoveryState(string correlationId) => new()
@@ -193,22 +252,24 @@ public sealed class RedisChannelCoverageTests
         Assert.Equal(9d, AsyncResponseActivityCollector.Tag(activity, "asyncresponse.timeout_seconds"));
     }
 
-    /// <summary>A disconnected endpoint is skipped rather than probed.</summary>
+    /// <summary>A disconnected endpoint is skipped rather than probed; nothing probed reads as unknown.</summary>
     [Fact]
     public async Task CountActiveSubscribers_SkipsDisconnectedEndpointsAndSurvivesAProbeFailure()
     {
         var channel = CreateChannel();
 
+        // No endpoint could be probed: negative = "unknown" (the watchdog's could-not-probe
+        // contract), never 0 — 0 would assert there is definitively no live waiter.
         _server.Setup(instance => instance.IsConnected).Returns(false);
-        Assert.Equal(0L, await channel.CountActiveSubscribersAsync("corr-disconnected"));
+        Assert.Equal(-1L, await channel.CountActiveSubscribersAsync("corr-disconnected"));
 
         // A probe that throws is logged and treated as "no information", not propagated.
         _server.Setup(instance => instance.IsConnected).Returns(true);
-        _server.Setup(instance => instance.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Throws(new RedisTimeoutException(CommandFlags.None, "probe timed out", CommandStatus.Unknown));
-        Assert.Equal(0L, await channel.CountActiveSubscribersAsync("corr-probe-fails"));
+        _server.Setup(instance => instance.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException(CommandFlags.None, "probe timed out", CommandStatus.Unknown));
+        Assert.Equal(-1L, await channel.CountActiveSubscribersAsync("corr-probe-fails"));
 
-        // A blank correlation id short-circuits before any endpoint is touched.
+        // A blank correlation id short-circuits before any endpoint is touched: definitively zero.
         Assert.Equal(0L, await channel.CountActiveSubscribersAsync(" "));
     }
 

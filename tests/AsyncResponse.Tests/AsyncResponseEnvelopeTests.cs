@@ -53,6 +53,28 @@ public class AsyncResponseEnvelopeTests
         Assert.Equal("at Remote.Do()", restored.ExceptionStackTrace);
     }
 
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Success":"true","Payload":{"Status":2}}""")]
+    [InlineData("""{"SchemaVersion":1,"Success":1,"Payload":{"Status":2}}""")]
+    [InlineData("""{"SchemaVersion":1,"Success":null,"Payload":{"Status":2}}""")]
+    public void WrongTypedSuccess_ThrowsJsonException_NotInvalidOperation(string json)
+    {
+        // Regression (r24): GetBoolean on a non-boolean token threw InvalidOperationException,
+        // which the ingress retry predicate (`ex is not (JsonException or InvalidDataException)`)
+        // classified as TRANSIENT — a permanently malformed envelope burned the full re-parse
+        // retry budget before terminally failing the flow. A malformed envelope must fail fast
+        // as a JsonException, like every sibling property in this converter.
+        Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+    }
+
+    [Theory]
+    [InlineData("""{"SchemaVersion":1,"Success":true,"Payload":null,"ExceptionMessage":123}""")]
+    [InlineData("""{"SchemaVersion":1,"Success":true,"Payload":null,"ExceptionStackTrace":false}""")]
+    public void WrongTypedExceptionText_ThrowsJsonException_NotInvalidOperation(string json)
+        => Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<AsyncResponseEnvelope<OperationResult>>(
+            json, AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+
     [Fact]
     public void NullPayload_ForNonNullableValueType_BecomesDefault()
     {

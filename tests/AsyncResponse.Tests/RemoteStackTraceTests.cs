@@ -47,4 +47,25 @@ public class RemoteStackTraceTests
         Assert.Contains("truncated", result);
         Assert.True(result!.Length < 150);
     }
+
+    [Fact]
+    public void Cap_NeverSplitsASurrogatePair_AtTheBoundary()
+    {
+        // Regression (r24): the cap sliced at a UTF-16 code-unit boundary, so a cap landing inside
+        // a surrogate pair kept a lone high surrogate — ill-formed UTF-16 that every framework
+        // UTF-8 encoder silently replaces with U+FFFD on the wire, so the delivered trace no
+        // longer round-tripped. The cap now backs off to the last whole code point.
+        var input = new string('x', 99) + "\U0001F600" + new string('y', 50); // emoji spans units 99-100
+
+        var result = RemoteStackTrace.Cap(input, 100);
+
+        Assert.NotNull(result);
+        Assert.StartsWith(new string('x', 99), result);
+        // The kept prefix ends on a whole code point (the emoji was dropped, not split)...
+        Assert.False(char.IsHighSurrogate(result![98]));
+        Assert.Contains("truncated", result);
+        // ...and the whole capped string survives a UTF-8 round trip byte-identically — a lone
+        // surrogate would come back as U+FFFD and fail this equality.
+        Assert.Equal(result, System.Text.Encoding.UTF8.GetString(System.Text.Encoding.UTF8.GetBytes(result)));
+    }
 }

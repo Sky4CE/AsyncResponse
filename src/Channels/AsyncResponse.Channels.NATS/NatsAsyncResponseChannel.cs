@@ -906,16 +906,31 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "Failed to probe active subscribers for subject {Subject}.", subject);
-            return 0L;
+            // Negative = "could not be probed" (the watchdog's unknown-liveness contract): 0 would
+            // assert there is definitively no live waiter and flag every over-threshold
+            // registration stale during a transient probe outage.
+            return -1L;
         }
     }
 
     /// <summary>
     /// Re-probes waiter liveness for the lost-subscriber dispatcher's snapshot-race re-check,
-    /// using the same presence probe the watchdog uses.
+    /// using the same presence probe the watchdog uses. An unprobeable result THROWS instead of
+    /// reading as "no live waiter", so the failure propagates to the publisher's catch and the
+    /// publish retries rather than consuming a live waiter's recovery registration (parity with
+    /// the DB channels, whose re-check calls the store directly).
     /// </summary>
     private async ValueTask<bool> HasLiveSubscriberAsync(string correlationId, CancellationToken cancellationToken)
-        => await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false) > 0;
+    {
+        var subscribers = await CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        if (subscribers < 0)
+        {
+            throw new InvalidOperationException(
+                $"NATS subscriber liveness for correlationId '{correlationId}' could not be probed.");
+        }
+
+        return subscribers > 0;
+    }
 
     private static string SerializeRawSuccessEnvelope(string payloadJson)
     {

@@ -423,11 +423,11 @@ public class RedisAsyncResponseChannelWaiterTests
         serverB.SetupGet(s => s.IsConnected).Returns(false);
         serverC.SetupGet(s => s.IsConnected).Returns(true);
         serverA
-            .Setup(s => s.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Returns(3);
+            .Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(3);
         serverC
-            .Setup(s => s.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Throws(new InvalidOperationException("node unavailable"));
+            .Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new InvalidOperationException("node unavailable"));
 
         _multiplexer.Setup(m => m.GetEndPoints(It.IsAny<bool>())).Returns([endpointA, endpointB, endpointC]);
         _multiplexer.Setup(m => m.GetServer(endpointA, It.IsAny<object?>())).Returns(serverA.Object);
@@ -793,8 +793,8 @@ public class RedisAsyncResponseChannelWaiterTests
 
         var server = new Mock<IServer>();
         server.SetupGet(s => s.IsConnected).Returns(true);
-        server.Setup(s => s.SubscriptionSubscriberCount(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
-            .Throws(new InvalidOperationException("Redis command failed"));
+        server.Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new InvalidOperationException("Redis command failed"));
 
         multiplexer.Setup(m => m.GetServer(endPoint, It.IsAny<object?>())).Returns(server.Object);
 
@@ -806,7 +806,9 @@ public class RedisAsyncResponseChannelWaiterTests
             new AsyncResponseContextPropagation([]),
             new TestLogger<RedisAsyncResponseChannel>());
 
+        // Nothing could be probed: negative = "unknown" (the watchdog's could-not-probe
+        // contract), never 0 — 0 would assert there is definitively no live waiter.
         var count = await channel.CountActiveSubscribersAsync("corr");
-        Assert.Equal(0, count);
+        Assert.Equal(-1, count);
     }
 }

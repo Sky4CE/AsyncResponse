@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using StackExchange.Redis;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Xunit;
@@ -35,6 +36,21 @@ public class LostSubscriberRoutingTests
         _subscriber
             .Setup(s => s.PublishAsync(It.IsAny<RedisChannel>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(0); // no active subscribers: the lost-subscriber fallback kicks in
+
+        // A healthy endpoint whose PUBSUB probe reports zero subscribers: the lost-subscriber
+        // re-check needs a SUCCESSFUL "no live waiter" probe — an unprobeable endpoint now
+        // propagates as a failure (publish retried) instead of consuming the registration.
+        var probeServer = new Mock<IServer>();
+        probeServer.Setup(s => s.IsConnected).Returns(true);
+        probeServer
+            .Setup(s => s.SubscriptionSubscriberCountAsync(It.IsAny<RedisChannel>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(0L);
+        _multiplexer
+            .Setup(m => m.GetEndPoints(It.IsAny<bool>()))
+            .Returns([new DnsEndPoint("localhost", 6379)]);
+        _multiplexer
+            .Setup(m => m.GetServer(It.IsAny<EndPoint>(), It.IsAny<object?>()))
+            .Returns(probeServer.Object);
         _database
             .Setup(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
             .ReturnsAsync(true);

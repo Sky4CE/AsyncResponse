@@ -362,6 +362,32 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_AlreadyExceededMax_SettlementIgnoresTheSubscriberToken()
+    {
+        // Regression (r24): the PRE-handler over-cap path passed subscriberCancellationToken into
+        // DeadLetterAndAckAsync (the post-handler path already used None), and the token gates
+        // both the XADD and the XACK — a shutdown landing between the two left the entry in the
+        // PEL to be reclaimed and dead-lettered a SECOND time after restart. Settlement now
+        // deliberately ignores cancellation on both over-cap paths.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        using var cts = new CancellationTokenSource();
+        await using var dispatcher = RedisMessageDispatcher.Create(
+            (_, _) => Task.CompletedTask,
+            database,
+            new RedisAsyncResponseTransportOptions { DeadLetterStream = "dead" },
+            new RedisSubscriberOptions { MaxDeliveryAttempts = 3 },
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 4), cts.Token);
+
+        Assert.False(Assert.Single(database.AddTokens).CanBeCanceled); // CancellationToken.None, not the subscriber token
+        Assert.False(Assert.Single(database.AckTokens).CanBeCanceled);
+    }
+
+    [Fact]
     public async Task Awaiting_HandlerFailsAtMax_WhenDeadLetterDisabled_AcksWithoutAdding()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

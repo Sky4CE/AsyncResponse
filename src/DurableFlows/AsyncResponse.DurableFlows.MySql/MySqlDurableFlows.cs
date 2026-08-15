@@ -301,8 +301,11 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
-            _created = true;
+            // Latch only when the table was actually verified (Oracle parity): an absent table
+            // under AutoCreateSchema = false must keep re-verifying, or a migration that lands
+            // AFTER the first operation would never have its unique-key/collation/charset checks
+            // run for the process lifetime.
+            _created = await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -331,7 +334,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
     /// </description></item>
     /// </list>
     /// </summary>
-    private async Task VerifyFlowTableAsync(MySqlConnection connection, CancellationToken cancellationToken)
+    private async Task<bool> VerifyFlowTableAsync(MySqlConnection connection, CancellationToken cancellationToken)
     {
         var columns = new Dictionary<string, ActualColumn>(StringComparer.OrdinalIgnoreCase);
         await using (var command = connection.CreateCommand())
@@ -365,8 +368,9 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         {
             // The table does not exist: AutoCreateSchema = false and the migration has not run yet.
             // That surfaces at the first query with a clear MySQL error, and failing here would
-            // break the documented "create it yourself, later" workflow.
-            return;
+            // break the documented "create it yourself, later" workflow. Returning false keeps
+            // _created unlatched so the next operation re-verifies once the migration has run.
+            return false;
         }
 
         foreach (var expected in ExpectedColumns)
@@ -471,6 +475,7 @@ public sealed class MySqlFlowStateStore : IFlowStateStore
         }
 
         await VerifyFlowIdIsUniqueAsync(connection, cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>One column as <c>information_schema</c> reports it.</summary>

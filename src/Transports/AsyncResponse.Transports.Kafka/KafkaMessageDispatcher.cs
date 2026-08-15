@@ -235,6 +235,30 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     protected void StoreOffset(KafkaDelivery delivery)
         => _consumer.StoreOffset(delivery.Topic, delivery.Partition, delivery.Offset);
 
+    /// <summary>
+    /// Stores the offset after the message is settled (handler success or dead-letter publish),
+    /// swallowing failures: StoreOffset throws when a rebalance revoked the partition — routine in
+    /// a consumer group — and the only consequence is redelivery after the rebalance. A thrown
+    /// settlement must never be misread as a handler failure that re-runs (or dead-letters)
+    /// already-settled work.
+    /// </summary>
+    protected void StoreOffsetAfterSettlement(KafkaDelivery delivery)
+    {
+        try
+        {
+            StoreOffset(delivery);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(
+                ex,
+                "Failed to store offset for Kafka message {Topic}[{Partition}]@{Offset} after settlement; it will be redelivered after a restart or rebalance.",
+                delivery.Topic,
+                delivery.Partition,
+                delivery.Offset);
+        }
+    }
+
     /// <summary>Runs the ReachedDeliveryAttempts operation.</summary>
     protected bool ReachedDeliveryAttempts(int attempt)
         => MaxDeliveryAttempts > 0 && attempt >= MaxDeliveryAttempts;
@@ -398,8 +422,6 @@ internal sealed class AwaitingKafkaMessageDispatcher(
             try
             {
                 await ExecuteHandlerAsync(delivery, attempt, subscriberCancellationToken).ConfigureAwait(false);
-                StoreOffset(delivery);
-                return;
             }
             catch (OperationCanceledException) when (subscriberCancellationToken.IsCancellationRequested)
             {
@@ -423,7 +445,7 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                         "handler_failed_max_attempts",
                         attempt,
                         CancellationToken.None).ConfigureAwait(false);
-                    StoreOffset(delivery);
+                    StoreOffsetAfterSettlement(delivery);
                     return;
                 }
 
@@ -431,7 +453,15 @@ internal sealed class AwaitingKafkaMessageDispatcher(
                 // stalls the message's partition (head-of-line), which is inherent to classic
                 // consumer groups.
                 await Task.Delay(RetryBackoff(attempt), subscriberCancellationToken).ConfigureAwait(false);
+                continue;
             }
+
+            // Settlement sits OUTSIDE the handler try (parity with the queued dispatcher and every
+            // sibling transport): a StoreOffset failure after a successful handler — routine when a
+            // rebalance revoked the partition mid-handler — must not be misread as a handler
+            // failure that re-runs, or dead-letters, work that already succeeded.
+            StoreOffsetAfterSettlement(delivery);
+            return;
         }
     }
 }

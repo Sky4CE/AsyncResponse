@@ -91,19 +91,19 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         cancellationToken.ThrowIfCancellationRequested();
 
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
-        var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
-        if (stored is null)
+        var loaded = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+        if (loaded is not { } found)
             return [];
 
-        if (IsExpired(stored))
+        if (IsExpired(found.Stored))
         {
             // Past its logical expiry but still physically present (bucket MaxAge has not collected it
             // yet): treat as gone and remove it best-effort so it never resurfaces.
-            await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
+            await TryDeleteSilentlyAsync(key, found.Revision, cancellationToken).ConfigureAwait(false);
             return [];
         }
 
-        var states = StatesFrom(stored);
+        var states = StatesFrom(found.Stored);
         for (var i = states.Count - 1; i >= 0; i--)
         {
             var state = states[i];
@@ -143,7 +143,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
             if (IsExpired(stored))
             {
-                await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
+                await TryDeleteSilentlyAsync(key, existing.Revision, cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
@@ -173,17 +173,17 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var stored = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
-            if (stored is null)
+            var loaded = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
+            if (loaded is not { } found)
                 continue;
 
-            if (IsExpired(stored))
+            if (IsExpired(found.Stored))
             {
-                await TryDeleteSilentlyAsync(key, cancellationToken).ConfigureAwait(false);
+                await TryDeleteSilentlyAsync(key, found.Revision, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            foreach (var state in StatesFrom(stored))
+            foreach (var state in StatesFrom(found.Stored))
             {
                 var correlationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
                 if (!IsStateReadable(state, key, correlationId))
@@ -196,10 +196,14 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
     private const int MaxCasAttempts = 4;
 
-    private async Task<StoredRecoveryState?> LoadStoredAsync(string key, CancellationToken cancellationToken)
+    private async Task<(StoredRecoveryState Stored, ulong Revision)?> LoadStoredAsync(string key, CancellationToken cancellationToken)
     {
         var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-        return entry is { } existing ? TryDeserialize(existing.Value, key) : null;
+        if (entry is not { } existing)
+            return null;
+
+        var stored = TryDeserialize(existing.Value, key);
+        return stored is null ? null : (stored, existing.Revision);
     }
 
     private static string SerializeStates(List<RecoveryState> states, DateTimeOffset expiresAtUtc)
@@ -254,11 +258,15 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     private static List<RecoveryState> StatesFrom(StoredRecoveryState stored)
         => stored.States is { Count: > 0 } ? [.. stored.States] : [];
 
-    private async Task TryDeleteSilentlyAsync(string key, CancellationToken cancellationToken)
+    private async Task TryDeleteSilentlyAsync(string key, ulong revision, CancellationToken cancellationToken)
     {
         try
         {
-            await _store.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+            // Revision-conditioned like every other write in this store: an unconditional delete
+            // could destroy a FRESH registration a concurrent SaveAsync committed between our
+            // expired read and this cleanup. On a revision conflict the delete is simply skipped —
+            // the new writer owns the key now.
+            await _store.TryDeleteAsync(key, revision, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

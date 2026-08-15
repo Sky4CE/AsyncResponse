@@ -35,8 +35,11 @@ internal static class MongoOwnershipLedger
         {
             // Atomic claim: the upsert inserts our ownership document only when no document
             // exists for the collection; a concurrent claimant loses the insert and reads the
-            // winner's document. Documents lacking the component field (foreign writes) are
-            // tolerated rather than guessed about.
+            // winner's document. Documents lacking the component/purpose fields — or carrying
+            // non-string values (a hand-repaired claim with component: null, a migration that
+            // stored an enum) — are foreign writes: tolerated rather than guessed about, and the
+            // BsonString pattern matches below keep the guard itself from throwing
+            // InvalidCastException while evaluating them.
             var existing = await ledger.FindOneAndUpdateAsync<BsonDocument>(
                 new BsonDocument("_id", collection),
                 new BsonDocument("$setOnInsert", new BsonDocument
@@ -54,11 +57,13 @@ internal static class MongoOwnershipLedger
             if (existing is not null
                 && existing.TryGetValue("component", out var owner)
                 && existing.TryGetValue("purpose", out var ownerPurpose)
-                && !(owner.AsString == componentName && ownerPurpose.AsString == purpose))
+                && owner is BsonString ownerName
+                && ownerPurpose is BsonString ownerPurposeName
+                && !(ownerName.Value == componentName && ownerPurposeName.Value == purpose))
             {
                 throw new InvalidOperationException(
                     $"MongoDB collection '{database.DatabaseNamespace.DatabaseName}.{collection}' is already claimed by the " +
-                    $"{owner.AsString} ({ownerPurpose.AsString}) in the persisted ownership ledger " +
+                    $"{ownerName.Value} ({ownerPurposeName.Value}) in the persisted ownership ledger " +
                     $"('{CollectionName}'), and this {componentName} configured it as {purpose}. Components sharing a database " +
                     "must use distinct collections — including derived ones such as the channel's '{MessageCollection}_counters' " +
                     "ack-sequence counter, whose documents another component's TTL index would silently delete. Rename one of the " +

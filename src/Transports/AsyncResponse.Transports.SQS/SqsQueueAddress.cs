@@ -25,4 +25,15 @@ internal static class SqsQueueAddress
         var lastSegment = trimmed.LastIndexOf('/');
         return lastSegment >= 0 ? trimmed[(lastSegment + 1)..] : trimmed;
     }
+
+    /// <summary>
+    /// Derives the dead-letter queue name provisioning creates for <paramref name="queueName"/>:
+    /// the suffix is appended, and for FIFO queues re-inserted before the mandatory
+    /// <c>.fifo</c> tail (a FIFO queue's dead-letter queue must itself be FIFO). The validator
+    /// uses the SAME derivation to reject collisions with a live queue, so the two must not drift.
+    /// </summary>
+    public static string DeriveDeadLetterQueueName(string queueName, string suffix)
+        => IsFifo(queueName)
+            ? $"{queueName[..^".fifo".Length]}{suffix}.fifo"
+            : $"{queueName}{suffix}";
 }

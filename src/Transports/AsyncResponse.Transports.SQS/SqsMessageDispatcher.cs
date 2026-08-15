@@ -140,7 +140,8 @@ internal abstract class SqsMessageDispatcher : IAsyncDisposable
     {
         try
         {
-            await delivery.ChangeVisibilityAsync(delay).ConfigureAwait(false);
+            // Settlement deliberately ignores cancellation (as every sibling transport does).
+            await delivery.ChangeVisibilityAsync(delay, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

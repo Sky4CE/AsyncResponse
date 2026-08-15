@@ -257,6 +257,63 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_DeadLetterFailureAfterFailedHandler_DoesNotEscape()
+    {
+        // Regression (r24): the failure-path settlements ran bare while the success-path Complete
+        // was guarded — a slow handler that outlived its peek lock made DeadLetterAsync throw
+        // MessageLockLost, and the escaping settlement tore down the whole receiver, dropping the
+        // rest of the already-received batch un-settled. The failure-path settles are now
+        // swallow-and-log; the lock lapse owns redelivery.
+        var calls = new SettlementCalls { DeadLetterException = new InvalidOperationException("lock lost") };
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        // Must NOT throw: an escaping settle rebuilds the receiver mid-batch.
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), CancellationToken.None);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(0, calls.Complete);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_AbandonFailureAfterFailedHandler_DoesNotEscape()
+    {
+        // Same regression as above, for the below-cap branch: a lock-lost Abandon must not escape.
+        var calls = new SettlementCalls { AbandonException = new InvalidOperationException("lock lost") };
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("boom"),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 5 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 1), CancellationToken.None);
+
+        Assert.Equal(1, calls.Abandon);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
+    [Fact]
+    public void LockRenewalInterval_DefaultBeatsAzureDefaultLockDuration()
+    {
+        // Regression (r24): the default was 30 s — exactly Azure Service Bus's own default
+        // LockDuration — and the renewal loop sleeps a FULL interval before its first renew, so
+        // at defaults the heartbeat could never beat lock expiry: later batch messages were
+        // redelivered to a competing consumer and handled twice. The default must stay
+        // comfortably below the 30-second lock.
+        var options = new AzureServiceBusSubscriberOptions();
+
+        Assert.Equal(TimeSpan.FromSeconds(10), options.LockRenewalInterval);
+        Assert.True(options.LockRenewalInterval < TimeSpan.FromSeconds(30));
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_UnlimitedAttemptsAlwaysAbandons()
     {
         var calls = new SettlementCalls();
@@ -509,6 +566,9 @@ public sealed class AzureServiceBusDispatcherTests
             () =>
             {
                 calls.Abandon++;
+                if (calls.AbandonException is not null)
+                    throw calls.AbandonException;
+
                 return ValueTask.CompletedTask;
             },
             (reason, description) =>
@@ -516,6 +576,9 @@ public sealed class AzureServiceBusDispatcherTests
                 calls.DeadLetter++;
                 calls.DeadLetterReason = reason;
                 calls.DeadLetterDescription = description;
+                if (calls.DeadLetterException is not null)
+                    throw calls.DeadLetterException;
+
                 return ValueTask.CompletedTask;
             },
             _ =>
@@ -530,7 +593,9 @@ public sealed class AzureServiceBusDispatcherTests
         public int Complete;
         public Exception? CompleteException;
         public int Abandon;
+        public Exception? AbandonException;
         public int DeadLetter;
+        public Exception? DeadLetterException;
         public int RenewLock;
         public string? DeadLetterReason;
         public string? DeadLetterDescription;

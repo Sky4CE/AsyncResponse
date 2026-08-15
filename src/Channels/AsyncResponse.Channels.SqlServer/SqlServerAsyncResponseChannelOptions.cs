@@ -142,6 +142,12 @@ public sealed class SqlServerAsyncResponseChannelOptions : DurableAsyncResponseC
 
         EnsurePersistedTtl(MessageRetention, nameof(SqlServerAsyncResponseChannelOptions), nameof(MessageRetention));
         EnsurePersistedTtl(DeliveryConfirmationTimeout, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationTimeout));
+        if (MessageRetention <= DeliveryConfirmationTimeout)
+            throw new InvalidOperationException(
+                $"{nameof(SqlServerAsyncResponseChannelOptions)}.{nameof(MessageRetention)} must exceed " +
+                $"{nameof(DeliveryConfirmationTimeout)}: a message row pruned inside the confirmation window is " +
+                "indistinguishable from an acknowledged one, so the response would be reported delivered and " +
+                "lost-response recovery silently skipped.");
         EnsureTimerBacked(DeliveryConfirmationPollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(DeliveryConfirmationPollInterval));
         EnsureTimerBacked(ActivePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(ActivePollInterval));
         EnsureTimerBacked(IdlePollInterval, nameof(SqlServerAsyncResponseChannelOptions), nameof(IdlePollInterval));

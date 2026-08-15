@@ -1,6 +1,8 @@
 using AsyncResponse.Channels.MongoDB;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Collections;
 using Microsoft.Extensions.Options;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -42,11 +44,67 @@ public sealed class MongoDbChannelCoverageTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => channel.SetResponse(new OperationResult(), "failed-response"));
         await Assert.ThrowsAsync<InvalidOperationException>(() => raw.SetRawResponseJson("{}", "failed-raw", CancellationToken.None));
         await Assert.ThrowsAsync<InvalidOperationException>(() => channel.SetException(new InvalidOperationException(), "failed-exception"));
-        Assert.Equal(0, await channel.CountActiveSubscribersAsync("failed-count"));
+        // A failed probe reads as negative "unknown" (watchdog contract); a blank id is
+        // definitively zero without touching the store.
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("failed-count"));
         Assert.Equal(0, await channel.CountActiveSubscribersAsync(" "));
         await Assert.ThrowsAsync<ArgumentNullException>(() => channel.SetException(null!, "corr"));
 
         await channel.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task WaiterTimeout_IsArmedOnlyAfterTheSubscriptionIsDiscoverable()
+    {
+        // Regression (r24): the waiter timeout was armed BEFORE AddSubscription published the
+        // subscription. A timer firing in that gap ran cleanup against a map that did not yet
+        // hold the entry — the insert then pinned a permanently-dropped subscription (plus its
+        // executor registration) that nothing could ever remove, and SQL Server's idle-poll
+        // downshift never engaged again. Redis/NATS arm last with a cleanup guard; the DB
+        // channels now do too. This test wedges the old gap open deterministically: the
+        // registration-path debug log blocks for 200 ms while a 1 ms timeout fires inside it.
+        var fixture = new ChannelFixture(logger: new RegistrationBlockingLogger());
+        var waiter = await fixture.Channel.CreateResponseWaiter<OperationResult>(
+            "corr-arm-last", timeout: TimeSpan.FromMilliseconds(1));
+        await Assert.ThrowsAnyAsync<Exception>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+
+        // The timed-out subscription must be fully retired: on the old code the early-armed timer
+        // cleaned up before the insert, and the map held a permanently-dropped entry forever.
+        var subscriptions = SubscriptionsOf(fixture.Channel);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (subscriptions.Count > 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "a dropped subscription stayed pinned in the channel's map");
+            await Task.Delay(10);
+        }
+
+        await fixture.Channel.DisposeAsync();
+    }
+
+    private static ICollection SubscriptionsOf(MongoDbAsyncResponseChannel channel)
+    {
+        for (var type = channel.GetType(); type is not null; type = type.BaseType)
+        {
+            if (type.GetField("_subscriptions", BindingFlags.NonPublic | BindingFlags.Instance) is { } field)
+                return (ICollection)field.GetValue(channel)!;
+        }
+
+        throw new InvalidOperationException("_subscriptions field not found on the channel type hierarchy");
+    }
+
+    private sealed class RegistrationBlockingLogger : ILogger<MongoDbAsyncResponseChannel>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            // Wedge open the (old) gap between CancelAfter and AddSubscription: the registration
+            // path logs "Waiting for ..." exactly there, and 200 ms dwarfs the 1 ms timeout.
+            if (formatter(state, exception).StartsWith("Waiting for", StringComparison.Ordinal))
+                Thread.Sleep(200);
+        }
     }
 
     [Fact]
@@ -693,7 +751,11 @@ public sealed class MongoDbChannelCoverageTests
 
     private sealed class ChannelFixture
     {
-        public ChannelFixture(bool autoCreateIndexes = false, TimeSpan? listenerPollInterval = null, int pendingMessageBatchSize = 64)
+        public ChannelFixture(
+            bool autoCreateIndexes = false,
+            TimeSpan? listenerPollInterval = null,
+            int pendingMessageBatchSize = 64,
+            ILogger<MongoDbAsyncResponseChannel>? logger = null)
         {
             var options = Options.Create(new MongoDbAsyncResponseChannelOptions
             {
@@ -767,7 +829,7 @@ public sealed class MongoDbChannelCoverageTests
                 RecoveryState.Object,
                 options,
                 new AsyncResponseContextPropagation([]),
-                mockLogger.Object);
+                logger ?? mockLogger.Object);
         }
 
         public Mock<IMongoDatabase> Database { get; } = new(MockBehavior.Loose);

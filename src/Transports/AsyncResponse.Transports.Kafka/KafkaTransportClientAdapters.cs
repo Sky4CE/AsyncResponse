@@ -91,14 +91,32 @@ internal interface IKafkaAdminClient
 internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
 {
     private readonly KafkaAsyncResponseTransportOptions _options;
-    private readonly Lazy<IProducer<string?, byte[]>> _producer;
+    private readonly object _producerGate = new();
+    private IProducer<string?, byte[]>? _producer;
 
     /// <summary>Runs the KafkaProducerClientAdapter operation.</summary>
     public KafkaProducerClientAdapter(KafkaAsyncResponseTransportOptions options)
     {
         _options = options;
-        // Lazy so constructing the adapter (e.g. during DI validation) never dials the broker.
-        _producer = new Lazy<IProducer<string?, byte[]>>(CreateProducer, LazyThreadSafetyMode.ExecutionAndPublication);
+    }
+
+    // Built lazily so constructing the adapter (e.g. during DI validation) never dials the broker,
+    // and assigned only on SUCCESS so a faulted build attempt is not cached: this adapter is a
+    // process-lifetime singleton, and Lazy<T>'s ExecutionAndPublication mode would rethrow one
+    // transient construction failure on every later publish until restart. Parity with the
+    // RabbitMQ/Pub-Sub/SQS worker transports, whose comments pin the same rule.
+    private IProducer<string?, byte[]> Producer
+    {
+        get
+        {
+            if (Volatile.Read(ref _producer) is { } existing)
+                return existing;
+
+            lock (_producerGate)
+            {
+                return _producer ??= CreateProducer();
+            }
+        }
     }
 
     /// <summary>Publishes the supplied message.</summary>
@@ -122,7 +140,7 @@ internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
                 message.Headers.Add(header.Key, header.Value);
         }
 
-        var result = await _producer.Value
+        var result = await Producer
             .ProduceAsync(topic, message, cancellationToken)
             .ConfigureAwait(false);
 
@@ -132,19 +150,20 @@ internal sealed class KafkaProducerClientAdapter : IKafkaProducerClient
     /// <summary>Releases resources held by this instance.</summary>
     public void Dispose()
     {
-        if (!_producer.IsValueCreated)
+        var producer = Volatile.Read(ref _producer);
+        if (producer is null)
             return;
 
         try
         {
-            _producer.Value.Flush(_options.OperationTimeout);
+            producer.Flush(_options.OperationTimeout);
         }
         catch (KafkaException)
         {
             // Best-effort drain of in-flight messages on shutdown; Dispose below always runs.
         }
 
-        _producer.Value.Dispose();
+        producer.Dispose();
     }
 
     private IProducer<string?, byte[]> CreateProducer()

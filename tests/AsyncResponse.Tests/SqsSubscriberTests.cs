@@ -267,6 +267,77 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task RenewalSweep_AbortsBetweenMessages_WhenTheSubscriberStops()
+    {
+        // Regression (r24): the renewal heartbeat hardcoded CancellationToken.None in its seam
+        // closure and never re-checked its token between messages, and the shutdown path awaited
+        // it unbounded — a degraded SQS endpoint held StopAsync hostage for up to a full SDK retry
+        // budget PER remaining batch message. The seam now threads the shutdown-linked token and
+        // the sweep exits between messages once it fires.
+        var client = new FakeSqsClient();
+        var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sweepBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSweep = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sweepToken = CancellationToken.None;
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () => await releaseFirstHandler.Task);
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            NullLogger<SqsWorkerSubscriber>.Instance);
+
+        // One batch of two: m1's handler blocks, and the sweep parks inside m1's renewal while
+        // recording the token the seam handed it.
+        client.Enqueue(new SqsTransportDelivery(
+            FakeSqsClient.UrlFor("workers"),
+            "m1-body",
+            "m1",
+            "m1-receipt",
+            1,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            () =>
+            {
+                firstCalls.Delete++;
+                firstCalls.Deleted.TrySetResult();
+                return ValueTask.CompletedTask;
+            },
+            async (delay, token) =>
+            {
+                firstCalls.RecordVisibilityChange(delay);
+                sweepToken = token;
+                sweepBlocked.TrySetResult();
+                await releaseSweep.Task;
+            }));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+        await sweepBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Shutdown fires while the sweep is parked in m1's renew: the linked token must reach the
+        // in-flight SDK call (so the SDK can abort its retries)...
+        var stopping = subscriber.StopAsync(CancellationToken.None);
+        await WaitUntilAsync(() => sweepToken.IsCancellationRequested);
+
+        // ...and once the parked renew returns, the sweep must exit BETWEEN messages instead of
+        // spending another SDK call on m2.
+        releaseSweep.TrySetResult();
+        releaseFirstHandler.TrySetResult();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Empty(secondCalls.VisibilityChanges);
+    }
+
+    [Fact]
     public async Task WorkerSubscriber_FailedMessageRedeliveryDelay_IsNotOverwrittenByRenewalHeartbeat()
     {
         var client = new FakeSqsClient();
@@ -312,7 +383,7 @@ public sealed class SqsSubscriberTests
                 firstCalls.Deleted.TrySetResult();
                 return ValueTask.CompletedTask;
             },
-            async delay =>
+            async (delay, _) =>
             {
                 firstCalls.RecordVisibilityChange(delay);
                 sweepBlocked.TrySetResult();
@@ -556,7 +627,7 @@ public sealed class SqsSubscriberTests
             VisibilityTimeout: TimeSpan.FromSeconds(90)));
         var delivery = Assert.Single(deliveries);
         await delivery.DeleteAsync();
-        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(30));
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
 
         Assert.NotNull(captured);
         Assert.Equal(5, captured.MaxNumberOfMessages);
@@ -586,6 +657,7 @@ public sealed class SqsSubscriberTests
         var sdkClient = new Mock<IAmazonSQS>();
         ReceiveMessageRequest? captured = null;
         var visibilityChanges = new List<int>();
+        var visibilityTokens = new List<CancellationToken>();
         sdkClient
             .Setup(c => c.ReceiveMessageAsync(It.IsAny<ReceiveMessageRequest>(), It.IsAny<CancellationToken>()))
             .Callback<ReceiveMessageRequest, CancellationToken>((request, _) => captured = request)
@@ -595,7 +667,11 @@ public sealed class SqsSubscriberTests
             });
         sdkClient
             .Setup(c => c.ChangeMessageVisibilityAsync("https://queue-url", "receipt-1", It.IsAny<int>(), It.IsAny<CancellationToken>()))
-            .Callback<string, string, int?, CancellationToken>((_, _, seconds, _) => visibilityChanges.Add(seconds ?? -1))
+            .Callback<string, string, int?, CancellationToken>((_, _, seconds, token) =>
+            {
+                visibilityChanges.Add(seconds ?? -1);
+                visibilityTokens.Add(token);
+            })
             .ReturnsAsync(new ChangeMessageVisibilityResponse());
         var adapter = new SqsClientAdapter(sdkClient.Object, ownsClient: false);
 
@@ -605,15 +681,25 @@ public sealed class SqsSubscriberTests
             WaitTime: TimeSpan.FromMilliseconds(500),
             VisibilityTimeout: TimeSpan.FromMilliseconds(500)));
         var delivery = Assert.Single(deliveries);
-        await delivery.ChangeVisibilityAsync(TimeSpan.FromMilliseconds(1));
-        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(1.2));
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromMilliseconds(1), CancellationToken.None);
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(1.2), CancellationToken.None);
         // Zero survives as zero: "make it visible now" is a legitimate request, not a rounding case.
-        await delivery.ChangeVisibilityAsync(TimeSpan.Zero);
+        await delivery.ChangeVisibilityAsync(TimeSpan.Zero, CancellationToken.None);
+
+        // Regression (r24): the seam closure hardcoded CancellationToken.None into the SDK call,
+        // so a renewal against a degraded endpoint could not be aborted at shutdown and burned
+        // the full SDK retry budget. The closure now forwards the CALLER's token — settlement
+        // passes None, the renewal heartbeat its shutdown-linked token.
+        using var renewalCts = new CancellationTokenSource();
+        await delivery.ChangeVisibilityAsync(TimeSpan.FromSeconds(5), renewalCts.Token);
+        Assert.True(visibilityTokens[^1].CanBeCanceled);
+        Assert.Equal(renewalCts.Token, visibilityTokens[^1]);
+        Assert.All(visibilityTokens[..^1], token => Assert.False(token.CanBeCanceled));
 
         Assert.NotNull(captured);
         Assert.Equal(1, captured.WaitTimeSeconds);
         Assert.Equal(1, captured.VisibilityTimeout);
-        Assert.Equal([1, 2, 0], visibilityChanges);
+        Assert.Equal([1, 2, 0, 5], visibilityChanges);
     }
 
     [Fact]
@@ -742,7 +828,7 @@ public sealed class SqsSubscriberTests
                 calls.Deleted.TrySetResult();
                 return ValueTask.CompletedTask;
             },
-            delay =>
+            (delay, _) =>
             {
                 calls.RecordVisibilityChange(delay);
                 return ValueTask.CompletedTask;

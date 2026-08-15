@@ -260,8 +260,6 @@ internal abstract class DbAsyncResponseChannelBase :
             await _store.UpsertSubscriberAsync(correlationId, registrationId, _instanceId, _options.SubscriberHeartbeatTimeout, CancellationToken.None).ConfigureAwait(false);
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
 
-            timeoutCts.CancelAfter(timeout.Value);
-
             if (_logger.IsEnabled(LogLevel.Debug))
                 _logger.LogDebug("Waiting for {Provider} response on correlationId {CorrelationId} with timeout {Timeout}.", _providerName, correlationId, timeout.Value);
         }
@@ -279,11 +277,25 @@ internal abstract class DbAsyncResponseChannelBase :
             throw;
         }
 
-        // Publish the subscription only once it is fully armed (heartbeat + timeout + context
-        // delegate), then signal a scan targeted at this correlation id so any already-stored
-        // response is delivered promptly without a full sweep.
+        // Publish the subscription only once it is fully armed (heartbeat + context delegate),
+        // then signal a scan targeted at this correlation id so any already-stored response is
+        // delivered promptly without a full sweep.
         AddSubscription(correlationId, subscription);
         SignalDispatcher(correlationId);
+
+        // Arm the waiter timeout only AFTER the subscription is discoverable (Redis/NATS parity):
+        // a timer that fired before AddSubscription would run cleanup against a map that does not
+        // hold the entry yet, and the insert above would then pin a permanently-dropped
+        // subscription (plus its executor registration) that nothing can ever remove again.
+        try
+        {
+            if (!subscription.CleanupStarted)
+                timeoutCts.CancelAfter(timeout.Value);
+        }
+        catch (ObjectDisposedException)
+        {
+            // A response completed and cleaned up between the check and CancelAfter.
+        }
 
         return CreateWaiter<T>(tcs.Task, () => subscription.DrainThenCleanupAsync(deleteRecoveryState: true));
     }
@@ -502,7 +514,10 @@ internal abstract class DbAsyncResponseChannelBase :
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogDebug(ex, "Failed to count {Provider} subscribers for correlationId {CorrelationId}.", _providerName, correlationId);
-            return 0L;
+            // Negative = "could not be probed" (the watchdog's documented unknown-liveness
+            // contract): returning 0 would assert there is definitively no live waiter, flagging
+            // every over-threshold registration stale during a transient probe outage.
+            return -1L;
         }
     }
 
@@ -1296,6 +1311,9 @@ internal abstract class DbAsyncResponseChannelBase :
         private readonly object _seenGate = new();
         private int _cleanupStarted;
         private volatile bool _dropped;
+
+        /// <summary>True once cleanup began — the arm-last waiter-timeout guard reads this.</summary>
+        internal bool CleanupStarted => Volatile.Read(ref _cleanupStarted) != 0;
         private readonly object _cleanupGate = new();
         private Task? _cleanupTask;
 

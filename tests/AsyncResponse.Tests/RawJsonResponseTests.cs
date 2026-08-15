@@ -5,31 +5,39 @@ namespace AsyncResponse.Tests;
 public class RawJsonResponseTests
 {
     [Fact]
-    public void Deserialize_CachesUntypedSingleTypedAndMultipleTypedPayloads()
+    public void Deserialize_MaterializesAFreshTypedInstancePerCall_AndCachesOnlyTheUntypedPayload()
     {
         const string json = """{"Status":2,"Message":"done","Value":42}""";
         var raw = new RawJsonResponse(json);
 
         Assert.Equal(json, raw.Json);
+
+        // The untyped payload is an immutable JsonElement, so sharing one instance is safe.
         var untyped = raw.DeserializeUntyped();
         Assert.Same(untyped, raw.DeserializeUntyped());
 
+        // Typed payloads are deliberately NOT memoized: one RawJsonResponse fans out to every
+        // subscriber of a correlation id, and a shared mutable payload instance would alias user
+        // state across concurrently-running predicates and handlers. Every call materializes a
+        // private instance — the same per-waiter isolation the durable channels provide.
         var operation = raw.Deserialize<OperationResult>();
-        Assert.Same(operation, raw.Deserialize<OperationResult>());
+        Assert.NotNull(operation);
         Assert.Equal("done", operation!.Message);
+        Assert.NotSame(operation, raw.Deserialize<OperationResult>());
 
         var alternate = raw.Deserialize<AlternatePayload>();
         Assert.Equal(42, alternate!.Value);
-        Assert.Same(alternate, raw.Deserialize<AlternatePayload>());
-        Assert.Same(operation, raw.Deserialize(typeof(OperationResult)));
+        Assert.NotSame(alternate, raw.Deserialize<AlternatePayload>());
+        Assert.NotSame(operation, raw.Deserialize(typeof(OperationResult)));
     }
 
     [Fact]
     public async Task Deserialize_IsThreadSafeUnderConcurrentFanOut()
     {
         // One instance is shared across every subscriber of a correlation id, so concurrent
-        // materialization from fan-out dispatch must never observe a torn (type, payload) pair or
-        // corrupt the memoization dictionary.
+        // materialization from fan-out dispatch must never observe a torn untyped payload — and
+        // every typed materialization must be a private instance, never one aliased across
+        // concurrently-running subscribers.
         const string json = """{"Status":2,"Message":"done","Value":42}""";
         for (var round = 0; round < 25; round++)
         {
@@ -58,9 +66,10 @@ public class RawJsonResponseTests
             start.Set();
             await Task.WhenAll(tasks);
 
-            // Memoization stayed consistent: repeated lookups return the cached instances.
-            Assert.Same(raw.Deserialize<OperationResult>(), raw.Deserialize<OperationResult>());
-            Assert.Same(raw.Deserialize<AlternatePayload>(), raw.Deserialize<AlternatePayload>());
+            // Typed materialization stays per-call private; the untyped memo stays stable.
+            Assert.NotSame(raw.Deserialize<OperationResult>(), raw.Deserialize<OperationResult>());
+            Assert.NotSame(raw.Deserialize<AlternatePayload>(), raw.Deserialize<AlternatePayload>());
+            Assert.Same(raw.DeserializeUntyped(), raw.DeserializeUntyped());
         }
     }
 

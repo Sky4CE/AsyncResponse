@@ -89,6 +89,36 @@ public sealed class SqsTransportTests
                 options.FifoMessageGroupIdFallback = " ";
             },
             nameof(SqsAsyncResponseOptions.FifoMessageGroupIdFallback));
+
+        // Regression (r24): the DERIVED dead-letter names were never checked against the live
+        // queues — "jobs" + "-dlq" equals a response queue named "jobs-dlq", so provisioning
+        // aimed the worker redrive policy at the LIVE response queue: every poison worker job was
+        // moved into the ingress, where any parseable JSON completes a real waiter.
+        AssertInvalidCommon(
+            options =>
+            {
+                options.CreateQueues = true;
+                options.WorkerQueue = "jobs";
+                options.ResponseQueue = "jobs-dlq";
+            },
+            nameof(SqsAsyncResponseOptions.DeadLetterQueueSuffix));
+        AssertInvalidCommon(
+            options =>
+            {
+                options.CreateQueues = true;
+                options.WorkerQueue = "jobs.fifo";
+                options.ResponseQueue = "jobs-dlq.fifo";
+            },
+            nameof(SqsAsyncResponseOptions.DeadLetterQueueSuffix));
+    }
+
+    [Fact]
+    public void DeriveDeadLetterQueueName_MatchesProvisioningForStandardAndFifo()
+    {
+        // The validator rejects collisions using the SAME derivation provisioning creates queues
+        // with — pin both shapes so the two can never drift apart.
+        Assert.Equal("jobs-dlq", SqsQueueAddress.DeriveDeadLetterQueueName("jobs", "-dlq"));
+        Assert.Equal("jobs-dlq.fifo", SqsQueueAddress.DeriveDeadLetterQueueName("jobs.fifo", "-dlq"));
     }
 
     [Fact]
@@ -612,5 +642,5 @@ public sealed class SqsTransportTests
             1,
             attributes ?? new Dictionary<string, string>(StringComparer.Ordinal),
             () => ValueTask.CompletedTask,
-            _ => ValueTask.CompletedTask);
+            (_, _) => ValueTask.CompletedTask);
 }

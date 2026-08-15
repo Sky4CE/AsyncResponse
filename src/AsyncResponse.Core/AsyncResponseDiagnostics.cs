@@ -55,6 +55,7 @@ public static class AsyncResponseDiagnostics
             description: "Inbound response messages acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them).");
 
     private static int _watchdogGaugesRegistered;
+    private static AsyncResponseWatchdogState? _watchdogState;
 
     internal static Activity? StartActivity(
         string name,
@@ -188,20 +189,27 @@ public static class AsyncResponseDiagnostics
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     internal static void EnsureWatchdogGauges(AsyncResponseWatchdogState state)
     {
+        // The NEWEST watchdog's state wins: the gauges are registered once process-wide on the
+        // static meter, so capturing the first state instance in the gauge callbacks would pin a
+        // disposed host's last snapshot forever in any process that builds more than one host
+        // (test harnesses, WebApplicationFactory, host-per-tenant workers). The callbacks read
+        // this holder instead, which every newly constructed watchdog state re-publishes.
+        Volatile.Write(ref _watchdogState, state);
+
         if (Interlocked.Exchange(ref _watchdogGaugesRegistered, 1) != 0)
             return;
 
         Meter.CreateObservableGauge("asyncresponse.recovery.outstanding",
-            () => (long)(state.Latest?.Report?.TotalEntries ?? 0), unit: "{entry}",
+            static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.TotalEntries ?? 0), unit: "{entry}",
             description: "Outstanding recovery registrations at the last watchdog scan.");
         Meter.CreateObservableGauge("asyncresponse.recovery.active_waiters",
-            () => (long)(state.Latest?.Report?.EntriesWithActiveWaiter ?? 0), unit: "{entry}",
+            static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.EntriesWithActiveWaiter ?? 0), unit: "{entry}",
             description: "Recovery registrations with a live waiter at the last watchdog scan.");
         Meter.CreateObservableGauge("asyncresponse.recovery.stale",
-            () => (long)(state.Latest?.Report?.StaleEntries.Count ?? 0), unit: "{entry}",
+            static () => (long)(Volatile.Read(ref _watchdogState)?.Latest?.Report?.StaleEntries.Count ?? 0), unit: "{entry}",
             description: "Stale recovery registrations (no live waiter, past the threshold) at the last watchdog scan.");
         Meter.CreateObservableGauge("asyncresponse.recovery.scan_truncated",
-            () => state.Latest?.Report?.Truncated == true ? 1L : 0L, unit: "{scan}",
+            static () => Volatile.Read(ref _watchdogState)?.Latest?.Report?.Truncated == true ? 1L : 0L, unit: "{scan}",
             description: "1 when the last watchdog scan stopped at the MaxScanEntries buffer cap — outstanding/stale then describe the buffered subset only.");
     }
 }

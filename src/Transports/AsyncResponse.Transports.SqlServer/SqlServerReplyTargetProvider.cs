@@ -29,6 +29,21 @@ internal sealed class SqlServerReplyTargetProvider(
         // than in ValidateCommon so a target added by mutating the dictionary directly is covered.
         SqlServerTransportOptionsValidator.ValidateQueueName(responseQueue, queueOptionName);
 
+        // ValidateCommon enforces three-way distinctness for the transport-wide queues because all
+        // logical queues share one table; a NAMED target reaches that same table by another route
+        // and must honor the same rule — a target aimed at the worker (or dead-letter) queue lands
+        // responses as rows the worker subscriber claims, NAKs to the cap, and dead-letters, while
+        // the waiter times out. Matching the transport-wide ResponseQueue is fine: that is
+        // literally the default target's destination.
+        if (StringComparer.Ordinal.Equals(responseQueue, options.WorkerQueue)
+            || StringComparer.Ordinal.Equals(responseQueue, options.DeadLetterQueue))
+        {
+            throw new InvalidOperationException(
+                $"SQL Server async-response reply target '{targetName}' uses queue '{responseQueue}', which collides with " +
+                $"{nameof(SqlServerAsyncResponseTransportOptions.WorkerQueue)} or {nameof(SqlServerAsyncResponseTransportOptions.DeadLetterQueue)}; " +
+                "all queues share one table, so the target's responses would be consumed as worker jobs (or buried as dead letters).");
+        }
+
         var properties = new Dictionary<string, string>(target.Properties, StringComparer.Ordinal)
         {
             ["schema"] = options.SchemaName,

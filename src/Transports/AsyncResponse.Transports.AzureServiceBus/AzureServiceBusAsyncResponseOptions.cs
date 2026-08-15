@@ -191,9 +191,11 @@ public sealed class AzureServiceBusSubscriberOptions
     /// failures are logged and processing continues — the message simply redelivers, preserving
     /// at-least-once semantics. Set to <c>null</c> to disable renewal. Ignored in
     /// <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/> (messages are already completed).
-    /// Default: <c>30 seconds</c>.
+    /// Keep this comfortably below the queue's <c>LockDuration</c> (Azure's default is 30 seconds):
+    /// the first renewal only fires after one full interval, so an interval at or above the lock
+    /// duration can never beat lock expiry. Default: <c>10 seconds</c>.
     /// </summary>
-    public TimeSpan? LockRenewalInterval { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan? LockRenewalInterval { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Number of background workers used by <see cref="AzureServiceBusAckMode.AckAfterEnqueue"/>.</summary>
     public int BackgroundWorkerCount { get; set; }

@@ -152,11 +152,14 @@ internal sealed class SqsClientAdapter(
             receiveCount,
             messageAttributes,
             () => new ValueTask(inner.DeleteMessageAsync(queueUrl, receiptHandle, CancellationToken.None)),
-            delay => new ValueTask(inner.ChangeMessageVisibilityAsync(
+            // The caller chooses the token: settlement paths pass None (settlement ignores
+            // cancellation), while the visibility-renewal heartbeat passes its shutdown-linked
+            // token so a degraded endpoint cannot hold the stop hostage for the SDK retry budget.
+            (delay, cancellationToken) => new ValueTask(inner.ChangeMessageVisibilityAsync(
                 queueUrl,
                 receiptHandle,
                 WholeSeconds(delay),
-                CancellationToken.None)));
+                cancellationToken)));
     }
 
     /// <summary>
@@ -240,4 +243,4 @@ internal sealed record SqsTransportDelivery(
     int ReceiveCount,
     IReadOnlyDictionary<string, string> MessageAttributes,
     Func<ValueTask> DeleteAsync,
-    Func<TimeSpan, ValueTask> ChangeVisibilityAsync);
+    Func<TimeSpan, CancellationToken, ValueTask> ChangeVisibilityAsync);
