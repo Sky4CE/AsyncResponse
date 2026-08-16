@@ -44,6 +44,14 @@ reportgenerator \
 
 # shields.io endpoint badges, one per metric, written next to the report so publishing the report
 # directory publishes the badges with it.
+#
+# Branch coverage is optional only as a safety net. Coverlet emits per-line conditions for every
+# product assembly, so the metric is expected — but ReportGenerator omits branchcoverage from
+# Summary.json entirely when the filtered set has no condition data at all, which is what an
+# instrumenter that records line and block hits alone produces. A missing metric therefore means the
+# collector changed, not that the code has no branches, and it must not take the whole report down.
+# An absent metric still writes its badge — as "n/a" — because the badge directory is published to
+# gh-pages and a file left behind would serve its last real number forever.
 python3 - "$TARGET_DIR" <<'PY'
 import json, sys, pathlib
 
@@ -59,16 +67,31 @@ def color(pct):
     return "red"
 
 
-for key, label, filename in (
-    ("linecoverage", "line coverage", "badge-line.json"),
-    ("branchcoverage", "branch coverage", "badge-branch.json"),
-):
-    pct = summary[key]
+def write_badge(filename, label, message, badge_color):
     (target / filename).write_text(json.dumps({
         "schemaVersion": 1,
         "label": label,
-        "message": f"{pct}%",
-        "color": color(pct),
+        "message": message,
+        "color": badge_color,
     }))
+
+
+for key, label, filename, required in (
+    ("linecoverage", "line coverage", "badge-line.json", True),
+    ("branchcoverage", "branch coverage", "badge-branch.json", False),
+):
+    pct = summary.get(key)
+    if pct is None:
+        if required:
+            raise SystemExit(
+                f"coverage-report: Summary.json has no '{key}'. The report itself rendered, so this "
+                "is a reporting-pipeline break, not a coverage result — check the cobertura inputs."
+            )
+        write_badge(filename, label, "n/a", "lightgrey")
+        print(f"{label}: NOT MEASURED — the cobertura inputs carry no condition data, so the "
+              "collector is no longer recording branches")
+        continue
+
+    write_badge(filename, label, f"{pct}%", color(pct))
     print(f"{label}: {pct}%")
 PY

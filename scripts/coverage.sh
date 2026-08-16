@@ -13,16 +13,21 @@
 #   -c, --configuration <cfg>   build configuration (default: Debug — see below)
 #   --no-open          write the report but don't launch a browser
 #
-# Debug is the deliberate local default even though CI publishes the badge from Release, so expect
-# a percentage a point or two BELOW the badge on identical code. An optimised build emits fewer
-# sequence points, so ~4,900 lines and ~300 branches stop being instrumented and drop out of the
-# denominator entirely — they are not covered, they are uncounted. Debug counts them, which makes
-# it both the more conservative number and the better view for finding untested code. Release is
-# what the badge must report because Release is what ships. Use --like-ci to reproduce the badge.
+# Debug is the deliberate local default even though CI publishes the badge from Release, so the two
+# numbers are close but never identical. An optimised build emits fewer sequence points: on the unit
+# suite alone Release counts ~5,400 fewer coverable lines than Debug (27.6k against 33.0k) — they are
+# not uncovered, they are uncounted. The branch denominator barely moves (9,580 against 9,694), since
+# a branch survives optimisation even where its lines are folded away. Debug therefore sees more of
+# the code, which makes it the better view for finding untested paths; Release is what the badge must
+# report because Release is what ships. Use --like-ci to reproduce the badge.
 #
-# Coverage is collected by Microsoft.Testing.Extensions.CodeCoverage (already referenced by both
-# test projects) and rendered by ReportGenerator. Everything lands in TestResults/, which is
-# gitignored.
+# Coverage is collected by coverlet and rendered by ReportGenerator. Everything lands in
+# TestResults/, which is gitignored. The collector needs the tool CI installs:
+#
+#   dotnet tool install --global coverlet.console --version 10.0.1 --framework net8.0
+#
+# The --framework is a hard requirement, not tidiness — see scripts/coverage-collect.sh, which owns
+# the collector invocation and is shared with CI.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,22 +74,21 @@ PARTIAL=""
 
 run_with_coverage() {
   local project="$1" framework="$2" label="$3"
+  shift 3
   echo "==> Testing $label"
   # MTP surfaces failures via exit code; keep going so a red test still produces a report. The TRX
   # is the durable record of pass/fail — console output is easy to lose to a pipe.
   #
-  # NOTE: CI does NOT use MTP's --coverage flag anymore — it pre-instruments with dotnet-coverage
-  # and collects via a session (see scripts/coverage-instrument.sh) because on linux-x64 the flag
-  # picks dynamic CLR-profiler instrumentation, whose JIT-time rewriter corrupted IL in CI. On
-  # macOS/arm64 no dynamic engine ships, so this flag already uses the same static managed
-  # pipeline CI now pins — the MEASUREMENT is identical, only the orchestration differs. Do not
-  # "simplify" ci.yml back to --coverage. If you run this script on a linux-x64 workstation, be
-  # aware it takes the dynamic path there.
-  if ! dotnet test --project "$project" \
+  # This goes through the same collector script CI does, so a contributor's branch percentage and the
+  # published one are produced by the same instrumenter. Do not "simplify" either side back to MTP's
+  # --coverage flag: it measures no branches at all, and on linux-x64 it corrupts IL (details in
+  # scripts/coverage-collect.sh).
+  if ! "$REPO_ROOT/scripts/coverage-collect.sh" \
+    "$RESULTS_DIR/$label.cobertura.xml" \
+    "$(dirname "$project")/bin/$CONFIGURATION/$framework" \
+    "$@" \
+    -- dotnet test --project "$project" \
     --configuration "$CONFIGURATION" --framework "$framework" --no-build \
-    --coverage \
-    --coverage-output-format cobertura \
-    --coverage-output "$label.cobertura.xml" \
     --report-trx \
     --report-trx-filename "$label.trx" \
     --results-directory "$RESULTS_DIR"; then
@@ -111,8 +115,12 @@ if [[ $RUN_INTEGRATION -eq 1 ]]; then
   else
     dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
       -c "$CONFIGURATION" -v q --nologo
+    # The AppHost and the sample apps it launches are separate processes loading their own copies of
+    # the product assemblies; --share puts them on the instrumented ones (see coverage-collect.sh).
     run_with_coverage tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj \
-      net10.0 "integration-net10.0"
+      net10.0 "integration-net10.0" \
+      --share "tests/AsyncResponse.IntegrationTests.AppHost/bin/$CONFIGURATION/net10.0" \
+      --share "samples/AsyncResponse.Sample/bin/$CONFIGURATION/net10.0"
   fi
 else
   PARTIAL="--unit-only: the integration suite was skipped, so this report understates coverage."
@@ -150,9 +158,10 @@ if [[ "$RUN_SHAPE" != "$CI_SHAPE" ]]; then
   echo "  this run: $RUN_SHAPE"
   echo "  badge:    $CI_SHAPE"
   if [[ "$CONFIGURATION" != "Release" ]]; then
-    echo "  $CONFIGURATION instruments ~4,900 more lines and ~300 more branches than Release, which"
-    echo "  emits fewer sequence points — so this run reports a LOWER percentage on identical code"
-    echo "  (~1 point on lines, ~3 on branches). That makes it the better view for finding gaps."
+    echo "  $CONFIGURATION counts ~5,400 more coverable lines than Release on the unit suite, which"
+    echo "  emits fewer sequence points; the branch denominator is nearly unchanged. Expect the line"
+    echo "  percentage within about a point of the badge, either side. It sees more of the code,"
+    echo "  which makes it the better view for finding gaps."
   fi
   echo "  Run './scripts/coverage.sh --like-ci' to reproduce the badge exactly."
 fi

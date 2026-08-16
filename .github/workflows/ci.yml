@@ -42,38 +42,32 @@ jobs:
       - name: Build
         run: dotnet build --configuration Release --no-restore
 
-      # Coverage runs through `dotnet-coverage` static instrumentation (instrument-on-disk, then
-      # collect via a session) instead of MTP's `--coverage` flag: on linux-x64 that flag prefers
-      # dynamic CLR-profiler IL rewriting at JIT time, whose rewriter corrupted one Redis async
-      # state machine after an innocent refactor (InvalidProgramException on every publish — the
-      # 23 red RedisChannelConformanceTests). Static managed instrumentation is what every arm64
-      # run already used, is deterministic, and is validated by the JitProbeTests force-JIT
-      # sweep. Details in scripts/coverage-instrument.sh.
-      - name: Install dotnet-coverage
-        # Keep in lockstep with the Microsoft.Testing.Extensions.CodeCoverage version in
-        # Directory.Packages.props — same engine, same probe/report semantics.
-        run: dotnet tool install --global dotnet-coverage --version 18.10.0
-
-      - name: Instrument for coverage
-        run: |
-          ./scripts/coverage-instrument.sh unit-net8 tests/AsyncResponse.Tests/bin/Release/net8.0
-          ./scripts/coverage-instrument.sh unit-net10 tests/AsyncResponse.Tests/bin/Release/net10.0
+      # Coverage runs through coverlet rather than MTP's `--coverage` flag or `dotnet-coverage`:
+      # pre-instrumenting with `dotnet-coverage instrument` discards condition data, so the published
+      # report measured zero branches, and the only Microsoft mode that keeps it on linux-x64 is the
+      # dynamic CLR profiler — the one that corrupted IL here. Coverlet rewrites IL ahead of time,
+      # reports real branch coverage, and behaves the same on every OS and architecture. Details in
+      # scripts/coverage-collect.sh.
+      - name: Install coverlet
+        # --framework net8.0 is required: the tool's own host framework is stamped into every
+        # assembly it rewrites, so a net10.0-hosted coverlet makes the net8.0 leg unloadable.
+        run: dotnet tool install --global coverlet.console --version 10.0.1 --framework net8.0
 
       # MTP otherwise executes both target frameworks concurrently. On the 2-core hosted runner that
       # has repeatedly starved real-time durable-flow tests; keep the same coverage, one TFM at a time.
       - name: Test (unit, net8.0)
         run: |
-          dotnet-coverage collect --session-id unit-net8 \
-            --output-format cobertura \
-            --output "${{ github.workspace }}/TestResults/unit-net8.0.cobertura.xml" \
-            "dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net8.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults"
+          ./scripts/coverage-collect.sh \
+            "${{ github.workspace }}/TestResults/unit-net8.0.cobertura.xml" \
+            tests/AsyncResponse.Tests/bin/Release/net8.0 \
+            -- dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net8.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults
 
       - name: Test (unit, net10.0)
         run: |
-          dotnet-coverage collect --session-id unit-net10 \
-            --output-format cobertura \
-            --output "${{ github.workspace }}/TestResults/unit-net10.0.cobertura.xml" \
-            "dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net10.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults"
+          ./scripts/coverage-collect.sh \
+            "${{ github.workspace }}/TestResults/unit-net10.0.cobertura.xml" \
+            tests/AsyncResponse.Tests/bin/Release/net10.0 \
+            -- dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj --configuration Release --framework net10.0 --no-build --report-trx --results-directory ${{ github.workspace }}/TestResults
 
       - name: Upload test results
         if: always()
@@ -83,9 +77,9 @@ jobs:
           overwrite: true
           path: ${{ github.workspace }}/TestResults
 
-      # Coverage alone, for the `coverage` job to merge with the integration suite's. The glob is
-      # non-recursive on purpose: --report-trx also copies each file into its attachment folder,
-      # and a recursive pattern would ship — and then double-count — both copies.
+      # Coverage alone, for the `coverage` job to merge with the integration suite's. The glob stays
+      # non-recursive: TestResults also holds the TRX attachment folders, and a recursive pattern
+      # would ship — and then double-count — anything a runner drops in there.
       - name: Upload unit coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -334,21 +328,14 @@ jobs:
       - name: Build
         run: dotnet build tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-restore
 
-      # Same static-instrumentation coverage flow as build-and-test (see the comment there and
-      # scripts/coverage-instrument.sh): the dynamic-profiler mode that MTP's --coverage flag
-      # picks on linux-x64 corrupted RedisAsyncResponseChannel.SetResponseCore<T> at JIT time,
-      # failing all 23 Redis conformance tests in this very leg. The AppHost and SUT sample bins
-      # are instrumented too: they run as child processes, inherit the collect session through
-      # the environment, and contribute most of AsyncResponse.Sample's coverage.
-      - name: Install dotnet-coverage
-        run: dotnet tool install --global dotnet-coverage --version 18.10.0
-
-      - name: Instrument for coverage
-        run: |
-          ./scripts/coverage-instrument.sh "itest-${{ matrix.batch }}" \
-            tests/AsyncResponse.IntegrationTests/bin/Release/net10.0 \
-            tests/AsyncResponse.IntegrationTests.AppHost/bin/Release/net10.0 \
-            samples/AsyncResponse.Sample/bin/Release/net10.0
+      # Same collector as build-and-test (see the comment there and scripts/coverage-collect.sh).
+      # The AppHost and the SUT sample apps run as separate processes loading their own copies of
+      # the product assemblies; --share links those copies at the instrumented ones so every process
+      # accumulates into the same hits file.
+      - name: Install coverlet
+        # --framework net8.0 for the same reason as build-and-test: the tool's host framework is
+        # stamped into every assembly it rewrites, and the two legs must instrument identically.
+        run: dotnet tool install --global coverlet.console --version 10.0.1 --framework net8.0
 
       - name: Test (integration, ${{ matrix.batch }})
         # This leg boots only its own batch's containers and sample apps; the inventory per batch is
@@ -357,13 +344,15 @@ jobs:
         run: |
           # Same targeted boot-flake retry as the AOT integration job: rerun once only when the
           # failure signature is a batch fixture failing to initialize, never for test failures.
-          # dotnet-coverage returns non-zero when the wrapped command fails, so the retry logic
-          # keys off the same exit code as before; a second attempt overwrites the same output.
+          # coverlet returns non-zero when the wrapped command fails, so the retry logic keys off the
+          # same exit code as before; a second attempt re-instruments and overwrites the same output.
           run_integration_tests() {
-            dotnet-coverage collect --session-id "itest-${{ matrix.batch }}" \
-              --output-format cobertura \
-              --output "${{ github.workspace }}/TestResults/Integration/integration.${{ matrix.batch }}.cobertura.xml" \
-              "dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-build --filter-trait batch=${{ matrix.batch }} --report-trx --results-directory ${{ github.workspace }}/TestResults/Integration" \
+            ./scripts/coverage-collect.sh \
+              "${{ github.workspace }}/TestResults/Integration/integration.${{ matrix.batch }}.cobertura.xml" \
+              tests/AsyncResponse.IntegrationTests/bin/Release/net10.0 \
+              --share tests/AsyncResponse.IntegrationTests.AppHost/bin/Release/net10.0 \
+              --share samples/AsyncResponse.Sample/bin/Release/net10.0 \
+              -- dotnet test --project tests/AsyncResponse.IntegrationTests/AsyncResponse.IntegrationTests.csproj --configuration Release --no-build --filter-trait batch=${{ matrix.batch }} --report-trx --results-directory ${{ github.workspace }}/TestResults/Integration \
               2>&1 | tee itest-console.log
             return "${PIPESTATUS[0]}"
           }

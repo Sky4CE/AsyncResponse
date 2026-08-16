@@ -55,9 +55,9 @@ jobs:
       # Unit suite only, one TFM at a time — same invocation shape as ci.yml (MTP otherwise runs
       # both TFMs concurrently, which starves real-time tests on the 2-core hosted runner).
       # The Docker/Aspire integration suite is omitted here because it already gates every merge to main.
-      # No --coverage: nothing consumed the output here, and the flag's dynamic-profiler mode on
-      # linux-x64 is the engine that corrupted IL in CI (see scripts/coverage-instrument.sh);
-      # this job is a release gate, not a coverage source.
+      # No coverage collection: nothing consumed the output here, and an instrumented run gates on
+      # rewritten IL rather than on what ships (see scripts/coverage-collect.sh); this job is a
+      # release gate, not a coverage source.
       - name: Test (unit, net8.0)
         run: |
           dotnet test --project tests/AsyncResponse.Tests/AsyncResponse.Tests.csproj \
