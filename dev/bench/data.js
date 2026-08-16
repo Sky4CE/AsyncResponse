@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786878143290,
+  "lastUpdate": 1786878168986,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -89576,6 +89576,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1519.8420239724076,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "36030fc76428c1af13c23dd903eb48b2cb3b3245",
+          "message": "fix: SQL Server transport must not constrain an operator's queue column\n\nThe round-25 pass ran the full DDL-path verifier on the AutoCreateSchema=false\npath, so an operator-provisioned queue table was rejected at startup unless it\nwas nvarchar(200) with a binary collation. ExactQueueMatch supplies\nLatin1_General_100_BIN2 in the query itself and defeats trailing-space padding\nwith its sentinel concat, so exact matching never depended on the column's\nstored type or collation — the two legacy-tolerance tests that pin this\n(nvarchar CI, varchar) failed in CI on both the data and the AOT integration\nlegs.\n\nExpectedColumn.Type is now nullable, meaning \"this store does not constrain the\ntype\": the comparison and both halves of the rendered error skip it. The\ntransport's ExpectedObjects takes selfCreated — a table its own DDL created is\nstill held to the exact declared shape, an operator's is not, and every other\ncolumn keeps its expectation on both paths. The channel needs nothing (its\noperator path validates only the ack-sequence objects) and the durable-flow\nstore is correct as declared: it compares flow_id with no explicit COLLATE, so\nits binary-collation requirement is load-bearing.\n\nThe same pass also added a sub-case asserting the opposite contract (a CI\ncollation on an operator table must be rejected); it is replaced with one that\npins what verification really owns there — a wrong payload_json shape fails and\ndoes not latch, and repairing only that column lets the same store latch with\nthe case-folding queue column untouched.\n\nAlso fixes the PostgreSQL direct tests' schema prefixes: ar_ + prefix + a\n32-char GUID + \"_transport\" exceeded PostgreSQL's 63-character identifier limit\nfor three prefixes this pass added, failing two tests before they reached their\nsubject. NewSchema now asserts the budget and names the offending prefix.",
+          "timestamp": "2026-08-16T12:51:02+02:00",
+          "tree_id": "1273d7ae198bdf1a3e6f7051b97eed0beae07bdb",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/36030fc76428c1af13c23dd903eb48b2cb3b3245"
+        },
+        "date": 1786878168041,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 82087.03326954623,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 47240.31526296794,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 46220.34086946747,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 220902.6967801223,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 449002.31685195497,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 404687.9046879047,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 325330.21016331576,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 253874.1190568069,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 262580.2182566774,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 287145.0886704034,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 284268.57695150375,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 476580.818575214,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 485653.787128232,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 133705.4981305297,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 115660.68855121109,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 51372.29791987401,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 25011.56534781683,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4822.291331015097,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 244501.16871558645,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 91354.56900741433,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1644493.4138038778,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1563.9701319240087,
             "unit": "flows/s"
           }
         ]
