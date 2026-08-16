@@ -36,14 +36,19 @@ internal static class SqlServerRelationVerifier
     /// so two distinct ids collide: lookups cross-match and primary keys reject the second id.
     /// </summary>
     /// <remarks>
+    /// A <c>null</c> <c>Type</c> means the store does not constrain this column's type: it must
+    /// exist with the declared nullability, and nothing more is compared or reported. Only a store
+    /// whose queries stay correct under ANY storage type may declare one.
+    /// <para>
     /// <c>DefaultExpression</c> is the exact <c>sys.default_constraints.definition</c> rendering,
     /// given for the columns the store never names on insert and therefore DEPENDS on:
     /// <c>(sysutcdatetime())</c>, <c>((0))</c>, <c>(N'{}')</c>. <c>null</c> means the store always
     /// supplies the value itself.
+    /// </para>
     /// </remarks>
     internal readonly record struct ExpectedColumn(
         string Name,
-        string Type,
+        string? Type,
         bool Nullable,
         bool RequiresBinaryCollation = false,
         string? DefaultExpression = null);
@@ -324,14 +329,18 @@ internal static class SqlServerRelationVerifier
                 if (!actual.TryGetValue((table.Name, column.Name), out var found))
                     throw new InvalidOperationException(
                         $"The SQL Server {componentName} store's table '{schemaName}.{table.Name}' exists but is missing the column " +
-                        $"'{column.Name}' ({column.Type}); a same-name table from another component or a partial manual creation " +
-                        "occupies the name. " + CollisionGuidance);
+                        $"'{column.Name}'{(column.Type is null ? "" : $" ({column.Type})")}; a same-name table from another component " +
+                        "or a partial manual creation occupies the name. " + CollisionGuidance);
 
-                if (!string.Equals(found.Type, column.Type, StringComparison.OrdinalIgnoreCase) || found.Nullable != column.Nullable)
+                // An unconstrained (null) type compares and reports nullability alone.
+                if ((column.Type is { } expectedType && !string.Equals(found.Type, expectedType, StringComparison.OrdinalIgnoreCase))
+                    || found.Nullable != column.Nullable)
+                {
                     throw new InvalidOperationException(
                         $"The SQL Server {componentName} store's table '{schemaName}.{table.Name}' exists but column '{column.Name}' " +
-                        $"does not match the expected shape: expected {column.Type}{(column.Nullable ? " NULL" : " NOT NULL")}; " +
-                        $"found {found.Type}{(found.Nullable ? " NULL" : " NOT NULL")}. " + CollisionGuidance);
+                        $"does not match the expected shape: expected {Shape(column.Type, column.Nullable)}; " +
+                        $"found {Shape(column.Type is null ? null : found.Type, found.Nullable)}. " + CollisionGuidance);
+                }
 
                 if (column.RequiresBinaryCollation && !IsOrdinalCollation(found.Collation))
                     throw new InvalidOperationException(
@@ -457,6 +466,9 @@ internal static class SqlServerRelationVerifier
         "datetime2" or "datetimeoffset" or "time" => $"{typeName}({scale})",
         _ => typeName
     };
+
+    private static string Shape(string? type, bool nullable)
+        => $"{(type is null ? "" : type + " ")}{(nullable ? "NULL" : "NOT NULL")}";
 
     // ONLY a binary collation compares by code point, which is what an ordinal contract requires.
     // A merely case-SENSITIVE collation is not enough: _CS_AI still folds accents (probed on SQL

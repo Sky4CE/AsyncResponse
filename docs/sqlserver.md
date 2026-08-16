@@ -135,7 +135,12 @@ now also checks scale on every fractional-seconds column: a bare `datetime2` abo
 `datetime2(7)`, so the shape needs no change, but a manually reduced scale (`datetime2(3)`,
 `datetime2(0)`) is rejected — SQL Server rounds on store, so a lower-scale column is a different
 clock, not a coarser view of the same one, and could round a timestamp below an already-observed
-watermark.
+watermark. The one column verification deliberately leaves alone on a table it did not create is
+`queue`: the claim predicate below supplies the binary collation itself and defeats padding on its
+own, so a schema an older build or a hand-written migration left as `varchar` or on the server's
+case-insensitive default still claims exactly and is accepted as-is. On a table the store created,
+the declared `nvarchar(200) COLLATE Latin1_General_100_BIN2` is held to exactly — there, a
+difference means the column was altered afterwards.
 
 The three logical queues share this one table and are told apart by the `queue` column alone, so
 the claim query matches it exactly — `queue = @queue AND queue + N'.' = @queue + N'.' COLLATE

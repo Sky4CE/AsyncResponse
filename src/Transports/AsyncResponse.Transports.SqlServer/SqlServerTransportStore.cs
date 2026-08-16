@@ -118,18 +118,18 @@ internal sealed class SqlServerTransportStore
 
             if (!_options.AutoCreateSchema)
             {
-                // Operator-managed schema: no DDL and no DDL lock, but the SAME catalog
-                // verification the DDL path runs — an operator-provisioned queue table with the
-                // wrong shape (the queue column's binary collation above all, which ExactQueueMatch
-                // and the claim index depend on) fails silently at runtime, which is exactly what
-                // verification exists to catch. An absent object is fine: the migration has not run
-                // yet, the first query surfaces a clear SQL Server error (the documented "create it
-                // yourself, later" workflow), and _created stays unlatched so a later operation
-                // re-verifies once the migration lands.
+                // Operator-managed schema: no DDL and no DDL lock, but catalog verification all the
+                // same — an operator-provisioned queue table whose payload_json, headers_json, or
+                // timestamp columns have the wrong shape breaks every insert or silently reorders
+                // the timestamps this store compares, which is exactly what verification exists to
+                // catch. An absent object is fine: the migration has not run yet, the first query
+                // surfaces a clear SQL Server error (the documented "create it yourself, later"
+                // workflow), and _created stays unlatched so a later operation re-verifies once the
+                // migration lands.
                 if (!await ObjectExistsAsync(connection, cancellationToken).ConfigureAwait(false))
                     return;
 
-                await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
+                await VerifyRelationsAsync(connection, transaction: null, selfCreated: false, cancellationToken).ConfigureAwait(false);
                 _created = true;
                 return;
             }
@@ -203,7 +203,7 @@ internal sealed class SqlServerTransportStore
                     ex,
                     _options.SchemaName,
                     "transport",
-                    ExpectedObjects(),
+                    ExpectedObjects(selfCreated: true),
                     cancellationToken).ConfigureAwait(false);
                 throw;
             }
@@ -221,7 +221,7 @@ internal sealed class SqlServerTransportStore
             // EnsureCreated re-runs. Correctness does not need the transaction: the application
             // lock serialized the DDL, and what these checks look for is somebody ELSE'S committed
             // object occupying a name, never our own uncommitted work.
-            await VerifyRelationsAsync(connection, transaction: null, cancellationToken).ConfigureAwait(false);
+            await VerifyRelationsAsync(connection, transaction: null, selfCreated: true, cancellationToken).ConfigureAwait(false);
             _created = true;
         }
         finally
@@ -230,13 +230,13 @@ internal sealed class SqlServerTransportStore
         }
     }
 
-    private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, CancellationToken cancellationToken)
+    private Task VerifyRelationsAsync(SqlConnection connection, SqlTransaction? transaction, bool selfCreated, CancellationToken cancellationToken)
         => SqlServerRelationVerifier.VerifyAsync(
             connection,
             transaction,
             _options.SchemaName,
             "transport",
-            ExpectedObjects(),
+            ExpectedObjects(selfCreated),
             cancellationToken);
 
     /// <summary>
@@ -261,17 +261,32 @@ internal sealed class SqlServerTransportStore
         return (int)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))! == 1;
     }
 
-    /// <summary>The catalog shape this store's DDL intends — the single source for both the
-    /// post-DDL verification and the failed-batch diagnosis.</summary>
-    /// <remarks>A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types
-    /// state the scale, because a reduced-scale column rounds <c>available_at</c>/<c>locked_until</c>
-    /// on store — a claim lease that rounds backwards is already expired when it is written.</remarks>
-    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects() =>
+    /// <summary>The catalog shape this store expects — the single source for the post-DDL
+    /// verification, the failed-batch diagnosis, and the operator-provisioned check.</summary>
+    /// <remarks>
+    /// A bare <c>datetime2</c> declaration is <c>datetime2(7)</c>; the expected types state the
+    /// scale, because a reduced-scale column rounds <c>available_at</c>/<c>locked_until</c> on
+    /// store — a claim lease that rounds backwards is already expired when it is written.
+    /// <para>
+    /// <paramref name="selfCreated"/> distinguishes a table this build's DDL created — where any
+    /// drift means somebody ALTERed it, so the queue column is held to the exact declared shape —
+    /// from an operator-provisioned one, where the queue column's type and collation are
+    /// deliberately unconstrained: <see cref="ExactQueueMatch"/> supplies the binary collation in
+    /// the query itself and its sentinel concat defeats trailing-space padding, so every logical
+    /// queue is told apart exactly whatever string type the migration chose and whatever collation
+    /// the column carries. Every other column keeps its expectation on both paths: a wrong
+    /// <c>payload_json</c>, <c>headers_json</c>, or timestamp shape breaks inserts or reorders the
+    /// timestamps this store compares no matter who created the table.
+    /// </para>
+    /// </remarks>
+    private SqlServerRelationVerifier.ExpectedObject[] ExpectedObjects(bool selfCreated) =>
             [
                 new(_options.MessageTable, SqlServerObjectKind.Table,
                 [
                     new("id", "uniqueidentifier", Nullable: false),
-                    new("queue", "nvarchar(200)", Nullable: false, RequiresBinaryCollation: true),
+                    selfCreated
+                        ? new("queue", "nvarchar(200)", Nullable: false, RequiresBinaryCollation: true)
+                        : new("queue", Type: null, Nullable: false),
                     new("payload_json", "nvarchar(max)", Nullable: false),
                     new("headers_json", "nvarchar(max)", Nullable: false, DefaultExpression: "(N'{}')"),
                     new("created_at", "datetime2(7)", Nullable: false, DefaultExpression: "(sysutcdatetime())"),

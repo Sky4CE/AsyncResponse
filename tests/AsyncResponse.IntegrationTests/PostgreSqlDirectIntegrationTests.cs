@@ -386,7 +386,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
         // DDL path, i.e. only where it was least needed. Managed mode now runs the same catalog
         // verification with the flow stores' semantics: absent table = silent, re-check later
         // (never latch); present = verify (wrong shape fails actionably) and latch.
-        await WithDataSourceAsync("managed_transport", async (schema, dataSource) =>
+        await WithDataSourceAsync("managed_ok", async (schema, dataSource) =>
         {
             var managedOptions = TransportOptions(schema);
             managedOptions.AutoCreateSchema = false;
@@ -402,7 +402,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             Assert.True(CreatedLatch(managed));
         });
 
-        await WithDataSourceAsync("managed_transport_wrong", async (schema, dataSource) =>
+        await WithDataSourceAsync("managed_wrong", async (schema, dataSource) =>
         {
             await using (var connection = await dataSource.OpenConnectionAsync())
             await using (var craft = connection.CreateCommand())
@@ -442,7 +442,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
         // rejected on the same columns: the database folds strings its rules call equal into ONE
         // key, so two distinct queue names collide and the second is rejected on insert. Nothing
         // downstream re-checks the queue column's storage, and the verifier checked no collation.
-        await WithDataSourceAsync("pg_nondeterministic", async (schema, dataSource) =>
+        await WithDataSourceAsync("nondet_coll", async (schema, dataSource) =>
         {
             var options = TransportOptions(schema);
             options.MessageTable = "jobs";
@@ -483,7 +483,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             Assert.False(CreatedLatch(store));
         });
 
-        await WithDataSourceAsync("pg_default_collation", async (schema, dataSource) =>
+        await WithDataSourceAsync("default_coll", async (schema, dataSource) =>
         {
             // The default collation reports collisdeterministic = true, and uuid/jsonb columns
             // carry no collation at all (attcollation 0, no joined row) — both must pass.
@@ -1507,8 +1507,20 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
         ]
     };
 
+    // The longest suffix any derived identifier appends to a schema name below ("_transport").
+    private const int LongestDerivedSuffix = 10;
+
     private static string NewSchema(string prefix)
-        => $"ar_{prefix}_{Guid.NewGuid():N}";
+    {
+        // PostgreSQL truncates identifiers past 63 characters, so the options validators reject an
+        // overlong derived name at construction — asserting here names the too-long PREFIX instead
+        // of failing the test with a validator message about a name it never chose.
+        var schema = $"ar_{prefix}_{Guid.NewGuid():N}";
+        Assert.True(
+            schema.Length + LongestDerivedSuffix <= 63,
+            $"Schema prefix '{prefix}' is too long: '{schema}' plus a derived suffix exceeds PostgreSQL's 63-character identifier limit.");
+        return schema;
+    }
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 

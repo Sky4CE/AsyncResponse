@@ -196,10 +196,12 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             Assert.True(CreatedLatch(managed));
         });
 
-        // The queue column's binary collation is part of the verified shape: three logical queues
-        // share one table told apart by nothing but that column, and a case-folding collation on
-        // an operator-provisioned table previously went completely undetected.
-        await WithSchemaAsync("sql_managed_collation", async schema =>
+        // What "the same verification" means on a table this build did not create: every column
+        // the store's own reads and writes depend on is held to its shape — but NOT the queue
+        // column, whose type and collation ExactQueueMatch overrides in the query itself (proved
+        // end to end by AssertLegacyQueueColumnClaimsExactlyAsync). Constraining it here would
+        // reject the legacy schemas that predicate exists to keep working.
+        await WithSchemaAsync("sql_managed_shape", async schema =>
         {
             await ExecuteAsync($"IF SCHEMA_ID(N'{schema}') IS NULL EXEC(N'CREATE SCHEMA [{schema}]');");
             await ExecuteAsync(
@@ -207,7 +209,7 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
                 CREATE TABLE [{schema}].[jobs] (
                     id uniqueidentifier NOT NULL PRIMARY KEY NONCLUSTERED,
                     queue nvarchar(200) COLLATE Latin1_General_100_CI_AS NOT NULL,
-                    payload_json nvarchar(max) NOT NULL,
+                    payload_json nvarchar(200) NOT NULL,
                     headers_json nvarchar(max) NOT NULL DEFAULT N'{EmptyJsonObject}',
                     created_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
                     available_at datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
@@ -223,8 +225,16 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             options.MessageTable = "jobs";
             var store = new SqlServerTransportStore(Options.Create(options));
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => store.EnsureCreatedAsync());
-            Assert.Contains("not binary", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("payload_json", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("expected nvarchar(max) NOT NULL", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("found nvarchar(200) NOT NULL", ex.Message, StringComparison.Ordinal);
             Assert.False(CreatedLatch(store));
+
+            // Repairing only that column is enough: the case-folding queue column stays exactly as
+            // the operator left it, and the same unlatched store re-verifies and accepts.
+            await ExecuteAsync($"ALTER TABLE [{schema}].[jobs] ALTER COLUMN payload_json nvarchar(max) NOT NULL;");
+            await store.EnsureCreatedAsync();
+            Assert.True(CreatedLatch(store));
         });
     }
 

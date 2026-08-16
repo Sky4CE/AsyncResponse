@@ -94,12 +94,67 @@ public sealed class SqlServerRelationVerifierTests
             {
                 if (type is "datetime2" or "datetimeoffset" or "time")
                     offenders.Add($"{label}: {table}.{column} expects a scale-less '{type}'");
-                else if (type.StartsWith("datetime2", StringComparison.Ordinal) && type != "datetime2(7)")
+                else if (type?.StartsWith("datetime2", StringComparison.Ordinal) == true && type != "datetime2(7)")
                     offenders.Add($"{label}: {table}.{column} expects '{type}', but its DDL declares a bare datetime2 (scale 7)");
             }
         }
 
         Assert.Empty(offenders);
+    }
+
+    [Fact]
+    public void TransportQueueColumn_IsUnconstrained_OnlyOnTheOperatorProvisionedPath()
+    {
+        // ExactQueueMatch forces Latin1_General_100_BIN2 in the query and defeats trailing-space
+        // padding with its sentinel concat, so an operator's queue column claims exactly whatever
+        // its type and collation are — legacy nvarchar CI and varchar tables included. Constraining
+        // them there rejected schemas this transport reads correctly. On the path where this build
+        // ran the DDL itself, any drift means somebody ALTERed the column, so both stay pinned.
+        var transport = new SqlServerTransportStore(Options.Create(new SqlServerAsyncResponseTransportOptions { ConnectionString = ConnectionString }));
+
+        Assert.Equal("nvarchar(200)", QueueColumn(transport, selfCreated: true).Type);
+        Assert.True(QueueColumn(transport, selfCreated: true).RequiresBinaryCollation);
+        Assert.Null(QueueColumn(transport, selfCreated: false).Type);
+        Assert.False(QueueColumn(transport, selfCreated: false).RequiresBinaryCollation);
+
+        // Unconstrained is not unchecked: the column must still exist and be NOT NULL, and every
+        // OTHER column — a wrong payload_json or timestamp shape breaks inserts or reorders the
+        // timestamps this store compares — keeps the identical expectation on both paths.
+        Assert.False(QueueColumn(transport, selfCreated: false).Nullable);
+        Assert.Equal(
+            ExpectedColumns(transport, selfCreated: true).Where(c => c.Column != "queue"),
+            ExpectedColumns(transport, selfCreated: false).Where(c => c.Column != "queue"));
+
+        static (string? Type, bool Nullable, bool RequiresBinaryCollation) QueueColumn(object store, bool selfCreated)
+        {
+            var method = store.GetType().GetMethod("ExpectedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var columns = (IEnumerable)Read(((IEnumerable)method.Invoke(store, [selfCreated])!).Cast<object>().Single(), "Columns")!;
+            var queue = columns.Cast<object>().Single(c => (string)Read(c, "Name")! == "queue");
+            return ((string?)Read(queue, "Type"), (bool)Read(queue, "Nullable")!, (bool)Read(queue, "RequiresBinaryCollation")!);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateTableColumns_UnconstrainedType_AcceptsAnyType_ButStillEnforcesNullability(Type anchor)
+    {
+        var verifier = new Verifier(anchor);
+        var expected = verifier.Tables(verifier.Table("jobs", verifier.Column("queue", type: null, nullable: false)));
+
+        // Any string type claims correctly when the query supplies the collation itself.
+        Assert.Null(verifier.Evaluate(expected, [(("jobs", "queue"), verifier.ColumnRow("varchar(200)", nullable: false, collation: "SQL_Latin1_General_CP1_CI_AS"))]));
+        Assert.Null(verifier.Evaluate(expected, [(("jobs", "queue"), verifier.ColumnRow("nvarchar(400)", nullable: false, collation: "Latin1_General_100_BIN2"))]));
+
+        // A nullable column is a different contract, and the report names only what is compared.
+        var rejected = verifier.Evaluate(expected, [(("jobs", "queue"), verifier.ColumnRow("varchar(200)", nullable: true))]);
+        Assert.NotNull(rejected);
+        Assert.Contains("expected NOT NULL; found NULL", rejected.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("varchar(200)", rejected.Message, StringComparison.Ordinal);
+
+        // An absent column is still an absent column.
+        var missing = verifier.Evaluate(expected, []);
+        Assert.NotNull(missing);
+        Assert.Contains("missing the column 'queue';", missing.Message, StringComparison.Ordinal);
     }
 
     private static IEnumerable<(string Label, object Store)> Stores()
@@ -109,12 +164,15 @@ public sealed class SqlServerRelationVerifierTests
         yield return ("durable-flow", new SqlServerFlowStateStore(Options.Create(new SqlServerDurableFlowOptions { ConnectionString = ConnectionString })));
     }
 
-    /// <summary>Every declared column of every expected table, across one store's DDL contract.</summary>
-    private static IEnumerable<(string Table, string Column, string Type)> ExpectedColumns(object store)
+    /// <summary>
+    /// Every declared column of every expected table, across one store's contract. Stores whose
+    /// expectation differs between the shape their own DDL created and an operator-provisioned one
+    /// take a <c>selfCreated</c> flag; the rest declare one shape for both.
+    /// </summary>
+    private static IEnumerable<(string Table, string Column, string? Type)> ExpectedColumns(object store, bool selfCreated = true)
     {
-        var expectedObjects = (IEnumerable)store.GetType()
-            .GetMethod("ExpectedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(store, null)!;
+        var method = store.GetType().GetMethod("ExpectedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var expectedObjects = (IEnumerable)method.Invoke(store, method.GetParameters().Length == 0 ? null : [selfCreated])!;
 
         foreach (var expectedObject in expectedObjects)
         {
@@ -123,7 +181,7 @@ public sealed class SqlServerRelationVerifierTests
                 continue;
 
             foreach (var column in columns)
-                yield return (name, (string)Read(column, "Name")!, (string)Read(column, "Type")!);
+                yield return (name, (string)Read(column, "Name")!, (string?)Read(column, "Type"));
         }
     }
 
@@ -162,7 +220,7 @@ public sealed class SqlServerRelationVerifierTests
         public string RenderType(string typeName, short maxLength, byte scale)
             => (string)_renderType.Invoke(null, [typeName, maxLength, scale])!;
 
-        public object Column(string name, string type, bool nullable, bool requiresBinaryCollation = false, string? defaultExpression = null)
+        public object Column(string name, string? type, bool nullable, bool requiresBinaryCollation = false, string? defaultExpression = null)
             => Activator.CreateInstance(_expectedColumn, name, type, nullable, requiresBinaryCollation, defaultExpression)!;
 
         public object Table(string name, params object[] columns)
