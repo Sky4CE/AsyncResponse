@@ -25,7 +25,7 @@
 </tr>
 <tr>
 <th>File(s):</th>
-<td class="overflow-wrap"><a href="#homerunnerworkAsyncResponseAsyncResponsesrcTransportsAsyncResponseTransportsRabbitMQRabbitMqClientAdapterscs" class="navigatetohash">/home/runner/work/AsyncResponse/AsyncResponse/src/Transports/AsyncResponse.Transports.RabbitMQ/RabbitMqClientAdapters.cs</a></td>
+<td class="overflow-wrap"><a href="#_srcTransportsAsyncResponseTransportsRabbitMQRabbitMqClientAdapterscs" class="navigatetohash">/_/src/Transports/AsyncResponse.Transports.RabbitMQ/RabbitMqClientAdapters.cs</a></td>
 </tr>
 </table>
 </div>
@@ -107,12 +107,20 @@
 </colgroup>
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
-<tr><td title=".ctor(string, ulong, bool, string, string, RabbitMQ.Client.IReadOnlyBasicProperties, System.ReadOnlyMemory&lt;byte&gt;, System.Threading.CancellationToken)"><a href="#file0_line196" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title=".ctor(System.String,System.UInt64,System.Boolean,System.String,System.String,RabbitMQ.Client.IReadOnlyBasicProperties,System.ReadOnlyMemory`1&lt;System.Byte&gt;,System.Threading.CancellationToken)"><a href="#file0_line196" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_ConsumerTag()"><a href="#file0_line197" class="navigatetohash">get_ConsumerTag()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_DeliveryTag()"><a href="#file0_line198" class="navigatetohash">get_DeliveryTag()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_Redelivered()"><a href="#file0_line199" class="navigatetohash">get_Redelivered()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_Exchange()"><a href="#file0_line200" class="navigatetohash">get_Exchange()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_RoutingKey()"><a href="#file0_line201" class="navigatetohash">get_RoutingKey()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_BasicProperties()"><a href="#file0_line202" class="navigatetohash">get_BasicProperties()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_Body()"><a href="#file0_line203" class="navigatetohash">get_Body()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_CancellationToken()"><a href="#file0_line204" class="navigatetohash">get_CancellationToken()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
 <h1>File(s)</h1>
-<h2 id="homerunnerworkAsyncResponseAsyncResponsesrcTransportsAsyncResponseTransportsRabbitMQRabbitMqClientAdapterscs">/home/runner/work/AsyncResponse/AsyncResponse/src/Transports/AsyncResponse.Transports.RabbitMQ/RabbitMqClientAdapters.cs</h2>
+<h2 id="_srcTransportsAsyncResponseTransportsRabbitMQRabbitMqClientAdapterscs">/_/src/Transports/AsyncResponse.Transports.RabbitMQ/RabbitMqClientAdapters.cs</h2>
 <div class="table-responsive">
 <table class="lineAnalysis">
 <thead><tr><th></th><th>#</th><th>Line</th><th></th><th>Line coverage</th></tr></thead>
@@ -312,23 +320,31 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line193"></a><code>193</code></td><td></td><td class="lightgray"><code>///&nbsp;&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line194"></a><code>194</code></td><td></td><td class="lightgray"><code>internal&nbsp;sealed&nbsp;record&nbsp;RabbitMqConsumer(string&nbsp;ConsumerTag,&nbsp;Task&lt;string&gt;&nbsp;Terminated);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line195"></a><code>195</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line196"></a><code>196</code></td><td></td><td class="lightgreen"><code>internal&nbsp;sealed&nbsp;record&nbsp;RabbitMqDelivery(</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line197"></a><code>197</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;ConsumerTag,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line198"></a><code>198</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;ulong&nbsp;DeliveryTag,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line199"></a><code>199</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;bool&nbsp;Redelivered,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line200"></a><code>200</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;Exchange,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line201"></a><code>201</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;RoutingKey,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line202"></a><code>202</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;IReadOnlyBasicProperties&nbsp;BasicProperties,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line203"></a><code>203</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;ReadOnlyMemory&lt;byte&gt;&nbsp;Body,</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line204"></a><code>204</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;CancellationToken&nbsp;CancellationToken);</code></td></tr>
+<tr class="coverableline" title="Covered (518 visits)" data-coverage="{'AllTestMethods': {'VC': '518', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">518</td><td class="rightmargin right"><a id="file0_line196"></a><code>196</code></td><td></td><td class="lightgreen"><code>internal&nbsp;sealed&nbsp;record&nbsp;RabbitMqDelivery(</code></td></tr>
+<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line197"></a><code>197</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;ConsumerTag,</code></td></tr>
+<tr class="coverableline" title="Covered (502 visits)" data-coverage="{'AllTestMethods': {'VC': '502', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">502</td><td class="rightmargin right"><a id="file0_line198"></a><code>198</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;ulong&nbsp;DeliveryTag,</code></td></tr>
+<tr class="coverableline" title="Covered (21 visits)" data-coverage="{'AllTestMethods': {'VC': '21', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">21</td><td class="rightmargin right"><a id="file0_line199"></a><code>199</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;bool&nbsp;Redelivered,</code></td></tr>
+<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line200"></a><code>200</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;Exchange,</code></td></tr>
+<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line201"></a><code>201</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;string&nbsp;RoutingKey,</code></td></tr>
+<tr class="coverableline" title="Covered (685 visits)" data-coverage="{'AllTestMethods': {'VC': '685', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">685</td><td class="rightmargin right"><a id="file0_line202"></a><code>202</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;IReadOnlyBasicProperties&nbsp;BasicProperties,</code></td></tr>
+<tr class="coverableline" title="Covered (496 visits)" data-coverage="{'AllTestMethods': {'VC': '496', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">496</td><td class="rightmargin right"><a id="file0_line203"></a><code>203</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;ReadOnlyMemory&lt;byte&gt;&nbsp;Body,</code></td></tr>
+<tr class="coverableline" title="Covered (518 visits)" data-coverage="{'AllTestMethods': {'VC': '518', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">518</td><td class="rightmargin right"><a id="file0_line204"></a><code>204</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;CancellationToken&nbsp;CancellationToken);</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 23:32:14<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/16/2026 - 16:08:44<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
-<a href="#file0_line196" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(string, ulong, bool, string, string, RabbitMQ.Client.IReadOnlyBasicProperties, System.ReadOnlyMemory&lt;byte&gt;, System.Threading.CancellationToken)"><i class="icon-cube"></i>.ctor(string, ulong, bool, string, string, RabbitMQ.Client.IReadOnlyBasicProperties, System.ReadOnlyMemory&lt;byte&gt;, System.Threading.CancellationToken)</a><br />
+<a href="#file0_line196" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(System.String,System.UInt64,System.Boolean,System.String,System.String,RabbitMQ.Client.IReadOnlyBasicProperties,System.ReadOnlyMemory`1&lt;System.Byte&gt;,System.Threading.CancellationToken)"><i class="icon-cube"></i>.ctor(System.String,System.UInt64,System.Boolean,System.String,System.String,RabbitMQ.Client.IReadOnlyBasicProperties,System.ReadOnlyMemory`1&lt;System.Byte&gt;,System.Threading.CancellationToken)</a><br />
+<a href="#file0_line197" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_ConsumerTag()"><i class="icon-wrench"></i>get_ConsumerTag()</a><br />
+<a href="#file0_line198" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_DeliveryTag()"><i class="icon-wrench"></i>get_DeliveryTag()</a><br />
+<a href="#file0_line199" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_Redelivered()"><i class="icon-wrench"></i>get_Redelivered()</a><br />
+<a href="#file0_line200" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_Exchange()"><i class="icon-wrench"></i>get_Exchange()</a><br />
+<a href="#file0_line201" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_RoutingKey()"><i class="icon-wrench"></i>get_RoutingKey()</a><br />
+<a href="#file0_line202" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_BasicProperties()"><i class="icon-wrench"></i>get_BasicProperties()</a><br />
+<a href="#file0_line203" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_Body()"><i class="icon-wrench"></i>get_Body()</a><br />
+<a href="#file0_line204" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_CancellationToken()"><i class="icon-wrench"></i>get_CancellationToken()</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>

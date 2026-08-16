@@ -25,7 +25,7 @@
 </tr>
 <tr>
 <th>File(s):</th>
-<td class="overflow-wrap"><a href="#homerunnerworkAsyncResponseAsyncResponsesrcAsyncResponseAbstractionsAsyncResponseIndeterminateDeliveryExceptioncs" class="navigatetohash">/home/runner/work/AsyncResponse/AsyncResponse/src/AsyncResponse.Abstractions/AsyncResponseIndeterminateDeliveryException.cs</a></td>
+<td class="overflow-wrap"><a href="#_srcAsyncResponseAbstractionsAsyncResponseIndeterminateDeliveryExceptioncs" class="navigatetohash">/_/src/AsyncResponse.Abstractions/AsyncResponseIndeterminateDeliveryException.cs</a></td>
 </tr>
 </table>
 </div>
@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="6">6</td>
+<td class="limit-width right" title="7">7</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,7 +49,7 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="6">6</td>
+<td class="limit-width right" title="7">7</td>
 </tr>
 <tr>
 <th>Total lines:</th>
@@ -57,7 +57,7 @@
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="6 of 6">100%</td>
+<td class="limit-width right" title="7 of 7">100%</td>
 </tr>
 </table>
 </div>
@@ -107,12 +107,13 @@
 </colgroup>
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
-<tr><td title=".ctor(string, System.TimeSpan)"><a href="#file0_line21" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title=".ctor(System.String,System.TimeSpan)"><a href="#file0_line21" class="navigatetohash">.ctor(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="get_CorrelationId()"><a href="#file0_line30" class="navigatetohash">get_CorrelationId()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
 <h1>File(s)</h1>
-<h2 id="homerunnerworkAsyncResponseAsyncResponsesrcAsyncResponseAbstractionsAsyncResponseIndeterminateDeliveryExceptioncs">/home/runner/work/AsyncResponse/AsyncResponse/src/AsyncResponse.Abstractions/AsyncResponseIndeterminateDeliveryException.cs</h2>
+<h2 id="_srcAsyncResponseAbstractionsAsyncResponseIndeterminateDeliveryExceptioncs">/_/src/AsyncResponse.Abstractions/AsyncResponseIndeterminateDeliveryException.cs</h2>
 <div class="table-responsive">
 <table class="lineAnalysis">
 <thead><tr><th></th><th>#</th><th>Line</th><th></th><th>Line coverage</th></tr></thead>
@@ -137,25 +138,26 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line18"></a><code>18</code></td><td></td><td class="lightgray"><code>{</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line19"></a><code>19</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Runs&nbsp;the&nbsp;AsyncResponseIndeterminateDeliveryException&nbsp;operation.&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line20"></a><code>20</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;AsyncResponseIndeterminateDeliveryException(string?&nbsp;correlationId,&nbsp;TimeSpan&nbsp;drainTimeout)</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line21"></a><code>21</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;base($&quot;Disposal&nbsp;abandoned&nbsp;an&nbsp;in-flight&nbsp;response&nbsp;delivery&nbsp;for&nbsp;correlationId&nbsp;&#39;{correlationId}&#39;&nbsp;&quot;&nbsp;+</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line22"></a><code>22</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;after&nbsp;draining&nbsp;for&nbsp;{drainTimeout.TotalSeconds:0.###}s.&nbsp;The&nbsp;response&nbsp;may&nbsp;already&nbsp;have&nbsp;been&nbsp;&quot;&nbsp;+</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line23"></a><code>23</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;consumed&nbsp;from&nbsp;the&nbsp;channel;&nbsp;treat&nbsp;delivery&nbsp;as&nbsp;indeterminate&nbsp;and&nbsp;restart&nbsp;the&nbsp;awaiting&nbsp;&quot;&nbsp;+</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line24"></a><code>24</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;(idempotent)&nbsp;step&nbsp;instead&nbsp;of&nbsp;re-attaching&nbsp;to&nbsp;this&nbsp;correlation&nbsp;id.&quot;)</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line21"></a><code>21</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;base($&quot;Disposal&nbsp;abandoned&nbsp;an&nbsp;in-flight&nbsp;response&nbsp;delivery&nbsp;for&nbsp;correlationId&nbsp;&#39;{correlationId}&#39;&nbsp;&quot;&nbsp;+</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line22"></a><code>22</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$&quot;after&nbsp;draining&nbsp;for&nbsp;{drainTimeout.TotalSeconds:0.###}s.&nbsp;The&nbsp;response&nbsp;may&nbsp;already&nbsp;have&nbsp;been&nbsp;&quot;&nbsp;+</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line23"></a><code>23</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;consumed&nbsp;from&nbsp;the&nbsp;channel;&nbsp;treat&nbsp;delivery&nbsp;as&nbsp;indeterminate&nbsp;and&nbsp;restart&nbsp;the&nbsp;awaiting&nbsp;&quot;&nbsp;+</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line24"></a><code>24</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&quot;(idempotent)&nbsp;step&nbsp;instead&nbsp;of&nbsp;re-attaching&nbsp;to&nbsp;this&nbsp;correlation&nbsp;id.&quot;)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line25"></a><code>25</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line26"></a><code>26</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CorrelationId&nbsp;=&nbsp;correlationId;</code></td></tr>
-<tr class="coverableline" title="Covered (3 visits)" data-coverage="{'AllTestMethods': {'VC': '3', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3</td><td class="rightmargin right"><a id="file0_line27"></a><code>27</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line26"></a><code>26</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CorrelationId&nbsp;=&nbsp;correlationId;</code></td></tr>
+<tr class="coverableline" title="Covered (13 visits)" data-coverage="{'AllTestMethods': {'VC': '13', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">13</td><td class="rightmargin right"><a id="file0_line27"></a><code>27</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line28"></a><code>28</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line29"></a><code>29</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;The&nbsp;correlation&nbsp;id&nbsp;whose&nbsp;delivery&nbsp;outcome&nbsp;is&nbsp;unknown.&lt;/summary&gt;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line30"></a><code>30</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;string?&nbsp;CorrelationId&nbsp;{&nbsp;get;&nbsp;}</code></td></tr>
+<tr class="coverableline" title="Covered (11 visits)" data-coverage="{'AllTestMethods': {'VC': '11', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">11</td><td class="rightmargin right"><a id="file0_line30"></a><code>30</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;string?&nbsp;CorrelationId&nbsp;{&nbsp;get;&nbsp;}</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line31"></a><code>31</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 23:32:13<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/16/2026 - 16:08:43<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
-<a href="#file0_line21" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(string, System.TimeSpan)"><i class="icon-cube"></i>.ctor(string, System.TimeSpan)</a><br />
+<a href="#file0_line21" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - .ctor(System.String,System.TimeSpan)"><i class="icon-cube"></i>.ctor(System.String,System.TimeSpan)</a><br />
+<a href="#file0_line30" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_CorrelationId()"><i class="icon-wrench"></i>get_CorrelationId()</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>

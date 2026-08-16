@@ -25,7 +25,7 @@
 </tr>
 <tr>
 <th>File(s):</th>
-<td class="overflow-wrap"><a href="#homerunnerworkAsyncResponseAsyncResponsesrcTransportsAsyncResponseTransportsSQSSqsQueueAddresscs" class="navigatetohash">/home/runner/work/AsyncResponse/AsyncResponse/src/Transports/AsyncResponse.Transports.SQS/SqsQueueAddress.cs</a></td>
+<td class="overflow-wrap"><a href="#_srcTransportsAsyncResponseTransportsSQSSqsQueueAddresscs" class="navigatetohash">/_/src/Transports/AsyncResponse.Transports.SQS/SqsQueueAddress.cs</a></td>
 </tr>
 </table>
 </div>
@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="8">8</td>
+<td class="limit-width right" title="11">11</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="8">8</td>
+<td class="limit-width right" title="11">11</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="28">28</td>
+<td class="limit-width right" title="39">39</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="8 of 8">100%</td>
+<td class="limit-width right" title="11 of 11">100%</td>
 </tr>
 </table>
 </div>
@@ -66,20 +66,20 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large cardpercentagebar cardpercentagebar17">83%</div>
+<div class="large cardpercentagebar cardpercentagebar12">87%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="5">5</td>
+<td class="limit-width right" title="7">7</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="6">6</td>
+<td class="limit-width right" title="8">8</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="5 of 6">83.3%</td>
+<td class="limit-width right" title="7 of 8">87.5%</td>
 </tr>
 </table>
 </div>
@@ -107,14 +107,15 @@
 </colgroup>
 <thead><tr><th>Method</th><th>Branch coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th><th>Crap Score <a href="https://googletesting.blogspot.de/2011/02/this-code-is-crap.html" target="_blank"><i class="icon-info-circled"></i></a></th><th>Cyclomatic complexity <a href="https://en.wikipedia.org/wiki/Cyclomatic_complexity" target="_blank"><i class="icon-info-circled"></i></a></th><th>Line coverage <a href="https://en.wikipedia.org/wiki/Code_coverage" target="_blank"><i class="icon-info-circled"></i></a></th></tr></thead>
 <tbody>
-<tr><td title="IsUrl(string)"><a href="#file0_line11" class="navigatetohash">IsUrl(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
-<tr><td title="IsFifo(string)"><a href="#file0_line16" class="navigatetohash">IsFifo(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="QueueName(string)"><a href="#file0_line21" class="navigatetohash">QueueName(...)</a></td><td>75%</td><td>4</td><td>4</td><td>100%</td></tr>
+<tr><td title="IsUrl(System.String)"><a href="#file0_line11" class="navigatetohash">IsUrl(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
+<tr><td title="IsFifo(System.String)"><a href="#file0_line16" class="navigatetohash">IsFifo(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="QueueName(System.String)"><a href="#file0_line21" class="navigatetohash">QueueName(...)</a></td><td>75%</td><td>4</td><td>4</td><td>100%</td></tr>
+<tr><td title="DeriveDeadLetterQueueName(System.String,System.String)"><a href="#file0_line36" class="navigatetohash">DeriveDeadLetterQueueName(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
 <h1>File(s)</h1>
-<h2 id="homerunnerworkAsyncResponseAsyncResponsesrcTransportsAsyncResponseTransportsSQSSqsQueueAddresscs">/home/runner/work/AsyncResponse/AsyncResponse/src/Transports/AsyncResponse.Transports.SQS/SqsQueueAddress.cs</h2>
+<h2 id="_srcTransportsAsyncResponseTransportsSQSSqsQueueAddresscs">/_/src/Transports/AsyncResponse.Transports.SQS/SqsQueueAddress.cs</h2>
 <div class="table-responsive">
 <table class="lineAnalysis">
 <thead><tr><th></th><th>#</th><th>Line</th><th></th><th>Line coverage</th></tr></thead>
@@ -129,34 +130,46 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line8"></a><code>8</code></td><td></td><td class="lightgray"><code>{</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line9"></a><code>9</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Returns&nbsp;&lt;c&gt;true&lt;/c&gt;&nbsp;when&nbsp;the&nbsp;configured&nbsp;queue&nbsp;string&nbsp;is&nbsp;a&nbsp;full&nbsp;queue&nbsp;URL.&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line10"></a><code>10</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;static&nbsp;bool&nbsp;IsUrl(string&nbsp;queue)</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line11"></a><code>11</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;queue.StartsWith(&quot;http://&quot;,&nbsp;StringComparison.OrdinalIgnoreCase)</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line12"></a><code>12</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;||&nbsp;queue.StartsWith(&quot;https://&quot;,&nbsp;StringComparison.OrdinalIgnoreCase);</code></td></tr>
+<tr class="coverableline" title="Covered (6131 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6131', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6131</td><td class="rightmargin right"><a id="file0_line11"></a><code>11</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;queue.StartsWith(&quot;http://&quot;,&nbsp;StringComparison.OrdinalIgnoreCase)</code></td></tr>
+<tr class="coverableline" title="Covered (6131 visits)" data-coverage="{'AllTestMethods': {'VC': '6131', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6131</td><td class="rightmargin right"><a id="file0_line12"></a><code>12</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;||&nbsp;queue.StartsWith(&quot;https://&quot;,&nbsp;StringComparison.OrdinalIgnoreCase);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line13"></a><code>13</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line14"></a><code>14</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Returns&nbsp;&lt;c&gt;true&lt;/c&gt;&nbsp;when&nbsp;the&nbsp;queue&nbsp;(name&nbsp;or&nbsp;URL)&nbsp;addresses&nbsp;an&nbsp;SQS&nbsp;FIFO&nbsp;queue.&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line15"></a><code>15</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;static&nbsp;bool&nbsp;IsFifo(string&nbsp;queue)</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line16"></a><code>16</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;QueueName(queue).EndsWith(&quot;.fifo&quot;,&nbsp;StringComparison.OrdinalIgnoreCase);</code></td></tr>
+<tr class="coverableline" title="Covered (3492 visits)" data-coverage="{'AllTestMethods': {'VC': '3492', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3492</td><td class="rightmargin right"><a id="file0_line16"></a><code>16</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;QueueName(queue).EndsWith(&quot;.fifo&quot;,&nbsp;StringComparison.OrdinalIgnoreCase);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line17"></a><code>17</code></td><td></td><td class="lightgray"><code></code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line18"></a><code>18</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;Extracts&nbsp;the&nbsp;queue&nbsp;name&nbsp;from&nbsp;a&nbsp;queue&nbsp;string&nbsp;(the&nbsp;last&nbsp;URL&nbsp;segment,&nbsp;or&nbsp;the&nbsp;string&nbsp;itself).&lt;/summary&gt;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line19"></a><code>19</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;static&nbsp;string&nbsp;QueueName(string&nbsp;queue)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line20"></a><code>20</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line21"></a><code>21</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;trimmed&nbsp;=&nbsp;queue.TrimEnd(&#39;/&#39;);</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line22"></a><code>22</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(!IsUrl(trimmed))</code></td></tr>
-<tr class="coverableline" title="Covered (7 visits)" data-coverage="{'AllTestMethods': {'VC': '7', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7</td><td class="rightmargin right"><a id="file0_line23"></a><code>23</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;trimmed;</code></td></tr>
+<tr class="coverableline" title="Covered (3516 visits)" data-coverage="{'AllTestMethods': {'VC': '3516', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3516</td><td class="rightmargin right"><a id="file0_line21"></a><code>21</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;trimmed&nbsp;=&nbsp;queue.TrimEnd(&#39;/&#39;);</code></td></tr>
+<tr class="coverableline" title="Covered (3516 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '3516', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3516</td><td class="rightmargin right"><a id="file0_line22"></a><code>22</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if&nbsp;(!IsUrl(trimmed))</code></td></tr>
+<tr class="coverableline" title="Covered (3484 visits)" data-coverage="{'AllTestMethods': {'VC': '3484', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3484</td><td class="rightmargin right"><a id="file0_line23"></a><code>23</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;trimmed;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line24"></a><code>24</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="coverableline" title="Covered (2 visits)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line25"></a><code>25</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;lastSegment&nbsp;=&nbsp;trimmed.LastIndexOf(&#39;/&#39;);</code></td></tr>
-<tr class="coverableline" title="Partially covered (2 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '2', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">2</td><td class="rightmargin right"><a id="file0_line26"></a><code>26</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;lastSegment&nbsp;&gt;=&nbsp;0&nbsp;?&nbsp;trimmed[(lastSegment&nbsp;+&nbsp;1)..]&nbsp;:&nbsp;trimmed;</code></td></tr>
+<tr class="coverableline" title="Covered (32 visits)" data-coverage="{'AllTestMethods': {'VC': '32', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">32</td><td class="rightmargin right"><a id="file0_line25"></a><code>25</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;lastSegment&nbsp;=&nbsp;trimmed.LastIndexOf(&#39;/&#39;);</code></td></tr>
+<tr class="coverableline" title="Partially covered (32 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '32', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">32</td><td class="rightmargin right"><a id="file0_line26"></a><code>26</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;lastSegment&nbsp;&gt;=&nbsp;0&nbsp;?&nbsp;trimmed[(lastSegment&nbsp;+&nbsp;1)..]&nbsp;:&nbsp;trimmed;</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line27"></a><code>27</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line28"></a><code>28</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line28"></a><code>28</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line29"></a><code>29</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line30"></a><code>30</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;Derives&nbsp;the&nbsp;dead-letter&nbsp;queue&nbsp;name&nbsp;provisioning&nbsp;creates&nbsp;for&nbsp;&lt;paramref&nbsp;name=&quot;queueName&quot;/&gt;:</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line31"></a><code>31</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;the&nbsp;suffix&nbsp;is&nbsp;appended,&nbsp;and&nbsp;for&nbsp;FIFO&nbsp;queues&nbsp;re-inserted&nbsp;before&nbsp;the&nbsp;mandatory</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line32"></a><code>32</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;c&gt;.fifo&lt;/c&gt;&nbsp;tail&nbsp;(a&nbsp;FIFO&nbsp;queue&#39;s&nbsp;dead-letter&nbsp;queue&nbsp;must&nbsp;itself&nbsp;be&nbsp;FIFO).&nbsp;The&nbsp;validator</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line33"></a><code>33</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;uses&nbsp;the&nbsp;SAME&nbsp;derivation&nbsp;to&nbsp;reject&nbsp;collisions&nbsp;with&nbsp;a&nbsp;live&nbsp;queue,&nbsp;so&nbsp;the&nbsp;two&nbsp;must&nbsp;not&nbsp;drift.</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line34"></a><code>34</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line35"></a><code>35</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;static&nbsp;string&nbsp;DeriveDeadLetterQueueName(string&nbsp;queueName,&nbsp;string&nbsp;suffix)</code></td></tr>
+<tr class="coverableline" title="Covered (1986 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '1986', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1986</td><td class="rightmargin right"><a id="file0_line36"></a><code>36</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;IsFifo(queueName)</code></td></tr>
+<tr class="coverableline" title="Covered (1986 visits)" data-coverage="{'AllTestMethods': {'VC': '1986', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1986</td><td class="rightmargin right"><a id="file0_line37"></a><code>37</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;?&nbsp;$&quot;{queueName[..^&quot;.fifo&quot;.Length]}{suffix}.fifo&quot;</code></td></tr>
+<tr class="coverableline" title="Covered (1986 visits)" data-coverage="{'AllTestMethods': {'VC': '1986', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1986</td><td class="rightmargin right"><a id="file0_line38"></a><code>38</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;$&quot;{queueName}{suffix}&quot;;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line39"></a><code>39</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/14/2026 - 23:32:14<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/16/2026 - 16:08:44<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
-<a href="#file0_line11" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsUrl(string)"><i class="icon-cube"></i>IsUrl(string)</a><br />
-<a href="#file0_line16" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsFifo(string)"><i class="icon-cube"></i>IsFifo(string)</a><br />
-<a href="#file0_line21" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - QueueName(string)"><i class="icon-cube"></i>QueueName(string)</a><br />
+<a href="#file0_line11" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsUrl(System.String)"><i class="icon-cube"></i>IsUrl(System.String)</a><br />
+<a href="#file0_line16" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - IsFifo(System.String)"><i class="icon-cube"></i>IsFifo(System.String)</a><br />
+<a href="#file0_line21" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - QueueName(System.String)"><i class="icon-cube"></i>QueueName(System.String)</a><br />
+<a href="#file0_line36" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - DeriveDeadLetterQueueName(System.String,System.String)"><i class="icon-cube"></i>DeriveDeadLetterQueueName(System.String,System.String)</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>
