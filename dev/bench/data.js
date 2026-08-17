@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786968670970,
+  "lastUpdate": 1786968691117,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -91558,6 +91558,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1387.8550910521762,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "872babe7a341e1d499e812e5061600191d54201c",
+          "message": "fix: apply round-27 external review — 11 verified findings across core, channels, and CI\nTriaged all 16 findings of an external full-codebase review of 56a7542. Roughly\n60% held up; the \"REJECTED / 54-100\" verdict did not — the review's own evidence\nreported a clean build, a green suite, no cycles and no vulnerable packages.\nIts useful contribution was the framing: several separate gaps shared one root,\nambiguous outcomes defaulting to ACK.\nFixed, each with a regression test that is red on the pre-fix source:\n- JsonSafety embedded 200 payload characters in InvalidDataException.Message,\n  which the ingress logged and, on the response path, republished through\n  SetException. That defeated docs/security.md's \"the library never logs a\n  message body\" on both routes. Size and JSON position remain.\n- Three raw NUL bytes made a .cs file binary to git and invisible to ripgrep,\n  hiding a regression suite from diffs and searches. Escaped, plus a test that\n  scans every checked-in source for raw control bytes.\n- AsyncResponseContextPropagation.Restore leaked the scopes of propagators\n  1..N-1 when propagator N threw, leaving ambient identity attached to an\n  aborted dispatch. It also disposed asymmetrically: one scope propagated its\n  Dispose failure out of the caller's using (redelivering an already-executed\n  worker job), two or more swallowed it silently. Now unwinds in reverse and\n  logs uniformly.\n- Callback authorization ran after the worker envelope's propagated context was\n  restored, so a rejected message still chose the ambient tenant/principal an\n  authorizer would consult to judge it. Authorization now decides on the raw\n  descriptor, at the ingress and in the recovery dispatcher; the check inside\n  InvokeAsync stays as the backstop.\n- An unreadable ledger was indistinguishable from a missing one: malformed JSON\n  and unknown schema versions both loaded as null, the executor read that as\n  \"nothing to execute\", and the transport acked a live flow's only wake-up.\n  FlowStateUnreadableException now separates them. Revision and identity\n  mismatch deliberately still read as absent.\n- StartAsync committed the Running ledger then published; a publish failure left\n  an orphan, and with a generated id the caller never learned which run to\n  re-drive. The publish is retried, and DurableFlowNotDispatchedException\n  carries the flow id out.\n- FlowExecutionLease.LostToken was cancelled only by a renewal call that\n  returned, so a wedged renewal left it live past the lease deadline. A deadline\n  watcher now fires independently of renewal I/O, chunked so a long lease stays\n  within the timer ceiling.\n- AsyncResponseTypeResolution registrations were permanent, pinning collectible\n  AssemblyLoadContexts despite the type's own documented claim. Both\n  registration methods return an IDisposable; swallowed resolver faults are\n  counted.\n- Added AsyncResponseOptions.MaxInboundMessageChars, enforced at the ingress\n  before any parse.\n- The watchdog scanned on an exact period, so co-deployed replicas stayed in\n  lockstep; added IntervalJitter (default 10% of Interval). RedisRecoveryStateStore\n  scanned every endpoint including replicas; primaries only now.\n- benchmarks.yml interpolated workflow_dispatch inputs directly into run: under\n  a contents:write token. All inputs go through env with allowlists. publish.yml\n  now verifies the tagged commit is reachable from main.",
+          "timestamp": "2026-08-17T13:59:15+02:00",
+          "tree_id": "6d9e3f823bc01c696721cfab197ad48ae52a2495",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/872babe7a341e1d499e812e5061600191d54201c"
+        },
+        "date": 1786968689251,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 109749.77490321168,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 59855.1505357036,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 62434.47501846812,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 394894.80002527323,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 504072.909105573,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 457716.17935150774,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 583839.3274170948,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 463701.450458137,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 478331.57945087535,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 468348.9761891381,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 396322.1306277742,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 689769.3411323254,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 807884.9571820972,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 198851.90862038932,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 123275.25589477619,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 56732.30973117962,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 49501.93136735423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4866.369493702918,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 282046.07504681963,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 126114.85532103798,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1873080.0929047726,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 2665.194058109759,
             "unit": "flows/s"
           }
         ]
