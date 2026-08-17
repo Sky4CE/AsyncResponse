@@ -273,6 +273,14 @@ internal static class FlowStoreContract
     /// A state written by a newer build must be refused, not executed against. Silently loading a
     /// schema this build does not understand is how a rolling deploy runs a flow with half its
     /// checkpoints invisible.
+    /// <para>
+    /// "Refused" means <see cref="FlowStateUnreadableException"/>, not <c>null</c>. Returning null
+    /// says the run does not exist, and every caller answers that by acknowledging the wake-up and
+    /// stopping — which is precisely the failure this contract exists to prevent: the ledger stays
+    /// <c>Running</c> and the message that would have resumed it is gone. Throwing routes the
+    /// delivery to the transport's retry/dead-letter path instead, where a replica that can read
+    /// the ledger gets its turn.
+    /// </para>
     /// </summary>
     private static async Task AssertSchemaVersionContractAsync(IFlowStateStore store, Func<string, string, Task>? seedRawStateAsync)
     {
@@ -282,6 +290,9 @@ internal static class FlowStoreContract
 
         await Assert.ThrowsAnyAsync<ArgumentException>(
             () => store.TryCreateAsync(flowId, future, TimeSpan.FromMinutes(5)));
+
+        // The write was rejected, so nothing was ever stored — this id really is absent, and null
+        // is the right answer for it.
         Assert.Null(await store.LoadAsync(flowId));
 
         // Write rejection alone cannot catch a backend-specific READ regression: state written by
@@ -293,7 +304,14 @@ internal static class FlowStoreContract
             var rawFuture = CreateState(rawFlowId);
             rawFuture.SchemaVersion = FlowStateSchema.Current + 1;
             await seedRawStateAsync(rawFlowId, JsonSerializer.Serialize(rawFuture));
-            Assert.Null(await store.LoadAsync(rawFlowId));
+
+            var unreadable = await Assert.ThrowsAsync<FlowStateUnreadableException>(
+                () => store.LoadAsync(rawFlowId));
+            Assert.Equal(rawFlowId, unreadable.FlowId);
+            Assert.Contains(
+                $"schema version is {FlowStateSchema.Current + 1}",
+                unreadable.Reason,
+                StringComparison.Ordinal);
         }
     }
 
