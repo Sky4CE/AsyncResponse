@@ -353,4 +353,65 @@ public sealed class Round28RegressionTests
         });
         return (weak, handle);
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Follow-up — the all-unreadable rule must not fire for a row that is perfectly readable and
+    // simply belongs to a DIFFERENT correlation id. A legacy case-insensitive collation returns
+    // "LEGACY-CI"'s row for a "legacy-ci" query; the ordinal re-check refuses it, and for the id
+    // actually asked about that is absence, not corruption.
+    // -----------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RegistrationBelongingToAnotherCorrelationId_ReadsAsAbsent_NotAsUnreadable()
+    {
+        var kv = new FakeNatsKvStore();
+        var clock = new TestTimeProvider();
+        var store = new AsyncResponse.Channels.NATS.NatsRecoveryStateStore(
+            kv,
+            Options.Create(new AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions()),
+            NullLogger<AsyncResponse.Channels.NATS.NatsRecoveryStateStore>.Instance,
+            clock);
+
+        // One stored registration, fully readable, but registered under a different (upper-case) id.
+        kv.Entries[AsyncResponse.Channels.NATS.NatsSubjectSchema.RecoveryKey("legacy-ci")] =
+            System.Text.Json.JsonSerializer.Serialize(
+                new AsyncResponse.Channels.NATS.NatsRecoveryStateStore.StoredRecoveryState
+                {
+                    States = [new RecoveryState { CorrelationId = "LEGACY-CI", RegistrationId = Guid.NewGuid() }],
+                    ExpiresAtUtc = clock.Now + TimeSpan.FromMinutes(5),
+                });
+
+        // Empty, not a throw: nothing is armed for "legacy-ci", and failing the delivery would
+        // redeliver a response that has no callback to reach.
+        Assert.Empty(await store.GetAllAsync("legacy-ci"));
+    }
+
+    [Fact]
+    public async Task MixOfForeignAndUnreadable_StillFails_BecauseTheUnreadableOneIsOurs()
+    {
+        var kv = new FakeNatsKvStore();
+        var clock = new TestTimeProvider();
+        var store = new AsyncResponse.Channels.NATS.NatsRecoveryStateStore(
+            kv,
+            Options.Create(new AsyncResponse.Channels.NATS.NatsAsyncResponseChannelOptions()),
+            NullLogger<AsyncResponse.Channels.NATS.NatsRecoveryStateStore>.Instance,
+            clock);
+
+        kv.Entries[AsyncResponse.Channels.NATS.NatsSubjectSchema.RecoveryKey("mixed-ci")] =
+            System.Text.Json.JsonSerializer.Serialize(
+                new AsyncResponse.Channels.NATS.NatsRecoveryStateStore.StoredRecoveryState
+                {
+                    States =
+                    [
+                        new RecoveryState { CorrelationId = "MIXED-CI", RegistrationId = Guid.NewGuid() },
+                        new RecoveryState { CorrelationId = "mixed-ci", RegistrationId = Guid.NewGuid(), SchemaVersion = RecoveryStateSchema.Current + 1 },
+                    ],
+                    ExpiresAtUtc = clock.Now + TimeSpan.FromMinutes(5),
+                });
+
+        // The second row IS this id's, and it is unreadable — so the response still must not be
+        // acknowledged. Only the foreign row is discounted.
+        var ex = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("mixed-ci"));
+        Assert.Equal(1, ex.UnreadableCount);
+    }
 }

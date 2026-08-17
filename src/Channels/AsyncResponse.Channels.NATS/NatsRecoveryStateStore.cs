@@ -104,24 +104,26 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
 
         var states = StatesFrom(found.Stored);
-        var stored = states.Count;
+        var unreadable = 0;
         for (var i = states.Count - 1; i >= 0; i--)
         {
             var state = states[i];
-            if (!IsStateReadable(state, key, correlationId))
+            if (!IsStateReadable(state, key, correlationId, ref unreadable))
             {
                 states.RemoveAt(i);
                 continue;
             }
         }
 
-        // Registrations existed and none of them survived. An empty list reads as "no recovery
-        // callback was ever armed", which the dispatcher answers by acknowledging the response —
-        // so a corrupt or newer-schema registration consumed a terminal response its callback never
-        // saw. Fail the delivery instead; a partially readable batch deliberately does not (see
-        // RecoveryStateUnreadableException).
-        if (stored > 0 && states.Count == 0)
-            throw new RecoveryStateUnreadableException(correlationId, stored);
+        // Registrations existed and none this build could INTERPRET survived. An empty list reads
+        // as "no recovery callback was ever armed", which the dispatcher answers by acknowledging
+        // the response — so a corrupt or newer-schema registration would consume a terminal response
+        // its callback never saw. A partially readable batch deliberately does not throw (see
+        // RecoveryStateUnreadableException), and neither does a row rejected for carrying ANOTHER
+        // correlation id: that row is readable and simply belongs elsewhere, so for the id actually
+        // asked about it is absence, not corruption.
+        if (unreadable > 0 && states.Count == 0)
+            throw new RecoveryStateUnreadableException(correlationId, unreadable);
 
         return states;
     }
@@ -224,13 +226,25 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
 
+    /// <summary>Readability check for paths that prune without judging a read.</summary>
     private bool IsStateReadable(RecoveryState? state, string key, string correlationId)
+    {
+        var ignored = 0;
+        return IsStateReadable(state, key, correlationId, ref ignored);
+    }
+
+    /// <summary>
+    /// Readability check that also counts rows this build could not INTERPRET. A row carrying
+    /// another correlation id is deliberately NOT counted: it is readable and belongs elsewhere.
+    /// </summary>
+    private bool IsStateReadable(RecoveryState? state, string key, string correlationId, ref int unreadable)
     {
         if (state is null || state.RegistrationId == Guid.Empty)
         {
             _logger.LogWarning(
                 "Recovery state at key {RecoveryKey} has no registration id; rejecting it because it cannot be deleted safely.",
                 key);
+            unreadable++;
             return false;
         }
 
@@ -239,6 +253,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             _logger.LogWarning(
                 "Recovery state at key {RecoveryKey} has unsupported schema version {SchemaVersion} (current: {Current}); rejecting it instead of risking a misinterpreted recovery.",
                 key, state.SchemaVersion, RecoveryStateSchema.Current);
+            unreadable++;
             return false;
         }
 

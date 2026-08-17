@@ -619,6 +619,19 @@ public sealed class SqlServerOptionsTests
 
         Assert.Null(InvokeDeserializeState(store, "null", "fallback"));
         Assert.Null(InvokeDeserializeState(store, "{not-json", "fallback"));
+
+        // A row is rejected for four reasons, and only three of them mean "this build cannot read
+        // it". The fourth — the stored row carries a DIFFERENT correlation id — is a readable row
+        // that belongs to another conversation, surfaced by a legacy case-insensitive collation and
+        // correctly refused by the ordinal re-check. Counting it as unreadable turned that refusal
+        // into a failed delivery for an id that simply has nothing registered.
+        Assert.Equal(1, InvokeDeserializeStateUnreadableCount(store, "{not-json", "fallback"));
+        Assert.Equal(
+            0,
+            InvokeDeserializeStateUnreadableCount(
+                store,
+                JsonSerializer.Serialize(new RecoveryState { CorrelationId = "OTHER-ID", RegistrationId = Guid.NewGuid() }),
+                "other-id"));
         Assert.Null(InvokeDeserializeState(
             store,
             JsonSerializer.Serialize(new RecoveryState
@@ -779,7 +792,24 @@ public sealed class SqlServerOptionsTests
         string? correlationId)
         => (RecoveryState?)typeof(SqlServerRecoveryStateStore)
             .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .Invoke(store, [json, correlationId]);
+            .Invoke(store, [json, correlationId, 0]);
+
+    /// <summary>
+    /// Same call, but reporting how many rows were rejected as UNREADABLE. A row rejected only for
+    /// carrying another correlation id must not be counted — that is what keeps a legacy
+    /// case-insensitive collation returning somebody else's row from being reported as corruption.
+    /// </summary>
+    private static int InvokeDeserializeStateUnreadableCount(
+        SqlServerRecoveryStateStore store,
+        string json,
+        string? correlationId)
+    {
+        var args = new object?[] { json, correlationId, 0 };
+        typeof(SqlServerRecoveryStateStore)
+            .GetMethod("DeserializeState", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(store, args);
+        return (int)args[2]!;
+    }
 
     private static SqlException CreateSqlException(int number, byte severity)
     {

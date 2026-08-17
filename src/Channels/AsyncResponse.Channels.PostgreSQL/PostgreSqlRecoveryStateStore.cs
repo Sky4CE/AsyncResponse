@@ -56,7 +56,8 @@ internal sealed class PostgreSqlRecoveryStateStore(
     {
         await foreach (var json in _sql.ScanRecoveryStateJsonAsync(cancellationToken).ConfigureAwait(false))
         {
-            var state = DeserializeState(json, correlationId: null);
+            var ignored = 0;
+            var state = DeserializeState(json, correlationId: null, ref ignored);
             if (state is not null)
                 yield return state;
         }
@@ -68,9 +69,10 @@ internal sealed class PostgreSqlRecoveryStateStore(
             return [];
 
         var states = new List<RecoveryState>(jsonStates.Count);
+        var unreadable = 0;
         foreach (var json in jsonStates)
         {
-            var state = DeserializeState(json, correlationId);
+            var state = DeserializeState(json, correlationId, ref unreadable);
             if (state is not null)
                 states.Add(state);
         }
@@ -81,25 +83,34 @@ internal sealed class PostgreSqlRecoveryStateStore(
         // response its callback never saw. Fail instead, and let redelivery reach a build that can
         // read it. A PARTIALLY readable batch deliberately does not throw: see
         // RecoveryStateUnreadableException.
-        if (states.Count == 0)
-            throw new RecoveryStateUnreadableException(correlationId, jsonStates.Count);
+        // Only rows this build could not INTERPRET count. A row rejected for belonging to another
+        // correlation id is perfectly readable — it surfaced because a legacy case-insensitive
+        // collation matched the wrong key, and refusing it is the ordinal re-check doing its job.
+        // For the id actually asked about, that is absence, not corruption, and absence must stay
+        // an empty list.
+        if (states.Count == 0 && unreadable > 0)
+            throw new RecoveryStateUnreadableException(correlationId, unreadable);
 
         return states;
     }
 
-    private RecoveryState? DeserializeState(string json, string? correlationId)
+    private RecoveryState? DeserializeState(string json, string? correlationId, ref int unreadable)
     {
         try
         {
             var state = AsyncResponseJson.Deserialize<RecoveryState>(json);
             if (state is null)
+            {
+                unreadable++;
                 return null;
+            }
 
             if (state.RegistrationId == Guid.Empty || string.IsNullOrWhiteSpace(state.CorrelationId))
             {
                 _logger.LogWarning(
                     "PostgreSQL recovery state for correlationId {CorrelationId} has an incomplete identity; rejecting it.",
                     correlationId ?? state.CorrelationId);
+                unreadable++;
                 return null;
             }
 
@@ -110,6 +121,7 @@ internal sealed class PostgreSqlRecoveryStateStore(
                     correlationId ?? state.CorrelationId,
                     state.SchemaVersion,
                     RecoveryStateSchema.Current);
+                unreadable++;
                 return null;
             }
 
@@ -127,6 +139,7 @@ internal sealed class PostgreSqlRecoveryStateStore(
         catch (JsonException ex)
         {
             _logger.LogWarning(ex, "Unreadable PostgreSQL recovery state for correlationId {CorrelationId}; skipping.", correlationId);
+            unreadable++;
             return null;
         }
     }

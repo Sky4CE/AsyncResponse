@@ -192,8 +192,10 @@ public sealed class RelationalChannelSubscriptionCoverageTests
     private static void ExerciseRecoveryDeserializer(object store)
     {
         var method = store.GetType().GetMethod("DeserializeState", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        // The third argument is the by-ref unreadable counter; this helper only exercises the
+        // rejection branches, so it discards the count.
         object? Deserialize(string json, string? correlationId)
-            => method.Invoke(store, [json, correlationId]);
+            => method.Invoke(store, [json, correlationId, 0]);
 
         Assert.Null(Deserialize("null", "corr"));
         Assert.Null(Deserialize(

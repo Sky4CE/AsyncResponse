@@ -313,11 +313,17 @@ internal static class FlowStoreContract
                 unreadable.Reason,
                 StringComparison.Ordinal);
 
-            // The same rule one level down: a row whose JSON itself will not parse. The schema gate
-            // above only fires on a document this build can read far enough to find a version in,
-            // so a corrupt row takes a different path through every store and needs its own case.
+            // The same rule one level down: a row whose contents this build cannot bind to a
+            // FlowState at all. The schema gate above only fires on a document that binds far
+            // enough to expose a version, so a corrupt row takes a different path and needs its
+            // own case.
+            //
+            // It has to be SYNTACTICALLY valid JSON that is semantically wrong — here, a revision
+            // that is not a number. A raw `{not-json` cannot be used: PostgreSQL's `state_json` is
+            // `jsonb`, so the seed itself fails with 22P02 before the read path is ever reached,
+            // and the case would only be exercised on the stores with a text column.
             var corruptFlowId = $"flow-corrupt-raw-{Guid.NewGuid():N}";
-            await seedRawStateAsync(corruptFlowId, "{not-json");
+            await seedRawStateAsync(corruptFlowId, """{"SchemaVersion":1,"Revision":"not-a-number"}""");
 
             var corrupt = await Assert.ThrowsAsync<FlowStateUnreadableException>(
                 () => store.LoadAsync(corruptFlowId));
