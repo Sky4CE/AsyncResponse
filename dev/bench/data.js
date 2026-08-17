@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786968691117,
+  "lastUpdate": 1786968694301,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -123920,6 +123920,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 46335.488,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "872babe7a341e1d499e812e5061600191d54201c",
+          "message": "fix: apply round-27 external review — 11 verified findings across core, channels, and CI\nTriaged all 16 findings of an external full-codebase review of 56a7542. Roughly\n60% held up; the \"REJECTED / 54-100\" verdict did not — the review's own evidence\nreported a clean build, a green suite, no cycles and no vulnerable packages.\nIts useful contribution was the framing: several separate gaps shared one root,\nambiguous outcomes defaulting to ACK.\nFixed, each with a regression test that is red on the pre-fix source:\n- JsonSafety embedded 200 payload characters in InvalidDataException.Message,\n  which the ingress logged and, on the response path, republished through\n  SetException. That defeated docs/security.md's \"the library never logs a\n  message body\" on both routes. Size and JSON position remain.\n- Three raw NUL bytes made a .cs file binary to git and invisible to ripgrep,\n  hiding a regression suite from diffs and searches. Escaped, plus a test that\n  scans every checked-in source for raw control bytes.\n- AsyncResponseContextPropagation.Restore leaked the scopes of propagators\n  1..N-1 when propagator N threw, leaving ambient identity attached to an\n  aborted dispatch. It also disposed asymmetrically: one scope propagated its\n  Dispose failure out of the caller's using (redelivering an already-executed\n  worker job), two or more swallowed it silently. Now unwinds in reverse and\n  logs uniformly.\n- Callback authorization ran after the worker envelope's propagated context was\n  restored, so a rejected message still chose the ambient tenant/principal an\n  authorizer would consult to judge it. Authorization now decides on the raw\n  descriptor, at the ingress and in the recovery dispatcher; the check inside\n  InvokeAsync stays as the backstop.\n- An unreadable ledger was indistinguishable from a missing one: malformed JSON\n  and unknown schema versions both loaded as null, the executor read that as\n  \"nothing to execute\", and the transport acked a live flow's only wake-up.\n  FlowStateUnreadableException now separates them. Revision and identity\n  mismatch deliberately still read as absent.\n- StartAsync committed the Running ledger then published; a publish failure left\n  an orphan, and with a generated id the caller never learned which run to\n  re-drive. The publish is retried, and DurableFlowNotDispatchedException\n  carries the flow id out.\n- FlowExecutionLease.LostToken was cancelled only by a renewal call that\n  returned, so a wedged renewal left it live past the lease deadline. A deadline\n  watcher now fires independently of renewal I/O, chunked so a long lease stays\n  within the timer ceiling.\n- AsyncResponseTypeResolution registrations were permanent, pinning collectible\n  AssemblyLoadContexts despite the type's own documented claim. Both\n  registration methods return an IDisposable; swallowed resolver faults are\n  counted.\n- Added AsyncResponseOptions.MaxInboundMessageChars, enforced at the ingress\n  before any parse.\n- The watchdog scanned on an exact period, so co-deployed replicas stayed in\n  lockstep; added IntervalJitter (default 10% of Interval). RedisRecoveryStateStore\n  scanned every endpoint including replicas; primaries only now.\n- benchmarks.yml interpolated workflow_dispatch inputs directly into run: under\n  a contents:write token. All inputs go through env with allowlists. publish.yml\n  now verifies the tagged commit is reachable from main.",
+          "timestamp": "2026-08-17T13:59:15+02:00",
+          "tree_id": "6d9e3f823bc01c696721cfab197ad48ae52a2495",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/872babe7a341e1d499e812e5061600191d54201c"
+        },
+        "date": 1786968693451,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0307,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1669.99136,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 0.0537,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3381.0752,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4939.8544,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0021,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 457.7024,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0018,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 475.5968,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0019,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 495.8336,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0017,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 442.3392,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0025,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 462.528,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0028,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 460.2208,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0029,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 460.6912,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0046,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 633.616,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0022,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 538.656,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0014,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 289.8016,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.0272,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1483.3216,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.0447,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1864.872,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 4.167,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4919.18208,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 2.6534,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8542.44992,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 53.2069,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3016.868,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0198,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1141.9488,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 0.0445,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2762.9152,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 5.3388,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 47273.5424,
             "unit": "B/flow"
           }
         ]
