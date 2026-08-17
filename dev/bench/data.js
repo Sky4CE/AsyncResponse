@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786995788243,
+  "lastUpdate": 1786995813230,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -95262,6 +95262,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1262.5204149551098,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "fced384c7c1bbcf93db5b925b67acf25abed9b50",
+          "message": "ci: a failed benchmark alert comment must not fail the benchmark job\n\nThe Benchmarks run on de68674 went red after its work had already succeeded: the\ngh-pages push completed (\"9306b821..0a3e43b3  gh-pages -> gh-pages\"), and the\nstep then failed posting the commit comment for a performance alert, with\nGitHub's \"No server is currently available to service your request\".\n\nThe alert itself was never the problem — the four preceding runs raised 2, 30,\n10 and 2 alerts and all passed, because fail-on-alert is already false. Failing\nbecause the NOTIFICATION about a regression could not be posted, on a job that\ndeliberately does not fail on regressions, is incoherent.\n\ncomment-on-alert is now false on all five publish steps across both workflows.\nThe alert still surfaces twice: as a workflow warning annotation and in the job\nsummary (summary-always). It also stops a single commit collecting dozens of\ncomments.\n\nFor the record, the alert that triggered this was noise, not a regression:\nRabbitMqAckDispatchBenchmarks.AckAfterEnqueue_Callback(BackgroundWorkers: 1)\nmeasured 242.1, 245.9 and 279.1 ns across three runs of the SAME commit, in a\nseries that has ranged 140-434 ns across unrelated commits.",
+          "timestamp": "2026-08-17T21:31:55+02:00",
+          "tree_id": "f71b7d64b3ff5fd13bfa776199131bec4756fa4c",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/fced384c7c1bbcf93db5b925b67acf25abed9b50"
+        },
+        "date": 1786995812485,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 84132.93272596087,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 56149.24018848177,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 36791.83444969571,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 252599.2462438492,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 475556.40098915726,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 238272.2403309125,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 400025.6016385048,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 237099.4205290162,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 246701.5996131719,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 248627.5757816851,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 250030.00360043204,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 390070.36869451246,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 413811.3682259079,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 125184.52198540649,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 99044.26248472738,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 40508.974196107505,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 28995.269827661396,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4808.274848683591,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 235152.47286340466,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 79864.2945906316,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1647853.6705940512,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1586.3157550088872,
             "unit": "flows/s"
           }
         ]
