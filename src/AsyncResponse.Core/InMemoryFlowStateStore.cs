@@ -60,11 +60,12 @@ internal sealed class InMemoryFlowStateStore : IFlowStateStore
                 continue;
             }
 
-            var state = FlowStateJson.Deserialize(entry.StateJson);
+            // Unreadable JSON or an unknown schema version throws out of here rather than
+            // masquerading as a deleted flow; revision/identity mismatch still reads as absent.
+            // Same contract as the durable stores — see DurableFlowStoreShared.ReadState.
+            var state = FlowStateJson.Deserialize(entry.StateJson, flowId);
             return Task.FromResult(
-                state is not null
-                && FlowStateSchema.IsReadable(state.SchemaVersion)
-                && state.Revision == entry.Revision
+                state.Revision == entry.Revision
                 && string.Equals(state.FlowId, flowId, StringComparison.Ordinal)
                     ? state
                     : null);

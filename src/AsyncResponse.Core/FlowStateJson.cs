@@ -13,17 +13,36 @@ internal static class FlowStateJson
 
     public static string Serialize(FlowState state) => JsonSerializer.Serialize(state, TypeInfo);
 
-    public static FlowState? Deserialize(string json)
+    /// <summary>
+    /// Materializes a ledger row that the store has already found. Every failure here means the
+    /// row EXISTS and cannot be read, which is categorically different from the row being absent —
+    /// so none of them returns <c>null</c>. See <see cref="FlowStateUnreadableException"/> for why
+    /// that difference decides whether a wake-up may be acknowledged.
+    /// </summary>
+    /// <exception cref="FlowStateUnreadableException">The row is present but uninterpretable.</exception>
+    public static FlowState Deserialize(string json, string flowId)
     {
+        FlowState? state;
         try
         {
-            var state = JsonSerializer.Deserialize(json, TypeInfo);
-            return state is not null && FlowStateSchema.IsReadable(state.SchemaVersion) ? state : null;
+            state = JsonSerializer.Deserialize(json, TypeInfo);
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            return null;
+            throw new FlowStateUnreadableException(flowId, "the stored JSON is malformed", ex);
         }
+
+        if (state is null)
+            throw new FlowStateUnreadableException(flowId, "the stored JSON is the literal null");
+
+        if (!FlowStateSchema.IsReadable(state.SchemaVersion))
+        {
+            throw new FlowStateUnreadableException(
+                flowId,
+                $"its schema version is {state.SchemaVersion} and this build reads {FlowStateSchema.Current}");
+        }
+
+        return state;
     }
 
     public static bool JsonEquivalent(string? left, string right)

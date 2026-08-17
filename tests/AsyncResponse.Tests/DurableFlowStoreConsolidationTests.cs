@@ -53,7 +53,7 @@ public sealed class DurableFlowStoreConsolidationTests
             var json = Assert.IsType<string>(Invoke(shared, "Serialize", state));
             Assert.Equal(FlowStateJson.Serialize(state), json);
 
-            var restored = Assert.IsType<FlowState>(Invoke(shared, "Deserialize", json));
+            var restored = Assert.IsType<FlowState>(Invoke(shared, "Deserialize", json, state.FlowId!));
             Assert.Equal(state.FlowId, restored.FlowId);
             Assert.Equal(state.Revision, restored.Revision);
         }
@@ -73,7 +73,7 @@ public sealed class DurableFlowStoreConsolidationTests
             """;
 
         var shared = providerOptionsType.Assembly.GetType(SharedTypeName, throwOnError: true)!;
-        var state = Assert.IsType<FlowState>(Invoke(shared, "Deserialize", ledger));
+        var state = Assert.IsType<FlowState>(Invoke(shared, "Deserialize", ledger, "flow-1"));
 
         Assert.Equal(3, state.Revision);
         Assert.Equal("flow-1", state.FlowId);
@@ -86,8 +86,13 @@ public sealed class DurableFlowStoreConsolidationTests
         Assert.Equal("parent-1", state.ParentFlowId);
         Assert.Equal("\"hi\"", state.Values!["greeting"]);
 
-        // The read-side contract is unchanged too: unknown schema versions load as absent.
-        Assert.Null(Invoke(shared, "Deserialize", """{"SchemaVersion":2,"FlowId":"flow-1"}"""));
+        // Unknown schema versions are rejected, loudly. They used to load as absent, which during
+        // a rolling deployment meant an older replica acked the wake-up of a flow a newer replica
+        // had rewritten — the run stayed Running with nothing left to resume it.
+        var unreadable = AssertInner<FlowStateUnreadableException>(
+            shared, "Deserialize", """{"SchemaVersion":2,"FlowId":"flow-1"}""", "flow-1");
+        Assert.Equal("flow-1", unreadable.FlowId);
+        Assert.Contains("schema version is 2", unreadable.Reason, StringComparison.Ordinal);
     }
 
     [Theory]

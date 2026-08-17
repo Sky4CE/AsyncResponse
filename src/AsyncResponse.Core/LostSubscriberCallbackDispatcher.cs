@@ -562,10 +562,21 @@ internal sealed class LostSubscriberCallbackDispatcher(
 
     private async Task InvokeAsync(ReflectionInvocationDto invocation, IReadOnlyDictionary<string, string>? context)
     {
+        await using var serviceScope = _scopeFactory.CreateAsyncScope();
+
+        // Authorize first, on the raw persisted descriptor. Both the callback target and the
+        // context carrier come out of the recovery store, so anyone who can write a row there
+        // supplies both — and restoring the context first would let the row pick the ambient
+        // tenant/principal an authorizer consults to decide whether that same row's target may
+        // run. The scope exists by now only to resolve the authorizer; nothing has been invoked.
+        ReflectionExtensions.ThrowIfNotAuthorized(
+            serviceScope.ServiceProvider.GetService<IAsyncResponseCallbackAuthorizer>(),
+            invocation.ServiceInterfaceFullName,
+            invocation.MethodName);
+
         // The recovery callback may run in a different deployment than the original waiter, so
         // restore any ambient context captured at registration before resolving and invoking it.
         using var contextScope = _propagation.Restore(context);
-        await using var serviceScope = _scopeFactory.CreateAsyncScope();
         await serviceScope.ServiceProvider.InvokeAsync(invocation).ConfigureAwait(false);
     }
 

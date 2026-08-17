@@ -50,11 +50,16 @@ public sealed class DurableFlowStoreSharedTests
         AssertInner<OverflowException>(shared, "ValidateUpdate", "flow", state, long.MaxValue, TimeSpan.FromMinutes(1));
 
         var json = Assert.IsType<string>(Invoke(shared, "Serialize", state));
-        Assert.Equal("flow", Assert.IsType<FlowState>(Invoke(shared, "Deserialize", json)).FlowId);
-        Assert.Null(Invoke(shared, "Deserialize", "null"));
-        Assert.Null(Invoke(shared, "Deserialize", "{"));
+        Assert.Equal("flow", Assert.IsType<FlowState>(Invoke(shared, "Deserialize", json, "flow")).FlowId);
+
+        // A row that is PRESENT and uninterpretable throws rather than returning null, in every
+        // store package: null is reserved for genuine absence, which is the only case where the
+        // executor may ack the wake-up (see FlowStateUnreadableException).
+        Assert.Equal("flow", AssertInner<FlowStateUnreadableException>(shared, "Deserialize", "null", "flow").FlowId);
+        AssertInner<FlowStateUnreadableException>(shared, "Deserialize", "{", "flow");
         state.SchemaVersion = FlowStateSchema.Current + 1;
-        Assert.Null(Invoke(shared, "Deserialize", JsonSerializer.Serialize(state)));
+        AssertInner<FlowStateUnreadableException>(shared, "Deserialize", JsonSerializer.Serialize(state), "flow");
+        state.SchemaVersion = FlowStateSchema.Current;
 
         Invoke(shared, "ValidateIdentifier", "valid_name2", "Name", "provider", 0);
         AssertInner<InvalidOperationException>(shared, "ValidateIdentifier", null, "Name", "provider", 0);
@@ -112,8 +117,12 @@ public sealed class DurableFlowStoreSharedTests
         Assert.Contains("exceeding the provider MaxStateBytes limit of 1 bytes", tooLarge.Message);
 
         // ReadState: only a readable ledger whose revision AND identity match loads as present.
+        // The two mismatches still read as absent — a row under the wrong key or at the wrong
+        // revision is a benign race or a misplaced restore, and treating it as this flow would be
+        // worse. An UNREADABLE row is the case that changed: it throws, because reporting it as
+        // absent told the executor to ack a live run's only wake-up.
         Assert.Equal("flow", Assert.IsType<FlowState>(Invoke(shared, "ReadState", "flow", json, 0L)).FlowId);
-        Assert.Null(Invoke(shared, "ReadState", "flow", "{", 0L));         // unreadable
+        AssertInner<FlowStateUnreadableException>(shared, "ReadState", "flow", "{", 0L);  // unreadable
         Assert.Null(Invoke(shared, "ReadState", "flow", json, 7L));        // revision mismatch
         Assert.Null(Invoke(shared, "ReadState", "other", json, 0L));       // identity mismatch
 

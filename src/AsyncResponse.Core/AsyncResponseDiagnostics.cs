@@ -54,6 +54,10 @@ public static class AsyncResponseDiagnostics
         Meter.CreateCounter<long>("asyncresponse.ingress.unroutable_responses", unit: "{message}",
             description: "Inbound response messages acknowledged without routing because they carry no correlation id (deliberate poison guard — redelivery could never route them).");
 
+    private static readonly Counter<long> OversizedInboundCounter =
+        Meter.CreateCounter<long>("asyncresponse.ingress.oversized_messages", unit: "{message}",
+            description: "Inbound messages acknowledged without processing because they exceed AsyncResponseOptions.MaxInboundMessageChars, tagged by route.");
+
     private static int _watchdogGaugesRegistered;
     private static AsyncResponseWatchdogState? _watchdogState;
 
@@ -178,6 +182,17 @@ public static class AsyncResponseDiagnostics
     {
         if (UnroutableResponsesCounter.Enabled)
             UnroutableResponsesCounter.Add(1);
+    }
+
+    /// <summary>
+    /// Records an inbound message dropped for exceeding the configured size budget, tagged by the
+    /// route it arrived on ("response" or "worker"). Producer-side contract violations, and the
+    /// only visible trace of a message deliberately not processed — alert on them.
+    /// </summary>
+    internal static void RecordOversizedInboundMessage(string route)
+    {
+        if (OversizedInboundCounter.Enabled)
+            OversizedInboundCounter.Add(1, new KeyValuePair<string, object?>("route", route));
     }
 
     /// <summary>

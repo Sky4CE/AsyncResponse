@@ -75,17 +75,26 @@ internal static class DurableFlowStoreShared
     }
 
     /// <summary>
-    /// Materializes a loaded ledger row. Unreadable JSON, an unknown schema version, a revision
-    /// that does not match the stored row, and an identity-mismatched ledger
-    /// (<c>state.FlowId != flowId</c>) all load as absent — the read-side mirror of the write-side
+    /// Materializes a loaded ledger row.
+    /// <para>
+    /// A revision that does not match the stored row, and an identity-mismatched ledger
+    /// (<c>state.FlowId != flowId</c>), load as absent — the read-side mirror of the write-side
     /// key/identity validation in <see cref="ValidateCreate"/>, so a row copied or restored under
     /// the wrong key can never resurrect as that flow.
+    /// </para>
+    /// <para>
+    /// Unreadable JSON and an unknown schema version do NOT: they say the row is there and this
+    /// build cannot interpret it, so they throw
+    /// <see cref="FlowStateUnreadableException"/> rather than impersonating a deleted flow. That
+    /// distinction is what stops a rolling deployment from acknowledging a live flow's only
+    /// wake-up (see the exception's remarks).
+    /// </para>
     /// </summary>
+    /// <exception cref="FlowStateUnreadableException">The row is present but uninterpretable.</exception>
     public static FlowState? ReadState(string flowId, string stateJson, long revision)
     {
-        var state = Deserialize(stateJson);
-        return state is not null
-            && state.Revision == revision
+        var state = Deserialize(stateJson, flowId);
+        return state.Revision == revision
             && string.Equals(state.FlowId, flowId, StringComparison.Ordinal)
                 ? state
                 : null;
@@ -112,8 +121,8 @@ internal static class DurableFlowStoreShared
     public static long ServerClockTtlMilliseconds(TimeSpan ttl)
         => (long)ServerClockTtl(ttl).TotalMilliseconds;
 
-    /// <inheritdoc cref="Serialize"/>
-    public static FlowState? Deserialize(string json) => FlowStateJson.Deserialize(json);
+    /// <inheritdoc cref="FlowStateJson.Deserialize"/>
+    public static FlowState Deserialize(string json, string flowId) => FlowStateJson.Deserialize(json, flowId);
 
     /// <summary>
     /// Throttles opportunistic expired-state pruning: returns <c>true</c> at most once per

@@ -28,6 +28,26 @@ public sealed class AsyncResponseWatchdogOptions
     public TimeSpan StartupDelay { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// Upper bound on the random extra delay added to the startup delay and to every interval
+    /// wait. Default: 10% of <see cref="Interval"/>.
+    /// <para>
+    /// Replicas deployed together start together, so a fixed interval keeps them scanning in
+    /// lockstep forever: every host walks the same recovery store and fires its own liveness probe
+    /// per correlation id at the same instant, turning a routine scan into a synchronized burst
+    /// against the channel. An independent offset per replica spreads that out and costs nothing —
+    /// the scan is a periodic report, so when it runs within the interval does not matter.
+    /// </para>
+    /// <para>
+    /// Set to <see cref="TimeSpan.Zero"/> for an exactly-periodic scan (single-host deployments,
+    /// or tests that assert on scan timing).
+    /// </para>
+    /// </summary>
+    public TimeSpan? IntervalJitter { get; set; }
+
+    /// <summary>The resolved jitter bound: <see cref="IntervalJitter"/> or 10% of the interval.</summary>
+    internal TimeSpan ResolvedJitter => IntervalJitter ?? TimeSpan.FromTicks(Interval.Ticks / 10);
+
+    /// <summary>
     /// Upper bound on the recovery entries one scan buffers (the scan dedupes in memory before
     /// probing liveness). When the store holds more, the scan stops enumerating at the cap,
     /// reports the buffered subset (<see cref="AsyncResponseWatchdogReport.Truncated"/> is set,
@@ -55,6 +75,10 @@ public sealed class AsyncResponseWatchdogOptions
         // failing fast where the misconfiguration is visible.
         AsyncResponseChannelOptions.EnsureTimerBacked(Interval, nameof(AsyncResponseWatchdogOptions), nameof(Interval));
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(StartupDelay, nameof(AsyncResponseWatchdogOptions), nameof(StartupDelay));
+
+        // Jitter is added to those same waits, so it shares their ceiling. Validated on the
+        // RESOLVED value: the 10% default of a near-ceiling interval is itself timer-armed.
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(ResolvedJitter, nameof(AsyncResponseWatchdogOptions), nameof(IntervalJitter));
 
         // The probe fan-out degree feeds Parallel.ForEachAsync mid-scan, which rejects values
         // below 1 with the same delayed, host-stopping failure mode.
@@ -335,6 +359,20 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
         _logger = logger;
     }
 
+    /// <summary>
+    /// A base wait plus a random offset up to <see cref="AsyncResponseWatchdogOptions.ResolvedJitter"/>,
+    /// so replicas that started together do not stay in step. Drawn per wait rather than once per
+    /// process: a single per-process offset keeps the SPACING identical, so two replicas that
+    /// happen to draw similar offsets collide on every scan thereafter instead of just the first.
+    /// </summary>
+    private TimeSpan NextWait(TimeSpan baseDelay)
+    {
+        var jitter = _options.ResolvedJitter;
+        return jitter <= TimeSpan.Zero
+            ? baseDelay
+            : baseDelay + TimeSpan.FromTicks(Random.Shared.NextInt64(jitter.Ticks + 1));
+    }
+
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -362,7 +400,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
 
         try
         {
-            await Task.Delay(_options.StartupDelay, _timeProvider, stoppingToken).ConfigureAwait(false);
+            await Task.Delay(NextWait(_options.StartupDelay), _timeProvider, stoppingToken).ConfigureAwait(false);
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -381,7 +419,7 @@ internal sealed class AsyncResponseWatchdog : BackgroundService
                     _state.Publish(new AsyncResponseWatchdogSnapshot(_timeProvider.GetUtcNow().UtcDateTime, _options.Interval, Report: null, Error: ex.Message));
                 }
 
-                await Task.Delay(_options.Interval, _timeProvider, stoppingToken).ConfigureAwait(false);
+                await Task.Delay(NextWait(_options.Interval), _timeProvider, stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)

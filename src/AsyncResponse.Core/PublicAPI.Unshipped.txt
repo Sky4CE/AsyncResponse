@@ -1,6 +1,5 @@
 #nullable enable
 AsyncResponse.AsyncResponseChannelOptions
-const AsyncResponse.AsyncResponseChannelOptions.MaxCorrelationIdLength = 400 -> int
 AsyncResponse.AsyncResponseChannelOptions.AsyncResponseChannelOptions() -> void
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.get -> System.TimeSpan?
 AsyncResponse.AsyncResponseChannelOptions.DefaultTimeout.set -> void
@@ -12,6 +11,8 @@ AsyncResponse.AsyncResponseDiagnostics
 AsyncResponse.AsyncResponseJsonSerialization
 AsyncResponse.AsyncResponseOptions
 AsyncResponse.AsyncResponseOptions.AsyncResponseOptions() -> void
+AsyncResponse.AsyncResponseOptions.MaxInboundMessageChars.get -> int?
+AsyncResponse.AsyncResponseOptions.MaxInboundMessageChars.set -> void
 AsyncResponse.AsyncResponseOptions.Watchdog.get -> AsyncResponse.AsyncResponseWatchdogOptions!
 AsyncResponse.AsyncResponseOptions.Watchdog.set -> void
 AsyncResponse.AsyncResponseRecoveryHealthCheck
@@ -50,6 +51,8 @@ AsyncResponse.AsyncResponseWatchdogOptions.Enabled.get -> bool
 AsyncResponse.AsyncResponseWatchdogOptions.Enabled.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.Interval.get -> System.TimeSpan
 AsyncResponse.AsyncResponseWatchdogOptions.Interval.set -> void
+AsyncResponse.AsyncResponseWatchdogOptions.IntervalJitter.get -> System.TimeSpan?
+AsyncResponse.AsyncResponseWatchdogOptions.IntervalJitter.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.MaxScanEntries.get -> int
 AsyncResponse.AsyncResponseWatchdogOptions.MaxScanEntries.set -> void
 AsyncResponse.AsyncResponseWatchdogOptions.ProbeConcurrency.get -> int
@@ -105,8 +108,6 @@ AsyncResponse.DurableAsyncResponseChannelOptions.IncludeRemoteStackTrace.set -> 
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.get -> int
 AsyncResponse.DurableAsyncResponseChannelOptions.MaxRemoteStackTraceLength.set -> void
 AsyncResponse.DurableFlowOptions
-const AsyncResponse.DurableFlowOptions.MaxFlowIdBytes = 1023 -> int
-const AsyncResponse.DurableFlowOptions.MaxFlowIdLength = 400 -> int
 AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.get -> bool
 AsyncResponse.DurableFlowOptions.AllowEarlyAckWorkerSubscriber.set -> void
 AsyncResponse.DurableFlowOptions.DefaultStepTimeout.get -> System.TimeSpan?
@@ -179,8 +180,11 @@ Microsoft.Extensions.DependencyInjection.AsyncResponseCoreServiceCollectionExten
 Microsoft.Extensions.DependencyInjection.AsyncResponseHealthCheckExtensions
 Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder
 Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder.Services.get -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
+const AsyncResponse.AsyncResponseChannelOptions.MaxCorrelationIdLength = 400 -> int
 const AsyncResponse.AsyncResponseDiagnostics.ActivitySourceName = "AsyncResponse" -> string!
 const AsyncResponse.AsyncResponseDiagnostics.MeterName = "AsyncResponse" -> string!
+const AsyncResponse.DurableFlowOptions.MaxFlowIdBytes = 1023 -> int
+const AsyncResponse.DurableFlowOptions.MaxFlowIdLength = 400 -> int
 override AsyncResponse.AsyncResponseRecoveryStats.Equals(object? obj) -> bool
 override AsyncResponse.AsyncResponseRecoveryStats.GetHashCode() -> int
 override AsyncResponse.AsyncResponseRecoveryStats.ToString() -> string!
@@ -201,8 +205,8 @@ static AsyncResponse.AsyncResponseRecoveryStats.operator !=(AsyncResponse.AsyncR
 static AsyncResponse.AsyncResponseRecoveryStats.operator ==(AsyncResponse.AsyncResponseRecoveryStats? left, AsyncResponse.AsyncResponseRecoveryStats? right) -> bool
 static AsyncResponse.AsyncResponseStaleRecoveryEntry.operator !=(AsyncResponse.AsyncResponseStaleRecoveryEntry? left, AsyncResponse.AsyncResponseStaleRecoveryEntry? right) -> bool
 static AsyncResponse.AsyncResponseStaleRecoveryEntry.operator ==(AsyncResponse.AsyncResponseStaleRecoveryEntry? left, AsyncResponse.AsyncResponseStaleRecoveryEntry? right) -> bool
-static AsyncResponse.AsyncResponseTypeResolution.RegisterAssembly(System.Reflection.Assembly! assembly) -> void
-static AsyncResponse.AsyncResponseTypeResolution.RegisterResolver(System.Func<string!, System.Type?>! resolver) -> void
+static AsyncResponse.AsyncResponseTypeResolution.RegisterAssembly(System.Reflection.Assembly! assembly) -> System.IDisposable!
+static AsyncResponse.AsyncResponseTypeResolution.RegisterResolver(System.Func<string!, System.Type?>! resolver) -> System.IDisposable!
 static AsyncResponse.AsyncResponseWatchdogReport.Evaluate(System.Collections.Generic.IReadOnlyCollection<AsyncResponse.RecoveryStateObservation!>! entries, System.DateTime utcNow, System.TimeSpan staleAfter) -> AsyncResponse.AsyncResponseWatchdogReport!
 static AsyncResponse.AsyncResponseWatchdogReport.operator !=(AsyncResponse.AsyncResponseWatchdogReport? left, AsyncResponse.AsyncResponseWatchdogReport? right) -> bool
 static AsyncResponse.AsyncResponseWatchdogReport.operator ==(AsyncResponse.AsyncResponseWatchdogReport? left, AsyncResponse.AsyncResponseWatchdogReport? right) -> bool

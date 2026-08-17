@@ -197,6 +197,87 @@ public class ContextPropagationAggregatorTests
         Assert.Null(Record.Exception(scope.Dispose));
         Assert.Null(Record.Exception(scope.Dispose));
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Restore is all-or-nothing. A propagator that throws part-way leaves the earlier ones'
+    // ambient state (principal, tenant, logging scope) attached with no scope in any caller's
+    // hands to take it back off — the aggregator never returned one.
+    // ---------------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(1)] // the throw lands after `first` only
+    [InlineData(2)] // after `first` + `second` — the fixed-field pair
+    [InlineData(3)] // after the List-backed composite has formed
+    public void Restore_WhenAPropagatorThrows_UnwindsTheAlreadyRestoredScopesInReverse(int restoredBeforeThrow)
+    {
+        var events = new List<string>();
+        var propagators = new List<IAsyncResponseContextPropagator>();
+        for (var i = 1; i <= restoredBeforeThrow; i++)
+            propagators.Add(new RecordingPropagator($"p{i}", $"k{i}", $"v{i}", events));
+        propagators.Add(new ThrowingRestorePropagator());
+
+        var thrown = Record.Exception(
+            () => propagation(propagators).Restore(new Dictionary<string, string> { ["present"] = "yes" }));
+
+        // The fault still reaches the caller — a half-restored context is not a dispatch that
+        // should quietly continue.
+        Assert.IsType<InvalidOperationException>(thrown);
+        Assert.Equal("restore failed", thrown.Message);
+
+        // ...and everything that did restore was unwound, newest first.
+        var expected = new List<string>();
+        for (var i = 1; i <= restoredBeforeThrow; i++)
+            expected.Add($"p{i}:restore");
+        for (var i = restoredBeforeThrow; i >= 1; i--)
+            expected.Add($"p{i}:dispose");
+
+        Assert.Equal(expected, events);
+    }
+
+    [Fact]
+    public void Restore_WhenUnwindingHitsAThrowingScope_StillDisposesTheRest()
+    {
+        // The unwind path gets the same treatment as normal disposal: one bad scope cannot strand
+        // the others, and the original restore failure — not the disposal noise — is what surfaces.
+        var events = new List<string>();
+        var thrown = Record.Exception(() => propagation(
+        [
+            new RecordingPropagator("p1", "k1", "v1", events),
+            new ThrowingScopePropagator("k2", "v2"),
+            new ThrowingRestorePropagator(),
+        ]).Restore(new Dictionary<string, string> { ["present"] = "yes" }));
+
+        Assert.IsType<InvalidOperationException>(thrown);
+        Assert.Equal("restore failed", thrown.Message);
+        Assert.Equal(["p1:restore", "p1:dispose"], events);
+    }
+
+    [Fact]
+    public void Restore_WithASingleThrowingScope_SwallowsTheDisposeFailureLikeEveryOtherCount()
+    {
+        // Disposal behavior must not depend on how many propagators happen to be registered.
+        // Returning the lone scope unwrapped meant one propagator threw out of the caller's
+        // `using` — at the worker ingress, failing (and so redelivering) a job that had already
+        // run to completion — while two or more swallowed the same fault.
+        var propagation = new AsyncResponseContextPropagation([new ThrowingScopePropagator("only", "1")]);
+
+        var scope = propagation.Restore(new Dictionary<string, string> { ["present"] = "yes" });
+
+        Assert.Null(Record.Exception(scope.Dispose));
+        Assert.Null(Record.Exception(scope.Dispose)); // and stays idempotent
+    }
+
+    private static AsyncResponseContextPropagation propagation(IEnumerable<IAsyncResponseContextPropagator> propagators)
+        => new(propagators);
+}
+
+/// <summary>A propagator that fails while restoring, to test partial-restore unwinding.</summary>
+public sealed class ThrowingRestorePropagator : IAsyncResponseContextPropagator
+{
+    public void Capture(IDictionary<string, string> carrier) { }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+        => throw new InvalidOperationException("restore failed");
 }
 
 /// <summary>Exercises the capture carrier through the public dictionary contract.</summary>

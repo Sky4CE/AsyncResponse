@@ -175,9 +175,14 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
     /// <inheritdoc />
     public async IAsyncEnumerable<RecoveryState> ScanAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        // Primaries only. Every replica holds a copy of the same keys, so scanning them too walked
+        // the keyspace once per node and produced nothing the primary had not already yielded —
+        // the dedupe below hid the duplicate entries but not the round trips. It also aimed a full
+        // keyspace scan at nodes that exist to serve reads cheaply. On a single-node deployment
+        // this changes nothing: that node is the primary.
         var connectedServers = _multiplexer.GetEndPoints()
             .Select(endPoint => _multiplexer.GetServer(endPoint))
-            .Where(server => server.IsConnected)
+            .Where(server => server.IsConnected && !server.IsReplica)
             .ToList();
 
         var seenKeys = new HashSet<string>(StringComparer.Ordinal);

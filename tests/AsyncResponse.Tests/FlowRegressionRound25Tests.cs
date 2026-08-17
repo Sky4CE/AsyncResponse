@@ -375,7 +375,7 @@ public sealed class FlowRegressionRound25Tests
             $$"""
             {"SchemaVersion":1,"Revision":0,"FlowId":"expired-wait","FlowTypeName":"{{typeof(ShortWaitFlow).FullName}}","InputTypeName":"{{typeof(R25Input).FullName}}","InputJson":"{\"Name\":\"acme\"}","Status":0,"Steps":{"slow":{"Completed":false,"PendingCorrelationId":"cid-r25-expired","AwaitDeadlineUtc":"2020-01-01T00:00:00Z","Faulted":false} } }
             """;
-        var state = FlowStateJson.Deserialize(json);
+        var state = FlowStateJson.Deserialize(json, "expired-wait");
         Assert.NotNull(state);
         Assert.True(await store.TryCreateAsync("expired-wait", state!, TimeSpan.FromDays(1)));
 

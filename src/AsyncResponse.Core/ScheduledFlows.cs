@@ -202,6 +202,17 @@ internal sealed class ScheduledFlowService(
                 "Scheduled flow '{Schedule}' occurrence {FlowId} was already started with different input — the input factory is not deterministic across replicas. The occurrence still ran exactly once.",
                 registration.Name, flowId);
         }
+        catch (DurableFlowNotDispatchedException ex)
+        {
+            // Worse than a failed start: the occurrence's ledger IS committed and Running, and only
+            // its wake-up was lost. Nothing will retry it on its own, so this is called out
+            // separately from the nothing-happened case below — the id is deterministic, so an
+            // operator (or a re-drive job) can start the same occurrence again idempotently.
+            _logger.LogError(
+                ex,
+                "Scheduled flow '{Schedule}' persisted occurrence {FlowId} but could not publish its worker job; the run exists with no wake-up and needs to be re-driven with this id.",
+                registration.Name, flowId);
+        }
         catch (Exception ex)
         {
             // A failed start (store or transport outage) is this occurrence's loss only; the loop

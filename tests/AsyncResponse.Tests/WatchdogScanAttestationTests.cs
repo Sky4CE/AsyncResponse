@@ -182,6 +182,11 @@ public class WatchdogScanAttestationTests
                 StartupDelay = startupDelay ?? TimeSpan.Zero,
                 // These tests inspect the first publication; keep the next scan outside that window.
                 Interval = interval ?? PublishTimeout + PublishTimeout,
+                // Exact periods here: these tests assert on WHEN a scan lands, and the shipped
+                // default adds a random offset (10% of the interval) so co-deployed replicas do
+                // not scan in lockstep. That anti-thundering-herd offset is covered on its own in
+                // Round27RegressionTests; it would only make these assertions flaky.
+                IntervalJitter = TimeSpan.Zero,
                 StaleAfter = TimeSpan.FromMinutes(1)
             }
         });

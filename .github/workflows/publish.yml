@@ -28,6 +28,22 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The ancestry check below needs history, not just the tagged commit.
+          fetch-depth: 0
+
+      # A tag can be pushed to ANY commit, including one that never went through a pull request.
+      # Without this, tag-creation rights alone were enough to publish unreviewed code to nuget.org
+      # under the repository's push key — around branch protection, not through it. Publishing only
+      # what `main` already contains puts the review gate back in front of the package.
+      - name: Verify the tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Commit $(git rev-parse HEAD) is not reachable from origin/main; publish only tags on main."
+            exit 1
+          fi
+          echo "Tagged commit is an ancestor of origin/main."
 
       - name: Setup .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0

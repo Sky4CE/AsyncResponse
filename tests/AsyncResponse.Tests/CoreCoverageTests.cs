@@ -270,8 +270,10 @@ public sealed class CoreCoverageTests
         AddRawFlowEntry(store, "revision-mismatch", FlowStateJson.Serialize(State("revision-mismatch")), revision: 1);
         AddRawFlowEntry(store, "flow-mismatch", FlowStateJson.Serialize(State("different-id")), revision: 0);
 
-        Assert.Null(await store.LoadAsync("malformed"));
-        Assert.Null(await store.LoadAsync("null-json"));
+        // A present-but-unreadable row throws; only genuine absence (and the two benign mismatches)
+        // reads as null, because callers ack on null. See FlowStateUnreadableException.
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("malformed"));
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("null-json"));
         Assert.Null(await store.LoadAsync("revision-mismatch"));
         Assert.Null(await store.LoadAsync("flow-mismatch"));
         Assert.Null(await store.LoadAsync("missing"));
@@ -316,7 +318,14 @@ public sealed class CoreCoverageTests
     [Fact]
     public void FlowStateJson_HandlesMalformedNullAndEquivalentDocuments()
     {
-        Assert.Null(FlowStateJson.Deserialize("{not-json"));
+        // A row that exists and cannot be parsed is not an absent row: it throws rather than
+        // returning null, so nothing downstream can mistake it for a deleted flow and ack.
+        var malformed = Assert.Throws<FlowStateUnreadableException>(() => FlowStateJson.Deserialize("{not-json", "flow-1"));
+        Assert.Equal("flow-1", malformed.FlowId);
+        Assert.Contains("malformed", malformed.Reason, StringComparison.Ordinal);
+
+        Assert.Throws<FlowStateUnreadableException>(() => FlowStateJson.Deserialize("null", "flow-1"));
+
         Assert.False(FlowStateJson.JsonEquivalent(null, "{}"));
         Assert.True(FlowStateJson.JsonEquivalent("{\"a\":1,\"b\":2}", "{\"b\":2,\"a\":1}"));
         Assert.False(FlowStateJson.JsonEquivalent("{not-json", "{}"));

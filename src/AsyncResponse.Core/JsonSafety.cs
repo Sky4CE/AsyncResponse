@@ -8,13 +8,23 @@ namespace AsyncResponse;
 /// Defensive JSON helpers for broker ingress payloads. All overloads resolve contract metadata
 /// through <see cref="AsyncResponseJson"/> (trim/AOT-safe) instead of the reflection-based
 /// serializer entry points; property matching stays case-insensitive as it always was here.
+/// <para>
+/// <b>No body in any message these throw.</b> These run at the ingress, where every inbound
+/// response and worker envelope passes through, and the exceptions they raise are logged
+/// (<c>AsyncResponseIngress</c>) and, on the response path, republished through
+/// <c>SetException</c> to the waiter. A payload prefix in the message therefore reached both the
+/// application log and a remote consumer, which is exactly what "the library never logs a message
+/// body" (docs/security.md) rules out — arguments, tenant/auth baggage, PII and proxy HTML all
+/// travel in that first 200 characters. What is left is size and JSON position, which locate the
+/// fault without disclosing it.
+/// </para>
 /// </summary>
 internal static class JsonSafety
 {
     /// <summary>
     /// Deserializes with guards for the classic broker-ingress garbage: empty bodies and HTML
-    /// error pages. Throws <see cref="InvalidDataException"/> with the offending prefix so the
-    /// failure is diagnosable from logs.
+    /// error pages. Throws <see cref="InvalidDataException"/> describing the failure's size and
+    /// position — never its content — so the failure is diagnosable from logs.
     /// </summary>
     public static T? SafeDeserialize<T>(string json, JsonSerializerOptions? options = null)
         => SafeDeserialize(json, AsyncResponseJson.GetTypeInfo<T>(WithResolver(options)));
@@ -30,8 +40,7 @@ internal static class JsonSafety
         }
         catch (JsonException jsonException)
         {
-            // Re-throw with the payload prefix in the message so the failure is diagnosable.
-            throw new InvalidDataException($"Failed to parse JSON payload: {json[..Math.Min(200, json.Length)]}…", jsonException);
+            throw ParseFailure(json, jsonException);
         }
     }
 
@@ -49,10 +58,28 @@ internal static class JsonSafety
         }
         catch (JsonException jsonException)
         {
-            // Re-throw with the payload prefix in the message so the failure is diagnosable.
-            throw new InvalidDataException($"Failed to parse JSON payload: {json[..Math.Min(200, json.Length)]}…", jsonException);
+            throw ParseFailure(json, jsonException);
         }
     }
+
+    /// <summary>
+    /// Builds the body-free parse failure: size plus the JSON coordinates the reader stopped at.
+    /// <para>
+    /// The <see cref="JsonException"/> rides along as the inner exception because it carries the
+    /// structural detail (expected token, contract path, line/byte position) that makes a parse
+    /// failure actionable, and its own message is bounded metadata — at worst the single offending
+    /// character, never a span of the body. That is the line this helper draws: enough to find the
+    /// fault, never enough to read the payload.
+    /// </para>
+    /// </summary>
+    private static InvalidDataException ParseFailure(string json, JsonException jsonException)
+        => new(
+            $"Failed to parse JSON payload ({json.Length} UTF-16 code units) at line {Describe(jsonException.LineNumber)}, " +
+            $"byte position {Describe(jsonException.BytePositionInLine)}.",
+            jsonException);
+
+    private static string Describe(long? position)
+        => position?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown";
 
     /// <summary>
     /// Defaults to the library's case-insensitive chain options. Caller-supplied options are
@@ -90,8 +117,12 @@ internal static class JsonSafety
 
         var trimmed = json.AsSpan().TrimStart();
 
-        // Guard against HTML error pages.
+        // Guard against HTML error pages. Size only, never the markup: the classic source of one
+        // is a reverse proxy or auth gateway answering in place of the service, and its body is
+        // the last thing to copy into a log — it carries session banners, internal hostnames and
+        // whatever the gateway decided to echo back. The '<' that triggered this is already the
+        // whole diagnosis.
         if (trimmed[0] == '<')
-            throw new InvalidDataException($"Received HTML when JSON was expected: {json[..Math.Min(200, json.Length)]}…");
+            throw new InvalidDataException($"Received HTML when JSON was expected ({json.Length} UTF-16 code units).");
     }
 }

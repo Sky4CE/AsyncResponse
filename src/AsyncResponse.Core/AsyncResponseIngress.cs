@@ -13,8 +13,34 @@ internal sealed class AsyncResponseIngress(
     WorkerJobExecutor _workerJobExecutor,
     AsyncResponseContextPropagation _propagation,
     ILogger<AsyncResponseIngress> _logger,
-    TimeProvider? _timeProvider = null) : IAsyncResponseIngress
+    TimeProvider? _timeProvider = null,
+    IAsyncResponseCallbackAuthorizer? _authorizer = null,
+    Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>? _options = null) : IAsyncResponseIngress
 {
+    /// <summary>
+    /// Enforces <see cref="AsyncResponseOptions.MaxInboundMessageChars"/>. Returns <c>true</c> when
+    /// the message was rejected, in which case the caller returns cleanly and the transport acks —
+    /// see the option's remarks for why an oversized message is dropped rather than redelivered.
+    /// Only the LENGTH is logged, never a prefix: an oversized body is still a body.
+    /// </summary>
+    private bool RejectIfOversized(string messageJson, string route, Activity? activity)
+    {
+        if (_options?.Value.MaxInboundMessageChars is not { } limit || messageJson.Length <= limit)
+            return false;
+
+        _logger.LogError(
+            "Ingress received an oversized {Route} message and acknowledged it without dispatch: {PayloadLength} UTF-16 code units exceeds the configured {Limit}.",
+            route,
+            messageJson.Length,
+            limit);
+        AsyncResponseDiagnostics.SetError(
+            activity,
+            "oversized_message",
+            $"Inbound {route} message exceeds the configured size budget of {limit} UTF-16 code units.");
+        AsyncResponseDiagnostics.RecordOversizedInboundMessage(route);
+        return true;
+    }
+
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleResponseMessageAsync(string messageJson, string? correlationId)
     {
@@ -34,6 +60,9 @@ internal sealed class AsyncResponseIngress(
         // loud — every occurrence is a producer-side contract violation. The ACTIVITY carries the
         // routing context (trace id, the id as extracted); nothing about the body is logged, not
         // even a hash of it — see the note on payload metadata below.
+        if (RejectIfOversized(messageJson, "response", activity))
+            return;
+
         if (CorrelationIdGuard.IsUnroutable(correlationId, out var unroutable))
         {
             _logger.LogError(
@@ -109,6 +138,10 @@ internal sealed class AsyncResponseIngress(
             "asyncresponse.ingress.worker",
             ActivityKind.Consumer);
 
+        // Before the parse, so an oversized envelope never becomes a DOM.
+        if (RejectIfOversized(messageJson, "worker", activity))
+            return;
+
         try
         {
             // The envelope is the WORST thing in the library to log whole: it carries the job's
@@ -127,6 +160,18 @@ internal sealed class AsyncResponseIngress(
                 job.CorrelationId,
                 job.Call?.ServiceInterfaceFullName,
                 job.Call?.MethodName);
+
+            // Authorize the target while the envelope is still inert data — BEFORE its propagated
+            // context is restored. Both halves of this envelope are attacker-controlled to anyone
+            // who can write to the worker transport: Call names the method to run, Context names
+            // the ambient identity to run it under. Restoring Context first handed a custom
+            // authorizer that consults ambient tenant/principal state the message's own answer to
+            // the question it was about to be asked. ReflectionExtensions.InvokeAsync re-checks
+            // downstream; this is the ordering, not the only gate.
+            ReflectionExtensions.ThrowIfNotAuthorized(
+                _authorizer,
+                job.Call?.ServiceInterfaceFullName ?? string.Empty,
+                job.Call?.MethodName ?? string.Empty);
 
             // The job crossed a serialization boundary (broker → ingress): restore any ambient
             // context its propagators captured before executing it.

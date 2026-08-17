@@ -39,6 +39,9 @@ AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! mess
 AsyncResponse.DurableFlowFailedException.DurableFlowFailedException(string! message, System.Exception! innerException) -> void
 AsyncResponse.DurableFlowIdConflictException
 AsyncResponse.DurableFlowIdConflictException.DurableFlowIdConflictException(string! message) -> void
+AsyncResponse.DurableFlowNotDispatchedException
+AsyncResponse.DurableFlowNotDispatchedException.DurableFlowNotDispatchedException(string! flowId, System.Exception? innerException = null) -> void
+AsyncResponse.DurableFlowNotDispatchedException.FlowId.get -> string!
 AsyncResponse.DurableFlowRunEvent
 AsyncResponse.DurableFlowRunEvent.Deconstruct(out string! FlowId, out AsyncResponse.FlowRunStatus Status, out string? Message) -> void
 AsyncResponse.DurableFlowRunEvent.DurableFlowRunEvent() -> void
@@ -110,6 +113,10 @@ AsyncResponse.FlowState.UpdatedAtUtc.set -> void
 AsyncResponse.FlowState.Values.get -> System.Collections.Generic.Dictionary<string!, string!>?
 AsyncResponse.FlowState.Values.set -> void
 AsyncResponse.FlowStateSchema
+AsyncResponse.FlowStateUnreadableException
+AsyncResponse.FlowStateUnreadableException.FlowId.get -> string!
+AsyncResponse.FlowStateUnreadableException.FlowStateUnreadableException(string! flowId, string! reason, System.Exception? innerException = null) -> void
+AsyncResponse.FlowStateUnreadableException.Reason.get -> string!
 AsyncResponse.FlowStepState
 AsyncResponse.FlowStepState.AwaitDeadlineUtc.get -> System.DateTime?
 AsyncResponse.FlowStepState.AwaitDeadlineUtc.set -> void

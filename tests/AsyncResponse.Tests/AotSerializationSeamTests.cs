@@ -49,7 +49,7 @@ public class AotSerializationSeamTests
 
         Assert.Equal(reflectionBaseline, FlowStateJson.Serialize(state));
 
-        var roundTripped = FlowStateJson.Deserialize(reflectionBaseline);
+        var roundTripped = FlowStateJson.Deserialize(reflectionBaseline, state.FlowId!);
         Assert.NotNull(roundTripped);
         Assert.Equal(state.FlowTypeName, roundTripped!.FlowTypeName);
         Assert.Equal("cid-42", roundTripped.Steps!["remote-work"].PendingCorrelationId);

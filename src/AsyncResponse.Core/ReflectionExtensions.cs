@@ -79,13 +79,14 @@ internal static class ReflectionExtensions
             // must be gated like every other target. The AuthorizeCallbacks allowlist includes it by
             // default (see AsyncResponseCallbackAllowList.AllowDurableFlowExecutor); custom
             // authorizers must allow it explicitly when durable flows are enabled.
-            if (provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
-                && !authorizer.IsAllowed(dto.ServiceInterfaceFullName, dto.MethodName))
-            {
-                throw new CallbackTargetUnresolvableException(
-                    $"Callback target '{dto.ServiceInterfaceFullName}.{dto.MethodName}' is not authorized by the registered " +
-                    $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
-            }
+            //
+            // Callers that restore propagated context around the invocation (the worker ingress,
+            // the lost-subscriber dispatcher) authorize BEFORE they restore it and reach here
+            // already cleared; this stays as the backstop for every other path.
+            ThrowIfNotAuthorized(
+                provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) as IAsyncResponseCallbackAuthorizer,
+                dto.ServiceInterfaceFullName,
+                dto.MethodName);
 
             // 2) Load the service type by full name
             var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
@@ -118,6 +119,33 @@ internal static class ReflectionExtensions
         {
             // Match async-method exception behavior without paying for a state machine on the hot path.
             return Task.FromException(ex);
+        }
+    }
+
+    /// <summary>
+    /// Applies the registered callback authorizer to a persisted <c>(service, method)</c> pair.
+    /// A <c>null</c> authorizer means none is registered, which allows everything — the opt-in
+    /// default (see <c>AsyncResponseCallbackAuthorizationExtensions</c>).
+    /// <para>
+    /// Exposed separately from <see cref="InvokeAsync"/> so callers can run it at the point the
+    /// descriptor is still just untrusted strings, before anything the descriptor's own message
+    /// carries has been given effect. The worker envelope and the recovery row both ship a
+    /// propagated-context carrier that gets pushed onto ambient state (principal, tenant, logging
+    /// scope) for the dispatch; authorizing after that restore let a message choose the very
+    /// context an authorizer would consult to judge it. The check is string-only, so running it
+    /// first also costs nothing and keeps an unauthorized name away from the assembly scan.
+    /// </para>
+    /// </summary>
+    internal static void ThrowIfNotAuthorized(
+        IAsyncResponseCallbackAuthorizer? authorizer,
+        string serviceInterfaceFullName,
+        string methodName)
+    {
+        if (authorizer is not null && !authorizer.IsAllowed(serviceInterfaceFullName, methodName))
+        {
+            throw new CallbackTargetUnresolvableException(
+                $"Callback target '{serviceInterfaceFullName}.{methodName}' is not authorized by the registered " +
+                $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
         }
     }
 

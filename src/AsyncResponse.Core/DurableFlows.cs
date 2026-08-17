@@ -84,10 +84,41 @@ internal sealed class DurableFlowService : IDurableFlows
             _logger.LogInformation("Durable flow {FlowId} already exists; re-enqueueing instead of creating a duplicate.", flowId);
         }
 
+        // The ledger is committed; from here the run EXISTS and is Running. If the wake-up never
+        // gets published, nothing in the system will ever execute it — IFlowStateStore has no
+        // enumeration, so no reconciler can go find it either. Retry the publish through the same
+        // ladder the ingress uses, and if it still fails, surface the flow id rather than the bare
+        // transport fault: with the id, a caller can re-drive the start idempotently; without it
+        // (the generated-id case) the run is simply lost.
         var id = flowId;
-        await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(
-            executor => executor.ExecuteAsync(id),
-            cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await AsyncResponseRetry.ExecuteAsync(
+                async token =>
+                {
+                    await _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(
+                        executor => executor.ExecuteAsync(id),
+                        token).ConfigureAwait(false);
+                    return true;
+                },
+                // Cancellation is not a transport fault and must not burn the ladder; it still
+                // lands in the catch below, because a canceled start leaves the same orphan.
+                isTransient: static ex => ex is not OperationCanceledException,
+                maxAttempts: 4,
+                baseDelay: TimeSpan.FromMilliseconds(250),
+                maxDelay: TimeSpan.FromSeconds(2),
+                cancellationToken,
+                _timeProvider).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Durable flow {FlowId} was persisted but its worker job could not be published; the run exists with no wake-up. Retry the start with this id to re-enqueue it.",
+                id);
+            throw new DurableFlowNotDispatchedException(id, ex);
+        }
+
         return flowId;
     }
 

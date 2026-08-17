@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using System.Collections;
 
 namespace AsyncResponse;
@@ -10,10 +11,16 @@ namespace AsyncResponse;
 internal sealed class AsyncResponseContextPropagation
 {
     private readonly IReadOnlyList<IAsyncResponseContextPropagator> _propagators;
+    private readonly ILogger? _logger;
 
     /// <summary>Runs the AsyncResponseContextPropagation operation.</summary>
-    public AsyncResponseContextPropagation(IEnumerable<IAsyncResponseContextPropagator> propagators)
-        => _propagators = propagators as IReadOnlyList<IAsyncResponseContextPropagator> ?? propagators.ToArray();
+    public AsyncResponseContextPropagation(
+        IEnumerable<IAsyncResponseContextPropagator> propagators,
+        ILogger<AsyncResponseContextPropagation>? logger = null)
+    {
+        _propagators = propagators as IReadOnlyList<IAsyncResponseContextPropagator> ?? propagators.ToArray();
+        _logger = logger;
+    }
 
     /// <summary>
     /// Captures the current ambient context from every propagator into a serializable carrier.
@@ -53,8 +60,8 @@ internal sealed class AsyncResponseContextPropagation
             return NullScope.Instance;
 
         // Collect the real scopes without allocating until we genuinely need a composite. The 0/1/2
-        // active-scope cases — by far the most common — return either the shared no-op, the single
-        // scope directly, or a fixed two-field CompositeScope2. Only 3+ active propagators fall back
+        // active-scope cases — by far the most common — return either the shared no-op, a single
+        // guarded scope, or a fixed two-field CompositeScope2. Only 3+ active propagators fall back
         // to the List-backed CompositeScope. Indexing the list avoids the foreach enumerator alloc.
         IDisposable? first = null;
         IDisposable? second = null;
@@ -62,7 +69,22 @@ internal sealed class AsyncResponseContextPropagation
 
         for (var i = 0; i < count; i++)
         {
-            var scope = propagators[i].Restore(carrier);
+            IDisposable? scope;
+            try
+            {
+                scope = propagators[i].Restore(carrier);
+            }
+            catch
+            {
+                // Propagator i threw part-way through the set. Everything 0..i-1 already mutated
+                // ambient state (principal, tenant, logging scope) and only its scope can put that
+                // back — and no caller can dispose what was never returned. Unwind here, in reverse,
+                // then let the fault out: an aborted dispatch must not leave a half-restored
+                // identity attached to the thread for whatever the pool runs next.
+                DisposeInReverse(first, second, more);
+                throw;
+            }
+
             if (scope is null || ReferenceEquals(scope, NullScope.Instance))
                 continue;
 
@@ -77,12 +99,53 @@ internal sealed class AsyncResponseContextPropagation
         }
 
         if (more is not null)
-            return new CompositeScope(more);
+            return new CompositeScope(more, _logger);
 
         if (second is not null)
-            return new CompositeScope2(first!, second);
+            return new CompositeScope2(first!, second, _logger);
 
-        return first ?? NullScope.Instance;
+        // Wrapped even though it is a single scope: returning it raw made disposal behavior depend
+        // on how many propagators happen to be registered — with one, a throwing Dispose escaped
+        // the caller's `using` and failed a dispatch whose work had already completed (at the
+        // worker ingress, that redelivers an executed job); with two or more it vanished silently.
+        // One rule for every count: cleanup never fails the dispatch, and never fails invisibly.
+        return first is null ? NullScope.Instance : new GuardedScope(first, _logger);
+    }
+
+    private void DisposeInReverse(IDisposable? first, IDisposable? second, List<IDisposable>? more)
+    {
+        if (more is not null)
+        {
+            for (var i = more.Count - 1; i >= 0; i--)
+                SafeDispose(more[i], _logger);
+
+            return;
+        }
+
+        if (second is not null)
+            SafeDispose(second, _logger);
+        if (first is not null)
+            SafeDispose(first, _logger);
+    }
+
+    /// <summary>
+    /// Disposes one scope without letting its failure mask the others or the dispatch. Logged
+    /// rather than swallowed: a propagator that cannot detach its ambient state is leaking it into
+    /// whatever the thread runs next, which is precisely the kind of fault that has to be visible.
+    /// </summary>
+    private static void SafeDispose(IDisposable scope, ILogger? logger)
+    {
+        try
+        {
+            scope.Dispose();
+        }
+        catch (Exception ex)
+        {
+            logger?.LogError(
+                ex,
+                "An AsyncResponse context propagator scope ({ScopeType}) failed to dispose; ambient context it restored may still be attached to this thread.",
+                scope.GetType().FullName);
+        }
     }
 
     private sealed class NullScope : IDisposable
@@ -93,11 +156,10 @@ internal sealed class AsyncResponseContextPropagation
     }
 
     /// <summary>
-    /// Disposes exactly two scopes in reverse order, mirroring nested <c>using</c> semantics without
-    /// the <see cref="List{T}"/> + general <see cref="CompositeScope"/> allocation that the 1–2
-    /// propagator case (the overwhelmingly common one) would otherwise pay.
+    /// Guards a single propagator scope so its disposal obeys the same rule as the multi-scope
+    /// cases: a failure is reported, never thrown at the dispatch that was already finishing.
     /// </summary>
-    private sealed class CompositeScope2(IDisposable _first, IDisposable _second) : IDisposable
+    private sealed class GuardedScope(IDisposable _scope, ILogger? _logger) : IDisposable
     {
         private int _disposed;
 
@@ -107,15 +169,33 @@ internal sealed class AsyncResponseContextPropagation
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
-            try { _second.Dispose(); }
-            catch { /* a misbehaving propagator scope must not mask the other */ }
-
-            try { _first.Dispose(); }
-            catch { /* swallow: best-effort restore of the remaining scope */ }
+            SafeDispose(_scope, _logger);
         }
     }
 
-    private sealed class CompositeScope(List<IDisposable> _scopes) : IDisposable
+    /// <summary>
+    /// Disposes exactly two scopes in reverse order, mirroring nested <c>using</c> semantics without
+    /// the <see cref="List{T}"/> + general <see cref="CompositeScope"/> allocation that the 1–2
+    /// propagator case (the overwhelmingly common one) would otherwise pay.
+    /// </summary>
+    private sealed class CompositeScope2(IDisposable _first, IDisposable _second, ILogger? _logger) : IDisposable
+    {
+        private int _disposed;
+
+        /// <summary>Releases resources held by this instance.</summary>
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            // A misbehaving propagator scope must not mask the other — but it must not vanish
+            // either, so SafeDispose logs what it absorbs.
+            SafeDispose(_second, _logger);
+            SafeDispose(_first, _logger);
+        }
+    }
+
+    private sealed class CompositeScope(List<IDisposable> _scopes, ILogger? _logger) : IDisposable
     {
         private int _disposed;
 
@@ -127,10 +207,7 @@ internal sealed class AsyncResponseContextPropagation
 
             // Dispose in reverse order, mirroring nested using semantics.
             for (int i = _scopes.Count - 1; i >= 0; i--)
-            {
-                try { _scopes[i].Dispose(); }
-                catch { /* a misbehaving propagator scope must not mask the others */ }
-            }
+                SafeDispose(_scopes[i], _logger);
         }
     }
 

@@ -68,3 +68,37 @@ public sealed class DurableFlowIdConflictException : InvalidOperationException
     {
     }
 }
+
+/// <summary>
+/// Thrown by <c>IDurableFlows.StartAsync</c> when the flow's ledger was committed but its worker
+/// job could not be published — the run exists, in <c>Running</c>, with nothing scheduled to
+/// execute it.
+/// <para>
+/// The distinct type exists to carry <see cref="FlowId"/> out of the failure. A start called
+/// without an explicit id generates one, and a plain throw discarded it: the caller was left
+/// knowing a flow might exist but not which, and the store interface has no enumeration to go
+/// looking. With the id in hand, recovery is a re-call of <c>StartAsync</c> with that same id —
+/// idempotent by contract, since an identical start re-enqueues the existing run rather than
+/// creating a second one.
+/// </para>
+/// <para>
+/// Publication is retried before this surfaces, so it means the transport stayed unavailable, not
+/// that it blinked. The ambiguous case is deliberately included: a publish that may or may not
+/// have landed also throws here, because a duplicate delivery of a durable flow is harmless
+/// (completed steps skip via their checkpoints) while a dropped one is not.
+/// </para>
+/// </summary>
+public sealed class DurableFlowNotDispatchedException : InvalidOperationException
+{
+    /// <summary>Creates the failure for <paramref name="flowId"/>.</summary>
+    public DurableFlowNotDispatchedException(string flowId, Exception? innerException = null)
+        : base(
+            $"Durable flow '{flowId}' was persisted but its worker job could not be published, so nothing " +
+            $"is scheduled to execute it. Retry the start with this same flow id — an identical start " +
+            $"re-enqueues the existing run instead of creating a duplicate.",
+            innerException)
+        => FlowId = flowId;
+
+    /// <summary>The id of the persisted-but-undispatched run, so a caller can re-drive it.</summary>
+    public string FlowId { get; }
+}

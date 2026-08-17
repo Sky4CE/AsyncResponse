@@ -198,10 +198,19 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _lost = new();
     private readonly Task _renewal;
+    private readonly Task _deadline;
     // DateTime ticks so the renewal loop's writes and the execution path's reads tear-free on
     // 32-bit runtimes and order via Volatile.
     private long _validUntilUtcTicks;
     private int _disposed;
+
+    /// <summary>
+    /// Longest single wait the deadline watcher arms. ExecutionLeaseDuration is validated as a
+    /// PERSISTENCE bound, not a timer bound (see <see cref="FlowStateConcurrency.ValidateOptions"/>) —
+    /// a 60-day lease is a legal configuration — so the watcher sleeps in chunks and re-reads the
+    /// deadline rather than handing an out-of-range delay to a BCL timer.
+    /// </summary>
+    private static readonly TimeSpan MaxDeadlineChunk = TimeSpan.FromDays(1);
 
     public FlowExecutionLease(
         IFlowStateStore store,
@@ -219,6 +228,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         Volatile.Write(ref _validUntilUtcTicks, _timeProvider.GetUtcNow().UtcDateTime.Add(options.ExecutionLeaseDuration).Ticks);
         _renewal = RenewLoopAsync();
+        _deadline = DeadlineLoopAsync();
     }
 
     public CancellationToken LostToken => _lost.Token;
@@ -349,6 +359,49 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Cancels <see cref="LostToken"/> when the lease deadline passes, on a clock of its own.
+    /// <para>
+    /// <see cref="RenewLoopAsync"/> cannot be trusted to do this: it only learns the lease is gone
+    /// by completing a store round-trip, so a renewal call that hangs — a wedged connection, a
+    /// database that accepts the request and never answers — leaves the token live indefinitely
+    /// while the server-side lease expires and another replica takes the flow over. Checkpoints
+    /// stay fenced regardless (<see cref="ThrowIfLost"/> and the lease-fenced CAS both check the
+    /// clock), but anything watching the TOKEN — a step body, a linked operation — saw nothing.
+    /// This loop closes that gap: it re-reads the deadline each pass, so a successful renewal
+    /// simply pushes it out, and it fires whether or not the renewal path is responsive.
+    /// </para>
+    /// </summary>
+    private async Task DeadlineLoopAsync()
+    {
+        try
+        {
+            while (!_stop.IsCancellationRequested && !_lost.IsCancellationRequested)
+            {
+                var remaining = new DateTime(Volatile.Read(ref _validUntilUtcTicks), DateTimeKind.Utc)
+                    - _timeProvider.GetUtcNow().UtcDateTime;
+
+                if (remaining <= TimeSpan.Zero)
+                {
+                    _logger.LogWarning(
+                        "Durable flow {FlowId} execution lease reached its deadline without a successful renewal; abandoning this execution.",
+                        _flowId);
+                    MarkLost();
+                    return;
+                }
+
+                await Task.Delay(
+                    remaining < MaxDeadlineChunk ? remaining : MaxDeadlineChunk,
+                    _timeProvider,
+                    _stop.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+            // Normal completion: the execution finished and disposal stopped the watcher.
+        }
+    }
+
     private void MarkLost()
     {
         try
@@ -368,6 +421,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
 
         _stop.Cancel();
         await _renewal.ConfigureAwait(false);
+        await _deadline.ConfigureAwait(false);
 
         try
         {

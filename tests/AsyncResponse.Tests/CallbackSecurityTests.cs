@@ -1,10 +1,45 @@
 using System.Diagnostics.Metrics;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace AsyncResponse.Tests;
+
+/// <summary>
+/// Records whether (and with what) its <see cref="Restore"/> ran, so a test can prove an
+/// unauthorized message never got to choose the ambient context it would be judged under.
+/// </summary>
+public sealed class RestoreRecordingPropagator : IAsyncResponseContextPropagator
+{
+    public const string Key = "authz-order-probe";
+
+    private static int _restoreCount;
+
+    public static int RestoreCount => Volatile.Read(ref _restoreCount);
+    public static string? LastRestoredValue { get; private set; }
+
+    public static void Reset()
+    {
+        Volatile.Write(ref _restoreCount, 0);
+        LastRestoredValue = null;
+    }
+
+    public void Capture(IDictionary<string, string> carrier) { }
+
+    public IDisposable Restore(IReadOnlyDictionary<string, string> carrier)
+    {
+        Interlocked.Increment(ref _restoreCount);
+        LastRestoredValue = carrier.TryGetValue(Key, out var value) ? value : null;
+        return new NoOpScope();
+    }
+
+    private sealed class NoOpScope : IDisposable
+    {
+        public void Dispose() { }
+    }
+}
 
 /// <summary>
 /// Opt-in callback authorization (review item 1): when an <see cref="IAsyncResponseCallbackAuthorizer"/>
@@ -102,6 +137,86 @@ public class CallbackAuthorizationTests
         await provider.InvokeAsync(TargetCall());
 
         Assert.Equal("hello", Assert.Single(target.Calls));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Ordering: authorization decides on the RAW descriptor, before anything the same message
+    // carries has been given effect. A worker envelope supplies both the target to invoke and
+    // the ambient context to invoke it under; restoring the context first let a rejected message
+    // still choose the tenant/principal an authorizer would consult to judge it.
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task UnauthorizedWorkerJob_IsRejectedBeforeItsContextIsRestored()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ICallbackTarget>(new CallbackTarget());
+        services
+            .AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithContextPropagator<RestoreRecordingPropagator>()
+            .AuthorizeCallbacks(a => a.Allow("Some.Other.Service"));
+        using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = JsonSerializer.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(ICallbackTarget).FullName!,
+                MethodName = nameof(ICallbackTarget.RunAsync),
+                Params = [CallbackParam.ForValue("hello")],
+            },
+            CorrelationId = "cid",
+            // The forged half: the identity the rejected message would like to be judged under.
+            Context = new Dictionary<string, string> { [RestoreRecordingPropagator.Key] = "attacker-tenant" },
+        });
+
+        RestoreRecordingPropagator.Reset();
+
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => ingress.HandleWorkerMessageAsync(json));
+
+        Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(0, RestoreRecordingPropagator.RestoreCount);
+    }
+
+    [Fact]
+    public async Task AuthorizedWorkerJob_StillRestoresItsContextBeforeExecuting()
+    {
+        // The other half of the contract: reordering the check must not cost an allowed job its
+        // ambient context.
+        var target = new CallbackTarget();
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<ICallbackTarget>(target);
+        services
+            .AddAsyncResponse()
+            .WithInMemoryChannel()
+            .WithContextPropagator<RestoreRecordingPropagator>()
+            .AuthorizeCallbacks(a => a.Allow<ICallbackTarget>());
+        using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = JsonSerializer.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(ICallbackTarget).FullName!,
+                MethodName = nameof(ICallbackTarget.RunAsync),
+                Params = [CallbackParam.ForValue("hello")],
+            },
+            CorrelationId = "cid",
+            Context = new Dictionary<string, string> { [RestoreRecordingPropagator.Key] = "acme" },
+        });
+
+        RestoreRecordingPropagator.Reset();
+
+        await ingress.HandleWorkerMessageAsync(json);
+
+        Assert.Equal("hello", Assert.Single(target.Calls));
+        Assert.Equal(1, RestoreRecordingPropagator.RestoreCount);
+        Assert.Equal("acme", RestoreRecordingPropagator.LastRestoredValue);
     }
 
     [Fact]
