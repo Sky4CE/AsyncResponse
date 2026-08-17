@@ -313,7 +313,9 @@ internal sealed class SqsResponseIngressSubscriber : SqsSubscriberService
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(SqsTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = SqsCorrelationIdExtractor.Extract(delivery, delivery.Body, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Body)
+            ? SqsCorrelationIdExtractor.Extract(delivery, delivery.Body, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Body, correlationId);
     }
 }

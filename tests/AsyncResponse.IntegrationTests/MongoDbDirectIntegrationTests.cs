@@ -64,9 +64,12 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
             },
             TimeSpan.FromSeconds(30),
             CancellationToken.None);
-        Assert.Empty(await recovery.GetAllAsync("future-state"));
+        // Every stored registration for this id is unreadable, so an empty list would be a lie:
+        // it reads as "no callback was ever armed", which the dispatcher answers by ACKing the
+        // terminal response. Failing the delivery is what keeps the response recoverable.
+        await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => recovery.GetAllAsync("future-state"));
 
-        // An unreadable persisted document is skipped, not thrown.
+        // An unreadable persisted document fails the read rather than masquerading as absence.
         await database.GetCollection<BsonDocument>(options.RecoveryStateCollection).InsertOneAsync(new BsonDocument
         {
             ["_id"] = $"bad-state:{Guid.NewGuid():N}",
@@ -76,7 +79,7 @@ public sealed class MongoDbDirectIntegrationTests(DataBatchFixture fixture) : In
             ["expires_at"] = DateTime.UtcNow.AddSeconds(30),
             ["registered_at"] = DateTime.UtcNow
         });
-        Assert.Empty(await recovery.GetAllAsync("bad-state"));
+        await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => recovery.GetAllAsync("bad-state"));
 
         Assert.False(await recovery.TryDeleteAsync(correlationId, Guid.NewGuid()));
         Assert.True(await recovery.TryDeleteAsync(correlationId, state.RegistrationId));

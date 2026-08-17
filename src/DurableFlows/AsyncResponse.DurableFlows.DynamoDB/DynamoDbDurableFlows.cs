@@ -133,18 +133,28 @@ public sealed class DynamoDbFlowStateStore : IFlowStateStore, IDisposable
             ConsistentRead = true
         }, cancellationToken).ConfigureAwait(false);
 
+        // No item: the run is genuinely gone. This is the ONLY shape that may read as absence,
+        // because callers acknowledge the wake-up on null.
         if (response.Item is null || response.Item.Count == 0)
             return null;
-        if (!response.Item.TryGetValue(_options.TimeToLiveAttributeName, out var expires) ||
-            !long.TryParse(expires.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAt) ||
-            expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+
+        // From here the item EXISTS. A required attribute that is missing or unparseable means this
+        // build cannot interpret a ledger that is still physically there — categorically different
+        // from absence, and reporting it as absence acknowledged a live run's only wake-up. Only a
+        // well-formed, elapsed TTL is real expiry.
+        if (!response.Item.TryGetValue(_options.TimeToLiveAttributeName, out var expires)
+            || !long.TryParse(expires.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresAt))
+            throw new FlowStateUnreadableException(flowId, $"its '{_options.TimeToLiveAttributeName}' attribute is missing or not an epoch-seconds number");
+
+        if (expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds())
             return null;
+
         if (!response.Item.TryGetValue(StateJsonAttribute, out var json) || string.IsNullOrEmpty(json.S))
-            return null;
+            throw new FlowStateUnreadableException(flowId, $"its '{StateJsonAttribute}' attribute is missing or empty");
 
         if (!response.Item.TryGetValue(RevisionAttribute, out var revision)
             || !long.TryParse(revision.N, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-            return null;
+            throw new FlowStateUnreadableException(flowId, $"its '{RevisionAttribute}' attribute is missing or not a number");
 
         return DurableFlowStoreShared.ReadState(flowId, json.S, value);
     }

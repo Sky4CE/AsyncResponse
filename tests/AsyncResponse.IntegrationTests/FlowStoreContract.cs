@@ -312,6 +312,17 @@ internal static class FlowStoreContract
                 $"schema version is {FlowStateSchema.Current + 1}",
                 unreadable.Reason,
                 StringComparison.Ordinal);
+
+            // The same rule one level down: a row whose JSON itself will not parse. The schema gate
+            // above only fires on a document this build can read far enough to find a version in,
+            // so a corrupt row takes a different path through every store and needs its own case.
+            var corruptFlowId = $"flow-corrupt-raw-{Guid.NewGuid():N}";
+            await seedRawStateAsync(corruptFlowId, "{not-json");
+
+            var corrupt = await Assert.ThrowsAsync<FlowStateUnreadableException>(
+                () => store.LoadAsync(corruptFlowId));
+            Assert.Equal(corruptFlowId, corrupt.FlowId);
+            Assert.Contains("malformed", corrupt.Reason, StringComparison.Ordinal);
         }
     }
 

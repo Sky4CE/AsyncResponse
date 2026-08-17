@@ -293,7 +293,9 @@ internal sealed class NatsResponseIngressSubscriber : NatsSubscriberService
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = NatsCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Payload)
+            ? NatsCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId);
     }
 }

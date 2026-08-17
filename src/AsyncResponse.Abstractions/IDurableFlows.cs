@@ -21,6 +21,23 @@ public interface IDurableFlows
     /// <typeparam name="TInput">The flow input, persisted as JSON with the flow state.</typeparam>
     /// <exception cref="ArgumentException"><paramref name="flowId"/> is empty or whitespace.</exception>
     /// <exception cref="InvalidOperationException"><paramref name="flowId"/> already belongs to different work.</exception>
+    /// <exception cref="DurableFlowNotDispatchedException">
+    /// The ledger was committed but the worker job could not be published, even after retries — the
+    /// run exists as <see cref="FlowRunStatus.Running"/> with nothing scheduled to execute it.
+    /// <see cref="DurableFlowNotDispatchedException.FlowId"/> carries the id (including a generated
+    /// one) so the orphan can be re-driven:
+    /// <code>
+    /// try
+    /// {
+    ///     return await flows.StartAsync&lt;ProvisioningFlow, ProvisionRequest&gt;(request);
+    /// }
+    /// catch (DurableFlowNotDispatchedException ex)
+    /// {
+    ///     // Idempotent: the atomic create dedupes and re-enqueues the SAME run.
+    ///     return await flows.StartAsync&lt;ProvisioningFlow, ProvisionRequest&gt;(request, ex.FlowId);
+    /// }
+    /// </code>
+    /// </exception>
     Task<string> StartAsync<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors | DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.Interfaces)] TFlow, TInput>(
         TInput input,
         string? flowId = null,

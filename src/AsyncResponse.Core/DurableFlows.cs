@@ -101,9 +101,13 @@ internal sealed class DurableFlowService : IDurableFlows
                         token).ConfigureAwait(false);
                     return true;
                 },
-                // Cancellation is not a transport fault and must not burn the ladder; it still
-                // lands in the catch below, because a canceled start leaves the same orphan.
-                isTransient: static ex => ex is not OperationCanceledException,
+                // Only the CALLER's cancellation ends the ladder. An OperationCanceledException
+                // whose token is not the caller's is a transport or SDK timeout — brokers surface
+                // those as TaskCanceledException all the time — and that is exactly the transient
+                // shape this retry exists for. Excluding the whole exception type meant the most
+                // common recoverable publish failure got zero retries and went straight to an
+                // orphaned Running ledger.
+                isTransient: ex => ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested,
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),

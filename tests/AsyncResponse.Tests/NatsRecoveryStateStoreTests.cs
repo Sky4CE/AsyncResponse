@@ -278,7 +278,12 @@ public class NatsRecoveryStateStoreTests
             ExpiresAtUtc = _time.Now + TimeSpan.FromMinutes(5)
         });
 
-        Assert.Empty(await _store.GetAllAsync("mixed"));
+        // BOTH stored registrations are unreadable — one has no correlation id, the other a future
+        // schema version. Filtering them to an empty list made that indistinguishable from "no
+        // registration was ever armed", which the dispatcher answers by acknowledging the response.
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("mixed"));
+        Assert.Equal("mixed", unreadable.CorrelationId);
+        Assert.Equal(2, unreadable.UnreadableCount);
     }
 
     [Fact]

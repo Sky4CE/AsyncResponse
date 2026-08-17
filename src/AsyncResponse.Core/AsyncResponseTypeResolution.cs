@@ -90,20 +90,29 @@ public static class AsyncResponseTypeResolution
             _resolvers = remaining;
         }
 
-        // Names this resolver was answering must stop resolving to its types, so the caches that
-        // remember those answers have to go with it.
-        ReflectionExtensions.InvalidateUnresolvableServiceTypes();
+        // Names this resolver was answering must stop resolving to its types — including the ones
+        // already ANSWERED. The positive caches key a resolved Type by name, so leaving them
+        // populated meant a revoked alias kept serving the old type (and kept its assembly alive)
+        // for the life of the process, which is most of what disposing the handle is for.
+        ReflectionExtensions.InvalidateResolvedServiceTypes();
+        PayloadRecoveryClassifier.InvalidateResolvedPayloadTypes();
     }
 
-    private sealed class ResolverRegistration(Func<string, Type?> _resolver) : IDisposable
+    private sealed class ResolverRegistration : IDisposable
     {
-        private int _disposed;
+        // Cleared on dispose, not just unregistered: a caller that keeps the handle around (a
+        // field on a plugin host, a using-scoped variable still in scope) would otherwise keep the
+        // delegate — and everything its closure captured, including the plugin assembly — reachable
+        // through the handle itself, which is exactly the pinning the handle exists to end.
+        private Func<string, Type?>? _resolver;
 
-        /// <summary>Removes the registration. Idempotent.</summary>
+        public ResolverRegistration(Func<string, Type?> resolver) => _resolver = resolver;
+
+        /// <summary>Removes the registration and drops this handle's reference. Idempotent.</summary>
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                Unregister(_resolver);
+            if (Interlocked.Exchange(ref _resolver, null) is { } resolver)
+                Unregister(resolver);
         }
     }
 

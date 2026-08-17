@@ -175,7 +175,9 @@ internal sealed class SqlServerResponseIngressSubscriber : SqlServerSubscriberSe
 
     protected override Task HandleMessageAsync(SqlServerTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = SqlServerCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Payload)
+            ? SqlServerCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId);
     }
 }

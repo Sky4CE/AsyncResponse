@@ -270,7 +270,9 @@ internal sealed class AzureServiceBusResponseIngressSubscriber : AzureServiceBus
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(AzureServiceBusTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = AzureServiceBusCorrelationIdExtractor.Extract(delivery, delivery.Body, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Body)
+            ? AzureServiceBusCorrelationIdExtractor.Extract(delivery, delivery.Body, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Body, correlationId);
     }
 }

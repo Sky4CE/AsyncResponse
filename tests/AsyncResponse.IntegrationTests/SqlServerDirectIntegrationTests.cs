@@ -884,10 +884,13 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
                 SchemaVersion = RecoveryStateSchema.Current + 1
             };
             await sql.SaveRecoveryStateAsync("future-state", newerState, TimeSpan.FromSeconds(30), CancellationToken.None);
-            Assert.Empty(await store.GetAllAsync("future-state"));
+            // Every stored registration for this id is unreadable, so an empty list would be a lie:
+            // it reads as "no callback was ever armed", which the dispatcher answers by ACKing the
+            // terminal response. Failing the delivery is what keeps the response recoverable.
+            await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("future-state"));
 
             await InsertUnreadableRecoveryStateAsync(schema, options.RecoveryStateTable, "bad-state");
-            Assert.Empty(await store.GetAllAsync("bad-state"));
+            await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => store.GetAllAsync("bad-state"));
 
             Assert.False(await store.TryDeleteAsync(correlationId, Guid.NewGuid()));
             Assert.True(await store.TryDeleteAsync(correlationId, state.RegistrationId));

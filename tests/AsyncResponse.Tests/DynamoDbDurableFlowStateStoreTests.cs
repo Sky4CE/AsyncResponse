@@ -128,7 +128,9 @@ public sealed class DynamoDbDurableFlowStateStoreTests
             .ThrowsAsync(new ConditionalCheckFailedException("held"));
         var store = CreateStore(client, enableTtl: false, ownsClient: true);
 
-        Assert.Null(await store.LoadAsync("flow"));
+        // The item is there but carries no revision, so it cannot be interpreted — that is not the
+        // same as the run being gone, and only the latter may ack the wake-up.
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("flow"));
         Assert.False(await store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
 
         store.Dispose();
@@ -173,10 +175,27 @@ public sealed class DynamoDbDurableFlowStateStoreTests
                 ("revision", new AttributeValue { N = "0" })));
         using var store = CreateStore(client, enableTtl: false);
 
-        for (var index = 0; index < 8; index++)
-            Assert.Null(await store.LoadAsync("flow"));
+        // The item EXISTS in every case below, so "cannot interpret it" and "it is gone" must not
+        // give the same answer: callers ack on null, and acking a ledger that is still in the table
+        // strands a Running flow with no wake-up left. Only real expiry and the deliberate
+        // revision-mismatch race read as absent.
+        await AssertUnreadableAsync("its 'expires_at' attribute is missing");         // no expires_at
+        await AssertUnreadableAsync("not an epoch-seconds number");                    // expires_at = "not-a-number"
+        Assert.Null(await store.LoadAsync("flow"));                                    // expired: genuinely gone
+        await AssertUnreadableAsync("'state_json' attribute is missing");              // no state_json
+        await AssertUnreadableAsync("'state_json' attribute is missing or empty");     // state_json = ""
+        await AssertUnreadableAsync("'revision' attribute is missing");                // no revision
+        await AssertUnreadableAsync("not a number");                                   // revision = "bad"
+        Assert.Null(await store.LoadAsync("flow"));                                    // revision mismatch: benign race
 
         Assert.Equal("flow", (await store.LoadAsync("flow"))?.FlowId);
+
+        async Task AssertUnreadableAsync(string expectedReasonFragment)
+        {
+            var ex = await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync("flow"));
+            Assert.Equal("flow", ex.FlowId);
+            Assert.Contains(expectedReasonFragment, ex.Reason, StringComparison.Ordinal);
+        }
     }
 
     [Fact]

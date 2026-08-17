@@ -141,9 +141,16 @@ public sealed class CosmosFlowStateStore : IFlowStateStore, IDisposable
             if (document.ExpiresAtUtc <= DateTime.UtcNow)
                 return null;
 
-            return document.Revision is { } revision
-                ? DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision)
-                : null;
+            // The document exists, so a missing required field is an unreadable ledger, not an
+            // absent one — absence is the NotFound catch below. Reporting it as absent let the
+            // executor ack the only wake-up of a run that is still sitting in the container.
+            if (document.Revision is not { } revision)
+                throw new FlowStateUnreadableException(flowId, "its stored document has no revision");
+
+            if (string.IsNullOrEmpty(document.StateJson))
+                throw new FlowStateUnreadableException(flowId, "its stored document has no state JSON");
+
+            return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {

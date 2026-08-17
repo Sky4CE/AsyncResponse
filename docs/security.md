@@ -159,11 +159,28 @@ find them. Register them explicitly (opt-in):
 using AsyncResponse;
 
 // register a whole assembly's types for resolution…
-AsyncResponseTypeResolution.RegisterAssembly(typeof(MyPlugin.IPluginFlow).Assembly);
+IDisposable assemblyRegistration =
+    AsyncResponseTypeResolution.RegisterAssembly(typeof(MyPlugin.IPluginFlow).Assembly);
 
 // …or supply a custom resolver function:
-AsyncResponseTypeResolution.RegisterResolver(name =>
+IDisposable resolverRegistration = AsyncResponseTypeResolution.RegisterResolver(name =>
     PluginCatalog.TryFind(name, out var t) ? t : null);
+```
+
+**Keep the returned handle and dispose it when the plugin goes away.** A registration lives in a
+process-wide list, and `RegisterAssembly` holds the assembly strongly — so an undisposed
+registration keeps the plugin's `AssemblyLoadContext` alive for the life of the process, and a
+resolver you meant to replace keeps answering. Disposal removes the registration and drops the
+resolved-type caches it fed, so a revoked alias stops resolving to its old type:
+
+```csharp
+// Own the registration for exactly as long as the plugin is loaded.
+using (AsyncResponseTypeResolution.RegisterAssembly(pluginAssembly))
+{
+    await RunPluginWorkloadAsync();
+}   // registration removed here — the context can now unload
+
+context.Unload();
 ```
 
 Type names that still can't be resolved are surfaced via the

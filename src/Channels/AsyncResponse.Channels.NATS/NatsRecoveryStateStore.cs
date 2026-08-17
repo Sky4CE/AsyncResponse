@@ -104,6 +104,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
 
         var states = StatesFrom(found.Stored);
+        var stored = states.Count;
         for (var i = states.Count - 1; i >= 0; i--)
         {
             var state = states[i];
@@ -113,6 +114,14 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 continue;
             }
         }
+
+        // Registrations existed and none of them survived. An empty list reads as "no recovery
+        // callback was ever armed", which the dispatcher answers by acknowledging the response —
+        // so a corrupt or newer-schema registration consumed a terminal response its callback never
+        // saw. Fail the delivery instead; a partially readable batch deliberately does not (see
+        // RecoveryStateUnreadableException).
+        if (stored > 0 && states.Count == 0)
+            throw new RecoveryStateUnreadableException(correlationId, stored);
 
         return states;
     }

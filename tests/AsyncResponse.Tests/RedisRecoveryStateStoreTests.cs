@@ -139,8 +139,15 @@ public class RedisRecoveryStateStoreTests
             .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:broken", It.IsAny<CommandFlags>()))
             .ReturnsAsync("{not-json");
 
+        // No key at all: nobody ever armed a callback here, so an empty list is the truth and the
+        // dispatcher may ack.
         Assert.Empty(await _store.GetAllAsync("missing"));
-        Assert.Empty(await _store.GetAllAsync("broken"));
+
+        // A key holding an unparseable blob is the opposite: registrations exist and this build
+        // cannot read them. Reporting that as "none" acked a terminal response whose callback never
+        // ran, so it fails the delivery instead.
+        var unreadable = await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("broken"));
+        Assert.Equal("broken", unreadable.CorrelationId);
         await Assert.ThrowsAsync<ArgumentException>(() => _store.GetAllAsync(" "));
 
         using var canceled = new CancellationTokenSource();

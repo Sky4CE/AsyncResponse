@@ -7,6 +7,14 @@ namespace AsyncResponse.Transports.Redis;
 
 internal abstract class RedisSubscriberService : BackgroundService
 {
+    /// <summary>
+    /// Whether the payload is within the engine's inbound size budget. Overridden by the response
+    /// ingress subscriber, which is the only role that parses the BODY to find a correlation id —
+    /// the worker role reads a header and never touches payload size. Default true so a role
+    /// without a budget behaves exactly as before.
+    /// </summary>
+    protected virtual bool IsWithinInboundBudget(string payload) => true;
+
     private static readonly string GeneratedConsumerName = CreateGeneratedConsumerName();
 
     private readonly IRedisStreamDatabase _database;
@@ -345,8 +353,12 @@ internal abstract class RedisSubscriberService : BackgroundService
                 $"Redis stream entry {entry.Id} on {Stream.ToString()} does not contain payload field '{Options.PayloadField}'.");
         }
 
+        // Body-path extraction parses the whole payload, so it is gated on the inbound budget;
+        // the field/header path reads metadata only and is unaffected by payload size.
         var correlationId = SubscriberRole is RedisSubscriberRole.ResponseIngress
-            ? RedisCorrelationIdExtractor.Extract(entry, payload, Options)
+            ? IsWithinInboundBudget(payload)
+                ? RedisCorrelationIdExtractor.Extract(entry, payload, Options)
+                : null
             : RedisCorrelationIdExtractor.TryReadField(entry, Options.CorrelationIdField);
 
         return new RedisStreamDelivery(
@@ -455,6 +467,9 @@ internal sealed class RedisResponseIngressSubscriber : RedisSubscriberService
     protected override RedisValue ConsumerGroup => Options.ResponseConsumerGroup;
     protected override RedisSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override RedisSubscriberRole SubscriberRole => RedisSubscriberRole.ResponseIngress;
+
+    /// <inheritdoc />
+    protected override bool IsWithinInboundBudget(string payload) => !_ingress.IsOverInboundBudget(payload);
 
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(RedisStreamDelivery delivery, CancellationToken cancellationToken)

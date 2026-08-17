@@ -228,7 +228,9 @@ internal sealed class MongoDbResponseIngressSubscriber : MongoDbSubscriberServic
 
     protected override Task HandleMessageAsync(MongoDbTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = MongoDbCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Payload)
+            ? MongoDbCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId);
     }
 }

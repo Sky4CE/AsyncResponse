@@ -287,7 +287,9 @@ public sealed class CosmosDurableFlowStateStoreTests
 
         document.Revision = null;
         harness.Reads(document);
-        Assert.Null(await harness.Store.LoadAsync("flow"));
+        // Present-but-uninterpretable: the document is in the container, so reporting absence here
+        // would ack the only wake-up of a run that still exists.
+        await Assert.ThrowsAsync<FlowStateUnreadableException>(() => harness.Store.LoadAsync("flow"));
         Assert.False(await harness.Store.TryAcquireLeaseAsync("flow", "owner", TimeSpan.FromMinutes(1)));
 
         document = Document(state, DateTime.UtcNow.AddMinutes(-1));

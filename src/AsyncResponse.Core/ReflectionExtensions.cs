@@ -38,6 +38,19 @@ internal static class ReflectionExtensions
     /// classifier's resolution path.
     /// </summary>
     internal static void InvalidateUnresolvableServiceTypes() => UnresolvableTypeNames.Invalidate();
+
+    /// <summary>
+    /// Drops resolved service types as well as the negative cache. Used when a resolver is
+    /// UNREGISTERED: the negative cache holds names that failed, but the harm after a revoke is in
+    /// the positive entries — a name the departing resolver already answered keeps resolving to its
+    /// type, so a revoked alias still dispatches to the old service and its assembly stays
+    /// reachable through the cache. Both directions of the registry change therefore clear both.
+    /// </summary>
+    internal static void InvalidateResolvedServiceTypes()
+    {
+        ServiceTypes.Clear();
+        UnresolvableTypeNames.Invalidate();
+    }
     private static readonly ConcurrentDictionary<Type, ConversionPlan> ConversionPlans = new();
     private static readonly ConcurrentDictionary<InvocationPlanKey, InvocationPlan> InvocationPlans = new();
     private static readonly MethodInfo ToValueTaskMethod = typeof(ReflectionExtensions)

@@ -168,6 +168,7 @@ AsyncResponse.IAsyncResponseContextPropagator.Restore(System.Collections.Generic
 AsyncResponse.IAsyncResponseIngress
 AsyncResponse.IAsyncResponseIngress.HandleResponseMessageAsync(string! messageJson, string? correlationId) -> System.Threading.Tasks.Task!
 AsyncResponse.IAsyncResponseIngress.HandleWorkerMessageAsync(string! messageJson) -> System.Threading.Tasks.Task!
+AsyncResponse.IAsyncResponseIngress.IsOverInboundBudget(string! messageJson) -> bool
 AsyncResponse.IAsyncResponsePayload
 AsyncResponse.IAsyncResponsePayload.OnRecovery() -> AsyncResponse.RecoveryAction
 AsyncResponse.IAsyncResponsePublisher
@@ -285,6 +286,10 @@ AsyncResponse.RecoveryState.ResumeCallback.set -> void
 AsyncResponse.RecoveryState.SchemaVersion.get -> int
 AsyncResponse.RecoveryState.SchemaVersion.set -> void
 AsyncResponse.RecoveryStateSchema
+AsyncResponse.RecoveryStateUnreadableException
+AsyncResponse.RecoveryStateUnreadableException.CorrelationId.get -> string?
+AsyncResponse.RecoveryStateUnreadableException.RecoveryStateUnreadableException(string? correlationId, int unreadableCount) -> void
+AsyncResponse.RecoveryStateUnreadableException.UnreadableCount.get -> int
 AsyncResponse.ReflectionCallDto
 AsyncResponse.ReflectionCallDto.MethodName.get -> string!
 AsyncResponse.ReflectionCallDto.MethodName.set -> void

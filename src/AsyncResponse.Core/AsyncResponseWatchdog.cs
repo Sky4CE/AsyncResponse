@@ -75,10 +75,28 @@ public sealed class AsyncResponseWatchdogOptions
         // failing fast where the misconfiguration is visible.
         AsyncResponseChannelOptions.EnsureTimerBacked(Interval, nameof(AsyncResponseWatchdogOptions), nameof(Interval));
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(StartupDelay, nameof(AsyncResponseWatchdogOptions), nameof(StartupDelay));
-
-        // Jitter is added to those same waits, so it shares their ceiling. Validated on the
-        // RESOLVED value: the 10% default of a near-ceiling interval is itself timer-armed.
         AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(ResolvedJitter, nameof(AsyncResponseWatchdogOptions), nameof(IntervalJitter));
+
+        // Validating the parts separately is not enough, because NextWait arms their SUM: two
+        // individually legal values can still hand Task.Delay an out-of-range delay and fault the
+        // background service on its very first wait — the exact delayed, host-stopping failure
+        // these checks exist to prevent.
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(
+            StartupDelay + ResolvedJitter, nameof(AsyncResponseWatchdogOptions), $"{nameof(StartupDelay)} + {nameof(IntervalJitter)}");
+        AsyncResponseChannelOptions.EnsureTimerBackedAllowZero(
+            Interval + ResolvedJitter, nameof(AsyncResponseWatchdogOptions), $"{nameof(Interval)} + {nameof(IntervalJitter)}");
+
+        // Jitter is a de-synchronization offset, not a second interval. Allowing it to exceed the
+        // interval lets a perfectly healthy next scan be scheduled beyond the freshness budget the
+        // recovery health check derives from Interval, so readiness reports the watchdog dead while
+        // it is doing exactly what it was configured to do.
+        if (ResolvedJitter > Interval)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseWatchdogOptions)}.{nameof(IntervalJitter)} ({ResolvedJitter}) cannot exceed " +
+                $"{nameof(Interval)} ({Interval}): the health check derives its freshness budget from the interval, so a " +
+                "larger offset would report a healthy watchdog as stale.");
+        }
 
         // The probe fan-out degree feeds Parallel.ForEachAsync mid-scan, which rejects values
         // below 1 with the same delayed, host-stopping failure mode.

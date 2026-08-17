@@ -7,6 +7,14 @@ namespace AsyncResponse.Transports.Kafka;
 
 internal abstract class KafkaSubscriberService : BackgroundService
 {
+    /// <summary>
+    /// Whether the payload is within the engine's inbound size budget. Overridden by the response
+    /// ingress subscriber, which is the only role that parses the BODY to find a correlation id —
+    /// the worker role reads a header and never touches payload size. Default true so a role
+    /// without a budget behaves exactly as before.
+    /// </summary>
+    protected virtual bool IsWithinInboundBudget(string payload) => true;
+
     private readonly IKafkaConsumerClientFactory _consumerFactory;
     private readonly IKafkaProducerClient _producer;
     private readonly IKafkaAdminClient _adminClient;
@@ -200,8 +208,12 @@ internal abstract class KafkaSubscriberService : BackgroundService
                 $"Kafka message {message.Topic}[{message.Partition}]@{message.Offset} does not contain a payload.");
         }
 
+        // Body-path extraction parses the whole payload, so it is gated on the inbound budget;
+        // the field/header path reads metadata only and is unaffected by payload size.
         var correlationId = SubscriberRole is KafkaSubscriberRole.ResponseIngress
-            ? KafkaCorrelationIdExtractor.Extract(message.Headers, payload, Options)
+            ? IsWithinInboundBudget(payload)
+                ? KafkaCorrelationIdExtractor.Extract(message.Headers, payload, Options)
+                : null
             : KafkaCorrelationIdExtractor.TryReadHeader(message.Headers, Options.CorrelationIdHeader);
 
         return new KafkaDelivery(
@@ -284,6 +296,9 @@ internal sealed class KafkaResponseIngressSubscriber : KafkaSubscriberService
     protected override string ConsumerGroup => Options.ResponseConsumerGroup;
     protected override KafkaSubscriberOptions SubscriberOptions => Options.ResponseSubscriber;
     protected override KafkaSubscriberRole SubscriberRole => KafkaSubscriberRole.ResponseIngress;
+
+    /// <inheritdoc />
+    protected override bool IsWithinInboundBudget(string payload) => !_ingress.IsOverInboundBudget(payload);
 
     /// <summary>Handles the delivered message.</summary>
     protected override Task HandleMessageAsync(KafkaDelivery delivery, CancellationToken cancellationToken)

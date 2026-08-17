@@ -165,9 +165,17 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         if (document is null)
             return null;
 
-        return document.Revision is { } revision
-            ? DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision)
-            : null;
+        // BuildLiveFilter already excluded expired documents server-side, so reaching here with a
+        // document means the ledger is present and live. A missing required field is therefore an
+        // unreadable ledger, not an absent one — returning null for it acknowledged the only
+        // wake-up of a run still sitting in the collection.
+        if (document.Revision is not { } revision)
+            throw new FlowStateUnreadableException(flowId, "its stored document has no revision");
+
+        if (string.IsNullOrEmpty(document.StateJson))
+            throw new FlowStateUnreadableException(flowId, "its stored document has no state JSON");
+
+        return DurableFlowStoreShared.ReadState(flowId, document.StateJson, revision);
     }
 
     public async Task<bool> TryCreateAsync(string flowId, FlowState state, TimeSpan ttl, CancellationToken cancellationToken = default)

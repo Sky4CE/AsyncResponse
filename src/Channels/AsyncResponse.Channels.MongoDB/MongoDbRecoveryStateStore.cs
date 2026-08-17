@@ -76,6 +76,15 @@ internal sealed class MongoDbRecoveryStateStore(
                 states.Add(state);
         }
 
+        // Rows existed and none of them survived materialization. Returning an empty list here told
+        // the dispatcher "no recovery callback was ever armed", which it answers by acknowledging
+        // the response — so a corrupt or newer-schema registration silently consumed a terminal
+        // response its callback never saw. Fail instead, and let redelivery reach a build that can
+        // read it. A PARTIALLY readable batch deliberately does not throw: see
+        // RecoveryStateUnreadableException.
+        if (states.Count == 0)
+            throw new RecoveryStateUnreadableException(correlationId, jsonStates.Count);
+
         return states;
     }
 

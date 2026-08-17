@@ -221,7 +221,9 @@ internal sealed class RabbitMqResponseIngressSubscriber : RabbitMqSubscriberServ
     protected override Task HandleMessageAsync(RabbitMqDelivery delivery, CancellationToken cancellationToken)
     {
         var messageJson = Encoding.UTF8.GetString(delivery.Body.Span);
-        var correlationId = RabbitMqCorrelationIdExtractor.Extract(delivery, messageJson, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(messageJson)
+            ? RabbitMqCorrelationIdExtractor.Extract(delivery, messageJson, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(messageJson, correlationId);
     }
 }

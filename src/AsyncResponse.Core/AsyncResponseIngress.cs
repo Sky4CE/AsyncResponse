@@ -17,6 +17,12 @@ internal sealed class AsyncResponseIngress(
     IAsyncResponseCallbackAuthorizer? _authorizer = null,
     Microsoft.Extensions.Options.IOptions<AsyncResponseOptions>? _options = null) : IAsyncResponseIngress
 {
+    /// <inheritdoc />
+    public bool IsOverInboundBudget(string messageJson)
+        => _options?.Value.MaxInboundMessageChars is { } limit
+           && messageJson is not null
+           && messageJson.Length > limit;
+
     /// <summary>
     /// Enforces <see cref="AsyncResponseOptions.MaxInboundMessageChars"/>. Returns <c>true</c> when
     /// the message was rejected, in which case the caller returns cleanly and the transport acks —
@@ -25,8 +31,10 @@ internal sealed class AsyncResponseIngress(
     /// </summary>
     private bool RejectIfOversized(string messageJson, string route, Activity? activity)
     {
-        if (_options?.Value.MaxInboundMessageChars is not { } limit || messageJson.Length <= limit)
+        if (!IsOverInboundBudget(messageJson))
             return false;
+
+        var limit = _options!.Value.MaxInboundMessageChars!.Value;
 
         _logger.LogError(
             "Ingress received an oversized {Route} message and acknowledged it without dispatch: {PayloadLength} UTF-16 code units exceeds the configured {Limit}.",

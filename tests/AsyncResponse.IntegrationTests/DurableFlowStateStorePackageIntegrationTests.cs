@@ -969,7 +969,8 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                 ["expires_at_utc"] = DateTime.UtcNow.AddMinutes(5),
                 ["updated_at_utc"] = DateTime.UtcNow
             });
-            Assert.Null(await store.LoadAsync(legacyFlowId));
+            // The row predates the revision column: present, and not interpretable by this build.
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync(legacyFlowId));
             Assert.False(await store.TryAcquireLeaseAsync(legacyFlowId, "owner", TimeSpan.FromMinutes(1)));
         }
         finally
@@ -1010,7 +1011,8 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
                     ["updated_at"] = new() { N = now.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) }
                 }
             });
-            Assert.Null(await store.LoadAsync(legacyFlowId));
+            // The row predates the revision column: present, and not interpretable by this build.
+            await Assert.ThrowsAsync<FlowStateUnreadableException>(() => store.LoadAsync(legacyFlowId));
             Assert.False(await store.TryAcquireLeaseAsync(legacyFlowId, "owner", TimeSpan.FromMinutes(1)));
         }
         finally

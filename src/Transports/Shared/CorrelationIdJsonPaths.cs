@@ -143,7 +143,15 @@ internal static class CorrelationIdJsonPaths
         foreach (var property in obj.EnumerateObject())
         {
             if (!seen.Add(property.Name))
-                throw new ArgumentException($"An item with the same key has already been added. Key: {property.Name}");
+            {
+                // The name is NOT in the message. It comes straight off an untrusted inbound body,
+                // and transport dispatchers log this exception — so including it put an
+                // attacker-chosen string (newlines, PII, a forged log line) into the application log
+                // through a path the "never logs a message body" guarantee is supposed to close.
+                // The duplicate's position is enough to diagnose a malformed producer.
+                throw new ArgumentException(
+                    $"The JSON object contains a duplicate property name at index {seen.Count}; correlation extraction cannot choose between them.");
+            }
 
             if (!exactFound && string.Equals(property.Name, name, StringComparison.Ordinal))
             {

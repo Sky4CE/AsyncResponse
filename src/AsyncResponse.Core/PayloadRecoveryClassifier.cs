@@ -40,6 +40,14 @@ internal static class PayloadRecoveryClassifier
     private static readonly ConcurrentDictionary<string, Type> PayloadTypes = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Drops resolved payload types when a type resolver is unregistered. Counterpart to
+    /// <see cref="ReflectionExtensions.InvalidateResolvedServiceTypes"/>: a payload name the
+    /// departing resolver already answered would otherwise keep materializing into its old type,
+    /// and keep that type's assembly reachable through this cache.
+    /// </summary>
+    internal static void InvalidateResolvedPayloadTypes() => PayloadTypes.Clear();
+
+    /// <summary>
     /// Attempts to classify <paramref name="payload"/> for the lost-subscriber path: which route it
     /// takes, and the materialized instance the route's callback must receive.
     /// </summary>

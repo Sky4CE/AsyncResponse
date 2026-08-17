@@ -145,6 +145,7 @@ internal sealed class AsyncResponseStartupValidator(
     public Task StartAsync(CancellationToken cancellationToken)
     {
         ValidateWatchdogOptions(_options.Value.Watchdog);
+        ValidateInboundMessageBudget(_options.Value);
         _observerAudit?.Validate();
 
         var channelNames = _channels.Select(c => c.Name).Distinct(StringComparer.Ordinal).ToArray();
@@ -285,6 +286,25 @@ internal sealed class AsyncResponseStartupValidator(
     /// ceiling; <c>Interval</c> and <c>StartupDelay</c> arm timers, and zero is a valid startup
     /// delay ("scan immediately").
     /// </summary>
+    /// <summary>
+    /// Rejects an inbound size budget that would silently swallow traffic. The guard acknowledges
+    /// oversized messages without dispatch, so a zero or negative limit does not fail loudly — it
+    /// quietly drops EVERY non-empty message on both the response and worker routes and reports
+    /// success. That is total data loss wearing the shape of a healthy service, and a plausible
+    /// configuration typo (`0` read as "no limit"), so it has to be caught at startup where a
+    /// misconfiguration is still visible.
+    /// </summary>
+    private static void ValidateInboundMessageBudget(AsyncResponseOptions options)
+    {
+        if (options.MaxInboundMessageChars is { } limit && limit <= 0)
+        {
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.MaxInboundMessageChars)} must be positive " +
+                $"(got {limit}); use null to remove the limit. A non-positive budget acknowledges every inbound message " +
+                "without dispatching it.");
+        }
+    }
+
     private static void ValidateWatchdogOptions(AsyncResponseWatchdogOptions watchdog)
     {
         const string optionsPath = $"{nameof(AsyncResponseOptions)}.{nameof(AsyncResponseOptions.Watchdog)}";

@@ -217,8 +217,69 @@ internal sealed class RedisRecoveryStateStore : IRecoveryStateStore, IRecoverySt
         if (value.IsNullOrEmpty)
             return [];
 
-        var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: true, _timeProvider.GetUtcNow());
-        return entries.ConvertAll(entry => entry.State!);
+        var now = _timeProvider.GetUtcNow();
+        var (entries, _) = DeserializeEntries(value, recoveryKey, correlationId, logAsError: true, now);
+        if (entries.Count > 0)
+            return entries.ConvertAll(entry => entry.State!);
+
+        // The key held a blob and nothing readable came out of it. That must not read as "no
+        // registration was ever armed" — the dispatcher acknowledges the response on that answer,
+        // consuming a terminal response whose callback never ran.
+        //
+        // Expiry is the exception and has to be told apart here, because DeserializeEntries drops
+        // lapsed entries by the same route it drops unreadable ones: a registration past its expiry
+        // is legitimately gone, and failing on it would redeliver forever against a record that is
+        // supposed to disappear.
+        if (CountStoredRegistrations(value, out var stored) && stored > 0)
+            throw new RecoveryStateUnreadableException(correlationId, stored);
+
+        return [];
+    }
+
+    /// <summary>
+    /// Counts the registrations physically present in the blob that are NOT past their expiry,
+    /// without applying the readability rules. The gap between this and what
+    /// <see cref="DeserializeEntries"/> returned is exactly the unreadable set. Returns
+    /// <c>false</c> when the blob itself will not parse at all — in which case every registration it
+    /// held is unreadable by definition, and the caller is told so via <paramref name="stored"/>.
+    /// </summary>
+    private bool CountStoredRegistrations(RedisValue value, out int stored)
+    {
+        var json = value.ToString();
+        var now = _timeProvider.GetUtcNow();
+        try
+        {
+            if (IsLegacyShape(json))
+            {
+                // Legacy blobs carry no per-entry expiry; every element is a live registration.
+                stored = AsyncResponseJson.Deserialize<List<RecoveryState>>(json)?.Count ?? 0;
+                return true;
+            }
+
+            var parsed = JsonSerializer.Deserialize(json, RedisChannelJsonContext.Default.StoredRecoveryState);
+            var registrations = parsed?.Registrations;
+            if (registrations is null)
+            {
+                stored = 0;
+                return true;
+            }
+
+            stored = 0;
+            foreach (var entry in registrations)
+            {
+                if (entry is not null && entry.ExpiresAtUtc > now)
+                    stored++;
+            }
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            // Unparseable at the top level: the blob exists and holds an unknown number of
+            // registrations, all of them unreadable. One is enough to fail the delivery.
+            stored = 1;
+            return true;
+        }
     }
 
     private static RedisValue SerializeEntries(List<StoredRegistration> entries)

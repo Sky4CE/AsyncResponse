@@ -108,7 +108,18 @@ internal static class FlowStateConcurrency
     {
         ValidateOptions(options);
 
+        var clock = timeProvider ?? TimeProvider.System;
         var leaseId = Guid.NewGuid().ToString("N");
+
+        // Stamp the deadline BEFORE the call, not after it returns. The store starts the lease when
+        // it executes the command; every millisecond after that — network latency, a delayed
+        // continuation, a GC pause between the response arriving and this line running — is lease
+        // time already spent. Anchoring afterwards handed that whole interval back to the client as
+        // if it were still owned, so a worker could believe it held a 60s lease 20s past the point
+        // another replica was free to take it. Anchoring first is conservative in the safe
+        // direction: the client's deadline can only be EARLIER than the server's.
+        var deadline = FlowExecutionLease.DeadlineFrom(clock, options.ExecutionLeaseDuration);
+
         if (!await store.TryAcquireLeaseAsync(
                 flowId,
                 leaseId,
@@ -117,10 +128,10 @@ internal static class FlowStateConcurrency
             return null;
 
         // The constructor is throw-free after the option bounds above: it only assigns fields,
-        // computes a bounded "now + lease" stamp, and starts the renewal loop (whose first
-        // Task.Delay faults the loop task, never the constructor). Were that ever to change,
-        // lease expiry is the backstop for the persisted row.
-        return new FlowExecutionLease(store, flowId, leaseId, options, logger, timeProvider ?? TimeProvider.System);
+        // records the pre-call deadline, and starts the renewal loop (whose first Task.Delay faults
+        // the loop task, never the constructor). Were that ever to change, lease expiry is the
+        // backstop for the persisted row.
+        return new FlowExecutionLease(store, flowId, leaseId, options, logger, clock, deadline);
     }
 
     public static async Task<bool> MutateAsync(
@@ -212,13 +223,25 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// </summary>
     private static readonly TimeSpan MaxDeadlineChunk = TimeSpan.FromDays(1);
 
+    /// <param name="store">The flow state store the lease was acquired through.</param>
+    /// <param name="flowId">The flow the lease protects.</param>
+    /// <param name="leaseId">The identity of this lease within the flow's row.</param>
+    /// <param name="options">Validated durable-flow options.</param>
+    /// <param name="logger">Sink for renewal and deadline watcher events.</param>
+    /// <param name="timeProvider">Clock used for deadline computation; <see cref="TimeProvider.System"/> when omitted.</param>
+    /// <param name="acquiredDeadlineUtcTicks">
+    /// The conservative deadline for the lease this instance was handed, captured BEFORE the
+    /// acquire call went out. Omitted only by callers that construct a lease without an acquire
+    /// round trip (tests), where "now + duration" is exact.
+    /// </param>
     public FlowExecutionLease(
         IFlowStateStore store,
         string flowId,
         string leaseId,
         DurableFlowOptions options,
         ILogger logger,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        long? acquiredDeadlineUtcTicks = null)
     {
         _store = store;
         _flowId = flowId;
@@ -226,9 +249,22 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
         _options = options;
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
-        Volatile.Write(ref _validUntilUtcTicks, _timeProvider.GetUtcNow().UtcDateTime.Add(options.ExecutionLeaseDuration).Ticks);
+        Volatile.Write(
+            ref _validUntilUtcTicks,
+            acquiredDeadlineUtcTicks ?? DeadlineFrom(_timeProvider, options.ExecutionLeaseDuration));
         _renewal = RenewLoopAsync();
         _deadline = DeadlineLoopAsync();
+    }
+
+    /// <summary>
+    /// "Now + duration" in UTC ticks, saturating instead of overflowing: <c>ExecutionLeaseDuration</c>
+    /// is bounded as a persistence TTL, not a timer, so a 60-day lease near <see cref="DateTime.MaxValue"/>
+    /// is a legal configuration that must not throw here.
+    /// </summary>
+    internal static long DeadlineFrom(TimeProvider timeProvider, TimeSpan duration)
+    {
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+        return duration > DateTime.MaxValue - now ? DateTime.MaxValue.Ticks : now.Add(duration).Ticks;
     }
 
     public CancellationToken LostToken => _lost.Token;
@@ -331,6 +367,13 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             try
             {
                 await Task.Delay(_options.ExecutionLeaseRenewInterval, _timeProvider, _stop.Token).ConfigureAwait(false);
+
+                // Same anchoring rule as acquisition: the renewed lease starts when the store runs
+                // the command, so the deadline is measured from before the call, not from whenever
+                // the answer gets back here. Published only on success, so a failed renewal never
+                // extends anything.
+                var renewedDeadline = DeadlineFrom(_timeProvider, _options.ExecutionLeaseDuration);
+
                 if (!await _store.TryRenewLeaseAsync(
                         _flowId,
                         _leaseId,
@@ -341,7 +384,7 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
                     return;
                 }
 
-                Volatile.Write(ref _validUntilUtcTicks, _timeProvider.GetUtcNow().UtcDateTime.Add(_options.ExecutionLeaseDuration).Ticks);
+                Volatile.Write(ref _validUntilUtcTicks, renewedDeadline);
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {

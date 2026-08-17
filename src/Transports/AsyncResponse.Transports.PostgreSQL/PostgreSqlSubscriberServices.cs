@@ -216,7 +216,9 @@ internal sealed class PostgreSqlResponseIngressSubscriber : PostgreSqlSubscriber
 
     protected override Task HandleMessageAsync(PostgreSqlTransportDelivery delivery, CancellationToken cancellationToken)
     {
-        var correlationId = PostgreSqlCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options);
+        var correlationId = !_ingress.IsOverInboundBudget(delivery.Payload)
+            ? PostgreSqlCorrelationIdExtractor.Extract(delivery.Headers, delivery.Payload, Options)
+            : null;
         return _ingress.HandleResponseMessageAsync(delivery.Payload, correlationId);
     }
 }
