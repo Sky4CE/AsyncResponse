@@ -147,7 +147,16 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
           alert-threshold: '200%'
-          comment-on-alert: true
+          # No commit comment. The data push above has already succeeded by the time the action
+          # posts one, so a failed comment API call turned a completed publish into a red job —
+          # which is what happened on de68674 ("No server is currently available to service your
+          # request", raised AFTER "9306b821..0a3e43b3  gh-pages -> gh-pages"). With
+          # fail-on-alert: false this job deliberately does not fail ON a regression, so failing
+          # because the NOTIFICATION about one did not post is incoherent. The alert still surfaces
+          # twice without it: as a workflow warning annotation, and in the job summary
+          # (summary-always). Recent runs raised 2, 10 and 30 alerts, so this also stops a
+          # commit collecting dozens of comments nobody reads.
+          comment-on-alert: false
           fail-on-alert: false
           summary-always: true
 
@@ -162,7 +171,8 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: dev/bench
           alert-threshold: '200%'
-          comment-on-alert: true
+          # See the first publish step for why comments are off.
+          comment-on-alert: false
           fail-on-alert: false
           summary-always: true
 
