@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="12">12</td>
+<td class="limit-width right" title="14">14</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="12">12</td>
+<td class="limit-width right" title="14">14</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="268">268</td>
+<td class="limit-width right" title="270">270</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="12 of 12">100%</td>
+<td class="limit-width right" title="14 of 14">100%</td>
 </tr>
 </table>
 </div>
@@ -66,20 +66,20 @@
 <div class="card">
 <div class="card-header">Branch coverage</div>
 <div class="card-body">
-<div class="large">N/A</div>
+<div class="large cardpercentagebar cardpercentagebar50">50%</div>
 <div class="table">
 <table>
 <tr>
 <th>Covered branches:</th>
-<td class="limit-width right" title="0">0</td>
+<td class="limit-width right" title="1">1</td>
 </tr>
 <tr>
 <th>Total branches:</th>
-<td class="limit-width right" title="0">0</td>
+<td class="limit-width right" title="2">2</td>
 </tr>
 <tr>
 <th>Branch coverage:</th>
-<td class="limit-width right" title="N/A">N/A</td>
+<td class="limit-width right" title="1 of 2">50%</td>
 </tr>
 </table>
 </div>
@@ -112,7 +112,7 @@
 <tr><td title="get_SubscriptionId()"><a href="#file0_line256" class="navigatetohash">get_SubscriptionId()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="get_SubscriberOptions()"><a href="#file0_line258" class="navigatetohash">get_SubscriberOptions()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="get_SubscriberRole()"><a href="#file0_line259" class="navigatetohash">get_SubscriberRole()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="HandleMessageAsync(Google.Cloud.PubSub.V1.PubsubMessage,System.Threading.CancellationToken)"><a href="#file0_line264" class="navigatetohash">HandleMessageAsync(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="HandleMessageAsync(Google.Cloud.PubSub.V1.PubsubMessage,System.Threading.CancellationToken)"><a href="#file0_line264" class="navigatetohash">HandleMessageAsync(...)</a></td><td>50%</td><td>2</td><td>2</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -386,14 +386,16 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line262"></a><code>262</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;protected&nbsp;override&nbsp;Task&nbsp;HandleMessageAsync(PubsubMessage&nbsp;message,&nbsp;CancellationToken&nbsp;cancellationToken)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line263"></a><code>263</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;{</code></td></tr>
 <tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line264"></a><code>264</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;messageJson&nbsp;=&nbsp;message.Data.ToStringUtf8();</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line265"></a><code>265</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;correlationId&nbsp;=&nbsp;GooglePubSubCorrelationIdExtractor.Extract(message,&nbsp;messageJson,&nbsp;Options);</code></td></tr>
-<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line266"></a><code>266</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;_ingress.HandleResponseMessageAsync(messageJson,&nbsp;correlationId);</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line267"></a><code>267</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line268"></a><code>268</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="coverableline" title="Partially covered (6 visits, 1 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'orange'}}"><td class="orange">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line265"></a><code>265</code></td><td class="percentagebar percentagebar50"><i class="icon-fork"></i></td><td class="lightorange"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;var&nbsp;correlationId&nbsp;=&nbsp;!_ingress.IsOverInboundBudget(messageJson)</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line266"></a><code>266</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;?&nbsp;GooglePubSubCorrelationIdExtractor.Extract(message,&nbsp;messageJson,&nbsp;Options)</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line267"></a><code>267</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;null;</code></td></tr>
+<tr class="coverableline" title="Covered (6 visits)" data-coverage="{'AllTestMethods': {'VC': '6', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6</td><td class="rightmargin right"><a id="file0_line268"></a><code>268</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return&nbsp;_ingress.HandleResponseMessageAsync(messageJson,&nbsp;correlationId);</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line269"></a><code>269</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line270"></a><code>270</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/17/2026 - 13:47:54<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/17/2026 - 19:49:49<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
