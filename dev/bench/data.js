@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786983018478,
+  "lastUpdate": 1786983022149,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -125712,6 +125712,240 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm allocations",
             "value": 47170.4832,
+            "unit": "B/flow"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "17c3b19c1b94a9977d1eee6ec03b842f765f8ed6",
+          "message": "fix: apply round-28 review — 9 findings, most of them defects in the round-27 fixes\n\nTwo independent reviews of daac580. The first was accurate on all nine of its\nfindings and, usefully, seven of them were bugs inside the code round 27 had\njust added. The second contributed little: four findings were already answered\nin round 27, its Kafka poll-loop claim is refuted by the existing\nPauseAssignment/keep-consuming backpressure (and its remediation is the\nAckAfterEnqueue mode that already ships), and its \"MaxInboundMessageChars\ndefaults to null\" is wrong — round 27 set it to 8 Mi.\n\n- Recovery stores filtered unreadable registrations out of GetAllAsync, so a\n  correlation id whose registrations were ALL unreadable returned an empty list.\n  The dispatcher reads that as \"no callback was ever armed\" and acknowledges the\n  terminal response. RecoveryStateUnreadableException now fails that delivery\n  across all five stores. A partially readable batch deliberately still\n  dispatches its readable half: failing it would redeliver callbacks that already\n  succeeded and, since successful registrations are deleted, the redelivery would\n  then see all-unreadable and loop forever.\n- DynamoDB returned null for a missing or malformed TTL, state JSON or revision\n  attribute; Cosmos and MongoDB for a missing revision. The item exists in every\n  one of those cases, so they throw FlowStateUnreadableException now. Only a\n  well-formed, elapsed expiry reads as absence.\n- FlowExecutionLease stamped its deadline after the acquire/renew round trip\n  returned, adding response latency to the lease the client believed it held.\n  The deadline is captured before the call and published on success.\n- The durable-start publish retry excluded every OperationCanceledException, so a\n  transport timeout — TaskCanceledException with the caller's token untouched,\n  the most common recoverable publish failure — got zero retries and produced the\n  orphaned ledger the retry exists to prevent.\n- MaxInboundMessageChars was unvalidated: zero or negative acknowledged every\n  inbound message without dispatching it, total data loss shaped like a healthy\n  service. Rejected at startup. The guard also ran after correlation extraction\n  had already parsed the body; IAsyncResponseIngress.IsOverInboundBudget now gates\n  extraction in all eleven response subscribers. It is a defaulted interface\n  member phrased so false means \"carry on\" — this interface is the documented\n  seam for hand-written adapters.\n- Watchdog validation checked Interval, StartupDelay and jitter separately while\n  NextWait arms their sum, so two legal values could fault the background service\n  on its first delay. Jitter is now also capped at Interval, since the health\n  check derives its freshness budget from Interval.\n- A disposed resolver registration still held its delegate, and unregistering\n  cleared only the negative cache — a revoked alias kept resolving from\n  ServiceTypes/PayloadTypes and kept its assembly reachable. Dispose now clears\n  the field and both positive caches.\n- The duplicate-JSON-property error embedded the offending property name, taken\n  straight off an untrusted body and logged by the transport dispatchers. It\n  reports the position instead.\n- Documented DurableFlowNotDispatchedException on StartAsync and in\n  durable-flows.md, the owned resolver handle in security.md, and both new\n  options in configuration.md.",
+          "timestamp": "2026-08-17T17:56:37+02:00",
+          "tree_id": "a928822242601a0195e837b72a56982c78f62052",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/17c3b19c1b94a9977d1eee6ec03b842f765f8ed6"
+        },
+        "date": 1786983021194,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm p99 latency",
+            "value": 0.0615,
+            "unit": "ms"
+          },
+          {
+            "name": "waiter-storm allocations",
+            "value": 1667.40896,
+            "unit": "B/op"
+          },
+          {
+            "name": "progress-storm p99 latency",
+            "value": 3.025,
+            "unit": "ms"
+          },
+          {
+            "name": "progress-storm allocations",
+            "value": 3381.0464,
+            "unit": "B/op"
+          },
+          {
+            "name": "worker-storm allocations",
+            "value": 4954.07296,
+            "unit": "B/op"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0025,
+            "unit": "ms"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm allocations",
+            "value": 477.6768,
+            "unit": "B/op"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0026,
+            "unit": "ms"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm allocations",
+            "value": 486.6176,
+            "unit": "B/op"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0031,
+            "unit": "ms"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm allocations",
+            "value": 538.9184,
+            "unit": "B/op"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0028,
+            "unit": "ms"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm allocations",
+            "value": 458.1888,
+            "unit": "B/op"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0053,
+            "unit": "ms"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm allocations",
+            "value": 458.6784,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0053,
+            "unit": "ms"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm allocations",
+            "value": 463.7856,
+            "unit": "B/op"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0058,
+            "unit": "ms"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm allocations",
+            "value": 457.1456,
+            "unit": "B/op"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm p99 latency",
+            "value": 0.0057,
+            "unit": "ms"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm allocations",
+            "value": 604.6688,
+            "unit": "B/op"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm allocations",
+            "value": 538.9376,
+            "unit": "B/op"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm p99 latency",
+            "value": 0.0019,
+            "unit": "ms"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm allocations",
+            "value": 291.9264,
+            "unit": "B/op"
+          },
+          {
+            "name": "race-burst p99 latency",
+            "value": 0.063,
+            "unit": "ms"
+          },
+          {
+            "name": "race-burst allocations",
+            "value": 1482.5312,
+            "unit": "B/op"
+          },
+          {
+            "name": "raw-ingress-storm p99 latency",
+            "value": 0.0728,
+            "unit": "ms"
+          },
+          {
+            "name": "raw-ingress-storm allocations",
+            "value": 1875.31008,
+            "unit": "B/op"
+          },
+          {
+            "name": "shared-response-fanout p99 latency",
+            "value": 8.1046,
+            "unit": "ms"
+          },
+          {
+            "name": "shared-response-fanout allocations",
+            "value": 4958.25664,
+            "unit": "B/op"
+          },
+          {
+            "name": "exception-fanout p99 latency",
+            "value": 5.1288,
+            "unit": "ms"
+          },
+          {
+            "name": "exception-fanout allocations",
+            "value": 8563.61088,
+            "unit": "B/op"
+          },
+          {
+            "name": "timeout-storm p99 latency",
+            "value": 56.1817,
+            "unit": "ms"
+          },
+          {
+            "name": "timeout-storm allocations",
+            "value": 3046.748,
+            "unit": "B/op"
+          },
+          {
+            "name": "dispose-cleanup-storm p99 latency",
+            "value": 0.0375,
+            "unit": "ms"
+          },
+          {
+            "name": "dispose-cleanup-storm allocations",
+            "value": 1167.952,
+            "unit": "B/op"
+          },
+          {
+            "name": "context-isolation-storm p99 latency",
+            "value": 3.0668,
+            "unit": "ms"
+          },
+          {
+            "name": "context-isolation-storm allocations",
+            "value": 2783.6384,
+            "unit": "B/op"
+          },
+          {
+            "name": "watchdog-scan-storm elapsed",
+            "value": 6.4842,
+            "unit": "ms"
+          },
+          {
+            "name": "watchdog-scan-storm allocations",
+            "value": 63.5576,
+            "unit": "B/entry"
+          },
+          {
+            "name": "durable-flow-storm allocations",
+            "value": 47272.8192,
             "unit": "B/flow"
           }
         ]
