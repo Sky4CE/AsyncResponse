@@ -26,10 +26,42 @@ internal static class AsyncResponseRetry
             {
                 return await action(cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception ex) when (attempt < maxAttempts && isTransient(ex))
+            // The filter deliberately tests only the cheap, throw-free attempt count. isTransient
+            // is caller-supplied and runs in the BODY below: the CLR swallows an exception thrown
+            // inside an exception filter and evaluates the filter as false, so a predicate that
+            // faults (a null-deref on ex.InnerException, say) would silently reclassify every
+            // retryable fault as permanent and burn the whole retry budget with its own bug
+            // invisible in every log and trace.
+            catch (Exception ex) when (attempt < maxAttempts)
             {
+                if (!IsTransientOrThrow(isTransient, ex))
+                    throw;
+
                 await Task.Delay(Backoff(attempt, baseDelay, maxDelay), timeProvider ?? TimeProvider.System, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>
+    /// Evaluates the caller's transience predicate OUTSIDE an exception filter, so a predicate
+    /// that throws surfaces instead of being silently read as "not transient". Both failures are
+    /// raised together: the predicate's own fault (the bug to fix) and the exception it was
+    /// judging (the reason the retry ran at all), so neither is lost. Only reachable when the
+    /// predicate itself is broken; a well-behaved one returns and this is a plain call.
+    /// </summary>
+    private static bool IsTransientOrThrow(Func<Exception, bool> isTransient, Exception ex)
+    {
+        try
+        {
+            return isTransient(ex);
+        }
+        catch (Exception predicateFailure)
+        {
+            throw new AggregateException(
+                "The retry policy's isTransient predicate threw while classifying a fault. The predicate's own failure and the " +
+                "exception it was judging are both attached; fix the predicate — until then no fault can be classified as transient.",
+                ex,
+                predicateFailure);
         }
     }
 

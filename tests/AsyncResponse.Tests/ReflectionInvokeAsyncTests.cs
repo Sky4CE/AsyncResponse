@@ -191,7 +191,10 @@ public class ReflectionInvokeAsyncTests
     {
         var provider = new ServiceCollection().BuildServiceProvider();
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        // ThrowsAny: wiring failures carry the CallbackTargetUnresolvableException subtype so retry
+        // policies can tell them from a callback body's own fault. The contract asserted here is
+        // the InvalidOperationException shape and the message, not the exact runtime type.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = "AsyncResponse.Tests.NoSuchService",
             MethodName = "X",
@@ -206,7 +209,7 @@ public class ReflectionInvokeAsyncTests
     {
         var provider = new ServiceCollection().BuildServiceProvider(); // IInvokeTarget not registered
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
             MethodName = nameof(IInvokeTarget.RecordAsync),

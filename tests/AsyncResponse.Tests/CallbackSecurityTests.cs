@@ -63,7 +63,10 @@ public class CallbackAuthorizationTests
             Params = []
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(dto));
+        // ThrowsAny: wiring failures (unauthorized, unresolvable type, unregistered service) carry
+        // the CallbackTargetUnresolvableException subtype so retry policies can tell them from a
+        // callback body's own fault. The asserted contract is the shape and the message.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(dto));
         Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
     }
 
@@ -79,7 +82,7 @@ public class CallbackAuthorizationTests
     public async Task Allowlist_RejectsUnlistedType()
     {
         var (provider, target) = BuildProvider(b => b.AuthorizeCallbacks(a => a.Allow("Some.Other.Service")));
-        await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(TargetCall()));
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(TargetCall()));
         Assert.Empty(target.Calls);
     }
 
@@ -158,7 +161,7 @@ public class CallbackAuthorizationTests
             Params = ["flow-1"]
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(executorCall));
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(executorCall));
         Assert.Contains("not authorized", ex.Message, StringComparison.Ordinal);
     }
 
@@ -250,7 +253,7 @@ public class TypeResolutionTests
 
         await using var provider = new ServiceCollection().BuildServiceProvider();
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = missingName,
             MethodName = "X",

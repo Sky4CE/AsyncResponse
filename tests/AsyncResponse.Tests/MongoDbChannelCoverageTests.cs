@@ -749,13 +749,176 @@ public sealed class MongoDbChannelCoverageTests
         await fixture.Channel.DisposeAsync();
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Round-26 review regressions in the shared DB channel base. They live here because the fixture
+    // above is the only harness whose delivery claim actually succeeds (a mocked findOneAndUpdate),
+    // which every one of these paths runs behind.
+    // ---------------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task OneThrowingSubscription_DoesNotStrandTheRestOfTheFanOut()
+    {
+        // Regression (r26): the claim stamps acked_at and trips the publisher's confirmation
+        // BEFORE the fan-out loop runs, so the message is already consumed. Pre-fix a throw from
+        // one subscription's dispatch propagated straight out of the loop, and every subscription
+        // after it never saw a response that IsWithinWatermark now excludes from every later
+        // sweep — those waiters hung to their step timeout while the publisher saw success.
+        var fixture = new ChannelFixture();
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument());
+
+        var poisoned = fixture.Subscription(_ => new ValueTask<bool>(true));
+        var healthy = fixture.Subscription(_ => new ValueTask<bool>(true));
+
+        // Throw from the captured-context wrapper, i.e. OUTSIDE ProcessAsync's own catch — the
+        // shape the finding describes (a PushCorrelationId/ExecutionContext.Run fault, or a
+        // CleanupOnceAsync throw from CleanupCoreAsync's uncaught finally).
+        SetProperty(
+            poisoned.Instance,
+            "ProcessUnderContextAsync",
+            (Func<MongoDbChannelMessage, Task>)(_ => throw new InvalidOperationException("context wrapper exploded")));
+
+        var message = Message("""{"SchemaVersion":1,"Success":true,"Payload":{"Status":2,"Message":"fan-out"}}""");
+
+        // Still reported as a failed dispatch — the fix isolates siblings, it does not swallow.
+        var thrown = await Assert.ThrowsAsync<AggregateException>(
+            () => DispatchAsync(fixture.Channel, message, poisoned.Instance, healthy.Instance));
+        Assert.Contains(thrown.InnerExceptions, ex => ex.Message == "context wrapper exploded");
+
+        // The sibling behind the throw received the already-acked response.
+        var delivered = await healthy.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("fan-out", delivered.Message);
+    }
+
+    [Fact]
+    public async Task RecoveryStateRegisteredAt_ComesFromTheServerStampedSubscriptionStart()
+    {
+        // Regression (r26): RegisteredAtUtc was stamped with DateTime.UtcNow while the delivery
+        // watermark on the very next lines was drawn from the store's clock. The watchdog judges
+        // staleness as "utcNow - RegisteredAtUtc" from whichever host scans, so a skewed host's
+        // registrations either never aged (a stuck flow stayed invisible) or aged instantly
+        // (healthy waits paged the operator).
+        var serverNow = new DateTime(2031, 5, 4, 3, 2, 1, DateTimeKind.Utc);
+        var fixture = new ChannelFixture(serverStampedAt: serverNow);
+
+        RecoveryState? saved = null;
+        fixture.RecoveryState
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Callback<string, RecoveryState, TimeSpan, CancellationToken>((_, state, _, _) => saved = state)
+            .Returns(Task.CompletedTask);
+
+        await using var waiter = await ((IAsyncResponseSubscriber)fixture.Channel)
+            .CreateResponseWaiter<OperationResult>("corr", timeout: TimeSpan.FromMinutes(5));
+
+        Assert.NotNull(saved);
+        // Pre-fix this was the app clock (a real "now"), not the distinctive server stamp.
+        Assert.Equal(serverNow, saved.RegisteredAtUtc);
+    }
+
+    [Fact]
+    public async Task WaiterTimeout_FiresOnTheInjectedTimeProvider()
+    {
+        // Regression (r26): the waiter timeout armed CancellationTokenSource.CancelAfter on a
+        // default CTS, which is bound to the system clock. AsyncResponse.Testing's virtual clock
+        // therefore could not fire a production-sized timeout on any DB-backed channel — the
+        // in-memory channel's ArmTimeout documents that seam as the reason TimeProvider exists.
+        var time = new AsyncResponse.Testing.VirtualTimeProvider();
+        var fixture = new ChannelFixture(timeProvider: time);
+
+        await using var waiter = await ((IAsyncResponseSubscriber)fixture.Channel)
+            .CreateResponseWaiter<OperationResult>("corr", timeout: TimeSpan.FromMinutes(30));
+
+        Assert.False(waiter.ResponseTask.IsCompleted);
+
+        time.Advance(TimeSpan.FromMinutes(31));
+
+        // The MESSAGE is the assertion, not the type: WaitAsync below raises TimeoutException of
+        // its own when the task never settles, so a bare ThrowsAsync<TimeoutException> would pass
+        // on the pre-fix code for entirely the wrong reason. Only the waiter's own timeout names
+        // the correlation id.
+        var thrown = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Contains("correlationId corr", thrown.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_AwaitsExecutorRetirementsStartedByCleanup()
+    {
+        // Regression (r26): CleanupCoreAsync unlinks the correlation id and THEN fires its
+        // executor retirement on the thread pool, so DisposeAsync's own loop never saw it. The
+        // host could tear down the logger and exit while that retirement was still inside its
+        // 30-second drain budget.
+        var fixture = new ChannelFixture();
+        fixture.Messages
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new MongoChannelMessageDocument());
+
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true));
+        AddSubscription(fixture.Channel, "corr", subscription.Instance);
+
+        // A completing delivery runs CleanupCoreAsync, which unlinks the correlation id and then
+        // schedules its retirement — so DisposeAsync's own loop over _subscriptions cannot see it.
+        await DispatchAsync(
+            fixture.Channel,
+            Message("""{"SchemaVersion":1,"Success":true,"Payload":{"Status":2}}"""),
+            subscription.Instance);
+        await subscription.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var pending = (System.Collections.IDictionary)typeof(MongoDbAsyncResponseChannel)
+            .BaseType!.GetField("_pendingRetirements", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(fixture.Channel)!;
+
+        // Stand in for a retirement still inside its drain budget. Asserting only that the
+        // collection ends up EMPTY would be vacuous — it is trivially empty when nothing is
+        // tracked at all — so the assertion is that disposal BLOCKS on an outstanding entry.
+        var stillDraining = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pending[stillDraining.Task] = (byte)0;
+
+        var disposal = fixture.Channel.DisposeAsync().AsTask();
+        await Task.Delay(100);
+        Assert.False(disposal.IsCompleted, "DisposeAsync returned while an executor retirement was still draining");
+
+        stillDraining.TrySetResult();
+        await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private static IMongoCollection<BsonDocument> CountersStampedAt(DateTime drawnAt)
+    {
+        var counters = new Mock<IMongoCollection<BsonDocument>>(MockBehavior.Loose);
+        var seq = 0L;
+        counters
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<BsonDocument>>(),
+                It.IsAny<UpdateDefinition<BsonDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<BsonDocument, BsonDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(() => new BsonDocument
+            {
+                ["_id"] = "ack_seq",
+                ["seq"] = Interlocked.Increment(ref seq),
+                ["drawn_at"] = new BsonDateTime(drawnAt)
+            });
+        return counters.Object;
+    }
+
     private sealed class ChannelFixture
     {
         public ChannelFixture(
             bool autoCreateIndexes = false,
             TimeSpan? listenerPollInterval = null,
             int pendingMessageBatchSize = 64,
-            ILogger<MongoDbAsyncResponseChannel>? logger = null)
+            ILogger<MongoDbAsyncResponseChannel>? logger = null,
+            TimeProvider? timeProvider = null,
+            TimeSpan? defaultTimeout = null,
+            DateTime? serverStampedAt = null)
         {
             var options = Options.Create(new MongoDbAsyncResponseChannelOptions
             {
@@ -763,6 +926,7 @@ public sealed class MongoDbChannelCoverageTests
                 UseChangeStreams = false,
                 ListenerPollInterval = listenerPollInterval ?? TimeSpan.FromHours(1),
                 PendingMessageBatchSize = pendingMessageBatchSize,
+                DefaultTimeout = defaultTimeout,
                 DeliveryConfirmationTimeout = TimeSpan.FromMilliseconds(2),
                 DeliveryConfirmationPollInterval = TimeSpan.FromMilliseconds(1)
             });
@@ -785,6 +949,14 @@ public sealed class MongoDbChannelCoverageTests
             // counters collection alone, so a registration that reaches RunCommandAsync again
             // (the old two-round-trip draw) fails loudly on the unmocked call.
             Database.WithCounters();
+            // Must land BEFORE the store is constructed: MongoDbChannelStore resolves its
+            // collections eagerly, so a later re-setup on the database mock is never seen.
+            if (serverStampedAt is { } drawnAt)
+            {
+                Database
+                    .Setup(d => d.GetCollection<BsonDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+                    .Returns(CountersStampedAt(drawnAt));
+            }
             Subscribers
                 .Setup(c => c.CountDocumentsAsync(
                     It.IsAny<FilterDefinition<MongoChannelSubscriberDocument>>(),
@@ -826,7 +998,8 @@ public sealed class MongoDbChannelCoverageTests
                 RecoveryState.Object,
                 options,
                 new AsyncResponseContextPropagation([]),
-                logger ?? mockLogger.Object);
+                logger ?? mockLogger.Object,
+                timeProvider);
         }
 
         public Mock<IMongoDatabase> Database { get; } = new(MockBehavior.Loose);

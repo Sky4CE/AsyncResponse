@@ -92,7 +92,8 @@ internal abstract class DbAsyncResponseChannelBase :
         string providerName,
         string activityTag,
         string subscriberRecordNoun,
-        string localDispatchRetryHint)
+        string localDispatchRetryHint,
+        TimeProvider? timeProvider = null)
     {
         _store = store;
         _recoveryStateStore = recoveryStateStore;
@@ -105,9 +106,18 @@ internal abstract class DbAsyncResponseChannelBase :
         _activityTag = activityTag;
         _subscriberRecordNoun = subscriberRecordNoun;
         _localDispatchRetryHint = localDispatchRetryHint;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
-        _executors = new SerialExecutorRegistry(logger);
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
+        _executors = new SerialExecutorRegistry(logger, timeProvider: _timeProvider);
     }
+
+    /// <summary>
+    /// The engine's clock. Waiter timeouts and the delivery-confirmation wait arm on it rather
+    /// than on the wall clock, so AsyncResponse.Testing's virtual clock can fire production-sized
+    /// timeouts instantly here exactly as it already does on the in-memory channel — previously
+    /// these were the only channels whose timeout paths a virtual-clock test could not reach.
+    /// </summary>
+    private protected readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// The per-correlation channel name used as the serial-executor key and the lost-subscriber
@@ -212,7 +222,9 @@ internal abstract class DbAsyncResponseChannelBase :
             tcs,
             activity);
 
-        var timeoutCts = new CancellationTokenSource();
+        // Clock-injected: CancelAfter on a default CTS is bound to the system clock, so a virtual
+        // clock could never fire a production-sized waiter timeout on this channel.
+        var timeoutCts = new CancellationTokenSource(Timeout.InfiniteTimeSpan, _timeProvider);
         CancellationTokenRegistration timeoutRegistration = default;
         subscription.TimeoutRegistration = () => timeoutRegistration.DisposeAsync();
         subscription.TimeoutCancellation = timeoutCts;
@@ -250,7 +262,13 @@ internal abstract class DbAsyncResponseChannelBase :
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
                 PayloadTypeFullName = typeof(T).FullName,
-                RegisteredAtUtc = DateTime.UtcNow,
+                // The SERVER-stamped subscription start, not the app clock. The watchdog judges
+                // staleness as "utcNow - RegisteredAtUtc" from whichever host scans, so an
+                // app-clock stamp made a skewed host's registrations either never age (skew
+                // ahead: a genuinely stuck flow stays invisible) or age instantly (skew behind:
+                // healthy waits page the operator). This is the same clock the delivery watermark
+                // above is drawn from, and for the same reason.
+                RegisteredAtUtc = startedAtUtc.UtcDateTime,
                 Context = _propagation.Capture()
             };
             // Subscriber record BEFORE recovery state: "recovery state visible ⇒ subscription
@@ -611,6 +629,21 @@ internal abstract class DbAsyncResponseChannelBase :
             merged[entry.Key] = entry.Value;
     }
 
+    // Executor retirements started off the cleanup path (see CleanupCoreAsync). Keyed by the task
+    // itself and self-evicting, so a long-lived channel never accumulates completed entries.
+    private readonly ConcurrentDictionary<Task, byte> _pendingRetirements = new();
+
+    private void TrackRetirement(Task retirement)
+    {
+        _pendingRetirements[retirement] = 0;
+        _ = retirement.ContinueWith(
+            static (completed, state) => ((ConcurrentDictionary<Task, byte>)state!).TryRemove(completed, out _),
+            _pendingRetirements,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
     private void ThrowIfDisposed()
     {
         lock (_listenerGate)
@@ -681,7 +714,16 @@ internal abstract class DbAsyncResponseChannelBase :
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "{Provider} subscriber heartbeat failed; retrying for all local waiters.", _providerName);
+                // Distinct from the inner catch's message, which reports a failed store upsert
+                // that the drop compensation below it still runs. Reaching HERE means the round's
+                // own bookkeeping broke — the snapshot, or the compensating deletes — so subscriber
+                // rows dropped mid-round stay resurrected and suppress lost-subscriber recovery for
+                // their correlation ids until the heartbeat timeout. Different cause, different
+                // operator response, so it must not read identically.
+                _logger.LogWarning(
+                    ex,
+                    "{Provider} subscriber heartbeat round failed outside the store upsert (snapshot or drop compensation); subscriber records dropped during this round may linger until the heartbeat timeout.",
+                    _providerName);
             }
         }
     }
@@ -859,17 +901,26 @@ internal abstract class DbAsyncResponseChannelBase :
         ConcurrentDictionary<Guid, IDbSubscription> group,
         CancellationToken cancellationToken)
     {
+        // The oldest watermark is folded into the pass that builds the list: this runs per
+        // correlation id on every sweep tick AND on every publish's targeted scan, so a separate
+        // LINQ Min() was one enumerator allocation and one delegate call per element on the
+        // dispatch hot path, over a list this loop has in hand anyway.
         var subscriptions = new List<IDbSubscription>(group.Count);
+        var oldestStartedAtUtc = DateTimeOffset.MaxValue;
         foreach (var subscription in group.Values)
         {
-            if (!subscription.Dropped)
-                subscriptions.Add(subscription);
+            if (subscription.Dropped)
+                continue;
+
+            subscriptions.Add(subscription);
+            if (subscription.StartedAtUtc < oldestStartedAtUtc)
+                oldestStartedAtUtc = subscription.StartedAtUtc;
         }
         if (subscriptions.Count == 0)
             return;
 
-        var since = subscriptions.Min(static s => s.StartedAtUtc).AddSeconds(-1);
-        var seenCutoff = DateTimeOffset.UtcNow - _options.MessageRetention - TimeSpan.FromMinutes(1);
+        var since = oldestStartedAtUtc.AddSeconds(-1);
+        var seenCutoff = _timeProvider.GetUtcNow() - _options.MessageRetention - TimeSpan.FromMinutes(1);
         foreach (var subscription in subscriptions)
             subscription.PruneSeen(seenCutoff);
 
@@ -989,13 +1040,40 @@ internal abstract class DbAsyncResponseChannelBase :
         if (_pendingConfirmations.TryGetValue(message.Id, out var confirmation))
             confirmation.TrySetResult(true);
 
+        // Per-subscription isolation is load-bearing, not defensive tidiness. The claim above
+        // already stamped acked_at and tripped the publisher's confirmation, so this message is
+        // consumed: IsWithinWatermark excludes it from every later sweep and the lost-subscriber
+        // path will never see it. If one subscription's dispatch throws OUTSIDE ProcessAsync's own
+        // catch — a fault in the captured-context wrapper, or CleanupOnceAsync throwing from
+        // CleanupCoreAsync's uncaught finally, which replaces the swallowed exception — letting it
+        // propagate would strand every subscription after it in this fan-out until its step
+        // timeout, with the response gone. Record the first fault and rethrow only after every
+        // sibling has had the message, so the dispatch is still reported as failed.
+        List<Exception>? failures = null;
         foreach (var subscription in subscriptions)
         {
             if (subscription.Dropped || !IsWithinWatermark(subscription, message) || !subscription.MarkSeen(message.Id))
                 continue;
 
-            await subscription.ProcessUnderContextAsync(message).ConfigureAwait(false);
+            try
+            {
+                await subscription.ProcessUnderContextAsync(message).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogError(
+                    ex,
+                    "Delivering the {Provider} response for correlationId {CorrelationId} to one waiter failed; the remaining waiters for this correlation id still receive it.",
+                    _providerName,
+                    message.CorrelationId);
+                (failures ??= []).Add(ex);
+            }
         }
+
+        // Always aggregated, never a bare rethrow of failures[0]: a rethrow would reset that
+        // exception's stack trace, and AggregateException carries every inner one intact.
+        if (failures is not null)
+            throw new AggregateException($"Delivering the response for correlationId {message.CorrelationId} failed for {failures.Count} waiter(s).", failures);
     }
 
     /// <summary>
@@ -1135,21 +1213,35 @@ internal abstract class DbAsyncResponseChannelBase :
 
     private async Task<bool> WaitForAcknowledgementAsync(PendingConfirmation confirmation, CancellationToken cancellationToken)
     {
-        var deadline = DateTimeOffset.UtcNow + _options.DeliveryConfirmationTimeout;
-        while (DateTimeOffset.UtcNow < deadline)
-        {
-            var remaining = deadline - DateTimeOffset.UtcNow;
-            if (remaining <= TimeSpan.Zero)
-                break;
+        var deadline = _timeProvider.GetUtcNow() + _options.DeliveryConfirmationTimeout;
 
+        // One `remaining` computation drives both the loop condition and the poll delay: the old
+        // shape tested the deadline twice, one line apart, so the code read as if two different
+        // conditions mattered when the second could only ever agree with the first.
+        //
+        // The fast-path wait is a WaitAsync on the confirmation rather than a fresh Task.Delay
+        // raced by WhenAny. WhenAny abandoned its loser every iteration, so the overwhelmingly
+        // common same-process delivery left a live timer entry and a registration on the caller's
+        // token behind on every publish; WaitAsync tears its timer down when the confirmation
+        // wins. A lapsed poll interval surfaces as TimeoutException, which is the loop condition,
+        // not a failure.
+        for (var remaining = deadline - _timeProvider.GetUtcNow();
+             remaining > TimeSpan.Zero;
+             remaining = deadline - _timeProvider.GetUtcNow())
+        {
             var pollDelay = remaining < _options.DeliveryConfirmationPollInterval
                 ? remaining
                 : _options.DeliveryConfirmationPollInterval;
 
-            // Fast path: an in-process delivery trips the completion and we return without a query.
-            await Task.WhenAny(confirmation.Delivered, Task.Delay(pollDelay, cancellationToken)).ConfigureAwait(false);
-            if (confirmation.Delivered.IsCompletedSuccessfully)
-                return true;
+            try
+            {
+                // Fast path: an in-process delivery trips the completion and we return without a query.
+                return await confirmation.Delivered.WaitAsync(pollDelay, _timeProvider, cancellationToken).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // Nothing local within this poll interval; fall through to the store check.
+            }
 
             // Slow path: a delivery in another process only set acked_at, so poll for it.
             if (await _store.IsMessageAcknowledgedAsync(confirmation.MessageId, cancellationToken).ConfigureAwait(false))
@@ -1291,6 +1383,15 @@ internal abstract class DbAsyncResponseChannelBase :
                 await subscription.DrainThenCleanupAsync(deleteRecoveryState: false).ConfigureAwait(false);
             await _executors.RemoveAsync(ChannelName(correlationId)).ConfigureAwait(false);
         }
+
+        // Retirements for subscriptions that cleaned themselves up (a response landing during
+        // shutdown) unlink their correlation id before scheduling, so the loop above never sees
+        // them. Awaiting them here is what makes disposal mean "every executor is retired" rather
+        // than "every executor still in the map is retired". Their bodies swallow, so this cannot
+        // throw; the drain budgets inside RemoveAsync bound how long it can take.
+        var retirements = _pendingRetirements.Keys.ToArray();
+        if (retirements.Length > 0)
+            await Task.WhenAll(retirements).ConfigureAwait(false);
     }
 
     /// <summary>Scopes an in-process delivery completion; <see cref="Dispose"/> unregisters it.</summary>
@@ -1384,7 +1485,10 @@ internal abstract class DbAsyncResponseChannelBase :
 
                 // Use the local observation time, not the database creation time. This keeps the
                 // pruning queue monotonic and avoids immediate eviction when app and DB clocks differ.
-                _seenOrder.Enqueue((messageId, DateTimeOffset.UtcNow));
+                // It MUST come from the same clock PruneSeen's cutoff is computed on: mixing a
+                // wall-clock stamp with a TimeProvider cutoff makes every entry look either
+                // permanently fresh or permanently expired under a virtual clock.
+                _seenOrder.Enqueue((messageId, _owner._timeProvider.GetUtcNow()));
                 return true;
             }
         }
@@ -1589,8 +1693,13 @@ internal abstract class DbAsyncResponseChannelBase :
                 // Schedule the executor retirement on the thread pool; do not await directly —
                 // dispatch-loop deliveries run this cleanup ON the executor, and RemoveAsync waits
                 // for the executor's drain loop to finish, which would be a circular await.
+                // TRACKED, though: RemoveSubscription above already unlinked this correlation id,
+                // so DisposeAsync's own retirement loop will not see it, and an untracked
+                // retirement could still be inside its 30-second drain budget when the host tears
+                // down the logger and exits — logging into a disposed logger, or being killed
+                // mid-drain. DisposeAsync awaits whatever is still outstanding here.
                 var channelName = _owner.ChannelName(_correlationId);
-                _ = Task.Run(async () =>
+                _owner.TrackRetirement(Task.Run(async () =>
                 {
                     try
                     {
@@ -1600,7 +1709,7 @@ internal abstract class DbAsyncResponseChannelBase :
                     {
                         _owner._logger.LogError(ex, "Failed to retire the executor for channel {Channel}.", channelName);
                     }
-                });
+                }));
 
                 if (TimeoutRegistration is not null)
                     await TimeoutRegistration().ConfigureAwait(false);

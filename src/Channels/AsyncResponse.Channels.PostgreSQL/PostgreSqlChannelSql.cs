@@ -732,24 +732,17 @@ internal sealed class PostgreSqlChannelSql
     /// <summary>PostgreSQL's identifier length cap (NAMEDATALEN - 1); longer names are silently truncated server-side.</summary>
     internal const int IdentifierCap = 63;
 
-    // Suffix space is RESERVED before capping in BOTH derived-name helpers: truncating the whole
+    // Suffix space is RESERVED before capping in BOTH derived-name helpers (see
+    // RelationalNamePlan.DerivedName, the shared implementation): truncating the whole
     // "{table}{suffix}" let a maximum-length table name produce exactly the table's own name — the
     // derived object then collided with the table (indexes, sequences, and tables share one
     // relation namespace), CREATE ... IF NOT EXISTS silently skipped it, and the store ran with a
     // missing sequence (runtime failure) or missing indexes (silent full scans).
     private static string IndexName(string table, string suffix)
-    {
-        var tail = $"_{suffix}_idx";
-        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
-        return stem + tail;
-    }
+        => RelationalNamePlan.DerivedName(table, $"_{suffix}_idx", IdentifierCap);
 
     private static string SequenceName(string table)
-    {
-        const string suffix = "_ack_seq";
-        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
-        return stem + suffix;
-    }
+        => RelationalNamePlan.DerivedName(table, "_ack_seq", IdentifierCap);
 
     /// <summary>
     /// Validates the complete effective object-name plan — configured tables plus every derived

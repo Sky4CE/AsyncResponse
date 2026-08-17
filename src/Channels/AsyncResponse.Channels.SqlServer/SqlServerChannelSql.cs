@@ -790,18 +790,10 @@ internal sealed class SqlServerChannelSql
     // the table's two indexes derive one shared name (the second IF NOT EXISTS guard matched the
     // first index and silently skipped creation).
     private static string SequenceName(string table)
-    {
-        const string suffix = "_ack_seq";
-        var stem = table.Length <= IdentifierCap - suffix.Length ? table : table[..(IdentifierCap - suffix.Length)];
-        return stem + suffix;
-    }
+        => RelationalNamePlan.DerivedName(table, "_ack_seq", IdentifierCap);
 
     private static string IndexName(string table, string suffix)
-    {
-        var tail = $"_{suffix}_idx";
-        var stem = table.Length <= IdentifierCap - tail.Length ? table : table[..(IdentifierCap - tail.Length)];
-        return stem + tail;
-    }
+        => RelationalNamePlan.DerivedName(table, $"_{suffix}_idx", IdentifierCap);
 
     /// <summary>
     /// Validates the effective schema-object name plan: the three configured tables plus the

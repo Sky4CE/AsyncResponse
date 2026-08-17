@@ -25,7 +25,8 @@ internal sealed class MongoDbAsyncResponseChannel : DbAsyncResponseChannelBase
         IRecoveryStateStore recoveryStateStore,
         IOptions<MongoDbAsyncResponseChannelOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<MongoDbAsyncResponseChannel> logger)
+        ILogger<MongoDbAsyncResponseChannel> logger,
+        TimeProvider? timeProvider = null)
         : base(
             scopeFactory,
             store,
@@ -37,7 +38,8 @@ internal sealed class MongoDbAsyncResponseChannel : DbAsyncResponseChannelBase
             providerName: "MongoDB",
             activityTag: "mongodb",
             subscriberRecordNoun: "document",
-            localDispatchRetryHint: "listener retry will pick it up")
+            localDispatchRetryHint: "listener retry will pick it up",
+            timeProvider)
     {
     }
 

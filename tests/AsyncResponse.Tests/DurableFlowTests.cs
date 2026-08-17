@@ -962,7 +962,7 @@ public class DurableFlowTests
         Expression<Func<FlowProbe, Task>> other = probe => probe.RecordTrigger("x");
         var otherDto = CallbackExpressionConverter.ToReflectionCall(other);
         var otherInvocation = ReflectionExtensions.ResolveCallback(otherDto, payload: null, exception: null, correlationId: "x");
-        await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(otherInvocation));
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(otherInvocation));
     }
 
     private sealed class ScopedStoreDependency;

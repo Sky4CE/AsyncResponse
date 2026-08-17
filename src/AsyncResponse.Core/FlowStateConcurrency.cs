@@ -44,6 +44,12 @@ internal static class FlowStateConcurrency
     /// </summary>
     internal static string? FlowIdNotPortable(string flowId)
     {
+        // Length-guarded before the [0]/[^1] probe below: this is the single door every create
+        // walks through and its contract is to RETURN a rejection, so an empty id must not throw
+        // IndexOutOfRangeException out of the very method whose job is to explain bad ids.
+        if (flowId.Length == 0)
+            return "Flow id is empty. A run needs an id to be addressable by its wake-ups, child flows, and recovery callbacks.";
+
         if (flowId.Length > DurableFlowOptions.MaxFlowIdLength)
         {
             return $"Flow id '{Excerpt(flowId)}' is {flowId.Length} UTF-16 code units; the portable maximum is " +
@@ -90,8 +96,7 @@ internal static class FlowStateConcurrency
         "Budget root ids for growth: child flows append \":{stepName}\" to the parent id, and scheduled flows wrap the schedule " +
         "name as \"sched:{name}:{timestamp}\".";
 
-    private static string Excerpt(string flowId)
-        => flowId.Length <= 40 ? flowId : string.Concat(flowId.AsSpan(0, 40), "…");
+    private static string Excerpt(string flowId) => PortableText.Excerpt(flowId);
 
     public static async Task<FlowExecutionLease?> TryAcquireExecutionLeaseAsync(
         IFlowStateStore store,

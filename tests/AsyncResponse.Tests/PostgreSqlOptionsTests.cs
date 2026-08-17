@@ -67,7 +67,7 @@ public sealed class PostgreSqlOptionsTests
                 options.MessageTable = new string('m', 63);
                 options.SubscriberTable = string.Concat(new string('m', 51), new string('x', 12));
             },
-            "both resolve to");
+            "resolve to the same name");
     }
 
     [Fact]

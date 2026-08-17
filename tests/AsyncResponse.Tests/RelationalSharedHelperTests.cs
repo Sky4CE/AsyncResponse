@@ -98,7 +98,8 @@ public sealed class RelationalSharedHelperTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlChannelSql.ValidateNamePlan(options));
         Assert.Equal(
-            "PostgreSqlAsyncResponseChannelOptions: the RecoveryStateTable table and the MessageTable table both resolve to 'shared_tbl'. " +
+            "PostgreSqlAsyncResponseChannelOptions: the RecoveryStateTable table ('shared_tbl') and the MessageTable table " +
+            "('shared_tbl') resolve to the same name — object names are compared case-insensitively. " +
             "All tables and the index/sequence names derived from them share one namespace and must be distinct " +
             "(long names reserve suffix space by truncating the table stem, which can make distinct tables derive " +
             "the same name). Shorten or de-overlap the configured table names.",
@@ -116,7 +117,8 @@ public sealed class RelationalSharedHelperTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => SqlServerChannelSql.ValidateNamePlan(options));
         Assert.Equal(
-            "SqlServerAsyncResponseChannelOptions: the RecoveryStateTable table and the MessageTable table both resolve to 'shared_tbl'. " +
+            "SqlServerAsyncResponseChannelOptions: the RecoveryStateTable table ('shared_tbl') and the MessageTable table " +
+            "('shared_tbl') resolve to the same name — object names are compared case-insensitively. " +
             "Tables and the sequence derived from MessageTable share one schema-object namespace and must be distinct " +
             "(long names reserve suffix space by truncating the table stem). Shorten or de-overlap the configured table names.",
             ex.Message);
@@ -132,8 +134,9 @@ public sealed class RelationalSharedHelperTests
 
         var ex = Assert.Throws<InvalidOperationException>(() => PostgreSqlTransportOptionsValidator.ValidateCommon(options));
         Assert.Equal(
-            "PostgreSqlAsyncResponseTransportOptions: the MessageTable table and the claim index (derived from MessageTable) both resolve to " +
-            $"'{messageTable}'; rename MessageTable so the derived index names stay distinct.",
+            $"PostgreSqlAsyncResponseTransportOptions: the MessageTable table ('{messageTable}') and the claim index (derived from " +
+            $"MessageTable) ('{messageTable}') resolve to the same name — object names are compared case-insensitively" +
+            "; rename MessageTable so the derived index names stay distinct.",
             ex.Message);
     }
 

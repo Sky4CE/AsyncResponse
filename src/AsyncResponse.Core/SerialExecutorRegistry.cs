@@ -19,7 +19,11 @@ namespace AsyncResponse;
 /// for the same channel, briefly violating the per-channel ordering guarantee.
 /// </para>
 /// </summary>
-internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeDrainLimit = null)
+internal sealed class SerialExecutorRegistry(
+    ILogger _logger,
+    TimeSpan? disposeDrainLimit = null,
+    TimeSpan? enqueueDrainLimit = null,
+    TimeProvider? timeProvider = null)
 {
     // How long a retired channel's tombstone blocks executor re-creation. Long enough to outlive
     // any enqueue that was already in flight when cleanup retired the executor, short enough that
@@ -40,8 +44,20 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
 
     private readonly TimeSpan _disposeDrainLimit = disposeDrainLimit ?? DisposeDrainLimit;
 
+    // Overridable alongside _disposeDrainLimit: RemoveAsync waits on BOTH budgets in sequence, so
+    // a caller that could shorten only one still paid the other's full 30 seconds — and the
+    // worst-case retirement became "the value I passed, plus 30s" rather than the value passed.
+    private readonly TimeSpan _enqueueDrainLimit = enqueueDrainLimit ?? EnqueueDrainLimit;
+
+    // Tombstone expiry runs on the injected clock so a virtual-clock harness can advance past
+    // TombstoneLifetime instead of sleeping 30 real seconds. Without it, the drop-a-delivery
+    // branch in EnqueueAsync (and tombstone pruning) could not be covered deterministically.
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+
+    private DateTimeOffset UtcNow => _timeProvider.GetUtcNow();
+
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTime> _tombstones = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _tombstones = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _registrations = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
@@ -208,13 +224,13 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
                 // completes the executor's writer, which unparks the wedged producer, and its
                 // retry then lands on the tombstone/recreate machinery built for exactly the
                 // enqueue-races-retirement case.
-                await waitForEnqueues.WaitAsync(EnqueueDrainLimit).ConfigureAwait(false);
+                await waitForEnqueues.WaitAsync(_enqueueDrainLimit, _timeProvider).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
                 _logger.LogWarning(
                     "Timed out after {DrainLimit} waiting for in-flight enqueues on channel {Channel} to drain; disposing the executor anyway.",
-                    EnqueueDrainLimit,
+                    _enqueueDrainLimit,
                     channel);
             }
 
@@ -225,7 +241,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
                 // before disposal first awaits, so the abandoned loop drains and exits on its own
                 // if the wedged item ever finishes; retiring the entry regardless (the finally
                 // below) keeps the channel key usable for future waiters.
-                await entry.Executor.DisposeAsync().AsTask().WaitAsync(_disposeDrainLimit).ConfigureAwait(false);
+                await entry.Executor.DisposeAsync().AsTask().WaitAsync(_disposeDrainLimit, _timeProvider).ConfigureAwait(false);
             }
             catch (TimeoutException)
             {
@@ -245,7 +261,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
                 // Tombstone the retired channel so an enqueue that raced this retirement cannot
                 // recreate a leaked executor; ClearTombstone lifts it the moment a new
                 // subscription legitimately reuses the channel.
-                _tombstones[channel] = DateTime.UtcNow + TombstoneLifetime;
+                _tombstones[channel] = UtcNow + TombstoneLifetime;
                 PruneTombstonesUnderLock();
             }
 
@@ -258,7 +274,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
         if (!_tombstones.TryGetValue(channel, out var expiresAtUtc))
             return false;
 
-        if (expiresAtUtc > DateTime.UtcNow)
+        if (expiresAtUtc > UtcNow)
             return true;
 
         _tombstones.Remove(channel);
@@ -270,7 +286,7 @@ internal sealed class SerialExecutorRegistry(ILogger _logger, TimeSpan? disposeD
         if (_tombstones.Count == 0)
             return;
 
-        var now = DateTime.UtcNow;
+        var now = UtcNow;
         List<string>? expired = null;
         foreach (var (channel, expiresAtUtc) in _tombstones)
         {

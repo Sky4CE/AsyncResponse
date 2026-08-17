@@ -242,8 +242,8 @@ public sealed class CoreUncoveredPathTests
         Assert.Equal(second.RegistrationId, Assert.Single(states).RegistrationId);
     }
 
-    private static Dictionary<string, DateTime> Tombstones(SerialExecutorRegistry registry)
-        => (Dictionary<string, DateTime>)typeof(SerialExecutorRegistry)
+    private static Dictionary<string, DateTimeOffset> Tombstones(SerialExecutorRegistry registry)
+        => (Dictionary<string, DateTimeOffset>)typeof(SerialExecutorRegistry)
             .GetField("_tombstones", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(registry)!;
 

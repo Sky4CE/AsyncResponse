@@ -46,6 +46,38 @@ internal static class PortableText
         return -1;
     }
 
+    /// <summary>
+    /// Finds the first control character, or <c>-1</c> when there is none.
+    /// <para>
+    /// Control characters are not merely ugly in diagnostics: U+0000 in particular is rejected
+    /// outright by PostgreSQL's <c>text</c> type (SQLSTATE 22021, "invalid byte sequence for
+    /// encoding UTF8: 0x00") while SQL Server's <c>nvarchar</c> stores it happily, so an id
+    /// carrying one exists on one store and fails at its first write on another — the opposite of
+    /// portable, and diagnosed only as an opaque driver error far from the call site.
+    /// </para>
+    /// </summary>
+    internal static int IndexOfControlCharacter(string value)
+    {
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (char.IsControl(value[index]))
+                return index;
+        }
+
+        return -1;
+    }
+
+    /// <summary>The rejection message for a control character, worded for the given kind of id.</summary>
+    internal static string ControlCharacterRejection(string kind, string excerpt, char offending, int index)
+        => $"{kind} '{excerpt}' contains the control character \\u{(int)offending:x4} at index {index}. Control characters are not " +
+            "portable: PostgreSQL rejects U+0000 in a text column outright (22021) while SQL Server stores it, so the same id " +
+            "succeeds on one store and fails at its first write on another, and control characters corrupt diagnostics " +
+            "everywhere. Use a printable id.";
+
+    /// <summary>The shared 40-character excerpt used when quoting an offending id back to the caller.</summary>
+    internal static string Excerpt(string value)
+        => value.Length <= 40 ? value : string.Concat(value.AsSpan(0, 40), "…");
+
     /// <summary>The rejection message for an unpaired surrogate, worded for the given kind of id.</summary>
     internal static string IllFormedUtf16Rejection(string kind, string excerpt, char offending, int index)
         => $"{kind} '{excerpt}' is not well-formed UTF-16: the code unit at index {index} (\\u{(int)offending:x4}) is an unpaired " +

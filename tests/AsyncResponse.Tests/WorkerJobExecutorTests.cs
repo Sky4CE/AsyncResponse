@@ -79,7 +79,7 @@ public class WorkerJobExecutorTests
             provider.GetRequiredService<IServiceScopeFactory>(),
             NullLogger<WorkerJobExecutor>.Instance);
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(new WorkerJobEnvelope
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => executor.ExecuteAsync(new WorkerJobEnvelope
         {
             Call = new ReflectionCallDto
             {

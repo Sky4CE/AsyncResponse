@@ -23,7 +23,8 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
         IRecoveryStateStore recoveryStateStore,
         IOptions<PostgreSqlAsyncResponseChannelOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<PostgreSqlAsyncResponseChannel> logger)
+        ILogger<PostgreSqlAsyncResponseChannel> logger,
+        TimeProvider? timeProvider = null)
         : base(
             scopeFactory,
             sql,
@@ -35,7 +36,8 @@ internal sealed class PostgreSqlAsyncResponseChannel : DbAsyncResponseChannelBas
             providerName: "PostgreSQL",
             activityTag: "postgresql",
             subscriberRecordNoun: "row",
-            localDispatchRetryHint: "listener retry will pick it up")
+            localDispatchRetryHint: "listener retry will pick it up",
+            timeProvider)
     {
     }
 

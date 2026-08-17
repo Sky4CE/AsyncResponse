@@ -61,6 +61,26 @@ public sealed class AsyncResponseWatchdogOptions
         if (ProbeConcurrency < 1)
             throw new InvalidOperationException(
                 $"{nameof(AsyncResponseWatchdogOptions)}.{nameof(ProbeConcurrency)} must be at least 1.");
+
+        // The buffer cap gates growth with ">= MaxScanEntries", so a non-positive value truncates
+        // on the FIRST entry: every scan then classifies an empty set and publishes a report that
+        // is Truncated with zeroed counters. The health check degrades permanently and no stale
+        // registration is ever reported — the stuck-flow alarm is silently off while the logs
+        // still show a scan completing each interval. Nothing later in the scan can catch this,
+        // so it has to fail here. ("Unlimited" is not a supported value: the cap is a memory
+        // bound, and int.MaxValue is the way to ask for effectively no limit.)
+        if (MaxScanEntries < 1)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseWatchdogOptions)}.{nameof(MaxScanEntries)} must be at least 1; it bounds scan memory, " +
+                $"so use {int.MaxValue} for effectively no limit rather than zero.");
+
+        // Staleness is judged as "utcNow - registeredAtUtc >= StaleAfter", so a non-positive
+        // threshold makes EVERY live registration stale and logs a Warning per entry on every
+        // scan — an alarm that fires constantly is the same as no alarm at all.
+        if (StaleAfter <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"{nameof(AsyncResponseWatchdogOptions)}.{nameof(StaleAfter)} must be positive; a non-positive threshold reports " +
+                "every live registration as stale.");
     }
 }
 

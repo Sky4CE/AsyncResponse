@@ -360,35 +360,56 @@ internal sealed class DurableFlowContext : IDurableFlowContext
     /// as before). Failures log and return: this run's own checkpoint already latched, and
     /// faulting the park over ancestor insurance would re-run the step for a write the next long
     /// park retries anyway.
+    /// <para>
+    /// SINGLE-SHOT per ancestor, deliberately NOT <see cref="FlowStateConcurrency.MutateAsync"/>:
+    /// every write here advances the ancestor's <c>Revision</c>, which invalidates the
+    /// compare-and-swap of an ancestor execution that currently holds a lease. MutateAsync's
+    /// eight-attempt retry turned one such collision into a fight — each winning round killed
+    /// another of the live ancestor's checkpoints, abandoning its delivery for redelivery and
+    /// re-running everything since its last checkpoint, all for a write whose only purpose was a
+    /// TTL stamp. Losing the CAS is therefore treated as SUCCESS, not as something to retry: a
+    /// concurrent writer means the ancestor is alive and checkpointing, and every checkpoint
+    /// re-stamps its expiry — this insurance exists only for an ancestor that is parked and
+    /// therefore silent. The walk still continues upward, because a grandparent can be parked
+    /// behind an actively-executing parent.
+    /// </para>
     /// </summary>
     private async Task ExtendAncestorLedgersAsync(TimeSpan ttl, CancellationToken cancellationToken)
     {
         var ancestorId = _state.ParentFlowId;
         for (var depth = 0; ancestorId is not null && depth < MaxAncestorLedgerDepth; depth++)
         {
-            string? next = null;
-            var running = false;
             try
             {
-                var found = await FlowStateConcurrency.MutateAsync(
-                    _store,
-                    ancestorId,
-                    ttl,
-                    _timeProvider,
-                    state =>
-                    {
-                        next = state.ParentFlowId;
-                        running = state.Status == FlowRunStatus.Running;
-                        return running;
-                    },
-                    cancellationToken).ConfigureAwait(false);
-                if (!found)
+                var ancestor = await _store.LoadAsync(ancestorId, cancellationToken).ConfigureAwait(false);
+                if (ancestor is null)
                 {
                     _logger.LogWarning(
                         "Flow {FlowId} parked for {Ttl} but ancestor flow {AncestorFlowId} has no state (expired or deleted); its chain keeps the current expiry.",
                         FlowId, ttl, ancestorId);
                     return;
                 }
+
+                if (ancestor.Status != FlowRunStatus.Running)
+                    return;
+
+                var expectedRevision = ancestor.Revision;
+                ancestor.Revision = checked(expectedRevision + 1);
+                ancestor.UpdatedAtUtc = UtcNow;
+                if (!await _store.TryUpdateAsync(
+                        ancestorId,
+                        ancestor,
+                        expectedRevision,
+                        ttl,
+                        leaseId: null,
+                        cancellationToken).ConfigureAwait(false))
+                {
+                    _logger.LogDebug(
+                        "Flow {FlowId} skipped extending ancestor flow {AncestorFlowId}'s ledger TTL: a concurrent write won the revision, so the ancestor is live and re-stamping its own expiry.",
+                        FlowId, ancestorId);
+                }
+
+                ancestorId = ancestor.ParentFlowId;
             }
             catch (OperationCanceledException)
             {
@@ -402,10 +423,6 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                     FlowId, ancestorId, ttl);
                 return;
             }
-
-            if (!running)
-                return;
-            ancestorId = next;
         }
     }
 

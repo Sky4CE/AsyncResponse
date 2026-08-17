@@ -215,11 +215,31 @@ internal static class DurableFlowStoreShared
     /// truncating the whole "{table}{suffix}" lets a maximum-length table name derive its own
     /// name — on providers where indexes share the table namespace the DDL is then silently
     /// skipped, on the rest it fails outright.
+    /// <para>
+    /// Kept in step with <c>AsyncResponse.Internal.RelationalNamePlan.DerivedName</c>, which is
+    /// the same rule for the channel and transport packages. The two cannot be one method: this
+    /// file is source-linked into all nine flow stores, and RelationalNamePlan is linked only
+    /// into the four relational channel/transport packages that need a name plan.
+    /// </para>
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="suffix"/> leaves no room for a stem inside <paramref name="identifierCap"/>.
+    /// Guarded explicitly: the slice below would otherwise take a negative length and fail schema
+    /// creation with a bare index-out-of-range naming neither the suffix nor the cap.
+    /// </exception>
     public static string DerivedName(string tableName, string suffix, int identifierCap)
     {
         if (identifierCap <= 0 || tableName.Length + suffix.Length <= identifierCap)
             return tableName + suffix;
+
+        if (suffix.Length >= identifierCap)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(suffix),
+                $"The derived-name suffix '{suffix}' is {suffix.Length} characters, which leaves no room for a table stem inside " +
+                $"the {identifierCap}-character identifier limit. Shorten the suffix.");
+        }
+
         return tableName[..(identifierCap - suffix.Length)] + suffix;
     }
 

@@ -516,17 +516,10 @@ internal sealed class PostgreSqlTransportStore
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
 
-    // Suffix space is RESERVED before capping (mirrors the channel store's derived-name rule):
-    // truncating the whole "{table}_{suffix}_idx" let a maximum-length queue table derive its own
-    // name for both indexes — CREATE INDEX IF NOT EXISTS matched the table relation and silently
-    // created neither.
+    // Suffix space is RESERVED before capping; see RelationalNamePlan.DerivedName for why and for
+    // the single implementation this and the SQL Server / channel stores all share.
     internal static string IndexName(string table, string suffix)
-    {
-        var tail = $"_{suffix}_idx";
-        const int identifierCap = 63;
-        var stem = table.Length <= identifierCap - tail.Length ? table : table[..(identifierCap - tail.Length)];
-        return stem + tail;
-    }
+        => RelationalNamePlan.DerivedName(table, $"_{suffix}_idx", identifierCap: 63);
 
     private static readonly TimeSpan DeadLetterPruneThrottle = TimeSpan.FromMinutes(1);
 

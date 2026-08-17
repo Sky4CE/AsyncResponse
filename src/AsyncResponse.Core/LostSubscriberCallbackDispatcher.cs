@@ -443,13 +443,21 @@ internal sealed class LostSubscriberCallbackDispatcher(
             // callback is re-invocable by contract (broker redelivery re-invokes it the same way),
             // and a one-shot invoke turned a transient dependency blip into a silently dropped
             // domain-failure signal that nothing ever revisited (the watchdog is report-only).
+            //
+            // Retry only what a retry can fix. A blanket "everything is transient" spent the full
+            // ~1.75s backoff ladder on faults that are deterministic by construction — a callback
+            // whose target is not registered in DI, or whose persisted type/method no longer
+            // resolves, fails identically on attempt 4 — so a single misconfiguration taxed EVERY
+            // lost-response dispatch on the publisher's thread and compounded with the transport's
+            // own redelivery. Those cases now fail fast and loudly on the first attempt; genuine
+            // dependency blips keep the full ladder.
             await AsyncResponseRetry.ExecuteAsync(
                 async _ =>
                 {
                     await InvokeAsync(invocation, recoveryState.Context).ConfigureAwait(false);
                     return true;
                 },
-                isTransient: static _ => true,
+                isTransient: static ex => !IsPermanentCallbackFailure(ex),
                 maxAttempts: 4,
                 baseDelay: TimeSpan.FromMilliseconds(250),
                 maxDelay: TimeSpan.FromSeconds(2),
@@ -474,6 +482,26 @@ internal sealed class LostSubscriberCallbackDispatcher(
             return false;
         }
     }
+
+    /// <summary>
+    /// Whether a failed callback invocation is deterministic — the same call will fail the same
+    /// way on every attempt, so retrying only burns the backoff ladder on the publish path.
+    /// <para>
+    /// Narrow on purpose: only faults raised while WIRING UP the call qualify — the target is
+    /// unauthorized, its persisted type no longer resolves, its service is not registered
+    /// (<see cref="CallbackTargetUnresolvableException"/>), or its method/arguments no longer bind
+    /// (<see cref="MissingMethodException"/>, <see cref="TypeLoadException"/>). A failure thrown by
+    /// the callback BODY is never classified here, whatever its type: a handler that throws
+    /// <see cref="InvalidOperationException"/> for a transient reason is ordinary application code
+    /// and keeps the full retry ladder, which is why the marker type exists rather than a plain
+    /// <c>is InvalidOperationException</c> test.
+    /// </para>
+    /// </summary>
+    private static bool IsPermanentCallbackFailure(Exception exception)
+        => exception is CallbackTargetUnresolvableException
+            or MissingMethodException
+            or MissingMemberException
+            or TypeLoadException;
 
     /// <summary>
     /// Deletes a registration whose callback has already been invoked successfully. Best-effort by

@@ -67,10 +67,26 @@ public abstract class AsyncResponseChannelOptions
     /// <c>null</c>. Length is bounded by the relational column; surrounding spaces are rejected
     /// because SQL Server pads the shorter operand of an equality comparison — even under a binary
     /// collation — so <c>"abc "</c> and <c>"abc"</c> are ONE key to the database while the library
-    /// compares them ordinally and would route their responses to different waiters.
+    /// compares them ordinally and would route their responses to different waiters; control
+    /// characters are rejected because the stores disagree about them (see
+    /// <see cref="PortableText.IndexOfControlCharacter"/>).
+    /// <para>
+    /// The rules kept in <see cref="PortableText"/> are the ones this contract genuinely SHARES
+    /// with <c>FlowStateConcurrency.FlowIdNotPortable</c>. Two flow-id rules are deliberately not
+    /// mirrored here because correlation ids have no such sink: the UTF-8 byte cap exists for
+    /// Cosmos DB item ids, and the <c>/ \ ? #</c> character set is Cosmos's id syntax — no bundled
+    /// channel persists a correlation id to Cosmos. Adding either here would reject ids that every
+    /// shipped channel handles correctly.
+    /// </para>
     /// </summary>
     internal static string? CorrelationIdNotPortable(string correlationId)
     {
+        // Length-guarded before the [0]/[^1] probe below: this method's contract is to RETURN a
+        // rejection for an unusable id, and an empty one indexing off the end would throw
+        // IndexOutOfRangeException out of the very method whose job is to explain bad ids.
+        if (correlationId.Length == 0)
+            return "CorrelationId is empty. An id must carry enough information to route a response back to its waiter.";
+
         if (correlationId.Length > MaxCorrelationIdLength)
         {
             return $"CorrelationId is {correlationId.Length} UTF-16 code units; the portable maximum is {MaxCorrelationIdLength} " +
@@ -89,9 +105,18 @@ public abstract class AsyncResponseChannelOptions
         {
             return PortableText.IllFormedUtf16Rejection(
                 "CorrelationId",
-                correlationId.Length <= 40 ? correlationId : string.Concat(correlationId.AsSpan(0, 40), "…"),
+                PortableText.Excerpt(correlationId),
                 correlationId[illFormed],
                 illFormed);
+        }
+
+        if (PortableText.IndexOfControlCharacter(correlationId) is var control and >= 0)
+        {
+            return PortableText.ControlCharacterRejection(
+                "CorrelationId",
+                PortableText.Excerpt(correlationId),
+                correlationId[control],
+                control);
         }
 
         return null;

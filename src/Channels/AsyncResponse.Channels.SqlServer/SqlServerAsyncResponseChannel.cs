@@ -26,7 +26,8 @@ internal sealed class SqlServerAsyncResponseChannel : DbAsyncResponseChannelBase
         IRecoveryStateStore recoveryStateStore,
         IOptions<SqlServerAsyncResponseChannelOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<SqlServerAsyncResponseChannel> logger)
+        ILogger<SqlServerAsyncResponseChannel> logger,
+        TimeProvider? timeProvider = null)
         : base(
             scopeFactory,
             sql,
@@ -38,7 +39,8 @@ internal sealed class SqlServerAsyncResponseChannel : DbAsyncResponseChannelBase
             providerName: "SQL Server",
             activityTag: "sqlserver",
             subscriberRecordNoun: "row",
-            localDispatchRetryHint: "the sweep retry will pick it up")
+            localDispatchRetryHint: "the sweep retry will pick it up",
+            timeProvider)
     {
     }
 

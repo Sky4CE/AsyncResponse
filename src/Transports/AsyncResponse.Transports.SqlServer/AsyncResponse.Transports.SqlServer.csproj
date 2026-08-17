@@ -29,6 +29,7 @@
     <Compile Include="..\Shared\SubscriberSupervisor.cs" Link="SubscriberSupervisor.cs" />
     <Compile Include="..\..\Shared\SqlServerRelationVerifier.cs" Link="SqlServerRelationVerifier.cs" />
     <Compile Include="..\..\Shared\SqlServerTransientFaults.cs" Link="SqlServerTransientFaults.cs" />
+    <Compile Include="..\..\Shared\RelationalNamePlan.cs" Link="RelationalNamePlan.cs" />
   </ItemGroup>
 
   <ItemGroup>

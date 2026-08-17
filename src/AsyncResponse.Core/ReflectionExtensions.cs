@@ -11,6 +11,20 @@ namespace AsyncResponse;
 /// materializing untyped JSON payloads as CLR types, resolving placeholder parameters, and
 /// invoking <see cref="ReflectionInvocationDto"/>s against the DI container.
 /// </summary>
+/// <summary>
+/// A callback could not be WIRED UP — it is unauthorized, its persisted service type no longer
+/// resolves on this build, or that service is not registered in DI. Distinct from a failure thrown
+/// by the callback BODY, which is ordinary application code and may well be transient.
+/// <para>
+/// Derives from <see cref="InvalidOperationException"/> so every existing catch and message
+/// assertion keeps working; it exists purely so retry policies can tell "this call can never
+/// succeed, no matter how many times it runs" from "the dependency behind this call blipped".
+/// Without the distinction, a permanently mis-wired callback burned the full retry ladder on the
+/// publish path for every lost response.
+/// </para>
+/// </summary>
+internal sealed class CallbackTargetUnresolvableException(string message) : InvalidOperationException(message);
+
 internal static class ReflectionExtensions
 {
     private delegate ValueTask AsyncMethodInvoker(object service, object?[] args);
@@ -68,7 +82,7 @@ internal static class ReflectionExtensions
             if (provider.GetService(typeof(IAsyncResponseCallbackAuthorizer)) is IAsyncResponseCallbackAuthorizer authorizer
                 && !authorizer.IsAllowed(dto.ServiceInterfaceFullName, dto.MethodName))
             {
-                throw new InvalidOperationException(
+                throw new CallbackTargetUnresolvableException(
                     $"Callback target '{dto.ServiceInterfaceFullName}.{dto.MethodName}' is not authorized by the registered " +
                     $"{nameof(IAsyncResponseCallbackAuthorizer)}; add it to the allowlist (AuthorizeCallbacks) to permit it.");
             }
@@ -77,12 +91,12 @@ internal static class ReflectionExtensions
             var serviceType = ResolveServiceType(dto.ServiceInterfaceFullName);
 
             if (serviceType == null)
-                throw new InvalidOperationException(
+                throw new CallbackTargetUnresolvableException(
                     $"Type '{dto.ServiceInterfaceFullName}' not found in loaded assemblies.");
 
             // 3) Resolve the service instance
             var service = provider.GetService(serviceType)
-                       ?? throw new InvalidOperationException(
+                       ?? throw new CallbackTargetUnresolvableException(
                             $"Service '{dto.ServiceInterfaceFullName}' is not registered.");
 
             // 4) Resolve and cache method metadata + compiled invocation delegate. Collectible
