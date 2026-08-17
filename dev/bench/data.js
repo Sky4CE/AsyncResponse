@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786926239029,
+  "lastUpdate": 1786926266770,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -90236,6 +90236,138 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1563.9701319240087,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Sky4CE",
+            "username": "Sky4CE",
+            "email": "tyunisov@gmail.com"
+          },
+          "committer": {
+            "name": "Sky4CE",
+            "username": "Sky4CE",
+            "email": "tyunisov@gmail.com"
+          },
+          "id": "5390613cb23f8b18a9be4afae996e53fcb8ae6ae",
+          "message": "fix(ci): measure branch coverage again by collecting through coverlet\n\nPre-instrumenting with `dotnet-coverage instrument` discards condition data:\nan A/B on one test class emits 3,917 branch=\"True\" lines through the collector\nand 0 through pre-instrumentation, so ReportGenerator — which counts per-line\nconditions, not the derived root branches-valid attribute — omitted\nbranchcoverage from Summary.json and the badge step died on it.\n\nNeither Microsoft path can replace it. 18.10.0 is the current release, the\nInvalidProgramException that forced pre-instrumentation was never reported\nupstream, and forcing the static engine through the settings XML instruments\nnothing at all (\"Profiler was not initialized\"). The CodeCoverage schema has no\nbranch or condition element. On linux-x64 there is no configuration that\nreports branches and leaves IL intact.\n\nCoverlet rewrites IL ahead of time with Cecil and never loads a CLR profiler,\nso the failure mode that forced the workaround cannot recur on any platform,\nand it measures identically on every OS and architecture — what the\npre-instrumentation workaround was reaching for. JitProbeTests still force-JITs\nevery AsyncResponse method under the active collector, so corrupt IL from any\ninstrumenter is still caught.\n\nThree collection hazards are handled in coverage-collect.sh: the test\nassemblies stay uninstrumented because coverlet's tracker roots on\nAppDomain.ProcessExit and would pin the collectible load context a test asserts\nis released; --exclude-assemblies-without-sources None, because CI's\ndeterministic source paths otherwise make coverlet drop every product assembly\nsilently; and the Aspire-launched sample's duplicate module copies are linked\nat the instrumented file, since coverlet instruments one file per module name.\nThe tool is installed --framework net8.0 deliberately: a net10.0-hosted\ncoverlet injects System.Runtime 10.0.0.0 into the net8.0 leg (coverlet #1990).",
+          "timestamp": "2026-08-16T15:52:43Z",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/5390613cb23f8b18a9be4afae996e53fcb8ae6ae"
+        },
+        "date": 1786926266062,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 70899.3784676886,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 50888.82420353901,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 26788.163489233302,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 198683.91772896334,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 294346.1982245037,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 297233.3519599567,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 314121.6530337869,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 243885.78340991348,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 274900.4860240593,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 232785.5114297686,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 243444.05168804104,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 325013.0005200208,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 361350.00361350004,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 100516.73643868398,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 79019.5257248066,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 34482.378125482755,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 24374.986350007646,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4763.954396570143,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 230697.53707309422,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 75309.59775637646,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1575051.1891636478,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1370.1606200930437,
             "unit": "flows/s"
           }
         ]
