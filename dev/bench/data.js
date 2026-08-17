@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786982990466,
+  "lastUpdate": 1786983018478,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -92882,6 +92882,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1353.8258522902347,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "17c3b19c1b94a9977d1eee6ec03b842f765f8ed6",
+          "message": "fix: apply round-28 review — 9 findings, most of them defects in the round-27 fixes\n\nTwo independent reviews of daac580. The first was accurate on all nine of its\nfindings and, usefully, seven of them were bugs inside the code round 27 had\njust added. The second contributed little: four findings were already answered\nin round 27, its Kafka poll-loop claim is refuted by the existing\nPauseAssignment/keep-consuming backpressure (and its remediation is the\nAckAfterEnqueue mode that already ships), and its \"MaxInboundMessageChars\ndefaults to null\" is wrong — round 27 set it to 8 Mi.\n\n- Recovery stores filtered unreadable registrations out of GetAllAsync, so a\n  correlation id whose registrations were ALL unreadable returned an empty list.\n  The dispatcher reads that as \"no callback was ever armed\" and acknowledges the\n  terminal response. RecoveryStateUnreadableException now fails that delivery\n  across all five stores. A partially readable batch deliberately still\n  dispatches its readable half: failing it would redeliver callbacks that already\n  succeeded and, since successful registrations are deleted, the redelivery would\n  then see all-unreadable and loop forever.\n- DynamoDB returned null for a missing or malformed TTL, state JSON or revision\n  attribute; Cosmos and MongoDB for a missing revision. The item exists in every\n  one of those cases, so they throw FlowStateUnreadableException now. Only a\n  well-formed, elapsed expiry reads as absence.\n- FlowExecutionLease stamped its deadline after the acquire/renew round trip\n  returned, adding response latency to the lease the client believed it held.\n  The deadline is captured before the call and published on success.\n- The durable-start publish retry excluded every OperationCanceledException, so a\n  transport timeout — TaskCanceledException with the caller's token untouched,\n  the most common recoverable publish failure — got zero retries and produced the\n  orphaned ledger the retry exists to prevent.\n- MaxInboundMessageChars was unvalidated: zero or negative acknowledged every\n  inbound message without dispatching it, total data loss shaped like a healthy\n  service. Rejected at startup. The guard also ran after correlation extraction\n  had already parsed the body; IAsyncResponseIngress.IsOverInboundBudget now gates\n  extraction in all eleven response subscribers. It is a defaulted interface\n  member phrased so false means \"carry on\" — this interface is the documented\n  seam for hand-written adapters.\n- Watchdog validation checked Interval, StartupDelay and jitter separately while\n  NextWait arms their sum, so two legal values could fault the background service\n  on its first delay. Jitter is now also capped at Interval, since the health\n  check derives its freshness budget from Interval.\n- A disposed resolver registration still held its delegate, and unregistering\n  cleared only the negative cache — a revoked alias kept resolving from\n  ServiceTypes/PayloadTypes and kept its assembly reachable. Dispose now clears\n  the field and both positive caches.\n- The duplicate-JSON-property error embedded the offending property name, taken\n  straight off an untrusted body and logged by the transport dispatchers. It\n  reports the position instead.\n- Documented DurableFlowNotDispatchedException on StartAsync and in\n  durable-flows.md, the owned resolver handle in security.md, and both new\n  options in configuration.md.",
+          "timestamp": "2026-08-17T17:56:37+02:00",
+          "tree_id": "a928822242601a0195e837b72a56982c78f62052",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/17c3b19c1b94a9977d1eee6ec03b842f765f8ed6"
+        },
+        "date": 1786983017529,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 69066.3064168124,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 35749.984627506616,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 26295.873809257093,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 216219.95623708086,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 301266.5244688671,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 217066.64814364602,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 330512.9561078794,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 231128.36869597374,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 225338.9097202192,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 223595.59606113998,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 321539.27280678065,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 404976.34938119614,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 302557.2135690859,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 97240.7736009192,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 72501.88939923776,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 33823.659135445625,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 19155.643743031174,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4759.6167461403675,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 156369.23153904852,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 47049.967065023055,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1542210.2957959347,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1408.5062509507418,
             "unit": "flows/s"
           }
         ]
