@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787834585682,
+  "lastUpdate": 1787834615756,
   "repoUrl": "https://github.com/Sky4CE/AsyncResponse",
   "entries": {
     "AsyncResponse Microbenchmarks": [
@@ -96586,6 +96586,140 @@ window.BENCHMARK_DATA = {
           {
             "name": "durable-flow-storm throughput",
             "value": 1499.7889496989983,
+            "unit": "flows/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "committer": {
+            "email": "tyunisov@gmail.com",
+            "name": "Sky4CE",
+            "username": "Sky4CE"
+          },
+          "distinct": true,
+          "id": "02292590b81b78d658f371aad8fc591581563e5e",
+          "message": "fix(tests): the PG wrong-column-shape probe must seed jsonb now that text is the expected type\nRound 29 changed the durable-flow ledger column from jsonb to text, which\ninverted OperatorProvisionedFlowSchema_WrongColumnShape_IsReportedBeforeAMissingIndex:\nits seeded \"wrong\" shape (text) became the correct one, so the verifier reported\nthe missing index instead of the column mismatch the test pins. Seed jsonb — the\nlegacy shape an upgraded manual-schema deployment actually presents — and repair\nwith ALTER COLUMN ... TYPE text. Verified against a real postgres:16.\nThe accompanying loadtest failure was checked with a local A/B (8b1050c vs\nfced384, core profile, 4x the CI rate): zero failures and equal-or-better\nlatencies on round 29 — the CI breach (5.89% vs 5%) was a degraded-runner flake,\nnot a regression.",
+          "timestamp": "2026-08-27T14:25:38+02:00",
+          "tree_id": "e80ceabde3a99e7e94d882d752101794f12fefd2",
+          "url": "https://github.com/Sky4CE/AsyncResponse/commit/02292590b81b78d658f371aad8fc591581563e5e"
+        },
+        "date": 1787834614828,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "waiter-storm throughput",
+            "value": 52934.1953843499,
+            "unit": "ops/s"
+          },
+          {
+            "name": "progress-storm throughput",
+            "value": 29641.6443761501,
+            "unit": "ops/s"
+          },
+          {
+            "name": "worker-storm throughput",
+            "value": 22468.357587326194,
+            "unit": "jobs/s"
+          },
+          {
+            "name": "google-pubsub-ack-after-enqueue-dispatch-storm throughput",
+            "value": 269100.7728574196,
+            "unit": "ops/s"
+          },
+          {
+            "name": "rabbitmq-ack-after-enqueue-dispatch-storm throughput",
+            "value": 331174.07834253996,
+            "unit": "ops/s"
+          },
+          {
+            "name": "redis-ack-after-enqueue-dispatch-storm throughput",
+            "value": 261336.7899479417,
+            "unit": "ops/s"
+          },
+          {
+            "name": "nats-ack-after-receive-dispatch-storm throughput",
+            "value": 326882.8451882845,
+            "unit": "ops/s"
+          },
+          {
+            "name": "postgresql-ack-after-receive-dispatch-storm throughput",
+            "value": 247360.6617392423,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqlserver-ack-after-enqueue-dispatch-storm throughput",
+            "value": 247157.68660405336,
+            "unit": "ops/s"
+          },
+          {
+            "name": "mongodb-ack-after-enqueue-dispatch-storm throughput",
+            "value": 229404.09991007362,
+            "unit": "ops/s"
+          },
+          {
+            "name": "azure-servicebus-ack-after-receive-dispatch-storm throughput",
+            "value": 292076.5474215482,
+            "unit": "ops/s"
+          },
+          {
+            "name": "sqs-ack-after-enqueue-dispatch-storm throughput",
+            "value": 328441.74100398074,
+            "unit": "ops/s"
+          },
+          {
+            "name": "kafka-ack-after-enqueue-dispatch-storm throughput",
+            "value": 420090.4034548235,
+            "unit": "ops/s"
+          },
+          {
+            "name": "race-burst throughput",
+            "value": 89563.13609978335,
+            "unit": "ops/s"
+          },
+          {
+            "name": "raw-ingress-storm throughput",
+            "value": 107517.95657392741,
+            "unit": "ops/s"
+          },
+          {
+            "name": "shared-response-fanout throughput",
+            "value": 45559.580997645484,
+            "unit": "ops/s"
+          },
+          {
+            "name": "exception-fanout throughput",
+            "value": 23537.954103625747,
+            "unit": "ops/s"
+          },
+          {
+            "name": "timeout-storm throughput",
+            "value": 4827.433726576084,
+            "unit": "ops/s"
+          },
+          {
+            "name": "dispose-cleanup-storm throughput",
+            "value": 238946.34220939345,
+            "unit": "ops/s"
+          },
+          {
+            "name": "context-isolation-storm throughput",
+            "value": 73340.45224656473,
+            "unit": "ops/s"
+          },
+          {
+            "name": "watchdog-scan-storm throughput",
+            "value": 1567447.2553998558,
+            "unit": "entries/s"
+          },
+          {
+            "name": "durable-flow-storm throughput",
+            "value": 1529.4723821948369,
             "unit": "flows/s"
           }
         ]
