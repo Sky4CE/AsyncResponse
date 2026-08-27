@@ -319,7 +319,9 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
         // A misprovisioned schema is usually wrong in several ways at once. The verifier used to
         // report the index the operator forgot ("does not exist") while the wrong column type on
         // the table they DID provide — the actionable finding — went unreported; and the absence
-        // error carried no shared-namespace guidance at all.
+        // error carried no shared-namespace guidance at all. The wrong shape seeded here is
+        // state_json jsonb — the pre-round-29 column type, i.e. exactly what a manually-migrated
+        // deployment presents after upgrading (the expected type is now text; see the store DDL).
         await WithDataSourceAsync("flow_cause_order", async (schema, dataSource) =>
         {
             await using (var connection = await dataSource.OpenConnectionAsync())
@@ -330,7 +332,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
                     CREATE SCHEMA IF NOT EXISTS "{schema}";
                     CREATE TABLE "{schema}"."flow_state" (
                         flow_id text NOT NULL PRIMARY KEY,
-                        state_json text NOT NULL,
+                        state_json jsonb NOT NULL,
                         expires_at_utc timestamptz NOT NULL,
                         updated_at_utc timestamptz NOT NULL,
                         revision bigint NOT NULL DEFAULT 0,
@@ -359,7 +361,7 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
             await using (var repair = connection.CreateCommand())
             {
                 repair.CommandText =
-                    $"""ALTER TABLE "{schema}"."flow_state" ALTER COLUMN state_json TYPE jsonb USING state_json::jsonb;""";
+                    $"""ALTER TABLE "{schema}"."flow_state" ALTER COLUMN state_json TYPE text USING state_json::text;""";
                 await repair.ExecuteNonQueryAsync();
             }
 
