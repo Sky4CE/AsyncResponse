@@ -286,6 +286,33 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task DeadLetterPublish_DropsTheInboundNatsMsgId()
+    {
+        // Regression (round 29): the inbound Nats-Msg-Id belongs to the LIVE publish, not to this
+        // one. Carrying it over made a second dead-letter of the same message inside the DLQ
+        // stream's duplicate window — reachable whenever the Term fails and the message redelivers
+        // after AckWait — a deduplicated publish, which the caller reads as a DLQ failure and
+        // answers with a NAK, looping until the window passes.
+        var rec = new RecordingDelivery();
+        var subscriber = new NatsSubscriberOptions { MaxDeliveryAttempts = 5 };
+        await using var dispatcher = CreateDispatcher((_, _) => throw new InvalidOperationException("boom"), subscriber);
+
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Nats-Msg-Id"] = "worker-job-42",
+            ["AR-Correlation-Id"] = "corr-1"
+        };
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 5, headers: headers), CancellationToken.None);
+
+        var deadLettered = Assert.Single(_jetStream.Published);
+        Assert.Equal(DeadLetterSubject, deadLettered.Subject);
+        Assert.DoesNotContain("Nats-Msg-Id", deadLettered.Headers!.Keys);
+        // The rest of the inbound headers still travel with the buried copy.
+        Assert.Equal("corr-1", deadLettered.Headers["AR-Correlation-Id"]);
+    }
+
+    [Fact]
     public async Task TermFailureAfterDeadLetterPublish_DoesNotUnwindTheConsumeLoop()
     {
         // Regression (r24): TermAsync at the attempt cap ran bare while both ack sites were

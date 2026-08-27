@@ -236,13 +236,17 @@ public sealed class Round28RegressionTests
 
         // Reached through one transport's copy of the shared walker (the type is compiled into every
         // transport assembly, so it has to be named through exactly one of them).
-        var ex = Assert.Throws<ArgumentException>(() => NatsCorrelationIdExtractor.Extract(
+        //
+        // The walker no longer THROWS for a duplicate key — that made an unroutable message a
+        // handler failure, which on RabbitMQ's default cap of 0 requeued forever. It reports the id
+        // as unresolvable instead, and the ingress acknowledges the message. The property name is
+        // still never surfaced anywhere, which is what this regression is about.
+        var extracted = NatsCorrelationIdExtractor.Extract(
             headers: null,
             body,
-            new AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["correlationId"] }));
+            new AsyncResponse.Transports.NATS.NatsAsyncResponseTransportOptions { CorrelationIdJsonPaths = ["correlationId"] });
 
-        Assert.DoesNotContain(secret, ex.Message, StringComparison.Ordinal);
-        Assert.Contains("duplicate property name", ex.Message, StringComparison.Ordinal);
+        Assert.Null(extracted);
     }
 
     // -----------------------------------------------------------------------------------------

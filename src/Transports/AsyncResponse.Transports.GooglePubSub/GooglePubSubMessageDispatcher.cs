@@ -395,6 +395,29 @@ internal sealed class QueuedGooglePubSubMessageDispatcher : GooglePubSubMessageD
             Interlocked.Decrement(ref _pendingCount);
             Interlocked.Increment(ref _runningCount);
 
+            // Once the drain budget has lapsed, STOP executing. The token below cannot stop the
+            // real handler — it is the ingress, whose target takes no CancellationToken — so the
+            // loop kept starting fresh work past the budget and every message still queued at
+            // process exit vanished with no record (they were ACKed at enqueue, so Pub/Sub will not
+            // redeliver them). Route them through OnBackgroundFailure instead of losing them.
+            if (_drainCancellation.IsCancellationRequested)
+            {
+                Logger.LogWarning(
+                    "Pub/Sub background handler for already-ACKed message {MessageId} on {SubscriptionId} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+                    message.MessageId,
+                    _subscriptionId);
+
+                await NotifyBackgroundFailureAsync(
+                    message,
+                    new OperationCanceledException(
+                        "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled."),
+                    _subscriptionId,
+                    _role).ConfigureAwait(false);
+
+                Interlocked.Decrement(ref _runningCount);
+                continue;
+            }
+
             try
             {
                 Logger.LogDebug(

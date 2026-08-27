@@ -471,6 +471,14 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
     }
 }
 
+/// <remarks>
+/// [BsonIgnoreExtraElements] for the same reason the transport's queue document carries it: the
+/// driver's default is to THROW FormatException for any element outside this class map, so one
+/// column a newer build added would make every older replica in a rolling deploy fail to read a
+/// live flow's ledger — and an unreadable ledger is the one outcome the store contract refuses to
+/// report as "absent".
+/// </remarks>
+[BsonIgnoreExtraElements]
 internal sealed class MongoFlowStateDocument
 {
     [BsonId]

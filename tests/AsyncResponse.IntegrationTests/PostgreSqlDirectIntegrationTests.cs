@@ -1135,6 +1135,53 @@ public sealed class PostgreSqlDirectIntegrationTests(DataBatchFixture fixture) :
     }
 
     [Fact]
+    public async Task TransportStore_DeadLetterOnAStaleClaim_NoOpsInsteadOfBuryingALiveMessage()
+    {
+        // Regression (round 29): the DLQ row was written unconditionally and the fenced delete's
+        // result ignored, so a claim whose lease had lapsed (a peer re-claimed the row) still
+        // buried a full copy of a message that is still live and may yet succeed under its new
+        // owner — the DLQ showed a poison entry for work that completed, and an operator replaying
+        // it duplicated its side effects. The fenced ack and NAK already no-op in that window.
+        await WithDataSourceAsync("dlqfence", async (schema, dataSource) =>
+        {
+            var options = TransportOptions(schema);
+            var store = new PostgreSqlTransportStore(dataSource, Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            var id = Guid.NewGuid();
+            await store.PublishAsync(id, options.WorkerQueue, """{"kind":"fenced"}""", null, CancellationToken.None);
+            var claimed = (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None))!;
+
+            // The peer takeover: a different lock_id now owns the row, so this claim's fence is dead.
+            await using (var steal = dataSource.CreateCommand(
+                $"UPDATE {store.MessageTable} SET lock_id = @peer, locked_until = now() + interval '5 minutes' WHERE id = @id;"))
+            {
+                steal.Parameters.AddWithValue("@peer", Guid.NewGuid());
+                steal.Parameters.AddWithValue("@id", id);
+                await steal.ExecuteNonQueryAsync();
+            }
+
+            Assert.False(await claimed.DeadLetterAsync(new InvalidOperationException("stale"), true, CancellationToken.None));
+
+            // No DLQ copy was written...
+            await using (var count = dataSource.CreateCommand(
+                $"SELECT count(*) FROM {store.MessageTable} WHERE queue = @queue;"))
+            {
+                count.Parameters.AddWithValue("@queue", options.DeadLetterQueue);
+                Assert.Equal(0L, (long)(await count.ExecuteScalarAsync())!);
+            }
+
+            // ...and the live row is untouched, still owned by its new claimant.
+            await using (var survives = dataSource.CreateCommand(
+                $"SELECT count(*) FROM {store.MessageTable} WHERE id = @id;"))
+            {
+                survives.Parameters.AddWithValue("@id", id);
+                Assert.Equal(1L, (long)(await survives.ExecuteScalarAsync())!);
+            }
+        });
+    }
+
+    [Fact]
     public async Task TransportStore_WorkerTransportSubscribersAndDeliveryStatesRoundTrip()
     {
         await WithDataSourceAsync("transport", async (schema, dataSource) =>

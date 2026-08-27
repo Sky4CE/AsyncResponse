@@ -239,17 +239,25 @@ internal static class ReflectionExtensions
     private static InvocationPlan CreateInvocationPlan(InvocationPlanKey key)
     {
         // Pick the overload by name + parameter count once, then reuse the compiled plan.
-        var candidates = key.ServiceType.GetMethods(BindingFlags.Instance | BindingFlags.Public)
+        //
+        // Interfaces do NOT inherit members in reflection: Type.GetMethods on an interface returns
+        // only that interface's own declarations, and FlattenHierarchy does not change it. Searching
+        // the service type alone therefore failed every callback and worker job whose method is
+        // declared on a BASE interface — code that compiles cleanly, registers cleanly, and then
+        // threw "no method" on every dispatch attempt forever. The base interfaces are searched too,
+        // deduped by declaring type so a re-declaration does not read as an ambiguous overload.
+        var candidates = CandidateMethods(key.ServiceType)
             .Where(m => m.Name == key.MethodName
                      && m.GetParameters().Length == key.ParameterCount)
+            .DistinctBy(m => (m.DeclaringType, m.Name, string.Join(',', m.GetParameters().Select(p => p.ParameterType.FullName))))
             .ToArray();
 
         if (candidates.Length == 0)
-            throw new InvalidOperationException(
+            throw new CallbackTargetUnresolvableException(
                 $"No method '{key.MethodName}' with {key.ParameterCount} parameter(s) on '{key.ServiceType.Name}'.");
 
         if (candidates.Length > 1)
-            throw new InvalidOperationException(
+            throw new CallbackTargetUnresolvableException(
                 $"Method '{key.MethodName}' on '{key.ServiceType.Name}' has {candidates.Length} overloads with " +
                 $"{key.ParameterCount} parameter(s); persisted callbacks cannot disambiguate overloads. " +
                 "Give the callback target a unique name/arity.");
@@ -262,7 +270,7 @@ internal static class ReflectionExtensions
             var parameterType = parameters[i].ParameterType;
             if (parameterType.IsByRef)
             {
-                throw new NotSupportedException(
+                throw new CallbackTargetUnresolvableException(
                     $"Callback method '{method.Name}' on '{key.ServiceType.Name}' uses by-ref parameter '{parameters[i].Name}', which is not supported.");
             }
 
@@ -271,11 +279,44 @@ internal static class ReflectionExtensions
 
         if (method.ContainsGenericParameters)
         {
-            throw new NotSupportedException(
+            throw new CallbackTargetUnresolvableException(
                 $"Callback method '{method.Name}' on '{key.ServiceType.Name}' has unbound generic parameters, which are not supported.");
         }
 
         return new InvocationPlan(converters, CreateInvoker(method, parameters));
+    }
+
+    /// <summary>
+    /// The service type's own public instance methods plus, for an interface, those of every base
+    /// interface — the members a caller can legally invoke through it, which is what a persisted
+    /// callback names.
+    /// </summary>
+    /// <summary>
+    /// Shared justification: the caller already carries the trimming contract — expression-based
+    /// registration annotates TService with DynamicallyAccessedMembers(PublicMethods) and
+    /// DTO-based registration carries RequiresUnreferencedCode. A base-interface method trimmed
+    /// away fails closed with the same actionable "no method" error a missing method gives.
+    /// Deliberately NOT an iterator: a suppression cannot reach a compiler-generated MoveNext.
+    /// </summary>
+    private const string TrimmingJustification =
+        "The caller carries the trimming contract (DynamicallyAccessedMembers on TService, or RequiresUnreferencedCode " +
+        "for DTO-based registration); a trimmed-away base-interface method fails closed with the same 'no method' error.";
+
+    [UnconditionalSuppressMessage(
+        "Trimming",
+        "IL2070:UnrecognizedReflectionPattern",
+        Justification = TrimmingJustification)]
+    [UnconditionalSuppressMessage("Trimming", "IL2075:UnrecognizedReflectionPattern", Justification = TrimmingJustification)]
+    private static List<MethodInfo> CandidateMethods(Type serviceType)
+    {
+        var candidates = new List<MethodInfo>(serviceType.GetMethods(BindingFlags.Instance | BindingFlags.Public));
+        if (!serviceType.IsInterface)
+            return candidates;
+
+        foreach (var baseInterface in serviceType.GetInterfaces())
+            candidates.AddRange(baseInterface.GetMethods(BindingFlags.Instance | BindingFlags.Public));
+
+        return candidates;
     }
 
     private static AsyncMethodInvoker CreateInvoker(MethodInfo method, ParameterInfo[] parameters)
@@ -332,10 +373,11 @@ internal static class ReflectionExtensions
         // Collectible (plugin) target types are planned per call: a strong Type-keyed cache entry
         // would pin the plugin's AssemblyLoadContext after unload. Cold path — only plugin hosts
         // resolve conversions for collectible types, and only on recovery/callback traffic.
+        ArgumentNullException.ThrowIfNull(targetType);
+
         if (targetType.Assembly.IsCollectible)
             return new ConversionPlan(targetType);
 
-        ArgumentNullException.ThrowIfNull(targetType);
         return ConversionPlans.GetOrAdd(targetType, static type => new ConversionPlan(type));
     }
 

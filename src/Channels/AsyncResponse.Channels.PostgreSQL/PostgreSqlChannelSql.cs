@@ -108,7 +108,7 @@ internal sealed class PostgreSqlChannelSql
                 CREATE TABLE IF NOT EXISTS {RecoveryTable} (
                     correlation_id text NOT NULL,
                     registration_id uuid NOT NULL,
-                    state_json jsonb NOT NULL,
+                    state_json text NOT NULL,
                     expires_at timestamptz NOT NULL,
                     registered_at timestamptz NOT NULL DEFAULT now(),
                     PRIMARY KEY (correlation_id, registration_id)
@@ -119,7 +119,7 @@ internal sealed class PostgreSqlChannelSql
                 CREATE TABLE IF NOT EXISTS {MessageTable} (
                     id uuid PRIMARY KEY,
                     correlation_id text NOT NULL,
-                    envelope_json jsonb NOT NULL,
+                    envelope_json text NOT NULL,
                     created_at timestamptz NOT NULL DEFAULT now(),
                     expires_at timestamptz NOT NULL,
                     acked_at timestamptz NULL,
@@ -128,6 +128,31 @@ internal sealed class PostgreSqlChannelSql
                 );
                 ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS recovery_claimed boolean NOT NULL DEFAULT false;
                 ALTER TABLE {MessageTable} ADD COLUMN IF NOT EXISTS acked_seq bigint NULL;
+
+                -- jsonb REJECTS the \u0000 escape that System.Text.Json emits for U+0000 (SQLSTATE
+                -- 22P05), so any payload, exception message, propagated context value or callback
+                -- argument containing a NUL was unpublishable on PostgreSQL alone while every other
+                -- channel delivered it. Nothing here ever queries INSIDE the document — both columns
+                -- are read back with ::text — so text costs nothing and accepts the whole contract.
+                -- Guarded so the rewrite happens once, not on every start.
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.MessageTable)}
+                          AND column_name = 'envelope_json' AND data_type = 'jsonb')
+                    THEN
+                        ALTER TABLE {MessageTable} ALTER COLUMN envelope_json TYPE text USING envelope_json::text;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.RecoveryStateTable)}
+                          AND column_name = 'state_json' AND data_type = 'jsonb')
+                    THEN
+                        ALTER TABLE {RecoveryTable} ALTER COLUMN state_json TYPE text USING state_json::text;
+                    END IF;
+                END $$;
                 CREATE SEQUENCE IF NOT EXISTS {AckSequence} AS bigint;
                 CREATE INDEX IF NOT EXISTS {Quote(IndexName(_options.MessageTable, "correlation_created"))}
                     ON {MessageTable} (correlation_id, created_at);
@@ -173,7 +198,7 @@ internal sealed class PostgreSqlChannelSql
                         [
                             new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
                             new("registration_id", "uuid", Nullable: false, RequiresDeterministicCollation: true),
-                            new("state_json", "jsonb", Nullable: false),
+                            new("state_json", "text", Nullable: false),
                             new("expires_at", "timestamp with time zone", Nullable: false),
                             new("registered_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
                         ], PrimaryKey: ["correlation_id", "registration_id"]),
@@ -181,7 +206,7 @@ internal sealed class PostgreSqlChannelSql
                         [
                             new("id", "uuid", Nullable: false),
                             new("correlation_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("envelope_json", "jsonb", Nullable: false),
+                            new("envelope_json", "text", Nullable: false),
                             new("created_at", "timestamp with time zone", Nullable: false, DefaultExpression: "now()"),
                             new("expires_at", "timestamp with time zone", Nullable: false),
                             new("acked_at", "timestamp with time zone", Nullable: true),
@@ -277,7 +302,7 @@ internal sealed class PostgreSqlChannelSql
             """;
         command.Parameters.AddWithValue("correlation_id", correlationId);
         command.Parameters.AddWithValue("registration_id", state.RegistrationId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = AsyncResponseJson.Serialize(state);
+        command.Parameters.Add("state_json", NpgsqlDbType.Text).Value = AsyncResponseJson.Serialize(state);
         command.Parameters.AddWithValue("ttl", ttl);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
@@ -378,7 +403,7 @@ internal sealed class PostgreSqlChannelSql
             """;
         command.Parameters.AddWithValue("id", id);
         command.Parameters.AddWithValue("correlation_id", correlationId);
-        command.Parameters.Add("envelope_json", NpgsqlDbType.Jsonb).Value = envelopeJson;
+        command.Parameters.Add("envelope_json", NpgsqlDbType.Text).Value = envelopeJson;
         command.Parameters.AddWithValue("retention", retention);
         command.Parameters.AddWithValue("channel", NotificationChannel);
         command.Parameters.AddWithValue("payload", NotifyPayload(correlationId));
@@ -728,6 +753,13 @@ internal sealed class PostgreSqlChannelSql
     }
 
     private static string Quote(string identifier) => "\"" + identifier + "\"";
+
+    /// <summary>
+    /// A single-quoted SQL string literal, for the catalog lookups inside the DDL's DO block where
+    /// a parameter cannot be bound. Names are already validated by the options; the doubling keeps
+    /// the literal well-formed regardless.
+    /// </summary>
+    private static string SqlLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 
     /// <summary>PostgreSQL's identifier length cap (NAMEDATALEN - 1); longer names are silently truncated server-side.</summary>
     internal const int IdentifierCap = 63;

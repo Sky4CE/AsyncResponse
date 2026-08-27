@@ -496,8 +496,11 @@ checkpoints before its ledger can expire, instead of racing it. When `DefaultSte
 startup enforces that margin for you: `StateExpiry` must exceed the registered channel's effective
 default wait timeout (`DefaultTimeout ?? RecoveryStateExpiry` — the window a timeout-less awaited
 step actually waits out) or it throws with the fix; set `DefaultStepTimeout` explicitly to opt out
-of the check. Expired, malformed, identity-mismatched, revision-mismatched, or unsupported-schema
-ledgers load as absent instead of entering execution.
+of the check. Expired, identity-mismatched and revision-mismatched ledgers load as
+absent instead of entering execution. Malformed JSON and an unsupported schema version do **not**:
+they say the row is there and this build cannot interpret it, so the load throws
+`FlowStateUnreadableException` rather than impersonating a deleted flow — reporting them as absent
+would let a rolling deployment acknowledge a live flow's only wake-up.
 
 Full contract, package lifetimes, schema requirements, and expired-state cleanup:
 [durable-flow-state-stores.md](durable-flow-state-stores.md). `StateExpiry` and

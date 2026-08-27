@@ -121,6 +121,14 @@ put all of that in the application log the moment someone turned Debug on to dia
 else. What is logged instead is a size, plus routing metadata that is safe by construction: the
 correlation id, the reply target, and the target service and method.
 
+**Nor the JSON reader's own message.** A `System.Text.Json` parse failure looks like bounded
+metadata and is not: it appends `Path: $.<name>` built from the *inbound* property names —
+dictionary keys read straight off the wire, such as a worker envelope's propagated `Context` — and
+for a malformed literal it quotes several raw body characters. Both the message and the chained
+inner exception the ingress logs (and, on the response path, republishes to the waiter through
+`SetException`) are rebuilt from position only: line, byte position, and size. The reader's own
+message and path are dropped, not chained.
+
 **Nor a hash of one.** A content digest reads like harmless metadata and is not: it is
 deterministic, so two log entries showing the same prefix prove the two payloads were identical —
 across messages, hosts, and days — and a payload drawn from a small set (a status enum, an account

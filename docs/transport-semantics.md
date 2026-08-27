@@ -139,6 +139,16 @@ Only cells that need more than a phrase.
   decision and leaves poison handling entirely to that broker policy.
 - In early ACK the receive loop waits for background-queue capacity before receiving, so
   queue-full abandons cannot burn `DeliveryCount` in steady state.
+- A message the transport cannot project — `ServiceBusReceivedMessage.Body` throws
+  `NotSupportedException` for an AMQP **Value** or **Sequence** body, which is what a JMS or raw
+  AMQP producer sends — is dead-lettered on its own with reason `AsyncResponseUnsupportedBody`.
+  The rest of the batch is unaffected. If that dead-letter itself fails, the lock simply lapses and
+  the broker redelivers.
+- Dead-letter descriptions are truncated to 4096 characters. Service Bus rejects a longer one with
+  `ArgumentOutOfRangeException` client-side, which is indistinguishable from a lost lock at the
+  call site — so a handler whose exception message ran long (a serializer dump, a wrapped SQL error,
+  an HTTP body) could not be dead-lettered at all and re-ran until the entity's own
+  `MaxDeliveryCount`.
 
 ### Google Pub/Sub
 
@@ -165,6 +175,11 @@ Only cells that need more than a phrase.
   The same retry-then-dead-letter path runs for background failures after an early ACK.
 - In early ACK, a full background queue pauses consumption on all assigned partitions
   (re-checked every `BackpressurePollDelay` 50 ms) rather than dropping or re-fetching.
+- A message that cannot be projected at all (empty payload, unresolvable correlation id) is
+  produced to the dead-letter topic and its offset stored, ignoring the stopping token like every
+  other settlement path — a shutdown landing mid-burial would leave the poison message neither
+  buried nor committed. A `StoreOffset` that throws because a rebalance revoked the partition is
+  logged rather than faulting the poll loop; the message simply redelivers.
 
 ### RabbitMQ
 
@@ -193,6 +208,10 @@ Only cells that need more than a phrase.
 
 - Attempts are the broker's `NumDelivered` for the JetStream consumer; the consumer is durable,
   so counts survive subscriber restarts (unlike Kafka's in-process counter).
+- The dead-letter republish drops the inbound `Nats-Msg-Id`: that id identifies the *live* publish,
+  and carrying it over would make a second burial of the same message a deduplicated publish inside
+  the DLQ stream's duplicate window — which the caller reads as a DLQ failure and answers with a
+  NAK, looping until the window passes.
 - In early ACK, a full background queue pauses pulling; a message still waiting in the queue
   when the subscriber stops is NAKed so JetStream redelivers it — backpressure itself never
   churns redeliveries.
@@ -218,7 +237,9 @@ Only cells that need more than a phrase.
   whole message group blocked if the consumer wedges. When enabled, it requires
   `VisibilityTimeout` to be set and shorter renewal beats; once the failure path schedules
   `RedeliveryDelay` for a message, the renewal sweep suppresses that message so a late renewal
-  cannot overwrite the shortened redelivery. Ignored in early ACK.
+  cannot overwrite the shortened redelivery. Ignored in early ACK. A renewal that fails — including
+  the AWS SDK's own client-side HTTP timeout, which surfaces as `TaskCanceledException` — is logged
+  and the sweep continues with the rest of the batch; only the subscriber's own stop ends it.
 - `CreateQueues` is the only provisioning default that is **off** — production queues (and
   their redrive policies) are usually owned by infrastructure code.
 - `CorrelationIdAttribute` resolution is case-**sensitive**, unlike every other transport's
@@ -238,6 +259,16 @@ Only cells that need more than a phrase.
   renewal stops and the fenced ack/NAK no-ops for the stale claim: at-least-once is preserved,
   and the loss is logged. Renewal *failures* (transient DB errors) are logged and retried next
   beat.
+- `MaxDeliveryAttempts` is enforced **before** the handler runs, not only after it throws. A
+  delivery that ends any other way — the process dies mid-handler, the lease lapses while the
+  database is unreachable at settlement — never reaches the post-failure check, and the claim has
+  already stamped `attempts + 1`, so the row comes back over the cap forever. A message that
+  arrives past the cap is dead-lettered without executing (and released for retry if the
+  dead-letter write itself fails). `MaxDeliveryAttempts = 0` still means unlimited.
+- Dead-lettering is fenced by the same `lock_id` as the ack and NAK: if the lease lapsed and a peer
+  re-claimed the row, the burial no-ops and reports failure rather than writing a DLQ copy of a
+  message that is still live under its new owner (on MongoDB the DLQ document is written first,
+  under a deterministic id, and removed again when the fenced delete does not match).
 - The dead-letter queue is rows/documents in the same table/collection under the
   `DeadLetterQueue` logical name; it has no consumer by default, so set `DeadLetterRetention`
   if entries should be pruned instead of kept for manual inspection. DDL is owned by

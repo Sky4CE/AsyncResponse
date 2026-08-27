@@ -61,6 +61,104 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
+    {
+        // Regression (round 29): save and delete are read-MODIFY-write on a SHARED envelope, and
+        // both pruned entries this build cannot INTERPRET (a newer schema version written by a host
+        // mid-rolling-upgrade) before rewriting. That silently deleted the sibling — the write path
+        // treating "unreadable" as "missing", which is exactly what GetAllAsync refuses to do.
+        var key = NatsSubjectSchema.RecoveryKey("corr-a");
+        var newerHostsRegistration = Guid.NewGuid();
+        _kv.Entries[key] = JsonSerializer.Serialize(new
+        {
+            ExpiresAtUtc = (_time.Now + TimeSpan.FromMinutes(10)).UtcDateTime,
+            States = new[]
+            {
+                new RecoveryState
+                {
+                    RegistrationId = newerHostsRegistration,
+                    CorrelationId = "corr-a",
+                    SchemaVersion = RecoveryStateSchema.Current + 1
+                }
+            }
+        });
+
+        var mine = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", mine, TimeSpan.FromMinutes(3));
+
+        using var written = JsonDocument.Parse(_kv.Entries[key]);
+        var ids = written.RootElement.GetProperty("States").EnumerateArray()
+            .Select(state => state.GetProperty("RegistrationId").GetGuid())
+            .ToList();
+
+        Assert.Contains(newerHostsRegistration, ids);
+        Assert.Contains(mine.RegistrationId, ids);
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
+    {
+        // Same rule on the delete path — and pruning them here also let the key be deleted outright
+        // when the unreadable siblings were the only survivors.
+        var key = NatsSubjectSchema.RecoveryKey("corr-a");
+        var newerHostsRegistration = Guid.NewGuid();
+        var mine = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _kv.Entries[key] = JsonSerializer.Serialize(new
+        {
+            ExpiresAtUtc = (_time.Now + TimeSpan.FromMinutes(10)).UtcDateTime,
+            States = new[]
+            {
+                new RecoveryState
+                {
+                    RegistrationId = newerHostsRegistration,
+                    CorrelationId = "corr-a",
+                    SchemaVersion = RecoveryStateSchema.Current + 1
+                },
+                mine
+            }
+        });
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", mine.RegistrationId));
+
+        Assert.True(_kv.Entries.ContainsKey(key), "the key was deleted along with a sibling this build merely could not read");
+        using var written = JsonDocument.Parse(_kv.Entries[key]);
+        var remaining = Assert.Single(written.RootElement.GetProperty("States").EnumerateArray());
+        Assert.Equal(newerHostsRegistration, remaining.GetProperty("RegistrationId").GetGuid());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(7L)]
+    [InlineData(OperationStatus.Completed)]
+    public async Task SaveAsync_AcceptsACallbackArgumentTheChannelsOwnJsonContextNeverSaw(object literal)
+    {
+        // Regression (round 29): this store serialized through the package-local source-generated
+        // context ALONE. A callback argument is CallbackParam.Value, typed object, so it serializes
+        // by RUNTIME type — and the generator only emitted what the envelope references
+        // transitively (string, int, Guid, DateTime). A perfectly ordinary literal therefore threw
+        // NotSupportedException at waiter registration, on this channel only, and the documented
+        // trim/AOT seam (AsyncResponseJsonSerialization.RegisterResolver) was bypassed entirely.
+        var state = new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-a",
+            ResumeCallback = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "Acme.IOrders",
+                MethodName = "ResumeAsync",
+                Params = [CallbackParam.ForValue(literal)]
+            }
+        };
+
+        await _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3));
+
+        Assert.Contains(
+            "ResumeAsync",
+            _kv.Entries[NatsSubjectSchema.RecoveryKey("corr-a")],
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SaveAsync_CompetingWriteBetweenReadAndWrite_RetriesAndKeepsAllRegistrations()
     {
         var first = new RecoveryState
@@ -189,12 +287,16 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
-    public async Task GetAllAsync_ReturnsEmpty_ForMissingMalformedAndExpired()
+    public async Task GetAllAsync_ReturnsEmpty_ForMissingAndExpired_ButRefusesAnUnreadableEnvelope()
     {
         Assert.Empty(await _store.GetAllAsync("missing"));
 
+        // Present but unparseable is NOT absence: an empty list reads as "no recovery callback was
+        // ever armed", which the dispatcher answers by acknowledging the terminal response — so a
+        // corrupt or newer-shaped envelope would consume a response its callback never saw. The
+        // per-registration branch already refused this; the envelope itself now does too.
         _kv.Entries[NatsSubjectSchema.RecoveryKey("broken")] = "{not-json";
-        Assert.Empty(await _store.GetAllAsync("broken"));
+        await Assert.ThrowsAsync<RecoveryStateUnreadableException>(() => _store.GetAllAsync("broken"));
 
         await _store.SaveAsync("expired", new RecoveryState { CorrelationId = "expired" }, TimeSpan.FromMinutes(1));
         _time.Advance(TimeSpan.FromMinutes(2));

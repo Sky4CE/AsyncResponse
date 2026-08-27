@@ -195,6 +195,13 @@ The in-memory transport is configured directly on registration:
 })
 ```
 
+`QueueCapacity` is backpressure on *external* producers only. A publish made from **inside** a
+running job — a durable flow starting a child, or a child waking its parent — never waits for
+capacity: the workers are the only consumers, so a worker parking on a full queue would be waiting
+on itself (with the default `WorkerCount = 1`, permanently). Follow-up work is a continuation of a
+job the queue already admitted, so it is accepted past the bound and drains as soon as a worker
+frees a slot; it still counts toward the shutdown drain, so nothing is lost at exit.
+
 | Option | Transports | Purpose |
 |---|---|---|
 | `KeyPrefix` / `SubjectPrefix` / `SchemaName` / `TopicPrefix` | Redis / NATS / PostgreSQL / SQL Server / Kafka | Namespace for worker and response streams/subjects/tables/topics. NATS additionally caps every resolved subject and JetStream stream/consumer name at 255 characters, validated at startup before any subscriber connects. |

@@ -415,12 +415,19 @@ internal sealed class PostgreSqlTransportStore
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
+            // The DLQ row is written ONLY if the fenced delete matched. A stale claim (the lease
+            // lapsed and a peer re-claimed the row) must no-op here exactly as the fenced ack and
+            // NAK do; writing the row unconditionally buried a full copy of a message that is still
+            // live and may yet succeed under its new owner, so the DLQ showed a poison entry for
+            // work that completed — and an operator replaying it duplicated its side effects.
             command.CommandText =
                 $"""
+                WITH removed AS (
+                    DELETE FROM {MessageTable} WHERE id = @source_id AND lock_id = @lock_id RETURNING id
+                )
                 INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-                VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason)
+                SELECT @id, @queue, @payload_json, @headers_json, @dead_letter_reason FROM removed
                 ON CONFLICT (id) DO NOTHING;
-                DELETE FROM {MessageTable} WHERE id = @source_id AND lock_id = @lock_id;
                 """;
             command.Parameters.AddWithValue("id", Guid.NewGuid());
             command.Parameters.AddWithValue("queue", _options.DeadLetterQueue);
@@ -429,8 +436,21 @@ internal sealed class PostgreSqlTransportStore
             command.Parameters.AddWithValue("dead_letter_reason", exception.Message);
             command.Parameters.AddWithValue("source_id", id);
             command.Parameters.AddWithValue("lock_id", lockId);
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var inserted = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            // Zero rows means the fence was lost, not that the write failed. Report it as a
+            // non-dead-letter so the caller does not log a burial that did not happen; its NAK
+            // fallback is fenced too, so the new owner keeps the row untouched.
+            if (inserted == 0)
+            {
+                _logger?.LogWarning(
+                    "PostgreSQL dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the row was re-claimed.",
+                    id,
+                    sourceQueue);
+                return false;
+            }
+
             return true;
         }
         catch (Exception ex)

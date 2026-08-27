@@ -270,7 +270,15 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
                     CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
                     """;
                 await ExecuteWriteAsync(command, cancellationToken).ConfigureAwait(false);
-                _created = true;
+
+                // Fall THROUGH to verification instead of latching here. CREATE TABLE IF NOT EXISTS
+                // is a no-op against a table an earlier build or a hand-run migration left behind,
+                // so latching on the DDL trusted its shape for the process lifetime — none of the
+                // load-bearing checks below (a single-column NOT NULL primary key, ISO-8601 text
+                // affinity on the expiry and lease columns, no extra NOT NULL column, a BINARY
+                // flow_id collation) ever ran on the DEFAULT path. MySQL, PostgreSQL and SQL Server
+                // all verify after their DDL for exactly this reason.
+                _created = await VerifyFlowTableAsync(connection, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
@@ -389,7 +397,52 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
                 "it a default, make it nullable or generated, or move it to a table of your own.");
         }
 
+        await VerifyFlowIdCollationAsync(connection, cancellationToken).ConfigureAwait(false);
+
         return true;
+    }
+
+    /// <summary>
+    /// flow_id must compare ordinally. PRAGMA table_info does not report a column's collation, so
+    /// the declaration is read from sqlite_master instead — the one property of this table that a
+    /// shape check cannot see and that fails SILENTLY: under COLLATE NOCASE the primary key and
+    /// every <c>WHERE flow_id = $flow_id</c> fold case, so "Order-A1" and "order-a1" become one
+    /// key. The second flow's insert-if-absent then reports "already running" and a load for one
+    /// id returns the other run's ledger. SQLite is the only one of the six relational stores that
+    /// was not checking this; MySQL, PostgreSQL, SQL Server, Oracle and EF Core all do.
+    /// </summary>
+    private async Task VerifyFlowIdCollationAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = $name;";
+        command.Parameters.AddWithValue("$name", _options.TableName);
+
+        var ddl = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+        if (string.IsNullOrEmpty(ddl))
+            return;
+
+        // Only the flow_id column's own COLLATE clause matters: find the declaration and look at
+        // what follows it up to the next column separator.
+        var start = ddl.IndexOf("flow_id", StringComparison.OrdinalIgnoreCase);
+        if (start < 0)
+            return;
+
+        var end = ddl.IndexOf(',', start);
+        var declaration = end < 0 ? ddl[start..] : ddl[start..end];
+
+        var collate = declaration.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
+        if (collate < 0)
+            return;
+
+        var collation = declaration[(collate + "COLLATE".Length)..].Trim().TrimEnd(')').Trim();
+        if (collation.Length == 0 || collation.StartsWith("BINARY", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        throw new InvalidOperationException(
+            $"The SQLite durable-flow table '{_options.TableName}' declares flow_id with COLLATE {collation}. Flow ids are compared " +
+            "ordinally by this library, so a case- or accent-insensitive collation makes ids differing only in case collide on the " +
+            "primary key: the second flow fails to start and a load returns the other run's state. Re-create the table with flow_id " +
+            "using the default BINARY collation (the DDL in docs/durable-flow-state-stores.md, which tables this build creates use).");
     }
 
     /// <summary>SQLite column-affinity rules (in the documented precedence order).</summary>

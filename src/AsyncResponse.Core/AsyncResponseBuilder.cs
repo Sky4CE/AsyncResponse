@@ -54,10 +54,22 @@ internal abstract class AsyncResponseBuilderBase(
                 ".WithGooglePubSubTransport(...) for Google Pub/Sub, " +
                 "or install another full AsyncResponse transport package.");
 
+            // The worker publish path was the only public entry point that did not apply the
+            // portable-id contract. A non-blank ambient id outside it published cleanly and was
+            // then drop-ACKed by the consumer (WorkerJobExecutor rejects it and returns, by
+            // design — throwing there would poison the queue), so the job silently never ran, the
+            // producer saw success, and any waiter burned its full timeout. Throw here instead,
+            // where the caller can still fix it: "the library throws it back at every public entry
+            // point" is the guard's own stated contract. A blank id is left alone — that is a
+            // fire-and-forget job with no response to publish.
+            var ambientCorrelationId = AsyncResponseContext.CorrelationId;
+            if (!string.IsNullOrWhiteSpace(ambientCorrelationId))
+                CorrelationIdGuard.ThrowIfUnusable(ambientCorrelationId);
+
             var envelope = new WorkerJobEnvelope
             {
                 Call = work,
-                CorrelationId = AsyncResponseContext.CorrelationId,
+                CorrelationId = ambientCorrelationId,
                 ReplyTarget = AsyncResponseContext.ReplyTarget,
                 Context = _propagation?.Capture()
             };

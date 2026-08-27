@@ -203,6 +203,8 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         // also captures delayed publishes made BY draining jobs (a flow suspending mid-drain), so
         // nothing falls between a pre-stop snapshot and the drain — a broker would keep all of it.
         var pendingDelayed = Transport.BeginRetainingDelayedJobs();
+        // Resolved BEFORE the provider goes away; abandoned after, once nothing can add to it.
+        var dyingChannel = _provider.GetService<InMemoryAsyncResponseChannel>();
         await StopHostedServicesAsync().ConfigureAwait(false);
         await _provider.DisposeAsync().ConfigureAwait(false);
 
@@ -216,6 +218,16 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         // store. The quiesce probe's parked entries died with the incarnation too.
         _flowStore.ExpireAllLeases();
         _quiesce.Reset();
+
+        // Same hard-crash semantics for the dead incarnation's response waiters. Their timeout
+        // timers were armed on the SHARED virtual clock, so without this they stayed live past the
+        // "restart": advancing time fired them, completed a pre-restart ResponseTask that a crash
+        // would leave hanging forever, and ran the cleanup that DELETES the registration from the
+        // SHARED recovery store — so the late response this scenario exists to test found no
+        // waiter AND no registration, and was silently dropped. Abandoning leaves the registration
+        // exactly as a crash does: alive until its TTL, recoverable by the new incarnation.
+        if (dyingChannel is not null)
+            await dyingChannel.AbandonAllAsync().ConfigureAwait(false);
 
         whileDown?.Invoke();
 

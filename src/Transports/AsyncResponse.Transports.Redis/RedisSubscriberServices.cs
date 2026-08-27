@@ -155,10 +155,16 @@ internal abstract class RedisSubscriberService : BackgroundService
         {
             delivery = CreateDelivery(entry, attempt);
         }
-        catch (InvalidDataException ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // A foreign/malformed entry (or a trimmed tombstone) can never be handled; dead-letter and
             // ACK it so it drains instead of poisoning the pending-claim loop forever.
+            //
+            // Deliberately every non-cancellation exception, not just InvalidDataException:
+            // CreateDelivery also runs correlation-id extraction, and anything that escapes here
+            // leaves the entry in the PEL to be reclaimed and re-thrown every PendingClaimInterval,
+            // abandoning the rest of the claimed batch behind it — MaxDeliveryAttempts cannot help,
+            // because it is keyed on a delivery this path never constructed.
             await dispatcher.DiscardUnprocessableAsync(Stream, ConsumerGroup, entry, ex, cancellationToken).ConfigureAwait(false);
             return RedisDispatchOutcome.Processed;
         }

@@ -74,12 +74,16 @@ owns the full story — this page is the map, not the territory.
 - **Cause:** `MaxDeliveryAttempts` defaults to `0` (unlimited): a persistently failing message
   requeues forever rather than being silently dropped — deliberate for a durability-focused
   default, but it means poison protection is opt-in. Additionally, the broker does not count
-  plain `basic.nack` requeues, so `MaxDeliveryAttempts` values above 2 need the TTL-retry
-  dead-letter cycle to make attempts countable.
+  plain `basic.nack` requeues, so `MaxDeliveryAttempts` values above 2 need a TTL-retry
+  dead-letter cycle to make attempts countable. Without one the cap is *clamped to 2* — the
+  message is rejected on its second delivery rather than requeued forever, which is what the
+  startup warning is telling you.
 - **Fix:** for production, set a positive `MaxDeliveryAttempts` **and** configure
-  `DeadLetterExchange` (so capped-out messages are preserved, not dropped); let the package
-  declare the cycle (`DeclareTopology` on), declare it in your own topology when infra owns it,
-  or keep `MaxDeliveryAttempts` at 2 or below. See
+  `DeadLetterExchange` (so capped-out messages are preserved, not dropped). `DeclareTopology`
+  declares the dead-letter *wiring* (`x-dead-letter-exchange` on the worker and response queues),
+  not the retry cycle: to make a cap above 2 reachable, declare a dead-letter queue with
+  `x-message-ttl` that dead-letters back to the source exchange in your own topology. Otherwise
+  keep `MaxDeliveryAttempts` at 2 or below and silence the warning. See
   [transport options](configuration.md#transport-options).
 
 ## Durable flows

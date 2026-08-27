@@ -830,6 +830,79 @@ public class GooglePubSubSubscriberTests
     }
 
     [Fact]
+    public async Task Dispatcher_AckAfterEnqueue_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_AndSurfacesIt()
+    {
+        // Regression (round 29): the drain token cannot stop the REAL handler — it is the ingress,
+        // whose target takes no CancellationToken — so the sibling fact's token-honoring handler
+        // hid the defect. With a handler that ignores the token the loop kept dequeuing and
+        // EXECUTING past the budget, and whatever was still queued at process exit vanished with no
+        // record: those messages were ACKed at enqueue, so Pub/Sub never redelivers them.
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<GooglePubSubBackgroundFailureContext>();
+
+        var subscriberOptions = new GooglePubSubSubscriberOptions().UseAckAfterEnqueue(
+            backgroundWorkerCount: 1,
+            backgroundQueueCapacity: 8,
+            backgroundDrainTimeout: TimeSpan.FromMilliseconds(100));
+        subscriberOptions.OnBackgroundFailure = context =>
+        {
+            lock (failures)
+            {
+                failures.Add(context);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+
+        var dispatcher = GooglePubSubMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            new GooglePubSubAsyncResponseOptions(),
+            subscriberOptions,
+            NullLogger.Instance,
+            "workers",
+            GooglePubSubSubscriberRole.Worker);
+
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-running"), CancellationToken.None));
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(SubscriberClient.Reply.Ack, await dispatcher.HandleAsync(Message("message-queued"), CancellationToken.None));
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued message
+
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            lock (failures)
+            {
+                if (failures.Count == 1)
+                    break;
+            }
+
+            await Task.Delay(15);
+        }
+
+        lock (failures)
+        {
+            var dropped = Assert.Single(failures);
+            Assert.Equal("message-queued", dropped.MessageId);
+            Assert.IsAssignableFrom<OperationCanceledException>(dropped.Exception);
+        }
+
+        // The queued message was NOT executed after the budget lapsed.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+    }
+
+    [Fact]
     public async Task Dispatcher_AckAfterEnqueue_CancelsRunningHandlerAfterDrainTimeout()
     {
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

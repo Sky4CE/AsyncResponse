@@ -427,14 +427,12 @@ public class NatsCorrelationIdExtractorTests
     // this runtime's throwing behavior is preserved rather than silently resolving to one of the
     // duplicates, on both net8.0 and net10.0.
     [Fact]
-    public void Extract_Throws_WhenTouchedObjectHasExactDuplicateKey()
-        => Assert.Throws<ArgumentException>(
-            () => NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"1","CorrelationId":"2"}""", _options));
+    public void Extract_ReturnsNull_WhenTouchedObjectHasExactDuplicateKey()
+        => Assert.Null(NatsCorrelationIdExtractor.Extract(null, """{"CorrelationId":"1","CorrelationId":"2"}""", _options));
 
     [Fact]
-    public void Extract_Throws_WhenTouchedObjectHasAnUnrelatedDuplicateKey()
-        => Assert.Throws<ArgumentException>(
-            () => NatsCorrelationIdExtractor.Extract(null, """{"Other":"1","Other":"2","CorrelationId":"x"}""", _options));
+    public void Extract_ReturnsNull_WhenTouchedObjectHasAnUnrelatedDuplicateKey()
+        => Assert.Null(NatsCorrelationIdExtractor.Extract(null, """{"Other":"1","Other":"2","CorrelationId":"x"}""", _options));
 
     [Fact]
     public void Extract_DoesNotThrow_WhenDuplicateKeyIsInAnUntouchedSibling()

@@ -400,6 +400,76 @@ public sealed class DbChannelSharedCoverageTests
     }
 
     /// <summary>
+    /// Regression (round 29): the waiter timeout faulted the TaskCompletionSource BEFORE draining
+    /// the per-correlation executor. A delivery already inside that executor may hold a message the
+    /// claim ACKED — the publisher was told "delivered" and the watermark excludes it from every
+    /// later sweep, so it exists nowhere else — and the timeout beat it, reporting a consumed
+    /// response as a timeout. The response was then unrecoverable: gone from the store, and never
+    /// handed to the caller. The terminal exception is now applied after the drain, where TrySet
+    /// loses to the delivery that won.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task WaiterTimeout_DrainsTheExecutorBeforeFaulting_SoAnInFlightDeliveryStillWins(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var (subscription, completion) = harness.Subscription("corr", cleanupStarted: false);
+        harness.AddSubscription("corr", subscription);
+
+        // Occupy the executor the way an in-flight delivery mid-Until-predicate does: the drain's
+        // marker item cannot run until this one returns.
+        var inFlight = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseInFlight = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True(await harness.Executors.EnqueueAsync(harness.ChannelName("corr"), async () =>
+        {
+            inFlight.TrySetResult();
+            await releaseInFlight.Task;
+        }));
+        await inFlight.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The timeout fires while that delivery is still in flight.
+        var timedOut = ((ValueTask)subscription.GetType()
+            .GetMethod("DrainThenCleanupAsync")!
+            .Invoke(subscription, [true, new TimeoutException("timed out")])!).AsTask();
+
+        // Red on the old code: it faulted here, before the drain could prove anything.
+        await Task.Delay(100);
+        Assert.False(completion.Task.IsCompleted, "the waiter was settled before the in-flight delivery had drained");
+
+        // The delivery finishes and hands over the response it was holding...
+        completion.TrySetResult(new OperationResult { Status = OperationStatus.Completed });
+        releaseInFlight.TrySetResult();
+        await timedOut.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // ...and the timeout does not overwrite it.
+        Assert.Equal(OperationStatus.Completed, (await completion.Task).Status);
+    }
+
+    /// <summary>
+    /// The counterpart: with nothing in flight the drain completes immediately and the timeout is
+    /// still what the caller sees.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task WaiterTimeout_WithNothingInFlight_StillFaultsWithTheTimeout(Provider provider)
+    {
+        await using var harness = Harness.Create(provider, failing: true, pollInterval: TimeSpan.FromSeconds(30));
+        var (subscription, completion) = harness.Subscription("corr", cleanupStarted: false);
+        harness.AddSubscription("corr", subscription);
+
+        await ((ValueTask)subscription.GetType()
+            .GetMethod("DrainThenCleanupAsync")!
+            .Invoke(subscription, [true, new TimeoutException("timed out")])!).AsTask()
+            .WaitAsync(TimeSpan.FromSeconds(10));
+
+        await Assert.ThrowsAsync<TimeoutException>(() => completion.Task);
+    }
+
+    /// <summary>
     /// Cleanup is best-effort on both network calls: a recovery-state delete and a subscriber delete
     /// that both fail are logged, and the purely local teardown still runs.
     /// </summary>
@@ -728,6 +798,11 @@ public sealed class DbChannelSharedCoverageTests
 
         public void AddSubscription(string correlationId, object subscription)
             => Method("AddSubscription").Invoke(Channel, [correlationId, subscription]);
+
+        /// <summary>The per-correlation serial executor the disposal drain has to get through.</summary>
+        public SerialExecutorRegistry Executors => (SerialExecutorRegistry)Field("_executors").GetValue(Channel)!;
+
+        public string ChannelName(string correlationId) => (string)Method("ChannelName").Invoke(Channel, [correlationId])!;
 
 
         public void Invoke(string name, params object?[] arguments) => Method(name).Invoke(Channel, arguments);

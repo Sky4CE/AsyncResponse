@@ -339,6 +339,73 @@ public sealed class SqsSubscriberTests
     }
 
     [Fact]
+    public async Task RenewalSweep_SurvivesAnSdkClientTimeout_AndKeepsRenewingTheRestOfTheBatch()
+    {
+        // Regression (round 29): the sweep's catch filter excluded EVERY OperationCanceledException,
+        // but the AWS SDK surfaces its own client-side HTTP timeout as TaskCanceledException with
+        // the caller's token untouched. That escaped to the outer catch — whose body is just a
+        // comment — silently ending renewal for the whole remaining batch. Messages 3..N then went
+        // visible mid-processing and a peer re-ran them: systematic duplicate execution, no log.
+        var client = new FakeSqsClient();
+        var logger = new CollectingLogger<SqsWorkerSubscriber>();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new Mock<IAsyncResponseIngress>();
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m1-body")).Returns(async () => await release.Task);
+        ingress.Setup(i => i.HandleWorkerMessageAsync("m2-body")).Returns(Task.CompletedTask);
+        var options = new SqsAsyncResponseOptions
+        {
+            WorkerQueue = "workers",
+            ResponseQueue = "responses",
+            ReceiveWaitTime = TimeSpan.FromMilliseconds(10)
+        };
+        options.WorkerSubscriber.VisibilityTimeout = TimeSpan.FromSeconds(45);
+        options.WorkerSubscriber.VisibilityRenewalInterval = TimeSpan.FromMilliseconds(50);
+        var firstCalls = new SettlementCalls();
+        var secondCalls = new SettlementCalls();
+        var subscriber = new SqsWorkerSubscriber(
+            Options.Create(options),
+            client,
+            ingress.Object,
+            logger);
+
+        // m1 is renewed FIRST in every sweep pass and always fails the way the SDK reports its own
+        // HTTP timeout: TaskCanceledException, with the sweep's token never signalled.
+        client.Enqueue(new SqsTransportDelivery(
+            FakeSqsClient.UrlFor("workers"),
+            "m1-body",
+            "m1",
+            "m1-receipt",
+            1,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            () =>
+            {
+                firstCalls.Delete++;
+                firstCalls.Deleted.TrySetResult();
+                return ValueTask.CompletedTask;
+            },
+            (delay, token) =>
+            {
+                firstCalls.RecordVisibilityChange(delay);
+                Assert.False(token.IsCancellationRequested);
+                throw new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout.");
+            }));
+        client.Enqueue(Delivery(secondCalls, body: "m2-body", messageId: "m2"));
+        await subscriber.StartAsync(CancellationToken.None);
+
+        // m2 keeps being renewed across several passes even though m1 fails on every one.
+        await WaitUntilAsync(() => secondCalls.VisibilityChanges.Count >= 2);
+
+        release.TrySetResult();
+        await secondCalls.Deleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await subscriber.StopAsync(CancellationToken.None);
+
+        Assert.Contains(
+            logger.Snapshot(),
+            entry => entry.Level == LogLevel.Warning
+                && entry.Message.Contains("Failed to renew visibility of SQS message", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task RenewalJoin_IsBounded_WhenAnInFlightRenewIgnoresCancellation()
     {
         // Red-on-old: the batch finally awaited the renewal task unbounded. The sweep is well

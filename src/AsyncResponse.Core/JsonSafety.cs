@@ -65,18 +65,24 @@ internal static class JsonSafety
     /// <summary>
     /// Builds the body-free parse failure: size plus the JSON coordinates the reader stopped at.
     /// <para>
-    /// The <see cref="JsonException"/> rides along as the inner exception because it carries the
-    /// structural detail (expected token, contract path, line/byte position) that makes a parse
-    /// failure actionable, and its own message is bounded metadata — at worst the single offending
-    /// character, never a span of the body. That is the line this helper draws: enough to find the
-    /// fault, never enough to read the payload.
+    /// The inner exception is deliberately NOT the raw <see cref="JsonException"/>. Its message is
+    /// not the bounded metadata it looks like: System.Text.Json appends <c>Path: $.&lt;name&gt;</c>
+    /// built from the INBOUND property names — including dictionary keys read straight off the
+    /// wire, such as a worker envelope's propagated Context — and for a malformed literal it quotes
+    /// several raw body characters ("'tru}' is an invalid JSON literal"). Both reach the
+    /// application log through the ingress's <c>LogError(ex, …)</c> and, on the response path, the
+    /// waiter through SetException, which is exactly what "the library never logs a message body"
+    /// forbids. Only the position is carried across; the original is dropped, not chained.
     /// </para>
     /// </summary>
     private static InvalidDataException ParseFailure(string json, JsonException jsonException)
         => new(
             $"Failed to parse JSON payload ({json.Length} UTF-16 code units) at line {Describe(jsonException.LineNumber)}, " +
             $"byte position {Describe(jsonException.BytePositionInLine)}.",
-            jsonException);
+            new JsonException(
+                $"The JSON payload is malformed at line {Describe(jsonException.LineNumber)}, " +
+                $"byte position {Describe(jsonException.BytePositionInLine)}. " +
+                "The reader's own message and path are omitted because they quote the inbound body."));
 
     private static string Describe(long? position)
         => position?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "unknown";

@@ -1,4 +1,5 @@
 using AsyncResponse.Channels.Redis;
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -389,6 +390,72 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task WaiterTimeout_DrainsTheExecutorBeforeFaulting_SoAnInFlightDeliveryStillWins()
+    {
+        // Regression (round 29): the timeout faulted the waiter BEFORE draining the per-correlation
+        // executor, so a delivery already inside it — mid Until-predicate, holding a message the
+        // publisher was told was delivered — lost the race and a consumed response was reported as
+        // a timeout. The terminal exception is now applied after the drain, where TrySet loses.
+        var channel = CreateChannel();
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-drain-timeout",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromMilliseconds(50));
+
+        await PublishSuccess(new OperationResult { Status = OperationStatus.Completed, Message = "delivered" });
+        await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The 50ms timeout fires while the predicate still holds the executor.
+        await Task.Delay(300);
+        Assert.False(waiter.ResponseTask.IsCompleted, "the waiter was settled before the in-flight delivery had drained");
+
+        releasePredicate.TrySetResult();
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("delivered", result.Message);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_StampsRegisteredAtFromTheInjectedTimeProvider()
+    {
+        // Regression (round 29): the stamp came from DateTime.UtcNow, which no host can substitute.
+        // The watchdog judges staleness as "utcNow - RegisteredAtUtc" from whichever host scans, so
+        // a skewed stamp made registrations either never age (a stuck flow stays invisible, health
+        // stays green) or age instantly (healthy waits page the operator every scan).
+        var time = new VirtualTimeProvider(new DateTimeOffset(2031, 5, 4, 3, 2, 1, TimeSpan.Zero));
+        RecoveryState? saved = null;
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Callback((string _, RecoveryState state, TimeSpan _, CancellationToken _) => saved = state)
+            .Returns(Task.CompletedTask);
+
+        var channel = CreateChannel(
+            new RedisAsyncResponseOptions { DefaultTimeout = TimeSpan.FromSeconds(5), RecoveryStateExpiry = TimeSpan.FromMinutes(5) },
+            timeProvider: time);
+
+        await using var waiter = await channel.CreateRecoverableResponseWaiter<OperationResult>(
+            "corr-registered-at",
+            resumeCallback: new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IAsyncResponsePublisher).FullName!,
+                MethodName = "Resume",
+                Params = []
+            },
+            timeout: TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(saved);
+        Assert.Equal(time.GetUtcNow().UtcDateTime, saved!.RegisteredAtUtc);
+    }
+
+    [Fact]
     public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
     {
         // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
@@ -728,14 +795,16 @@ public class RedisAsyncResponseChannelWaiterTests
 
     private RedisAsyncResponseChannel CreateChannel(
         RedisAsyncResponseOptions options,
-        ILogger<RedisAsyncResponseChannel>? logger = null) => new(
+        ILogger<RedisAsyncResponseChannel>? logger = null,
+        TimeProvider? timeProvider = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _multiplexer.Object,
         _store.Object,
         Options.Create(options),
         new AsyncResponseContextPropagation([]),
         logger ?? NullLogger<RedisAsyncResponseChannel>.Instance,
-        _channelSubscriber);
+        _channelSubscriber,
+        timeProvider);
 
     [Fact]
     public async Task CreateResponseWaiter_UnsupportedEnvelopeSchema_FaultsWaiter()

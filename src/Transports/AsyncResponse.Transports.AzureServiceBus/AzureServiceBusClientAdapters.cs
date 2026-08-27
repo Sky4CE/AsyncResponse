@@ -113,11 +113,49 @@ internal sealed class AzureServiceBusReceiverAdapter(
             return [];
 
         var queue = queueOverride ?? inner.EntityPath;
-        var deliveries = new AzureServiceBusTransportDelivery[messages.Count];
+        var deliveries = new List<AzureServiceBusTransportDelivery>(messages.Count);
         for (var i = 0; i < messages.Count; i++)
-            deliveries[i] = CreateDelivery(queue, messages[i]);
+        {
+            var message = messages[i];
+            try
+            {
+                deliveries.Add(CreateDelivery(queue, message));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Projecting the message must not be able to abort the RECEIVE. The Body getter
+                // throws for an AMQP Value/Sequence body — what a JMS or raw-AMQP producer sends —
+                // and the throw used to escape the whole batch: nothing was settled, all N locks
+                // lapsed, all N DeliveryCounts advanced, and the poison message crashed the loop
+                // again next cycle while its innocent batch-mates burned attempts toward the
+                // entity's MaxDeliveryCount without ever running. Bury this one and keep the rest.
+                await DeadLetterUnprojectableAsync(message, ex).ConfigureAwait(false);
+            }
+        }
 
         return deliveries;
+    }
+
+    /// <summary>
+    /// Buries a message this adapter cannot project (an unsupported AMQP body type). Best-effort:
+    /// if the dead-letter itself fails the lock simply lapses and the broker redelivers, which is
+    /// still strictly better than tearing down the receive loop.
+    /// </summary>
+    private async Task DeadLetterUnprojectableAsync(ServiceBusReceivedMessage message, Exception cause)
+    {
+        try
+        {
+            await inner.DeadLetterMessageAsync(
+                message,
+                deadLetterReason: "AsyncResponseUnsupportedBody",
+                deadLetterErrorDescription: cause.GetType().Name,
+                cancellationToken: CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Swallowed deliberately: the caller is mid-batch and the alternative is losing the
+            // deliveries already projected.
+        }
     }
 
     private AzureServiceBusTransportDelivery CreateDelivery(

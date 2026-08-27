@@ -66,7 +66,8 @@ internal abstract class RabbitMqSubscriberService : BackgroundService
             Logger.LogWarning(
                 "RabbitMQ {OptionName} is {MaxDeliveryAttempts} for queue {Queue} ({Role}), but attempts beyond 2 cannot be counted: "
                 + "basic.nack requeue does not increment x-death, so the cap only takes effect once a TTL-retry dead-letter cycle "
-                + "re-delivers the message through a dead-letter exchange.",
+                + "re-delivers the message through a dead-letter exchange. Until then the effective cap is 2 — a failing message is "
+                + "rejected on its second delivery rather than requeued without limit.",
                 nameof(RabbitMqSubscriberOptions.MaxDeliveryAttempts),
                 SubscriberOptions.MaxDeliveryAttempts,
                 queue,

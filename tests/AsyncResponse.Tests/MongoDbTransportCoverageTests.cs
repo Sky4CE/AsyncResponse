@@ -173,6 +173,59 @@ public sealed class MongoDbTransportCoverageTests
     }
 
     [Fact]
+    public async Task Store_DeadLetterOnAStaleClaim_NoOpsAndCompensatesTheDlqCopy()
+    {
+        // Regression (round 29): the DLQ insert ran unconditionally and the fenced delete's result
+        // was ignored, so a claim whose lease had lapsed (a peer re-claimed the document) still
+        // buried a full copy of a message that is still live and may yet succeed under its new
+        // owner — the DLQ showed a poison entry for work that completed, and an operator replaying
+        // it duplicated its side effects. The fenced ack and NAK already no-op in that window.
+        var sourceId = Guid.NewGuid();
+        var message = new MongoTransportMessageDocument
+        {
+            Id = sourceId,
+            Queue = "worker",
+            Payload = "{}",
+            Headers = new Dictionary<string, string>()
+        };
+        var deletes = new List<BsonDocument>();
+        var collection = new Mock<IMongoCollection<MongoTransportMessageDocument>>(MockBehavior.Loose);
+        collection
+            .Setup(c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoTransportMessageDocument, MongoTransportMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(message);
+        collection
+            .Setup(c => c.UpdateOneAsync(
+                It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoTransportMessageDocument>>(),
+                It.IsAny<UpdateOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new UpdateResult.Acknowledged(0, 1, BsonNull.Value));
+        collection
+            .Setup(c => c.DeleteOneAsync(It.IsAny<FilterDefinition<MongoTransportMessageDocument>>(), It.IsAny<CancellationToken>()))
+            .Callback((FilterDefinition<MongoTransportMessageDocument> filter, CancellationToken _)
+                => deletes.Add(filter.Render(TransportRenderArgs())))
+            // The fence lost: the lease lapsed and a peer re-claimed the document.
+            .ReturnsAsync(new DeleteResult.Acknowledged(0));
+
+        var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });
+        using var store = CreateStore(collection.Object, options);
+        var delivery = Assert.IsType<MongoDbTransportDelivery>(
+            await store.TryClaimAsync("worker", TimeSpan.FromSeconds(1), CancellationToken.None));
+
+        Assert.False(await delivery.DeadLetterAsync(new InvalidOperationException("poison"), true, CancellationToken.None));
+
+        // Two deletes: the fenced one that did not match, then the compensating removal of the DLQ
+        // copy written a moment earlier. The deterministic id makes that removal exact.
+        Assert.Equal(2, deletes.Count);
+        Assert.Equal(sourceId, deletes[0]["_id"].AsGuid);
+        Assert.Equal(MongoDbTransportStore.DeadLetterId(sourceId), Assert.Single(deletes[1].Elements).Value.AsGuid);
+    }
+
+    [Fact]
     public async Task SubscriberAdapters_ExposeConfiguredRolesAndForwardPayloads()
     {
         var options = Options.Create(new MongoDbAsyncResponseTransportOptions { AutoCreateIndexes = false });

@@ -603,7 +603,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
 
             default:
                 await NotifyStepAsync(static (o, e) => o.OnStepWaitingAsync(e), name, DurableFlowStepKind.ChildFlow).ConfigureAwait(false);
-                await SuspendForChildAsync(childFlowId, cancellationToken).ConfigureAwait(false);
+                await SuspendForChildAsync(childFlowId, child, cancellationToken).ConfigureAwait(false);
                 throw new InvalidOperationException("Unreachable.");
         }
     }
@@ -749,10 +749,6 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         }
         catch (OperationCanceledException ex) when (triggerCompleted)
         {
-            // A lost lease surfaces as cancellation of the linked wait; convert it with the wait
-            // failure attached so the takeover signal does not discard the real cause.
-            _lease.ThrowIfLost(ex);
-
             // SETTLE the handoff before deciding. A point-in-time IsCompletedSuccessfully check
             // raced the channel's dispatch: the response could win the task a moment after the
             // check, leaving a consumed response behind a still-pending ledger. Disposing the
@@ -771,9 +767,28 @@ internal sealed class DurableFlowContext : IDurableFlowContext
                 // gets its say again at the next step boundary.
                 var received = waiter.ResponseTask.Result;
                 checkpoint.PendingCorrelationId = null;
+
+                // Checked AFTER settling, never before. Running ThrowIfLost at the top of this
+                // catch threw while the waiter still held a claimed, channel-acked response: the
+                // payload was dropped with no checkpoint and no re-publish, PendingCorrelationId
+                // stayed set, and the redelivered execution re-attached to a correlation id that
+                // could never be answered — one lost response plus one duplicate remote request.
+                // A lost lease cannot write lease-fenced, so the payload is persisted through the
+                // lease-less compare-and-swap the recovery path already uses; only then is the
+                // takeover signal raised.
+                if (_lease.IsLost)
+                {
+                    await CheckpointReceivedWithoutLeaseAsync(name, checkpoint, received, correlationId).ConfigureAwait(false);
+                    _lease.ThrowIfLost(ex);
+                }
+
                 await CompleteStepAsync(name, checkpoint, AsyncResponseJson.Serialize(received), CancellationToken.None, kind: DurableFlowStepKind.Awaited, correlationId: correlationId).ConfigureAwait(false);
                 return received;
             }
+
+            // No response was won, so nothing is at risk: a lost lease is now just the takeover
+            // signal it always was.
+            _lease.ThrowIfLost(ex);
 
             if (waiter.ResponseTask.IsFaulted)
             {
@@ -932,7 +947,7 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         return _builder.EnqueueWorkerAsync<IDurableFlowExecutor>(executor => executor.ExecuteAsync(id));
     }
 
-    private async Task SuspendForChildAsync(string childFlowId, CancellationToken cancellationToken)
+    private async Task SuspendForChildAsync(string childFlowId, FlowState? child, CancellationToken cancellationToken)
     {
         // Persist the suspension BEFORE the child becomes runnable: once the child is enqueued it
         // can complete and re-execute this parent on another worker at any moment, and a save after
@@ -940,9 +955,47 @@ internal sealed class DurableFlowContext : IDurableFlowContext
         // The executor therefore does NOT save again on the suspension path.
         _suspended = true;
         _state.LastMessage = $"Flow {FlowId} suspended waiting for child flow {childFlowId}.";
-        await SaveAsync(cancellationToken).ConfigureAwait(false);
+
+        // Cover the child's OWN park window, not just this parent's idle margin. A plain
+        // StateExpiry save here (and the executor's per-attempt save above it) SHRANK a ledger the
+        // child had already extended through ExtendAncestorLedgersAsync — and nothing re-extends
+        // it while the child is parked in-process under a live lease, because that rescue enqueue
+        // is acked as redundant and the child never replays. The parent's row then expired
+        // mid-park and the child's completion wake-up found no state: the parent run, and every
+        // step after this one, silently lost.
+        await SaveForSleepAsync(RemainingChildParkWindow(child), cancellationToken).ConfigureAwait(false);
         await EnqueueChildAsync(childFlowId).ConfigureAwait(false);
         throw new DurableFlowSuspendedException(_state.LastMessage);
+    }
+
+    /// <summary>
+    /// How long the child's own persisted park runs from here — its pending timer wake or awaited
+    /// deadline, whichever is furthest out. Zero when the child is simply running, which leaves
+    /// the plain StateExpiry behavior unchanged.
+    /// </summary>
+    private TimeSpan RemainingChildParkWindow(FlowState? child)
+    {
+        if (child is null)
+            return TimeSpan.Zero;
+
+        if (child.Steps is not { Count: > 0 } steps)
+            return TimeSpan.Zero;
+
+        var now = UtcNow;
+        var furthest = now;
+        foreach (var step in steps.Values)
+        {
+            if (step.Completed)
+                continue;
+
+            if (step.WakeAtUtc is { } wakeAt && wakeAt > furthest)
+                furthest = wakeAt;
+
+            if (step.AwaitDeadlineUtc is { } deadline && deadline > furthest)
+                furthest = deadline;
+        }
+
+        return furthest > now ? furthest - now : TimeSpan.Zero;
     }
 
     private void ThrowIfSuspended()
@@ -1038,6 +1091,71 @@ internal sealed class DurableFlowContext : IDurableFlowContext
             _logger.LogDebug("Flow {FlowId} step '{Step}' completed.", FlowId, name);
 
         await NotifyStepAsync(static (o, e) => o.OnStepCompletedAsync(e), name, kind, correlationId, step.WakeAtUtc).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Persists a response that was already claimed and acked by the channel when this execution's
+    /// lease had ALREADY been lost — the one case where a lease-fenced write is impossible but the
+    /// payload exists nowhere else. Uses the same lease-less compare-and-swap the recovery
+    /// dispatcher uses, and re-reads the ledger so it mutates whatever the new owner wrote rather
+    /// than clobbering it. Best-effort by construction: on a conflict or an absent ledger the step
+    /// simply restarts, which is the pre-existing behavior — but on the common path the response
+    /// survives instead of being dropped.
+    /// </summary>
+    private async Task CheckpointReceivedWithoutLeaseAsync<T>(
+        string name,
+        FlowStepState step,
+        T received,
+        string correlationId)
+    {
+        var resultJson = AsyncResponseJson.Serialize(received);
+        var completedAtUtc = UtcNow;
+
+        try
+        {
+            await FlowStateConcurrency.MutateAsync(
+                _store,
+                FlowId,
+                _options.StateExpiry,
+                _timeProvider,
+                state =>
+                {
+                    if (state.Steps is not { } steps || !steps.TryGetValue(name, out var current) || current.Completed)
+                        return false;
+
+                    current.Completed = true;
+                    current.ResultJson = resultJson;
+                    current.PendingCorrelationId = null;
+                    current.PendingPayloadTypeFullName = null;
+                    current.Faulted = false;
+                    current.CompletedAtUtc = completedAtUtc;
+                    state.LastMessage = $"Step '{name}' completed (checkpointed after the execution lease was lost).";
+                    return true;
+                },
+                CancellationToken.None).ConfigureAwait(false);
+
+            _logger.LogWarning(
+                "Flow {FlowId} lost its execution lease while step '{Step}' held a claimed response for correlationId {CorrelationId}; the response was checkpointed without the lease so the takeover resumes from it.",
+                FlowId,
+                name,
+                correlationId);
+        }
+        catch (Exception ex)
+        {
+            // The takeover signal is raised by the caller regardless; losing this write only means
+            // the step restarts as it did before.
+            _logger.LogError(
+                ex,
+                "Flow {FlowId} could not checkpoint the claimed response for step '{Step}' after losing its execution lease; the step will restart.",
+                FlowId,
+                name);
+        }
+
+        step.Completed = true;
+        step.ResultJson = resultJson;
+        step.PendingCorrelationId = null;
+        step.PendingPayloadTypeFullName = null;
+        step.CompletedAtUtc = completedAtUtc;
     }
 
     internal Task FlushProgressAsync()

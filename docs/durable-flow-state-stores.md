@@ -315,6 +315,11 @@ CREATE TABLE asyncresponse_flow_state (
 CREATE INDEX asyncresponse_flow_state_expires_idx ON asyncresponse_flow_state (expires_at_utc);
 ```
 
+`flow_id` must also keep SQLite's default **BINARY** collation. `COLLATE NOCASE` (on the column or
+the primary key) folds `Order-A1` and `order-a1` onto one row, so two distinct runs share a ledger
+and each overwrites the other's checkpoints. `PRAGMA table_info` does not report a collation, so the
+store parses the stored `CREATE TABLE` text and refuses a folding one at startup.
+
 The **primary key on `flow_id` alone** is the one to keep if you change anything: starting a flow
 targets `ON CONFLICT(flow_id)`, which needs a uniqueness constraint on exactly that column — a
 composite key constrains a different tuple, so the upsert fails at the first flow instead of at
@@ -504,8 +509,8 @@ migrations or infrastructure-as-code and disable automatic DDL where available.
 The current relational shape is:
 
 ```text
-flow_id              string primary key
-state_json           large text / JSON
+flow_id              string primary key (case-sensitive/binary collation)
+state_json           large text (PostgreSQL: text, NOT jsonb)
 expires_at_utc       UTC timestamp
 updated_at_utc       UTC timestamp
 revision             64-bit integer, not null
@@ -516,6 +521,14 @@ index on expires_at_utc
 
 Document stores persist the same fields. DynamoDB uses `flow_id` as the partition key, Unix seconds
 for the TTL attribute, and Unix milliseconds for lease expiry.
+
+On PostgreSQL `state_json` is `text`, not `jsonb`: `jsonb` rejects the `\u0000` escape
+`System.Text.Json` emits for U+0000 (SQLSTATE 22P05), so a ledger every other store accepts would
+fail every write — the flow could not start, or its checkpoints failed until the job dead-lettered.
+Nothing queries inside the ledger, so `text` costs nothing. With `AutoCreateSchema = true` an
+existing `jsonb` column is converted in place on first use; with your own migration, deploy
+`ALTER TABLE ... ALTER COLUMN state_json TYPE text USING state_json::text` — the startup verifier
+rejects a `jsonb` column with that instruction rather than failing later on one unlucky payload.
 
 The library does not silently upgrade an incomplete concurrency schema:
 
@@ -565,8 +578,15 @@ a custom store in production, test all of these against the real backend:
 - a lease cannot be renewed or released by another owner;
 - takeover works after lease expiry;
 - TTL refresh and expired-record replacement are atomic;
-- malformed JSON, wrong `flowId`, missing/mismatched revision, and missing or unsupported schema versions load
-  as `null`;
+- a wrong `flowId` and a missing/mismatched revision load as `null` — the row does not belong to
+  this flow, so it is absent;
+- **unreadable is not missing:** malformed JSON and an unknown schema version instead throw
+  `FlowStateUnreadableException`. Returning `null` there says "this flow was deleted", and the
+  caller acknowledges the wake-up that was a live flow's only one — the failure mode a rolling
+  deployment hits when an older replica reads a row a newer one wrote;
+- `flow_id` compares **ordinally**: a case- or accent-insensitive column collation folds distinct
+  runs onto one row. The built-in stores verify the deployed collation at startup and refuse a
+  folding one rather than corrupting state silently;
 - cancellation reaches network/database operations;
 - transient failures do not fall back to unconditional writes.
 

@@ -234,8 +234,14 @@ public sealed class DurableFlowStateStoreExampleTests
         {
             ConnectionString = database.ConnectionString
         }));
-        await Assert.ThrowsAsync<SqliteException>(
+        // The DEFAULT path (AutoCreateSchema = true) now verifies the table after its
+        // CREATE TABLE IF NOT EXISTS, which is a no-op against this pre-existing one. The operator
+        // gets an actionable startup error naming the missing column instead of a raw SQLite error
+        // at the first flow — the wrong end of the deployment, as the verifier's own doc puts it.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => store.TryCreateAsync("incomplete", CreateState("incomplete"), TimeSpan.FromMinutes(5)));
+
+        Assert.Contains("revision", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

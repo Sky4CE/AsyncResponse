@@ -29,6 +29,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
     private readonly NatsSubjectSchema _subjects;
     private readonly NatsAsyncResponseChannelOptions _options;
     private readonly ILogger<NatsAsyncResponseChannel> _logger;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>Creates a NATS-backed async-response channel.</summary>
     public NatsAsyncResponseChannel(
@@ -37,8 +38,10 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         IRecoveryStateStore recoveryStateStore,
         IOptions<NatsAsyncResponseChannelOptions> options,
         AsyncResponseContextPropagation propagation,
-        ILogger<NatsAsyncResponseChannel> logger)
+        ILogger<NatsAsyncResponseChannel> logger,
+        TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _options = options.Value;
         _options.Validate();
         _client = client;
@@ -227,7 +230,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         // once the predicate returns. (A teardown FAILURE no longer throws — the latched
         // teardown logs it and leaves subscriptionTornDown false — so it backstop-cancels and
         // still proves settlement through the join.)
-        async ValueTask DrainThenCleanupAsync()
+        async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null)
         {
             if (Volatile.Read(ref cleanupStarted) == 0)
             {
@@ -271,6 +274,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     await DisarmThenCancelSubscriptionTokenAsync().ConfigureAwait(false);
                 }
             }
+
+            // Settle AFTER the drain, never before it. The consume loop may already hold a message
+            // the subscription received — the publisher was told "delivered", so it exists nowhere
+            // else. Faulting first let a timeout beat that in-flight delivery and report a consumed
+            // response as a timeout; TrySet loses here if the delivery won, which is the whole
+            // point. (A lapsed drain budget has already faulted the task as indeterminate above,
+            // and TrySet is a no-op behind it.)
+            if (terminalIfUndelivered is not null)
+                tcs.TrySetException(terminalIfUndelivered);
 
             await CleanupOnceAsync().ConfigureAwait(false);
         }
@@ -505,8 +517,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     _logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", correlationId);
                     AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
                     AsyncResponseDiagnostics.RecordWaiterTimeout("nats");
-                    tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-                    await DrainThenCleanupAsync().ConfigureAwait(false);
+                    await DrainThenCleanupAsync(
+                        new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."))
+                        .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -528,7 +541,15 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
                 PayloadTypeFullName = typeof(T).FullName,
-                RegisteredAtUtc = DateTime.UtcNow,
+                // The engine's clock, not the ambient one. The watchdog judges staleness as
+                // "utcNow - RegisteredAtUtc" from whichever host scans, so an unsubstitutable
+                // app-clock stamp made a skewed host's registrations either never age (skew ahead:
+                // a genuinely stuck flow stays invisible and the health check stays green) or age
+                // instantly (skew behind: healthy waits page the operator every scan). The DB
+                // channels stamp the SERVER clock for exactly this reason; this at least puts the
+                // stamp and the watchdog's "now" on one substitutable clock, and matches the
+                // ExpiresAtUtc the recovery store writes for the same registration.
+                RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
@@ -619,7 +640,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             // A response completed and cleaned up between the check and CancelAfter.
         }
 
-        return new NatsAsyncResponseWaiter<T>(UnwrapConsumeLoopFaults(tcs.Task), DrainThenCleanupAsync);
+        return new NatsAsyncResponseWaiter<T>(UnwrapConsumeLoopFaults(tcs.Task), () => DrainThenCleanupAsync());
     }
 
     // ---------------------------------------------------------------------------------------
@@ -902,10 +923,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         try
         {
             // NATS Core does not expose exact subscriber counts to clients, so the probe reports
-            // presence: a live waiter answers the ping (1), no-responders or no timely answer means
-            // none (0). The watchdog only needs "is anyone listening".
+            // presence. Only NoResponders is a definitive zero — the server told us nothing is
+            // subscribed. NoReply means the OPPOSITE: interest existed and the ping was delivered,
+            // it just was not acked inside PresenceProbeTimeout. That is routine for a LIVE waiter,
+            // because the consume loop acks a probe only when it reads it, serially, after the
+            // previous message's user Until predicate returns — so any predicate slower than the
+            // 2s default made a healthy waiter look dead, which flagged it stale in the watchdog
+            // and (worse) let the lost-subscriber dispatcher consume its recovery registration.
             var outcome = await _client.RequestAsync(subject, payload: null, probe: true, _options.PresenceProbeTimeout, cancellationToken).ConfigureAwait(false);
-            return outcome == NatsDeliveryOutcome.Replied ? 1L : 0L;
+            return outcome switch
+            {
+                NatsDeliveryOutcome.Replied => 1L,
+                NatsDeliveryOutcome.NoResponders => 0L,
+                _ => -1L
+            };
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

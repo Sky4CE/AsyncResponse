@@ -507,6 +507,76 @@ public class RedisDispatcherTests
     }
 
     [Fact]
+    public async Task Queued_AfterTheDrainBudgetLapses_DoesNotStartFreshWork_AndSurfacesIt()
+    {
+        // Regression (round 29): the drain token cannot stop the REAL handler — it is
+        // _ingress.HandleWorkerMessageAsync(payload), whose target takes no CancellationToken — so
+        // the sibling fact's token-honoring handler hid the defect. With a handler that ignores the
+        // token (as the ingress does), the loop kept dequeuing and EXECUTING past the budget, and
+        // whatever was still queued at process exit vanished with no record: those entries were
+        // ACKed at enqueue, so Redis never redelivers them.
+        var database = new RedisTransportTests.FakeRedisStreamDatabase();
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerRuns = 0;
+        var failures = new List<RedisBackgroundFailureContext>();
+
+        var options = new RedisSubscriberOptions().UseAckAfterEnqueue(1, 8, TimeSpan.FromMilliseconds(100));
+        options.OnBackgroundFailure = context =>
+        {
+            lock (failures)
+            {
+                failures.Add(context);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+
+        var dispatcher = RedisMessageDispatcher.Create(
+            async (_, _) =>
+            {
+                // Deliberately ignores the token, exactly like the ingress handler in production.
+                if (Interlocked.Increment(ref handlerRuns) == 1)
+                {
+                    firstStarted.TrySetResult();
+                    await releaseFirst.Task.ConfigureAwait(false);
+                }
+            },
+            database,
+            new RedisAsyncResponseTransportOptions(),
+            options,
+            NullLogger.Instance,
+            "worker-stream",
+            "worker-group",
+            RedisSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("1-0", attempt: 1), CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await dispatcher.HandleAsync(Delivery("2-0", attempt: 1), CancellationToken.None); // ACKed, waiting in queue
+
+        await dispatcher.DisposeAsync(); // the 100ms drain budget lapses while the first handler blocks
+        releaseFirst.TrySetResult();      // ...and only now can the loop reach the queued entry
+
+        await WaitUntilAsync(() =>
+        {
+            lock (failures)
+            {
+                return failures.Count == 1;
+            }
+        });
+
+        lock (failures)
+        {
+            var dropped = Assert.Single(failures);
+            Assert.Equal("2-0", dropped.MessageId);
+            Assert.IsAssignableFrom<OperationCanceledException>(dropped.Exception);
+        }
+
+        // The queued entry was NOT executed after the budget lapsed.
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+    }
+
+    [Fact]
     public async Task Queued_Dispose_CancelledDrain_SurfacesDroppedEntriesViaOnBackgroundFailure()
     {
         var database = new RedisTransportTests.FakeRedisStreamDatabase();

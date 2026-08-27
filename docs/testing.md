@@ -158,7 +158,10 @@ await harness.PublishAsync(new OperationResult { Status = OperationStatus.Comple
 
 This is the recovery tri-state (`Resume` / `Fail` / `KeepWaiting`) — the part of the API teams
 most need to test and previously could not without a broker. Waiter tasks obtained before the
-restart never complete (their process is gone); assert through the recovery side effects instead.
+restart never carry a response or a timeout: the restart abandons them exactly as a crash does —
+their `ResponseTask` is cancelled and their recovery registration is deliberately left intact, so
+the late response routes through `OnRecovery()`. Assert through the recovery side effects, not the
+dead incarnation's task.
 
 ## Sizing and guard rails
 

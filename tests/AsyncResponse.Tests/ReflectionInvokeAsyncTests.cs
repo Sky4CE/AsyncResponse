@@ -224,7 +224,10 @@ public class ReflectionInvokeAsyncTests
     {
         var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(new InvokeTarget()).BuildServiceProvider();
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        // ThrowsAny: wiring failures carry the CallbackTargetUnresolvableException subtype so the
+        // lost-subscriber dispatcher classifies them as PERMANENT and fails fast instead of
+        // burning its four-attempt retry ladder on a binding that can never succeed.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
             MethodName = nameof(IInvokeTarget.RecordAsync),
@@ -239,7 +242,10 @@ public class ReflectionInvokeAsyncTests
     {
         var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(new InvokeTarget()).BuildServiceProvider();
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        // ThrowsAny: wiring failures carry the CallbackTargetUnresolvableException subtype so the
+        // lost-subscriber dispatcher classifies them as PERMANENT and fails fast instead of
+        // burning its four-attempt retry ladder on a binding that can never succeed.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
             MethodName = nameof(IInvokeTarget.TwinAsync), // two arity-1 overloads
@@ -250,11 +256,14 @@ public class ReflectionInvokeAsyncTests
     }
 
     [Fact]
-    public async Task ByRefParameter_ThrowsNotSupported()
+    public async Task ByRefParameter_ThrowsUnresolvable()
     {
         var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(new InvokeTarget()).BuildServiceProvider();
 
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        // ThrowsAny: wiring failures carry the CallbackTargetUnresolvableException subtype so the
+        // lost-subscriber dispatcher classifies them as PERMANENT and fails fast instead of
+        // burning its four-attempt retry ladder on a binding that can never succeed.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
             MethodName = nameof(IInvokeTarget.ByRefAsync),
@@ -265,11 +274,14 @@ public class ReflectionInvokeAsyncTests
     }
 
     [Fact]
-    public async Task UnboundGenericMethod_ThrowsNotSupported()
+    public async Task UnboundGenericMethod_ThrowsUnresolvable()
     {
         var provider = new ServiceCollection().AddSingleton<IInvokeTarget>(new InvokeTarget()).BuildServiceProvider();
 
-        var ex = await Assert.ThrowsAsync<NotSupportedException>(() => provider.InvokeAsync(new ReflectionInvocationDto
+        // ThrowsAny: wiring failures carry the CallbackTargetUnresolvableException subtype so the
+        // lost-subscriber dispatcher classifies them as PERMANENT and fails fast instead of
+        // burning its four-attempt retry ladder on a binding that can never succeed.
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() => provider.InvokeAsync(new ReflectionInvocationDto
         {
             ServiceInterfaceFullName = typeof(IInvokeTarget).FullName!,
             MethodName = nameof(IInvokeTarget.GenericAsync),

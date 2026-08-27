@@ -540,11 +540,12 @@ public sealed class AzureServiceBusTransportTests
     }
 
     [Fact]
-    public void CorrelationIdExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
-        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
-        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
-        // of the duplicates.
-        => Assert.Throws<ArgumentException>(() => AzureServiceBusCorrelationIdExtractor.Extract(
+    public void CorrelationIdExtractor_ReturnsNull_WhenTouchedObjectHasExactDuplicateKey()
+        // An object with a duplicate key cannot resolve a property, so the id is simply not in this
+        // body: extraction reports "not found" and the ingress acknowledges the message as
+        // unroutable. Throwing made it a handler failure, which on RabbitMQ's default cap of 0
+        // requeued forever.
+        => Assert.Null(AzureServiceBusCorrelationIdExtractor.Extract(
             Delivery(body: """{"CorrelationId":"1","CorrelationId":"2"}"""),
             """{"CorrelationId":"1","CorrelationId":"2"}""",
             new AzureServiceBusAsyncResponseOptions()));

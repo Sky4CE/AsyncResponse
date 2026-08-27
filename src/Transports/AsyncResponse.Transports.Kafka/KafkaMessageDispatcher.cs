@@ -296,19 +296,26 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
     /// already-settled work.
     /// </summary>
     protected void StoreOffsetAfterSettlement(KafkaDelivery delivery)
+        => StoreOffsetAfterSettlement(delivery.Topic, delivery.Partition, delivery.Offset);
+
+    /// <summary>
+    /// Coordinate overload, for settlement paths that never built a <see cref="KafkaDelivery"/> —
+    /// the unprocessable-message discard runs before projection succeeds.
+    /// </summary>
+    protected void StoreOffsetAfterSettlement(string topic, int partition, long offset)
     {
         try
         {
-            StoreOffset(delivery);
+            _consumer.StoreOffset(topic, partition, offset);
         }
         catch (Exception ex)
         {
             Logger.LogError(
                 ex,
                 "Failed to store offset for Kafka message {Topic}[{Partition}]@{Offset} after settlement; it will be redelivered after a restart or rebalance.",
-                delivery.Topic,
-                delivery.Partition,
-                delivery.Offset);
+                topic,
+                partition,
+                offset);
         }
     }
 
@@ -363,6 +370,9 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
             message.Partition,
             message.Offset);
 
+        // Settlement ignores the stopping token, as every sibling settlement path does: a shutdown
+        // landing between the dead-letter publish and the offset store would abort the publish
+        // mid-flight and leave the poison message neither buried nor committed.
         await DeadLetterCoreAsync(
             message.Topic,
             message.Partition,
@@ -373,9 +383,13 @@ internal abstract class KafkaMessageDispatcher : IAsyncDisposable
             failure,
             "unprocessable_message",
             attempts: 0,
-            cancellationToken).ConfigureAwait(false);
+            CancellationToken.None).ConfigureAwait(false);
 
-        _consumer.StoreOffset(message.Topic, message.Partition, message.Offset);
+        // Guarded like every other settlement: a rebalance revoking this partition makes
+        // StoreOffset throw, and here that throw originates INSIDE the poll loop's catch arm, so
+        // nothing could catch it — it faulted the poll loop after the message was already produced
+        // to the dead-letter topic, and the restart dead-lettered it a second time.
+        StoreOffsetAfterSettlement(message.Topic, message.Partition, message.Offset);
     }
 
     private async Task DeadLetterCoreAsync(

@@ -491,6 +491,57 @@ public class AsyncResponseBuilderTests
         Assert.Equal(7, Assert.Single(published.Call.Params).Value);
     }
 
+    [Theory]
+    [InlineData("order-42 ")]
+    [InlineData(" order-42")]
+    public async Task EnqueueWorker_RejectsANonPortableAmbientCorrelationId(string ambient)
+    {
+        // Regression (round 29): the worker publish path was the only public entry point that did
+        // not apply the portable-id contract. A non-blank ambient id published cleanly and the
+        // consumer then drop-ACKed it (WorkerJobExecutor rejects an unusable id and returns, by
+        // design), so the job silently never ran while the producer saw success.
+        var transport = new Mock<IWorkerTransport>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        AsyncResponseContext.SetCorrelationId(ambient);
+        try
+        {
+            await Assert.ThrowsAsync<ArgumentException>(
+                () => new AsyncResponseBuilder(_subscriber.Object, transport.Object)
+                    .EnqueueWorkerAsync<IRecoverySpy>(spy => spy.OnWorkerJob(7)));
+        }
+        finally
+        {
+            AsyncResponseContext.ClearCorrelationId();
+        }
+
+        transport.Verify(
+            t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task EnqueueWorker_StillAcceptsNoAmbientCorrelationId()
+    {
+        // The counterpart: fire-and-forget work has no response to publish, so a blank ambient id
+        // stays legal and must not be dragged into the guard.
+        var transport = new Mock<IWorkerTransport>();
+        transport
+            .Setup(t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        AsyncResponseContext.ClearCorrelationId();
+
+        await new AsyncResponseBuilder(_subscriber.Object, transport.Object)
+            .EnqueueWorkerAsync<IRecoverySpy>(spy => spy.OnWorkerJob(7));
+
+        transport.Verify(
+            t => t.PublishAsync(It.IsAny<WorkerJobEnvelope>(), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
     [Fact]
     public async Task EnqueueWorker_PassesCancellationToTransport()
     {

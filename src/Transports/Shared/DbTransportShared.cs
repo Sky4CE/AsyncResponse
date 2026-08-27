@@ -90,6 +90,47 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     /// <summary>Handles one claimed queue item.</summary>
     public async Task HandleAsync(DbTransportDelivery delivery, CancellationToken cancellationToken)
     {
+        // Pre-execution cap, BEFORE either ack mode. HandleFailureAsync below is the only other
+        // place the cap is consulted, and it runs only when the handler THREW — so a delivery that
+        // ends any other way (the process dies mid-handler, the host is killed, the lease lapses
+        // while the DB is unreachable at settlement) never reaches it. The claim already stamped
+        // attempts+1, so the row comes back at attempts cap+1, cap+2, ... and would be executed
+        // again every time: redelivered forever, killing each replica in turn, and never
+        // dead-lettered — the opposite of what MaxDeliveryAttempts documents. Settlement uses
+        // CancellationToken.None for the usual reason: burying a poison row must not be abandoned
+        // half-done by a shutdown. Mirrors the Redis dispatcher's AlreadyExceededDeliveryAttempts.
+        var cap = _subscriberOptions.MaxDeliveryAttempts;
+        if (cap > 0 && delivery.Attempt > cap)
+        {
+            _logger.LogError(
+                "{Provider} message on queue {Queue} ({Role}) arrived on attempt {Attempt} with a cap of {MaxDeliveryAttempts}; dead-lettering without executing it.",
+                _providerName,
+                delivery.Queue,
+                _role,
+                delivery.Attempt,
+                cap);
+
+            var buried = await delivery
+                .DeadLetterAsync(
+                    new InvalidOperationException(
+                        $"Message exceeded {cap} delivery attempts without settling (attempt {delivery.Attempt})."),
+                    true,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
+
+            if (!buried)
+            {
+                _logger.LogWarning(
+                    "{Provider} dead-letter publish failed for over-cap message on queue {Queue} ({Role}); releasing for retry.",
+                    _providerName,
+                    delivery.Queue,
+                    _role);
+                await NakSwallowingFailureAsync(delivery).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
         if (_subscriberOptions.AckMode is DbAckMode.AckAfterEnqueue)
         {
             await HandleEarlyAckAsync(delivery, cancellationToken).ConfigureAwait(false);

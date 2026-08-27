@@ -3,6 +3,7 @@ using Microsoft.Extensions.Options;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 
 namespace AsyncResponse.Channels.NATS;
 
@@ -68,7 +69,11 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             var states = stored is not null && !IsExpired(stored)
                 ? StatesFrom(stored)
                 : [];
-            states.RemoveAll(existingState => !IsStateReadable(existingState, key, correlationId));
+            // Deliberately NOT pruned by readability: a registration this build cannot INTERPRET
+            // (a newer schema version written by a host mid-rolling-upgrade) must be carried
+            // through untouched. Rewriting the shared envelope from the readable subset silently
+            // deleted that sibling — the write path treating "unreadable" as "missing", which is
+            // exactly what GetAllAsync was hardened to refuse.
             states.RemoveAll(existingState => existingState.RegistrationId == state.RegistrationId);
             states.Add(state);
             var json = SerializeStates(states, _timeProvider.GetUtcNow() + ttl);
@@ -92,8 +97,21 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
         var key = NatsSubjectSchema.RecoveryKey(correlationId);
         var loaded = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
-        if (loaded is not { } found)
+
+        // The ENVELOPE itself is unreadable — a truncated or corrupt value, or a shape a newer
+        // build wrote whose JSON this one cannot parse at all (so the per-registration schema check
+        // below never gets to classify it). That is the same "unreadable is not missing" case the
+        // per-registration branch guards, one level up: returning [] here would read as "no
+        // recovery callback was ever armed" and the dispatcher would acknowledge the terminal
+        // response, consuming it for a callback that never ran. Refuse so redelivery can reach a
+        // build that can read it.
+        if (loaded.Unreadable)
+            throw new RecoveryStateUnreadableException(correlationId, 1);
+
+        if (loaded.Stored is not { } stored)
             return [];
+
+        var found = (Stored: stored, loaded.Revision);
 
         if (IsExpired(found.Stored))
         {
@@ -159,7 +177,9 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             }
 
             var states = StatesFrom(stored);
-            states.RemoveAll(state => !IsStateReadable(state, key, correlationId));
+            // Same rule as SaveAsync: remove only the targeted registration, never a sibling this
+            // build merely cannot read — dropping those here also let the key be deleted outright
+            // when they were the only survivors.
             var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
             if (!removed)
                 return false;
@@ -185,8 +205,14 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             cancellationToken.ThrowIfCancellationRequested();
 
             var loaded = await LoadStoredAsync(key, cancellationToken).ConfigureAwait(false);
-            if (loaded is not { } found)
+
+            // The watchdog scan reports; it does not settle a delivery, so an unreadable envelope
+            // is skipped here rather than thrown (TryDeserialize already logged it). GetAllAsync —
+            // the path whose answer decides whether a terminal response is acknowledged — refuses.
+            if (loaded.Stored is not { } storedState)
                 continue;
+
+            var found = (Stored: storedState, loaded.Revision);
 
             if (IsExpired(found.Stored))
             {
@@ -207,22 +233,45 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
     private const int MaxCasAttempts = 4;
 
-    private async Task<(StoredRecoveryState Stored, ulong Revision)?> LoadStoredAsync(string key, CancellationToken cancellationToken)
+    /// <summary>
+    /// Tri-state load: the key is absent, or it holds an envelope this build can read, or it holds
+    /// an envelope it cannot. The third case is NOT absence — see the note in <see cref="GetAllAsync"/>.
+    /// </summary>
+    private async Task<(StoredRecoveryState? Stored, ulong Revision, bool Unreadable)> LoadStoredAsync(string key, CancellationToken cancellationToken)
     {
         var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
         if (entry is not { } existing)
-            return null;
+            return (null, 0, false);
 
         var stored = TryDeserialize(existing.Value, key);
-        return stored is null ? null : (stored, existing.Revision);
+        return stored is null ? (null, existing.Revision, true) : (stored, existing.Revision, false);
     }
+
+    /// <summary>
+    /// The package-local envelope metadata CHAINED behind the library's resolver, not used alone.
+    /// A callback argument is <see cref="CallbackParam"/>.Value, typed <c>object</c>, so it
+    /// serializes by runtime type — and the source generator only emitted what this envelope
+    /// references transitively (string, int, Guid, DateTime). On its own the context therefore
+    /// threw NotSupportedException at waiter registration for a perfectly ordinary literal
+    /// (a bool, a long, an enum, a DTO), on this channel and Redis only, and bypassed
+    /// AsyncResponseJsonSerialization.RegisterResolver — the documented trim/AOT seam — entirely.
+    /// The wire format is unchanged: the envelope's own metadata still resolves first.
+    /// </summary>
+    private static readonly JsonSerializerOptions _envelopeOptions = new()
+    {
+        TypeInfoResolver = JsonTypeInfoResolver.Combine(NatsChannelJsonContext.Default, AsyncResponseJson.Resolver)
+    };
+
+    /// <summary>The envelope's metadata off the chained options — the JsonTypeInfo overloads keep this trim/AOT-clean.</summary>
+    private static readonly JsonTypeInfo<StoredRecoveryState> _envelopeTypeInfo =
+        AsyncResponseJson.GetTypeInfo<StoredRecoveryState>(_envelopeOptions);
 
     private static string SerializeStates(List<RecoveryState> states, DateTimeOffset expiresAtUtc)
         => JsonSerializer.Serialize(new StoredRecoveryState
         {
             States = states,
             ExpiresAtUtc = expiresAtUtc
-        }, NatsChannelJsonContext.Default.StoredRecoveryState);
+        }, _envelopeTypeInfo);
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
 
@@ -270,7 +319,7 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     {
         try
         {
-            return JsonSerializer.Deserialize(json, NatsChannelJsonContext.Default.StoredRecoveryState);
+            return JsonSerializer.Deserialize(json, _envelopeTypeInfo);
         }
         catch (JsonException ex)
         {

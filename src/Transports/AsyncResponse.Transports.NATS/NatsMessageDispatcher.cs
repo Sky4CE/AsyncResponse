@@ -326,6 +326,13 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
             ["AR-DeadLetter-Role"] = _role.ToString()
         };
 
+        // The inbound Nats-Msg-Id belongs to the LIVE publish, not to this one. Carrying it over
+        // makes a second dead-letter of the same message inside the DLQ stream's duplicate window
+        // — reachable whenever the Term below fails and the message redelivers after AckWait — a
+        // deduplicated publish, which the caller reads as a DLQ failure and answers with a NAK,
+        // looping until the window passes.
+        headers.Remove("Nats-Msg-Id");
+
         try
         {
             await _jetStream.PublishAsync(_schema.DeadLetterSubject, delivery.Payload, headers, cancellationToken).ConfigureAwait(false);

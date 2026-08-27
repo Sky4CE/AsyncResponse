@@ -225,8 +225,15 @@ internal abstract class SqsSubscriberService : BackgroundService
                     {
                         await delivery.ChangeVisibilityAsync(visibilityTimeout, cancellationToken).ConfigureAwait(false);
                     }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
                     {
+                        // Only OUR token ends the sweep. The AWS SDK surfaces its own client-side
+                        // HTTP timeout as TaskCanceledException with the caller's token untouched,
+                        // and excluding every OperationCanceledException let that escape to the
+                        // outer catch — whose body is just a comment — silently ending renewal for
+                        // the whole remaining batch. Messages 3..N then went visible mid-processing
+                        // and a peer re-ran them: systematic duplicate execution with no log line.
+                        // Same idiom the durable-flow start ladder and the DB channel already use.
                         Logger.LogWarning(
                             ex,
                             "Failed to renew visibility of SQS message {MessageId} on {Queue}; it may redeliver while still being processed (at-least-once preserved).",

@@ -231,7 +231,7 @@ internal abstract class DbAsyncResponseChannelBase :
 
         timeoutRegistration = timeoutCts.Token.Register(
             OnWaiterTimeout,
-            new WaiterTimeoutState<T>(this, subscription, activity, correlationId, tcs));
+            new WaiterTimeoutState<T>(this, subscription, activity, correlationId));
 
         // Wire the captured-context delegate before the subscription becomes discoverable, so a
         // response already stored for this correlation id is processed with the caller's context.
@@ -954,6 +954,18 @@ internal abstract class DbAsyncResponseChannelBase :
                     continue;
                 }
 
+                // Pre-filter BEFORE enqueueing. The work item re-checks this anyway, but the store
+                // deliberately keeps returning acked rows (cross-process fan-out), so every sweep
+                // tick and every targeted signal re-enqueued one item per retained message. A
+                // waiter wedged in a slow user Until predicate holds its per-correlation executor,
+                // those items pile up against the executor's bounded queue, and the next
+                // EnqueueAsync then parks the PROCESS-WIDE dispatch loop — which walks correlation
+                // ids sequentially — so every other waiter stopped receiving and local publishers
+                // blocked on the same enqueue. Skipping messages no live subscription would take
+                // keeps a wedged predicate's blast radius inside its own correlation id.
+                if (!WouldDeliverToAnySubscription(message, subscriptions))
+                    continue;
+
                 // Work-item class, not a lambda: a queued closure would chain display classes
                 // pinning this paging frame (batch list, cursors, watermark) for as long as the
                 // item sits in the executor's bounded queue.
@@ -970,6 +982,21 @@ internal abstract class DbAsyncResponseChannelBase :
             afterCreatedAtUtc = last.CreatedAtUtc;
             afterId = last.Id;
         }
+    }
+
+    /// <summary>
+    /// Would any live subscription actually take this message? Used both as the sweep's
+    /// pre-enqueue filter and as the dispatch work item's own guard, so the two can never drift.
+    /// </summary>
+    private static bool WouldDeliverToAnySubscription(DbChannelMessage message, IReadOnlyList<IDbSubscription> subscriptions)
+    {
+        foreach (var subscription in subscriptions)
+        {
+            if (!subscription.Dropped && IsWithinWatermark(subscription, message) && !subscription.HasSeen(message.Id))
+                return true;
+        }
+
+        return false;
     }
 
     private async Task PublishMessageAsync(
@@ -1001,16 +1028,7 @@ internal abstract class DbAsyncResponseChannelBase :
         // Only subscriptions that are still live, inside their delivery watermark, and have not
         // already processed this message. Skipping when there is nothing to deliver also avoids a
         // redundant claim on every re-sweep.
-        var hasTargets = false;
-        foreach (var subscription in subscriptions)
-        {
-            if (!subscription.Dropped && IsWithinWatermark(subscription, message) && !subscription.HasSeen(message.Id))
-            {
-                hasTargets = true;
-                break;
-            }
-        }
-        if (!hasTargets)
+        if (!WouldDeliverToAnySubscription(message, subscriptions))
             return;
 
         // Take the message for live delivery. The claim sets acked_at unless the publisher already
@@ -1279,14 +1297,14 @@ internal abstract class DbAsyncResponseChannelBase :
     private async Task HandleWaiterTimeoutAsync<T>(
         DbSubscription<T> subscription,
         Activity? activity,
-        string correlationId,
-        TaskCompletionSource<T> tcs) where T : IAsyncResponsePayload
+        string correlationId) where T : IAsyncResponsePayload
     {
         _logger.LogWarning("Timed out waiting for {Provider} response for correlationId {CorrelationId}.", _providerName, correlationId);
         AsyncResponseDiagnostics.SetError(activity, "timeout", $"Timed out waiting for response for correlationId {correlationId}.");
         AsyncResponseDiagnostics.RecordWaiterTimeout(_activityTag);
-        tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {correlationId}."));
-        await subscription.DrainThenCleanupAsync(deleteRecoveryState: true).ConfigureAwait(false);
+        await subscription.DrainThenCleanupAsync(
+            deleteRecoveryState: true,
+            new TimeoutException($"Timed out waiting for response for correlationId {correlationId}.")).ConfigureAwait(false);
     }
 
     private interface IWaiterTimeoutState
@@ -1299,15 +1317,14 @@ internal abstract class DbAsyncResponseChannelBase :
         DbAsyncResponseChannelBase owner,
         DbSubscription<T> subscription,
         Activity? activity,
-        string correlationId,
-        TaskCompletionSource<T> tcs) : IWaiterTimeoutState where T : IAsyncResponsePayload
+        string correlationId) : IWaiterTimeoutState where T : IAsyncResponsePayload
     {
         public void Schedule()
             => _ = Task.Run(async () =>
             {
                 try
                 {
-                    await owner.HandleWaiterTimeoutAsync(subscription, activity, correlationId, tcs).ConfigureAwait(false);
+                    await owner.HandleWaiterTimeoutAsync(subscription, activity, correlationId).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -1417,7 +1434,7 @@ internal abstract class DbAsyncResponseChannelBase :
         void PruneSeen(DateTimeOffset cutoffUtc);
         Task ProcessAsync(DbChannelMessage message);
         ValueTask CleanupOnceAsync(bool deleteRecoveryState);
-        ValueTask DrainThenCleanupAsync(bool deleteRecoveryState);
+        ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null);
         ValueTask DropLocalAsync(CancellationToken cancellationToken);
     }
 
@@ -1596,7 +1613,7 @@ internal abstract class DbAsyncResponseChannelBase :
         /// below is truthful.
         /// </para>
         /// </summary>
-        public async ValueTask DrainThenCleanupAsync(bool deleteRecoveryState)
+        public async ValueTask DrainThenCleanupAsync(bool deleteRecoveryState, Exception? terminalIfUndelivered = null)
         {
             if (Volatile.Read(ref _cleanupStarted) == 0)
             {
@@ -1631,6 +1648,16 @@ internal abstract class DbAsyncResponseChannelBase :
                     _tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout));
                 }
             }
+
+            // Settle AFTER the drain, never before it. A delivery already inside the per-correlation
+            // executor may hold a message the claim acked — the publisher was told "delivered" and
+            // the watermark excludes it from every later sweep, so it exists nowhere else. Faulting
+            // first let a timeout beat that in-flight delivery and report a consumed response as a
+            // timeout; TrySet loses here if the delivery won, which is the whole point. (A lapsed
+            // drain budget has already faulted the task as indeterminate above, and TrySet is a
+            // no-op behind it.)
+            if (terminalIfUndelivered is not null)
+                _tcs.TrySetException(terminalIfUndelivered);
 
             await CleanupOnceAsync(deleteRecoveryState).ConfigureAwait(false);
         }

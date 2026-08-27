@@ -158,7 +158,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
             WHERE {Table}.expires_at_utc <= now();
             """;
         command.Parameters.AddWithValue("flow_id", flowId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = stateJson;
+        command.Parameters.Add("state_json", NpgsqlDbType.Text).Value = stateJson;
         command.Parameters.Add("ttl", NpgsqlDbType.Interval).Value = DurableFlowStoreShared.ServerClockTtl(ttl);
         command.Parameters.AddWithValue("revision", state.Revision);
         return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
@@ -191,7 +191,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
               AND (@lease_id IS NULL OR (lease_id = @lease_id AND lease_expires_at_utc > now()));
             """;
         command.Parameters.AddWithValue("flow_id", flowId);
-        command.Parameters.Add("state_json", NpgsqlDbType.Jsonb).Value = stateJson;
+        command.Parameters.Add("state_json", NpgsqlDbType.Text).Value = stateJson;
         command.Parameters.Add("ttl", NpgsqlDbType.Interval).Value = DurableFlowStoreShared.ServerClockTtl(ttl);
         command.Parameters.AddWithValue("expected_revision", expectedRevision);
         command.Parameters.AddWithValue("new_revision", state.Revision);
@@ -281,7 +281,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                     CREATE SCHEMA IF NOT EXISTS {Schema};
                     CREATE TABLE IF NOT EXISTS {Table} (
                         flow_id text NOT NULL PRIMARY KEY,
-                        state_json jsonb NOT NULL,
+                        state_json text NOT NULL,
                         expires_at_utc timestamptz NOT NULL,
                         updated_at_utc timestamptz NOT NULL,
                         revision bigint NOT NULL DEFAULT 0,
@@ -289,6 +289,22 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                         lease_expires_at_utc timestamptz NULL
                     );
                     CREATE INDEX IF NOT EXISTS {IndexName} ON {Table} (expires_at_utc);
+
+                    -- jsonb REJECTS the \u0000 escape System.Text.Json emits for U+0000 (SQLSTATE
+                    -- 22P05), so a ledger every other store accepts failed every write here: the
+                    -- flow could not start, or its checkpoint failed on every attempt until the
+                    -- job dead-lettered. Nothing queries INSIDE the ledger (it is read back with
+                    -- ::text), so text costs nothing. Guarded so the rewrite happens once.
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_schema = {SqlLiteral(_options.SchemaName)} AND table_name = {SqlLiteral(_options.TableName)}
+                              AND column_name = 'state_json' AND data_type = 'jsonb')
+                        THEN
+                            ALTER TABLE {Table} ALTER COLUMN state_json TYPE text USING state_json::text;
+                        END IF;
+                    END $$;
                     """;
                 try
                 {
@@ -329,7 +345,7 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
                     new(_options.TableName, 'r', Columns:
                         [
                             new("flow_id", "text", Nullable: false, RequiresDeterministicCollation: true),
-                            new("state_json", "jsonb", Nullable: false),
+                            new("state_json", "text", Nullable: false),
                             new("expires_at_utc", "timestamp with time zone", Nullable: false),
                             new("updated_at_utc", "timestamp with time zone", Nullable: false),
                             new("revision", "bigint", Nullable: false, DefaultExpression: "0"),
@@ -421,5 +437,11 @@ public sealed class PostgreSqlFlowStateStore : IFlowStateStore, IDisposable, IAs
     private string Table => $"{Schema}.{Quote(_options.TableName)}";
     private string IndexName => Quote(DurableFlowStoreShared.DerivedName(_options.TableName, "_expires_idx", 63));
     private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    /// <summary>
+    /// A single-quoted SQL string literal, for the catalog lookups inside the DDL's DO block where
+    /// a parameter cannot be bound.
+    /// </summary>
+    private static string SqlLiteral(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
 }
 }

@@ -554,6 +554,46 @@ internal sealed class QueuedRedisMessageDispatcher : RedisMessageDispatcher
             Interlocked.Decrement(ref _pendingCount);
             Interlocked.Increment(ref _runningCount);
 
+            // Once the drain budget has lapsed, STOP executing. The token below cannot stop the
+            // real handler — it is `_ingress.HandleWorkerMessageAsync(payload)`, whose target takes
+            // no CancellationToken — so nothing ever raised the OperationCanceledException the arm
+            // below was written for, the loop kept starting fresh work past the budget, and every
+            // entry still queued at process exit vanished with no record (they were ACKed at
+            // enqueue, so Redis will not redeliver them). Route them through the same
+            // OnBackgroundFailure/dead-letter path instead of losing them silently.
+            if (_drainCancellation.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
+
+                Logger.LogWarning(
+                    "Redis background handler for already-ACKed message {MessageId} on {Stream} was not started: the dispatcher's drain budget had lapsed. Surfacing via OnBackgroundFailure.",
+                    delivery.MessageId.ToString(),
+                    _stream);
+
+                await NotifyBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+
+                try
+                {
+                    await DeadLetterAndAckAsync(
+                        delivery,
+                        lapsed,
+                        "drain_budget_lapsed_after_ack",
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception deadLetterException)
+                {
+                    Logger.LogError(
+                        deadLetterException,
+                        "Failed to dead-letter undrained Redis message {MessageId} on {Stream}.",
+                        delivery.MessageId.ToString(),
+                        _stream);
+                }
+
+                Interlocked.Decrement(ref _runningCount);
+                continue;
+            }
+
             try
             {
                 await ExecuteHandlerAsync(

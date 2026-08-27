@@ -65,7 +65,8 @@ end-to-end profiles).
 14. **Treat queue capacity as backpressure, not an error.** In-memory workers and internal
     per-correlation dispatch queues are bounded and publishers wait asynchronously when full. Size
     `InMemoryWorkerTransportOptions.QueueCapacity` for the burst you accept and raise `WorkerCount`
-    only when jobs are safe to run concurrently.
+    only when jobs are safe to run concurrently. Jobs published from inside a running job bypass the
+    bound rather than deadlocking the worker against itself.
 15. **Keep durable-flow hosts time-synchronized.** Execution leases use absolute UTC expiry. Run
     NTP (or the platform equivalent), and keep `ExecutionLeaseDuration` comfortably above expected
     clock skew and renewal jitter so a fast replica cannot take over a healthy owner's lease early.

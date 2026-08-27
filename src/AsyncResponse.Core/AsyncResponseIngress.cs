@@ -186,6 +186,24 @@ internal sealed class AsyncResponseIngress(
             using (_propagation.Restore(job.Context))
                 await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
         }
+        catch (Exception ex) when (ex is InvalidDataException or System.Text.Json.JsonException)
+        {
+            // An envelope NO build can ever parse, which is the same class the response path above
+            // acknowledges rather than throws — and for the same reason: redelivery would retry it
+            // forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap) or burn dead-letter
+            // attempts on brokers that do. Error log + counter make the drop loud; every occurrence
+            // is a producer-side contract violation.
+            //
+            // Deliberately NOT the unsupported-schema rejection, which stays a throw: that envelope
+            // is well-formed and a NEWER build can read it, so refusing lets it reach one instead
+            // of being acknowledged away mid-rolling-deploy.
+            _logger.LogError(
+                ex,
+                "Ingress received a worker envelope it cannot parse; it can never be executed and is acknowledged without dispatch. Payload: {PayloadLength} UTF-16 code units.",
+                messageJson.Length);
+            AsyncResponseDiagnostics.SetError(activity, ex);
+            AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Ingress worker job execution failed.");

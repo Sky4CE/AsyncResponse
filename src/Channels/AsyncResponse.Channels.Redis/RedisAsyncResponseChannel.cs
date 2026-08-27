@@ -32,6 +32,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
     private readonly RedisKeySchema _keys;
     private readonly RedisAsyncResponseOptions _options;
     private readonly ILogger<RedisAsyncResponseChannel> _logger;
+    private readonly TimeProvider _timeProvider;
 
     private readonly SerialExecutorRegistry _executors;
 
@@ -43,8 +44,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         IOptions<RedisAsyncResponseOptions> options,
         AsyncResponseContextPropagation propagation,
         ILogger<RedisAsyncResponseChannel> logger,
-        IRedisChannelSubscriber? channelSubscriber = null)
+        IRedisChannelSubscriber? channelSubscriber = null,
+        TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _subscriber = multiplexer.GetSubscriber();
         _channelSubscriber = channelSubscriber ?? new RedisChannelMessageQueueSubscriber(_subscriber);
         _multiplexer = multiplexer;
@@ -190,7 +193,15 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                 FailureCallback = failureCallback,
                 CorrelationId = correlationId,
                 PayloadTypeFullName = typeof(T).FullName,
-                RegisteredAtUtc = DateTime.UtcNow,
+                // The engine's clock, not the ambient one. The watchdog judges staleness as
+                // "utcNow - RegisteredAtUtc" from whichever host scans, so an unsubstitutable
+                // app-clock stamp made a skewed host's registrations either never age (skew ahead:
+                // a genuinely stuck flow stays invisible and the health check stays green) or age
+                // instantly (skew behind: healthy waits page the operator every scan). The DB
+                // channels stamp the SERVER clock for exactly this reason; this at least puts the
+                // stamp and the watchdog's "now" on one substitutable clock, and matches the
+                // ExpiresAtUtc the recovery store writes for the same registration.
+                RegisteredAtUtc = _timeProvider.GetUtcNow().UtcDateTime,
                 Context = _propagation.Capture()
             };
             await _recoveryStateStore.SaveAsync(correlationId, recoveryState, _options.RecoveryStateExpiry).ConfigureAwait(false);
@@ -248,7 +259,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
 
         subscription.ArmTimeout(timeout.Value);
 
-        return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, subscription.DrainThenCleanupAsync);
+        return new RedisAsyncResponseWaiter<T>(subscription.ResponseTask, () => subscription.DrainThenCleanupAsync());
     }
 
     /// <summary>
@@ -334,8 +345,9 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     _owner._logger.LogWarning("Timed out waiting for response for correlationId {CorrelationId}.", _correlationId);
                     AsyncResponseDiagnostics.SetError(_activity, "timeout", $"Timed out waiting for response for correlationId {_correlationId}.");
                     AsyncResponseDiagnostics.RecordWaiterTimeout("redis");
-                    _tcs.TrySetException(new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."));
-                    await DrainThenCleanupAsync().ConfigureAwait(false);
+                    await DrainThenCleanupAsync(
+                        new TimeoutException($"Timed out waiting for response for correlationId {_correlationId}."))
+                        .ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -494,7 +506,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         /// everything it ever admitted, so nothing is in flight and the plain cancel is truthful.
         /// </para>
         /// </summary>
-        public async ValueTask DrainThenCleanupAsync()
+        public async ValueTask DrainThenCleanupAsync(Exception? terminalIfUndelivered = null)
         {
             if (Volatile.Read(ref _cleanupStarted) == 0 && ExecutorRegistered)
             {
@@ -529,6 +541,15 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
                     _tcs.TrySetException(new AsyncResponseIndeterminateDeliveryException(_correlationId, drainTimeout));
                 }
             }
+
+            // Settle AFTER the drain, never before it. A delivery already inside the per-correlation
+            // executor may hold a message the claim acked — the publisher was told "delivered", so
+            // it exists nowhere else. Faulting first let a timeout beat that in-flight delivery and
+            // report a consumed response as a timeout; TrySet loses here if the delivery won, which
+            // is the whole point. (A lapsed drain budget has already faulted the task as
+            // indeterminate above, and TrySet is a no-op behind it.)
+            if (terminalIfUndelivered is not null)
+                _tcs.TrySetException(terminalIfUndelivered);
 
             await CleanupOnceAsync().ConfigureAwait(false);
         }

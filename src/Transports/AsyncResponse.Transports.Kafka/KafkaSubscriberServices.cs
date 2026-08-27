@@ -172,10 +172,17 @@ internal abstract class KafkaSubscriberService : BackgroundService
             {
                 delivery = CreateDelivery(message);
             }
-            catch (InvalidDataException ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 // A foreign/malformed message can never be handled; dead-letter and commit it so
                 // its partition advances instead of re-failing on every subscriber restart.
+                //
+                // Deliberately every non-cancellation exception, not just InvalidDataException:
+                // CreateDelivery also runs correlation-id extraction, and anything that escapes
+                // here faults the poll loop with the offset unstored, so the same message re-throws
+                // after every supervisor restart and the whole subscriber (all assigned partitions)
+                // stops advancing — MaxDeliveryAttempts cannot help, because it is keyed on a
+                // delivery this path never constructed.
                 dispatcher.DiscardUnprocessableAsync(message, ex, stoppingToken).GetAwaiter().GetResult();
                 continue;
             }

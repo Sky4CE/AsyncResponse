@@ -114,8 +114,27 @@ internal sealed class NatsJetStreamTransportAdapter(INatsJSContext _jetStream) :
             payload,
             headers: ToHeaders(headers),
             cancellationToken: cancellationToken).ConfigureAwait(false);
-        ack.EnsureSuccess();
+
+        EnsureAccepted(ack);
+
         return ack.Seq.ToString();
+    }
+
+    /// <summary>
+    /// Accepts a JetStream publish ack. Deliberately NOT <c>ack.EnsureSuccess()</c>: that treats
+    /// <c>PubAck.Duplicate</c> as a failure and throws NatsJSDuplicateMessageException.
+    /// Duplicate=true means JetStream already holds this Nats-Msg-Id — the SUCCESS case for the
+    /// stable id the worker transport stamps outside its retry loop, precisely so a retry after a
+    /// lost PubAck is deduplicated rather than enqueuing the same worker job twice. Throwing there
+    /// burned the whole retry ladder (every attempt gets the same answer — it is a JetStream
+    /// decision, not a blip) and reported a publish failure for a job that is queued and WILL run,
+    /// so the caller re-published under a fresh id and the job executed twice. Only a real API
+    /// error is a failure.
+    /// </summary>
+    internal static void EnsureAccepted(PubAckResponse ack)
+    {
+        if (ack.Error is not null)
+            throw new NatsJSApiException(ack.Error);
     }
 
     /// <summary>Runs the FetchNoWaitAsync operation.</summary>

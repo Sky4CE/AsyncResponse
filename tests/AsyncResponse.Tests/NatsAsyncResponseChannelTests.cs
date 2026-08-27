@@ -1,4 +1,5 @@
 using AsyncResponse.Channels.NATS;
+using AsyncResponse.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -428,6 +429,76 @@ public class NatsAsyncResponseChannelTests
     }
 
     [Fact]
+    public async Task WaiterTimeout_DrainsTheConsumeLoopBeforeFaulting_SoAnInFlightDeliveryStillWins()
+    {
+        // Regression (round 29): the timeout faulted the waiter BEFORE draining the consume loop, so
+        // a message the subscription had already received — sitting mid Until-predicate, and which
+        // the publisher was told was delivered — lost the race and a consumed response was reported
+        // as a timeout. The terminal exception is now applied after the drain, where TrySet loses.
+        var channel = CreateChannel();
+        var insidePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePredicate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-drain-timeout",
+            completionPredicate: async _ =>
+            {
+                insidePredicate.TrySetResult();
+                await releasePredicate.Task;
+                return true;
+            },
+            timeout: TimeSpan.FromMilliseconds(50));
+
+        _client.Push(JsonSerializer.Serialize(
+            new AsyncResponseEnvelope<OperationResult>
+            {
+                Success = true,
+                Payload = new OperationResult { Status = OperationStatus.Completed, Message = "delivered" }
+            },
+            AsyncResponseEnvelopeOptions<OperationResult>.Instance));
+        await insidePredicate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The 50ms timeout fires while the predicate still holds the consume loop.
+        await Task.Delay(300);
+        Assert.False(waiter.ResponseTask.IsCompleted, "the waiter was settled before the in-flight delivery had drained");
+
+        releasePredicate.TrySetResult();
+
+        var result = await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("delivered", result.Message);
+    }
+
+    [Fact]
+    public async Task CreateRecoverableResponseWaiter_StampsRegisteredAtFromTheInjectedTimeProvider()
+    {
+        // Regression (round 29): the stamp came from DateTime.UtcNow, which no host can substitute.
+        // The watchdog judges staleness as "utcNow - RegisteredAtUtc" from whichever host scans, so
+        // a skewed stamp made registrations either never age (a stuck flow stays invisible) or age
+        // instantly (healthy waits page the operator every scan).
+        var time = new VirtualTimeProvider(new DateTimeOffset(2031, 5, 4, 3, 2, 1, TimeSpan.Zero));
+        RecoveryState? saved = null;
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Callback((string _, RecoveryState state, TimeSpan _, CancellationToken _) => saved = state)
+            .Returns(Task.CompletedTask);
+
+        var channel = CreateChannel(timeProvider: time);
+
+        await using var waiter = await channel.CreateRecoverableResponseWaiter<OperationResult>(
+            "corr-registered-at",
+            resumeCallback: new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IAsyncResponsePublisher).FullName!,
+                MethodName = "Resume",
+                Params = []
+            },
+            timeout: TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(saved);
+        Assert.Equal(time.GetUtcNow().UtcDateTime, saved!.RegisteredAtUtc);
+    }
+
+    [Fact]
     public async Task WaiterTimeout_WhenTimeoutHandlingThrows_LogsInsteadOfLeavingAnUnobservedFault()
     {
         // The timeout body runs on a fire-and-forget Task.Run; an exception escaping it (here a
@@ -577,8 +648,13 @@ public class NatsAsyncResponseChannelTests
         _client.OutcomeForProbe = _ => NatsDeliveryOutcome.NoResponders;
         Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr-a"));
 
+        // NoReply means interest EXISTED and the ping was delivered — only the ack was slow, which
+        // is routine for a live waiter inside a slow Until predicate (the consume loop acks a probe
+        // only when it reads it, after the previous message's predicate returns). Reporting 0 there
+        // flagged healthy waiters stale and let the lost-subscriber dispatcher consume their
+        // recovery registration; -1 is the watchdog's "could not be probed".
         _client.OutcomeForProbe = _ => NatsDeliveryOutcome.NoReply;
-        Assert.Equal(0, await channel.CountActiveSubscribersAsync("corr-a"));
+        Assert.Equal(-1, await channel.CountActiveSubscribersAsync("corr-a"));
     }
 
     [Fact]
@@ -782,7 +858,7 @@ public class NatsAsyncResponseChannelTests
         releasePredicate.Release();
     }
 
-    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null) => new(
+    private NatsAsyncResponseChannel CreateChannel(bool useRecoveryExpiry = false, TimeSpan? drainTimeout = null, TimeProvider? timeProvider = null) => new(
         _services.GetRequiredService<IServiceScopeFactory>(),
         _client,
         _store.Object,
@@ -793,7 +869,8 @@ public class NatsAsyncResponseChannelTests
             DisposalDrainTimeout = drainTimeout ?? TimeSpan.FromSeconds(30)
         }),
         new AsyncResponseContextPropagation([]),
-        new TestLogger<NatsAsyncResponseChannel>());
+        new TestLogger<NatsAsyncResponseChannel>(),
+        timeProvider);
 
     private static async Task Eventually(Func<bool> condition)
     {

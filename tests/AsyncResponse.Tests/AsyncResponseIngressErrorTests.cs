@@ -117,8 +117,9 @@ public class AsyncResponseIngressErrorTests
         var logger = new CapturingLogger<AsyncResponseIngress>();
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher(), logger);
 
-        await Assert.ThrowsAnyAsync<Exception>(
-            () => ingress.HandleWorkerMessageAsync("""{"Call":{"broken":"card 4111-1111-1111-1111"}"""));
+        // Acknowledged now rather than thrown (it can never parse on any build), but the point of
+        // this regression is unchanged: nothing of the body may reach the log on the way out.
+        await ingress.HandleWorkerMessageAsync("""{"Call":{"broken":"card 4111-1111-1111-1111"}""");
 
         Assert.DoesNotContain(logger.Entries, entry => entry.Message.Contains("4111", StringComparison.Ordinal));
         AssertNoContentDigest(logger);
@@ -177,14 +178,28 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
-    public async Task HandleWorkerMessageAsync_InvalidPayload_PropagatesForTransportRetryOrDeadLetter()
+    public async Task HandleWorkerMessageAsync_UnparseableEnvelope_IsAcknowledgedInsteadOfRedelivered()
     {
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
 
-        // The transport dispatcher owns the retry/dead-letter decision for worker jobs, so a
-        // failing worker message must propagate instead of being acknowledged as a success.
-        await Assert.ThrowsAsync<InvalidDataException>(() => ingress.HandleWorkerMessageAsync("null"));
-        await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync("{not-json"));
+        // An envelope NO build can ever parse gets the same answer the response path gives an
+        // unroutable id: acknowledged, never thrown. Propagating it made the transport redeliver —
+        // and on RabbitMQ's shipped default MaxDeliveryAttempts = 0 that requeued forever, at full
+        // CPU, pinning a prefetch slot. Errors that CAN succeed on a retry still propagate (see
+        // HandleWorkerMessageAsync_ExecutionFailure_PropagatesForTransportRetryOrDeadLetter).
+        await ingress.HandleWorkerMessageAsync("null");
+        await ingress.HandleWorkerMessageAsync("{not-json");
+    }
+
+    [Fact]
+    public async Task HandleWorkerMessageAsync_ExecutionFailure_PropagatesForTransportRetryOrDeadLetter()
+    {
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
+
+        // A well-formed envelope whose execution fails is the transport dispatcher's decision to
+        // make (per its AckMode and MaxDeliveryAttempts), so it must still propagate.
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => ingress.HandleWorkerMessageAsync("""{"SchemaVersion":2147483647,"Call":{"ServiceInterfaceFullName":"X","MethodName":"Y","Params":[]}}"""));
     }
 
     [Fact]

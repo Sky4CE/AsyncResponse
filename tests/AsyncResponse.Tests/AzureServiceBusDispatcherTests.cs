@@ -228,6 +228,53 @@ public sealed class AzureServiceBusDispatcherTests
     }
 
     [Fact]
+    public async Task AckAfterHandlerCompletes_TruncatesALongHandlerMessage_SoTheDeadLetterIsAccepted()
+    {
+        // Regression (round 29): Service Bus rejects a dead-letter description longer than 4096
+        // characters with ArgumentOutOfRangeException, thrown client-side before any network call.
+        // The surrounding catch could not tell that apart from a lost lock, so a handler whose
+        // exception message ran long (a serializer dump, a wrapped SQL error, an HTTP body) could
+        // never be dead-lettered at all: MaxDeliveryAttempts went silently inoperative and the
+        // handler re-ran until the ENTITY's own MaxDeliveryCount.
+        var calls = new SettlementCalls();
+        var longMessage = new string('x', 10_000);
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException(longMessage),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), CancellationToken.None);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal("AsyncResponseHandlerFailed", calls.DeadLetterReason);
+        Assert.Equal(4096, calls.DeadLetterDescription!.Length);
+        Assert.Equal(longMessage[..4096], calls.DeadLetterDescription);
+    }
+
+    [Fact]
+    public async Task AckAfterHandlerCompletes_LeavesAShortHandlerMessageIntact()
+    {
+        // The truncation must not touch the common case: a message at or under the limit is passed
+        // through byte for byte.
+        var calls = new SettlementCalls();
+        var exactLimit = new string('y', 4096);
+        await using var dispatcher = AzureServiceBusMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException(exactLimit),
+            new AzureServiceBusAsyncResponseOptions(),
+            new AzureServiceBusSubscriberOptions { MaxDeliveryAttempts = 2 },
+            NullLogger.Instance,
+            "workers",
+            AzureServiceBusSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery(calls, deliveryCount: 2), CancellationToken.None);
+
+        Assert.Equal(exactLimit, calls.DeadLetterDescription);
+    }
+
+    [Fact]
     public async Task AckAfterHandlerCompletes_CompleteFailureAfterSuccessfulHandler_DoesNotDeadLetterOrAbandon()
     {
         // Regression (review fix): CompleteAsync used to sit inside the handler try, so a lost

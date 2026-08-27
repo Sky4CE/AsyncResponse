@@ -189,6 +189,98 @@ public sealed class DbTransportSharedCoverageTests
         Assert.Contains(logger.Messages, message => message.StartsWith("Failed to NAK", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Regression (round 29): the cap was consulted ONLY in HandleFailureAsync, which runs only
+    /// when the handler threw. A delivery that ended any other way — the process died mid-handler,
+    /// the lease lapsed while the store was unreachable at settlement — came back at attempts
+    /// cap+1, cap+2, … and was EXECUTED again every time: redelivered forever, killing each replica
+    /// in turn, never dead-lettered. The cap is now a pre-execution guard.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer, false)]
+    [InlineData(Provider.PostgreSql, false)]
+    [InlineData(Provider.MongoDb, false)]
+    // The guard sits BEFORE the ack-mode branch, so early-ACK cannot enqueue it either.
+    [InlineData(Provider.SqlServer, true)]
+    [InlineData(Provider.PostgreSql, true)]
+    [InlineData(Provider.MongoDb, true)]
+    public async Task OverCapDelivery_IsDeadLetteredWithoutExecutingTheHandler(Provider provider, bool earlyAck)
+    {
+        var calls = new Calls();
+        var logger = new CollectingLogger();
+        var handlerRuns = 0;
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: () => { Interlocked.Increment(ref handlerRuns); return Task.CompletedTask; },
+            earlyAck: earlyAck,
+            maxDeliveryAttempts: 2,
+            attempt: 3);
+
+        Assert.Equal(0, Volatile.Read(ref handlerRuns));
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(0, calls.Ack);
+        Assert.Equal(0, calls.Nak);
+        Assert.Contains(logger.Messages, message => message.Contains("dead-lettering without executing it", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The over-cap guard's own failure path: a dead-letter publish that reports false releases the
+    /// row instead of dropping it, exactly as the post-handler cap does.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task OverCapDelivery_WhoseDeadLetterFails_IsReleasedForRetry(Provider provider)
+    {
+        var calls = new Calls { DeadLetterResult = false };
+        var logger = new CollectingLogger();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: static () => Task.CompletedTask,
+            maxDeliveryAttempts: 2,
+            attempt: 5);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(1, calls.Nak);
+        Assert.Equal(0, calls.Ack);
+    }
+
+    /// <summary>
+    /// The unlimited cap (0, the default) still means unlimited: an attempt far past any bound is
+    /// executed normally rather than swept into the dead-letter queue by the new guard.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task UnlimitedCap_StillExecutesAHighAttemptDelivery(Provider provider)
+    {
+        var calls = new Calls();
+        var handlerRuns = 0;
+
+        await RunAsync(
+            provider,
+            new CollectingLogger(),
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: () => { Interlocked.Increment(ref handlerRuns); return Task.CompletedTask; },
+            maxDeliveryAttempts: 0,
+            attempt: 99);
+
+        Assert.Equal(1, Volatile.Read(ref handlerRuns));
+        Assert.Equal(1, calls.Ack);
+        Assert.Equal(0, calls.DeadLetter);
+    }
+
     public enum Provider
     {
         SqlServer,
@@ -208,7 +300,8 @@ public sealed class DbTransportSharedCoverageTests
         Func<Task> handler,
         bool earlyAck = false,
         Action? onBackgroundFailure = null,
-        int? maxDeliveryAttempts = null)
+        int? maxDeliveryAttempts = null,
+        int attempt = 1)
     {
         switch (provider)
         {
@@ -231,7 +324,7 @@ public sealed class DbTransportSharedCoverageTests
                     (_, _) => handler(), options, subscriber, logger, SqlServerSubscriberRole.Worker);
                 await dispatcher.HandleAsync(
                     new SqlServerTransportDelivery(
-                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
                     CancellationToken.None);
                 return;
@@ -252,7 +345,7 @@ public sealed class DbTransportSharedCoverageTests
                     (_, _) => handler(), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
                 await dispatcher.HandleAsync(
                     new PostgreSqlTransportDelivery(
-                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
                     CancellationToken.None);
                 return;
@@ -273,7 +366,7 @@ public sealed class DbTransportSharedCoverageTests
                     (_, _) => handler(), options, subscriber, logger, MongoDbSubscriberRole.Worker);
                 await dispatcher.HandleAsync(
                     new MongoDbTransportDelivery(
-                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
                     CancellationToken.None);
                 return;

@@ -246,7 +246,12 @@ Recovery state lives in the durable channel's store and survives a redeploy:
 - **NATS** — recovery state lives in a JetStream Key-Value bucket (`RecoveryBucket`), with a
   per-entry expiry layered over the bucket's `MaxAge`. Registration-list updates are
   revision-conditioned (KV compare-and-set with retries), so concurrent registrations for one
-  correlation id all survive.
+  correlation id all survive. Waiter-liveness probing over NATS Core reports presence, not
+  counts: only a "no responders" answer is a definitive zero. A request that was delivered but not
+  answered inside `PresenceProbeTimeout` is reported as **unprobeable**, not dead — the consume
+  loop acks a probe only when it reads it, serially, behind the previous message's `Until`
+  predicate, so any predicate slower than the 2 s default would otherwise make a healthy waiter
+  look gone (and let the lost-subscriber dispatcher consume its registration).
 - **PostgreSQL** — recovery state lives in `RecoveryStateTable` (default
   `asyncresponse_recovery_state`) as one row per waiter registration. Rows expire by `expires_at`
   and are pruned opportunistically during channel operations.
@@ -293,6 +298,16 @@ only alongside a tested migration path.
 Keep all hosts that share recovery or worker storage on the same wire schema during deployment.
 An incompatible writer fails safe—the reader refuses the payload instead of invoking a callback or
 worker with a shape it does not understand.
+
+**Unreadable is not missing.** On the Redis and NATS channels several registrations for one
+correlation id share a single stored blob, and updating one is a read-modify-write of the whole
+thing. A registration a newer host wrote — one this build cannot interpret — is carried through
+those rewrites untouched rather than pruned to the readable subset: dropping it would silently
+delete a live sibling's recovery callback mid-rolling-upgrade. Reads still filter it out (this
+build cannot dispatch it), but a *whole* stored value this build cannot parse fails the read
+instead of reporting "no registration", so the terminal response is redelivered to a host that
+can read it rather than acknowledged away. The durable-flow ledger applies the same rule
+(`FlowStateUnreadableException`).
 
 ## Shared-correlation recovery
 

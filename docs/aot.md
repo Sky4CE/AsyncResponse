@@ -57,7 +57,13 @@ their persisted type name through DI, as they always have).
 
 - **Library wire types** (envelopes, `FlowState`, `RecoveryState`, `WorkerJobEnvelope`, callback
   descriptors) use source-generated metadata compiled into the packages. The wire format is
-  byte-identical to previous releases; the schema-version stamps are unchanged.
+  byte-identical to previous releases; the schema-version stamps are unchanged. Where a provider
+  package has its own source-generated context (the Redis and NATS recovery stores wrap
+  registrations in a package-local envelope), that context is **chained in front of** the library
+  chain below rather than used alone — a callback argument is `CallbackParam.Value`, typed
+  `object`, so it serializes by runtime type, and a context that only emitted what its envelope
+  references transitively would reject an ordinary `bool`/`long`/enum literal on that channel only.
+  The envelope's own metadata still resolves first, so the wire format is unchanged.
 - **Your payload types** resolve through a chain: the library's own metadata → resolvers you
   register via `AsyncResponseJsonSerialization.RegisterResolver(...)` (process-wide and additive,
   like `AsyncResponseTypeResolution`) → the runtime's reflection resolver when the app has it

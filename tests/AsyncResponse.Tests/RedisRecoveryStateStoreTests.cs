@@ -130,6 +130,112 @@ public class RedisRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
+    {
+        // Regression (round 29): the read path filters out an entry this build cannot INTERPRET
+        // (a newer schema version, a null state, a blank registration id) — correct for a read. But
+        // save and delete are read-MODIFY-write on a SHARED blob, and rewriting it from the
+        // readable subset silently deleted a sibling registration written by a newer host
+        // mid-rolling-upgrade: the write path treating "unreadable" as "missing", which is exactly
+        // what the read path was hardened to refuse.
+        var newerHostsRegistration = Guid.NewGuid();
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (new RecoveryState
+                {
+                    RegistrationId = newerHostsRegistration,
+                    CorrelationId = "corr-a",
+                    SchemaVersion = RecoveryStateSchema.Current + 1
+                },
+                _time.Now + TimeSpan.FromMinutes(10))));
+        SetupTransactions(true);
+
+        var mine = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        await _store.SaveAsync("corr-a", mine, TimeSpan.FromMinutes(3));
+
+        var stringSet = Assert.Single(
+            Assert.Single(_transactions).Invocations,
+            invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+
+        // Both survive: mine, and the one only a newer build can interpret.
+        Assert.Equal(2, written.RootElement.GetProperty("Registrations").GetArrayLength());
+        Assert.NotEqual(default, WrittenRegistration(written.RootElement, newerHostsRegistration));
+        Assert.NotEqual(default, WrittenRegistration(written.RootElement, mine.RegistrationId));
+    }
+
+    [Fact]
+    public async Task TryDeleteAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
+    {
+        // The same rule on the delete path: removing MY registration must not take a sibling this
+        // build cannot interpret with it.
+        var newerHostsRegistration = Guid.NewGuid();
+        var mine = new RecoveryState { RegistrationId = Guid.NewGuid(), CorrelationId = "corr-a" };
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(EnvelopeBlob(
+                (new RecoveryState
+                {
+                    RegistrationId = newerHostsRegistration,
+                    CorrelationId = "corr-a",
+                    SchemaVersion = RecoveryStateSchema.Current + 1
+                },
+                _time.Now + TimeSpan.FromMinutes(10)),
+                (mine, _time.Now + TimeSpan.FromMinutes(10))));
+        SetupTransactions(true);
+
+        Assert.True(await _store.TryDeleteAsync("corr-a", mine.RegistrationId));
+
+        var stringSet = Assert.Single(
+            Assert.Single(_transactions).Invocations,
+            invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        using var written = JsonDocument.Parse(((RedisValue)stringSet.Arguments[1]!).ToString());
+
+        var remaining = Assert.Single(written.RootElement.GetProperty("Registrations").EnumerateArray());
+        Assert.Equal(newerHostsRegistration, remaining.GetProperty("State").GetProperty("RegistrationId").GetGuid());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(7L)]
+    [InlineData(OperationStatus.Completed)]
+    public async Task SaveAsync_AcceptsACallbackArgumentTheChannelsOwnJsonContextNeverSaw(object literal)
+    {
+        // Regression (round 29): this store serialized through the package-local source-generated
+        // context ALONE. A callback argument is CallbackParam.Value, typed object, so it serializes
+        // by RUNTIME type — and the generator only emitted what the envelope references
+        // transitively (string, int, Guid, DateTime). A perfectly ordinary literal therefore threw
+        // NotSupportedException at waiter registration, on this channel only, and the documented
+        // trim/AOT seam (AsyncResponseJsonSerialization.RegisterResolver) was bypassed entirely.
+        // The context is now CHAINED in front of the library resolver, so the wire format is
+        // unchanged and every other type still resolves.
+        _database
+            .Setup(d => d.StringGetAsync((RedisKey)"ar:recovery:corr-a", It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisValue.Null);
+        SetupTransactions(true);
+
+        var state = new RecoveryState
+        {
+            RegistrationId = Guid.NewGuid(),
+            CorrelationId = "corr-a",
+            ResumeCallback = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = "Acme.IOrders",
+                MethodName = "ResumeAsync",
+                Params = [CallbackParam.ForValue(literal)]
+            }
+        };
+
+        await _store.SaveAsync("corr-a", state, TimeSpan.FromMinutes(3));
+
+        var stringSet = Assert.Single(
+            Assert.Single(_transactions).Invocations,
+            invocation => invocation.Method.Name == nameof(IDatabase.StringSetAsync));
+        Assert.Contains("ResumeAsync", ((RedisValue)stringSet.Arguments[1]!).ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task GetAllAsync_ReturnsEmptyForMissingOrMalformedState()
     {
         _database

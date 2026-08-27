@@ -444,6 +444,72 @@ public sealed class MongoDbChannelCoverageTests
         Assert.True(await deliveredTask);
     }
 
+    [Theory]
+    // Already delivered to the only live subscription — the store deliberately keeps returning it
+    // so other processes' waiters can fan out on it.
+    [InlineData("seen")]
+    // Outside the delivery watermark: acked before this subscription ever existed.
+    [InlineData("acked-before-start")]
+    public async Task DispatchPendingMessagesAsync_DoesNotEnqueueAMessageNoLiveSubscriptionWouldTake(string reason)
+    {
+        // Regression (round 29): the sweep enqueued a dispatch work item for EVERY row the store
+        // returned and let the item re-check whether anyone wanted it. Because the store keeps
+        // returning acked rows, every sweep tick and every targeted signal re-enqueued one item per
+        // retained message. A waiter wedged in a slow user Until predicate holds its per-correlation
+        // executor, those items pile up against the bounded queue, and the next enqueue parks the
+        // PROCESS-WIDE dispatch loop — which walks correlation ids sequentially — so every other
+        // waiter stopped receiving and local publishers blocked on the same enqueue.
+        var logger = new CollectingLogger();
+        var fixture = new ChannelFixture(logger: logger.For<MongoDbAsyncResponseChannel>());
+        var channel = fixture.Channel;
+
+        var correlationId = "prefilter-corr";
+        var subscription = fixture.Subscription(_ => new ValueTask<bool>(true), correlationId);
+        AddSubscription(channel, correlationId, subscription.Instance);
+
+        var document = new MongoChannelMessageDocument
+        {
+            Id = Guid.NewGuid(),
+            CorrelationId = correlationId,
+            EnvelopeJson = "{}",
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        if (reason == "seen")
+            Invoke(subscription.Instance, "MarkSeen", document.Id);
+        else
+            document.AckedAtUtc = DateTime.UtcNow.AddMinutes(-5);
+
+        var cursor = new Mock<IAsyncCursor<MongoChannelMessageDocument>>();
+        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursor.Setup(c => c.Current).Returns([document]);
+        fixture.Messages
+            .Setup(c => c.FindAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cursor.Object);
+
+        await (Task)typeof(MongoDbAsyncResponseChannel)
+            .GetMethod("DispatchPendingMessagesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(channel, [null, CancellationToken.None])!;
+
+        // The executor logs every admitted work item; nothing was admitted.
+        Assert.DoesNotContain(
+            logger.Messages,
+            message => message.Contains("Channel executor enqueued work", StringComparison.Ordinal));
+        // ...and the message was never claimed for delivery either.
+        fixture.Messages.Verify(
+            c => c.FindOneAndUpdateAsync(
+                It.IsAny<FilterDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<UpdateDefinition<MongoChannelMessageDocument>>(),
+                It.IsAny<FindOneAndUpdateOptions<MongoChannelMessageDocument, MongoChannelMessageDocument>>(),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
     [Fact]
     public async Task DispatchPendingMessagesAsync_CoversPagination()
     {

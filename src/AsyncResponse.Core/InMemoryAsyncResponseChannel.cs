@@ -508,6 +508,32 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             : firstPending ?? Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Simulated process death: drop every live waiter WITHOUT touching the recovery store, which
+    /// is what a crash actually does — the registration survives until its TTL and a late response
+    /// routes through the lost-subscriber dispatcher.
+    /// <para>
+    /// Needed because this channel arms its waiter timeouts on the injected TimeProvider, and a
+    /// test harness shares that clock across incarnations. With no abandon hook, the dead
+    /// incarnation's timers stayed armed on the shared clock: advancing time fired them, completed
+    /// a ResponseTask the docs promise never completes after a restart, and — worse — ran the
+    /// cleanup that DELETES the registration from the shared recovery store, so the late response
+    /// the restart test exists to assert found nothing and was dropped.
+    /// </para>
+    /// <para>The DB channels model the same rule as DrainThenCleanupAsync(deleteRecoveryState: false).</para>
+    /// </summary>
+    internal async ValueTask AbandonAllAsync()
+    {
+        foreach (var correlationId in _subscriptions.Keys)
+        {
+            if (!_subscriptions.TryRemove(correlationId, out var group))
+                continue;
+
+            foreach (var subscription in group.DrainForAbandon())
+                await subscription.AbandonAsync().ConfigureAwait(false);
+        }
+    }
+
     private void RemoveSubscription(string correlationId, Guid subscriptionId)
     {
         if (!_subscriptions.TryGetValue(correlationId, out var subscribers))
@@ -570,6 +596,28 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
 
                 _many.Add(subscription);
                 return true;
+            }
+        }
+
+        /// <summary>Closes the group and returns everything still in it.</summary>
+        public IReadOnlyList<SubscriptionBase> DrainForAbandon()
+        {
+            lock (_gate)
+            {
+                _closed = true;
+                if (_single is not null)
+                {
+                    var only = new[] { _single };
+                    _single = null;
+                    return only;
+                }
+
+                if (_many is null)
+                    return [];
+
+                var all = _many.ToArray();
+                _many = null;
+                return all;
             }
         }
 
@@ -905,6 +953,20 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
                 // callback is not.
                 await _owner._recoveryStateStore.TryDeleteAsync(CorrelationId, Id).ConfigureAwait(false);
             }
+            catch (Exception ex)
+            {
+                // Best-effort, exactly as every other channel treats this delete (and as this
+                // channel already treats its own post-save compensation delete): the state expires
+                // on its own and the watchdog backs it. Letting it escape faulted the one-shot
+                // cleanup task AFTER the waiter had already been completed, so the fault surfaced
+                // to the publisher — whose retry then found no subscriber but an intact
+                // registration and fired the recovery callback for a response the waiter already
+                // held. On the timeout path it was not observed at all.
+                _owner._logger.LogError(
+                    ex,
+                    "Failed to delete recovery state for correlationId {CorrelationId}; it will expire on its own.",
+                    CorrelationId);
+            }
             finally
             {
                 _owner.RemoveSubscription(CorrelationId, Id);
@@ -920,6 +982,23 @@ internal sealed class InMemoryAsyncResponseChannel : IAsyncResponsePublisher, IR
             => Interlocked.Exchange(ref _terminal, 1) == 0;
 
         /// <summary>Stores the timeout exception on the concrete waiter task.</summary>
+        /// <summary>
+        /// Disarms this waiter as if its process had died: the timeout timer is disposed so it can
+        /// never fire on a shared clock, the task is cancelled for callers holding it, and the
+        /// recovery registration is deliberately left in place.
+        /// </summary>
+        public async ValueTask AbandonAsync()
+        {
+            Interlocked.Exchange(ref _cleanupStarted, 1);
+            _ = TryBeginTerminal();
+
+            if (Volatile.Read(ref _timeoutTimer) is { } timer)
+                await timer.DisposeAsync().ConfigureAwait(false);
+
+            TrySetCanceled();
+            _activity?.Dispose();
+        }
+
         protected abstract void SetTimeoutException(Exception exception);
 
         /// <summary>Attempts to fault the concrete waiter task.</summary>

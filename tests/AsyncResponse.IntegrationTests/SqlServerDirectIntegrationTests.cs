@@ -443,6 +443,46 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
     }
 
     [Fact]
+    public async Task TransportStore_DeadLetterOnAStaleClaim_NoOpsInsteadOfBuryingALiveMessage()
+    {
+        // Regression (round 29): the DLQ row was written unconditionally and the fenced delete's
+        // result ignored, so a claim whose lease had lapsed (a peer re-claimed the row) still
+        // buried a full copy of a message that is still live and may yet succeed under its new
+        // owner — the DLQ showed a poison entry for work that completed, and an operator replaying
+        // it duplicated its side effects. The fenced ack and NAK already no-op in that window.
+        await WithSchemaAsync("dlqfence", async schema =>
+        {
+            var options = TransportOptions(schema);
+            var store = new SqlServerTransportStore(Options.Create(options));
+            await store.EnsureCreatedAsync();
+
+            var id = Guid.NewGuid();
+            await store.PublishAsync(id, options.WorkerQueue, """{"kind":"fenced"}""", null, CancellationToken.None);
+            var claimed = (await store.TryClaimAsync(options.WorkerQueue, options.LockTimeout, CancellationToken.None))!;
+
+            // The peer takeover: a different lock_id now owns the row, so this claim's fence is dead.
+            await ExecuteAsync(
+                $"UPDATE {store.MessageTable} SET lock_id = NEWID(), locked_until = DATEADD(minute, 5, SYSUTCDATETIME()) WHERE id = '{id}';");
+
+            Assert.False(await claimed.DeadLetterAsync(new InvalidOperationException("stale"), true, CancellationToken.None));
+
+            // No DLQ copy was written, and the live row is untouched.
+            Assert.Equal(0, await ScalarIntAsync(
+                $"SELECT COUNT(*) FROM {store.MessageTable} WHERE queue = '{options.DeadLetterQueue}';"));
+            Assert.Equal(1, await ScalarIntAsync($"SELECT COUNT(*) FROM {store.MessageTable} WHERE id = '{id}';"));
+        });
+    }
+
+    private async Task<int> ScalarIntAsync(string sql)
+    {
+        await using var connection = new SqlConnection(Fixture.SqlServerConnectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (int)(await command.ExecuteScalarAsync())!;
+    }
+
+    [Fact]
     public async Task ASpacePaddedQueueRow_IsNeverClaimed_AndDoesNotStarveTheRowsBehindIt()
     {
         // Startup validation now rejects queue names with surrounding spaces, so this row can only

@@ -151,6 +151,40 @@ public class TestingHarnessDirectUsageTests
     }
 
     [Fact]
+    public async Task SimulateRestart_AbandonsThePreRestartWaiter_AndLeavesItsRegistrationRecoverable()
+    {
+        // Regression (round 29): the in-memory channel arms its waiter timeouts on the injected
+        // TimeProvider, and the harness shares that clock across incarnations. With no abandon hook
+        // the DEAD incarnation's timers stayed armed on the shared clock: advancing time fired
+        // them, completed a ResponseTask a real crash leaves hanging forever, and — worse — ran the
+        // cleanup that DELETES the registration from the shared recovery store, so the late
+        // response this scenario exists to test found no waiter AND no registration.
+        var audit = new RecordingRecoveryAudit();
+        await using var harness = await AsyncResponseTestHarness.StartAsync(options =>
+            options.ConfigureServices = services => services.AddSingleton<IRecoveryAudit>(audit));
+
+        var subscriber = harness.Services.GetRequiredService<IRecoverableAsyncResponseSubscriber>();
+        const string correlationId = "order-abandoned";
+        var waiter = await subscriber.CreateRecoverableResponseWaiter<OperationResult>(
+            correlationId,
+            resumeCallback: CallbackExpressionConverter.ToReflectionCall<IRecoveryAudit>(
+                target => target.ResumedAsync("order-abandoned", Placeholder.Payload<OperationResult>()!, Placeholder.CorrelationId())),
+            timeout: TimeSpan.FromMinutes(5));
+
+        await harness.SimulateRestartAsync();
+
+        // Past the dead waiter's five-minute timeout on the SHARED clock.
+        await harness.AdvanceAsync(TimeSpan.FromMinutes(6));
+
+        // A crashed process leaves its waiter unresolvable — never "timed out", never completed.
+        Assert.True(waiter.ResponseTask.IsCanceled, "the dead incarnation's waiter was settled by a timer that outlived its process");
+
+        // And the registration is still there, so the late response routes through recovery.
+        await harness.PublishAsync(new OperationResult { Status = OperationStatus.Completed }, correlationId);
+        Assert.Equal([$"order-abandoned:{OperationStatus.Completed}:{correlationId}"], audit.Resumed);
+    }
+
+    [Fact]
     public async Task DelayedWorkerJob_RunsOnlyAfterItsVirtualDelay()
     {
         var audit = new RecordingDeferredWorkAudit();

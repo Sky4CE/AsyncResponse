@@ -409,9 +409,34 @@ internal sealed class MongoDbTransportStore : IDisposable
             // work on standalone servers), so the DLQ insert uses an id derived deterministically
             // from the source document: if a crash lands between the insert and the delete, the
             // redelivered message dead-letters onto the same id and the duplicate-key insert is
-            // swallowed — the DLQ never accumulates copies of one poison message.
-            await InsertAsync(DeadLetterId(id), _options.DeadLetterQueue, payload, deadHeaders, exception.Message, cancellationToken).ConfigureAwait(false);
-            await AckAsync(id, lockId).ConfigureAwait(false);
+            // swallowed — the DLQ never accumulates copies of one poison message. Insert stays
+            // FIRST for that reason: delete-first would lose the message outright in the same window.
+            var deadLetterId = DeadLetterId(id);
+            await InsertAsync(deadLetterId, _options.DeadLetterQueue, payload, deadHeaders, exception.Message, cancellationToken).ConfigureAwait(false);
+
+            // ...but the burial only counts if the fenced delete matched. A stale claim (the lease
+            // lapsed and a peer re-claimed the document) must no-op here exactly as the fenced ack
+            // and NAK do, so the DLQ copy written a moment ago is compensated away: leaving it
+            // buried a full copy of a message that is still live and may yet succeed under its new
+            // owner. The deterministic id makes the compensating delete exact and idempotent.
+            var removed = await _messages.DeleteOneAsync(
+                Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, id)
+                & Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.LockId, lockId),
+                CancellationToken.None).ConfigureAwait(false);
+
+            if (removed.DeletedCount == 0)
+            {
+                await _messages.DeleteOneAsync(
+                    Builders<MongoTransportMessageDocument>.Filter.Eq(item => item.Id, deadLetterId),
+                    CancellationToken.None).ConfigureAwait(false);
+
+                _logger?.LogWarning(
+                    "MongoDB dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the document was re-claimed.",
+                    id,
+                    sourceQueue);
+                return false;
+            }
+
             return true;
         }
         catch (Exception ex)
@@ -526,6 +551,15 @@ internal sealed class MongoDbTransportStore : IDisposable
     }
 }
 
+/// <remarks>
+/// [BsonIgnoreExtraElements] is load-bearing, not tidiness. Queue documents can be written by
+/// foreign producers (the documented reply-target consumer) and by newer builds mid-rolling-deploy,
+/// and the driver's default is to THROW FormatException for any element outside this class map.
+/// That throw lands after findOneAndUpdate has already stamped attempts+1/lock_id and before any
+/// delivery object exists, so the document could never reach HandleFailureAsync or the dead-letter
+/// queue: it tore the subscriber down on every re-claim, forever, with attempts climbing unbounded.
+/// </remarks>
+[BsonIgnoreExtraElements]
 internal sealed class MongoTransportMessageDocument
 {
     [BsonId]

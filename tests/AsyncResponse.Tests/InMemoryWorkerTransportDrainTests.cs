@@ -87,6 +87,100 @@ public sealed class InMemoryWorkerTransportDrainTests
         await provider.DisposeAsync();
     }
 
+    public interface IOverflowProbe
+    {
+        Task RunAsync(int id);
+    }
+
+    private sealed class OverflowProbe : IOverflowProbe
+    {
+        private readonly List<int> _executed = [];
+
+        public InMemoryWorkerTransport? Transport { get; set; }
+        public TaskCompletionSource FirstStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirst { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FollowUpRan { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public IReadOnlyList<int> Executed
+        {
+            get { lock (_executed) return _executed.ToArray(); }
+        }
+
+        public async Task RunAsync(int id)
+        {
+            lock (_executed)
+            {
+                _executed.Add(id);
+            }
+
+            if (id == 3)
+            {
+                FollowUpRan.TrySetResult();
+                return;
+            }
+
+            if (id != 1)
+                return;
+
+            FirstStarted.TrySetResult();
+            await ReleaseFirst.Task;
+
+            // The in-job publish: a durable-flow child start, or a child waking its parent. The
+            // queue is FULL at this moment, and this worker is the only consumer.
+            await Transport!.PublishAsync(Job(3));
+        }
+
+        public static WorkerJobEnvelope Job(int id) => new()
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IOverflowProbe).FullName!,
+                MethodName = nameof(IOverflowProbe.RunAsync),
+                Params = [CallbackParam.ForValue(id)]
+            },
+            CorrelationId = $"overflow-{id}"
+        };
+    }
+
+    [Fact]
+    public async Task PublishFromInsideAJob_AgainstAFullQueue_DoesNotWedgeTheTransport()
+    {
+        // Regression (round 29): a publish from inside a running job used the same capacity-waiting
+        // WriteAsync as an external producer. The workers are the only consumers, so a worker that
+        // parks against a full queue is waiting on itself: with the default WorkerCount = 1 one
+        // in-job publish past capacity wedged the transport permanently — no job ever completed,
+        // _outstanding never reached zero, the shutdown drain never completed the writer, and the
+        // whole backlog was lost at process exit. Durable flows publish from inside jobs routinely.
+        var probe = new OverflowProbe();
+        var provider = new ServiceCollection()
+            .AddSingleton<IOverflowProbe>(probe)
+            .BuildServiceProvider();
+        var transport = new InMemoryWorkerTransport(
+            Options.Create(new InMemoryWorkerTransportOptions { QueueCapacity = 1, WorkerCount = 1 }));
+        probe.Transport = transport;
+        var executor = new WorkerJobExecutor(
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<WorkerJobExecutor>.Instance);
+        var host = new InMemoryWorkerHost(transport, executor, NullLogger<InMemoryWorkerHost>.Instance);
+
+        await host.StartAsync(CancellationToken.None);
+
+        await transport.PublishAsync(OverflowProbe.Job(1));
+        await probe.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Fill the single queue slot behind the running job, so the in-job publish has nowhere to go.
+        await transport.PublishAsync(OverflowProbe.Job(2));
+
+        probe.ReleaseFirst.TrySetResult();
+
+        // Old behavior: this never completes — the only worker is blocked publishing to itself.
+        await probe.FollowUpRan.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await host.StopAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal([1, 2, 3], probe.Executed);
+        await provider.DisposeAsync();
+    }
+
     public interface IChainProbe
     {
         Task RunAsync();

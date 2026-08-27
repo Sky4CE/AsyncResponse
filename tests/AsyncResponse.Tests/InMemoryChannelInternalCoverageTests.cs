@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -145,6 +146,30 @@ public sealed class InMemoryChannelInternalCoverageTests
     }
 
     [Fact]
+    public async Task Cleanup_WhenTheRecoveryDeleteThrows_IsLoggedAndDoesNotFaultThePublisher()
+    {
+        // Regression (round 29): this delete ran bare while every other channel treats it as
+        // best-effort. Its failure faulted the one-shot cleanup task AFTER the waiter had already
+        // been completed, so the fault surfaced to the PUBLISHER — whose retry then found no
+        // subscriber but an intact registration and fired the recovery callback for a response the
+        // waiter already held (a duplicated side effect). On the timeout path it was not observed
+        // at all. The state expires on its own and the watchdog backs it, so logging is enough.
+        var logger = new CollectingLogger();
+        var (channel, store) = CreateChannel(logger.For<InMemoryAsyncResponseChannel>());
+        store.Setup(s => s.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()))
+             .ThrowsAsync(new InvalidOperationException("recovery store offline"));
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("cleanup-throws");
+
+        // The publish must succeed: the waiter got its response, and a failed best-effort delete is
+        // not the publisher's problem.
+        await channel.SetResponse(new OperationResult { Status = OperationStatus.Completed, Message = "ok" }, "cleanup-throws");
+
+        Assert.Equal("ok", (await waiter.ResponseTask.WaitAsync(TimeSpan.FromSeconds(5))).Message);
+        await logger.WaitForAsync("Failed to delete recovery state for correlationId cleanup-throws");
+    }
+
+    [Fact]
     public async Task CreateResponseWaiter_WhenStoreThrows_RemovesSubscriptionAndRethrows()
     {
         var (channel, store) = CreateChannel();
@@ -162,7 +187,8 @@ public sealed class InMemoryChannelInternalCoverageTests
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
-    private static (InMemoryAsyncResponseChannel Channel, Mock<IRecoveryStateStore> Store) CreateChannel()
+    private static (InMemoryAsyncResponseChannel Channel, Mock<IRecoveryStateStore> Store) CreateChannel(
+        ILogger<InMemoryAsyncResponseChannel>? logger = null)
     {
         var provider = new ServiceCollection().BuildServiceProvider();
         var store = new Mock<IRecoveryStateStore>();
@@ -180,7 +206,7 @@ public sealed class InMemoryChannelInternalCoverageTests
                 RecoveryStateExpiry = TimeSpan.FromMinutes(1)
             }),
             new AsyncResponseContextPropagation([]),
-            NullLogger<InMemoryAsyncResponseChannel>.Instance);
+            logger ?? NullLogger<InMemoryAsyncResponseChannel>.Instance);
         return (channel, store);
     }
 

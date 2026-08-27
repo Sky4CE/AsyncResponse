@@ -57,6 +57,20 @@ internal abstract class RabbitMqMessageDispatcher : IAsyncDisposable
         return attempt > int.MaxValue ? int.MaxValue : (int)attempt;
     }
 
+    /// <summary>
+    /// The cap this delivery can actually be judged against. A plain <c>basic.nack</c> requeue does
+    /// NOT increment <c>x-death</c>, so without a dead-letter hop the resolved attempt saturates at
+    /// 2 — and a configured cap above 2 was therefore never reachable: <c>attempt &lt; cap</c> stayed
+    /// true on every redelivery and the message requeued forever, exactly as if the cap were 0.
+    /// That is strictly worse than the documented "behaves like 2", which is what this restores:
+    /// once the broker has actually dead-lettered the message at least once (x-death present), its
+    /// attempts are countable and the operator's full cap applies.
+    /// </summary>
+    internal int EffectiveDeliveryCap(RabbitMqDelivery delivery)
+        => MaxDeliveryAttempts > 2 && ReadDeathCount(delivery.BasicProperties) == 0
+            ? 2
+            : MaxDeliveryAttempts;
+
     private static long ReadDeathCount(IReadOnlyBasicProperties properties)
     {
         if (properties.Headers is null
@@ -347,7 +361,7 @@ internal sealed class AwaitingRabbitMqMessageDispatcher(
             // Requeue for redelivery, unless a delivery cap is configured and this delivery has reached it —
             // then reject without requeue so the broker dead-letters (or drops) it instead of hot-looping.
             var requeue = MaxDeliveryAttempts <= 0
-                || ResolveDeliveryAttempt(delivery) < MaxDeliveryAttempts;
+                || ResolveDeliveryAttempt(delivery) < EffectiveDeliveryCap(delivery);
             await TryNackAsync(delivery, channel, requeue).ConfigureAwait(false);
             return;
         }

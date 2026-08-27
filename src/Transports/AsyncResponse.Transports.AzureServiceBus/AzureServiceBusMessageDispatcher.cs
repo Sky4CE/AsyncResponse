@@ -37,6 +37,20 @@ internal abstract class AzureServiceBusMessageDispatcher : IAsyncDisposable
     protected ILogger Logger { get; }
     protected int MaxDeliveryAttempts => _subscriberOptions.MaxDeliveryAttempts;
 
+    /// <summary>
+    /// Service Bus rejects a dead-letter reason or description longer than 4096 characters with
+    /// ArgumentOutOfRangeException, thrown client-side before any network call. The surrounding
+    /// catch could not tell that apart from a lost lock, so a handler whose exception message ran
+    /// long could never be dead-lettered at all: the library's MaxDeliveryAttempts cap went
+    /// silently inoperative and the handler re-ran until the ENTITY's own MaxDeliveryCount.
+    /// </summary>
+    protected const int MaxDeadLetterDescriptionLength = 4096;
+
+    protected static string TruncateDeadLetterDescription(string? description)
+        => string.IsNullOrEmpty(description) || description.Length <= MaxDeadLetterDescriptionLength
+            ? description ?? string.Empty
+            : description[..MaxDeadLetterDescriptionLength];
+
     /// <summary>Creates the dispatcher configured by the subscriber options.</summary>
     public static AzureServiceBusMessageDispatcher Create(
         Func<AzureServiceBusTransportDelivery, CancellationToken, Task> handler,
@@ -215,7 +229,7 @@ internal sealed class AwaitingAzureServiceBusMessageDispatcher(
                 {
                     await delivery.DeadLetterAsync(
                         "AsyncResponseHandlerFailed",
-                        ex.Message).ConfigureAwait(false);
+                        TruncateDeadLetterDescription(ex.Message)).ConfigureAwait(false);
                 }
                 catch (Exception settleEx)
                 {

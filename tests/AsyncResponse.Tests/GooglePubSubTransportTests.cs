@@ -459,17 +459,18 @@ public class GooglePubSubTransportTests
     }
 
     [Fact]
-    public void CorrelationIdExtractor_Throws_WhenTouchedObjectHasExactDuplicateKey()
+    public void CorrelationIdExtractor_ReturnsNull_WhenTouchedObjectHasExactDuplicateKey()
     {
-        // The shared JSON-path walker materializes nothing, but still reproduces this runtime's
-        // JsonObject-throws-on-exact-duplicate-key behavior rather than silently resolving to one
-        // of the duplicates.
+        // An object with a duplicate key cannot resolve a property, so the id is simply not in this
+        // body: extraction reports "not found" and the ingress acknowledges the message as
+        // unroutable. Throwing made it a handler failure, which on RabbitMQ's default cap of 0
+        // requeued forever.
         var message = new PubsubMessage
         {
             Data = ByteString.CopyFromUtf8("""{"CorrelationId":"1","CorrelationId":"2"}""")
         };
 
-        Assert.Throws<ArgumentException>(() => GooglePubSubCorrelationIdExtractor.Extract(
+        Assert.Null(GooglePubSubCorrelationIdExtractor.Extract(
             message,
             message.Data.ToStringUtf8(),
             new GooglePubSubAsyncResponseOptions()));

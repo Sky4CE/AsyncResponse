@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Diagnostics;
 using System.Threading.Channels;
+using System.Collections.Concurrent;
 
 namespace AsyncResponse;
 
@@ -57,6 +58,46 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
 
     internal ChannelReader<QueuedJob> Reader => _queue.Reader;
     internal InMemoryWorkerTransportOptions Options { get; }
+
+    /// <summary>
+    /// Follow-up jobs published from inside a running job that did not fit the bounded queue. They
+    /// are already counted in <c>_outstanding</c>, so the drain cannot complete the writer while
+    /// any remain; a worker moves them into the queue as soon as it frees a slot.
+    /// </summary>
+    private readonly ConcurrentQueue<QueuedJob> _overflow = new();
+
+    /// <summary>Moves overflow jobs into the queue while it has room. Called by a worker before it reports a job finished.</summary>
+    internal void PumpOverflow()
+    {
+        while (_overflow.TryPeek(out var queued))
+        {
+            if (!_queue.Writer.TryWrite(queued))
+                return;
+
+            _overflow.TryDequeue(out _);
+        }
+    }
+
+    /// <summary>
+    /// Marks the ambient flow as "executing a worker job", so a publish made beneath it is
+    /// recognised as follow-up work rather than an external producer.
+    /// </summary>
+    internal static class InJobScope
+    {
+        private static readonly AsyncLocal<bool> _active = new();
+
+        public static bool IsActive => _active.Value;
+
+        /// <summary>
+        /// Must be called from INSIDE the <see cref="ExecutionContext.Run"/> that restores the
+        /// enqueue-time context (or, with no captured context, immediately around the execute
+        /// call). Run replaces ambient AsyncLocal state wholesale with the captured snapshot, so a
+        /// flag raised outside it never reaches the handler at all. Nothing clears it: Run restores
+        /// the caller's context when it returns, and the no-context path raises it on a flow that
+        /// ends with the job.
+        /// </summary>
+        public static void MarkActive() => _active.Value = true;
+    }
     internal ILogger? DrainLogger { get; set; }
 
     /// <summary>Jobs accepted but not yet finished (queued + executing). Test-harness idle probe.</summary>
@@ -180,7 +221,28 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
         Interlocked.Increment(ref _outstanding);
         try
         {
-            await _queue.Writer.WriteAsync(new QueuedJob(job, ExecutionContext.Capture()), cancellationToken).ConfigureAwait(false);
+            var queued = new QueuedJob(job, ExecutionContext.Capture());
+
+            // A publish made from INSIDE a running job must never wait for queue capacity. The
+            // workers are the only consumers, so a worker that parks in WriteAsync against a full
+            // queue is waiting on itself: with the default WorkerCount = 1 one in-job publish past
+            // capacity wedges the transport permanently — no job ever completes, _outstanding never
+            // reaches zero, the shutdown drain never completes the writer, and the whole backlog is
+            // lost at process exit. Durable flows publish from inside jobs routinely (child start,
+            // parent wake-up), so this is reachable in ordinary use, not an exotic case.
+            //
+            // Bypassing the bound for these is the safe side of the trade: the capacity exists as
+            // backpressure on EXTERNAL producers, and follow-up work is a continuation of work the
+            // queue already admitted.
+            if (InJobScope.IsActive)
+            {
+                if (!_queue.Writer.TryWrite(queued))
+                    _overflow.Enqueue(queued);
+
+                return;
+            }
+
+            await _queue.Writer.WriteAsync(queued, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -480,6 +542,9 @@ internal sealed class InMemoryWorkerHost(
             }
             finally
             {
+                // Before OnJobFinished: this job just freed a slot, and the overflow entries are
+                // still counted in the outstanding total that gates the drain's writer completion.
+                _transport.PumpOverflow();
                 _transport.OnJobFinished();
             }
         }
@@ -544,11 +609,25 @@ internal sealed class InMemoryWorkerHost(
     {
         // No captured context (flow suppressed): execute directly.
         if (queued.Context is null)
+        {
+            InMemoryWorkerTransport.InJobScope.MarkActive();
             return _executor.ExecuteAsync(queued.Job);
+        }
 
         // Run under the enqueue-time ExecutionContext so the job inherits its ambient AsyncLocals.
+        // The in-job marker is raised INSIDE that Run: the restore replaces ambient AsyncLocal
+        // state with the enqueue-time snapshot, so a marker raised around this call would be wiped
+        // before the handler ever saw it — and a publish the handler makes would take the
+        // capacity-waiting path the marker exists to avoid.
         Task? task = null;
-        ExecutionContext.Run(queued.Context, _ => task = _executor.ExecuteAsync(queued.Job), null);
+        ExecutionContext.Run(
+            queued.Context,
+            _ =>
+            {
+                InMemoryWorkerTransport.InJobScope.MarkActive();
+                task = _executor.ExecuteAsync(queued.Job);
+            },
+            null);
         return task!;
     }
 

@@ -270,6 +270,13 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     public CancellationToken LostToken => _lost.Token;
 
     /// <summary>
+    /// Whether this lease can still fence a write. Callers holding a claimed, unrecorded result
+    /// use it to choose the lease-less persistence path BEFORE surfacing the takeover signal.
+    /// </summary>
+    public bool IsLost => _lost.IsCancellationRequested
+        || _timeProvider.GetUtcNow().UtcDateTime.Ticks >= Volatile.Read(ref _validUntilUtcTicks);
+
+    /// <summary>
     /// Throws when the lease is lost. <paramref name="cause"/> (e.g. the exception that made the
     /// caller check) is attached as the inner exception so the real failure is not discarded.
     /// <para>

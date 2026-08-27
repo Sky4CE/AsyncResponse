@@ -463,6 +463,58 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Awaiting_CapAboveTwo_RejectsAtTwo_InsteadOfRequeueingForever()
+    {
+        // Regression (round 29): a plain basic.nack requeue adds no x-death, so ResolveDeliveryAttempt
+        // saturates at 2 and a cap ABOVE 2 was unreachable — every retry requeued, at broker rate,
+        // forever. docs/transport-semantics.md promises such a cap "behaves like 2"; enforce that
+        // rather than degrading into the unlimited cap.
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 5 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 1, redelivered: true), channel, CancellationToken.None);
+
+        Assert.False(
+            Assert.Single(channel.Nacks).Requeue,
+            "a cap above 2 with no countable x-death must reject at 2, not requeue forever");
+    }
+
+    [Fact]
+    public async Task Awaiting_CapAboveTwo_UsesTheOperatorsFullCap_OnceXDeathMakesAttemptsCountable()
+    {
+        // The counterpart: with a dead-letter cycle configured the broker DOES count attempts, so
+        // the operator's cap applies in full and attempt 2 of 5 still requeues.
+        var properties = new BasicProperties
+        {
+            Headers = new Dictionary<string, object?>
+            {
+                ["x-death"] = new List<object?> { new Dictionary<string, object?> { ["count"] = 1L } }
+            }
+        };
+
+        var channel = new FakeDispatcherChannel();
+        await using var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("handler boom"),
+            new RabbitMqAsyncResponseOptions(),
+            new RabbitMqSubscriberOptions { MaxDeliveryAttempts = 5 },
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        Assert.Equal(2, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("payload", properties)));
+
+        await dispatcher.HandleAsync(Delivery("payload", properties, deliveryTag: 1), channel, CancellationToken.None);
+
+        Assert.True(Assert.Single(channel.Nacks).Requeue);
+    }
+
+    [Fact]
     public void ResolveDeliveryAttempt_FreshDelivery_IsOne()
         => Assert.Equal(1, RabbitMqMessageDispatcher.ResolveDeliveryAttempt(Delivery("{}")));
 

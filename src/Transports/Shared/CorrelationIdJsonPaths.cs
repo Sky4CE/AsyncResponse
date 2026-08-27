@@ -144,13 +144,17 @@ internal static class CorrelationIdJsonPaths
         {
             if (!seen.Add(property.Name))
             {
-                // The name is NOT in the message. It comes straight off an untrusted inbound body,
-                // and transport dispatchers log this exception — so including it put an
-                // attacker-chosen string (newlines, PII, a forged log line) into the application log
-                // through a path the "never logs a message body" guarantee is supposed to close.
-                // The duplicate's position is enough to diagnose a malformed producer.
-                throw new ArgumentException(
-                    $"The JSON object contains a duplicate property name at index {seen.Count}; correlation extraction cannot choose between them.");
+                // Unresolvable, NOT a failure: extraction cannot choose between the duplicates, so
+                // the id is simply not in this body. Throwing here made an unroutable inbound
+                // message a handler failure, which the ingress explicitly refuses to do (see
+                // AsyncResponseIngress: an id that cannot route is acknowledged, never redelivered,
+                // because RabbitMQ's default MaxDeliveryAttempts = 0 has no cap). Returning false
+                // lets the caller log-and-ack it instead of hot-looping at broker rate.
+                //
+                // The duplicate's NAME is deliberately not surfaced anywhere: it comes straight off
+                // an untrusted body, and the "never logs a message body" guarantee covers it.
+                value = default;
+                return false;
             }
 
             if (!exactFound && string.Equals(property.Name, name, StringComparison.Ordinal))

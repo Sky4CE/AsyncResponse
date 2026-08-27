@@ -906,6 +906,58 @@ public class KafkaDispatcherTests
         Assert.Equal(4, stored.Offset);
     }
 
+    [Fact]
+    public async Task DiscardUnprocessable_WhenStoringTheOffsetThrows_DoesNotFaultThePollLoop()
+    {
+        // Regression (round 29): the offset store here was unguarded, and this call originates
+        // INSIDE the poll loop's own catch arm — so nothing could catch it. A rebalance revoking
+        // the partition made StoreOffset throw AFTER the message was already produced to the
+        // dead-letter topic, faulting the loop; the restart then dead-lettered it a second time.
+        var consumer = new FakeKafkaConsumerClient { StoreOffsetException = new InvalidOperationException("rebalanced") };
+        var producer = new FakeKafkaProducerClient();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions(),
+            consumer: consumer,
+            producer: producer);
+
+        var message = KafkaTestData.Message(Topic, offset: 4, payload: "", ("correlationId", "corr-x"));
+
+        await dispatcher.DiscardUnprocessableAsync(
+            message,
+            new InvalidDataException("no payload"),
+            CancellationToken.None);
+
+        // The burial still happened; only the commit was lost, and it is logged rather than thrown.
+        Assert.Single(producer.Publishes);
+    }
+
+    [Fact]
+    public async Task DiscardUnprocessable_SettlesEvenWhenTheSubscriberIsAlreadyStopping()
+    {
+        // Settlement ignores the stopping token, as every sibling settlement path does: a shutdown
+        // landing between the dead-letter publish and the offset store would abort the publish
+        // mid-flight and leave the poison message neither buried nor committed.
+        var consumer = new FakeKafkaConsumerClient();
+        var producer = new FakeKafkaProducerClient();
+        await using var dispatcher = CreateDispatcher(
+            (_, _) => Task.CompletedTask,
+            new KafkaSubscriberOptions(),
+            consumer: consumer,
+            producer: producer);
+
+        using var stopping = new CancellationTokenSource();
+        await stopping.CancelAsync();
+
+        await dispatcher.DiscardUnprocessableAsync(
+            KafkaTestData.Message(Topic, offset: 9, payload: "", ("correlationId", "corr-y")),
+            new InvalidDataException("no payload"),
+            stopping.Token);
+
+        Assert.Single(producer.Publishes);
+        Assert.Equal(9, Assert.Single(consumer.StoredOffsets).Offset);
+    }
+
     // ---------- Helpers ----------
 
     private static KafkaSubscriberOptions FastRetries(KafkaSubscriberOptions options)

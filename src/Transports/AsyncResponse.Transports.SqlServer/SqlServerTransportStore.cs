@@ -518,11 +518,23 @@ internal sealed class SqlServerTransportStore
             await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
+            // Delete FIRST and write the DLQ row only if the fence matched. A stale claim (the lease
+            // lapsed and a peer re-claimed the row) must no-op here exactly as the fenced ack and
+            // NAK do; writing the row unconditionally buried a full copy of a message that is still
+            // live and may yet succeed under its new owner, so the DLQ showed a poison entry for
+            // work that completed — and an operator replaying it duplicated its side effects.
             command.CommandText =
                 $"""
-                INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
-                VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason);
+                SET NOCOUNT ON;
                 DELETE FROM {MessageTable} WHERE id = @source_id AND lock_id = @lock_id;
+                IF @@ROWCOUNT = 1
+                BEGIN
+                    INSERT INTO {MessageTable} (id, queue, payload_json, headers_json, dead_letter_reason)
+                    VALUES (@id, @queue, @payload_json, @headers_json, @dead_letter_reason);
+                    SELECT 1;
+                END
+                ELSE
+                    SELECT 0;
                 """;
             command.Parameters.AddWithValue("@id", Guid.NewGuid());
             command.Parameters.AddWithValue("@queue", _options.DeadLetterQueue);
@@ -531,8 +543,21 @@ internal sealed class SqlServerTransportStore
             command.Parameters.AddWithValue("@dead_letter_reason", exception.Message);
             command.Parameters.AddWithValue("@source_id", id);
             command.Parameters.AddWithValue("@lock_id", lockId);
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            var buried = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is int and 1;
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            // Zero means the fence was lost, not that the write failed. Report it as a
+            // non-dead-letter so the caller does not log a burial that did not happen; its NAK
+            // fallback is fenced too, so the new owner keeps the row untouched.
+            if (!buried)
+            {
+                _logger?.LogWarning(
+                    "SQL Server dead-letter for message {MessageId} from queue {SourceQueue} no-opped: the claim's lease had lapsed and the row was re-claimed.",
+                    id,
+                    sourceQueue);
+                return false;
+            }
+
             return true;
         }
         catch (Exception ex)

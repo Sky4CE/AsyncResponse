@@ -90,6 +90,133 @@ public sealed class DurableFlowStateStorePackageIntegrationTests(DataBatchFixtur
     }
 
     [Fact]
+    public async Task PostgreSqlPackageStore_MigratesAJsonbLedgerColumn_AndThenAcceptsANulCharacter()
+    {
+        // Regression (round 29): the ledger column was jsonb, which REJECTS the \u0000 escape
+        // System.Text.Json emits for U+0000 (SQLSTATE 22P05). A flow value carrying that character
+        // — a legal .NET string, and one every other store accepts — failed every write here: the
+        // flow could not start, or its checkpoint failed on every attempt until the job
+        // dead-lettered. Nothing queries inside the ledger (it is read back as text), so text costs
+        // nothing, and an existing jsonb column is converted in place on the auto-create path.
+        var schema = NewIdentifier("df_pgjsonb", 32);
+        await using var dataSource = NpgsqlDataSource.Create(Fixture.PostgreSqlConnectionString);
+        try
+        {
+            // The pre-fix shape, exactly as a deployment that ran an older build would have it.
+            await using (var seed = dataSource.CreateCommand(
+                $"""
+                CREATE SCHEMA IF NOT EXISTS "{schema}";
+                CREATE TABLE "{schema}"."flow_state" (
+                    flow_id text NOT NULL PRIMARY KEY,
+                    state_json jsonb NOT NULL,
+                    expires_at_utc timestamptz NOT NULL,
+                    updated_at_utc timestamptz NOT NULL,
+                    revision bigint NOT NULL DEFAULT 0,
+                    lease_id text NULL,
+                    lease_expires_at_utc timestamptz NULL
+                );
+                """))
+            {
+                await seed.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions
+                {
+                    SchemaName = schema,
+                    TableName = "flow_state"
+                }));
+
+            var state = CreateState("flow-nul");
+            state.LastMessage = "before\u0000after";
+
+            // The very first operation runs the guarded migration, then writes a ledger a jsonb
+            // column could not have accepted.
+            Assert.True(await store.TryCreateAsync(state.FlowId!, state, TimeSpan.FromMinutes(5)));
+
+            await using (var check = dataSource.CreateCommand(
+                """
+                SELECT data_type FROM information_schema.columns
+                WHERE table_schema = @schema AND table_name = 'flow_state' AND column_name = 'state_json';
+                """))
+            {
+                check.Parameters.AddWithValue("@schema", schema);
+                Assert.Equal("text", (string)(await check.ExecuteScalarAsync())!);
+            }
+
+            var loaded = await store.LoadAsync(state.FlowId!);
+            Assert.NotNull(loaded);
+            Assert.Equal("before\u0000after", loaded!.LastMessage);
+
+            // And the checkpoint path (TryUpdateAsync) carries it too.
+            loaded.Revision = 1;
+            loaded.LastMessage = "\u0000leading";
+            Assert.True(await store.TryUpdateAsync(loaded.FlowId!, loaded, 0, TimeSpan.FromMinutes(5)));
+            Assert.Equal("\u0000leading", (await store.LoadAsync(loaded.FlowId!))!.LastMessage);
+        }
+        finally
+        {
+            await using var cleanup = await dataSource.OpenConnectionAsync();
+            await using var command = cleanup.CreateCommand();
+            command.CommandText = $"""DROP SCHEMA IF EXISTS "{schema}" CASCADE;""";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task PostgreSqlPackageStore_WithAManualJsonbSchema_FailsStartupWithTheAlterToRun()
+    {
+        // The counterpart for AutoCreateSchema = false: the library never runs DDL there, so the
+        // verifier must say what to deploy instead of failing later on one unlucky payload.
+        var schema = NewIdentifier("df_pgmanual", 32);
+        await using var dataSource = NpgsqlDataSource.Create(Fixture.PostgreSqlConnectionString);
+        try
+        {
+            await using (var seed = dataSource.CreateCommand(
+                $"""
+                CREATE SCHEMA IF NOT EXISTS "{schema}";
+                CREATE TABLE "{schema}"."flow_state" (
+                    flow_id text NOT NULL PRIMARY KEY,
+                    state_json jsonb NOT NULL,
+                    expires_at_utc timestamptz NOT NULL,
+                    updated_at_utc timestamptz NOT NULL,
+                    revision bigint NOT NULL DEFAULT 0,
+                    lease_id text NULL,
+                    lease_expires_at_utc timestamptz NULL
+                );
+                CREATE INDEX "flow_state_expires_idx" ON "{schema}"."flow_state" (expires_at_utc);
+                """))
+            {
+                await seed.ExecuteNonQueryAsync();
+            }
+
+            var store = new PostgreSqlFlowStateStore(
+                dataSource,
+                Options.Create(new PostgreSqlDurableFlowOptions
+                {
+                    SchemaName = schema,
+                    TableName = "flow_state",
+                    AutoCreateSchema = false
+                }));
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => store.TryCreateAsync("flow-manual", CreateState("flow-manual"), TimeSpan.FromMinutes(5)));
+
+            Assert.Contains("state_json", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("text", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("jsonb", ex.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await using var cleanup = await dataSource.OpenConnectionAsync();
+            await using var command = cleanup.CreateCommand();
+            command.CommandText = $"""DROP SCHEMA IF EXISTS "{schema}" CASCADE;""";
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
     public async Task SqlServerPackageStore_RoundTrips_Expires_Deletes()
     {
         var schema = NewIdentifier("df_sql", 32);
