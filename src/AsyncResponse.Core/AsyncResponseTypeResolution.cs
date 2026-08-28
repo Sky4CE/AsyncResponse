@@ -149,5 +149,11 @@ public static class AsyncResponseTypeResolution
         }
 
         ReflectionExtensions.InvalidateUnresolvableServiceTypes();
+
+        // Same as Unregister: names the removed resolvers already ANSWERED must stop resolving,
+        // so the positive caches are dropped too — otherwise a reset leaks resolved types (and
+        // their assemblies) into whatever runs next in the process.
+        ReflectionExtensions.InvalidateResolvedServiceTypes();
+        PayloadRecoveryClassifier.InvalidateResolvedPayloadTypes();
     }
 }

@@ -13,6 +13,13 @@ namespace AsyncResponse.Tests;
 /// Regressions for round 28 (two independent external reviews). Each test drives the defect's real
 /// path and fails on the pre-fix build.
 /// </summary>
+/// <remarks>
+/// In the registry collection because DisposingAResolver_RevokesAliasesItAlreadyResolved mutates
+/// and Resets the process-global AsyncResponseTypeResolution registry — un-collected, it ran
+/// concurrently with the classes serialized for exactly that and wiped their registrations
+/// mid-assert (the intermittent failure the collection exists to prevent).
+/// </remarks>
+[Collection("AsyncResponseTypeResolutionRegistry")]
 public sealed class Round28RegressionTests
 {
     // -----------------------------------------------------------------------------------------

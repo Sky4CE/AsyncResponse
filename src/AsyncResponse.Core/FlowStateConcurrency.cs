@@ -223,6 +223,16 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
     /// </summary>
     private static readonly TimeSpan MaxDeadlineChunk = TimeSpan.FromDays(1);
 
+    /// <summary>
+    /// Budget for joining the renewal and deadline loops on disposal. The renewal loop can be
+    /// stuck inside a store call that ignores its cancellation token (a wedged connection, a
+    /// database that accepts the request and never answers — the exact case the deadline watcher
+    /// exists for); an unbounded join there wedged the whole worker job. Past the budget the
+    /// loops are abandoned: the deadline watcher has already marked the lease lost and the
+    /// server-side lease expires on its own.
+    /// </summary>
+    private static readonly TimeSpan DisposeJoinLimit = TimeSpan.FromSeconds(30);
+
     /// <param name="store">The flow state store the lease was acquired through.</param>
     /// <param name="flowId">The flow the lease protects.</param>
     /// <param name="leaseId">The identity of this lease within the flow's row.</param>
@@ -470,8 +480,24 @@ internal sealed class FlowExecutionLease : IAsyncDisposable
             return;
 
         _stop.Cancel();
-        await _renewal.ConfigureAwait(false);
-        await _deadline.ConfigureAwait(false);
+        try
+        {
+            // Bounded join (see DisposeJoinLimit): both loops swallow their own exceptions, so an
+            // abandoned task cannot fault unobserved.
+            await Task.WhenAll(_renewal, _deadline).WaitAsync(DisposeJoinLimit, _timeProvider).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // The store call the renewal loop is stuck in ignores cancellation, so releasing the
+            // lease through the same store would hang this disposal all over again. Skip the
+            // release (the server-side lease expires) and leave the cancellation sources
+            // undisposed for the abandoned loops.
+            _logger.LogWarning(
+                "Durable flow {FlowId} execution lease loops did not stop within {DisposeJoinLimit}; abandoning them (the lease will expire server-side).",
+                _flowId,
+                DisposeJoinLimit);
+            return;
+        }
 
         try
         {

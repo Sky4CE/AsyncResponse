@@ -61,6 +61,66 @@ public class NatsRecoveryStateStoreTests
     }
 
     [Fact]
+    public async Task SaveAsync_ANewRegistration_DoesNotExtendASiblingsOwnExpiry()
+    {
+        // Regression: the envelope carried ONE ExpiresAtUtc re-stamped on every save, so a fresh
+        // registration under the same correlation id kept a dead sibling recoverable for as long
+        // as anything kept registering — a response arriving days after the sibling's own expiry
+        // still fanned out to it and fired its stale callback into a flow that lapsed long ago.
+        // Each registration now keeps its own stamp (Redis / relational per-row parity).
+        var siblingId = Guid.NewGuid();
+        await _store.SaveAsync("corr-a", new RecoveryState
+        {
+            RegistrationId = siblingId,
+            CorrelationId = "corr-a",
+            RegisteredAtUtc = _time.Now.UtcDateTime
+        }, TimeSpan.FromDays(7));
+
+        _time.Advance(TimeSpan.FromDays(6));
+        var freshId = Guid.NewGuid();
+        await _store.SaveAsync("corr-a", new RecoveryState
+        {
+            RegistrationId = freshId,
+            CorrelationId = "corr-a",
+            RegisteredAtUtc = _time.Now.UtcDateTime
+        }, TimeSpan.FromDays(7));
+
+        // Day 8: the sibling's own 7-day stamp lapsed a day ago; only the fresh registration
+        // survives, even though the fresh save kept the shared key alive until day 13.
+        _time.Advance(TimeSpan.FromDays(2));
+        var remaining = await _store.GetAllAsync("corr-a");
+        Assert.Equal(freshId, Assert.Single(remaining).RegistrationId);
+    }
+
+    [Fact]
+    public async Task GetAllAsync_EnvelopeWithoutPerRegistrationExpiries_FallsBackToTheSharedStamp()
+    {
+        // Upgrade compatibility: envelopes written before StateExpiries existed carry only the
+        // shared stamp; those registrations inherit it — readable until it lapses, gone after.
+        var key = NatsSubjectSchema.RecoveryKey("corr-legacy");
+        var registrationId = Guid.NewGuid();
+        _kv.Entries[key] = JsonSerializer.Serialize(new
+        {
+            ExpiresAtUtc = (_time.Now + TimeSpan.FromMinutes(10)).UtcDateTime,
+            States = new[]
+            {
+                new RecoveryState
+                {
+                    RegistrationId = registrationId,
+                    CorrelationId = "corr-legacy",
+                    PayloadTypeFullName = typeof(OperationResult).FullName,
+                    RegisteredAtUtc = _time.Now.UtcDateTime
+                }
+            }
+        });
+
+        Assert.Equal(registrationId, Assert.Single(await _store.GetAllAsync("corr-legacy")).RegistrationId);
+
+        _time.Advance(TimeSpan.FromMinutes(11));
+        Assert.Empty(await _store.GetAllAsync("corr-legacy"));
+    }
+
+    [Fact]
     public async Task SaveAsync_CarriesAnUnreadableSiblingThroughTheRewrite()
     {
         // Regression (round 29): save and delete are read-MODIFY-write on a SHARED envelope, and

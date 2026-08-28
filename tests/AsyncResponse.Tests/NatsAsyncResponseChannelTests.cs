@@ -76,8 +76,9 @@ public class NatsAsyncResponseChannelTests
         // saved. A terminal response landing in that window runs cleanup, whose delete no-ops
         // (nothing saved yet); the save then commits an orphaned callback-armed registration that
         // would resurrect recovery for a completed wait on any later publish. The creator must
-        // compensate with a second delete after the save — and must SKIP the post-save flush,
-        // whose lifetime token the settled wait's cleanup disposes.
+        // compensate with a second delete after the save — and must not flush again for a wait
+        // that already ended (the one subscription flush happens BEFORE the save, establishing
+        // "recovery state visible => subscription visible").
         //
         // Determinism: the consume loop processes the pushed message on its own schedule, so the
         // save completes only once cleanup's delete has been OBSERVED — cleanup sets
@@ -109,12 +110,62 @@ public class NatsAsyncResponseChannelTests
         await using var waiter = await waiterTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(OperationStatus.Completed, (await waiter.ResponseTask).Status);
 
-        // One delete from cleanup (pre-save no-op) plus the post-save compensation; no server
-        // flush for a wait that already ended.
+        // One delete from cleanup (pre-save no-op) plus the post-save compensation. Exactly the
+        // one pre-save subscription flush — the reorder that closed the save-before-visibility
+        // window — and no second flush for a wait that already ended (its lifetime token is
+        // disposed by cleanup).
         _store.Verify(
             s => s.TryDeleteAsync("corr-save-race", It.IsAny<Guid>(), It.IsAny<CancellationToken>()),
             Times.AtLeast(2));
-        Assert.Equal(0, _client.FlushCount);
+        Assert.Equal(1, _client.FlushCount);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_FlushesTheSubscriptionBeforeSavingRecoveryState()
+    {
+        // Regression: the recovery state was saved BEFORE the flush that makes the subscription
+        // server-visible, inverting the "recovery state visible => subscription visible" ordering
+        // the DB base documents and Redis follows. A publish landing in that window found the
+        // registration, probed the not-yet-visible subscription, and consumed a live waiter's
+        // recovery arm — the waiter then resumed twice.
+        var flushesWhenSaveStarted = -1;
+        _store
+            .Setup(s => s.SaveAsync(It.IsAny<string>(), It.IsAny<RecoveryState>(), It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                flushesWhenSaveStarted = _client.FlushCount;
+                return Task.CompletedTask;
+            });
+        var channel = CreateChannel();
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>("corr-flush-order");
+
+        Assert.Equal(1, flushesWhenSaveStarted);
+    }
+
+    [Fact]
+    public async Task CreateResponseWaiter_TimeoutFiresOnTheInjectedClock()
+    {
+        // Redis-parity regression: the waiter timeout was armed on a default
+        // CancellationTokenSource (the system clock) while RegisteredAtUtc came from the injected
+        // TimeProvider — under a virtual clock a production-sized timeout could never fire.
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var channel = CreateChannel(timeProvider: clock);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-virtual-timeout",
+            timeout: TimeSpan.FromMinutes(10));
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(5);
+        while (!waiter.ResponseTask.IsCompleted)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "advancing the virtual clock never fired the waiter timeout");
+            clock.Advance(TimeSpan.FromMinutes(11));
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        var timeout = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask);
+        Assert.Contains("corr-virtual-timeout", timeout.Message);
     }
 
     [Fact]

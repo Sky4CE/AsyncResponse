@@ -272,7 +272,11 @@ LocalStack there costs less than adding three database servers to another batch.
 
 To add a batch: add a `case` to the AppHost's switch on `ASYNCRESPONSE_ITEST_BATCH` composing the
 container and app-group functions it needs, derive a fixture overriding `Batch` and `WireAsync`, add a
-`[CollectionDefinition]`, and register it in `BatchAssignmentTests`. Note that a batch without sample
+`[CollectionDefinition]`, register it in `BatchAssignmentTests`, and add the batch's name to the
+`batch:` matrix in `.github/workflows/ci.yml`. That last step has no guard: the legs are hand-listed
+in the workflow and nothing asserts the list, so a batch missing from the matrix runs locally, is
+never selected in CI, and CI stays green — the same quiet failure the trait check above exists to
+catch. Note that a batch without sample
 apps inherits work they normally do on the suite's behalf — `DriverOnlyBatchFixture` waits for
 PostgreSQL and creates the SQL Server database itself, because no sample app is there to do it.
 

@@ -376,6 +376,12 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
     /// longer than this is the documented harness anti-pattern (use the injected TimeProvider).</item>
     /// </list>
     /// </summary>
+    /// <summary>Reports an inline executor attempt starting (see QuiesceProbe.DirectRunsInFlight).</summary>
+    internal void OnDirectRunStarted() => _quiesce.OnDirectRunStarted();
+
+    /// <summary>Reports an inline executor attempt finished.</summary>
+    internal void OnDirectRunFinished() => _quiesce.OnDirectRunFinished();
+
     private async Task SettleAsync()
     {
         // Let just-released continuations (a fired timer's write, worker dispatch) reach the
@@ -387,7 +393,7 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         }
 
         var budget = TimeProvider.System.GetUtcNow() + TimeSpan.FromMilliseconds(500);
-        while (Transport.OutstandingJobs > _quiesce.ParkedCount
+        while (Transport.OutstandingJobs + _quiesce.DirectRunsInFlight > _quiesce.ParkedCount
                && TimeProvider.System.GetUtcNow() < budget)
         {
             var next = Clock.NextTimerDueAt;
@@ -412,11 +418,24 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         private readonly HashSet<(string FlowId, string Step)> _parked = [];
         private TimeProvider _clock = TimeProvider.System;
         private TimeSpan _timerInProcessThreshold;
+        private int _directRunsInFlight;
 
         public int ParkedCount
         {
             get { lock (_parked) return _parked.Count; }
         }
+
+        /// <summary>
+        /// Executor attempts running inline (<c>FlowRunHandle.ExecuteDirectAsync</c>), which hold
+        /// no worker slot: SettleAsync counts them beside <c>Transport.OutstandingJobs</c>, since
+        /// a step they park would otherwise make ParkedCount exceed the outstanding jobs and let
+        /// the clock advance under a direct run still executing user code.
+        /// </summary>
+        public int DirectRunsInFlight => Volatile.Read(ref _directRunsInFlight);
+
+        public void OnDirectRunStarted() => Interlocked.Increment(ref _directRunsInFlight);
+
+        public void OnDirectRunFinished() => Interlocked.Decrement(ref _directRunsInFlight);
 
         /// <summary>Binds the engine clock and timer threshold of the current incarnation.</summary>
         public void Arm(TimeProvider clock, TimeSpan timerInProcessThreshold)
@@ -428,6 +447,7 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
         public void Reset()
         {
             lock (_parked) _parked.Clear();
+            Volatile.Write(ref _directRunsInFlight, 0);
         }
 
         public ValueTask OnStepWaitingAsync(DurableFlowStepEvent step)
@@ -457,6 +477,16 @@ public sealed class AsyncResponseTestHarness : IAsyncDisposable
 
         public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run)
         {
+            lock (_parked) _parked.RemoveWhere(entry => string.Equals(entry.FlowId, run.FlowId, StringComparison.Ordinal));
+            return default;
+        }
+
+        public ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+        {
+            // The failed attempt released its worker slot with its waits unresolved (a waiter
+            // timeout, a published failure the flow does not treat as terminal); the redelivery
+            // re-parks whatever still applies. Left in place, the stale entry offset a genuinely
+            // busy job in SettleAsync's guard for the rest of the incarnation.
             lock (_parked) _parked.RemoveWhere(entry => string.Equals(entry.FlowId, run.FlowId, StringComparison.Ordinal));
             return default;
         }

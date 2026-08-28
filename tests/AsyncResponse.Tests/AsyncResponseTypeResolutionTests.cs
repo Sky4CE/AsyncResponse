@@ -282,6 +282,31 @@ public class AsyncResponseTypeResolutionTests : IDisposable
             context.Unload();
         }
     }
+
+    [Fact]
+    public void Reset_DropsPositivelyCachedResolutions()
+    {
+        // Regression: Reset() cleared the resolver list and the negative cache but not the
+        // POSITIVE type caches, so a name a removed resolver had already answered kept resolving
+        // to its type for the rest of the process — the exact leak Unregister() closes, reopened
+        // through the test seam and bleeding resolved types across test cases.
+        var serviceAlias = $"Reset.Alias.Service{Guid.NewGuid():N}";
+        var payloadAlias = $"Reset.Alias.Payload{Guid.NewGuid():N}";
+        AsyncResponseTypeResolution.RegisterResolver(name =>
+            name == serviceAlias ? typeof(IRecoverySpy) : name == payloadAlias ? typeof(OperationResult) : null);
+        try
+        {
+            Assert.Same(typeof(IRecoverySpy), ReflectionExtensions.ResolveServiceType(serviceAlias));
+            Assert.Same(typeof(OperationResult), PayloadRecoveryClassifier.ResolvePayloadType(payloadAlias));
+        }
+        finally
+        {
+            AsyncResponseTypeResolution.Reset();
+        }
+
+        Assert.Null(ReflectionExtensions.ResolveServiceType(serviceAlias));
+        Assert.Null(PayloadRecoveryClassifier.ResolvePayloadType(payloadAlias));
+    }
 }
 
 /// <summary>

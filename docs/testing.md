@@ -80,7 +80,9 @@ executor inline, no worker queue — fully single-threaded for exhaustive matric
 observer seam at the exact boundary — before a step's first side effect, or right after its
 checkpoint persisted. The execution attempt fails exactly like a process death at that point, the
 transport redelivers (backoff on the virtual clock), and the run resumes from the last
-checkpoint:
+checkpoint. One crash can be armed at a time: arming another while one is still pending throws
+instead of silently discarding the first, which would let a test believe it exercised a
+crash/resume path that never ran — arm the next crash after the current one has fired:
 
 ```csharp
 harness.CrashAfterStep("create-workspace");   // die between the checkpoint and the next step

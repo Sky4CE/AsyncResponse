@@ -140,7 +140,11 @@ watermark. The one column verification deliberately leaves alone on a table it d
 own, so a schema an older build or a hand-written migration left as `varchar` or on the server's
 case-insensitive default still claims exactly and is accepted as-is. On a table the store created,
 the declared `nvarchar(200) COLLATE Latin1_General_100_BIN2` is held to exactly — there, a
-difference means the column was altered afterwards.
+difference means the column was altered afterwards. The derived indexes are verified the same way
+on tables this build created (the name-only `IF NOT EXISTS` guard would otherwise accept a
+same-name index with the wrong definition and silently cost the claim its seek); on a table your
+migration owns, the indexes above are yours to keep in shape — they carry claim performance, not
+correctness.
 
 The three logical queues share this one table and are told apart by the `queue` column alone, so
 the claim query matches it exactly — `queue = @queue AND queue + N'.' = @queue + N'.' COLLATE

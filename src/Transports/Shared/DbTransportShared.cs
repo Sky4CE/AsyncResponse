@@ -168,7 +168,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            await HandleFailureAsync(delivery, ex, cancellationToken).ConfigureAwait(false);
+            await HandleFailureAsync(delivery, ex).ConfigureAwait(false);
             return;
         }
 
@@ -353,10 +353,43 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
     private async Task BackgroundWorkerLoopAsync(CancellationToken cancellationToken)
     {
         // Token-less ReadAllAsync: on shutdown the queue is completed and fully drained, so every
-        // already-ACKed queue item is attempted (with the drain token once the drain budget lapses)
-        // instead of being silently dropped; each failure is dead-lettered and surfaced below.
+        // already-ACKed queue item is accounted for instead of being silently dropped; each
+        // failure is dead-lettered and surfaced below.
         await foreach (var delivery in _backgroundQueue!.Reader.ReadAllAsync().ConfigureAwait(false))
         {
+            // Once the drain budget has lapsed, STOP executing (Redis/Pub-Sub parity). The token
+            // below cannot stop the real handler — it is `_ingress.HandleWorkerMessageAsync(payload)`,
+            // whose target takes no CancellationToken — so past the budget the loop kept starting
+            // fresh work beyond the HostShutdownTimeout the options size, and every entry still
+            // queued at process exit vanished with no record (its queue row was deleted by the
+            // early ACK, so nothing redelivers it). Route the rest through the same
+            // dead-letter/OnBackgroundFailure path instead of losing them silently.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                var lapsed = new OperationCanceledException(
+                    "The ACK-after-enqueue drain budget lapsed before this already-ACKed message was handled.");
+
+                _logger.LogWarning(
+                    "{Provider} background handler for already-ACKed message {MessageId} on queue {Queue} ({Role}) was not started: the drain budget had lapsed. Dead-lettering and surfacing via OnBackgroundFailure.",
+                    _providerName,
+                    delivery.Id,
+                    delivery.Queue,
+                    _role);
+
+                if (!await delivery.DeadLetterAsync(lapsed, false, CancellationToken.None).ConfigureAwait(false))
+                {
+                    _logger.LogError(
+                        "Failed to dead-letter undrained {Provider} message {MessageId} on queue {Queue} ({Role}); the loss is only observable via logs and OnBackgroundFailure.",
+                        _providerName,
+                        delivery.Id,
+                        delivery.Queue,
+                        _role);
+                }
+
+                await InvokeBackgroundFailureAsync(delivery, lapsed).ConfigureAwait(false);
+                continue;
+            }
+
             try
             {
                 await ExecuteHandlerAsync(delivery, cancellationToken).ConfigureAwait(false);
@@ -379,7 +412,7 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
         }
     }
 
-    private async Task HandleFailureAsync(DbTransportDelivery delivery, Exception exception, CancellationToken cancellationToken)
+    private async Task HandleFailureAsync(DbTransportDelivery delivery, Exception exception)
     {
         var maxAttempts = _subscriberOptions.MaxDeliveryAttempts;
         if (maxAttempts > 0 && delivery.Attempt >= maxAttempts)
@@ -392,7 +425,12 @@ internal abstract class DbMessageDispatcherBase : IAsyncDisposable
                 _role,
                 delivery.Attempt);
 
-            var deadLettered = await delivery.DeadLetterAsync(exception, true, cancellationToken).ConfigureAwait(false);
+            // CancellationToken.None like every other settlement in this file: burying a poison
+            // row must not be abandoned half-done by a shutdown — with the stopping token, a
+            // handler failing on its LAST attempt during a stop had the burial aborted (the
+            // store's connection/transaction calls throw on the cancelled token) and the row was
+            // NAKed back instead of dead-lettered.
+            var deadLettered = await delivery.DeadLetterAsync(exception, true, CancellationToken.None).ConfigureAwait(false);
             if (!deadLettered)
             {
                 _logger.LogWarning(exception, "{Provider} dead-letter publish failed for queue {Queue} ({Role}); releasing for retry.", _providerName, delivery.Queue, _role);

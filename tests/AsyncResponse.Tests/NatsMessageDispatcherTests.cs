@@ -42,6 +42,57 @@ public class NatsMessageDispatcherTests
     }
 
     [Fact]
+    public async Task OverCapDelivery_DeadLettersAndTermsWithoutExecutingTheHandler()
+    {
+        // Regression: the consumer is created with MaxDeliver = -1 on the premise that the
+        // dispatcher bounds attempts, but the only cap check ran inside HandleFailureAsync —
+        // reached only when the handler THREW. A delivery whose earlier attempts never settled
+        // (process killed mid-handler, a failed NAK) therefore redelivered forever and was never
+        // dead-lettered (DB/Redis dispatcher parity).
+        var rec = new RecordingDelivery();
+        var handled = false;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handled = true;
+                return Task.CompletedTask;
+            },
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 3 });
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 4), CancellationToken.None);
+
+        Assert.False(handled);
+        Assert.Equal(1, rec.Terms);
+        Assert.Equal(0, rec.Acks);
+        Assert.Empty(rec.Naks);
+        var published = Assert.Single(_jetStream.Published);
+        Assert.Equal(DeadLetterSubject, published.Subject);
+    }
+
+    [Fact]
+    public async Task AtCapDelivery_StillExecutesTheHandler()
+    {
+        // The cap's LAST allowed attempt must still run: the pre-execution check refuses only
+        // deliveries beyond it (NumDelivered > cap), matching HandleFailureAsync's >= cap burial
+        // for an attempt that throws.
+        var rec = new RecordingDelivery();
+        var handled = false;
+        await using var dispatcher = CreateDispatcher(
+            (_, _) =>
+            {
+                handled = true;
+                return Task.CompletedTask;
+            },
+            new NatsSubscriberOptions { MaxDeliveryAttempts = 3 });
+
+        await dispatcher.HandleAsync(rec.Create("payload", numDelivered: 3), CancellationToken.None);
+
+        Assert.True(handled);
+        Assert.Equal(1, rec.Acks);
+        Assert.Empty(_jetStream.Published);
+    }
+
+    [Fact]
     public async Task HandlerExecution_EmitsNatsReceiveSpanWithMessagingTags()
     {
         using var collector = new AsyncResponseActivityCollector();

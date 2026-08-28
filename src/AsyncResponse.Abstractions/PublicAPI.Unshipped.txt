@@ -207,6 +207,7 @@ AsyncResponse.IDurableFlowContext.SetValueAsync<TValue>(string! key, TValue valu
 AsyncResponse.IDurableFlowContext.StepAsync(string! name, System.Func<System.Threading.Tasks.Task!>! step, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 AsyncResponse.IDurableFlowContext.StepAsync<TResult>(string! name, System.Func<System.Threading.Tasks.Task<TResult>!>! step, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<TResult>!
 AsyncResponse.IDurableFlowExecutionObserver
+AsyncResponse.IDurableFlowExecutionObserver.OnRunAttemptFailedAsync(AsyncResponse.DurableFlowRunEvent run) -> System.Threading.Tasks.ValueTask
 AsyncResponse.IDurableFlowExecutionObserver.OnRunFinishedAsync(AsyncResponse.DurableFlowRunEvent run) -> System.Threading.Tasks.ValueTask
 AsyncResponse.IDurableFlowExecutionObserver.OnStepCompletedAsync(AsyncResponse.DurableFlowStepEvent step) -> System.Threading.Tasks.ValueTask
 AsyncResponse.IDurableFlowExecutionObserver.OnStepStartingAsync(AsyncResponse.DurableFlowStepEvent step) -> System.Threading.Tasks.ValueTask

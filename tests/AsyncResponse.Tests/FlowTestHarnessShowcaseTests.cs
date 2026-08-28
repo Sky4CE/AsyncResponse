@@ -196,6 +196,62 @@ public class FlowTestHarnessShowcaseTests
     }
 
     [Fact]
+    public async Task FailedAttempt_ClearsTheQuiesceProbesParkedEntry()
+    {
+        // Regression: a step parked in-process, then its wait faulted (a published exception the
+        // flow does not treat as terminal). The attempt failed for redelivery, releasing its
+        // worker slot — but no step-completed or run-finished event ever fired, so the harness's
+        // quiesce probe kept the parked entry for the rest of the incarnation. From then on
+        // SettleAsync's guard under-counted busy jobs by one, and AdvanceAsync could move the
+        // virtual clock while another flow's step was still mid-user-code.
+        var (harness, _, _) = await StartAsync();
+        await using var _1 = harness;
+
+        var run = await harness.StartFlowAsync<TenantOnboardingFlow, OnboardingInput>(new OnboardingInput(13));
+        await run.WaitForAwaitingStepAsync("run-migration");
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+        while (ParkedCount(harness) != 1)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the awaited step never registered as parked");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        await run.ReplyExceptionAsync(new InvalidOperationException("migration service exploded"));
+
+        // The failed attempt released its worker slot; until the redelivery re-parks the step,
+        // nothing is parked in process — the probe must agree instead of leaking the entry.
+        while (ParkedCount(harness) != 0)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "the parked entry leaked after the failed attempt");
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task ArmingASecondCrash_WhileOneIsStillArmed_Throws()
+    {
+        // Regression: the second arm silently overwrote a still-unfired first one, so a test
+        // arming two crashes believed it exercised a crash/resume path that never ran. One slot,
+        // loudly: arm the next crash after the current one has fired.
+        var (harness, _, _) = await StartAsync();
+        await using var _1 = harness;
+
+        harness.CrashBeforeStep("run-migration");
+
+        var ex = Assert.Throws<InvalidOperationException>(() => harness.CrashAfterStep("import-data"));
+        Assert.Contains("already armed", ex.Message);
+    }
+
+    private static int ParkedCount(FlowTestHarness harness)
+    {
+        var quiesce = typeof(AsyncResponseTestHarness)
+            .GetField("_quiesce", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(harness.Engine)!;
+        return (int)quiesce.GetType().GetProperty("ParkedCount")!.GetValue(quiesce)!;
+    }
+
+    [Fact]
     public async Task DeclaredTerminalFailure_FailsTheRun()
     {
         var (harness, _, recorder) = await StartAsync();

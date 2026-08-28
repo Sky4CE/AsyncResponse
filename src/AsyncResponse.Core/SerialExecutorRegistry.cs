@@ -58,6 +58,16 @@ internal sealed class SerialExecutorRegistry(
 
     private readonly Dictionary<string, ExecutorEntry> _executors = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _tombstones = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Expiry-ordered index over <see cref="_tombstones"/> (constant lifetime, so insertion order
+    /// is expiry order). Pruning pops expired heads instead of scanning the whole dictionary —
+    /// the scan ran per retired waiter under <see cref="_gate"/>, the same lock every dispatched
+    /// message's enqueue takes, so its cost grew quadratically with throughput. Entries can be
+    /// stale (the channel was re-tombstoned later, or the tombstone was cleared); the dictionary
+    /// stays the source of truth and each popped head is validated against it.
+    /// </summary>
+    private readonly Queue<(string Channel, DateTimeOffset ExpiresAtUtc)> _tombstoneOrder = new();
     private readonly Dictionary<string, int> _registrations = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
@@ -261,7 +271,9 @@ internal sealed class SerialExecutorRegistry(
                 // Tombstone the retired channel so an enqueue that raced this retirement cannot
                 // recreate a leaked executor; ClearTombstone lifts it the moment a new
                 // subscription legitimately reuses the channel.
-                _tombstones[channel] = UtcNow + TombstoneLifetime;
+                var tombstoneExpiresAtUtc = UtcNow + TombstoneLifetime;
+                _tombstones[channel] = tombstoneExpiresAtUtc;
+                _tombstoneOrder.Enqueue((channel, tombstoneExpiresAtUtc));
                 PruneTombstonesUnderLock();
             }
 
@@ -283,22 +295,20 @@ internal sealed class SerialExecutorRegistry(
 
     private void PruneTombstonesUnderLock()
     {
-        if (_tombstones.Count == 0)
+        if (_tombstoneOrder.Count == 0)
             return;
 
         var now = UtcNow;
-        List<string>? expired = null;
-        foreach (var (channel, expiresAtUtc) in _tombstones)
+        while (_tombstoneOrder.TryPeek(out var head) && head.ExpiresAtUtc <= now)
         {
-            if (expiresAtUtc <= now)
-                (expired ??= []).Add(channel);
+            _tombstoneOrder.Dequeue();
+
+            // Only drop the tombstone the popped entry still describes: a re-tombstoned channel
+            // has a later expiry in the dictionary (its own queue entry follows), and a cleared
+            // one is already gone.
+            if (_tombstones.TryGetValue(head.Channel, out var current) && current <= now)
+                _tombstones.Remove(head.Channel);
         }
-
-        if (expired is null)
-            return;
-
-        foreach (var channel in expired)
-            _tombstones.Remove(channel);
     }
 
     private sealed class ExecutorEntry(ChannelSerialExecutor executor)

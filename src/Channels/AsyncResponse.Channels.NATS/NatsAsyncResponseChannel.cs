@@ -49,7 +49,7 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
         _propagation = propagation;
         _subjects = new NatsSubjectSchema(_options.SubjectPrefix);
         _logger = logger;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -146,7 +146,9 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
 
         // Single-use cancellation token implementing the timeout. Armed only after subscribe + recovery
         // save succeed, but its callback is registered first so a very fast terminal message cleans up safely.
-        var cancellationTokenSource = new CancellationTokenSource();
+        // Clock-injected (DbChannelShared parity): CancelAfter on a default CTS is bound to the
+        // system clock, so a virtual clock could never fire a production-sized waiter timeout.
+        var cancellationTokenSource = new CancellationTokenSource(Timeout.InfiniteTimeSpan, _timeProvider);
         CancellationTokenRegistration timeoutRegistration = default;
         INatsChannelSubscription? subscription = null;
 
@@ -534,6 +536,19 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
             subscription = await _client.SubscribeAsync(subject, cancellationTokenSource.Token).ConfigureAwait(false);
             consumeLoop = Task.Run(() => ConsumeLoopAsync(subscription));
 
+            // Round-trip to the server so the subscription is guaranteed registered BEFORE the
+            // recovery state is saved (and before the caller's trigger publishes the remote
+            // request — closing the subscribe/trigger race). The order is the DB channels'
+            // invariant: "recovery state visible ⇒ subscription visible". Saved first, a publish
+            // landing in the window found the registration, probed the not-yet-visible
+            // subscription, and consumed a live waiter's recovery arm — the waiter then resumed
+            // twice (recovery callback now, live delivery to its timeout). Skipped once cleanup
+            // started: the wait already settled terminally, so there is no trigger race left to
+            // close — and cleanup's teardown disposes the lifetime source this flush reads its
+            // token from, so attempting it would throw for nothing.
+            if (Volatile.Read(ref cleanupStarted) == 0)
+                await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+
             var recoveryState = new RecoveryState
             {
                 RegistrationId = registrationId,
@@ -570,14 +585,6 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                     _logger.LogError(ex, "Post-save recovery-state compensation delete failed for correlationId {CorrelationId}; the registration remains until TTL.", correlationId);
                 }
             }
-
-            // Round-trip to the server so the subscription is guaranteed registered before the caller's
-            // trigger publishes the remote request — closing the subscribe/trigger race. Skipped
-            // once cleanup started: the wait already settled terminally, so there is no trigger
-            // race left to close — and cleanup's teardown disposes the lifetime source this flush
-            // reads its token from, so attempting it would throw for nothing.
-            if (Volatile.Read(ref cleanupStarted) == 0)
-                await _client.FlushAsync(cancellationTokenSource.Token).ConfigureAwait(false);
 
             _logger.LogDebug("Subscribed to subject {Subject} for correlationId {CorrelationId}.", subject, correlationId);
         }
@@ -713,12 +720,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload: the caller
+                        // reports success, the broker message is acked, and the response then
+                        // exists nowhere.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
+                            "reporting a live subscriber; the payload was not delivered and recovery registrations were left intact. Retry " +
+                            "the publish once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 
@@ -794,12 +809,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload: the caller
+                        // reports success, the broker message is acked, and the response then
+                        // exists nowhere.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
+                            "reporting a live subscriber; the payload was not delivered and recovery registrations were left intact. Retry " +
+                            "the publish once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 
@@ -885,12 +908,20 @@ internal sealed class NatsAsyncResponseChannel : IAsyncResponsePublisher, IRawAs
                         // probe keeps reporting a live subscriber (interest not yet visible
                         // server-side, or a stale heartbeat). Consuming registrations on this
                         // evidence would strip a live waiter of its recovery arm — leave all state
-                        // intact for the next delivery or the waiter's own lifecycle.
+                        // intact and surface the non-delivery to the caller, whose retry/redelivery
+                        // machinery re-attempts once the subscription is visible (bounded by the
+                        // heartbeat's liveness expiry, after which normal recovery takes over).
+                        // Returning here instead would silently drop the payload: the caller
+                        // reports success, the broker message is acked, and the response then
+                        // exists nowhere.
                         _logger.LogWarning(
                             "Delivery for correlationId {CorrelationId} found no subscribers twice while the liveness probe kept reporting one; recovery registrations are left intact.",
                             correlationId);
                         activity?.SetTag("asyncresponse.recovery.liveness_contradiction", true);
-                        return;
+                        throw new InvalidOperationException(
+                            $"NATS delivery for correlationId '{correlationId}' found no responders twice while the liveness probe kept " +
+                            "reporting a live subscriber; the payload was not delivered and recovery registrations were left intact. Retry " +
+                            "the publish once the waiter's subscription is visible to the publishing endpoint.");
                     }
                 }
 

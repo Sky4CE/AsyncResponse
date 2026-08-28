@@ -5,3 +5,4 @@ AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.KeyPrefix.set -> void
 AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.RedisAsyncResponseOptions() -> void
 Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions
 static Microsoft.Extensions.DependencyInjection.RedisAsyncResponseServiceCollectionExtensions.WithRedisChannel(this Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder! builder, System.Action<AsyncResponse.Channels.Redis.RedisAsyncResponseOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.AsyncResponseRegistrationBuilder!
+AsyncResponse.Channels.Redis.RedisAsyncResponseOptions.Validate() -> void

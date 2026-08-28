@@ -54,11 +54,11 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         _recoveryStateStore = recoveryStateStore;
         _propagation = propagation;
         _options = options.Value;
-        _options.ValidateShared(nameof(RedisAsyncResponseOptions));
+        _options.Validate();
         _keys = new RedisKeySchema(_options.KeyPrefix);
         _logger = logger;
-        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger);
-        _executors = new SerialExecutorRegistry(logger);
+        _lostSubscriberDispatcher = new LostSubscriberCallbackDispatcher(scopeFactory, propagation, logger, _timeProvider);
+        _executors = new SerialExecutorRegistry(logger, timeProvider: _timeProvider);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -279,8 +279,10 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
         private readonly Activity? _activity;
         private readonly TaskCompletionSource<T> _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        // Single-use cancellation token implementing the waiter timeout.
-        private readonly CancellationTokenSource _cancellationTokenSource = new();
+        // Single-use cancellation token implementing the waiter timeout. Clock-injected
+        // (DbChannelShared parity): CancelAfter on a default CTS is bound to the system clock,
+        // so a virtual clock could never fire a production-sized waiter timeout on this channel.
+        private readonly CancellationTokenSource _cancellationTokenSource;
         private CancellationTokenRegistration _timeoutRegistration;
 
         // Ensures unsubscribe, recovery-state delete, timeout disposal, and executor cleanup
@@ -299,6 +301,7 @@ internal sealed class RedisAsyncResponseChannel : IAsyncResponsePublisher, IRawA
             Activity? activity)
         {
             _owner = owner;
+            _cancellationTokenSource = new CancellationTokenSource(Timeout.InfiniteTimeSpan, owner._timeProvider);
             _correlationId = correlationId;
             ChannelName = channel.ToString()!;
             Id = registrationId;

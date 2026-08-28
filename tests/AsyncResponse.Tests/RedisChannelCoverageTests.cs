@@ -135,6 +135,23 @@ public sealed class RedisChannelCoverageTests
         _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Fact]
+    public void Validate_RejectsANegativeRemoteStackTraceCap()
+    {
+        // Regression: Redis was the only channel accepting a negative MaxRemoteStackTraceLength —
+        // RemoteStackTrace.Cap treats any non-positive cap as "leave the trace unchanged", so a
+        // plausible "unlimited" (-1, or a bad configuration binding) silently disabled the DoS
+        // bound the other four channels reject at startup.
+        var options = new RedisAsyncResponseOptions { MaxRemoteStackTraceLength = -1 };
+
+        var ex = Assert.Throws<InvalidOperationException>(options.Validate);
+        Assert.Contains(nameof(RedisAsyncResponseOptions.MaxRemoteStackTraceLength), ex.Message);
+
+        // Zero (uncapped, the documented escape hatch) and the defaults stay accepted.
+        new RedisAsyncResponseOptions { MaxRemoteStackTraceLength = 0 }.Validate();
+        new RedisAsyncResponseOptions().Validate();
+    }
+
     [Theory]
     [InlineData(PublishKind.Response)]
     [InlineData(PublishKind.RawJson)]

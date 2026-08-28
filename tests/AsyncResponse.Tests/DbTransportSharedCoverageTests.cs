@@ -136,6 +136,153 @@ public sealed class DbTransportSharedCoverageTests
     }
 
     /// <summary>
+    /// Regression: the at-the-cap dead-letter passed the subscriber's stopping token, while every
+    /// other settlement in the shared file passes <see cref="CancellationToken.None"/>. A handler
+    /// failing on its LAST attempt during a stop had the burial aborted inside the store (whose
+    /// connection/transaction calls throw on the cancelled token) and the poison row was NAKed
+    /// back into the queue instead of dead-lettered.
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task LastAttemptFailure_DuringShutdown_StillBuriesWithAnUncancellableSettle(Provider provider)
+    {
+        var calls = new Calls();
+        var logger = new CollectingLogger();
+        using var stopping = new CancellationTokenSource();
+        await stopping.CancelAsync();
+
+        await RunAsync(
+            provider,
+            logger,
+            lockTimeout: TimeSpan.FromSeconds(30),
+            calls: calls,
+            handler: static () => throw new InvalidOperationException("handler boom on the last attempt"),
+            maxDeliveryAttempts: 3,
+            attempt: 3,
+            cancellationToken: stopping.Token);
+
+        Assert.Equal(1, calls.DeadLetter);
+        Assert.Equal(CancellationToken.None, calls.LastDeadLetterToken);
+        Assert.Equal(0, calls.Nak);
+    }
+
+    /// <summary>
+    /// Regression: once the drain budget lapsed, the early-ACK background loop kept STARTING
+    /// queued work — the drain token cannot stop the real handler, which takes no token — so the
+    /// stop ran past the validated shutdown budget, and anything still queued at process exit
+    /// vanished (its queue row was deleted by the early ACK) with no dead-letter and no
+    /// OnBackgroundFailure. Past the budget, queued-but-unstarted deliveries are now routed
+    /// through the dead-letter/OnBackgroundFailure path instead of being executed or lost
+    /// (Redis/Pub-Sub dispatcher parity).
+    /// </summary>
+    [Theory]
+    [InlineData(Provider.SqlServer)]
+    [InlineData(Provider.PostgreSql)]
+    [InlineData(Provider.MongoDb)]
+    public async Task EarlyAck_DrainBudgetLapse_DeadLettersQueuedWorkInsteadOfRunningIt(Provider provider)
+    {
+        var calls = new Calls();
+        var executed = 0;
+        var backgroundFailures = 0;
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (dispatcher, handle) = CreateEarlyAckDispatcher(
+            provider,
+            calls,
+            handler: async () =>
+            {
+                Interlocked.Increment(ref executed);
+                await releaseFirst.Task;
+            },
+            onBackgroundFailure: () => Interlocked.Increment(ref backgroundFailures),
+            drain: TimeSpan.FromMilliseconds(50));
+
+        try
+        {
+            // First delivery: ACKed at enqueue, its handler blocks the single background worker.
+            await handle(CancellationToken.None);
+            await Eventually(() => Volatile.Read(ref executed) == 1);
+
+            // Second delivery: ACKed at enqueue, queued behind the blocked worker.
+            await handle(CancellationToken.None);
+            Assert.Equal(2, calls.Ack);
+
+            // Dispose lapses the 50 ms drain budget and cancels; the blocked handler is released
+            // only afterwards, so the second delivery is read from the queue past the budget.
+            await dispatcher.DisposeAsync();
+        }
+        finally
+        {
+            releaseFirst.TrySetResult();
+        }
+
+        await Eventually(() => calls.DeadLetter == 1 && Volatile.Read(ref backgroundFailures) >= 1);
+
+        // The queued delivery was accounted for, not run: one execution (the first), one
+        // dead-letter and one background-failure notification (the second).
+        Assert.Equal(1, Volatile.Read(ref executed));
+    }
+
+    private static (IAsyncDisposable Dispatcher, Func<CancellationToken, Task> Handle) CreateEarlyAckDispatcher(
+        Provider provider,
+        Calls calls,
+        Func<Task> handler,
+        Action onBackgroundFailure,
+        TimeSpan drain)
+    {
+        var logger = new CollectingLogger();
+        switch (provider)
+        {
+            case Provider.SqlServer:
+            {
+                var options = new SqlServerAsyncResponseTransportOptions
+                {
+                    ConnectionString = "Server=localhost;Database=unused;User ID=sa;Password=unused;TrustServerCertificate=True",
+                    LockTimeout = TimeSpan.FromSeconds(30)
+                };
+                var subscriber = new SqlServerSubscriberOptions();
+                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
+                var dispatcher = new SqlServerMessageDispatcher((_, _) => handler(), options, subscriber, logger, SqlServerSubscriberRole.Worker);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new SqlServerTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+
+            case Provider.PostgreSql:
+            {
+                var options = new PostgreSqlAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromSeconds(30) };
+                var subscriber = new PostgreSqlSubscriberOptions();
+                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
+                var dispatcher = new PostgreSqlMessageDispatcher((_, _) => handler(), options, subscriber, logger, PostgreSqlSubscriberRole.Worker);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new PostgreSqlTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+
+            default:
+            {
+                var options = new MongoDbAsyncResponseTransportOptions { LockTimeout = TimeSpan.FromSeconds(30) };
+                var subscriber = new MongoDbSubscriberOptions();
+                subscriber.UseAckAfterEnqueue(1, 8, drain);
+                subscriber.OnBackgroundFailure = _ => { onBackgroundFailure(); return ValueTask.CompletedTask; };
+                var dispatcher = new MongoDbMessageDispatcher((_, _) => handler(), options, subscriber, logger, MongoDbSubscriberRole.Worker);
+                return (dispatcher, token => dispatcher.HandleAsync(
+                    new MongoDbTransportDelivery(
+                        Guid.NewGuid(), "worker", "{}", Headers, 1,
+                        calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
+                    token));
+            }
+        }
+    }
+
+    /// <summary>
     /// A failed handler is released for redelivery with a NAK; a NAK that itself fails (connection
     /// blip during the release) must be swallowed like the guarded ACK — an escape would tear the
     /// whole subscriber down over one poison message, and the drain on the way out dead-letters
@@ -301,7 +448,8 @@ public sealed class DbTransportSharedCoverageTests
         bool earlyAck = false,
         Action? onBackgroundFailure = null,
         int? maxDeliveryAttempts = null,
-        int attempt = 1)
+        int attempt = 1,
+        CancellationToken cancellationToken = default)
     {
         switch (provider)
         {
@@ -326,7 +474,7 @@ public sealed class DbTransportSharedCoverageTests
                     new SqlServerTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
-                    CancellationToken.None);
+                    cancellationToken);
                 return;
             }
 
@@ -347,7 +495,7 @@ public sealed class DbTransportSharedCoverageTests
                     new PostgreSqlTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
-                    CancellationToken.None);
+                    cancellationToken);
                 return;
             }
 
@@ -368,7 +516,7 @@ public sealed class DbTransportSharedCoverageTests
                     new MongoDbTransportDelivery(
                         Guid.NewGuid(), "worker", "{}", Headers, attempt,
                         calls.AckAsync, calls.NakAsync, calls.DeadLetterAsync, calls.RenewAsync),
-                    CancellationToken.None);
+                    cancellationToken);
                 return;
             }
         }
@@ -409,8 +557,11 @@ public sealed class DbTransportSharedCoverageTests
             return ValueTask.CompletedTask;
         }
 
+        public CancellationToken? LastDeadLetterToken;
+
         public ValueTask<bool> DeadLetterAsync(Exception exception, bool deleteOriginal, CancellationToken cancellationToken)
         {
+            LastDeadLetterToken = cancellationToken;
             Interlocked.Increment(ref DeadLetter);
             return ValueTask.FromResult(DeadLetterResult);
         }

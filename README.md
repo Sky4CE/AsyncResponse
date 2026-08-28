@@ -358,7 +358,7 @@ execution leases. They are independent axes — combine any one of each.
 | Transport | Broker mechanics |
 |---|---|
 | In-memory (in `Core`) | bounded in-process queue; configurable capacity and worker concurrency |
-| Redis | Redis Streams consumer groups, pending-entry retry, poison-entry discard, dead-lettering |
+| Redis | Redis Streams consumer groups, idempotent worker publish (a retried `XADD` cannot enqueue a job twice), pending-entry retry, poison-entry discard, dead-lettering |
 | RabbitMQ | publisher confirms + mandatory routing, dead-letter exchange |
 | Azure Service Bus | peek-lock ACKs; reuses your own `ServiceBusClient` (e.g. Azure Identity) if registered |
 | Google Pub/Sub | streaming pull; redelivery bounds via the subscription's DeadLetterPolicy |

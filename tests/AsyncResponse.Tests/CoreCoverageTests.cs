@@ -144,6 +144,60 @@ public sealed class CoreCoverageTests
     }
 
     [Fact]
+    public async Task FlowExecutionLease_DisposeIsBounded_WhenTheStoreIgnoresCancellation()
+    {
+        // Regression: DisposeAsync awaited the renewal loop with no bound, so a renewal stuck in
+        // a store call that ignores its cancellation token (a wedged connection, a database that
+        // accepts the request and never answers — the exact case the deadline watcher exists
+        // for) wedged the whole worker job's `await using`. The join is now bounded on the
+        // injected clock; past the budget the loops are abandoned and the release is SKIPPED,
+        // because the same wedged store would hang that call too.
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var renewEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var store = new Mock<IFlowStateStore>();
+        store.Setup(s => s.TryRenewLeaseAsync("flow-wedged", "lease-wedged", It.IsAny<TimeSpan>(), It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                renewEntered.TrySetResult();
+                return new TaskCompletionSource<bool>().Task; // never completes, token ignored
+            });
+        var lease = new FlowExecutionLease(
+            store.Object,
+            "flow-wedged",
+            "lease-wedged",
+            new DurableFlowOptions
+            {
+                ExecutionLeaseDuration = TimeSpan.FromMinutes(10),
+                ExecutionLeaseRenewInterval = TimeSpan.FromSeconds(1)
+            },
+            NullLogger.Instance,
+            clock);
+
+        // Release the renew-interval delay so the loop enters the wedged store call.
+        while (!renewEntered.Task.IsCompleted)
+        {
+            clock.Advance(TimeSpan.FromSeconds(1));
+            await Task.Yield();
+        }
+
+        var dispose = lease.DisposeAsync().AsTask();
+        var guard = Task.Delay(TimeSpan.FromSeconds(10));
+        while (!dispose.IsCompleted)
+        {
+            Assert.False(guard.IsCompleted, "DisposeAsync did not complete within the bounded join.");
+            clock.Advance(TimeSpan.FromSeconds(31));
+            await Task.Yield();
+        }
+        await dispose;
+
+        // The wedged store must not be asked to release the lease either — that call would hang
+        // the disposal all over again; the server-side lease expires on its own.
+        store.Verify(
+            s => s.ReleaseLeaseAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
     public async Task FlowExecutionLease_MarksLostWhenRenewalErrorsPastExpiry()
     {
         var store = new Mock<IFlowStateStore>();

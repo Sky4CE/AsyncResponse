@@ -390,6 +390,40 @@ public class RedisAsyncResponseChannelWaiterTests
     }
 
     [Fact]
+    public async Task CreateResponseWaiter_TimeoutFiresOnTheInjectedClock()
+    {
+        // Regression: the waiter timeout was armed on a default CancellationTokenSource — the
+        // system clock — while the same channel stamped RegisteredAtUtc from the injected
+        // TimeProvider. Under a virtual clock a production-sized timeout could never fire
+        // (DbChannelShared parity: its timeout CTS is created on the injected clock for exactly
+        // this reason).
+        var clock = new AsyncResponse.Testing.VirtualTimeProvider();
+        var channel = CreateChannel(
+            new RedisAsyncResponseOptions
+            {
+                DefaultTimeout = TimeSpan.FromSeconds(5),
+                RecoveryStateExpiry = TimeSpan.FromMinutes(5)
+            },
+            timeProvider: clock);
+
+        await using var waiter = await channel.CreateResponseWaiter<OperationResult>(
+            "corr-virtual-timeout",
+            timeout: TimeSpan.FromMinutes(10));
+
+        var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(5);
+        while (!waiter.ResponseTask.IsCompleted)
+        {
+            Assert.True(TimeProvider.System.GetUtcNow() < guard, "advancing the virtual clock never fired the waiter timeout");
+            clock.Advance(TimeSpan.FromMinutes(11));
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        // The waiter's own timeout — not a real-time guard — must be what faulted the task.
+        var timeout = await Assert.ThrowsAsync<TimeoutException>(() => waiter.ResponseTask);
+        Assert.Contains("corr-virtual-timeout", timeout.Message);
+    }
+
+    [Fact]
     public async Task WaiterTimeout_DrainsTheExecutorBeforeFaulting_SoAnInFlightDeliveryStillWins()
     {
         // Regression (round 29): the timeout faulted the waiter BEFORE draining the per-correlation

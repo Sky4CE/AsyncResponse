@@ -66,15 +66,25 @@ public sealed class InMemoryWorkerTransport : IWorkerTransport, IDelayedWorkerTr
     /// </summary>
     private readonly ConcurrentQueue<QueuedJob> _overflow = new();
 
+    /// <summary>
+    /// Serializes <see cref="PumpOverflow"/>: with multiple workers, an unguarded
+    /// peek/write/dequeue interleaving lets two pumpers write the same job twice and then dequeue
+    /// a job that was never written — a duplicated execution plus a silently lost job.
+    /// </summary>
+    private readonly object _overflowPumpGate = new();
+
     /// <summary>Moves overflow jobs into the queue while it has room. Called by a worker before it reports a job finished.</summary>
     internal void PumpOverflow()
     {
-        while (_overflow.TryPeek(out var queued))
+        lock (_overflowPumpGate)
         {
-            if (!_queue.Writer.TryWrite(queued))
-                return;
+            while (_overflow.TryPeek(out var queued))
+            {
+                if (!_queue.Writer.TryWrite(queued))
+                    return;
 
-            _overflow.TryDequeue(out _);
+                _overflow.TryDequeue(out _);
+            }
         }
     }
 

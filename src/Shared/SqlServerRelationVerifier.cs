@@ -54,8 +54,10 @@ internal static class SqlServerRelationVerifier
         string? DefaultExpression = null);
 
     /// <summary>
-    /// One expected object: a user table (verified against <paramref name="Columns"/> when given)
-    /// or a sequence (verified <c>bigint</c>, increment 1, no cycle).
+    /// One expected object: a user table (verified against <paramref name="Columns"/> when given),
+    /// a sequence (verified <c>bigint</c>, increment 1, no cycle), or an index (verified to sit on
+    /// <paramref name="OwningTable"/> as a non-unique, unfiltered, enabled rowstore index over
+    /// exactly <paramref name="KeyColumns"/> in order).
     /// </summary>
     /// <remarks>
     /// <c>PrimaryKey</c> lists the key columns in order, when the store's correctness depends on
@@ -66,7 +68,9 @@ internal static class SqlServerRelationVerifier
         string Name,
         SqlServerObjectKind Kind,
         ExpectedColumn[]? Columns = null,
-        string[]? PrimaryKey = null);
+        string[]? PrimaryKey = null,
+        string? OwningTable = null,
+        string[]? KeyColumns = null);
 
     /// <summary>
     /// Verifies every expected object, reporting missing ones as errors. Pass the DDL transaction
@@ -101,6 +105,11 @@ internal static class SqlServerRelationVerifier
         // explains it.
         foreach (var expectedObject in expected)
         {
+            // Indexes live in sys.indexes, not sys.objects, and their names are per-table rather
+            // than schema-wide — an unrelated object sharing an index's name collides with nothing.
+            if (expectedObject.Kind == SqlServerObjectKind.Index)
+                continue;
+
             if (!actual.TryGetValue(expectedObject.Name, out var foundType))
                 continue;
 
@@ -118,6 +127,7 @@ internal static class SqlServerRelationVerifier
         await VerifySequencesAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyTableColumnsAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
         await VerifyPrimaryKeysAsync(connection, transaction, schemaName, componentName, present, cancellationToken).ConfigureAwait(false);
+        await VerifyIndexesAsync(connection, transaction, schemaName, componentName, expected, reportAbsence, cancellationToken).ConfigureAwait(false);
 
         // In diagnosis mode absence proves nothing: the failed batch rolled back whatever it did
         // create, so the expected objects are missing BECAUSE the batch failed — reporting one
@@ -128,6 +138,10 @@ internal static class SqlServerRelationVerifier
 
         foreach (var expectedObject in expected)
         {
+            // Index existence was already settled against sys.indexes in VerifyIndexesAsync.
+            if (expectedObject.Kind == SqlServerObjectKind.Index)
+                continue;
+
             if (!actual.ContainsKey(expectedObject.Name))
                 throw new InvalidOperationException(
                     $"The SQL Server {componentName} store expected '{schemaName}.{expectedObject.Name}' to exist after schema creation, but it does not.");
@@ -452,6 +466,129 @@ internal static class SqlServerRelationVerifier
     }
 
     /// <summary>
+    /// Index verification: the stores' index guard is name-only
+    /// (<c>sys.indexes WHERE name = N'…' AND object_id = OBJECT_ID(…)</c>), so it accepts a
+    /// same-name index with the WRONG definition — an operator-provisioned index keyed on other
+    /// columns silently costs the store its seek, and every poll tick table-scans. The PostgreSQL
+    /// sibling's 'i' checks, in the form SQL Server expresses them: rowstore (clustered or
+    /// nonclustered both serve the seek), non-unique, unfiltered, enabled, and exactly the key
+    /// columns in order. Included columns are extra capacity, not a shape change — the
+    /// <c>key_ordinal &gt; 0</c> filter ignores them.
+    /// </summary>
+    private static async Task VerifyIndexesAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> expected,
+        bool reportAbsence,
+        CancellationToken cancellationToken)
+    {
+        var indexes = expected.Where(e => e.Kind == SqlServerObjectKind.Index).ToArray();
+        if (indexes.Length == 0)
+            return;
+
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"""
+            SELECT i.name, o.name, i.type, i.is_unique, i.has_filter, i.is_disabled, ic.key_ordinal, col.name
+            FROM sys.indexes i
+            JOIN sys.objects o ON o.object_id = i.object_id
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            LEFT JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0
+            LEFT JOIN sys.columns col ON col.object_id = i.object_id AND col.column_id = ic.column_id
+            WHERE s.name = @schema AND i.name IN ({NameParameters(command, indexes.Select(e => e.Name))});
+            """;
+        command.Parameters.AddWithValue("@schema", schemaName);
+
+        // Keyed by (index, owning table): SQL Server index names are per-table, so a same-name
+        // index on an UNRELATED table is not the expected index and not a collision either.
+        // OrdinalIgnoreCase tuple comparer for the usual catalog-collation reason.
+        var actual = new Dictionary<(string Table, string Column), ActualIndex>(TableColumnComparer.Instance);
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var key = (reader.GetString(0), reader.GetString(1));
+                if (!actual.TryGetValue(key, out var index))
+                {
+                    actual[key] = index = new ActualIndex(
+                        Type: reader.GetByte(2),
+                        IsUnique: reader.GetBoolean(3),
+                        HasFilter: reader.GetBoolean(4),
+                        IsDisabled: reader.GetBoolean(5),
+                        KeyColumns: []);
+                }
+
+                if (!await reader.IsDBNullAsync(6, cancellationToken).ConfigureAwait(false))
+                    index.KeyColumns.Add((reader.GetByte(6), reader.GetString(7)));
+            }
+        }
+
+        EvaluateIndexes(schemaName, componentName, indexes, actual, reportAbsence);
+    }
+
+    /// <summary>
+    /// The pure index decision, over catalog rows already loaded (server-free, like
+    /// <see cref="EvaluateTableColumns"/>). Shape first, absence last: a present-but-wrong index
+    /// is the culprit an absent sibling would otherwise mask.
+    /// </summary>
+    internal static void EvaluateIndexes(
+        string schemaName,
+        string componentName,
+        IReadOnlyList<ExpectedObject> indexes,
+        Dictionary<(string Table, string Column), ActualIndex> actual,
+        bool reportAbsence)
+    {
+        foreach (var index in indexes)
+        {
+            if (!actual.TryGetValue((index.Name, index.OwningTable!), out var found))
+                continue;
+
+            var foundColumns = found.KeyColumns.OrderBy(c => c.Ordinal).Select(c => c.Column).ToArray();
+            if (found.Type is not (1 or 2) || found.IsUnique || found.HasFilter || found.IsDisabled
+                || !foundColumns.AsSpan().SequenceEqual(index.KeyColumns!, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"The SQL Server {componentName} store's index '{schemaName}.{index.OwningTable}.{index.Name}' exists but does not " +
+                    $"match the expected definition: expected a non-unique, unfiltered rowstore index over " +
+                    $"({string.Join(", ", index.KeyColumns!)}); found {(found.IsDisabled ? "a disabled" : found.IsUnique ? "a UNIQUE" : "a")}" +
+                    $"{(found.HasFilter ? " filtered" : "")} {DescribeIndexType(found.Type)} index over ({string.Join(", ", foundColumns)}). " +
+                    "The store's existence guard only asks whether an index with this name exists on the table and guarantees nothing " +
+                    "about its shape — drop or rename the existing index so the store can create the correct one.");
+            }
+        }
+
+        if (!reportAbsence)
+            return;
+
+        foreach (var index in indexes)
+        {
+            if (!actual.ContainsKey((index.Name, index.OwningTable!)))
+                throw new InvalidOperationException(
+                    $"The SQL Server {componentName} store expected index '{schemaName}.{index.OwningTable}.{index.Name}' to exist " +
+                    "after schema creation, but it does not.");
+        }
+    }
+
+    private static string DescribeIndexType(byte type) => type switch
+    {
+        1 => "clustered",
+        2 => "nonclustered",
+        5 or 6 => "columnstore",
+        7 => "hash",
+        _ => $"type-{type}"
+    };
+
+    internal sealed record ActualIndex(
+        byte Type,
+        bool IsUnique,
+        bool HasFilter,
+        bool IsDisabled,
+        List<(byte Ordinal, string Column)> KeyColumns);
+
+    /// <summary>
     /// Renders a <c>sys.types</c> row the way the DDL declares it. <c>max_length</c> is in bytes,
     /// so the Unicode types halve it, and -1 is the <c>(max)</c> sentinel. The fractional-seconds
     /// types render their SCALE instead: a bare <c>datetime2</c> is <c>datetime2(7)</c>, and
@@ -538,5 +675,8 @@ internal enum SqlServerObjectKind
     Table = 0,
 
     /// <summary>A sequence object (<c>sys.objects.type = 'SO'</c>).</summary>
-    Sequence = 1
+    Sequence = 1,
+
+    /// <summary>An index, verified against <c>sys.indexes</c> (indexes are not in <c>sys.objects</c>).</summary>
+    Index = 2
 }

@@ -251,7 +251,15 @@ internal sealed class SqlServerChannelSql
                     new("expires_at", "datetime2(7)", Nullable: false)
                 ],
                 PrimaryKey: ["correlation_id", "registration_id"]),
-                new(AckSequenceName, SqlServerObjectKind.Sequence)
+                new(AckSequenceName, SqlServerObjectKind.Sequence),
+                new(IndexName(_options.RecoveryStateTable, "expires"), SqlServerObjectKind.Index,
+                    OwningTable: _options.RecoveryStateTable, KeyColumns: ["expires_at"]),
+                new(IndexName(_options.MessageTable, "correlation_created"), SqlServerObjectKind.Index,
+                    OwningTable: _options.MessageTable, KeyColumns: ["correlation_id", "created_at"]),
+                new(IndexName(_options.MessageTable, "expires"), SqlServerObjectKind.Index,
+                    OwningTable: _options.MessageTable, KeyColumns: ["expires_at"]),
+                new(IndexName(_options.SubscriberTable, "expires"), SqlServerObjectKind.Index,
+                    OwningTable: _options.SubscriberTable, KeyColumns: ["expires_at"])
             ];
 
     private async Task ValidateManagedSchemaAsync(CancellationToken cancellationToken)

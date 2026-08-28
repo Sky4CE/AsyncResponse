@@ -11,10 +11,11 @@ namespace AsyncResponse.Channels.NATS;
 /// NATS JetStream Key-Value implementation of <see cref="IRecoveryStateStore"/> and
 /// <see cref="IRecoveryStateScanner"/>.
 /// <para>
-/// NATS KV applies a single <c>MaxAge</c> per bucket rather than a TTL per key, so each entry also
-/// carries an absolute <see cref="StoredRecoveryState.ExpiresAtUtc"/>: reads and scans treat an entry
-/// past its expiry as absent (and delete it best-effort), giving precise per-correlation expiry while
-/// the bucket's <c>MaxAge</c> acts as a garbage-collection ceiling for orphans.
+/// NATS KV applies a single <c>MaxAge</c> per bucket rather than a TTL per key, so each stored
+/// registration carries its own absolute expiry (<see cref="StoredRecoveryState.StateExpiries"/>):
+/// reads and scans treat a registration past its stamp as absent — a fresh sibling registration
+/// under the same correlation id never extends it — and a fully expired key is deleted
+/// best-effort, while the bucket's <c>MaxAge</c> acts as a garbage-collection ceiling for orphans.
 /// </para>
 /// </summary>
 internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoveryStateScanner
@@ -66,17 +67,26 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
 
             var entry = await _store.GetAsync(key, cancellationToken).ConfigureAwait(false);
             var stored = entry is { } existing ? TryDeserialize(existing.Value, key) : null;
-            var states = stored is not null && !IsExpired(stored)
-                ? StatesFrom(stored)
+            var now = _timeProvider.GetUtcNow();
+            List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)> entries = stored is not null && !IsExpired(stored)
+                ? EntriesFrom(stored)
                 : [];
             // Deliberately NOT pruned by readability: a registration this build cannot INTERPRET
             // (a newer schema version written by a host mid-rolling-upgrade) must be carried
             // through untouched. Rewriting the shared envelope from the readable subset silently
             // deleted that sibling — the write path treating "unreadable" as "missing", which is
             // exactly what GetAllAsync was hardened to refuse.
-            states.RemoveAll(existingState => existingState.RegistrationId == state.RegistrationId);
-            states.Add(state);
-            var json = SerializeStates(states, _timeProvider.GetUtcNow() + ttl);
+            //
+            // Per-registration expiry, though, IS pruned: a sibling keeps its OWN stamp rather
+            // than inheriting this save's fresh TTL. Re-stamping the shared envelope kept a dead
+            // waiter's registration recoverable for as long as anything else registered under the
+            // correlation id — its stale callback then fired into a flow that lapsed days
+            // earlier. An entry past its own stamp is dropped exactly like a relational store's
+            // per-row expires_at drops it.
+            entries.RemoveAll(existingEntry => existingEntry.ExpiresAtUtc <= now);
+            entries.RemoveAll(existingEntry => existingEntry.State is { } existingState && existingState.RegistrationId == state.RegistrationId);
+            entries.Add((state, now + ttl));
+            var json = SerializeStates(entries);
 
             var written = entry is { } current
                 ? await _store.TryUpdateAsync(key, json, current.Revision, cancellationToken).ConfigureAwait(false)
@@ -121,16 +131,21 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
             return [];
         }
 
-        var states = StatesFrom(found.Stored);
+        var now = _timeProvider.GetUtcNow();
+        var entries = EntriesFrom(found.Stored);
+        var states = new List<RecoveryState>(entries.Count);
         var unreadable = 0;
-        for (var i = states.Count - 1; i >= 0; i--)
+        foreach (var (state, expiresAtUtc) in entries)
         {
-            var state = states[i];
-            if (!IsStateReadable(state, key, correlationId, ref unreadable))
-            {
-                states.RemoveAt(i);
+            // A registration past its own stamp is absence (the relational stores' per-row
+            // expires_at), even while a fresher sibling keeps the shared key alive.
+            if (expiresAtUtc <= now)
                 continue;
-            }
+
+            if (!IsStateReadable(state, key, correlationId, ref unreadable))
+                continue;
+
+            states.Add(state!);
         }
 
         // Registrations existed and none this build could INTERPRET survived. An empty list reads
@@ -176,17 +191,20 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 return false;
             }
 
-            var states = StatesFrom(stored);
+            var entries = EntriesFrom(stored);
             // Same rule as SaveAsync: remove only the targeted registration, never a sibling this
             // build merely cannot read — dropping those here also let the key be deleted outright
-            // when they were the only survivors.
-            var removed = states.RemoveAll(state => state.RegistrationId == registrationId) > 0;
+            // when they were the only survivors. Entries past their own expiry go too (they are
+            // already invisible to every read), and the survivors keep their own stamps.
+            var removed = entries.RemoveAll(candidate => candidate.State is { } candidateState && candidateState.RegistrationId == registrationId) > 0;
             if (!removed)
                 return false;
 
-            var succeeded = states.Count == 0
+            entries.RemoveAll(candidate => candidate.ExpiresAtUtc <= _timeProvider.GetUtcNow());
+
+            var succeeded = entries.Count == 0
                 ? await _store.TryDeleteAsync(key, existing.Revision, cancellationToken).ConfigureAwait(false)
-                : await _store.TryUpdateAsync(key, SerializeStates(states, stored.ExpiresAtUtc), existing.Revision, cancellationToken).ConfigureAwait(false);
+                : await _store.TryUpdateAsync(key, SerializeStates(entries), existing.Revision, cancellationToken).ConfigureAwait(false);
             if (succeeded)
                 return true;
         }
@@ -220,13 +238,17 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
                 continue;
             }
 
-            foreach (var state in StatesFrom(found.Stored))
+            var now = _timeProvider.GetUtcNow();
+            foreach (var (state, expiresAtUtc) in EntriesFrom(found.Stored))
             {
+                if (expiresAtUtc <= now)
+                    continue;
+
                 var correlationId = NatsSubjectSchema.CorrelationIdFromRecoveryKey(key);
                 if (!IsStateReadable(state, key, correlationId))
                     continue;
 
-                yield return state;
+                yield return state!;
             }
         }
     }
@@ -266,12 +288,45 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
     private static readonly JsonTypeInfo<StoredRecoveryState> _envelopeTypeInfo =
         AsyncResponseJson.GetTypeInfo<StoredRecoveryState>(_envelopeOptions);
 
-    private static string SerializeStates(List<RecoveryState> states, DateTimeOffset expiresAtUtc)
-        => JsonSerializer.Serialize(new StoredRecoveryState
+    private static string SerializeStates(List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)> entries)
+    {
+        var states = new List<RecoveryState>(entries.Count);
+        var expiries = new List<DateTimeOffset>(entries.Count);
+        var maxExpiresAtUtc = DateTimeOffset.MinValue;
+        foreach (var (state, expiresAtUtc) in entries)
+        {
+            states.Add(state!);
+            expiries.Add(expiresAtUtc);
+            if (expiresAtUtc > maxExpiresAtUtc)
+                maxExpiresAtUtc = expiresAtUtc;
+        }
+
+        return JsonSerializer.Serialize(new StoredRecoveryState
         {
             States = states,
-            ExpiresAtUtc = expiresAtUtc
+            StateExpiries = expiries,
+            ExpiresAtUtc = maxExpiresAtUtc
         }, _envelopeTypeInfo);
+    }
+
+    /// <summary>
+    /// Pairs each stored registration with its own expiry. Envelopes written before
+    /// <see cref="StoredRecoveryState.StateExpiries"/> existed carry only the shared stamp, which
+    /// those registrations inherit — the old behavior, applied to old data only.
+    /// </summary>
+    private static List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)> EntriesFrom(StoredRecoveryState stored)
+    {
+        var states = stored.States;
+        if (states is not { Count: > 0 })
+            return [];
+
+        var expiries = stored.StateExpiries is { } perState && perState.Count == states.Count ? stored.StateExpiries : null;
+        var entries = new List<(RecoveryState? State, DateTimeOffset ExpiresAtUtc)>(states.Count);
+        for (var i = 0; i < states.Count; i++)
+            entries.Add((states[i], expiries is not null ? expiries[i] : stored.ExpiresAtUtc));
+
+        return entries;
+    }
 
     private bool IsExpired(StoredRecoveryState stored) => stored.ExpiresAtUtc <= _timeProvider.GetUtcNow();
 
@@ -328,9 +383,6 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
     }
 
-    private static List<RecoveryState> StatesFrom(StoredRecoveryState stored)
-        => stored.States is { Count: > 0 } ? [.. stored.States] : [];
-
     private async Task TryDeleteSilentlyAsync(string key, ulong revision, CancellationToken cancellationToken)
     {
         try
@@ -347,10 +399,23 @@ internal sealed class NatsRecoveryStateStore : IRecoveryStateStore, IRecoverySta
         }
     }
 
-    /// <summary>The stored envelope: the recovery state plus its absolute expiry, for per-key logical TTL.</summary>
+    /// <summary>The stored envelope: the recovery states plus their expiries, for per-registration logical TTL.</summary>
     internal sealed class StoredRecoveryState
     {
         public List<RecoveryState>? States { get; set; }
+
+        /// <summary>
+        /// Per-registration absolute expiries, parallel to <see cref="States"/> by index.
+        /// Additive wire property: envelopes written before it existed carry only the shared
+        /// <see cref="ExpiresAtUtc"/>, which those registrations inherit on read.
+        /// </summary>
+        public List<DateTimeOffset>? StateExpiries { get; set; }
+
+        /// <summary>
+        /// The envelope-level expiry — the maximum of <see cref="StateExpiries"/>. Kept for the
+        /// whole-key fast path (every registration expired ⇒ the key is deletable) and for
+        /// downgrade compatibility with builds that read only this stamp.
+        /// </summary>
         public DateTimeOffset ExpiresAtUtc { get; set; }
     }
 }

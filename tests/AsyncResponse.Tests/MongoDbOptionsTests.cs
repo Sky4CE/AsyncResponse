@@ -57,6 +57,15 @@ public sealed class MongoDbOptionsTests
             var database = new Mock<IMongoDatabase>().WithTestNamespace();
             database.SetupGet(d => d.Client).Returns(client.Object);
 
+            // The flow store derives a primary-read view of its collection at construction.
+            var flowCollection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+            flowCollection
+                .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+                .Returns(flowCollection.Object);
+            database
+                .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+                .Returns(flowCollection.Object);
+
             var services = new ServiceCollection();
             services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
             services.AddSingleton(database.Object);
@@ -89,6 +98,13 @@ public sealed class MongoDbOptionsTests
         okClient.SetupGet(c => c.Settings).Returns(MongoClientSettings.FromConnectionString("mongodb://localhost:27017"));
         var okDatabase = new Mock<IMongoDatabase>().WithTestNamespace();
         okDatabase.SetupGet(d => d.Client).Returns(okClient.Object);
+        var okFlowCollection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+        okFlowCollection
+            .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(okFlowCollection.Object);
+        okDatabase
+            .Setup(d => d.GetCollection<MongoFlowStateDocument>(It.IsAny<string>(), It.IsAny<MongoCollectionSettings>()))
+            .Returns(okFlowCollection.Object);
         var okServices = new ServiceCollection();
         okServices.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
         okServices.AddSingleton(okDatabase.Object);

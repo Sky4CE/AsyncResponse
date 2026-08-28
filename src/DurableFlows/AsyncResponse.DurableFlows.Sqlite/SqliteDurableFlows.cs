@@ -410,39 +410,75 @@ public sealed class SqliteFlowStateStore : IFlowStateStore
     /// key. The second flow's insert-if-absent then reports "already running" and a load for one
     /// id returns the other run's ledger. SQLite is the only one of the six relational stores that
     /// was not checking this; MySQL, PostgreSQL, SQL Server, Oracle and EF Core all do.
+    /// <para>
+    /// The lookup matches the stored table name case-insensitively — <c>sqlite_master.name</c>
+    /// compares BINARY while SQLite resolves identifiers case-insensitively everywhere else, so a
+    /// case-variant table silently no-opped this whole check. And EVERY identifier-boundary
+    /// occurrence of <c>flow_id</c> is inspected, not the first substring hit: an earlier column
+    /// ending in flow_id (<c>parent_flow_id</c>) captured the match and hid the real column's
+    /// collation, and a table-level <c>PRIMARY KEY (flow_id COLLATE NOCASE)</c> — which the docs
+    /// promise is caught — was never reached.
+    /// </para>
     /// </summary>
     private async Task VerifyFlowIdCollationAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = $name;";
+        command.CommandText = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = $name COLLATE NOCASE;";
         command.Parameters.AddWithValue("$name", _options.TableName);
 
         var ddl = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
         if (string.IsNullOrEmpty(ddl))
             return;
 
-        // Only the flow_id column's own COLLATE clause matters: find the declaration and look at
-        // what follows it up to the next column separator.
-        var start = ddl.IndexOf("flow_id", StringComparison.OrdinalIgnoreCase);
-        if (start < 0)
-            return;
+        // Each flow_id occurrence's clause, up to the next column separator: the column
+        // declaration carries a column-level COLLATE, the table-level PRIMARY KEY clause a
+        // key-level one. Occurrences without a COLLATE (an FK column list, a plain PK clause)
+        // are skipped.
+        for (var start = IndexOfFlowIdIdentifier(ddl, 0); start >= 0; start = IndexOfFlowIdIdentifier(ddl, start + 1))
+        {
+            var end = ddl.IndexOf(',', start);
+            var declaration = end < 0 ? ddl[start..] : ddl[start..end];
 
-        var end = ddl.IndexOf(',', start);
-        var declaration = end < 0 ? ddl[start..] : ddl[start..end];
+            var collate = declaration.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
+            if (collate < 0)
+                continue;
 
-        var collate = declaration.IndexOf("COLLATE", StringComparison.OrdinalIgnoreCase);
-        if (collate < 0)
-            return;
+            var tail = declaration[(collate + "COLLATE".Length)..].TrimStart();
+            var tokenEnd = 0;
+            while (tokenEnd < tail.Length && !char.IsWhiteSpace(tail[tokenEnd]) && tail[tokenEnd] is not (')' or ','))
+                tokenEnd++;
 
-        var collation = declaration[(collate + "COLLATE".Length)..].Trim().TrimEnd(')').Trim();
-        if (collation.Length == 0 || collation.StartsWith("BINARY", StringComparison.OrdinalIgnoreCase))
-            return;
+            var collation = tail[..tokenEnd].Trim('"');
+            if (collation.Length == 0 || string.Equals(collation, "BINARY", StringComparison.OrdinalIgnoreCase))
+                continue;
 
-        throw new InvalidOperationException(
-            $"The SQLite durable-flow table '{_options.TableName}' declares flow_id with COLLATE {collation}. Flow ids are compared " +
-            "ordinally by this library, so a case- or accent-insensitive collation makes ids differing only in case collide on the " +
-            "primary key: the second flow fails to start and a load returns the other run's state. Re-create the table with flow_id " +
-            "using the default BINARY collation (the DDL in docs/durable-flow-state-stores.md, which tables this build creates use).");
+            throw new InvalidOperationException(
+                $"The SQLite durable-flow table '{_options.TableName}' declares flow_id with COLLATE {collation}. Flow ids are compared " +
+                "ordinally by this library, so a case- or accent-insensitive collation makes ids differing only in case collide on the " +
+                "primary key: the second flow fails to start and a load returns the other run's state. Re-create the table with flow_id " +
+                "using the default BINARY collation (the DDL in docs/durable-flow-state-stores.md, which tables this build creates use).");
+        }
+    }
+
+    /// <summary>
+    /// Finds the next occurrence of <c>flow_id</c> that is a whole identifier — not the tail of
+    /// <c>parent_flow_id</c> or the head of <c>flow_id_shadow</c>. Quoted forms ("flow_id",
+    /// [flow_id], `flow_id`) satisfy the boundary test through their quote characters.
+    /// </summary>
+    private static int IndexOfFlowIdIdentifier(string ddl, int startIndex)
+    {
+        for (var index = ddl.IndexOf("flow_id", startIndex, StringComparison.OrdinalIgnoreCase);
+             index >= 0;
+             index = index + 1 < ddl.Length ? ddl.IndexOf("flow_id", index + 1, StringComparison.OrdinalIgnoreCase) : -1)
+        {
+            var beforeIsIdentifierChar = index > 0 && (char.IsAsciiLetterOrDigit(ddl[index - 1]) || ddl[index - 1] == '_');
+            var afterIndex = index + "flow_id".Length;
+            var afterIsIdentifierChar = afterIndex < ddl.Length && (char.IsAsciiLetterOrDigit(ddl[afterIndex]) || ddl[afterIndex] == '_');
+            if (!beforeIsIdentifierChar && !afterIsIdentifierChar)
+                return index;
+        }
+
+        return -1;
     }
 
     /// <summary>SQLite column-affinity rules (in the documented precedence order).</summary>

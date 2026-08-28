@@ -340,46 +340,14 @@ internal abstract class DbAsyncResponseChannelBase :
 
         try
         {
-            var subscribers = await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
-            activity?.SetTag("asyncresponse.subscribers", subscribers);
-            if (subscribers <= 0)
-            {
-                var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(
-                        _recoveryStateStore,
-                        correlationId,
-                        response,
-                        ChannelName(correlationId),
-                        cancellationToken,
-                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
-                    .ConfigureAwait(false);
-                if (!dispatchResult.RetryLive)
-                {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
-                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                    return;
-                }
-
-                // A waiter registered between the count and the recovery-state read — publish live
-                // instead of consuming its registration.
-            }
-
             var envelope = new AsyncResponseEnvelope<T> { Success = true, Payload = response };
-            var json = AsyncResponseEnvelopeJson.Serialize(envelope);
-            var messageId = Guid.NewGuid();
-            using var confirmation = BeginConfirmation(messageId);
-            await PublishMessageAsync(messageId, correlationId, json, cancellationToken).ConfigureAwait(false);
-
-            if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
-            {
-                var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
-                    .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-            }
+            await PublishResponseWithRecoveryAsync(
+                activity,
+                correlationId,
+                AsyncResponseEnvelopeJson.Serialize(envelope),
+                typedResponse: response,
+                rawResponseJson: null,
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -400,52 +368,88 @@ internal abstract class DbAsyncResponseChannelBase :
 
         try
         {
-            var subscribers = await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
-            activity?.SetTag("asyncresponse.subscribers", subscribers);
-            if (subscribers <= 0)
-            {
-                var response = new RawJsonResponse(responseJson).DeserializeUntyped();
-                var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(
-                        _recoveryStateStore,
-                        correlationId,
-                        response,
-                        ChannelName(correlationId),
-                        cancellationToken,
-                        hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
-                    .ConfigureAwait(false);
-                if (!dispatchResult.RetryLive)
-                {
-                    AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
-                    AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
-                    activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-                    return;
-                }
-
-                // A waiter registered between the count and the recovery-state read — publish live
-                // instead of consuming its registration.
-            }
-
-            var messageId = Guid.NewGuid();
-            using var confirmation = BeginConfirmation(messageId);
-            await PublishMessageAsync(messageId, correlationId, SerializeRawSuccessEnvelope(responseJson), cancellationToken).ConfigureAwait(false);
-
-            if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
-            {
-                var response = new RawJsonResponse(responseJson).DeserializeUntyped();
-                var dispatchResult = await _lostSubscriberDispatcher
-                    .DispatchLostResponses(_recoveryStateStore, correlationId, response, ChannelName(correlationId), cancellationToken)
-                    .ConfigureAwait(false);
-                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
-                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
-                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
-            }
+            await PublishResponseWithRecoveryAsync(
+                activity,
+                correlationId,
+                SerializeRawSuccessEnvelope(responseJson),
+                typedResponse: null,
+                rawResponseJson: responseJson,
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to publish {Provider} raw response for correlationId {CorrelationId}.", _providerName, correlationId);
             AsyncResponseDiagnostics.SetError(activity, ex);
             throw;
+        }
+    }
+
+    /// <summary>
+    /// The publish-with-recovery protocol shared by <see cref="SetResponseCore{T}"/> and
+    /// <see cref="SetRawResponseJsonCore"/>, which carried lockstep copies of it (and the raw
+    /// copy parsed its body twice when the RetryLive branch fell through to a failed delivery
+    /// confirmation). The recovery payload is <paramref name="typedResponse"/> when
+    /// <paramref name="rawResponseJson"/> is null; otherwise the raw body is deserialized
+    /// lazily — once — on the cold branches that dispatch to recovery, so the delivered-live
+    /// path never parses it.
+    /// </summary>
+    private async Task PublishResponseWithRecoveryAsync(
+        Activity? activity,
+        string correlationId,
+        string envelopeJson,
+        object? typedResponse,
+        string? rawResponseJson,
+        CancellationToken cancellationToken)
+    {
+        var recoveryPayload = typedResponse;
+        var recoveryPayloadMaterialized = rawResponseJson is null;
+
+        var subscribers = await _store.CountActiveSubscribersAsync(correlationId, cancellationToken).ConfigureAwait(false);
+        activity?.SetTag("asyncresponse.subscribers", subscribers);
+        if (subscribers <= 0)
+        {
+            if (!recoveryPayloadMaterialized)
+            {
+                recoveryPayload = new RawJsonResponse(rawResponseJson!).DeserializeUntyped();
+                recoveryPayloadMaterialized = true;
+            }
+
+            var dispatchResult = await _lostSubscriberDispatcher
+                .DispatchLostResponses(
+                    _recoveryStateStore,
+                    correlationId,
+                    recoveryPayload,
+                    ChannelName(correlationId),
+                    cancellationToken,
+                    hasLiveSubscriber: () => HasLiveSubscriberAsync(correlationId, cancellationToken))
+                .ConfigureAwait(false);
+            if (!dispatchResult.RetryLive)
+            {
+                AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+                AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
+                activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
+                return;
+            }
+
+            // A waiter registered between the count and the recovery-state read — publish live
+            // instead of consuming its registration.
+        }
+
+        var messageId = Guid.NewGuid();
+        using var confirmation = BeginConfirmation(messageId);
+        await PublishMessageAsync(messageId, correlationId, envelopeJson, cancellationToken).ConfigureAwait(false);
+
+        if (!await TryConfirmDeliveryAsync(confirmation, cancellationToken).ConfigureAwait(false))
+        {
+            if (!recoveryPayloadMaterialized)
+                recoveryPayload = new RawJsonResponse(rawResponseJson!).DeserializeUntyped();
+
+            var dispatchResult = await _lostSubscriberDispatcher
+                .DispatchLostResponses(_recoveryStateStore, correlationId, recoveryPayload, ChannelName(correlationId), cancellationToken)
+                .ConfigureAwait(false);
+            AsyncResponseDiagnostics.SetLostSubscriberRoute(activity, dispatchResult.Action, dispatchResult.RouteMixed);
+            AsyncResponseDiagnostics.RecordLostSubscriber("response", dispatchResult.Action, dispatchResult.CallbackInvoked, dispatchResult.RouteMixed);
+            activity?.SetTag("asyncresponse.recovery.callback_invoked", dispatchResult.CallbackInvoked);
         }
     }
 

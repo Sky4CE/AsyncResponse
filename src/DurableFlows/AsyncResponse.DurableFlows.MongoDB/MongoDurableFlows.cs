@@ -149,7 +149,15 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         // at the first server operation.
         MongoNamespaceRegistry.ValidateEffectiveNamespace(database, _options.CollectionName, nameof(_options.CollectionName));
 
-        _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName);
+        // Primary reads, whatever read preference the host-supplied database carries: a
+        // secondaryPreferred connection string would route every ledger load to a lagging
+        // secondary, where a stale revision replays an already-checkpointed step and a
+        // not-yet-replicated ledger reads as null — the one answer callers ACK a wake-up on
+        // (LoadAsync's contract, and the reason the DynamoDB sibling pins ConsistentRead).
+        // It also keeps reads on the same authority whose $$NOW the filters evaluate against
+        // (see ReadServerNowAsync).
+        _collection = database.GetCollection<MongoFlowStateDocument>(_options.CollectionName)
+            .WithReadPreference(ReadPreference.Primary);
         _ownedClient = ownedClient;
     }
 
@@ -301,6 +309,12 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
 
             if (!_options.AutoCreateIndexes)
             {
+                // The TTL index is this store's ONLY cleanup mechanism (no application-side
+                // pruning exists), so an operator-provisioned collection must be verified to
+                // carry one — Cosmos and DynamoDB hard-fail the same way when their server-side
+                // reaper is missing. Without this, a collection provisioned without
+                // expireAfterSeconds grew without bound, with no error and no log line.
+                await VerifyTtlIndexAsync(cancellationToken).ConfigureAwait(false);
                 _created = true;
                 return;
             }
@@ -321,6 +335,34 @@ public sealed class MongoDbFlowStateStore : IFlowStateStore, IDisposable
         {
             _ensureGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Verifies an operator-provisioned collection carries the TTL reaper this store depends on:
+    /// a single-field index on the expiry timestamp with <c>expireAfterSeconds</c> set (any
+    /// value — a delayed reap is bounded; a missing one is unbounded growth).
+    /// </summary>
+    private async Task VerifyTtlIndexAsync(CancellationToken cancellationToken)
+    {
+        using var cursor = await _collection.Indexes.ListAsync(cancellationToken).ConfigureAwait(false);
+        var indexes = await cursor.ToListAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var index in indexes)
+        {
+            if (index.Contains("expireAfterSeconds")
+                && index.TryGetValue("key", out var key)
+                && key is BsonDocument keyDocument
+                && keyDocument.ElementCount == 1
+                && keyDocument.Contains("expires_at_utc"))
+            {
+                return;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"The MongoDB durable-flow collection '{_options.CollectionName}' has no TTL index on 'expires_at_utc' and " +
+            $"{nameof(MongoDbDurableFlowOptions)}.{nameof(MongoDbDurableFlowOptions.AutoCreateIndexes)} is disabled. The TTL index is " +
+            "the store's only cleanup mechanism; without it expired flow ledgers accumulate forever. Create it " +
+            "(createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })) or enable AutoCreateIndexes.");
     }
 
     /// <summary>

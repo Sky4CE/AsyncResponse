@@ -111,8 +111,21 @@ public sealed class FlowRunHandle
     /// attempt finishes — completed, suspended (timer/child parked), or failed. An injected crash
     /// or a step exception propagates to the caller; call again to simulate the next delivery.
     /// </summary>
-    public Task ExecuteDirectAsync()
-        => _harness.Engine.FlowExecutor.ExecuteAsync(FlowId);
+    public async Task ExecuteDirectAsync()
+    {
+        // Counted so AdvanceAsync's settle treats this attempt like a worker job: it holds no
+        // worker slot, so a step it parks would otherwise tip ParkedCount past OutstandingJobs
+        // and let the clock advance mid-attempt.
+        _harness.Engine.OnDirectRunStarted();
+        try
+        {
+            await _harness.Engine.FlowExecutor.ExecuteAsync(FlowId).ConfigureAwait(false);
+        }
+        finally
+        {
+            _harness.Engine.OnDirectRunFinished();
+        }
+    }
 
     /// <summary>Re-enqueues the run on the worker queue (the operator's resume action).</summary>
     public Task ResumeAsync()
@@ -235,7 +248,17 @@ public sealed class FlowProbe : IDurableFlowExecutionObserver
     internal void ArmCrash(string stepName, bool beforeStep)
     {
         lock (_gate)
+        {
+            // One slot, so a second arm would silently discard a still-unfired first one — and
+            // the test would pass without ever exercising the crash it asked for. Fail loudly
+            // instead; arm the next crash after the current one fires.
+            if (_armedCrash is { } armed)
+                throw new InvalidOperationException(
+                    $"A crash is already armed for step '{armed.Step}' ({(armed.Before ? "before" : "after")} the step) and has not fired yet; " +
+                    "arm one crash at a time, after the previous one has fired.");
+
             _armedCrash = (stepName, beforeStep);
+        }
     }
 
     ValueTask IDurableFlowExecutionObserver.OnStepStartingAsync(DurableFlowStepEvent step)

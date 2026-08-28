@@ -124,7 +124,19 @@ public sealed class DurableFlowStoreReviewFixesTests
     [Fact]
     public async Task MongoDbStore_RejectsOversizedState_BeforeAnyCollectionCall()
     {
-        using var store = new MongoDbFlowStateStore(new Mock<IMongoDatabase>().WithTestNamespace().Object, Options.Create(new MongoDbDurableFlowOptions
+        // The collection handle exists (the ctor derives a primary-read view of it), but the size
+        // rejection must fire before any SERVER operation on it — the mock has no setups beyond
+        // the read-preference passthrough, so any issued operation would fail the test.
+        var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+        collection
+            .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        collection.WithProvisionedTtlIndex();
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        database
+            .Setup(item => item.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        using var store = new MongoDbFlowStateStore(database.Object, Options.Create(new MongoDbDurableFlowOptions
         {
             CollectionName = "flows",
             AutoCreateIndexes = false,
@@ -172,6 +184,10 @@ public sealed class DurableFlowStoreReviewFixesTests
     public async Task MongoDbStore_TreatsSameMillisecondRenewalAsSuccess_AndKeepsModifiedSemanticsForCheckpoints()
     {
         var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+        collection
+            .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+        collection.WithProvisionedTtlIndex();
         var database = new Mock<IMongoDatabase>().WithTestNamespace();
         database
             .Setup(item => item.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))

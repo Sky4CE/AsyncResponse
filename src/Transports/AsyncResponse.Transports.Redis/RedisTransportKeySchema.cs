@@ -12,6 +12,14 @@ internal sealed class RedisTransportKeySchema(RedisAsyncResponseTransportOptions
     public RedisKey ResponseStream => Resolve(_options.ResponseStream, "response");
     public RedisKey DeadLetterStream => Resolve(_options.DeadLetterStream, "deadletter");
 
+    /// <summary>
+    /// Per-publish dedup marker for the idempotent worker XADD. Hash-tagged with the stream name
+    /// so the marker and the stream share a cluster slot — the MULTI/EXEC that couples them
+    /// would otherwise fail with CROSSSLOT on Redis Cluster.
+    /// </summary>
+    public RedisKey WorkerPublishDedupKey(string publishId)
+        => $"{{{(string?)WorkerStream}}}:publish:{publishId}";
+
     private RedisKey Resolve(string? configured, string role)
         => !string.IsNullOrWhiteSpace(configured)
             ? configured

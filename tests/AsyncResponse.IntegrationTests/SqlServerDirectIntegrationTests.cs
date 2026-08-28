@@ -1759,7 +1759,10 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             await sql.InsertMessageAsync(messageId, "corr", "{}", TimeSpan.FromMinutes(1), CancellationToken.None);
             
             var confirmation = beginConfirmationMethod.Invoke(channel, [messageId])!;
-            await (Task)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!;
+            var confirmed = await (Task<bool>)tryConfirmMethod.Invoke(channel, [confirmation, CancellationToken.None])!;
+            // The window lapsed with the message never acked: the poll loop must report
+            // non-delivery, not merely terminate.
+            Assert.False(confirmed);
 
             // 3. Cover DispatchMessageToSubscribersAsync continue branch (dropped & seen & live)
             var messageId2 = Guid.NewGuid();
@@ -1780,6 +1783,16 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
             subArray.SetValue(subscription3.Instance, 2); // Live (covers ProcessUnderCapturedContextAsync)
             
             await (Task)dispatchMethod.Invoke(channel, [message2, subArray, CancellationToken.None])!;
+
+            // The fan-out actually discriminated: the dropped and already-seen waiters were
+            // skipped, and only the live one was processed — its waiter settling (with the
+            // schema-version rejection this "{}" envelope produces) proves
+            // ProcessUnderCapturedContextAsync ran end to end.
+            Assert.False(subscription1.Completion.Task.IsCompleted);
+            Assert.False(subscription2.Completion.Task.IsCompleted);
+            var liveError = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => subscription3.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Contains("schema version", liveError.Message);
 
             // Start dispatcher to cover its background task dispose/cancellation
             var ensureDispatcherStartedMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("EnsureListenerStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;

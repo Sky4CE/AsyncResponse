@@ -44,6 +44,32 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   **Rolling-deploy caveat: an OLD build cannot read a blob a NEW build has written** — sequence the
   Redis channel package upgrade accordingly, or accept that recovery registrations saved mid-rollout
   by an upgraded host are invisible to not-yet-upgraded hosts until they too upgrade.
+- **NATS recovery-state envelope format changed.** Registrations sharing one correlation id's KV
+  key now each carry their own expiry (`StateExpiries`, parallel to `States`; the envelope-level
+  stamp becomes their maximum), so a stream of fresh registrations for one id can no longer keep a
+  dead sibling recoverable past its own `RecoveryStateExpiry`. Compatible in both directions:
+  new builds read old envelopes (those registrations inherit the shared stamp), and old builds
+  read new ones (they apply the envelope stamp, i.e. the pre-change behavior, until upgraded).
+- **Round-30 review hardening — deployment-visible behavior changes.** The NATS channel now
+  *throws* when delivery keeps finding no responders while the liveness probe keeps reporting a
+  live waiter (Redis parity; a normal return silently dropped the payload, acking the broker
+  message with the response existing nowhere). The NATS transport refuses an over-cap delivery
+  *before* executing it and dead-letters it (`MaxDeliver = -1` is premised on the dispatcher
+  bounding attempts, which previously only happened when the handler threw — an unsettled
+  delivery redelivered forever). RabbitMQ early-ACK background failures are now republished to
+  the configured `DeadLetterExchange` (best-effort; the early ACK forecloses the native DLX
+  route). Redis worker publishes are idempotent across retries via a short-lived, hash-tagged
+  dedup marker key beside the worker stream. The database transports dead-letter (instead of
+  run or lose) work still queued when the early-ACK drain budget lapses, and bury an at-cap
+  poison row with an uncancellable settle. The MongoDB flow store pins ledger reads to the
+  primary and, under `AutoCreateIndexes = false`, **fails startup when the provisioned
+  collection has no TTL index** — its only cleanup mechanism. The SQL Server channel (and the
+  transport, for tables it created itself) verifies its derived indexes against the catalog; the
+  SQLite flow store's `flow_id` collation probe now survives case-variant table names, columns
+  ending in `flow_id`, and table-level `PRIMARY KEY (flow_id COLLATE …)` declarations. The
+  worker ingress acknowledges an envelope with an explicit `"call": null` as unparseable instead
+  of poison-looping, while `JsonException`/`InvalidDataException` thrown by the *job body* now
+  propagate for redelivery instead of being acknowledged away as a malformed envelope.
 - NATS worker/response consumption switched from an open-ended prefetch stream to bounded
   batch-fetch dispatch, with an in-progress (`AckProgress`) heartbeat covering the whole in-flight
   batch so `AckWait` no longer has to exceed the slowest handler. Redis Streams batches get the
@@ -97,10 +123,11 @@ work that has landed on `main` but not yet shipped. Security reporters credited 
   `CrashBeforeStep`/`CrashAfterStep` one-shot `SimulatedCrashException` injection) — all with
   zero instrumentation in the flow classes under test.
 - **`IDurableFlowExecutionObserver`** — public execution-observation seam (step
-  starting/waiting/completed, run finished) invoked on the executor path; the Testing harness is
-  built on it and it doubles as a lightweight production telemetry hook. Observer exceptions
-  fail the current execution attempt like a step failure (that contract is the crash-injection
-  mechanism).
+  starting/waiting/completed, run attempt failed, run finished) invoked on the executor path; the
+  Testing harness is built on it and it doubles as a lightweight production telemetry hook.
+  Observer exceptions fail the current execution attempt like a step failure (that contract is
+  the crash-injection mechanism) — except in `OnRunAttemptFailedAsync`, which fires while the
+  attempt's own exception is already propagating and therefore swallows observer throws.
 - **Engine-wide `TimeProvider` seam** — `AddAsyncResponse()` registers `TimeProvider.System`
   (TryAdd; a host or the test harness can pre-register its own), and every time-driven Core
   component resolves it: waiter timeouts, execution leases and their renewal, the recovery

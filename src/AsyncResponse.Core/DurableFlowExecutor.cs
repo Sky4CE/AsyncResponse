@@ -179,14 +179,19 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
         catch (Exception ex) when (lease.LostToken.IsCancellationRequested)
         {
             AsyncResponseDiagnostics.SetError(activity, ex);
+            await NotifyRunAttemptFailedAsync(state).ConfigureAwait(false);
             throw;
         }
         catch (Exception ex)
         {
             state.LastMessage = ex.Message;
-            await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
-
             AsyncResponseDiagnostics.SetError(activity, ex);
+
+            // Before the save: a rejected checkpoint below must not lose the notification (the
+            // attempt ended either way, and any step it parked is no longer parked).
+            await NotifyRunAttemptFailedAsync(state).ConfigureAwait(false);
+
+            await lease.SaveAsync(state, _options.StateExpiry, cause: ex).ConfigureAwait(false);
 
             // Retriable: propagate so the worker transport redelivers the run with bounded
             // attempts and dead-letters it when they are exhausted — the "run is stuck" alarm.
@@ -630,6 +635,34 @@ internal sealed class DurableFlowExecutor : IDurableFlowExecutor
     /// redelivered execution re-notifies and acks — the run's outcome is never at stake, and the
     /// terminal event is delivered at least once.
     /// </summary>
+    /// <summary>
+    /// Best-effort attempt-failure notification (see
+    /// <see cref="IDurableFlowExecutionObserver.OnRunAttemptFailedAsync"/>): the attempt's own
+    /// exception is already propagating for redelivery, so observer throws are swallowed instead
+    /// of masking it.
+    /// </summary>
+    private async Task NotifyRunAttemptFailedAsync(FlowState state)
+    {
+        if (_observers.Length == 0)
+            return;
+
+        var runEvent = new DurableFlowRunEvent(state.FlowId!, state.Status, state.LastMessage);
+        foreach (var observer in _observers)
+        {
+            try
+            {
+                await observer.OnRunAttemptFailedAsync(runEvent).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "A durable-flow execution observer threw in OnRunAttemptFailedAsync for {FlowId}; ignoring so the attempt's own failure propagates.",
+                    state.FlowId);
+            }
+        }
+    }
+
     private async Task NotifyRunFinishedAsync(FlowState state)
     {
         if (_observers.Length == 0)

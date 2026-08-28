@@ -91,13 +91,15 @@ public sealed class NatsChannelCoverageTests
     /// Delivery keeps reporting no responders while the probe keeps reporting a live waiter — a
     /// contradiction (subscription interest not yet visible server-side, or a stale heartbeat).
     /// Consuming recovery registrations on that evidence would strip a live waiter of its recovery
-    /// arm, so after the bounded retry the publish leaves all state intact.
+    /// arm, so after the bounded retry the publish leaves all state intact — and surfaces the
+    /// non-delivery to the caller instead of silently dropping the payload (Redis parity: a
+    /// normal return here acked the broker message with the response existing nowhere).
     /// </summary>
     [Theory]
     [InlineData(PublishKind.Response)]
     [InlineData(PublishKind.RawJson)]
     [InlineData(PublishKind.Exception)]
-    public async Task Publish_LeavesRecoveryIntactWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
+    public async Task Publish_LeavesRecoveryIntactAndThrowsWhileProbeKeepsReportingALiveWaiter(PublishKind kind)
     {
         using var activities = new AsyncResponseActivityCollector();
         var channel = CreateChannel();
@@ -106,9 +108,12 @@ public sealed class NatsChannelCoverageTests
         _store.Setup(store => store.GetAllAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync([NewRecoveryState("corr-contradiction")]);
 
-        await PublishAsync(channel, kind, "corr-contradiction");
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PublishAsync(channel, kind, "corr-contradiction"));
+        Assert.Contains("found no responders twice", exception.Message);
 
-        // Bounded: one retry, then hands off to the intact registration instead of a third publish.
+        // Bounded: one retry, then the failure surfaces with the registration intact instead of
+        // looping or silently dropping the payload.
         Assert.Equal(2, _client.Requests.Count(request => !request.Probe));
         Assert.Equal(2, _client.Requests.Count(request => request.Probe));
         _store.Verify(store => store.TryDeleteAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Never);

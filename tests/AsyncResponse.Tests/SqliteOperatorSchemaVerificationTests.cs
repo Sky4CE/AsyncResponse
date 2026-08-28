@@ -230,6 +230,85 @@ public sealed class SqliteOperatorSchemaVerificationTests
         Assert.Equal("delete", (string)(await journal.ExecuteScalarAsync())!, ignoreCase: true);
     }
 
+    [Fact]
+    public async Task OperatorTable_WithParentColumnBeforeFlowId_StillRefusesNocaseFlowId()
+    {
+        // Regression: the collation probe located the column by a raw substring search, so an
+        // earlier column ending in flow_id (parent_flow_id — nullable extras are admitted by
+        // design) captured the match and the real flow_id's COLLATE NOCASE was never inspected:
+        // the case-folding primary key the probe exists to refuse was accepted.
+        await using var database = new TempSqliteDatabase();
+        await ProvisionAsync(database,
+            """
+            CREATE TABLE asyncresponse_flow_state (
+                parent_flow_id TEXT NULL,
+                flow_id TEXT NOT NULL PRIMARY KEY COLLATE NOCASE,
+                state_json TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                lease_id TEXT NULL,
+                lease_expires_at_utc TEXT NULL
+            );
+            """);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateStore(database).TryCreateAsync("Order-A1", CreateState("Order-A1"), TimeSpan.FromMinutes(5)));
+        Assert.Contains("NOCASE", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task OperatorTable_WithTableLevelNocasePrimaryKey_FailsWithActionableError()
+    {
+        // Regression: docs/durable-flow-state-stores.md promises COLLATE NOCASE is caught "on the
+        // column or the primary key", but the probe only ever examined the first flow_id
+        // substring's clause — a table-level PRIMARY KEY (flow_id COLLATE NOCASE) slipped through.
+        await using var database = new TempSqliteDatabase();
+        await ProvisionAsync(database,
+            """
+            CREATE TABLE asyncresponse_flow_state (
+                flow_id TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                lease_id TEXT NULL,
+                lease_expires_at_utc TEXT NULL,
+                PRIMARY KEY (flow_id COLLATE NOCASE)
+            );
+            """);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateStore(database).TryCreateAsync("Order-A1", CreateState("Order-A1"), TimeSpan.FromMinutes(5)));
+        Assert.Contains("NOCASE", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task OperatorTable_WithCaseVariantStoredName_StillRefusesNocaseFlowId()
+    {
+        // Regression: the probe looked the table up with a BINARY `name = $name` while SQLite
+        // resolves identifiers case-insensitively everywhere else — a table stored as
+        // ASYNCRESPONSE_FLOW_STATE passed every shape check but returned no DDL row, so the whole
+        // collation check silently no-opped and the folding key was accepted.
+        await using var database = new TempSqliteDatabase();
+        await ProvisionAsync(database,
+            """
+            CREATE TABLE ASYNCRESPONSE_FLOW_STATE (
+                flow_id TEXT NOT NULL PRIMARY KEY COLLATE NOCASE,
+                state_json TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                lease_id TEXT NULL,
+                lease_expires_at_utc TEXT NULL
+            );
+            """);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateStore(database).TryCreateAsync("Order-A1", CreateState("Order-A1"), TimeSpan.FromMinutes(5)));
+        Assert.Contains("NOCASE", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static SqliteFlowStateStore CreateStore(TempSqliteDatabase database)
         => new(Options.Create(new SqliteDurableFlowOptions
         {

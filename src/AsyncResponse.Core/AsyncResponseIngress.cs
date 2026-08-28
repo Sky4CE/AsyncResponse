@@ -150,6 +150,7 @@ internal sealed class AsyncResponseIngress(
         if (RejectIfOversized(messageJson, "worker", activity))
             return;
 
+        WorkerJobEnvelope job;
         try
         {
             // The envelope is the WORST thing in the library to log whole: it carries the job's
@@ -158,33 +159,14 @@ internal sealed class AsyncResponseIngress(
             // routing metadata once it has been read.
             _logger.LogDebug("Ingress received a worker job. Payload: {PayloadLength} UTF-16 code units.", messageJson.Length);
 
-            var job = JsonSafety.SafeDeserialize<WorkerJobEnvelope>(messageJson)
+            job = JsonSafety.SafeDeserialize<WorkerJobEnvelope>(messageJson)
                 ?? throw new InvalidDataException("Worker message deserialized to null.");
-            AsyncResponseDiagnostics.SetCorrelationId(activity, job.CorrelationId);
-            AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
-            AsyncResponseDiagnostics.SetWorker(activity, job.Call);
-            _logger.LogDebug(
-                "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
-                job.CorrelationId,
-                job.Call?.ServiceInterfaceFullName,
-                job.Call?.MethodName);
 
-            // Authorize the target while the envelope is still inert data — BEFORE its propagated
-            // context is restored. Both halves of this envelope are attacker-controlled to anyone
-            // who can write to the worker transport: Call names the method to run, Context names
-            // the ambient identity to run it under. Restoring Context first handed a custom
-            // authorizer that consults ambient tenant/principal state the message's own answer to
-            // the question it was about to be asked. ReflectionExtensions.InvokeAsync re-checks
-            // downstream; this is the ordering, not the only gate.
-            ReflectionExtensions.ThrowIfNotAuthorized(
-                _authorizer,
-                job.Call?.ServiceInterfaceFullName ?? string.Empty,
-                job.Call?.MethodName ?? string.Empty);
-
-            // The job crossed a serialization boundary (broker → ingress): restore any ambient
-            // context its propagators captured before executing it.
-            using (_propagation.Restore(job.Context))
-                await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
+            // `required` on WorkerJobEnvelope.Call enforces presence on the wire, not non-null:
+            // an explicit "call": null parses successfully yet can never be executed, so it is
+            // the same producer-side contract violation as an unparseable envelope.
+            if (job.Call is null)
+                throw new InvalidDataException("Worker envelope carries a null call description.");
         }
         catch (Exception ex) when (ex is InvalidDataException or System.Text.Json.JsonException)
         {
@@ -193,6 +175,11 @@ internal sealed class AsyncResponseIngress(
             // forever (RabbitMQ's default MaxDeliveryAttempts = 0 has no cap) or burn dead-letter
             // attempts on brokers that do. Error log + counter make the drop loud; every occurrence
             // is a producer-side contract violation.
+            //
+            // This filter must cover ONLY the parse above: the job body can throw the same
+            // exception types (a durable flow deserializing a persisted input, a handler parsing a
+            // third-party response), and those must propagate below for the transport to
+            // redeliver/dead-letter instead of being acknowledged away as a malformed envelope.
             //
             // Deliberately NOT the unsupported-schema rejection, which stays a throw: that envelope
             // is well-formed and a NEWER build can read it, so refusing lets it reach one instead
@@ -203,6 +190,36 @@ internal sealed class AsyncResponseIngress(
                 messageJson.Length);
             AsyncResponseDiagnostics.SetError(activity, ex);
             AsyncResponseDiagnostics.RecordWorkerOutcome("rejected");
+            return;
+        }
+
+        try
+        {
+            AsyncResponseDiagnostics.SetCorrelationId(activity, job.CorrelationId);
+            AsyncResponseDiagnostics.SetReplyTarget(activity, job.ReplyTarget);
+            AsyncResponseDiagnostics.SetWorker(activity, job.Call);
+            _logger.LogDebug(
+                "Ingress worker job for {CorrelationId} targets {Service}.{Method}.",
+                job.CorrelationId,
+                job.Call.ServiceInterfaceFullName,
+                job.Call.MethodName);
+
+            // Authorize the target while the envelope is still inert data — BEFORE its propagated
+            // context is restored. Both halves of this envelope are attacker-controlled to anyone
+            // who can write to the worker transport: Call names the method to run, Context names
+            // the ambient identity to run it under. Restoring Context first handed a custom
+            // authorizer that consults ambient tenant/principal state the message's own answer to
+            // the question it was about to be asked. ReflectionExtensions.InvokeAsync re-checks
+            // downstream; this is the ordering, not the only gate.
+            ReflectionExtensions.ThrowIfNotAuthorized(
+                _authorizer,
+                job.Call.ServiceInterfaceFullName ?? string.Empty,
+                job.Call.MethodName ?? string.Empty);
+
+            // The job crossed a serialization boundary (broker → ingress): restore any ambient
+            // context its propagators captured before executing it.
+            using (_propagation.Restore(job.Context))
+                await _workerJobExecutor.ExecuteAsync(job).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

@@ -192,6 +192,52 @@ public class AsyncResponseIngressErrorTests
     }
 
     [Fact]
+    public async Task HandleWorkerMessageAsync_ExplicitNullCall_IsAcknowledgedInsteadOfRedelivered()
+    {
+        // Regression: `required` on WorkerJobEnvelope.Call enforces PRESENCE on the wire, not
+        // non-null, so {"Call":null} parsed successfully and then hit the first unguarded
+        // dereference — a NullReferenceException outside the drop-and-ack filter, so the
+        // transport redelivered it forever (RabbitMQ's shipped default MaxDeliveryAttempts = 0
+        // requeues without a cap) with no worker-outcome counter moving. It is the same
+        // producer-side contract violation as an unparseable envelope and gets the same answer:
+        // acknowledged, never thrown.
+        var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
+
+        await ingress.HandleWorkerMessageAsync("""{"SchemaVersion":1,"Call":null,"CorrelationId":"corr-null-call"}""");
+    }
+
+    [Fact]
+    public async Task HandleWorkerMessageAsync_JsonExceptionFromTheJobBody_PropagatesForRedelivery()
+    {
+        // Regression: the "unparseable envelope" catch filter spanned the WHOLE handler, so a
+        // JsonException thrown by the job body — a durable flow deserializing a persisted input,
+        // a handler parsing a third-party response — was misclassified as a malformed envelope,
+        // recorded as rejected, and acknowledged: the transport never redelivered, and a Running
+        // flow lost its only wake-up. The filter now covers only the parse; body failures reach
+        // the transport's retry/dead-letter policy.
+        var services = new ServiceCollection();
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.AddSingleton<IJsonThrowingWorker>(new JsonThrowingWorker());
+        services.AddAsyncResponse().WithInMemoryChannel();
+        await using var provider = services.BuildServiceProvider();
+        var ingress = provider.GetRequiredService<IAsyncResponseIngress>();
+
+        var json = AsyncResponseJson.Serialize(new WorkerJobEnvelope
+        {
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IJsonThrowingWorker).FullName!,
+                MethodName = nameof(IJsonThrowingWorker.Parse),
+                Params = [CallbackParam.ForValue(7)]
+            },
+            CorrelationId = "corr-body-json"
+        });
+
+        var exception = await Assert.ThrowsAnyAsync<Exception>(() => ingress.HandleWorkerMessageAsync(json));
+        Assert.IsType<System.Text.Json.JsonException>(exception);
+    }
+
+    [Fact]
     public async Task HandleWorkerMessageAsync_ExecutionFailure_PropagatesForTransportRetryOrDeadLetter()
     {
         var ingress = CreateIngress(new ThrowingRawPublisher(), new RecordingPublisher());
@@ -334,6 +380,16 @@ public class AsyncResponseIngressErrorTests
             new WorkerJobExecutor(provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<WorkerJobExecutor>.Instance),
             new AsyncResponseContextPropagation([]),
             logger ?? NullLogger<AsyncResponseIngress>.Instance);
+    }
+
+    public interface IJsonThrowingWorker
+    {
+        Task Parse(int value);
+    }
+
+    private sealed class JsonThrowingWorker : IJsonThrowingWorker
+    {
+        public Task Parse(int value) => throw new System.Text.Json.JsonException("the job body failed to parse its own data");
     }
 
     private sealed class ThrowingRawPublisher(Exception? _exception = null, int _failures = int.MaxValue) : IRawAsyncResponsePublisher

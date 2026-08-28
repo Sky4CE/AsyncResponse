@@ -66,4 +66,33 @@ internal static class MongoTestCounters
             .Returns(Collection());
         return database;
     }
+
+    /// <summary>
+    /// Stubs the TTL-index listing the flow store verifies under <c>AutoCreateIndexes = false</c>:
+    /// one single-field index on <c>expires_at_utc</c> with <c>expireAfterSeconds</c> — a
+    /// correctly provisioned reaper, so mocked stores pass the operator-schema check.
+    /// </summary>
+    public static Mock<IMongoCollection<T>> WithProvisionedTtlIndex<T>(this Mock<IMongoCollection<T>> collection)
+    {
+        var cursor = new Mock<IAsyncCursor<BsonDocument>>();
+        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursor.SetupGet(c => c.Current).Returns(
+        [
+            new BsonDocument
+            {
+                ["name"] = "flows_expires_idx",
+                ["key"] = new BsonDocument("expires_at_utc", 1),
+                ["expireAfterSeconds"] = 0
+            }
+        ]);
+
+        var indexes = new Mock<IMongoIndexManager<T>>();
+        indexes
+            .Setup(m => m.ListAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(cursor.Object);
+        collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+        return collection;
+    }
 }

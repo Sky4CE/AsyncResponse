@@ -81,6 +81,54 @@ public sealed class SqlServerRelationVerifierTests
         Assert.Null(verifier.Evaluate(expected, [(("JOBS", "AVAILABLE_AT"), verifier.ColumnRow("DATETIME2(7)", nullable: false))]));
     }
 
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateIndexes_RejectsWrongKeyColumns_AndAcceptsTheDeclaredShape(Type anchor)
+    {
+        // Regression: the DDL's index guard is name-only (sys.indexes WHERE name = ... AND
+        // object_id = ...), so an operator-provisioned index keyed on other columns was silently
+        // accepted and every poll tick table-scanned; ExpectedObjects could not even DECLARE an
+        // index. The verifier now checks the shape the way the PostgreSQL sibling does.
+        var verifier = new Verifier(anchor);
+        var expected = verifier.Tables(verifier.Index("jobs_correlation_idx", "jobs", "correlation_id", "created_at"));
+
+        var rejected = verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(keyColumns: ["expires_at"]))]);
+        Assert.NotNull(rejected);
+        Assert.Contains("correlation_id, created_at", rejected.Message, StringComparison.Ordinal);
+        Assert.Contains("expires_at", rejected.Message, StringComparison.Ordinal);
+
+        // The declared shape passes, as does a clustered variant (both serve the seek), and
+        // included columns are extra capacity rather than a shape change (key_ordinal 0 rows
+        // never reach the loaded key list).
+        Assert.Null(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(keyColumns: ["correlation_id", "created_at"]))]));
+        Assert.Null(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(type: 1, keyColumns: ["correlation_id", "created_at"]))]));
+
+        // UNIQUE (would reject duplicate values), filtered (misses rows), disabled (unusable) and
+        // columnstore (no seek) are all the wrong index despite the right columns.
+        Assert.NotNull(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(unique: true, keyColumns: ["correlation_id", "created_at"]))]));
+        Assert.NotNull(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(filtered: true, keyColumns: ["correlation_id", "created_at"]))]));
+        Assert.NotNull(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(disabled: true, keyColumns: ["correlation_id", "created_at"]))]));
+        Assert.NotNull(verifier.EvaluateIndexRows(expected, [(("jobs_correlation_idx", "jobs"), verifier.IndexRow(type: 5, keyColumns: ["correlation_id", "created_at"]))]));
+    }
+
+    [Theory]
+    [MemberData(nameof(AnchorTypes))]
+    public void EvaluateIndexes_TreatsASameNameIndexOnAnotherTableAsAbsent(Type anchor)
+    {
+        // SQL Server index names are per-table, not schema-wide: a same-name index on an
+        // unrelated table is neither the expected index nor a collision — the expected one is
+        // simply missing (reported only when absence is reportable; diagnosis mode stays quiet).
+        var verifier = new Verifier(anchor);
+        var expected = verifier.Tables(verifier.Index("jobs_expires_idx", "jobs", "expires_at"));
+        var foreign = (("jobs_expires_idx", "other_table"), verifier.IndexRow(keyColumns: ["whatever"]));
+
+        var missing = verifier.EvaluateIndexRows(expected, [foreign]);
+        Assert.NotNull(missing);
+        Assert.Contains("to exist", missing.Message, StringComparison.Ordinal);
+
+        Assert.Null(verifier.EvaluateIndexRows(expected, [foreign], reportAbsence: false));
+    }
+
     [Fact]
     public void EveryExpectedFractionalSecondsColumn_StatesTheScaleItsDdlCreates()
     {
@@ -128,7 +176,12 @@ public sealed class SqlServerRelationVerifierTests
         static (string? Type, bool Nullable, bool RequiresBinaryCollation) QueueColumn(object store, bool selfCreated)
         {
             var method = store.GetType().GetMethod("ExpectedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            var columns = (IEnumerable)Read(((IEnumerable)method.Invoke(store, [selfCreated])!).Cast<object>().Single(), "Columns")!;
+            // The self-created path also declares the derived indexes (Columns: null); the queue
+            // column lives on the one object that carries columns.
+            var columns = (IEnumerable)((IEnumerable)method.Invoke(store, [selfCreated])!)
+                .Cast<object>()
+                .Select(expectedObject => Read(expectedObject, "Columns"))
+                .Single(objectColumns => objectColumns is not null)!;
             var queue = columns.Cast<object>().Single(c => (string)Read(c, "Name")! == "queue");
             return ((string?)Read(queue, "Type"), (bool)Read(queue, "Nullable")!, (bool)Read(queue, "RequiresBinaryCollation")!);
         }
@@ -198,10 +251,13 @@ public sealed class SqlServerRelationVerifierTests
         private readonly Type _expectedObject;
         private readonly Type _expectedColumn;
         private readonly Type _actualColumn;
+        private readonly Type _actualIndex;
         private readonly object _tableKind;
+        private readonly object _indexKind;
         private readonly object _columnComparer;
         private readonly MethodInfo _renderType;
         private readonly MethodInfo _evaluate;
+        private readonly MethodInfo _evaluateIndexes;
 
         public Verifier(Type anchor)
         {
@@ -209,12 +265,16 @@ public sealed class SqlServerRelationVerifierTests
             _expectedObject = type.GetNestedType("ExpectedObject", BindingFlags.NonPublic)!;
             _expectedColumn = type.GetNestedType("ExpectedColumn", BindingFlags.NonPublic)!;
             _actualColumn = type.GetNestedType("ActualColumn", BindingFlags.NonPublic)!;
-            _tableKind = Enum.ToObject(anchor.Assembly.GetType("AsyncResponse.Internal.SqlServerObjectKind", throwOnError: true)!, 0);
+            _actualIndex = type.GetNestedType("ActualIndex", BindingFlags.NonPublic)!;
+            var objectKind = anchor.Assembly.GetType("AsyncResponse.Internal.SqlServerObjectKind", throwOnError: true)!;
+            _tableKind = Enum.ToObject(objectKind, 0);
+            _indexKind = Enum.ToObject(objectKind, 2);
             _columnComparer = type.GetNestedType("TableColumnComparer", BindingFlags.NonPublic)!
                 .GetField("Instance", BindingFlags.Public | BindingFlags.Static)!
                 .GetValue(null)!;
             _renderType = type.GetMethod("RenderType", BindingFlags.NonPublic | BindingFlags.Static)!;
             _evaluate = type.GetMethod("EvaluateTableColumns", BindingFlags.NonPublic | BindingFlags.Static)!;
+            _evaluateIndexes = type.GetMethod("EvaluateIndexes", BindingFlags.NonPublic | BindingFlags.Static)!;
         }
 
         public string RenderType(string typeName, short maxLength, byte scale)
@@ -224,13 +284,51 @@ public sealed class SqlServerRelationVerifierTests
             => Activator.CreateInstance(_expectedColumn, name, type, nullable, requiresBinaryCollation, defaultExpression)!;
 
         public object Table(string name, params object[] columns)
-            => Activator.CreateInstance(_expectedObject, name, _tableKind, TypedArray(_expectedColumn, columns), null)!;
+            // Positional args must cover the whole ctor: ExpectedObject also carries the index
+            // members (OwningTable, KeyColumns), null here — tables do not use them.
+            => Activator.CreateInstance(_expectedObject, name, _tableKind, TypedArray(_expectedColumn, columns), null, null, null)!;
 
         public Array Tables(params object[] tables) => TypedArray(_expectedObject, tables);
 
         /// <summary>A healthy catalog row; facts override only what they bend.</summary>
         public object ColumnRow(string type, bool nullable, string collation = "", bool writable = false, string @default = "")
             => Activator.CreateInstance(_actualColumn, type, nullable, collation, writable, @default)!;
+
+        public object Index(string name, string owningTable, params string[] keyColumns)
+            => Activator.CreateInstance(_expectedObject, name, _indexKind, null, null, owningTable, keyColumns)!;
+
+        /// <summary>A healthy catalog index row (nonclustered rowstore); facts override only what they bend.</summary>
+        public object IndexRow(byte type = 2, bool unique = false, bool filtered = false, bool disabled = false, params string[] keyColumns)
+        {
+            var keys = (System.Collections.IList)Activator.CreateInstance(
+                typeof(List<>).MakeGenericType(typeof((byte Ordinal, string Column))))!;
+            for (byte ordinal = 0; ordinal < keyColumns.Length; ordinal++)
+                keys.Add(((byte)(ordinal + 1), keyColumns[ordinal]));
+            return Activator.CreateInstance(_actualIndex, type, unique, filtered, disabled, keys)!;
+        }
+
+        /// <summary>Runs the pure index decision over fabricated catalog rows; null means "accepted".</summary>
+        public InvalidOperationException? EvaluateIndexRows(
+            Array indexes,
+            ((string Index, string Table) Key, object Row)[] rows,
+            bool reportAbsence = true)
+        {
+            var actual = (System.Collections.IDictionary)Activator.CreateInstance(
+                typeof(Dictionary<,>).MakeGenericType(typeof((string, string)), _actualIndex),
+                _columnComparer)!;
+            foreach (var (key, row) in rows)
+                actual.Add(key, row);
+
+            try
+            {
+                _evaluateIndexes.Invoke(null, ["catalog_test", "channel", indexes, actual, reportAbsence]);
+                return null;
+            }
+            catch (TargetInvocationException wrapped)
+            {
+                return Assert.IsType<InvalidOperationException>(wrapped.InnerException);
+            }
+        }
 
         /// <summary>Runs the pure decision over fabricated catalog rows; null means "accepted".</summary>
         public InvalidOperationException? Evaluate(Array tables, ((string Table, string Column) Key, object Row)[] columns)

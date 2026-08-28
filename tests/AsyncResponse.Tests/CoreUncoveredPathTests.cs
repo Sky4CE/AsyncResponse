@@ -211,14 +211,38 @@ public sealed class CoreUncoveredPathTests
         await registry.EnqueueAsync("worked", () => Task.CompletedTask);
 
         var tombstones = Tombstones(registry);
-        tombstones["expired"] = DateTime.UtcNow.AddMinutes(-1);
-        tombstones["live"] = DateTime.UtcNow.AddMinutes(5);
+        // Planted through both halves of the bookkeeping: the dictionary is the source of truth,
+        // and the prune pops the expiry-ordered queue instead of scanning the dictionary.
+        PlantTombstone(registry, "expired", DateTime.UtcNow.AddMinutes(-1));
+        PlantTombstone(registry, "live", DateTime.UtcNow.AddMinutes(5));
 
         // Retiring an executor is what triggers the sweep.
         await registry.RemoveAsync("worked");
 
         Assert.DoesNotContain("expired", tombstones.Keys);
         Assert.Contains("live", tombstones.Keys);
+    }
+
+    /// <summary>
+    /// The prune pops the expiry-ordered queue and validates each popped head against the
+    /// dictionary: a channel re-tombstoned with a LATER expiry leaves its earlier queue entry
+    /// stale, and popping that stale head must not drop the live tombstone.
+    /// </summary>
+    [Fact]
+    public async Task Retirement_KeepsARetombstonedChannel_WhoseStaleQueueEntryExpired()
+    {
+        var registry = new SerialExecutorRegistry(NullLogger.Instance);
+        await registry.EnqueueAsync("worked", () => Task.CompletedTask);
+
+        var tombstones = Tombstones(registry);
+        PlantTombstone(registry, "renewed", DateTime.UtcNow.AddMinutes(-1)); // stale queue head...
+        PlantTombstone(registry, "renewed", DateTime.UtcNow.AddMinutes(5));  // ...superseded in the dictionary
+
+        // Retiring an executor is what triggers the sweep; it pops the stale head.
+        await registry.RemoveAsync("worked");
+
+        Assert.Contains("renewed", tombstones.Keys);
+        Assert.True(tombstones["renewed"] > DateTime.UtcNow);
     }
 
     /// <summary>
@@ -246,6 +270,20 @@ public sealed class CoreUncoveredPathTests
         => (Dictionary<string, DateTimeOffset>)typeof(SerialExecutorRegistry)
             .GetField("_tombstones", BindingFlags.Instance | BindingFlags.NonPublic)!
             .GetValue(registry)!;
+
+    /// <summary>
+    /// Plants a tombstone the way retirement does: the dictionary (source of truth) plus the
+    /// expiry-ordered queue the prune pops. Callers must plant in expiry order — that invariant
+    /// (constant lifetime, so insertion order is expiry order) is what the prune relies on.
+    /// </summary>
+    private static void PlantTombstone(SerialExecutorRegistry registry, string channel, DateTimeOffset expiresAtUtc)
+    {
+        Tombstones(registry)[channel] = expiresAtUtc;
+        var order = (Queue<(string Channel, DateTimeOffset ExpiresAtUtc)>)typeof(SerialExecutorRegistry)
+            .GetField("_tombstoneOrder", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(registry)!;
+        order.Enqueue((channel, expiresAtUtc));
+    }
 
     private sealed class FakeScanner(params RecoveryState?[] states) : IRecoveryStateScanner
     {

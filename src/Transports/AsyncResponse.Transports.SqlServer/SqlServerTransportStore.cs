@@ -296,7 +296,22 @@ internal sealed class SqlServerTransportStore
                     new("attempts", "int", Nullable: false, DefaultExpression: "((0))"),
                     new("dead_letter_reason", "nvarchar(max)", Nullable: true)
                 ],
-                PrimaryKey: ["id"])
+                PrimaryKey: ["id"]),
+                // Only on the table this build created (PostgreSQL-sibling parity): the DDL's
+                // index guard is name-only, so a pre-existing same-name index with the WRONG
+                // definition silently suppressed the CREATE and cost the claim its seek. An
+                // operator-owned table keeps its own indexing strategy — the same philosophy as
+                // the unconstrained queue column — because indexes are claim performance, not
+                // correctness.
+                .. selfCreated
+                    ? (SqlServerRelationVerifier.ExpectedObject[])
+                    [
+                        new(IndexName(_options.MessageTable, "claim"), SqlServerObjectKind.Index,
+                            OwningTable: _options.MessageTable, KeyColumns: ["queue", "available_at", "locked_until", "created_at"]),
+                        new(IndexName(_options.MessageTable, "created"), SqlServerObjectKind.Index,
+                            OwningTable: _options.MessageTable, KeyColumns: ["created_at"])
+                    ]
+                    : []
             ];
 
     /// <summary>

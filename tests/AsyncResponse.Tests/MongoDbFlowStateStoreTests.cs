@@ -84,6 +84,62 @@ public sealed class MongoDbFlowStateStoreTests
         UpdatedAtUtc = DateTime.UtcNow
     };
 
+    [Fact]
+    public void Construction_PinsLedgerReadsToThePrimary()
+    {
+        // Regression: the collection inherited whatever read preference the host-supplied
+        // IMongoDatabase carried, so a readPreference=secondaryPreferred connection string routed
+        // every ledger load to a possibly-lagging secondary — a stale revision replays an
+        // already-checkpointed step, and a not-yet-replicated ledger reads as null, the one
+        // answer callers ACK a wake-up on. Reads are pinned to the primary at construction
+        // (DynamoDB pins ConsistentRead for the same reason).
+        using var harness = new MongoHarness(new BsonDocument { ["ok"] = 1 });
+
+        harness.Collection.Verify(c => c.WithReadPreference(ReadPreference.Primary), Times.Once);
+    }
+
+    [Fact]
+    public async Task DisabledIndexCreation_WithoutAProvisionedTtlIndex_FailsWithActionableError()
+    {
+        // Regression: AutoCreateIndexes = false skipped index creation AND verification, so an
+        // operator-provisioned collection without expireAfterSeconds lost the store's only
+        // cleanup mechanism — the ledger collection grew without bound, with no error and no log
+        // line (loads filter on ExpiresAtUtc, so every functional test stayed green). Cosmos and
+        // DynamoDB hard-fail the same way when their server-side reaper is missing.
+        var collection = new Mock<IMongoCollection<MongoFlowStateDocument>>();
+        collection
+            .Setup(c => c.WithReadPreference(It.IsAny<ReadPreference>()))
+            .Returns(collection.Object);
+
+        // The provisioned collection lists ONLY the default _id index — no TTL reaper.
+        var cursor = new Mock<IAsyncCursor<BsonDocument>>();
+        cursor.SetupSequence(c => c.MoveNextAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true)
+            .ReturnsAsync(false);
+        cursor.SetupGet(c => c.Current).Returns(
+        [
+            new BsonDocument { ["name"] = "_id_", ["key"] = new BsonDocument("_id", 1) }
+        ]);
+        var indexes = new Mock<IMongoIndexManager<MongoFlowStateDocument>>();
+        indexes.Setup(m => m.ListAsync(It.IsAny<CancellationToken>())).ReturnsAsync(cursor.Object);
+        collection.SetupGet(c => c.Indexes).Returns(indexes.Object);
+
+        var database = new Mock<IMongoDatabase>().WithTestNamespace();
+        database
+            .Setup(d => d.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
+            .Returns(collection.Object);
+        using var store = new MongoDbFlowStateStore(database.Object, Options.Create(new MongoDbDurableFlowOptions
+        {
+            CollectionName = "flows",
+            AutoCreateIndexes = false
+        }));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.TryCreateAsync("flow", CreateState("flow"), TimeSpan.FromMinutes(5)));
+        Assert.Contains("TTL index", error.Message, StringComparison.Ordinal);
+        Assert.Contains("expires_at_utc", error.Message, StringComparison.Ordinal);
+    }
+
     private sealed class MongoHarness : IDisposable
     {
         public MongoHarness(BsonDocument helloReply)
@@ -91,6 +147,13 @@ public sealed class MongoDbFlowStateStoreTests
             Database
                 .Setup(item => item.GetCollection<MongoFlowStateDocument>("flows", It.IsAny<MongoCollectionSettings>()))
                 .Returns(Collection.Object);
+            // The store pins ledger reads to the primary at construction; the derived handle is
+            // this same mock. The TTL-index stub satisfies the operator-schema verification that
+            // AutoCreateIndexes = false now performs.
+            Collection
+                .Setup(item => item.WithReadPreference(It.IsAny<ReadPreference>()))
+                .Returns(Collection.Object);
+            Collection.WithProvisionedTtlIndex();
             Database
                 .Setup(item => item.RunCommandAsync(
                     It.IsAny<Command<BsonDocument>>(),

@@ -483,4 +483,59 @@ public sealed class InMemoryWorkerTransportDrainTests
                 Params = []
             }
         };
+
+    [Fact]
+    public async Task PumpOverflow_UnderConcurrentPumpers_NeitherDuplicatesNorLosesJobs()
+    {
+        // Regression: the pump's peek/write/dequeue ran unguarded, so two workers pumping at once
+        // could both peek job X, both write it, then dequeue X AND its neighbor Y — X executed
+        // twice and Y was silently lost while the outstanding counter still balanced (X's two
+        // executions paid for both increments), so even the shutdown drain saw nothing wrong.
+        // Barrier-released pumpers over many rounds make that interleaving overwhelmingly likely
+        // on the unguarded code; under the pump gate every round is exact.
+        var transport = new InMemoryWorkerTransport(Options.Create(new InMemoryWorkerTransportOptions
+        {
+            QueueCapacity = 64,
+            WorkerCount = 4
+        }));
+        var overflow = (System.Collections.Concurrent.ConcurrentQueue<InMemoryWorkerTransport.QueuedJob>)
+            typeof(InMemoryWorkerTransport)
+                .GetField("_overflow", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .GetValue(transport)!;
+
+        const int pumpers = 4;
+        const int jobsPerRound = 8;
+        for (var round = 0; round < 200; round++)
+        {
+            for (var job = 0; job < jobsPerRound; job++)
+                overflow.Enqueue(new InMemoryWorkerTransport.QueuedJob(OverflowJob($"{round}-{job}"), null));
+
+            using var start = new Barrier(pumpers);
+            await Task.WhenAll(Enumerable.Range(0, pumpers).Select(_ => Task.Run(() =>
+            {
+                start.SignalAndWait();
+                transport.PumpOverflow();
+            })));
+
+            var received = new List<string>();
+            while (transport.Reader.TryRead(out var queued))
+                received.Add(queued.Job.CorrelationId!);
+
+            Assert.Empty(overflow);
+            Assert.Equal(jobsPerRound, received.Count);
+            Assert.Equal(jobsPerRound, received.Distinct().Count());
+        }
+    }
+
+    private static WorkerJobEnvelope OverflowJob(string correlationId)
+        => new()
+        {
+            CorrelationId = correlationId,
+            Call = new ReflectionCallDto
+            {
+                ServiceInterfaceFullName = typeof(IDrainProbe).FullName!,
+                MethodName = nameof(IDrainProbe.RunAsync),
+                Params = []
+            }
+        };
 }

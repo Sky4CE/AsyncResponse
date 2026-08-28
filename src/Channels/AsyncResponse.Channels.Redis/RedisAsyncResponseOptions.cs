@@ -15,4 +15,23 @@ public sealed class RedisAsyncResponseOptions : DurableAsyncResponseChannelOptio
     /// recovery state.
     /// </summary>
     public string KeyPrefix { get; set; } = "asyncresponse";
+
+    /// <summary>
+    /// Validates the options, throwing <see cref="InvalidOperationException"/> on a
+    /// misconfiguration. Called by the channel so a bad configuration fails fast rather than at
+    /// first use.
+    /// </summary>
+    public void Validate()
+    {
+        // Shared channel knobs (RecoveryStateExpiry, DefaultTimeout, DisposalDrainTimeout) go
+        // through the ONE base guard set.
+        ValidateShared(nameof(RedisAsyncResponseOptions));
+
+        // Sibling-channel parity: RemoteStackTrace.Cap treats any non-positive cap as "leave the
+        // trace unchanged", so a negative value (a plausible "unlimited", or a bad configuration
+        // binding) silently disabled the DoS bound in both directions. The other four channels
+        // reject it at startup; Redis was the only one that accepted it.
+        if (MaxRemoteStackTraceLength < 0)
+            throw new InvalidOperationException($"{nameof(RedisAsyncResponseOptions)}.{nameof(MaxRemoteStackTraceLength)} must not be negative.");
+    }
 }

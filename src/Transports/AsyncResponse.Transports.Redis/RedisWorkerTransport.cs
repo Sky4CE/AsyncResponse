@@ -18,6 +18,7 @@ public sealed class RedisWorkerTransport : IWorkerTransport
     private readonly RedisAsyncResponseTransportOptions _options;
     private readonly IRedisStreamDatabase _database;
     private readonly RedisTransportKeySchema _keys;
+    private readonly TimeSpan _publishDedupTtl;
 
     /// <summary>Runs the RedisWorkerTransport operation.</summary>
     public RedisWorkerTransport(
@@ -40,6 +41,12 @@ public sealed class RedisWorkerTransport : IWorkerTransport
         ValidatePublishOptions(_options);
         _database = database;
         _keys = new RedisTransportKeySchema(_options);
+
+        // The dedup marker must outlive the whole retry window — attempts x (operation timeout +
+        // max backoff) — so a late retry still finds it; 2x margin, then it is garbage and
+        // expires. ~66s at the defaults.
+        var perAttempt = _options.OperationTimeout + _options.PublishRetryMaxDelay;
+        _publishDedupTtl = TimeSpan.FromTicks(perAttempt.Ticks * Math.Max(1, _options.PublishMaxAttempts) * 2);
     }
 
     private static RedisAsyncResponseTransportOptions RedisTransportOptionsValidatorWithValue(
@@ -77,9 +84,17 @@ public sealed class RedisWorkerTransport : IWorkerTransport
                 AsyncResponseJson.Serialize(job),
                 job.CorrelationId,
                 _options);
+            // Identity pinned OUTSIDE the retry loop (MongoDB/ASB/SQS parity): a retry after an
+            // ambiguous timeout — the adapter abandons the in-flight XADD best-effort while the
+            // multiplexer keeps running it — must not append the same worker job twice. The
+            // server-side marker makes the retried append a no-op instead.
+            var publishId = Guid.NewGuid().ToString("N");
+            var dedupKey = _keys.WorkerPublishDedupKey(publishId);
             var messageId = await RedisTransportRetry.ExecuteAsync(
-                token => _database.StreamAddAsync(
+                token => _database.StreamAddOnceAsync(
                     _keys.WorkerStream,
+                    dedupKey,
+                    _publishDedupTtl,
                     fields,
                     _options.StreamMaxLength,
                     _options.UseApproximateStreamTrimming,
@@ -89,7 +104,9 @@ public sealed class RedisWorkerTransport : IWorkerTransport
                 _options.PublishRetryMaxDelay,
                 cancellationToken).ConfigureAwait(false);
 
-            activity?.SetTag("messaging.message.id", messageId.ToString());
+            // Null: a previous attempt's append already committed — the job is on the stream once.
+            if (!messageId.IsNull)
+                activity?.SetTag("messaging.message.id", messageId.ToString());
         }
         catch (Exception ex)
         {

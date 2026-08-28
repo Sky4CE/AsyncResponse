@@ -310,6 +310,85 @@ public class RabbitMqDispatcherTests
     }
 
     [Fact]
+    public async Task Enqueue_BackgroundHandlerFails_PublishesTheDeliveryToTheDeadLetterExchange()
+    {
+        // Regression: a failed background handler was only logged and passed to
+        // OnBackgroundFailure — the already-ACKed delivery never reached the configured
+        // DeadLetterExchange (the early ACK forecloses the native reject-without-requeue DLX
+        // route), so a permanently failing job vanished with one log line while Kafka and Redis
+        // both write a dead-letter copy in the identical spot.
+        var channel = new FakeDispatcherChannel();
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("background boom"),
+            new RabbitMqAsyncResponseOptions { DeadLetterExchange = "dlx" },
+            EnqueueSubscriber(workers: 1, capacity: 8),
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(
+                Delivery("poison-payload", new BasicProperties { CorrelationId = "cid-dlx" }, routingKey: "worker.route", deliveryTag: 91),
+                channel,
+                CancellationToken.None);
+
+            var guard = TimeProvider.System.GetUtcNow() + TimeSpan.FromSeconds(10);
+            while (channel.Publishes.Count == 0)
+            {
+                Assert.True(TimeProvider.System.GetUtcNow() < guard, "the failed background delivery was never dead-lettered");
+                await Task.Delay(TimeSpan.FromMilliseconds(5));
+            }
+
+            var publish = Assert.Single(channel.Publishes);
+            Assert.Equal("dlx", publish.Exchange);
+            // Native dead-lettering keeps the original routing key unless DeadLetterRoutingKey
+            // overrides it — the manual copy must route the same way.
+            Assert.Equal("worker.route", publish.RoutingKey);
+            Assert.Equal("poison-payload", Encoding.UTF8.GetString(publish.Body.ToArray()));
+            Assert.Equal("background boom", Assert.IsType<string>(publish.Properties.Headers!["AR-DeadLetter-Reason"]));
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task Enqueue_BackgroundHandlerFails_WithoutADeadLetterExchange_OnlyLogsAndNotifies()
+    {
+        // No DLX configured: the pre-fix behavior (log + OnBackgroundFailure) is still the whole
+        // story — nothing may be published anywhere.
+        var channel = new FakeDispatcherChannel();
+        var notified = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var subscriber = EnqueueSubscriber(workers: 1, capacity: 8);
+        subscriber.OnBackgroundFailure = _ =>
+        {
+            notified.TrySetResult();
+            return ValueTask.CompletedTask;
+        };
+        var dispatcher = RabbitMqMessageDispatcher.Create(
+            (_, _) => throw new InvalidOperationException("background boom"),
+            new RabbitMqAsyncResponseOptions(),
+            subscriber,
+            NullLogger.Instance,
+            "worker.q",
+            RabbitMqSubscriberRole.Worker);
+
+        try
+        {
+            await dispatcher.HandleAsync(Delivery("payload", deliveryTag: 92), channel, CancellationToken.None);
+            await notified.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Empty(channel.Publishes);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task Awaiting_HandlerThrows_NacksWithRequeue()
     {
         var channel = new FakeDispatcherChannel();
@@ -1035,8 +1114,14 @@ public class RabbitMqDispatcherTests
         public Task BasicQosAsync(ushort prefetchCount, CancellationToken cancellationToken = default)
             => Task.CompletedTask;
 
+        public List<(string Exchange, string RoutingKey, BasicProperties Properties, ReadOnlyMemory<byte> Body)> Publishes { get; } = [];
+
         public ValueTask BasicPublishAsync(string exchange, string routingKey, BasicProperties properties, ReadOnlyMemory<byte> body, CancellationToken cancellationToken = default)
-            => ValueTask.CompletedTask;
+        {
+            lock (Publishes)
+                Publishes.Add((exchange, routingKey, properties, body));
+            return ValueTask.CompletedTask;
+        }
 
         public Task<RabbitMqConsumer> BasicConsumeAsync(string queue, Func<RabbitMqDelivery, Task> handler, CancellationToken cancellationToken = default)
             => Task.FromResult(new RabbitMqConsumer("consumer-tag", new TaskCompletionSource<string>().Task));

@@ -83,6 +83,16 @@ public interface IDurableFlowExecutionObserver
     ValueTask OnStepCompletedAsync(DurableFlowStepEvent step) => default;
 
     /// <summary>
+    /// The current execution attempt ended without the run reaching a terminal status: the
+    /// attempt failed (or lost its execution lease) and the delivery retries from the last
+    /// checkpoint. Any step this attempt had reported waiting is no longer parked in this
+    /// process; the retry re-raises whatever still applies. Best-effort, unlike the other
+    /// events: the attempt's own exception is already propagating, so an observer throw here is
+    /// swallowed rather than allowed to mask it.
+    /// </summary>
+    ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run) => default;
+
+    /// <summary>
     /// The run reached a terminal status (<see cref="FlowRunStatus.Succeeded"/> or
     /// <see cref="FlowRunStatus.Failed"/>). Delivered <b>at least once</b> per terminal run: a
     /// redelivered duplicate of an already-terminal wake-up re-notifies before acking, because the

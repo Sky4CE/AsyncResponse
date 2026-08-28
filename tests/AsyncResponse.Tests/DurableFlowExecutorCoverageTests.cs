@@ -196,6 +196,84 @@ public sealed class DurableFlowExecutorCoverageTests
             => throw new InvalidOperationException("observer boom");
     }
 
+    [Fact]
+    public async Task ExecuteAsync_RetryableFailure_RaisesRunAttemptFailed_AndStillPropagates()
+    {
+        // Regression: an attempt that failed retryably ended without ANY observer event — no
+        // step-completed for its parked steps and no run-finished (the run is not terminal) — so
+        // an observer tracking in-process state (the Testing harness's quiesce probe) leaked an
+        // entry per failed attempt for the rest of the incarnation.
+        var store = new InMemoryFlowStateStore();
+        var state = State("attempt-fails");
+        state.FlowTypeName = typeof(ThrowingBodyFlow).FullName;
+        state.InputTypeName = typeof(TestFlowInput).FullName;
+        await CreateAsync(store, state);
+        var observer = new AttemptFailureObserver();
+        await using var harness = CreateHarness(
+            store,
+            services => services.AddSingleton<ThrowingBodyFlow>(),
+            observers: [observer]);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Executor.ExecuteAsync("attempt-fails"));
+
+        Assert.Equal("flow body exploded", thrown.Message);
+        var failed = Assert.Single(observer.AttemptFailures);
+        Assert.Equal("attempt-fails", failed.FlowId);
+        Assert.Equal(FlowRunStatus.Running, failed.Status);
+        Assert.Empty(observer.Finished);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_ObserverThrowInRunAttemptFailed_IsSwallowed_KeepingTheOriginalFailure()
+    {
+        // The attempt's own exception is what the transport retries on; an observer throw in the
+        // best-effort attempt-failed notification must never replace it.
+        var store = new InMemoryFlowStateStore();
+        var state = State("attempt-fails-observer");
+        state.FlowTypeName = typeof(ThrowingBodyFlow).FullName;
+        state.InputTypeName = typeof(TestFlowInput).FullName;
+        await CreateAsync(store, state);
+        var observer = new AttemptFailureObserver { ThrowOnAttemptFailed = true };
+        await using var harness = CreateHarness(
+            store,
+            services => services.AddSingleton<ThrowingBodyFlow>(),
+            observers: [observer]);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => harness.Executor.ExecuteAsync("attempt-fails-observer"));
+
+        Assert.Equal("flow body exploded", thrown.Message);
+        Assert.Single(observer.AttemptFailures);
+    }
+
+    public sealed class ThrowingBodyFlow : IDurableFlow<TestFlowInput>
+    {
+        public Task ExecuteAsync(IDurableFlowContext context, TestFlowInput input)
+            => throw new InvalidOperationException("flow body exploded");
+    }
+
+    private sealed class AttemptFailureObserver : IDurableFlowExecutionObserver
+    {
+        public List<DurableFlowRunEvent> AttemptFailures { get; } = [];
+        public List<DurableFlowRunEvent> Finished { get; } = [];
+        public bool ThrowOnAttemptFailed { get; init; }
+
+        public ValueTask OnRunAttemptFailedAsync(DurableFlowRunEvent run)
+        {
+            AttemptFailures.Add(run);
+            return ThrowOnAttemptFailed
+                ? throw new InvalidOperationException("attempt observer boom")
+                : default;
+        }
+
+        public ValueTask OnRunFinishedAsync(DurableFlowRunEvent run)
+        {
+            Finished.Add(run);
+            return default;
+        }
+    }
+
     [Theory]
     [InlineData(InvalidFlowDefinition.MissingFlowType, "no flow type name")]
     [InlineData(InvalidFlowDefinition.UnresolvableFlowType, "Cannot resolve flow type")]

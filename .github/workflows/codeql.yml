@@ -42,6 +42,7 @@ jobs:
         run: |
           dotnet restore
           dotnet build src/AsyncResponse.Core/AsyncResponse.Core.csproj --configuration Release --no-restore
+          dotnet build src/AsyncResponse.Testing/AsyncResponse.Testing.csproj --configuration Release --no-restore
           for proj in src/Channels/*/*.csproj src/Transports/*/*.csproj src/DurableFlows/AsyncResponse.*/*.csproj; do
             dotnet build "$proj" --configuration Release --no-restore
           done

@@ -377,7 +377,17 @@ builder.Services.AddAsyncResponse()
 ```
 
 If the application already registers `IMongoDatabase`, the store reuses it and only
-`CollectionName` is needed. With a registered `IMongoClient`, configure `DatabaseName`.
+`CollectionName` is needed. With a registered `IMongoClient`, configure `DatabaseName`. Ledger
+reads are pinned to the primary regardless of the registered connection's read preference: a
+`readPreference=secondaryPreferred` string would otherwise route loads to a lagging secondary,
+where a stale revision replays an already-checkpointed step and a not-yet-replicated ledger reads
+as absent — the one answer that acknowledges a wake-up.
+
+With `AutoCreateIndexes = false` the store verifies at startup that the provisioned collection
+carries a TTL index on `expires_at_utc` (`createIndex({ expires_at_utc: 1 }, { expireAfterSeconds: 0 })`)
+and fails with an actionable error when it is missing — that index is the store's only cleanup
+mechanism, so without the check an unprovisioned reaper meant unbounded ledger growth with no
+symptom but disk.
 
 ### Azure Cosmos DB
 
@@ -534,8 +544,9 @@ The library does not silently upgrade an incomplete concurrency schema:
 
 - SQL packages create the complete table when missing. If a table exists without revision or lease
   columns, operations fail; deploy the correct migration before the application.
-- MongoDB creates the required TTL index when missing. It does not drop or rewrite a conflicting
-  application-owned index.
+- MongoDB creates the required TTL index when missing (and, with `AutoCreateIndexes = false`,
+  verifies an equivalent one exists — the TTL index is its only cleanup mechanism). It does not
+  drop or rewrite a conflicting application-owned index.
 - Cosmos auto-create uses the configured partition key and enables per-item TTL on a new container.
   An existing container must already use that partition key and have TTL enabled, or first use fails.
 - DynamoDB validates that TTL is enabled or being enabled on the configured attribute. A table with

@@ -423,6 +423,16 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
     private readonly Channel<RabbitMqDelivery> _queue;
     private readonly Task[] _workers;
     private readonly CancellationTokenSource _drainCancellation = new();
+
+    /// <summary>Serializes best-effort dead-letter publishes from concurrent background workers.</summary>
+    private readonly SemaphoreSlim _deadLetterPublishGate = new(1, 1);
+
+    /// <summary>
+    /// The subscriber's channel, captured per delivery: background workers need it to publish an
+    /// already-ACKed failed delivery to the dead-letter exchange (the native reject-without-requeue
+    /// DLX route is unreachable once the ACK happened at enqueue).
+    /// </summary>
+    private volatile IRabbitMqChannel? _channel;
     private readonly TimeSpan _drainTimeout;
     private readonly string _queueName;
     private readonly RabbitMqSubscriberRole _role;
@@ -478,6 +488,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
         // workers that read the body after the callback, so materialize a private copy now.
         // The awaiting dispatcher consumes the body inside the callback and stays zero-copy.
         delivery = delivery with { Body = delivery.Body.ToArray() };
+        _channel = channel;
 
         Interlocked.Increment(ref _pendingCount);
         if (!_queue.Writer.TryWrite(delivery))
@@ -524,6 +535,85 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                 "Failed to ACK RabbitMQ delivery {DeliveryTag} for {Queue} after enqueue; it is being processed but the broker will redeliver it when the channel closes.",
                 delivery.DeliveryTag,
                 _queueName);
+        }
+    }
+
+    /// <summary>
+    /// Publishes an already-ACKed failed delivery to the configured dead-letter exchange
+    /// (Kafka/Redis dispatcher parity). The native reject-without-requeue DLX route is
+    /// unreachable here — the ACK happened at enqueue — so without this copy a permanently
+    /// failing job vanished with one log line: no requeue, no DLX record, no forensic trail.
+    /// Best-effort: on any failure the loss stays observable via the log and OnBackgroundFailure,
+    /// exactly as before. Mirrors native dead-lettering's routing: the original routing key,
+    /// unless DeadLetterRoutingKey overrides it (the same rule the topology binds the
+    /// dead-letter queue with).
+    /// </summary>
+    private async Task TryDeadLetterAlreadyAckedAsync(RabbitMqDelivery delivery, Exception exception)
+    {
+        if (string.IsNullOrWhiteSpace(TransportOptions.DeadLetterExchange))
+            return;
+
+        if (_channel is not { IsOpen: true } channel)
+        {
+            Logger.LogError(
+                "Cannot dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}: the subscriber channel is closed. The failure is only observable via logs and OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName);
+            return;
+        }
+
+        var headers = new Dictionary<string, object?>(StringComparer.Ordinal);
+        if (delivery.BasicProperties.Headers is { } original)
+        {
+            foreach (var header in original)
+                headers[header.Key] = header.Value;
+        }
+
+        headers["AR-DeadLetter-Reason"] = exception.Message is { Length: > 512 } longMessage ? longMessage[..512] : exception.Message;
+        headers["AR-DeadLetter-Source-Queue"] = _queueName;
+        headers["AR-DeadLetter-Role"] = _role.ToString();
+
+        var properties = new BasicProperties
+        {
+            Persistent = true,
+            ContentType = delivery.BasicProperties.ContentType,
+            MessageId = delivery.BasicProperties.MessageId,
+            CorrelationId = delivery.BasicProperties.CorrelationId,
+            Headers = headers
+        };
+
+        var routingKey = string.IsNullOrWhiteSpace(TransportOptions.DeadLetterRoutingKey)
+            ? delivery.RoutingKey
+            : TransportOptions.DeadLetterRoutingKey;
+
+        // Serialized: multiple background workers can fail concurrently, and they share the
+        // subscriber's one channel.
+        await _deadLetterPublishGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await channel.BasicPublishAsync(
+                TransportOptions.DeadLetterExchange!,
+                routingKey,
+                properties,
+                delivery.Body,
+                CancellationToken.None).ConfigureAwait(false);
+            Logger.LogInformation(
+                "Dead-lettered already-ACKed RabbitMQ delivery {DeliveryTag} from {Queue} to exchange {DeadLetterExchange}.",
+                delivery.DeliveryTag,
+                _queueName,
+                TransportOptions.DeadLetterExchange);
+        }
+        catch (Exception publishException)
+        {
+            Logger.LogError(
+                publishException,
+                "Failed to dead-letter already-ACKed RabbitMQ delivery {DeliveryTag} on {Queue}; the failure is only observable via logs and OnBackgroundFailure.",
+                delivery.DeliveryTag,
+                _queueName);
+        }
+        finally
+        {
+            _deadLetterPublishGate.Release();
         }
     }
 
@@ -612,6 +702,7 @@ internal sealed class QueuedRabbitMqMessageDispatcher : RabbitMqMessageDispatche
                     ex,
                     _queueName,
                     _role).ConfigureAwait(false);
+                await TryDeadLetterAlreadyAckedAsync(delivery, ex).ConfigureAwait(false);
             }
             finally
             {

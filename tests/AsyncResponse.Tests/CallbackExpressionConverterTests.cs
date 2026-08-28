@@ -18,6 +18,30 @@ public class CallbackExpressionConverterTests
         Assert.Equal(42, param.Value);
     }
 
+    private static readonly int _staticCaptured = 1337;
+
+    private static int CapturedProperty => 7042;
+
+    [Fact]
+    public void StaticFieldArguments_AreCapturedByValue()
+    {
+        // The direct field-read fast path (closure display classes and static fields skip the
+        // per-call lambda interpretation) must produce the same values the interpreter did.
+        var call = CallbackExpressionConverter.ToReflectionCall<IRecoverySpy>(spy => spy.OnWorkerJob(_staticCaptured));
+
+        Assert.Equal(1337, Assert.Single(call.Params).Value);
+    }
+
+    [Fact]
+    public void PropertyArguments_StillEvaluateThroughTheInterpreter()
+    {
+        // Properties are NOT on the field fast path (a getter can run arbitrary code); they keep
+        // the interpreted evaluation and must still capture by value.
+        var call = CallbackExpressionConverter.ToReflectionCall<IRecoverySpy>(spy => spy.OnWorkerJob(CapturedProperty));
+
+        Assert.Equal(7042, Assert.Single(call.Params).Value);
+    }
+
     [Fact]
     public void PlaceholderMarkers_BecomeRuntimePlaceholders()
     {

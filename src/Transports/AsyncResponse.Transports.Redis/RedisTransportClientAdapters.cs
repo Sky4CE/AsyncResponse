@@ -64,6 +64,26 @@ internal interface IRedisStreamDatabase
         RedisValue[] messageIds,
         CancellationToken cancellationToken)
         => Task.FromResult(Array.Empty<RedisValue>());
+
+    /// <summary>
+    /// Idempotent XADD: appends <paramref name="values"/> only when <paramref name="dedupKey"/>
+    /// is not yet claimed (the marker and the append commit atomically, marker expiring after
+    /// <paramref name="dedupTtl"/>), returning <see cref="RedisValue.Null"/> when a previous
+    /// attempt's append already committed. Publish retries ride on this: XADD has no natural
+    /// identity (the entry id is server-generated), so a retry after an ambiguous timeout — the
+    /// adapter abandons the in-flight command best-effort while the multiplexer keeps running
+    /// it — appended the same worker job twice. Carries a non-idempotent pass-through default so
+    /// out-of-package fakes keep compiling.
+    /// </summary>
+    Task<RedisValue> StreamAddOnceAsync(
+        RedisKey stream,
+        RedisKey dedupKey,
+        TimeSpan dedupTtl,
+        NameValueEntry[] values,
+        long? maxLength,
+        bool useApproximateMaxLength,
+        CancellationToken cancellationToken)
+        => StreamAddAsync(stream, values, maxLength, useApproximateMaxLength, cancellationToken);
 }
 
 internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _operationTimeout) : IRedisStreamDatabase
@@ -96,6 +116,37 @@ internal sealed class RedisStreamDatabaseAdapter(IDatabase _database, TimeSpan _
     // (int? maxLength) is always reachable without overflow.
     private static int? ToInt32MaxLength(long? maxLength)
         => maxLength is null ? null : (int?)Math.Min(maxLength.Value, int.MaxValue);
+
+    /// <summary>Runs the StreamAddOnceAsync operation.</summary>
+    public async Task<RedisValue> StreamAddOnceAsync(
+        RedisKey stream,
+        RedisKey dedupKey,
+        TimeSpan dedupTtl,
+        NameValueEntry[] values,
+        long? maxLength,
+        bool useApproximateMaxLength,
+        CancellationToken cancellationToken)
+    {
+        // MULTI/EXEC guarded by KeyNotExists: the dedup marker and the append commit atomically,
+        // so a retried publish whose earlier attempt DID land (an ambiguous timeout) finds the
+        // marker and appends nothing. The XADD wire shape matches StreamAddAsync above (classic
+        // overload, no Redis 8 trim tokens).
+        var transaction = _database.CreateTransaction();
+        transaction.AddCondition(Condition.KeyNotExists(dedupKey));
+        _ = transaction.StringSetAsync(dedupKey, RedisValue.EmptyString, dedupTtl, flags: CommandFlags.FireAndForget);
+        var add = transaction.StreamAddAsync(
+            stream,
+            values,
+            messageId: (RedisValue?)null,
+            maxLength: ToInt32MaxLength(maxLength),
+            useApproximateMaxLength: useApproximateMaxLength,
+            flags: CommandFlags.None);
+
+        var committed = await WithCancellation(transaction.ExecuteAsync(), cancellationToken).ConfigureAwait(false);
+
+        // On a failed condition the queued tasks complete as canceled — do not await them.
+        return committed ? await add.ConfigureAwait(false) : RedisValue.Null;
+    }
 
     /// <summary>Runs the StreamCreateConsumerGroupAsync operation.</summary>
     public Task<bool> StreamCreateConsumerGroupAsync(

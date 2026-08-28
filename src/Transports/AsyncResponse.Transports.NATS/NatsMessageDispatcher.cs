@@ -75,6 +75,54 @@ internal sealed class NatsMessageDispatcher : IAsyncDisposable
     /// <summary>Handles the delivered message.</summary>
     public async Task HandleAsync(NatsJobDelivery delivery, CancellationToken cancellationToken)
     {
+        // Pre-execution cap, BEFORE either ack mode (DB/Redis dispatcher parity).
+        // HandleFailureAsync below is the only other place the cap is consulted, and it runs only
+        // when the handler THREW — so a delivery that ends any other way (the process dies
+        // mid-handler, the host is killed, a NAK fails) never reaches it. The consumer is created
+        // with MaxDeliver = -1 on the premise that THIS dispatcher bounds attempts, so without
+        // this check such a message redelivered forever after each AckWait, killing each replica
+        // in turn, and was never dead-lettered. Settlement uses CancellationToken.None for the
+        // usual reason: burying a poison message must not be abandoned half-done by a shutdown.
+        var cap = _subscriberOptions.MaxDeliveryAttempts;
+        if (cap > 0 && delivery.NumDelivered > cap)
+        {
+            _logger.LogError(
+                "Message on subject {Subject} ({Role}) arrived on delivery {NumDelivered} with a cap of {MaxDeliveryAttempts}; dead-lettering without executing it.",
+                delivery.Subject,
+                _role,
+                delivery.NumDelivered,
+                cap);
+
+            var shouldTerminate = await DeadLetterAsync(
+                delivery,
+                new InvalidOperationException(
+                    $"Message exceeded {cap} delivery attempts without settling (delivery {delivery.NumDelivered})."),
+                CancellationToken.None).ConfigureAwait(false);
+            if (shouldTerminate)
+            {
+                // Guarded like the failure path's Term: a thrown settlement would unwind the
+                // consume loop while the un-termed message redelivers and is dead-lettered again.
+                try
+                {
+                    await delivery.TermAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to TERM NATS message on subject {Subject} ({Role}) after dead-lettering; it may redeliver and be dead-lettered again.",
+                        delivery.Subject,
+                        _role);
+                }
+            }
+            else
+            {
+                await NakQuietlyAsync(delivery).ConfigureAwait(false);
+            }
+
+            return;
+        }
+
         if (_subscriberOptions.AckMode is NatsAckMode.AckAfterEnqueue)
         {
             await HandleEarlyAckAsync(delivery, cancellationToken).ConfigureAwait(false);

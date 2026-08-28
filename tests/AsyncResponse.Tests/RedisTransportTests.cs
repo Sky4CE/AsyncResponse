@@ -127,6 +127,31 @@ public class RedisTransportTests
     }
 
     [Fact]
+    public async Task WorkerTransport_RetryAfterAmbiguousTimeout_DoesNotAppendTheJobTwice()
+    {
+        // Regression: XADD was retried with a server-generated entry id and no dedup identity — a
+        // slow but SUCCESSFUL append surfaced as a TimeoutException (the adapter abandons the
+        // in-flight command best-effort while the multiplexer keeps running it), the retry
+        // appended a second entry, and the worker job executed twice. The identity is now pinned
+        // outside the retry loop (MongoDB/ASB/SQS parity) and the retried append is a no-op.
+        var database = new FakeRedisStreamDatabase { AmbiguousTimeoutsBeforeSuccess = 1 };
+        var transport = new RedisWorkerTransport(
+            Options.Create(new RedisAsyncResponseTransportOptions
+            {
+                PublishMaxAttempts = 3,
+                PublishRetryBaseDelay = TimeSpan.FromMilliseconds(1),
+                PublishRetryMaxDelay = TimeSpan.FromMilliseconds(1)
+            }),
+            database);
+
+        await transport.PublishAsync(WorkerJob("corr-ambiguous", 1));
+
+        Assert.Single(database.Adds);
+        Assert.Equal(2, database.AddOnceDedupKeys.Count);
+        Assert.Single(database.AddOnceDedupKeys.Distinct());
+    }
+
+    [Fact]
     public async Task WorkerTransport_WhenPublishFailsAfterRetries_Rethrows()
     {
         var database = new FakeRedisStreamDatabase { TransientAddFailuresBeforeSuccess = 5 };
@@ -562,6 +587,18 @@ public class RedisTransportTests
         public StreamEntry[] ClaimedMessages { get; set; } = [];
         public int AddAttempts { get; private set; }
         public int TransientAddFailuresBeforeSuccess { get; set; }
+
+        /// <summary>Dedup keys passed to StreamAddOnceAsync, in call order (retries repeat the key).</summary>
+        public List<string> AddOnceDedupKeys { get; } = [];
+
+        /// <summary>Markers committed atomically with an applied append (StreamAddOnceAsync semantics).</summary>
+        public HashSet<string> CommittedDedupKeys { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Simulates the ambiguous timeout: the append IS applied server-side (and its marker
+        /// committed), then the call surfaces a TimeoutException as if the adapter abandoned it.
+        /// </summary>
+        public int AmbiguousTimeoutsBeforeSuccess { get; set; }
         public TaskCompletionSource? FirstReadStarted { get; set; }
         public Exception? AddException { get; set; }
         public Exception? AckException { get; set; }
@@ -585,6 +622,36 @@ public class RedisTransportTests
 
             Adds.Add(new AddCall(stream.ToString(), values, maxLength, useApproximateMaxLength));
             return Task.FromResult<RedisValue>($"{AddAttempts}-0");
+        }
+
+        public async Task<RedisValue> StreamAddOnceAsync(
+            RedisKey stream,
+            RedisKey dedupKey,
+            TimeSpan dedupTtl,
+            NameValueEntry[] values,
+            long? maxLength,
+            bool useApproximateMaxLength,
+            CancellationToken cancellationToken)
+        {
+            var key = dedupKey.ToString();
+            AddOnceDedupKeys.Add(key);
+            if (CommittedDedupKeys.Contains(key))
+            {
+                AddAttempts++;
+                AddTokens.Add(cancellationToken);
+                return RedisValue.Null;
+            }
+
+            var id = await StreamAddAsync(stream, values, maxLength, useApproximateMaxLength, cancellationToken);
+            CommittedDedupKeys.Add(key);
+
+            if (AmbiguousTimeoutsBeforeSuccess > 0)
+            {
+                AmbiguousTimeoutsBeforeSuccess--;
+                throw new TimeoutException("The Redis command did not complete within the operation timeout.");
+            }
+
+            return id;
         }
 
         public Task<bool> StreamCreateConsumerGroupAsync(

@@ -16,6 +16,9 @@
        ========================================================================================== -->
   <!-- Core runtime abstractions (Microsoft.Extensions.*), aligned to the net10.0 line. -->
   <ItemGroup>
+    <!-- Shipped through AsyncResponse.Testing (its harness hosts a real container), so a bump
+         here changes that package's declared minimum — not a samples/benchmarks-only version. -->
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.11" />
     <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.11" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
@@ -76,7 +79,6 @@
          Re-check the upper bound whenever Microsoft.AspNetCore.OpenApi is bumped.
          The direct reference that carries this pin lives in AsyncResponse.Sample. -->
     <PackageVersion Include="Microsoft.OpenApi" Version="2.12.0" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.11" />
     <PackageVersion Include="NBomber" Version="4.1.2" />
     <PackageVersion Include="NBomber.Http" Version="4.1.1" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.17.0" />
