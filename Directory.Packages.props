@@ -115,7 +115,7 @@
        SQL Server, and that shared source compiles into the multi-targeted unit-test project too.
        ========================================================================================== -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
-    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.30" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.19" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.30" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.30" />
   </ItemGroup>
