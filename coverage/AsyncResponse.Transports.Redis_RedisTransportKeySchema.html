@@ -41,7 +41,7 @@
 <table>
 <tr>
 <th>Covered lines:</th>
-<td class="limit-width right" title="7">7</td>
+<td class="limit-width right" title="8">8</td>
 </tr>
 <tr>
 <th>Uncovered lines:</th>
@@ -49,15 +49,15 @@
 </tr>
 <tr>
 <th>Coverable lines:</th>
-<td class="limit-width right" title="7">7</td>
+<td class="limit-width right" title="8">8</td>
 </tr>
 <tr>
 <th>Total lines:</th>
-<td class="limit-width right" title="19">19</td>
+<td class="limit-width right" title="27">27</td>
 </tr>
 <tr>
 <th>Line coverage:</th>
-<td class="limit-width right" title="7 of 7">100%</td>
+<td class="limit-width right" title="8 of 8">100%</td>
 </tr>
 </table>
 </div>
@@ -111,7 +111,8 @@
 <tr><td title="get_WorkerStream()"><a href="#file0_line11" class="navigatetohash">get_WorkerStream()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="get_ResponseStream()"><a href="#file0_line12" class="navigatetohash">get_ResponseStream()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
 <tr><td title="get_DeadLetterStream()"><a href="#file0_line13" class="navigatetohash">get_DeadLetterStream()</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
-<tr><td title="Resolve(System.String,System.String)"><a href="#file0_line16" class="navigatetohash">Resolve(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
+<tr><td title="WorkerPublishDedupKey(System.String)"><a href="#file0_line21" class="navigatetohash">WorkerPublishDedupKey(...)</a></td><td>100%</td><td>1</td><td>1</td><td>100%</td></tr>
+<tr><td title="Resolve(System.String,System.String)"><a href="#file0_line24" class="navigatetohash">Resolve(...)</a></td><td>100%</td><td>2</td><td>2</td><td>100%</td></tr>
 </tbody>
 </table>
 </div>
@@ -129,21 +130,29 @@
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line6"></a><code>6</code></td><td></td><td class="lightgray"><code>///&nbsp;Resolves&nbsp;Redis&nbsp;stream&nbsp;names&nbsp;from&nbsp;transport&nbsp;options.&nbsp;These&nbsp;names&nbsp;are&nbsp;deployment&nbsp;contracts:&nbsp;changing</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line7"></a><code>7</code></td><td></td><td class="lightgray"><code>///&nbsp;them&nbsp;while&nbsp;entries&nbsp;are&nbsp;in&nbsp;flight&nbsp;strands&nbsp;unprocessed&nbsp;worker&nbsp;or&nbsp;response&nbsp;messages&nbsp;in&nbsp;the&nbsp;old&nbsp;stream.</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line8"></a><code>8</code></td><td></td><td class="lightgray"><code>///&nbsp;&lt;/summary&gt;</code></td></tr>
-<tr class="coverableline" title="Covered (3273 visits)" data-coverage="{'AllTestMethods': {'VC': '3273', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3273</td><td class="rightmargin right"><a id="file0_line9"></a><code>9</code></td><td></td><td class="lightgreen"><code>internal&nbsp;sealed&nbsp;class&nbsp;RedisTransportKeySchema(RedisAsyncResponseTransportOptions&nbsp;_options)</code></td></tr>
+<tr class="coverableline" title="Covered (3247 visits)" data-coverage="{'AllTestMethods': {'VC': '3247', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">3247</td><td class="rightmargin right"><a id="file0_line9"></a><code>9</code></td><td></td><td class="lightgreen"><code>internal&nbsp;sealed&nbsp;class&nbsp;RedisTransportKeySchema(RedisAsyncResponseTransportOptions&nbsp;_options)</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line10"></a><code>10</code></td><td></td><td class="lightgray"><code>{</code></td></tr>
-<tr class="coverableline" title="Covered (9469 visits)" data-coverage="{'AllTestMethods': {'VC': '9469', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">9469</td><td class="rightmargin right"><a id="file0_line11"></a><code>11</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;WorkerStream&nbsp;=&gt;&nbsp;Resolve(_options.WorkerStream,&nbsp;&quot;worker&quot;);</code></td></tr>
-<tr class="coverableline" title="Covered (7608 visits)" data-coverage="{'AllTestMethods': {'VC': '7608', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">7608</td><td class="rightmargin right"><a id="file0_line12"></a><code>12</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;ResponseStream&nbsp;=&gt;&nbsp;Resolve(_options.ResponseStream,&nbsp;&quot;response&quot;);</code></td></tr>
-<tr class="coverableline" title="Covered (1790 visits)" data-coverage="{'AllTestMethods': {'VC': '1790', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1790</td><td class="rightmargin right"><a id="file0_line13"></a><code>13</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;DeadLetterStream&nbsp;=&gt;&nbsp;Resolve(_options.DeadLetterStream,&nbsp;&quot;deadletter&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (8558 visits)" data-coverage="{'AllTestMethods': {'VC': '8558', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">8558</td><td class="rightmargin right"><a id="file0_line11"></a><code>11</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;WorkerStream&nbsp;=&gt;&nbsp;Resolve(_options.WorkerStream,&nbsp;&quot;worker&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (6600 visits)" data-coverage="{'AllTestMethods': {'VC': '6600', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">6600</td><td class="rightmargin right"><a id="file0_line12"></a><code>12</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;ResponseStream&nbsp;=&gt;&nbsp;Resolve(_options.ResponseStream,&nbsp;&quot;response&quot;);</code></td></tr>
+<tr class="coverableline" title="Covered (1775 visits)" data-coverage="{'AllTestMethods': {'VC': '1775', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">1775</td><td class="rightmargin right"><a id="file0_line13"></a><code>13</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;DeadLetterStream&nbsp;=&gt;&nbsp;Resolve(_options.DeadLetterStream,&nbsp;&quot;deadletter&quot;);</code></td></tr>
 <tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line14"></a><code>14</code></td><td></td><td class="lightgray"><code></code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line15"></a><code>15</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;RedisKey&nbsp;Resolve(string?&nbsp;configured,&nbsp;string&nbsp;role)</code></td></tr>
-<tr class="coverableline" title="Covered (18867 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '18867', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">18867</td><td class="rightmargin right"><a id="file0_line16"></a><code>16</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;!string.IsNullOrWhiteSpace(configured)</code></td></tr>
-<tr class="coverableline" title="Covered (18867 visits)" data-coverage="{'AllTestMethods': {'VC': '18867', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">18867</td><td class="rightmargin right"><a id="file0_line17"></a><code>17</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;?&nbsp;configured</code></td></tr>
-<tr class="coverableline" title="Covered (18867 visits)" data-coverage="{'AllTestMethods': {'VC': '18867', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">18867</td><td class="rightmargin right"><a id="file0_line18"></a><code>18</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;$&quot;{_options.KeyPrefix}:transport:{role}&quot;;</code></td></tr>
-<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line19"></a><code>19</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line15"></a><code>15</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line16"></a><code>16</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;Per-publish&nbsp;dedup&nbsp;marker&nbsp;for&nbsp;the&nbsp;idempotent&nbsp;worker&nbsp;XADD.&nbsp;Hash-tagged&nbsp;with&nbsp;the&nbsp;stream&nbsp;name</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line17"></a><code>17</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;so&nbsp;the&nbsp;marker&nbsp;and&nbsp;the&nbsp;stream&nbsp;share&nbsp;a&nbsp;cluster&nbsp;slot&nbsp;—&nbsp;the&nbsp;MULTI/EXEC&nbsp;that&nbsp;couples&nbsp;them</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line18"></a><code>18</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;would&nbsp;otherwise&nbsp;fail&nbsp;with&nbsp;CROSSSLOT&nbsp;on&nbsp;Redis&nbsp;Cluster.</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line19"></a><code>19</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;///&nbsp;&lt;/summary&gt;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line20"></a><code>20</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;public&nbsp;RedisKey&nbsp;WorkerPublishDedupKey(string&nbsp;publishId)</code></td></tr>
+<tr class="coverableline" title="Covered (418 visits)" data-coverage="{'AllTestMethods': {'VC': '418', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">418</td><td class="rightmargin right"><a id="file0_line21"></a><code>21</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;$&quot;{{{(string?)WorkerStream}}}:publish:{publishId}&quot;;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line22"></a><code>22</code></td><td></td><td class="lightgray"><code></code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line23"></a><code>23</code></td><td></td><td class="lightgray"><code>&nbsp;&nbsp;&nbsp;&nbsp;private&nbsp;RedisKey&nbsp;Resolve(string?&nbsp;configured,&nbsp;string&nbsp;role)</code></td></tr>
+<tr class="coverableline" title="Covered (16933 visits, 2 of 2 branches are covered)" data-coverage="{'AllTestMethods': {'VC': '16933', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">16933</td><td class="rightmargin right"><a id="file0_line24"></a><code>24</code></td><td class="percentagebar percentagebar100"><i class="icon-fork"></i></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;=&gt;&nbsp;!string.IsNullOrWhiteSpace(configured)</code></td></tr>
+<tr class="coverableline" title="Covered (16933 visits)" data-coverage="{'AllTestMethods': {'VC': '16933', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">16933</td><td class="rightmargin right"><a id="file0_line25"></a><code>25</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;?&nbsp;configured</code></td></tr>
+<tr class="coverableline" title="Covered (16933 visits)" data-coverage="{'AllTestMethods': {'VC': '16933', 'LVS': 'green'}}"><td class="green">&nbsp;</td><td class="leftmargin rightmargin right">16933</td><td class="rightmargin right"><a id="file0_line26"></a><code>26</code></td><td></td><td class="lightgreen"><code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;$&quot;{_options.KeyPrefix}:transport:{role}&quot;;</code></td></tr>
+<tr class="" title="Not coverable" data-coverage="{'AllTestMethods': {'VC': '', 'LVS': 'gray'}}"><td class="gray">&nbsp;</td><td class="leftmargin rightmargin right"></td><td class="rightmargin right"><a id="file0_line27"></a><code>27</code></td><td></td><td class="lightgray"><code>}</code></td></tr>
 </tbody>
 </table>
 </div>
-<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/27/2026 - 12:44:12<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
+<div class="footer">Generated by: ReportGenerator 5.5.10.0<br />08/28/2026 - 17:51:35<br /><a href="https://github.com/danielpalme/ReportGenerator">GitHub</a> | <a href="https://reportgenerator.io">reportgenerator.io</a></div></div>
 <div class="containerright">
 <div class="containerrightfixed">
 <h1>Methods/Properties</h1>
@@ -151,7 +160,8 @@
 <a href="#file0_line11" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_WorkerStream()"><i class="icon-wrench"></i>get_WorkerStream()</a><br />
 <a href="#file0_line12" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_ResponseStream()"><i class="icon-wrench"></i>get_ResponseStream()</a><br />
 <a href="#file0_line13" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - get_DeadLetterStream()"><i class="icon-wrench"></i>get_DeadLetterStream()</a><br />
-<a href="#file0_line16" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - Resolve(System.String,System.String)"><i class="icon-cube"></i>Resolve(System.String,System.String)</a><br />
+<a href="#file0_line21" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - WorkerPublishDedupKey(System.String)"><i class="icon-cube"></i>WorkerPublishDedupKey(System.String)</a><br />
+<a href="#file0_line24" class="navigatetohash percentagebar percentagebar100" title="Line coverage: 100% - Resolve(System.String,System.String)"><i class="icon-cube"></i>Resolve(System.String,System.String)</a><br />
 <br/></div>
 </div></div>
 <script type="text/javascript" src="class.js"></script>
