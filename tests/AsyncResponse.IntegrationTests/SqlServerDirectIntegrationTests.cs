@@ -1786,13 +1786,13 @@ public sealed class SqlServerDirectIntegrationTests(DataBatchFixture fixture) : 
 
             // The fan-out actually discriminated: the dropped and already-seen waiters were
             // skipped, and only the live one was processed — its waiter settling (with the
-            // schema-version rejection this "{}" envelope produces) proves
-            // ProcessUnderCapturedContextAsync ran end to end.
+            // envelope converter's rejection of this "{}" body, which carries no SchemaVersion)
+            // proves ProcessUnderCapturedContextAsync ran end to end.
             Assert.False(subscription1.Completion.Task.IsCompleted);
             Assert.False(subscription2.Completion.Task.IsCompleted);
-            var liveError = await Assert.ThrowsAsync<InvalidOperationException>(
+            var liveError = await Assert.ThrowsAsync<System.Text.Json.JsonException>(
                 () => subscription3.Completion.Task.WaitAsync(TimeSpan.FromSeconds(5)));
-            Assert.Contains("schema version", liveError.Message);
+            Assert.Contains("SchemaVersion", liveError.Message);
 
             // Start dispatcher to cover its background task dispose/cancellation
             var ensureDispatcherStartedMethod = typeof(SqlServerAsyncResponseChannel).GetMethod("EnsureListenerStarted", BindingFlags.Instance | BindingFlags.NonPublic)!;
